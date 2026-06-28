@@ -1,4 +1,5 @@
 use ace_wire::infohash::{infohash_of_transport, is_transport_file};
+use ace_wire::handshake::{Handshake, PSTR};
 use std::path::PathBuf;
 
 fn vec_bytes(rel: &str) -> Vec<u8> {
@@ -19,4 +20,30 @@ fn detects_transport_magic() {
     assert!(is_transport_file(&vec_bytes("transport-01.bin")));
     assert!(!is_transport_file(b"not a transport file"));
     assert!(!is_transport_file(b"AceStream")); // too short / partial
+}
+
+#[test]
+fn decodes_captured_handshake() {
+    let bytes = vec_bytes("messages/encrypter-handshake-peer-in.bin");
+    let hs = Handshake::decode(&bytes).unwrap();
+    assert_eq!(PSTR, b"AceStreamProtocol");
+    assert_eq!(hex::encode(hs.infohash), "50e93529d3eb46a50506b14464185a15292d6e47");
+    assert_eq!(&hs.peer_id, b"R30------Ef2V8QOgmt4");
+    assert_eq!(hs.reserved, [0u8; 8]);
+    // re-encode must be byte-identical to the captured 66 bytes
+    assert_eq!(hs.encode().to_vec(), bytes);
+}
+
+#[test]
+fn random_peer_id_has_acestream_prefix() {
+    let id = ace_wire::handshake::random_peer_id();
+    assert_eq!(&id[..9], b"R30------");
+    assert_eq!(id.len(), 20);
+}
+
+#[test]
+fn rejects_wrong_pstr() {
+    let mut bytes = vec_bytes("messages/encrypter-handshake-peer-in.bin");
+    bytes[1] = b'X'; // corrupt pstr
+    assert!(Handshake::decode(&bytes).is_err());
 }
