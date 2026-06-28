@@ -57,6 +57,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         Ok(())
     }
 
+    /// Send our BEP-10 extended handshake (id 20, sub-id 0).
+    pub async fn send_extended_handshake(
+        &mut self, hs: &ace_wire::extended::OutgoingExtendedHandshake,
+    ) -> Result<()> {
+        let msg = PeerMessage::Extended { ext_id: 0, payload: hs.encode_payload() };
+        self.send(&msg).await
+    }
+
     /// Read exactly one peer message, buffering until a full frame is available.
     pub async fn read_message(&mut self) -> Result<PeerMessage> {
         loop {
@@ -153,6 +161,39 @@ mod tests {
         println!("live peer accepted handshake; first message: {msg:?}");
     }
 
+    #[tokio::test]
+    async fn send_extended_handshake_frames_a_decodable_bep10_message() {
+        use ace_wire::extended::{ExtendedHandshake, OutgoingExtendedHandshake};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            // Read one full peer frame the way a real peer would.
+            let mut hdr = [0u8; 4];
+            server.read_exact(&mut hdr).await.unwrap();
+            let len = u32::from_be_bytes(hdr) as usize;
+            let mut body = vec![0u8; len];
+            server.read_exact(&mut body).await.unwrap();
+            let mut frame = hdr.to_vec();
+            frame.extend_from_slice(&body);
+            PeerMessage::decode(&frame).unwrap().unwrap().0
+        });
+
+        let mut session = PeerSession::new(client);
+        let hs = OutgoingExtendedHandshake { ace_metadata_version: 1, ut_metadata_id: 2, mi: None };
+        session.send_extended_handshake(&hs).await.unwrap();
+
+        match srv.await.unwrap() {
+            PeerMessage::Extended { ext_id, payload } => {
+                assert_eq!(ext_id, 0); // BEP-10 handshake sub-id
+                let parsed = ExtendedHandshake::parse(&payload).unwrap();
+                assert_eq!(parsed.ace_metadata_version, Some(1));
+                assert_eq!(parsed.ut_metadata_id(), Some(2));
+            }
+            other => panic!("expected Extended, got {other:?}"),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn read_message_times_out_on_silent_peer() {
         // Keep `_server` alive so the read pends (open but idle) rather than EOF-ing.
@@ -172,6 +213,92 @@ mod tests {
             .perform_handshake([0x11u8; 20], *b"R30------CLIENTPEERy")
             .await;
         assert!(matches!(res, Err(PeerError::Timeout)));
+    }
+
+    #[tokio::test]
+    #[ignore] // live network: drive past the handshake and observe unchoke/piece behavior
+    async fn live_recon_unchoke() {
+        // Phase 3.2 recon. Capture hot peers from the engine namespace, then e.g.:
+        //   ACE_PEER=82.213.234.240:8623 ACE_INFOHASH=47eda3..afa022 \
+        //     cargo test -p ace-peer live_recon -- --ignored --nocapture
+        use ace_wire::extended::{ExtendedHandshake, LivePosition, OutgoingExtendedHandshake};
+
+        let peer = std::env::var("ACE_PEER").expect("set ACE_PEER=ip:port");
+        let ih_hex = std::env::var("ACE_INFOHASH").expect("set ACE_INFOHASH=40hex");
+        let mut ih = [0u8; 20];
+        ih.copy_from_slice(&hex::decode(ih_hex).unwrap());
+
+        let mut session = connect(&peer)
+            .await
+            .unwrap()
+            .with_timeout(Duration::from_secs(10));
+        session
+            .perform_handshake(ih, ace_wire::handshake::random_peer_id())
+            .await
+            .unwrap();
+        println!("[recon {peer}] handshake accepted");
+
+        // The peer's first message is its extended handshake — read its live window.
+        let first = session.read_message().await.unwrap();
+        let mut their_pos: Option<LivePosition> = None;
+        if let PeerMessage::Extended { ext_id: 0, ref payload } = first {
+            if let Ok(eh) = ExtendedHandshake::parse(payload) {
+                let mi = eh.raw.get(b"mi");
+                let get = |k: &[u8]| mi.and_then(|m| m.get(k)).and_then(|v| v.as_int());
+                println!(
+                    "[recon {peer}] mi: min={:?} max={:?} pos={:?} dist={:?}",
+                    get(b"min_piece"), get(b"max_piece"), get(b"position"),
+                    get(b"distance_from_source"),
+                );
+                if let (Some(min), Some(max), Some(pos)) =
+                    (get(b"min_piece"), get(b"max_piece"), get(b"position"))
+                {
+                    their_pos = Some(LivePosition {
+                        min_piece: min, max_piece: max, position: pos,
+                        distance_from_source: get(b"distance_from_source").unwrap_or(99),
+                    });
+                }
+            }
+        } else {
+            println!("[recon {peer}] first message was not an extended handshake: {first:?}");
+        }
+
+        // Present ourselves as a live participant near the head, then express interest.
+        let ours = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: their_pos,
+        };
+        session.send_extended_handshake(&ours).await.unwrap();
+        session.send(&PeerMessage::Interested).await.unwrap();
+        println!("[recon {peer}] sent our extended handshake + interested");
+
+        // Observe what the peer does: unchoke? bitfield? have? piece?
+        let mut unchoked = false;
+        loop {
+            match session.read_message().await {
+                Ok(msg) => {
+                    match &msg {
+                        PeerMessage::Unchoke => { unchoked = true; println!("[recon {peer}] >>> UNCHOKE"); }
+                        PeerMessage::Bitfield(b) => println!("[recon {peer}] bitfield ({} bytes)", b.len()),
+                        PeerMessage::Have(i) => println!("[recon {peer}] have {i}"),
+                        PeerMessage::Piece { index, begin, block } =>
+                            println!("[recon {peer}] >>> PIECE idx={index} begin={begin} ({} bytes)", block.len()),
+                        other => println!("[recon {peer}] {other:?}"),
+                    }
+                    if unchoked {
+                        if let Some(p) = their_pos {
+                            // Request the first 16 KiB chunk of the live-head piece.
+                            let idx = p.position as u32;
+                            println!("[recon {peer}] requesting piece {idx} [0..16384]");
+                            session.send(&PeerMessage::Request { index: idx, begin: 0, length: 16384 }).await.unwrap();
+                            unchoked = false; // request once; keep reading for the piece
+                        }
+                    }
+                }
+                Err(e) => { println!("[recon {peer}] read ended: {e:?}"); break; }
+            }
+        }
     }
 
     #[tokio::test]
