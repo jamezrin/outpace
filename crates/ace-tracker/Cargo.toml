@@ -1,0 +1,12 @@
+[package]
+name = "ace-tracker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt", "macros", "time"] }
+rand = "0.8"
+
+[dev-dependencies]
+hex = "0.4"
+tokio = { version = "1", features = ["net", "rt", "macros", "time", "rt-multi-thread"] }
