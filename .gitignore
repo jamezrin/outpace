@@ -1,0 +1,6 @@
+# Third-party reference repos and large binary engine artifacts (not ours)
+/references/
+
+# Scratch / build
+/target/
+*.log
