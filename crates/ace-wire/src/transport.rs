@@ -55,6 +55,17 @@ pub struct TransportDescriptor {
 
 type Dec = cbc::Decryptor<aes::Aes128>;
 
+/// Read a required descriptor int that must be strictly positive.
+///
+/// These fields size piece/chunk requests, so a missing field or a negative value
+/// (which would otherwise wrap to a huge `u64`) is a decode error, not a silent 0.
+fn required_positive(raw: &Bencode, key: &[u8]) -> Result<u64> {
+    match raw.get(key).and_then(|v| v.as_int()) {
+        Some(i) if i > 0 => Ok(i as u64),
+        _ => Err(WireError::Invalid("missing or non-positive descriptor field")),
+    }
+}
+
 /// Decode an Acestream transport file using the global protocol key/IV.
 pub fn decode_transport(bytes: &[u8]) -> Result<TransportDescriptor> {
     decode_transport_with_key(bytes, &TRANSPORT_KEY, &TRANSPORT_IV)
@@ -98,17 +109,8 @@ pub fn decode_transport_with_key(
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
 
-    let piece_length = raw
-        .get(b"piece_length")
-        .and_then(|v| v.as_int())
-        .map(|i| i as u64)
-        .unwrap_or(0);
-
-    let chunk_length = raw
-        .get(b"chunk_length")
-        .and_then(|v| v.as_int())
-        .map(|i| i as u64)
-        .unwrap_or(0);
+    let piece_length = required_positive(&raw, b"piece_length")?;
+    let chunk_length = required_positive(&raw, b"chunk_length")?;
 
     let bitrate = raw.get(b"bitrate").and_then(|v| v.as_int());
 
@@ -157,6 +159,44 @@ pub fn decode_transport_with_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+
+    type Enc = cbc::Encryptor<aes::Aes128>;
+
+    /// Wrap raw bencode `plaintext` into a transport file under the global key/IV.
+    fn make_transport(plaintext: &[u8]) -> Vec<u8> {
+        let ct = Enc::new_from_slices(&TRANSPORT_KEY, &TRANSPORT_IV)
+            .unwrap()
+            .encrypt_padded_vec::<Pkcs7>(plaintext);
+        let mut out = b"AceStreamTransport\x00\x02".to_vec();
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    #[test]
+    fn rejects_negative_piece_length() {
+        // A negative bencode int must not be silently cast to a huge u64.
+        let tf = make_transport(b"d12:chunk_lengthi16384e12:piece_lengthi-1ee");
+        assert!(decode_transport(&tf).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_required_length_field() {
+        // piece_length is required to size piece requests; absence is a decode error,
+        // not a silent default of 0.
+        let tf = make_transport(b"d12:chunk_lengthi16384ee");
+        assert!(decode_transport(&tf).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_lengths() {
+        // Sanity check the synthetic-vector helper against the happy path.
+        let tf = make_transport(b"d12:chunk_lengthi16384e4:name2:hi12:piece_lengthi131072ee");
+        let d = decode_transport(&tf).unwrap();
+        assert_eq!(d.piece_length, 131072);
+        assert_eq!(d.chunk_length, 16384);
+        assert_eq!(d.name, "hi");
+    }
 
     #[test]
     fn rejects_short_and_non_magic_input() {
