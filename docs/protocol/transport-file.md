@@ -9,13 +9,40 @@ An Acestream transport file (`*.torrent` in the engine's
 torrent. It is:
 
 ```
-"AceStreamTransport"  (18-byte ASCII magic)
-<2-byte version?>      e.g. 00 02
-<binary body>          serialized TransportDescriptor (packed binary; not bencode,
-                       not zlib — see OPEN below)
+"AceStreamTransport"   (18-byte ASCII magic)
+<2-byte version>        00 02
+<body>                  AES-128-CBC(fixed key/IV) of PKCS#7( bencode(descriptor) )
 ```
 
-Example body start (vector `transport-01.bin`): `00 02 93 a4 be a2 72 88 07 26 …`.
+### Body decoding — RESOLVED (validated, see `notes/13-transport-descriptor.md`)
+```
+plaintext = PKCS7_unpad( AES128_CBC_decrypt(body, KEY, IV) )
+descriptor = bencode_parse(plaintext)          # a single dict
+```
+- **KEY/IV** are 16-byte **fixed global constants** embedded in the engine
+  (`core/src/Crypto.pyx`: `m2_AES_decrypt`/`block_decrypt`). The same pair decrypts
+  all transports → they are effectively protocol constants required for interop.
+  Captured value lives git-ignored at `re/captures/transport_keys.txt` (not committed
+  as raw bytes); it must be embedded in `ace-wire`'s transport decoder to interoperate.
+- Validated: decoding both committed vectors yields well-formed bencode with valid
+  PKCS#7 padding and sensible fields (below).
+
+### Descriptor fields (bencode dict)
+| key | meaning |
+|---|---|
+| `name` | channel/content name |
+| `piece_length` | bytes per piece (e.g. 1048576 or 131072) |
+| `chunk_length` | bytes per chunk (16384 = 16 KiB) |
+| `bitrate`, `quality` | media hints |
+| `authmethod` | `RSA` (live integrity via source signature) |
+| `pubkey` | 124-byte RSA DER public key of the broadcaster |
+| `trackers` | list of `udp://…/announce` tracker URLs |
+| `categories`, `allow_public_trackers`, `permanent` | metadata/flags |
+| `pieces` | **VOD only** — concatenated 20-byte SHA1 piece hashes (see OPEN) |
+
+Validated decode:
+- `transport-01.bin` → name "Synthetic Live Channel 1080 …", `piece_length=1048576`, RSA, 2 trackers, **live (no `pieces`)**.
+- `transport-02.bin` → name "Synthetic Demo Channel", `piece_length=131072`, tracker `udp://t1.torrentstream.org:2710/announce`, **live (no `pieces`)**.
 
 ## Infohash derivation — VALIDATED
 ```
@@ -30,23 +57,29 @@ This matches the Ghidra finding that `TorrentDef.finalize()` computes a SHA1
 (`hash_sha1`) used as the 20-byte infohash (plus secondary `hash_md5`/`hash_crc32`).
 NOTE: this is SHA1 over the **whole wrapped file**, not over a BitTorrent info-dict.
 
-## content_id — PARTIAL / OPEN
+## content_id — PARTIAL
 - The engine maps content_id ⇄ infohash (verified): content_id
   `cid1` → infohash
   `50e93529d3eb46a50506b14464185a15292d6e47`; infohash
   `685edf209ccfdf88977c0d317e1407baca486067` → content_id
   `cid4`.
-- For live broadcasts the content_id is stable while the infohash can rotate, so
-  content_id is almost certainly derived from a field **inside** the transport body
-  (e.g. the broadcaster public key), not from the file hash.
-- `OPEN:` exact content_id algorithm + the inner body field layout (the packed
-  TransportDescriptor after the `00 02` version). Recovering it needs either
-  decoding the binary body or hooking `TorrentDef`/`Transport` getters at runtime.
-- `get_content_id` (HTTP API) resolves it today, so an MVP can rely on the engine-
-  equivalent lookup; native derivation is a later refinement, not a blocker.
+- For live broadcasts the content_id is stable while the infohash rotates, so
+  content_id is almost certainly derived from the broadcaster **`pubkey`** in the
+  descriptor (now decodable — see above). Likely `content_id = SHA1(pubkey)` or a
+  hash of a descriptor subset; to be confirmed against the known pairs.
+- `OPEN:` confirm the exact content_id algorithm from the decoded `pubkey`.
+  `get_content_id` (HTTP API) resolves it today, so it is not an MVP blocker.
+
+## OPEN — VOD piece-hash list
+Both available fixtures are **live** (no `pieces`). A **VOD** transport is expected
+to carry `pieces` = a concatenated list of 20-byte SHA1 piece hashes (standard BT
+piece integrity). The decoder already surfaces `pieces` when present; this just needs
+a VOD fixture to confirm the exact encoding.
 
 ## Implementation note
-`ace-wire` can compute/verify the infohash immediately (SHA1 of the transport
-bytes). Parsing the inner descriptor (piece length, file list, trackers, live
-params) requires the body layout — tracked as OPEN and best recovered alongside
-Task 9/Phase-1 work.
+`ace-wire` can: (1) compute/verify infohash = SHA1(file); (2) **decode the descriptor**
+via AES-128-CBC(fixed key/IV) → PKCS#7 → bencode, exposing `piece_length`,
+`chunk_length`, `trackers`, `pubkey`, and (VOD) `pieces`. The AES key/IV must be
+embedded as protocol constants. Live integrity uses the RSA `pubkey` + per-piece
+source signatures; live piece selection uses the peer `mi` window (see
+`notes/11-live-extended-handshake.md`).
