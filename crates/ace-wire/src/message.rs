@@ -1,6 +1,15 @@
 //! BitTorrent peer-message framing: <u32 be length><u8 id><payload>; len 0 = keep-alive.
 use crate::{Result, WireError};
 
+/// Maximum accepted peer-frame body length (2 MiB).
+///
+/// The wire format trusts a 32-bit length prefix, so without a cap a hostile peer
+/// could advertise a ~4 GiB frame and trickle bytes to force unbounded buffering.
+/// 2 MiB comfortably covers any legitimate message — a full 1 MiB live piece plus
+/// headers, large bitfields, and BEP-10 extended handshakes — while bounding the
+/// per-connection memory a single peer can pin.
+pub const MAX_FRAME_LEN: usize = 2 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessage {
     KeepAlive,
@@ -53,6 +62,9 @@ impl PeerMessage {
     pub fn decode(buf: &[u8]) -> Result<Option<(PeerMessage, usize)>> {
         if buf.len() < 4 { return Ok(None); }
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len > MAX_FRAME_LEN {
+            return Err(WireError::Invalid("frame too large"));
+        }
         let total = 4 + len;
         if buf.len() < total { return Ok(None); }
         let body = &buf[4..total];
@@ -112,6 +124,27 @@ mod tests {
         let enc = m.encode();
         assert_eq!(&enc[..6], &[0, 0, 0, 4, 20, 0]); // len=4, id=20, ext_id=0
         assert_eq!(PeerMessage::decode(&enc).unwrap(), Some((m, enc.len())));
+    }
+
+    #[test]
+    fn rejects_oversized_frame_length() {
+        // A hostile peer advertises a frame far larger than any legitimate message.
+        // decode must reject it on the length prefix alone, before buffering a body.
+        let huge = (MAX_FRAME_LEN as u32) + 1;
+        let buf = huge.to_be_bytes();
+        assert!(matches!(
+            PeerMessage::decode(&buf),
+            Err(WireError::Invalid("frame too large"))
+        ));
+    }
+
+    #[test]
+    fn accepts_frame_at_max_length_boundary() {
+        // A frame whose length is exactly MAX_FRAME_LEN must not be rejected by the cap.
+        // (Body is absent here, so decode reports "need more bytes", not an error.)
+        let at_max = MAX_FRAME_LEN as u32;
+        let buf = at_max.to_be_bytes();
+        assert_eq!(PeerMessage::decode(&buf).unwrap(), None);
     }
 
     #[test]
