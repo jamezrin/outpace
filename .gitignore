@@ -4,3 +4,6 @@
 # Scratch / build
 /target/
 *.log
+
+# Phase-0 reverse-engineering working artifacts (raw/derived, not committed)
+/re/
