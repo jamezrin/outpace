@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 sha1 = "0.10"
 rand = "0.8"
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
 
 [dev-dependencies]
 hex = "0.4"

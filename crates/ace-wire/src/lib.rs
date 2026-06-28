@@ -6,6 +6,7 @@ pub mod extended;
 pub mod handshake;
 pub mod infohash;
 pub mod message;
+pub mod transport;
 
 /// Errors produced while decoding untrusted wire bytes.
 #[derive(Debug, PartialEq, Eq)]

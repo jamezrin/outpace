@@ -1,5 +1,6 @@
 use ace_wire::infohash::{infohash_of_transport, is_transport_file};
 use ace_wire::handshake::{Handshake, PSTR};
+use ace_wire::transport::{decode_transport, TransportDescriptor};
 use std::path::PathBuf;
 
 fn vec_bytes(rel: &str) -> Vec<u8> {
@@ -46,4 +47,32 @@ fn rejects_wrong_pstr() {
     let mut bytes = vec_bytes("messages/encrypter-handshake-peer-in.bin");
     bytes[1] = b'X'; // corrupt pstr
     assert!(Handshake::decode(&bytes).is_err());
+}
+
+#[test]
+fn decodes_live_transport_syntheticchannel() {
+    let d: TransportDescriptor = decode_transport(&vec_bytes("transport-01.bin")).unwrap();
+    assert_eq!(d.piece_length, 1048576);
+    assert_eq!(d.chunk_length, 16384);
+    assert!(d.is_live);                 // live: no static piece hashes
+    assert!(d.pieces.is_empty());
+    assert!(d.name.starts_with("Synthetic Live Channel 1080"));
+    assert_eq!(d.pubkey.len(), 124);    // RSA DER
+    assert_eq!(d.trackers.len(), 1);
+    assert!(d.trackers[0].contains("tracker1.invalid"));
+}
+
+#[test]
+fn decodes_live_transport_promo() {
+    let d = decode_transport(&vec_bytes("transport-02.bin")).unwrap();
+    assert_eq!(d.piece_length, 131072);
+    assert_eq!(d.chunk_length, 16384);
+    assert!(d.is_live);
+    assert_eq!(d.name, "Synthetic Demo Channel");
+    assert_eq!(d.trackers, vec!["udp://t1.torrentstream.org:2710/announce".to_string()]);
+}
+
+#[test]
+fn rejects_non_transport() {
+    assert!(decode_transport(b"not a transport file").is_err());
 }
