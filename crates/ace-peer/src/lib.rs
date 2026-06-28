@@ -9,6 +9,8 @@ pub enum PeerError {
     InfohashMismatch,
     /// Connection closed before a full structure arrived.
     Closed,
+    /// A peer I/O operation exceeded its configured timeout.
+    Timeout,
     /// Underlying I/O.
     Io(std::io::Error),
 }
