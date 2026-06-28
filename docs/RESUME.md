@@ -45,17 +45,28 @@ Crates: `crates/{ace-wire,ace-tracker,ace-peer}`. Workspace `Cargo.toml` at root
 - **No account/identity needed** for the public swarm. Public content is
   `is_encrypted=0` (no DRM); the AES `Encrypter` is only for premium (out of scope).
 
-## THE NEXT STEP (Phase 3.2 — piece download)
-The blocker to "play in VLC": peers accept our handshake but **don't unchoke a fresh,
-unproven leecher** (the connection closes after the extended handshake). So:
-1. **Recon:** extend `ace-peer` past the handshake — send `interested` + the Acestream
-   **live-extension** messages, and find what makes a peer/source serve pieces near the
-   live head. Likely target **source/support nodes** (low `distance_from_source`).
-2. Implement the live piece loop (request within `[min_piece, max_piece]` from the
-   `mi` window), then `ace-swarm` (multi-peer) → `ace-media` (MPEG-TS) → `ace-engine`
-   (`:6878` `/ace/getstream`). Verify by playing in VLC.
-This step is RE-ish (a live experiment), like the handshake/transport spikes — not pure
-clean coding. A **VOD acestream id** would also help (gives a static piece-hash list to
+## THE NEXT STEP (Phase 3.2 — piece download) — BLOCKER LOCATED
+The blocker to "play in VLC" is now **precisely characterized** (see
+`docs/protocol/notes/14-live-unchoke-recon.md`). `ace-peer` can now build + send its own
+BEP-10 extended handshake (`ace_wire::extended::OutgoingExtendedHandshake`,
+`PeerSession::send_extended_handshake`) and a recon harness (`live_recon_unchoke`,
+`#[ignore]`d, with env knobs) drove the full exchange against live peers.
+
+**Finding:** live peers accept our 66-byte handshake and send their extended handshake,
+then **insta-close (~0.1 s) the moment we send ours** — regardless of `mi`/`interested`/
+distance, and even with the full key set if `node_id`/`signature` are dummies. The same
+peers serve the official engine. So the gate is a **valid node identity**: `node_id`
+(32 B) + `signature` (64 B) — Ed25519-shaped. We must mint/sign a real one.
+
+1. **Crack the node identity (RE):** decompile **`re/engine/lib/acestreamengine/live.so`**
+   (the live-handshake module; NOT in the prior Ghidra pass). It links RSA primitives
+   (`rsa_sign_data`, `rsa_verify_data_pubkeyobj`); determine what the 64-byte `signature`
+   covers and whether the identity is self-generated per session (so we can forge our own).
+2. Then: live piece loop (request within `[min_piece, max_piece]`), `ace-swarm` →
+   `ace-media` (MPEG-TS) → `ace-engine` (`:6878` `/ace/getstream`). Verify in VLC.
+
+This step is RE-ish (a live experiment + binary RE), like the handshake/transport spikes —
+not clean coding. A **VOD acestream id** would also help (static piece-hash list to
 validate against; we've only had live fixtures).
 
 ## Environment & gotchas (HARD-WON — don't relearn these)

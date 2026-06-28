@@ -263,15 +263,28 @@ mod tests {
             println!("[recon {peer}] first message was not an extended handshake: {first:?}");
         }
 
-        // Present ourselves as a live participant near the head, then express interest.
-        let ours = OutgoingExtendedHandshake {
-            ace_metadata_version: 1,
-            ut_metadata_id: 2,
-            mi: their_pos,
+        // Experiment knobs (env): ACE_NO_MI=1 sends no mi; ACE_DIST=N overrides the
+        // advertised distance_from_source; ACE_NO_INTERESTED=1 holds without interest.
+        let env = |k: &str| std::env::var(k).ok();
+        let mi = if env("ACE_NO_MI").is_some() {
+            None
+        } else {
+            their_pos.map(|mut p| {
+                if let Some(d) = env("ACE_DIST").and_then(|v| v.parse().ok()) {
+                    p.distance_from_source = d;
+                }
+                p
+            })
         };
+        let has_mi = mi.is_some();
+        let ours = OutgoingExtendedHandshake { ace_metadata_version: 1, ut_metadata_id: 2, mi };
         session.send_extended_handshake(&ours).await.unwrap();
-        session.send(&PeerMessage::Interested).await.unwrap();
-        println!("[recon {peer}] sent our extended handshake + interested");
+        println!("[recon {peer}] sent our extended handshake (mi={})",
+                 if has_mi { "yes" } else { "no" });
+        if env("ACE_NO_INTERESTED").is_none() {
+            session.send(&PeerMessage::Interested).await.unwrap();
+            println!("[recon {peer}] sent interested");
+        }
 
         // Observe what the peer does: unchoke? bitfield? have? piece?
         let mut unchoked = false;
