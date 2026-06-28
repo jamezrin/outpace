@@ -1,5 +1,12 @@
 # Phase 3 gate — the transport body is encrypted/obfuscated
 
+> **RESOLVED — see `13-transport-descriptor.md`.** The body is **AES-128-CBC**
+> with a **fixed global key + fixed IV**, then PKCS#7 + **bencode**. Cracked via
+> Frida (pycryptodome `AESNI_start_operation`/`CBC_start_operation`/`CBC_decrypt`
+> hooks) and validated by decoding both vectors offline. The notes below are the
+> historical pre-crack analysis.
+
+
 ## What we know
 - A transport file = `"AceStreamTransport"` (18B) + version `00 02` + **body**.
 - infohash = SHA1(whole file) — already validated. The body's *content* is NOT
