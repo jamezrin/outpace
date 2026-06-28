@@ -72,18 +72,18 @@ impl PeerMessage {
         let id = body[0];
         let p = &body[1..];
         let msg = match id {
-            0 => PeerMessage::Choke,
-            1 => PeerMessage::Unchoke,
-            2 => PeerMessage::Interested,
-            3 => PeerMessage::NotInterested,
-            4 => PeerMessage::Have(be32(p, 0)?),
+            0 => { exact(p, 0)?; PeerMessage::Choke }
+            1 => { exact(p, 0)?; PeerMessage::Unchoke }
+            2 => { exact(p, 0)?; PeerMessage::Interested }
+            3 => { exact(p, 0)?; PeerMessage::NotInterested }
+            4 => { exact(p, 4)?; PeerMessage::Have(be32(p, 0)?) }
             5 => PeerMessage::Bitfield(p.to_vec()),
-            6 => PeerMessage::Request { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? },
+            6 => { exact(p, 12)?; PeerMessage::Request { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? } }
             7 => {
                 if p.len() < 8 { return Err(WireError::Invalid("short piece")); }
                 PeerMessage::Piece { index: be32(p, 0)?, begin: be32(p, 4)?, block: p[8..].to_vec() }
             }
-            8 => PeerMessage::Cancel { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? },
+            8 => { exact(p, 12)?; PeerMessage::Cancel { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? } }
             20 => {
                 if p.is_empty() { return Err(WireError::Invalid("short extended")); }
                 PeerMessage::Extended { ext_id: p[0], payload: p[1..].to_vec() }
@@ -92,6 +92,11 @@ impl PeerMessage {
         };
         Ok(Some((msg, total)))
     }
+}
+
+/// Require a fixed-size message payload to be exactly `n` bytes.
+fn exact(p: &[u8], n: usize) -> Result<()> {
+    if p.len() == n { Ok(()) } else { Err(WireError::Invalid("bad message length")) }
 }
 
 fn be32(p: &[u8], off: usize) -> Result<u32> {
@@ -145,6 +150,40 @@ mod tests {
         let at_max = MAX_FRAME_LEN as u32;
         let buf = at_max.to_be_bytes();
         assert_eq!(PeerMessage::decode(&buf).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_empty_message_with_trailing_payload() {
+        // choke/unchoke/interested/not-interested carry zero payload bytes.
+        // len=2 => id + one stray byte must be rejected, not silently accepted.
+        let buf = [0, 0, 0, 2, 0, 0xFF]; // id=0 (choke) + trailing 0xFF
+        assert!(matches!(
+            PeerMessage::decode(&buf),
+            Err(WireError::Invalid("bad message length"))
+        ));
+    }
+
+    #[test]
+    fn rejects_have_with_wrong_payload_length() {
+        // have (id=4) must carry exactly 4 payload bytes; here it has 5.
+        let buf = [0, 0, 0, 6, 4, 0, 0, 0, 1, 0xFF];
+        assert!(matches!(
+            PeerMessage::decode(&buf),
+            Err(WireError::Invalid("bad message length"))
+        ));
+    }
+
+    #[test]
+    fn rejects_request_with_trailing_payload() {
+        // request (id=6) must carry exactly 12 payload bytes; here it has 13.
+        let mut body = vec![6];
+        body.extend_from_slice(&[0u8; 13]);
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(&body);
+        assert!(matches!(
+            PeerMessage::decode(&buf),
+            Err(WireError::Invalid("bad message length"))
+        ));
     }
 
     #[test]
