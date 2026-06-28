@@ -28,10 +28,23 @@ pub fn parse_connect_response(buf: &[u8], txid: u32) -> Result<u64> {
     Ok(u64::from_be_bytes(c))
 }
 
+/// BEP-15 transfer counters advertised in an announce.
+///
+/// Caller-provided so the client reports its real state instead of a hardcoded
+/// value. The [`Default`] (all zeros) matches the value validated against the live
+/// Acestream tracker during Phase 2 — note `left = 0` advertises "complete" in
+/// BEP-15 terms, so revisit once real piece accounting exists.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferState {
+    pub downloaded: u64,
+    pub left: u64,
+    pub uploaded: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_announce_request(
     connection_id: u64, txid: u32, infohash: &[u8; 20], peer_id: &[u8; 20],
-    port: u16, num_want: i32,
+    port: u16, num_want: i32, transfer: &TransferState,
 ) -> Vec<u8> {
     let mut b = Vec::with_capacity(98);
     b.extend_from_slice(&connection_id.to_be_bytes());
@@ -39,9 +52,9 @@ pub fn build_announce_request(
     b.extend_from_slice(&txid.to_be_bytes());
     b.extend_from_slice(infohash);
     b.extend_from_slice(peer_id);
-    b.extend_from_slice(&0u64.to_be_bytes()); // downloaded
-    b.extend_from_slice(&0u64.to_be_bytes()); // left
-    b.extend_from_slice(&0u64.to_be_bytes()); // uploaded
+    b.extend_from_slice(&transfer.downloaded.to_be_bytes());
+    b.extend_from_slice(&transfer.left.to_be_bytes());
+    b.extend_from_slice(&transfer.uploaded.to_be_bytes());
     b.extend_from_slice(&EVENT_STARTED.to_be_bytes());
     b.extend_from_slice(&0u32.to_be_bytes()); // ip (default)
     b.extend_from_slice(&0u32.to_be_bytes()); // key
@@ -102,13 +115,23 @@ mod tests {
     #[test]
     fn announce_request_layout() {
         let req = build_announce_request(0x0102_0304_0506_0708, 0x1111_2222,
-            &[0xAB; 20], &[0xCD; 20], 6881, 50);
+            &[0xAB; 20], &[0xCD; 20], 6881, 50, &TransferState::default());
         assert_eq!(req.len(), 98);
         assert_eq!(&req[0..8], &0x0102_0304_0506_0708u64.to_be_bytes()); // conn id
         assert_eq!(&req[8..12], &1u32.to_be_bytes());                    // action announce
         assert_eq!(&req[16..36], &[0xABu8; 20]);                         // infohash
         assert_eq!(&req[36..56], &[0xCDu8; 20]);                         // peer id
         assert_eq!(&req[96..98], &6881u16.to_be_bytes());                // port
+    }
+
+    #[test]
+    fn announce_request_encodes_caller_transfer_counters() {
+        let t = TransferState { downloaded: 0x1122, left: 0x3344, uploaded: 0x5566 };
+        let req = build_announce_request(0x0102_0304_0506_0708, 0x1111_2222,
+            &[0xAB; 20], &[0xCD; 20], 6881, 50, &t);
+        assert_eq!(&req[56..64], &0x1122u64.to_be_bytes()); // downloaded
+        assert_eq!(&req[64..72], &0x3344u64.to_be_bytes()); // left
+        assert_eq!(&req[72..80], &0x5566u64.to_be_bytes()); // uploaded
     }
 
     #[test]
