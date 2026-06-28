@@ -86,7 +86,7 @@ pub fn decode_transport_with_key(
 
     // 2. Body = skip 18-byte magic + 2-byte version.
     let body = &bytes[20..];
-    if body.is_empty() || body.len() % 16 != 0 {
+    if body.is_empty() || !body.len().is_multiple_of(16) {
         return Err(WireError::Invalid("bad transport body length"));
     }
 
@@ -131,7 +131,7 @@ pub fn decode_transport_with_key(
 
     // 6. VOD pieces: concatenated 20-byte SHA-1 hashes; absent on live streams.
     let pieces: Vec<[u8; 20]> = match raw.get(b"pieces") {
-        Some(Bencode::Bytes(p)) if p.len() % 20 == 0 && !p.is_empty() => p
+        Some(Bencode::Bytes(p)) if p.len().is_multiple_of(20) && !p.is_empty() => p
             .chunks_exact(20)
             .map(|c| {
                 let mut arr = [0u8; 20];
