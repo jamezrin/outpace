@@ -53,6 +53,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     }
 }
 
+use tokio::net::TcpStream;
+
+/// Connect a TCP peer session to `addr` (e.g. "1.2.3.4:8621").
+pub async fn connect(addr: &str) -> Result<PeerSession<TcpStream>> {
+    let stream = TcpStream::connect(addr).await?;
+    Ok(PeerSession::new(stream))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +97,26 @@ mod tests {
             other => panic!("unexpected message: {other:?}"),
         }
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // live network: connect to a real Acestream peer and exchange handshakes
+    async fn live_interop_handshake() {
+        // Provide a current peer + infohash via env, since live peers churn:
+        //   ACE_PEER=82.213.234.240:8623 ACE_INFOHASH=47eda3..afa022 cargo test -p ace-peer live_interop -- --ignored --nocapture
+        let peer = std::env::var("ACE_PEER").expect("set ACE_PEER=ip:port");
+        let ih_hex = std::env::var("ACE_INFOHASH").expect("set ACE_INFOHASH=40hex");
+        let mut ih = [0u8; 20];
+        ih.copy_from_slice(&hex::decode(ih_hex).unwrap());
+        let mut session = connect(&peer).await.unwrap();
+        let hs = session
+            .perform_handshake(ih, ace_wire::handshake::random_peer_id())
+            .await
+            .unwrap();
+        assert_eq!(hs.infohash, ih);
+        // Read the next message the peer sends (typically the extended handshake).
+        let msg = session.read_message().await.unwrap();
+        println!("live peer accepted handshake; first message: {msg:?}");
     }
 
     #[tokio::test]
