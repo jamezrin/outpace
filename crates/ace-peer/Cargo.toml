@@ -1,0 +1,12 @@
+[package]
+name = "ace-peer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ace-wire = { path = "../ace-wire" }
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
+
+[dev-dependencies]
+hex = "0.4"
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time", "rt-multi-thread"] }
