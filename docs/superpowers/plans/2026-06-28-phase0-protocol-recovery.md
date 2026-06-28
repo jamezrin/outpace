@@ -129,14 +129,14 @@ WORKDIR /app
 COPY engine/ /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt frida-tools
 EXPOSE 6878 8621
-# --bind-all so we can reach the HTTP API from the host; verbose P2P logging.
-CMD ["python3", "/app/lib/acestreamengine/__init__.py", "--client-console", \
-     "--bind-all", "--log-stderr", "--log-stderr-level", "debug", \
-     "--log-modules", "root:D"]
+# The tarball ships a `start-engine` launcher at its root (confirmed: this is how
+# acestream-http-proxy invokes it). --bind-all exposes the HTTP API; verbose logs.
+CMD ["/app/start-engine", "--client-console", "--bind-all", \
+     "--log-stderr", "--log-stderr-level", "debug", "--log-modules", "root:D"]
 ```
-Note: the exact entrypoint may be a `start-engine` script in the tarball; in Step 3
-confirm the real invocation by listing `re/engine` and adjust `CMD` if a launcher
-script exists. The flags come from `engine-command-line-options.md`.
+Note: flags come from `engine-command-line-options.md`. `start-engine` is a shell
+launcher that sets `LD_LIBRARY_PATH` to the bundled `lib/` and execs the engine;
+ensure it is executable after `COPY` (`RUN chmod +x /app/start-engine`).
 
 - [ ] **Step 2: Write the compose file with a tcpdump sidecar sharing the netns**
 
