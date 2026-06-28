@@ -148,6 +148,20 @@ style lint:
 - `crates/ace-wire/src/transport.rs:78`: replace `body.len() % 16 != 0` with
   `!body.len().is_multiple_of(16)`.
 
+## Resolution (2026-06-29)
+
+All findings verified against the code and addressed via TDD; `cargo test` and
+`cargo clippy --all-targets --all-features -- -D warnings` are both clean.
+
+| # | Finding | Commit | Notes |
+|---|---------|--------|-------|
+| 1 | Unbounded frame buffering | `feb8f86` | `MAX_FRAME_LEN` = 2 MiB, rejected on the length prefix. |
+| 5 | No peer I/O timeouts | `7cee478` | `DEFAULT_PEER_TIMEOUT` (20s) wraps connect/handshake/send/read; `PeerSession::with_timeout`. |
+| 2 | Trailing bytes on fixed-size msgs | `36771c5` | Exact payload-length checks for choke/unchoke/interested/not-interested/have/request/cancel. |
+| 3 | Unvalidated descriptor numerics | `311fb21` | `piece_length`/`chunk_length` now required and strictly positive. |
+| 4 | Tracker `left = 0` | `c6c66b3` | Counters caller-provided via `TransferState`; all-zero default kept (validated live) with a doc caveat. |
+| — | Clippy `manual_is_multiple_of` | `ca1913f` | Fixed both occurrences (the review only spotted the first). |
+
 ## Suggested Fix Order
 
 1. Add max peer frame size enforcement and tests for malicious oversized length
