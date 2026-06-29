@@ -62,6 +62,28 @@ so the startup signing is captured with its `m`/`mlen`. Engine argv (PID 1 `star
 --log-modules root:D`. Confirm whether re-signs are periodic (hook + idle-wait several
 minutes) as a simpler alternative to spawn-gating.
 
+## CONCLUSIVE: the signature is computed once at engine startup (engine-global)
+A 400 s window with **hooks definitively installed** (10 `[hooked]` markers, per-module
+`getExportByName` from `_sodium.abi3.so` + `libcrypto.so.3`) plus fresh stream re-arms and
+12 handshake-triggering connects produced **zero** `crypto_sign*`/`EVP_*`/keypair calls.
+So the node signature is **not** recomputed during normal operation. It is computed **once
+when the node identity is established at engine startup** (it's an engine-global identity,
+not per-handshake or per-stream); peers always receive that cached value. The earlier
+"signature changed with `ts`" was across the **engine restarts** I performed (each restart
+= a fresh startup sign with a new `ts`), not periodic re-signing.
+
+→ Definitive capture procedure (deliberately disruptive — needs the engine's ports free):
+1. Stop the running engine (`PID 9`) so ports 6878/8621 are free.
+2. `frida.spawn(["/app/acestreamengine","--client-console","--bind-all", ...],
+   env={"LD_LIBRARY_PATH":"/app/lib", PATH, HOME, LANG})` — driver in
+   `scratchpad/spawn_driver2.py`; **lazy** per-module hook installer in
+   `scratchpad/hook_lazy.js` (modules load mid-startup). `LD_LIBRARY_PATH=/app/lib` is
+   required (start-engine sets only that).
+3. `frida.resume`, let it boot fully; the startup node-identity sign fires →
+   `crypto_sign`/`EVP_DigestSign` `m`/`mlen` = **the exact preimage**.
+   (A port-conflicting spawn alongside PID 9 does NOT reach the sign — confirmed twice.)
+Restore afterwards with `docker restart sandbox-acestream-1`.
+
 ## The remaining task (two viable routes)
 1. **Read the code (deterministic).** Trace `LiveSourceAuth`'s message assembly: the
    method that builds the bytes passed to the static Ed25519 sign. Obstacle: Cython

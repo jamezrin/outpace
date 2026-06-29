@@ -70,10 +70,14 @@ so we can mint our own keypair — no engine key needed. Signer = **`LiveSourceA
    matched / none fired during handshake builds. `live.so` has **no** ed25519/sha512
    constants. Conclusion: the signature is computed **at engine startup / on a timer and
    cached** (peers just get the cached value), so every attach-after-boot hook missed it.
-   **Recommended: frida SPAWN-GATE** the engine — install the `_sodium crypto_sign*` +
-   OpenSSL `EVP_DigestSign`/`ED25519_sign` hooks *before* it runs (`frida -f /app/acestreamengine
-   <argv>` in the container, or hook+idle several minutes to catch a periodic re-sign) and
-   read the message (`m`/`mlen`). Ghidra scripts + decompiled `sign` in `tools/ghidra/`.
+   CONCLUSIVE (note 16): a 400s window with hooks *definitively* installed + triggers caught
+   ZERO crypto calls — the signature is computed **once at engine startup** (engine-global
+   identity); it only changed across my restarts. **Capture procedure (disruptive):** stop
+   the running engine, then `frida.spawn` a clean instance with `env LD_LIBRARY_PATH=/app/lib`
+   and the lazy per-module hook (`scratchpad/spawn_driver2.py` + `hook_lazy.js`), resume, and
+   read `crypto_sign`/`EVP_DigestSign` `m`/`mlen` at startup = the preimage. (A port-conflicting
+   spawn alongside the running engine does NOT reach the sign — confirmed.) Ghidra scripts in
+   `tools/ghidra/`.
 2. **Mint + sign:** new `ace-identity` (Ed25519) + extend `OutgoingExtendedHandshake` to
    carry `node_id`/`signature`/`ts`/`v`/`pv`/`p`/`platform`/`nt`; re-run `live_recon_unchoke`
    → expect acceptance + unchoke.
