@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 sha1 = "0.10"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }

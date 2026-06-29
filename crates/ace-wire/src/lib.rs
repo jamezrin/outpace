@@ -5,6 +5,7 @@ pub mod bencode;
 pub mod extended;
 pub mod handshake;
 pub mod infohash;
+pub mod identity;
 pub mod live;
 pub mod reassembly;
 pub mod message;
