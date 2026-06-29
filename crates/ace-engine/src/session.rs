@@ -57,6 +57,12 @@ impl StreamSession {
         self.subscribers.load(Ordering::SeqCst)
     }
 
+    /// A receiver that does NOT count as a client (used by internal consumers like the HLS
+    /// packager, which must not pin the session open against idle teardown).
+    pub fn raw_receiver(&self) -> broadcast::Receiver<Bytes> {
+        self.tx.subscribe()
+    }
+
     pub async fn stats(&self) -> SourceStats {
         self.stats.lock().await.clone()
     }

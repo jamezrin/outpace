@@ -1,6 +1,7 @@
 //! Registry of live sessions keyed by `(network, id)`. One shared session per key; lazy
 //! start via the provider; teardown after the last subscriber leaves + grace.
 
+use crate::hls::HlsPackager;
 use crate::provider::{ProviderError, ProviderRegistry};
 use crate::session::StreamSession;
 use std::collections::HashMap;
@@ -11,6 +12,7 @@ use tokio::sync::Mutex;
 pub struct StreamManager {
     registry: ProviderRegistry,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
+    packagers: Mutex<HashMap<(String, String), Arc<HlsPackager>>>,
     buffer: usize,
     grace: Duration,
 }
@@ -20,6 +22,7 @@ impl StreamManager {
         Arc::new(StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
+            packagers: Mutex::new(HashMap::new()),
             buffer: 256,
             grace: Duration::from_secs(30),
         })
@@ -52,6 +55,18 @@ impl StreamManager {
         self.sessions.lock().await.get(&(network.to_string(), id.to_string())).cloned()
     }
 
+    /// Get (or lazily start) the HLS packager for `(network, id)`, starting the session too.
+    pub async fn get_or_start_hls(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+    ) -> Result<Arc<HlsPackager>, ProviderError> {
+        let session = self.get_or_start(network, id).await?;
+        let key = (network.to_string(), id.to_string());
+        let mut map = self.packagers.lock().await;
+        Ok(map.entry(key).or_insert_with(|| HlsPackager::start(&session)).clone())
+    }
+
     /// Active sessions as `(network, id, subscriber_count)`.
     pub async fn list(&self) -> Vec<(String, String, u64)> {
         self.sessions
@@ -70,6 +85,8 @@ impl StreamManager {
                 tokio::time::sleep(me.grace).await;
                 let mut map = me.sessions.lock().await;
                 map.retain(|_, s| s.subscriber_count() > 0);
+                // Drop packagers whose session is gone (their background task ends on close).
+                me.packagers.lock().await.retain(|k, _| map.contains_key(k));
             }
         });
     }

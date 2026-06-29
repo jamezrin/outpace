@@ -24,6 +24,7 @@ pub fn router(state: AppState) -> Router {
         .route("/streams", get(list_streams))
         .route("/streams/:network/:file", get(stream_file))
         .route("/streams/:network/:id/status", get(stream_status))
+        .route("/streams/:network/:id/seg/:seg", get(stream_segment))
         .with_state(state)
 }
 
@@ -62,8 +63,33 @@ async fn stream_status(State(s): State<AppState>, Path((network, id)): Path<(Str
     }
 }
 
-/// `GET /streams/{network}/{id}.ts` — continuous MPEG-TS. (`.m3u8` added in a later task.)
+/// `GET /streams/{network}/{id}/seg/{n}.ts` — a retained HLS segment.
+async fn stream_segment(State(s): State<AppState>, Path((network, id, seg)): Path<(String, String, String)>) -> Response {
+    let Some(seq) = seg.strip_suffix(".ts").and_then(|n| n.parse::<u64>().ok()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let pkg = match s.manager.get_or_start_hls(&network, &id).await {
+        Ok(p) => p,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match pkg.segment(seq) {
+        Some(bytes) => ([(header::CONTENT_TYPE, "video/mp2t")], bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `GET /streams/{network}/{id}.ts` (continuous MPEG-TS) or `.m3u8` (live HLS playlist).
 async fn stream_file(State(s): State<AppState>, Path((network, file)): Path<(String, String)>) -> Response {
+    if let Some(id) = file.strip_suffix(".m3u8") {
+        return match s.manager.get_or_start_hls(&network, id).await {
+            Ok(pkg) => (
+                [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+                pkg.playlist(&network, id),
+            )
+                .into_response(),
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     let Some(id) = file.strip_suffix(".ts") else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -178,6 +204,18 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         let txt = String::from_utf8_lossy(&body);
         assert!(txt.contains("\"clients\"") && txt.contains("\"peers\""));
+    }
+
+    #[tokio::test]
+    async fn m3u8_serves_hls_playlist() {
+        let resp = router(state())
+            .oneshot(Request::get("/streams/test/chan.m3u8").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/vnd.apple.mpegurl");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).starts_with("#EXTM3U"));
     }
 
     #[tokio::test]
