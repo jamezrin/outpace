@@ -47,6 +47,11 @@ impl StreamManager {
         Ok(map.entry(key).or_insert(session).clone())
     }
 
+    /// Peek at an already-running session without starting one.
+    pub async fn get(&self, network: &str, id: &str) -> Option<Arc<StreamSession>> {
+        self.sessions.lock().await.get(&(network.to_string(), id.to_string())).cloned()
+    }
+
     /// Active sessions as `(network, id, subscriber_count)`.
     pub async fn list(&self) -> Vec<(String, String, u64)> {
         self.sessions

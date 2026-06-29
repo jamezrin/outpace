@@ -21,12 +21,45 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/networks", get(networks))
+        .route("/streams", get(list_streams))
         .route("/streams/:network/:file", get(stream_file))
+        .route("/streams/:network/:id/status", get(stream_status))
         .with_state(state)
 }
 
 async fn networks(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({ "networks": s.networks }))
+}
+
+/// `GET /streams` — active sessions and their client counts.
+async fn list_streams(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let streams: Vec<_> = s
+        .manager
+        .list()
+        .await
+        .into_iter()
+        .map(|(network, id, clients)| json!({ "network": network, "id": id, "clients": clients }))
+        .collect();
+    Json(json!({ "streams": streams }))
+}
+
+/// `GET /streams/{network}/{id}/status` — stats for a running session (404 if not active).
+async fn stream_status(State(s): State<AppState>, Path((network, id)): Path<(String, String)>) -> Response {
+    match s.manager.get(&network, &id).await {
+        Some(session) => {
+            let stats = session.stats().await;
+            Json(json!({
+                "network": network,
+                "id": id,
+                "clients": session.subscriber_count(),
+                "peers": stats.peers,
+                "bitrate": stats.bitrate,
+                "buffer_ms": stats.buffer_ms,
+            }))
+            .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// `GET /streams/{network}/{id}.ts` — continuous MPEG-TS. (`.m3u8` added in a later task.)
@@ -122,5 +155,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn status_404_until_started_then_reports() {
+        let st = state();
+        let app = router(st.clone());
+        // Not started yet.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/streams/test/chan/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Start it, then status reports it with clean keys.
+        st.manager.get_or_start("test", "chan").await.unwrap();
+        let resp = app
+            .oneshot(Request::get("/streams/test/chan/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let txt = String::from_utf8_lossy(&body);
+        assert!(txt.contains("\"clients\"") && txt.contains("\"peers\""));
+    }
+
+    #[tokio::test]
+    async fn list_streams_reports_active() {
+        let st = state();
+        st.manager.get_or_start("test", "abc").await.unwrap();
+        let resp = router(st)
+            .oneshot(Request::get("/streams").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("\"abc\""));
     }
 }
