@@ -90,6 +90,17 @@ The engine listens for peers on **TCP 8621** (container IP `172.23.0.2`): connec
 with our client + the current infohash makes it reply as a peer with its full signed
 handshake — the ground-truth probe used to crack the above.
 
+**Identity gate is now PASSED (notes 17–18).** Hooking the engine's
+`crypto_sign_verify_detached` while our signed client connects shows `ret=0` with
+`pk = our node_id` and `m = the digest the engine recomputed` — the official engine accepts
+our minted identity. The engine-as-peer still closes us afterward, but that is **not**
+identity rejection: in the current sandbox the channel is `status=prebuf, downloaded=0`
+(the engine itself is pulling no data), so there is nothing to transact. **Validating live
+unchoke + piece flow needs a live channel that is actually delivering data** (and likely
+real swarm peers reachable from the host with WARP off) — an environmental gate, not a code
+one. A VOD acestream id (static piece-hash list) would let the piece loop be validated
+offline.
+
 This step is RE-ish (a live experiment + binary RE), like the handshake/transport spikes —
 not clean coding. A **VOD acestream id** would also help (static piece-hash list to
 validate against; we've only had live fixtures).
