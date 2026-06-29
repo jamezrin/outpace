@@ -35,17 +35,26 @@ pub struct AceProvider {
     identity: Arc<Identity>,
     port: u16,
     default_trackers: Vec<String>,
+    bootstrap_peers: Vec<SocketAddrV4>,
 }
 
 impl AceProvider {
     pub fn new(identity: Arc<Identity>, port: u16) -> Self {
-        AceProvider { identity, port, default_trackers: Vec::new() }
+        AceProvider { identity, port, default_trackers: Vec::new(), bootstrap_peers: Vec::new() }
     }
 
     /// Trackers used for a bare infohash (which carries none); transport files supply their
     /// own. Operators can extend this; DHT discovery is a documented follow-up.
     pub fn with_trackers(mut self, trackers: Vec<String>) -> Self {
         self.default_trackers = trackers;
+        self
+    }
+
+    /// Known peers to try in addition to tracker discovery. This mirrors the proven live
+    /// path (a directly-supplied `ip:port`), letting the daemon serve a stream before DHT /
+    /// ut_metadata discovery is wired.
+    pub fn with_bootstrap_peers(mut self, peers: Vec<SocketAddrV4>) -> Self {
+        self.bootstrap_peers = peers;
         self
     }
 }
@@ -82,9 +91,13 @@ impl StreamProvider for AceProvider {
             ));
         };
 
-        let peers = discover_peers(&info.trackers, &info.infohash, &random_peer_id(), self.port).await;
+        let mut peers = discover_peers(&info.trackers, &info.infohash, &random_peer_id(), self.port).await;
+        // Bootstrap peers (proven live path) are tried first.
+        let mut all = self.bootstrap_peers.clone();
+        all.append(&mut peers);
+        let peers = all;
         if peers.is_empty() {
-            return Err(ProviderError::Backend("no peers discovered".into()));
+            return Err(ProviderError::Backend("no peers (no trackers/bootstrap)".into()));
         }
 
         let (tx, rx) = mpsc::channel::<Bytes>(256);

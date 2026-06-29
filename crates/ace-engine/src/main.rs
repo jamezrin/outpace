@@ -27,7 +27,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register enabled providers. Only "ace" exists today; the registry is the seam for more.
     let mut registry = ProviderRegistry::new();
     if config.networks.iter().any(|n| n == "ace") {
-        registry.register(Arc::new(AceProvider::new(identity.clone(), config.bind.port())));
+        // OUTPACE_ACE_PEERS=ip:port,ip:port — bootstrap peers for the proven live path
+        // until DHT / ut_metadata discovery is wired.
+        let bootstrap = std::env::var("OUTPACE_ACE_PEERS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect::<Vec<_>>();
+        let provider = AceProvider::new(identity.clone(), config.bind.port())
+            .with_bootstrap_peers(bootstrap);
+        registry.register(Arc::new(provider));
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
