@@ -84,6 +84,23 @@ directly; piece/chunk sizing still comes from the transport metadata.
 - Lifecycle: lazy start on first request; `Arc` ref-count + a grace timer; teardown (stop
   swarm, drop buffers) after the last client disconnects + grace (default 30 s).
 
+**Out-of-the-box / acexy parity (first-class requirement).** acexy exists only because the
+official engine doesn't cleanly multiplex clients or manage stream lifecycle; this daemon
+does both natively, so **no proxy/wrapper is ever needed** — players point directly at
+`http://daemon/streams/{id}.ts`. Required behaviors:
+- **N clients → 1 download** for the same stream id (fan-out from the shared ring buffer);
+  never start a second swarm download for a stream already running.
+- **Concurrent distinct streams** each run their own independent session in parallel.
+- **Independent client lifecycles:** any client connecting, disconnecting, or stalling
+  (VLC closed, tab closed, network drop) must not interrupt other clients on that stream;
+  the session persists while ≥1 client is attached.
+- **Mid-stream join:** a new client starts at the current live edge (no rebuffer of old
+  data, no restart of the download).
+- **Last-client teardown:** session stops after the last client leaves + grace, freeing
+  swarm connections and buffers.
+These behaviors get explicit integration tests (multiple concurrent subscribers; one
+subscriber dropping mid-stream; join-after-start) — see Testing.
+
 ### 4. Clean HTTP API (axum)
 | Method & path | Purpose |
 |---|---|
