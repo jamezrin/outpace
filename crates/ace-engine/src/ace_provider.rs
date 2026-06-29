@@ -31,6 +31,11 @@ use tokio::sync::mpsc;
 const PREFETCH_PIECES: u64 = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Acestream's hardcoded public UDP tracker (see `docs/protocol/notes/03`). A bare
+/// content-id/infohash carries no tracker of its own, so we announce here to find peers.
+/// DHT discovery is a documented follow-up.
+const DEFAULT_ACE_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announce"];
+
 pub struct AceProvider {
     identity: Arc<Identity>,
     port: u16,
@@ -40,7 +45,12 @@ pub struct AceProvider {
 
 impl AceProvider {
     pub fn new(identity: Arc<Identity>, port: u16) -> Self {
-        AceProvider { identity, port, default_trackers: Vec::new(), bootstrap_peers: Vec::new() }
+        AceProvider {
+            identity,
+            port,
+            default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
+            bootstrap_peers: Vec::new(),
+        }
     }
 
     /// Trackers used for a bare infohash (which carries none); transport files supply their
@@ -282,10 +292,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn infohash_with_no_trackers_finds_no_peers() {
-        let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+    async fn no_trackers_and_no_bootstrap_yields_no_peers() {
+        // Clear the default tracker so this stays offline/deterministic.
+        let p = AceProvider::new(Arc::new(Identity::generate()), 6878).with_trackers(vec![]);
         let hex = "0123456789abcdef0123456789abcdef01234567";
-        // No trackers configured for a bare infohash -> discovery yields nothing.
         assert!(matches!(p.open(hex).await, Err(ProviderError::Backend(_))));
     }
 }
