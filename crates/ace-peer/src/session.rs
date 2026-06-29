@@ -262,6 +262,11 @@ mod tests {
         let mut their_pos: Option<LivePosition> = None;
         if let PeerMessage::Extended { ext_id: 0, ref payload } = first {
             if let Ok(eh) = ExtendedHandshake::parse(payload) {
+                let top = |k: &[u8]| eh.raw.get(k).and_then(|v| v.as_int());
+                println!(
+                    "[recon {peer}] their identity: ts={:?} v={:?} pv={:?} p={:?} nt={:?} platform={:?}",
+                    top(b"ts"), top(b"v"), top(b"pv"), top(b"p"), top(b"nt"), top(b"platform"),
+                );
                 let mi = eh.raw.get(b"mi");
                 let get = |k: &[u8]| mi.and_then(|m| m.get(k)).and_then(|v| v.as_int());
                 println!(
@@ -296,20 +301,60 @@ mod tests {
             })
         };
         let has_mi = mi.is_some();
-        // Mint our own Ed25519 identity (node_id = our pubkey) and send a SIGNED handshake.
+        // Mint our own Ed25519 identity (node_id = our pubkey).
         let identity = ace_wire::identity::Identity::generate();
         let ts: i64 = env("ACE_TS").and_then(|v| v.parse().ok()).unwrap_or(1);
-        let ours = OutgoingExtendedHandshake {
-            ace_metadata_version: 1,
-            ut_metadata_id: 2,
-            mi,
-            node: ace_wire::extended::NodeFields { ts, ..Default::default() },
-        };
-        session
-            .send_signed_extended_handshake(&ours, &identity)
-            .await
-            .unwrap();
-        println!("[recon {peer}] sent our SIGNED extended handshake (mi={}, node_id={})",
+
+        // Build the FULL client handshake the engine sends (note 19): the complete field
+        // set peers require, signed over the whole dict. `yourip` = the peer's IP (4 raw
+        // bytes), proving we really connected to them.
+        use ace_wire::bencode::Bencode;
+        use std::collections::BTreeMap;
+        let bi = |n: i64| Bencode::Int(n);
+        let bb = |b: &[u8]| Bencode::Bytes(b.to_vec());
+        let peer_ip: Vec<u8> = peer
+            .rsplit_once(':').map(|(h, _)| h).unwrap_or(&peer)
+            .split('.').filter_map(|o| o.parse::<u8>().ok()).collect();
+
+        let mut m: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        m.insert(b"ut_metadata".to_vec(), bi(2));
+
+        let p = mi.unwrap_or(LivePosition { min_piece: 0, max_piece: 0, position: -1, distance_from_source: -1 });
+        let mut midict: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        for (k, v) in [
+            ("distance_from_source", p.distance_from_source), ("down_rate", 0),
+            ("download_window_end", -1), ("is_accessible", 0),
+            ("live_window_size", (p.max_piece - p.min_piece + 1).max(0)), ("lsp", -1),
+            ("mam", -1), ("max_piece", p.max_piece), ("min_piece", p.min_piece),
+            ("peer_type", 0), ("ping_from_source", -1), ("position", -1),
+            ("time_from_source", -1), ("top_session_up_rate", 0), ("top_up_rate", 0),
+            ("up_rate", 0), ("upload_rating", 0),
+        ] { midict.insert(k.as_bytes().to_vec(), bi(v)); }
+
+        let mut f: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        f.insert(b"ace_metadata_version".to_vec(), bi(1));
+        f.insert(b"asn".to_vec(), bi(0));
+        f.insert(b"asn_country".to_vec(), bb(b""));
+        f.insert(b"geoip_country".to_vec(), bb(b""));
+        f.insert(b"lsp".to_vec(), bi(-1));
+        f.insert(b"m".to_vec(), Bencode::Dict(m));
+        if has_mi { f.insert(b"mi".to_vec(), Bencode::Dict(midict)); }
+        f.insert(b"node_id".to_vec(), bb(&identity.node_id()));
+        f.insert(b"nt".to_vec(), bi(1));
+        f.insert(b"p".to_vec(), bi(8621));
+        f.insert(b"platform".to_vec(), bi(2));
+        f.insert(b"pv".to_vec(), bi(2));
+        f.insert(b"stream_statuses".to_vec(), Bencode::Dict(BTreeMap::new()));
+        f.insert(b"ts".to_vec(), bi(ts));
+        f.insert(b"tt".to_vec(), bb(b"bt"));
+        f.insert(b"v".to_vec(), bi(3021100));
+        if peer_ip.len() == 4 { f.insert(b"yourip".to_vec(), bb(&peer_ip)); }
+
+        let digest = ace_wire::identity::handshake_digest(&f);
+        f.insert(b"signature".to_vec(), bb(&identity.sign(&digest)));
+        let payload = Bencode::Dict(f).encode();
+        session.send(&PeerMessage::Extended { ext_id: 0, payload }).await.unwrap();
+        println!("[recon {peer}] sent FULL SIGNED handshake (mi={}, node_id={})",
                  if has_mi { "yes" } else { "no" }, hex::encode(identity.node_id()));
         if env("ACE_NO_INTERESTED").is_none() {
             session.send(&PeerMessage::Interested).await.unwrap();
@@ -331,8 +376,9 @@ mod tests {
                     }
                     if unchoked {
                         if let Some(p) = their_pos {
-                            // Request the first 16 KiB chunk of the live-head piece.
-                            let idx = p.position as u32;
+                            // Request a complete piece the peer holds (max_piece, the live
+                            // head that's already filled), first 16 KiB chunk.
+                            let idx = p.max_piece as u32;
                             println!("[recon {peer}] requesting piece {idx} [0..16384]");
                             session.send(&PeerMessage::Request { index: idx, begin: 0, length: 16384 }).await.unwrap();
                             unchoked = false; // request once; keep reading for the piece

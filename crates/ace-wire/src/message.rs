@@ -23,6 +23,10 @@ pub enum PeerMessage {
     Piece { index: u32, begin: u32, block: Vec<u8> },
     Cancel { index: u32, begin: u32, length: u32 },
     Extended { ext_id: u8, payload: Vec<u8> },
+    /// A message id we don't model (Acestream/BEP-6 extras like HAVE_ALL/HAVE_NONE,
+    /// reject/allowed-fast, or vendor-custom). Preserved so callers can skip it rather
+    /// than tear down the connection.
+    Unknown { id: u8, payload: Vec<u8> },
 }
 
 impl PeerMessage {
@@ -50,6 +54,9 @@ impl PeerMessage {
             }
             PeerMessage::Extended { ext_id, payload } => {
                 body.push(20); body.push(*ext_id); body.extend_from_slice(payload);
+            }
+            PeerMessage::Unknown { id, payload } => {
+                body.push(*id); body.extend_from_slice(payload);
             }
         }
         let mut out = (body.len() as u32).to_be_bytes().to_vec();
@@ -88,7 +95,7 @@ impl PeerMessage {
                 if p.is_empty() { return Err(WireError::Invalid("short extended")); }
                 PeerMessage::Extended { ext_id: p[0], payload: p[1..].to_vec() }
             }
-            _ => return Err(WireError::Invalid("unknown message id")),
+            _ => PeerMessage::Unknown { id, payload: p.to_vec() },
         };
         Ok(Some((msg, total)))
     }
