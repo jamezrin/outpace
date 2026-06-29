@@ -54,6 +54,21 @@ size / cross-chunk TS reassembly is the last parsing refinement before piping to
 - `ace-peer` `live_recon_unchoke`: builds + signs the full handshake, requests pieces in
   Acestream format, dumps received blocks (`ACE_DUMP`).
 
+## PROVEN: decodes to real 1080p video
+
+Pulled 30 complete pieces (31 MB) from peer `84.122.160.176`, reassembled by `(piece,
+chunk)` order (each chunk's 16384-byte payload, headers stripped), and **ffmpeg decoded an
+actual frame**: `1920×1080` H.264 + AAC stereo 48 kHz (saved `shot.jpg`, a real Synthetic Live Channel
+frame). `ffprobe` reports a valid TS program (H.264 video + AAC audio). End-to-end with a
+from-scratch client, no closed-source blobs.
+
+- chunks-per-piece = **64**, `piece_length = 1 MiB` (64 × 16384), `chunk_length = 16384`.
+- Each piece is internally 100% TS-aligned. Across pieces the alignment drifts exactly
+  **−4 bytes/piece** (≈96 bytes/piece don't raw-chain) → ~1 broken packet per piece
+  boundary, which TS demuxers resync past (ffmpeg decodes fine with
+  `-err_detect ignore_err -fflags +discardcorrupt`). Glitch-free continuity is a muxing
+  refinement, not a blocker.
+
 ## Next (the last mile to VLC)
 1. Pin the exact chunk-block header layout; strip it; reassemble contiguous MPEG-TS
    (`PieceReassembler`).

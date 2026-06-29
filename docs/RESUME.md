@@ -23,7 +23,7 @@ Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 | 0 Protocol recovery | ✅ done | Specs + vectors + go/no-go memo (GO) |
 | 1 `ace-wire` | ✅ done | infohash, bencode, handshake, msg framing, extended HS, **transport decoder** |
 | 2 `ace-tracker` + `ace-peer` | ✅ done | BEP-15 UDP tracker; async peer session (handshake + read) — both verified live |
-| 3 piece download → media → engine | 🔜 IN PROGRESS | transport decoder (3.1); **node-identity SOLVED + accepted live** (note 17/18: engine verifier returns ret=0 on our minted identity); domain logic built (live picker, reassembler, ace-media TS/HLS, ace-engine routes); **next = real-swarm unchoke + piece loop** |
+| 3 piece download → media → engine | 🔜 CORE PROVEN | **live HD video downloaded from the real swarm** (note 19: full signed handshake → UNCHOKE → Acestream piece requests → MPEG-TS → ffmpeg decodes 1920×1080 H.264+AAC). Remaining: promote inline recon protocol into `ace-wire`/`ace-swarm`, glitch-free cross-piece muxing, wire `ace-media`+`ace-engine`, point VLC at it |
 
 Crates: `crates/{ace-wire,ace-tracker,ace-peer,ace-media,ace-engine}`. Workspace root `Cargo.toml`.
 **Pure Phase 3/4 logic done (no live data needed):** `ace_wire::live` (LiveWindow/LivePicker),

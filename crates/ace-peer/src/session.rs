@@ -375,8 +375,20 @@ mod tests {
                                 block.len(), hex::encode(&block[..block.len().min(24)]));
                             if let Ok(path) = std::env::var("ACE_DUMP") {
                                 use std::io::Write;
-                                let mut fh = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
-                                fh.write_all(block).unwrap();
+                                // Structured record so we can reassemble by (piece, chunk)
+                                // offline: [piece u32 BE][chunk u16 BE][len u32 BE][data].
+                                // piece = `begin`; chunk = block[8..10]; data = block[10..].
+                                if block.len() > 10 {
+                                    let chunk = ((block[8] as u16) << 8) | block[9] as u16;
+                                    let data = &block[10..];
+                                    let mut rec = Vec::new();
+                                    rec.extend_from_slice(&begin.to_be_bytes());
+                                    rec.extend_from_slice(&chunk.to_be_bytes());
+                                    rec.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                                    rec.extend_from_slice(data);
+                                    let mut fh = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+                                    fh.write_all(&rec).unwrap();
+                                }
                             }
                         }
                         PeerMessage::Unknown { id, payload } => println!(
@@ -387,16 +399,20 @@ mod tests {
                     if unchoked {
                         if let Some(p) = their_pos {
                             // Acestream request (id=6, 10-byte payload): [stream u32=0]
-                            // [piece u32][chunk u16]. Ask for the first few chunks of a
-                            // complete piece (max_piece - 1, safely behind the live head).
-                            let piece = (p.max_piece - 1) as u32;
-                            for chunk in 0u16..4 {
-                                let mut payload = vec![0u8, 0, 0, 0];
-                                payload.extend_from_slice(&piece.to_be_bytes());
-                                payload.extend_from_slice(&chunk.to_be_bytes());
-                                session.send(&PeerMessage::Unknown { id: 6, payload }).await.unwrap();
+                            // [piece u32][chunk u16]. Pull ACE_CHUNKS chunks each across
+                            // ACE_PIECES consecutive complete pieces ending below the head.
+                            let chunks: u16 = env("ACE_CHUNKS").and_then(|v| v.parse().ok()).unwrap_or(4);
+                            let pieces: u32 = env("ACE_PIECES").and_then(|v| v.parse().ok()).unwrap_or(1);
+                            let base = (p.max_piece as u32).saturating_sub(pieces);
+                            for piece in base..base + pieces {
+                                for chunk in 0..chunks {
+                                    let mut payload = vec![0u8, 0, 0, 0];
+                                    payload.extend_from_slice(&piece.to_be_bytes());
+                                    payload.extend_from_slice(&chunk.to_be_bytes());
+                                    session.send(&PeerMessage::Unknown { id: 6, payload }).await.unwrap();
+                                }
                             }
-                            println!("[recon {peer}] requested piece {piece} chunks 0..4 (acestream fmt)");
+                            println!("[recon {peer}] requested pieces {base}..{} x {chunks} chunks", base + pieces);
                             unchoked = false; // request once; keep reading for the data
                         }
                     }
