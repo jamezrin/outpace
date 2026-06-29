@@ -63,11 +63,14 @@ peers serve the official engine. So the gate is a **valid node identity**: `node
 signature (engine uses PyNaCl `_sodium.abi3.so`). Confirmed by exact pubkey match. The
 identity is **self-generated**, so we can mint our own keypair — no engine key needed.
 
-1. **Finish the preimage (last mile):** the signature is time-based (`ts`) and lazily
-   re-signed. Black-box brute force of node_id/infohash/ts combos did NOT reproduce it, so
-   capture the exact signed bytes by hooking `crypto_sign` in `_sodium.abi3.so`
-   (`scratchpad/hook_sign.js`) **while a live stream is actively advancing** (the call only
-   fires on a re-sign; the test channel had stalled). Fallback: Ghidra-decompile `live.so`.
+1. **Finish the preimage (last mile):** signer located via Ghidra (note 16) =
+   **`LiveSourceAuth.sign`** in `core/src/live/LiveSourceAuth.pyx`, using a **static Ed25519
+   inside `live.so`** (NOT PyNaCl — confirmed: zero `_sodium` `crypto_sign*` calls across an
+   engine restart + 8 handshake builds). So both black-box brute force AND the libsodium hook
+   are dead ends. Two routes left: (a) trace the message assembly in the decompiled
+   `LiveSourceAuth` (resolve Cython interned-string globals), or (b) **recommended** — find
+   the static ed25519 sign callee in Ghidra and Frida-hook *that address in `live.so`* to dump
+   the message arg directly. Ghidra scripts + decompiled `sign` are in `tools/ghidra/`.
 2. **Mint + sign:** new `ace-identity` (Ed25519) + extend `OutgoingExtendedHandshake` to
    carry `node_id`/`signature`/`ts`/`v`/`pv`/`p`/`platform`/`nt`; re-run `live_recon_unchoke`
    → expect acceptance + unchoke.

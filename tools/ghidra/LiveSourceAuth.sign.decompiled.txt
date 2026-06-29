@@ -1,0 +1,537 @@
+===== sign -> FUNC FUN_00286730 @ 00286730 ===== (GhidraScript)  
+INFO  find_funcs.java> 
+long FUN_00286730(undefined8 param_1,long param_2,long param_3)
+
+{
+  uint uVar1;
+  code *pcVar2;
+  int iVar3;
+  int iVar4;
+  long *plVar5;
+  long *plVar6;
+  long *plVar7;
+  long *plVar8;
+  long *plVar9;
+  long *plVar10;
+  long *plVar11;
+  long lVar12;
+  undefined4 uVar13;
+  long lVar14;
+  undefined *puVar15;
+  long *plVar16;
+  undefined8 uVar17;
+  long in_FS_OFFSET;
+  long *local_80;
+  long *local_68 [4];
+  long *local_48;
+  long local_40;
+  
+  lVar14 = *(long *)(param_2 + 0x10);
+  local_40 = *(long *)(in_FS_OFFSET + 0x28);
+  local_68[0] = (long *)0x0;
+  local_68[1] = (long *)0x0;
+  if (param_3 != 0) {
+    if (lVar14 == 1) {
+      local_68[0] = *(long **)(param_2 + 0x18);
+      lVar12 = PyDict_Size(param_3);
+LAB_00286fa0:
+      local_68[1] = (long *)_PyDict_GetItem_KnownHash
+                                      (param_3,DAT_00acdc28,*(undefined8 *)(DAT_00acdc28 + 0x18));
+      if (local_68[1] == (long *)0x0) {
+        lVar14 = 1;
+        goto LAB_00286ca5;
+      }
+      lVar12 = lVar12 + -1;
+LAB_00286fc5:
+      if ((lVar12 < 1) ||
+         (iVar3 = FUN_0016c040(param_3,&PTR_DAT_00a83090,0,local_68,lVar14,&DAT_009fc3c0),
+         -1 < iVar3)) {
+        local_80 = local_68[1];
+        plVar10 = local_68[0];
+        goto LAB_0028678b;
+      }
+    }
+    else {
+      if (lVar14 == 2) {
+        local_68[1] = *(long **)(param_2 + 0x20);
+        local_68[0] = *(long **)(param_2 + 0x18);
+        lVar12 = PyDict_Size(param_3);
+        goto LAB_00286fc5;
+      }
+      if (lVar14 == 0) {
+        lVar12 = PyDict_Size(param_3);
+        lVar12 = lVar12 + -1;
+        local_68[0] = (long *)_PyDict_GetItem_KnownHash
+                                        (param_3,DAT_00ac8b20,*(undefined8 *)(DAT_00ac8b20 + 0x18));
+        if (local_68[0] != (long *)0x0) goto LAB_00286fa0;
+        lVar14 = *(long *)(param_2 + 0x10);
+      }
+LAB_00286ca5:
+      PyErr_Format(*(undefined8 *)PTR_PyExc_TypeError_00a2dea8,
+                   "%.200s() takes %.8s %zd positional argument%.1s (%zd given)",&DAT_009fc3c0,
+                   "exactly",2,&DAT_009fcea5,lVar14);
+    }
+    lVar14 = 0;
+    FUN_00183de0(0,0x2e,"core/src/live/LiveSourceAuth.pyx");
+    goto LAB_00286cf0;
+  }
+  if (lVar14 != 2) goto LAB_00286ca5;
+  local_80 = *(long **)(param_2 + 0x20);
+  plVar10 = *(long **)(param_2 + 0x18);
+LAB_0028678b:
+  if (*(code **)(plVar10[1] + 0x90) == (code *)0x0) {
+    plVar5 = (long *)PyObject_GetAttr(plVar10,DAT_00ac8670);
+  }
+  else {
+    plVar5 = (long *)(**(code **)(plVar10[1] + 0x90))();
+  }
+  if (plVar5 == (long *)0x0) {
+    plVar9 = (long *)0x0;
+    uVar13 = 0x2f;
+LAB_00286e82:
+    FUN_00183de0(0,uVar13,"core/src/live/LiveSourceAuth.pyx");
+    lVar14 = 0;
+    if (plVar5 != (long *)0x0) {
+      *plVar5 = *plVar5 + -1;
+      if (*plVar5 == 0) {
+        lVar14 = 0;
+LAB_00286e52:
+        _Py_Dealloc(plVar5);
+      }
+      else {
+        lVar14 = 0;
+      }
+    }
+    if (plVar9 == (long *)0x0) goto LAB_00286cf0;
+  }
+  else {
+    if (*(code **)(plVar10[1] + 0x90) == (code *)0x0) {
+      plVar6 = (long *)PyObject_GetAttr(plVar10,DAT_00ac8670);
+    }
+    else {
+      plVar6 = (long *)(**(code **)(plVar10[1] + 0x90))();
+    }
+    if (plVar6 == (long *)0x0) {
+      uVar13 = 0x30;
+      plVar9 = (long *)0x0;
+      goto LAB_00286e82;
+    }
+    plVar7 = (long *)FUN_0016d4f0(plVar6,DAT_00ac6bc0,1,1);
+    if (plVar7 == (long *)0x0) {
+      plVar7 = (long *)0x0;
+      uVar13 = 0x30;
+      plVar9 = (long *)0x0;
+      goto LAB_00287038;
+    }
+    *plVar6 = *plVar6 + -1;
+    if (*plVar6 == 0) {
+      _Py_Dealloc(plVar6);
+    }
+    if (*(code **)(plVar10[1] + 0x98) == (code *)0x0) {
+      iVar3 = PyObject_SetAttr(plVar10,DAT_00ac8670,plVar7);
+    }
+    else {
+      iVar3 = (**(code **)(plVar10[1] + 0x98))();
+    }
+    lVar14 = *plVar7;
+    if (iVar3 < 0) {
+      plVar9 = (long *)0x0;
+      uVar13 = 0x30;
+LAB_00286e77:
+      *plVar7 = *plVar7 + -1;
+      if (*plVar7 == 0) {
+        _Py_Dealloc(plVar7);
+      }
+      goto LAB_00286e82;
+    }
+    *plVar7 = lVar14 + -1;
+    if (lVar14 + -1 == 0) {
+      _Py_Dealloc(plVar7);
+    }
+    if (*(code **)(plVar10[1] + 0x90) == (code *)0x0) {
+      plVar6 = (long *)PyObject_GetAttr(plVar10,DAT_00ac8cf0);
+    }
+    else {
+      plVar6 = (long *)(**(code **)(plVar10[1] + 0x90))();
+    }
+    if (plVar6 == (long *)0x0) {
+      uVar13 = 0x31;
+      plVar9 = (long *)0x0;
+      goto LAB_00286e82;
+    }
+    if (*(code **)(plVar10[1] + 0x90) == (code *)0x0) {
+      plVar8 = (long *)PyObject_GetAttr(plVar10,DAT_00acadb8);
+    }
+    else {
+      plVar8 = (long *)(**(code **)(plVar10[1] + 0x90))();
+    }
+    if (plVar8 == (long *)0x0) {
+      plVar7 = (long *)0x0;
+      uVar13 = 0x31;
+      plVar9 = (long *)0x0;
+      goto LAB_00287038;
+    }
+    puVar15 = (undefined *)plVar6[1];
+    if (puVar15 == PTR_PyMethod_Type_00a2de40) {
+      plVar16 = (long *)plVar6[3];
+      if (plVar16 == (long *)0x0) {
+        uVar17 = 3;
+        lVar14 = 0;
+      }
+      else {
+        plVar9 = (long *)plVar6[2];
+        *plVar16 = *plVar16 + 1;
+        *plVar9 = *plVar9 + 1;
+        *plVar6 = *plVar6 + -1;
+        if (*plVar6 == 0) {
+          uVar17 = 4;
+          lVar14 = 1;
+          _Py_Dealloc(plVar6);
+          puVar15 = (undefined *)plVar9[1];
+          plVar6 = plVar9;
+        }
+        else {
+          puVar15 = (undefined *)plVar9[1];
+          uVar17 = 4;
+          lVar14 = 1;
+          plVar6 = plVar9;
+        }
+      }
+    }
+    else {
+      uVar17 = 3;
+      lVar14 = 0;
+      plVar16 = (long *)0x0;
+    }
+    if (puVar15 != PTR_PyFunction_Type_00a2df30) {
+      if (((puVar15 == PTR_PyCFunction_Type_00a2dfc0) || (iVar3 = PyType_IsSubtype(), iVar3 != 0))
+         && ((*(uint *)(plVar6[2] + 0x10) & 0xffffff8d) == 0x80)) {
+        lVar12 = 0;
+        local_68[2] = local_80;
+        pcVar2 = *(code **)(plVar6[2] + 8);
+        uVar1 = *(uint *)(plVar6[2] + 0x10);
+        if ((uVar1 & 0x20) == 0) {
+          lVar12 = plVar6[3];
+        }
+        if ((uVar1 & 2) == 0) {
+          local_68[0] = plVar16;
+          local_68[1] = plVar5;
+          local_68[3] = plVar8;
+          plVar9 = (long *)(*pcVar2)(lVar12,local_68 + (1 - lVar14),uVar17);
+        }
+        else {
+          local_68[0] = plVar16;
+          local_68[1] = plVar5;
+          local_68[3] = plVar8;
+          plVar9 = (long *)(*pcVar2)(lVar12,local_68 + (1 - lVar14),uVar17,0);
+        }
+        goto joined_r0x00286dcd;
+      }
+      plVar7 = (long *)PyTuple_New(uVar17);
+      iVar3 = (int)lVar14;
+      if (plVar7 == (long *)0x0) {
+        plVar9 = (long *)0x0;
+        uVar13 = 0x31;
+        goto LAB_00286ddb;
+      }
+      if (plVar16 != (long *)0x0) {
+        plVar7[3] = (long)plVar16;
+      }
+      *plVar5 = *plVar5 + 1;
+      plVar7[(long)iVar3 + 3] = (long)plVar5;
+      *local_80 = *local_80 + 1;
+      plVar7[(long)(iVar3 + 1) + 3] = (long)local_80;
+      plVar7[(long)(iVar3 + 2) + 3] = (long)plVar8;
+      pcVar2 = *(code **)(plVar6[1] + 0x80);
+      if (pcVar2 == (code *)0x0) {
+        plVar9 = (long *)PyObject_Call(plVar6,plVar7,0);
+        if (plVar9 == (long *)0x0) {
+LAB_002870f8:
+          plVar9 = (long *)0x0;
+          uVar13 = 0x31;
+          goto LAB_00287038;
+        }
+LAB_002869b8:
+        *plVar7 = *plVar7 + -1;
+        if (*plVar7 == 0) {
+          _Py_Dealloc(plVar7);
+        }
+        goto LAB_002869c2;
+      }
+      iVar3 = Py_EnterRecursiveCall(" while calling a Python object");
+      if (iVar3 == 0) {
+        plVar9 = (long *)(*pcVar2)(plVar6,plVar7,0);
+        Py_LeaveRecursiveCall();
+        if (plVar9 != (long *)0x0) goto LAB_002869b8;
+        lVar14 = PyErr_Occurred();
+        if (lVar14 != 0) goto LAB_002870f8;
+        uVar13 = 0x31;
+        PyErr_SetString(*(undefined8 *)PTR_PyExc_SystemError_00a2de30,
+                        "NULL result without error in PyObject_Call");
+        plVar9 = (long *)0x0;
+      }
+      else {
+        uVar13 = 0x31;
+        plVar9 = (long *)0x0;
+      }
+LAB_00287038:
+      *plVar6 = *plVar6 + -1;
+      if (*plVar6 == 0) {
+        _Py_Dealloc(plVar6);
+      }
+LAB_00286dff:
+      plVar10 = (long *)0x0;
+      if (plVar7 == (long *)0x0) goto LAB_00286e82;
+LAB_00286e07:
+      *plVar7 = *plVar7 + -1;
+      if (*plVar7 == 0) {
+        _Py_Dealloc(plVar7);
+      }
+      if ((plVar10 != (long *)0x0) && (*plVar10 = *plVar10 + -1, *plVar10 == 0)) {
+        _Py_Dealloc(plVar10);
+      }
+      goto LAB_00286e82;
+    }
+    local_68[2] = local_80;
+    local_68[0] = plVar16;
+    local_68[1] = plVar5;
+    local_68[3] = plVar8;
+    plVar9 = (long *)FUN_00171980(plVar6,local_68 + (1 - lVar14),uVar17);
+joined_r0x00286dcd:
+    if (plVar9 == (long *)0x0) {
+      plVar7 = (long *)0x0;
+      uVar13 = 0x31;
+LAB_00286ddb:
+      *plVar6 = *plVar6 + -1;
+      if (*plVar6 == 0) {
+        _Py_Dealloc(plVar6);
+      }
+      *plVar8 = *plVar8 + -1;
+      if (*plVar8 == 0) {
+        _Py_Dealloc(plVar8);
+      }
+      if ((plVar16 != (long *)0x0) && (*plVar16 = *plVar16 + -1, *plVar16 == 0)) {
+        _Py_Dealloc(plVar16);
+      }
+      goto LAB_00286dff;
+    }
+    if ((plVar16 != (long *)0x0) && (*plVar16 = *plVar16 + -1, *plVar16 == 0)) {
+      _Py_Dealloc(plVar16);
+    }
+    *plVar8 = *plVar8 + -1;
+    if (*plVar8 == 0) {
+      _Py_Dealloc(plVar8);
+    }
+LAB_002869c2:
+    *plVar6 = *plVar6 + -1;
+    if (*plVar6 == 0) {
+      _Py_Dealloc(plVar6);
+    }
+    if (DAT_00acff70 != 0) {
+      if (*(code **)(plVar10[1] + 0x90) == (code *)0x0) {
+        plVar6 = (long *)PyObject_GetAttr(plVar10,DAT_00acaa98);
+      }
+      else {
+        plVar6 = (long *)(**(code **)(plVar10[1] + 0x90))();
+      }
+      if (plVar6 == (long *)0x0) {
+        uVar13 = 0x33;
+        goto LAB_00286e82;
+      }
+      if (*(code **)(plVar6[1] + 0x90) == (code *)0x0) {
+        plVar7 = (long *)PyObject_GetAttr(plVar6,DAT_00acd810);
+      }
+      else {
+        plVar7 = (long *)(**(code **)(plVar6[1] + 0x90))();
+      }
+      lVar14 = *plVar6;
+      if (plVar7 == (long *)0x0) {
+LAB_00287150:
+        uVar13 = 0x33;
+        goto LAB_00287038;
+      }
+      *plVar6 = lVar14 + -1;
+      if (lVar14 + -1 == 0) {
+        _Py_Dealloc(plVar6);
+      }
+      lVar14 = PyObject_Size(local_80);
+      if (lVar14 == -1) {
+        plVar10 = (long *)0x0;
+      }
+      else {
+        plVar6 = (long *)PyLong_FromSsize_t();
+        plVar10 = (long *)0x0;
+        if (plVar6 != (long *)0x0) {
+          lVar14 = PyObject_Size(plVar9);
+          if ((lVar14 == -1) || (plVar8 = (long *)PyLong_FromSsize_t(), plVar8 == (long *)0x0))
+          goto LAB_00287150;
+          puVar15 = (undefined *)plVar7[1];
+          if (puVar15 == PTR_PyMethod_Type_00a2de40) {
+            plVar16 = (long *)plVar7[3];
+            if (plVar16 == (long *)0x0) {
+              iVar3 = 0;
+              uVar17 = 4;
+            }
+            else {
+              plVar10 = (long *)plVar7[2];
+              *plVar16 = *plVar16 + 1;
+              *plVar10 = *plVar10 + 1;
+              *plVar7 = *plVar7 + -1;
+              if (*plVar7 == 0) {
+                uVar17 = 5;
+                _Py_Dealloc(plVar7);
+                puVar15 = (undefined *)plVar10[1];
+                iVar3 = 1;
+                plVar7 = plVar10;
+              }
+              else {
+                puVar15 = (undefined *)plVar10[1];
+                uVar17 = 5;
+                iVar3 = 1;
+                plVar7 = plVar10;
+              }
+            }
+          }
+          else {
+            iVar3 = 0;
+            uVar17 = 4;
+            plVar16 = (long *)0x0;
+          }
+          if (puVar15 == PTR_PyFunction_Type_00a2df30) {
+            local_68[1] = DAT_00ac8298;
+            local_68[0] = plVar16;
+            local_68[2] = plVar5;
+            local_68[3] = plVar6;
+            local_48 = plVar8;
+            plVar11 = (long *)FUN_00171980(plVar7,local_68 + (1 - (long)iVar3),uVar17);
+joined_r0x002871bb:
+            if (plVar11 != (long *)0x0) {
+              if ((plVar16 != (long *)0x0) && (*plVar16 = *plVar16 + -1, *plVar16 == 0)) {
+                _Py_Dealloc(plVar16);
+              }
+              *plVar6 = *plVar6 + -1;
+              if (*plVar6 == 0) {
+                _Py_Dealloc(plVar6);
+              }
+              *plVar8 = *plVar8 + -1;
+              if (*plVar8 == 0) {
+                _Py_Dealloc(plVar8);
+              }
+LAB_00286be0:
+              *plVar7 = *plVar7 + -1;
+              if (*plVar7 == 0) {
+                _Py_Dealloc(plVar7);
+              }
+              *plVar11 = *plVar11 + -1;
+              if (*plVar11 == 0) {
+                _Py_Dealloc(plVar11);
+              }
+              goto LAB_00286c00;
+            }
+          }
+          else {
+            if (((puVar15 == PTR_PyCFunction_Type_00a2dfc0) ||
+                (iVar4 = PyType_IsSubtype(), iVar4 != 0)) &&
+               ((*(uint *)(plVar7[2] + 0x10) & 0xffffff8d) == 0x80)) {
+              lVar14 = 0;
+              local_68[1] = DAT_00ac8298;
+              pcVar2 = *(code **)(plVar7[2] + 8);
+              uVar1 = *(uint *)(plVar7[2] + 0x10);
+              if ((uVar1 & 0x20) == 0) {
+                lVar14 = plVar7[3];
+              }
+              if ((uVar1 & 2) == 0) {
+                local_68[0] = plVar16;
+                local_68[2] = plVar5;
+                local_68[3] = plVar6;
+                local_48 = plVar8;
+                plVar11 = (long *)(*pcVar2)(lVar14,local_68 + (1 - (long)iVar3),uVar17);
+              }
+              else {
+                local_68[0] = plVar16;
+                local_68[2] = plVar5;
+                local_68[3] = plVar6;
+                local_48 = plVar8;
+                plVar11 = (long *)(*pcVar2)(lVar14,local_68 + (1 - (long)iVar3),uVar17,0);
+              }
+              goto joined_r0x002871bb;
+            }
+            plVar10 = (long *)PyTuple_New(uVar17);
+            if (plVar10 != (long *)0x0) {
+              if (plVar16 != (long *)0x0) {
+                plVar10[3] = (long)plVar16;
+              }
+              *DAT_00ac8298 = *DAT_00ac8298 + 1;
+              plVar10[(long)iVar3 + 3] = (long)DAT_00ac8298;
+              *plVar5 = *plVar5 + 1;
+              plVar10[(long)(iVar3 + 1) + 3] = (long)plVar5;
+              plVar10[(long)(iVar3 + 2) + 3] = (long)plVar6;
+              plVar10[(long)(iVar3 + 3) + 3] = (long)plVar8;
+              pcVar2 = *(code **)(plVar7[1] + 0x80);
+              if (pcVar2 != (code *)0x0) {
+                iVar3 = Py_EnterRecursiveCall(" while calling a Python object");
+                if (iVar3 == 0) {
+                  plVar11 = (long *)(*pcVar2)(plVar7,plVar10,0);
+                  Py_LeaveRecursiveCall();
+                  if (plVar11 != (long *)0x0) goto LAB_00286bd6;
+                  lVar14 = PyErr_Occurred();
+                  if (lVar14 == 0) {
+                    PyErr_SetString(*(undefined8 *)PTR_PyExc_SystemError_00a2de30,
+                                    "NULL result without error in PyObject_Call");
+                  }
+                }
+                goto LAB_00287309;
+              }
+              plVar11 = (long *)PyObject_Call(plVar7,plVar10,0);
+              if (plVar11 == (long *)0x0) goto LAB_00287309;
+LAB_00286bd6:
+              *plVar10 = *plVar10 + -1;
+              if (*plVar10 == 0) {
+                _Py_Dealloc(plVar10);
+              }
+              goto LAB_00286be0;
+            }
+          }
+          uVar13 = 0x33;
+          goto LAB_00286ddb;
+        }
+      }
+LAB_00287309:
+      uVar13 = 0x33;
+      goto LAB_00286e07;
+    }
+LAB_00286c00:
+    plVar7 = (long *)PyList_New(2);
+    if (plVar7 == (long *)0x0) {
+      uVar13 = 0x34;
+      goto LAB_00286e82;
+    }
+    *local_80 = *local_80 + 1;
+    *(long **)plVar7[3] = local_80;
+    *plVar9 = *plVar9 + 1;
+    *(long **)(plVar7[3] + 8) = plVar9;
+    lVar14 = PyTuple_New(2);
+    if (lVar14 == 0) {
+      uVar13 = 0x34;
+      goto LAB_00286e77;
+    }
+    *plVar5 = *plVar5 + 1;
+    *(long **)(lVar14 + 0x18) = plVar5;
+    *(long **)(lVar14 + 0x20) = plVar7;
+    *plVar5 = *plVar5 + -1;
+    if (*plVar5 == 0) goto LAB_00286e52;
+  }
+  *plVar9 = *plVar9 + -1;
+  if (*plVar9 == 0) {
+    _Py_Dealloc(plVar9);
+  }
+LAB_00286cf0:
+  if (local_40 != *(long *)(in_FS_OFFSET + 0x28)) {
+                    /* WARNING: Subroutine does not return */
+    __stack_chk_fail();
+  }
+  return lVar14;
+}
+
+ (GhidraScript)  
+INFO  find_funcs.java> 
