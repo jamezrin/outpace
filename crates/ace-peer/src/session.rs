@@ -240,7 +240,7 @@ mod tests {
         // Phase 3.2 recon. Capture hot peers from the engine namespace, then e.g.:
         //   ACE_PEER=82.213.234.240:8623 ACE_INFOHASH=47eda3..afa022 \
         //     cargo test -p ace-peer live_recon -- --ignored --nocapture
-        use ace_wire::extended::{ExtendedHandshake, LivePosition, OutgoingExtendedHandshake};
+        use ace_wire::extended::{ExtendedHandshake, LivePosition};
 
         let peer = std::env::var("ACE_PEER").expect("set ACE_PEER=ip:port");
         let ih_hex = std::env::var("ACE_INFOHASH").expect("set ACE_INFOHASH=40hex");
@@ -370,18 +370,34 @@ mod tests {
                         PeerMessage::Unchoke => { unchoked = true; println!("[recon {peer}] >>> UNCHOKE"); }
                         PeerMessage::Bitfield(b) => println!("[recon {peer}] bitfield ({} bytes)", b.len()),
                         PeerMessage::Have(i) => println!("[recon {peer}] have {i}"),
-                        PeerMessage::Piece { index, begin, block } =>
-                            println!("[recon {peer}] >>> PIECE idx={index} begin={begin} ({} bytes)", block.len()),
+                        PeerMessage::Piece { index, begin, block } => {
+                            println!("[recon {peer}] >>> PIECE idx={index} begin={begin} ({} bytes) head={}",
+                                block.len(), hex::encode(&block[..block.len().min(24)]));
+                            if let Ok(path) = std::env::var("ACE_DUMP") {
+                                use std::io::Write;
+                                let mut fh = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+                                fh.write_all(block).unwrap();
+                            }
+                        }
+                        PeerMessage::Unknown { id, payload } => println!(
+                            "[recon {peer}] >>> msg id={id} ({} bytes) head={}",
+                            payload.len(), hex::encode(&payload[..payload.len().min(16)])),
                         other => println!("[recon {peer}] {other:?}"),
                     }
                     if unchoked {
                         if let Some(p) = their_pos {
-                            // Request a complete piece the peer holds (max_piece, the live
-                            // head that's already filled), first 16 KiB chunk.
-                            let idx = p.max_piece as u32;
-                            println!("[recon {peer}] requesting piece {idx} [0..16384]");
-                            session.send(&PeerMessage::Request { index: idx, begin: 0, length: 16384 }).await.unwrap();
-                            unchoked = false; // request once; keep reading for the piece
+                            // Acestream request (id=6, 10-byte payload): [stream u32=0]
+                            // [piece u32][chunk u16]. Ask for the first few chunks of a
+                            // complete piece (max_piece - 1, safely behind the live head).
+                            let piece = (p.max_piece - 1) as u32;
+                            for chunk in 0u16..4 {
+                                let mut payload = vec![0u8, 0, 0, 0];
+                                payload.extend_from_slice(&piece.to_be_bytes());
+                                payload.extend_from_slice(&chunk.to_be_bytes());
+                                session.send(&PeerMessage::Unknown { id: 6, payload }).await.unwrap();
+                            }
+                            println!("[recon {peer}] requested piece {piece} chunks 0..4 (acestream fmt)");
+                            unchoked = false; // request once; keep reading for the data
                         }
                     }
                 }

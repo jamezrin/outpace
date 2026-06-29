@@ -78,32 +78,26 @@ impl PeerMessage {
         if len == 0 { return Ok(Some((PeerMessage::KeepAlive, total))); }
         let id = body[0];
         let p = &body[1..];
-        let msg = match id {
-            0 => { exact(p, 0)?; PeerMessage::Choke }
-            1 => { exact(p, 0)?; PeerMessage::Unchoke }
-            2 => { exact(p, 0)?; PeerMessage::Interested }
-            3 => { exact(p, 0)?; PeerMessage::NotInterested }
-            4 => { exact(p, 4)?; PeerMessage::Have(be32(p, 0)?) }
-            5 => PeerMessage::Bitfield(p.to_vec()),
-            6 => { exact(p, 12)?; PeerMessage::Request { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? } }
-            7 => {
-                if p.len() < 8 { return Err(WireError::Invalid("short piece")); }
-                PeerMessage::Piece { index: be32(p, 0)?, begin: be32(p, 4)?, block: p[8..].to_vec() }
-            }
-            8 => { exact(p, 12)?; PeerMessage::Cancel { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? } }
-            20 => {
-                if p.is_empty() { return Err(WireError::Invalid("short extended")); }
-                PeerMessage::Extended { ext_id: p[0], payload: p[1..].to_vec() }
-            }
-            _ => PeerMessage::Unknown { id, payload: p.to_vec() },
+        // Standard BT ids decode to their typed variant only when the payload length is
+        // exactly right; otherwise (and for unmodelled ids) we keep the raw bytes as
+        // `Unknown` so an Acestream peer's custom/variant messages never tear down the
+        // connection. id=7 (Piece) keeps Acestream's variable header in `block`.
+        let typed = match id {
+            0 if p.is_empty() => Some(PeerMessage::Choke),
+            1 if p.is_empty() => Some(PeerMessage::Unchoke),
+            2 if p.is_empty() => Some(PeerMessage::Interested),
+            3 if p.is_empty() => Some(PeerMessage::NotInterested),
+            4 if p.len() == 4 => Some(PeerMessage::Have(be32(p, 0)?)),
+            5 => Some(PeerMessage::Bitfield(p.to_vec())),
+            6 if p.len() == 12 => Some(PeerMessage::Request { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? }),
+            7 if p.len() >= 8 => Some(PeerMessage::Piece { index: be32(p, 0)?, begin: be32(p, 4)?, block: p[8..].to_vec() }),
+            8 if p.len() == 12 => Some(PeerMessage::Cancel { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? }),
+            20 if !p.is_empty() => Some(PeerMessage::Extended { ext_id: p[0], payload: p[1..].to_vec() }),
+            _ => None,
         };
+        let msg = typed.unwrap_or(PeerMessage::Unknown { id, payload: p.to_vec() });
         Ok(Some((msg, total)))
     }
-}
-
-/// Require a fixed-size message payload to be exactly `n` bytes.
-fn exact(p: &[u8], n: usize) -> Result<()> {
-    if p.len() == n { Ok(()) } else { Err(WireError::Invalid("bad message length")) }
 }
 
 fn be32(p: &[u8], off: usize) -> Result<u32> {
@@ -160,37 +154,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_message_with_trailing_payload() {
-        // choke/unchoke/interested/not-interested carry zero payload bytes.
-        // len=2 => id + one stray byte must be rejected, not silently accepted.
-        let buf = [0, 0, 0, 2, 0, 0xFF]; // id=0 (choke) + trailing 0xFF
-        assert!(matches!(
-            PeerMessage::decode(&buf),
-            Err(WireError::Invalid("bad message length"))
-        ));
+    fn standard_id_with_wrong_length_decodes_as_unknown() {
+        // Acestream peers reuse standard ids with non-standard payloads. A wrong-length
+        // frame is NOT torn down: it's preserved as `Unknown` (the MAX_FRAME_LEN cap is
+        // what guards against abuse). id=0 (choke) with a trailing byte:
+        let buf = [0, 0, 0, 2, 0, 0xFF];
+        assert_eq!(
+            PeerMessage::decode(&buf).unwrap(),
+            Some((PeerMessage::Unknown { id: 0, payload: vec![0xFF] }, 6))
+        );
     }
 
     #[test]
-    fn rejects_have_with_wrong_payload_length() {
-        // have (id=4) must carry exactly 4 payload bytes; here it has 5.
+    fn have_with_wrong_payload_length_is_unknown() {
+        // have (id=4) normally carries exactly 4 bytes; 5 → Unknown, not an error.
         let buf = [0, 0, 0, 6, 4, 0, 0, 0, 1, 0xFF];
-        assert!(matches!(
-            PeerMessage::decode(&buf),
-            Err(WireError::Invalid("bad message length"))
-        ));
+        assert_eq!(
+            PeerMessage::decode(&buf).unwrap(),
+            Some((PeerMessage::Unknown { id: 4, payload: vec![0, 0, 0, 1, 0xFF] }, 10))
+        );
     }
 
     #[test]
-    fn rejects_request_with_trailing_payload() {
-        // request (id=6) must carry exactly 12 payload bytes; here it has 13.
+    fn request_with_trailing_payload_is_unknown() {
+        // request (id=6) normally carries 12 bytes; 13 → Unknown (Acestream's own
+        // request is id=6 with a 10-byte payload, also handled this way).
         let mut body = vec![6];
         body.extend_from_slice(&[0u8; 13]);
         let mut buf = (body.len() as u32).to_be_bytes().to_vec();
         buf.extend_from_slice(&body);
-        assert!(matches!(
-            PeerMessage::decode(&buf),
-            Err(WireError::Invalid("bad message length"))
-        ));
+        let (msg, _) = PeerMessage::decode(&buf).unwrap().unwrap();
+        assert!(matches!(msg, PeerMessage::Unknown { id: 6, .. }));
     }
 
     #[test]
