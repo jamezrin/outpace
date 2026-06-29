@@ -58,12 +58,25 @@ distance, and even with the full key set if `node_id`/`signature` are dummies. T
 peers serve the official engine. So the gate is a **valid node identity**: `node_id`
 (32 B) + `signature` (64 B) — Ed25519-shaped. We must mint/sign a real one.
 
-1. **Crack the node identity (RE):** decompile **`re/engine/lib/acestreamengine/live.so`**
-   (the live-handshake module; NOT in the prior Ghidra pass). It links RSA primitives
-   (`rsa_sign_data`, `rsa_verify_data_pubkeyobj`); determine what the 64-byte `signature`
-   covers and whether the identity is self-generated per session (so we can forge our own).
-2. Then: live piece loop (request within `[min_piece, max_piece]`), `ace-swarm` →
+**Identity scheme CRACKED (note 15):** `node_id` = an **Ed25519 public key** derived from
+`/root/.ACEStream/device.key` (a 32-byte seed in hex); `signature` = a 64-byte **Ed25519**
+signature (engine uses PyNaCl `_sodium.abi3.so`). Confirmed by exact pubkey match. The
+identity is **self-generated**, so we can mint our own keypair — no engine key needed.
+
+1. **Finish the preimage (last mile):** the signature is time-based (`ts`) and lazily
+   re-signed. Black-box brute force of node_id/infohash/ts combos did NOT reproduce it, so
+   capture the exact signed bytes by hooking `crypto_sign` in `_sodium.abi3.so`
+   (`scratchpad/hook_sign.js`) **while a live stream is actively advancing** (the call only
+   fires on a re-sign; the test channel had stalled). Fallback: Ghidra-decompile `live.so`.
+2. **Mint + sign:** new `ace-identity` (Ed25519) + extend `OutgoingExtendedHandshake` to
+   carry `node_id`/`signature`/`ts`/`v`/`pv`/`p`/`platform`/`nt`; re-run `live_recon_unchoke`
+   → expect acceptance + unchoke.
+3. Then: live piece loop (request within `[min_piece, max_piece]`), `ace-swarm` →
    `ace-media` (MPEG-TS) → `ace-engine` (`:6878` `/ace/getstream`). Verify in VLC.
+
+The engine listens for peers on **TCP 8621** (container IP `172.23.0.2`): connecting there
+with our client + the current infohash makes it reply as a peer with its full signed
+handshake — the ground-truth probe used to crack the above.
 
 This step is RE-ish (a live experiment + binary RE), like the handshake/transport spikes —
 not clean coding. A **VOD acestream id** would also help (static piece-hash list to
