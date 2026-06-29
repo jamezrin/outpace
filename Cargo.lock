@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "ace-engine"
+version = "0.1.0"
+dependencies = [
+ "ace-media",
+ "ace-wire",
+]
+
+[[package]]
 name = "ace-media"
 version = "0.1.0"
 

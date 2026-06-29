@@ -1,0 +1,16 @@
+[package]
+name = "ace-engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ace-engine"
+path = "src/main.rs"
+
+[lib]
+name = "ace_engine"
+path = "src/lib.rs"
+
+[dependencies]
+ace-wire = { path = "../ace-wire" }
+ace-media = { path = "../ace-media" }
