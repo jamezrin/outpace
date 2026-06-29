@@ -199,6 +199,7 @@ mod tests {
             ut_metadata_id: 2,
             mi: None,
             node: Default::default(),
+            peer_ip: None,
         };
         session.send_extended_handshake(&hs).await.unwrap();
 

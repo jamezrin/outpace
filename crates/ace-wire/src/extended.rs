@@ -49,6 +49,8 @@ pub struct OutgoingExtendedHandshake {
     pub mi: Option<LivePosition>,
     /// Node identity/announce fields signed into the handshake.
     pub node: NodeFields,
+    /// The recipient peer's IP as 4 bytes (the `yourip` field; anti-spoof). None to omit.
+    pub peer_ip: Option<[u8; 4]>,
 }
 
 impl OutgoingExtendedHandshake {
@@ -85,21 +87,43 @@ impl OutgoingExtendedHandshake {
         Bencode::Dict(self.base_fields()).encode()
     }
 
-    /// Build the payload carrying our node identity and a valid signature (note 17):
-    /// add `node_id` + announce fields, compute `SHA256(bencode(dict, signature=zeros))`,
-    /// Ed25519-sign it, and emit the dict with the real `signature`.
+    /// Build the payload carrying our node identity and a valid signature over the FULL
+    /// accepted field set (note 19): identity + announce fields + rich `mi` + `yourip`,
+    /// signed as `SHA256(bencode(dict, signature=zeros))` then Ed25519.
     pub fn sign_and_encode(&self, id: &Identity) -> Vec<u8> {
-        let mut f = self.base_fields();
-        f.insert(b"node_id".to_vec(), Bencode::Bytes(id.node_id().to_vec()));
-        f.insert(b"ts".to_vec(), Bencode::Int(self.node.ts));
-        f.insert(b"v".to_vec(), Bencode::Int(self.node.v));
-        f.insert(b"pv".to_vec(), Bencode::Int(self.node.pv));
-        f.insert(b"p".to_vec(), Bencode::Int(self.node.p));
-        f.insert(b"nt".to_vec(), Bencode::Int(self.node.nt));
-        f.insert(b"platform".to_vec(), Bencode::Int(self.node.platform));
+        let bi = |n: i64| Bencode::Int(n);
+        let bb = |b: &[u8]| Bencode::Bytes(b.to_vec());
+        let mut f = self.base_fields(); // ace_metadata_version, m, mi(min/max/pos/dist)
+        // Promote `mi` to the full live-position dict peers expect.
+        if let Some(p) = self.mi {
+            let mut mi: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+            for (k, v) in [
+                ("distance_from_source", p.distance_from_source), ("down_rate", 0),
+                ("download_window_end", -1), ("is_accessible", 0),
+                ("live_window_size", (p.max_piece - p.min_piece + 1).max(0)), ("lsp", -1),
+                ("mam", -1), ("max_piece", p.max_piece), ("min_piece", p.min_piece),
+                ("peer_type", 0), ("ping_from_source", -1), ("position", p.position),
+                ("time_from_source", -1), ("top_session_up_rate", 0), ("top_up_rate", 0),
+                ("up_rate", 0), ("upload_rating", 0),
+            ] { mi.insert(k.as_bytes().to_vec(), bi(v)); }
+            f.insert(b"mi".to_vec(), Bencode::Dict(mi));
+        }
+        f.insert(b"asn".to_vec(), bi(0));
+        f.insert(b"asn_country".to_vec(), bb(b""));
+        f.insert(b"geoip_country".to_vec(), bb(b""));
+        f.insert(b"lsp".to_vec(), bi(-1));
+        f.insert(b"node_id".to_vec(), bb(&id.node_id()));
+        f.insert(b"nt".to_vec(), bi(self.node.nt));
+        f.insert(b"p".to_vec(), bi(self.node.p));
+        f.insert(b"platform".to_vec(), bi(self.node.platform));
+        f.insert(b"pv".to_vec(), bi(self.node.pv));
+        f.insert(b"stream_statuses".to_vec(), Bencode::Dict(BTreeMap::new()));
+        f.insert(b"ts".to_vec(), bi(self.node.ts));
+        f.insert(b"tt".to_vec(), bb(b"bt"));
+        f.insert(b"v".to_vec(), bi(self.node.v));
+        if let Some(ip) = self.peer_ip { f.insert(b"yourip".to_vec(), bb(&ip)); }
         let digest = handshake_digest(&f);
-        let sig = id.sign(&digest);
-        f.insert(b"signature".to_vec(), Bencode::Bytes(sig.to_vec()));
+        f.insert(b"signature".to_vec(), Bencode::Bytes(id.sign(&digest).to_vec()));
         Bencode::Dict(f).encode()
     }
 }
@@ -144,6 +168,7 @@ mod tests {
             ut_metadata_id: 2,
             mi: None,
             node: NodeFields::default(),
+            peer_ip: None,
         }
         .encode_payload();
         let parsed = ExtendedHandshake::parse(&payload).unwrap();
@@ -167,6 +192,7 @@ mod tests {
                 distance_from_source: 0,
             }),
             node: NodeFields { ts: 12345, ..NodeFields::default() },
+            peer_ip: None,
         }
         .sign_and_encode(&id);
 
@@ -184,6 +210,34 @@ mod tests {
     }
 
     #[test]
+    fn full_signed_handshake_has_all_accepted_fields_and_verifies() {
+        use crate::identity::{verify_handshake, Identity};
+        let id = Identity::generate();
+        let hs = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: Some(LivePosition { min_piece: 100, max_piece: 163, position: -1, distance_from_source: -1 }),
+            node: NodeFields { ts: 5000, ..NodeFields::default() },
+            peer_ip: Some([95, 17, 44, 10]),
+        };
+        let payload = hs.sign_and_encode(&id);
+        let dict = match Bencode::parse(&payload).unwrap() { Bencode::Dict(d) => d, _ => panic!() };
+        for k in [b"ace_metadata_version".as_slice(), b"asn", b"asn_country", b"geoip_country",
+                  b"lsp", b"m", b"mi", b"node_id", b"nt", b"p", b"platform", b"pv",
+                  b"signature", b"stream_statuses", b"ts", b"tt", b"v", b"yourip"] {
+            assert!(dict.contains_key(k), "missing key {:?}", std::str::from_utf8(k));
+        }
+        assert_eq!(dict[b"tt".as_slice()].as_bytes(), Some(b"bt".as_slice()));
+        assert_eq!(dict[b"yourip".as_slice()].as_bytes(), Some([95u8, 17, 44, 10].as_slice()));
+        let mi = match &dict[b"mi".as_slice()] { Bencode::Dict(d) => d, _ => panic!() };
+        assert_eq!(mi[b"min_piece".as_slice()].as_int(), Some(100));
+        assert_eq!(mi[b"max_piece".as_slice()].as_int(), Some(163));
+        let node_id: [u8; 32] = dict[b"node_id".as_slice()].as_bytes().unwrap().try_into().unwrap();
+        let sig: [u8; 64] = dict[b"signature".as_slice()].as_bytes().unwrap().try_into().unwrap();
+        assert!(verify_handshake(&node_id, &sig, &dict));
+    }
+
+    #[test]
     fn encodes_mi_live_position() {
         let payload = OutgoingExtendedHandshake {
             ace_metadata_version: 1,
@@ -195,6 +249,7 @@ mod tests {
                 distance_from_source: 5,
             }),
             node: NodeFields::default(),
+            peer_ip: None,
         }
         .encode_payload();
         let parsed = ExtendedHandshake::parse(&payload).unwrap();
