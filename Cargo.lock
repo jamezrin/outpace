@@ -46,6 +46,7 @@ dependencies = [
  "aes",
  "bytes",
  "cbc",
+ "rand",
  "tokio",
 ]
 
