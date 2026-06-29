@@ -23,9 +23,13 @@ Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 | 0 Protocol recovery | ✅ done | Specs + vectors + go/no-go memo (GO) |
 | 1 `ace-wire` | ✅ done | infohash, bencode, handshake, msg framing, extended HS, **transport decoder** |
 | 2 `ace-tracker` + `ace-peer` | ✅ done | BEP-15 UDP tracker; async peer session (handshake + read) — both verified live |
-| 3 piece download → media → engine | 🔜 IN PROGRESS | transport decoder done (3.1); **next = get piece bytes flowing** |
+| 3 piece download → media → engine | 🔜 IN PROGRESS | transport decoder (3.1); **deterministic domain logic built** (live picker, piece reassembler, ace-media TS/HLS, ace-engine routes); **blocked on live piece bytes** = node-identity preimage |
 
-Crates: `crates/{ace-wire,ace-tracker,ace-peer}`. Workspace `Cargo.toml` at root.
+Crates: `crates/{ace-wire,ace-tracker,ace-peer,ace-media,ace-engine}`. Workspace root `Cargo.toml`.
+**Pure Phase 3/4 logic done (no live data needed):** `ace_wire::live` (LiveWindow/LivePicker),
+`ace_wire::reassembly` (PieceReassembler: chunks→ordered bytes), `ace_media::{mpegts,hls}`
+(TS align + HLS segment/manifest), `ace_engine::routes` (6878 URL surface). What's left needs
+the live byte path: peer download loop / `ace-swarm`, then wire `ace-media`+`ace-engine` to it.
 
 ## The protocol in one screen (all reverse-engineered + validated)
 - Acestream is a **BitTornado (BitTorrent) fork**.
