@@ -23,13 +23,40 @@ Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 | 0 Protocol recovery | ✅ done | Specs + vectors + go/no-go memo (GO) |
 | 1 `ace-wire` | ✅ done | infohash, bencode, handshake, msg framing, extended HS, **transport decoder** |
 | 2 `ace-tracker` + `ace-peer` | ✅ done | BEP-15 UDP tracker; async peer session (handshake + read) — both verified live |
-| 3 piece download → media → engine | 🔜 CORE PROVEN | **live HD video downloaded from the real swarm** (note 19: full signed handshake → UNCHOKE → Acestream piece requests → MPEG-TS → ffmpeg decodes 1920×1080 H.264+AAC). Remaining: promote inline recon protocol into `ace-wire`/`ace-swarm`, glitch-free cross-piece muxing, wire `ace-media`+`ace-engine`, point VLC at it |
+| 3 piece download → media → engine | ✅ done | **live HD video downloaded from the real swarm** (note 19: full signed handshake → UNCHOKE → Acestream piece requests → MPEG-TS → ffmpeg decodes 1920×1080 H.264+AAC). Protocol promoted into `ace-wire`/`ace-swarm` |
+| 4 productization (outpace daemon) | ✅ built, ⏳ live-verify | Clean provider-abstracted daemon: `StreamProvider`/`TsSource` + `ProviderRegistry`, shared `StreamSession` broadcast fan-out (one download → many clients, **acexy-parity out of the box**), `StreamManager`, axum HTTP API, live HLS, config + persistent identity, tracker discovery, transport→`StreamInfo` resolve, `AceProvider`. All tests green + clippy clean; daemon boots & serves the clean API. **Remaining (live, operator-run):** point VLC at a real stream (Task 20) and root-cause the −4 B/piece muxing drift (Task 19) — both need the live swarm. Plan: `docs/superpowers/plans/2026-06-29-outpace-daemon.md`; spec: `docs/superpowers/specs/2026-06-29-outpace-daemon-design.md` |
 
 Crates: `crates/{ace-wire,ace-tracker,ace-peer,ace-media,ace-engine}`. Workspace root `Cargo.toml`.
 **Pure Phase 3/4 logic done (no live data needed):** `ace_wire::live` (LiveWindow/LivePicker),
 `ace_wire::reassembly` (PieceReassembler: chunks→ordered bytes), `ace_media::{mpegts,hls}`
 (TS align + HLS segment/manifest), `ace_engine::routes` (6878 URL surface). What's left needs
 the live byte path: peer download loop / `ace-swarm`, then wire `ace-media`+`ace-engine` to it.
+
+## Run the daemon + verify VLC (live, operator-run)
+The daemon binary is `outpace` (`cargo run -p ace-engine --bin outpace`). The clean API:
+`GET /healthz`, `/networks`, `/streams`, `/streams/{network}/{id}.ts` (live MPEG-TS),
+`/streams/{network}/{id}.m3u8` (+ `/seg/{n}.ts`), `/streams/{network}/{id}/status`.
+`{network}` is the provider key (`ace` today). **No `ace`/`acestream` baggage** elsewhere.
+
+Default bind is `127.0.0.1:6878` (collides with a running official engine — override with
+`OUTPACE_BIND`). Tracker/DHT/ut_metadata discovery for a bare infohash isn't wired yet, so
+bootstrap a known peer (the proven live path) via `OUTPACE_ACE_PEERS`:
+
+```sh
+# Use a current peer + infohash (peers churn; same ones the recon test uses):
+OUTPACE_BIND=127.0.0.1:6900 \
+OUTPACE_ACE_PEERS=82.213.234.240:8623 \
+  cargo run -p ace-engine --bin outpace
+
+# In another shell — VLC (or ffmpeg) plays from our daemon:
+vlc http://127.0.0.1:6900/streams/ace/<40-hex-infohash>.ts
+# Gapless-muxing workaround for the known −4 B/piece drift (Task 19):
+ffmpeg -err_detect ignore_err -fflags +discardcorrupt -i \
+  http://127.0.0.1:6900/streams/ace/<infohash>.ts -c copy out.ts
+```
+
+Multi-client check: open the same URL from two players — `GET /streams` shows ONE session
+with `clients: 2` (single shared swarm download).
 
 ## The protocol in one screen (all reverse-engineered + validated)
 - Acestream is a **BitTornado (BitTorrent) fork**.
