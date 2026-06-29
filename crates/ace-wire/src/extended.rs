@@ -1,6 +1,7 @@
 //! BEP-10 extended handshake (the `Extended { ext_id: 0 }` payload), with the
 //! Acestream metadata keys observed in capture (see docs/protocol/wire-protocol.md).
 use crate::bencode::Bencode;
+use crate::identity::{handshake_digest, Identity};
 use crate::{Result, WireError};
 use std::collections::BTreeMap;
 
@@ -19,6 +20,26 @@ pub struct LivePosition {
 /// bencoded bytes that follow the `<ext_id>` byte in an `Extended` peer message.
 ///
 /// [`encode_payload`]: OutgoingExtendedHandshake::encode_payload
+/// Node identity / announce fields a real peer carries in its extended handshake
+/// (see note 17). `v`/`pv`/`p`/`nt`/`platform` default to the values the engine sends;
+/// `ts` is a per-connection counter — any self-consistent value works for us.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeFields {
+    pub ts: i64,
+    pub v: i64,
+    pub pv: i64,
+    pub p: i64,
+    pub nt: i64,
+    pub platform: i64,
+}
+
+impl Default for NodeFields {
+    fn default() -> Self {
+        // Mirrors observed engine 3.2.11 handshakes.
+        NodeFields { ts: 0, v: 3021100, pv: 2, p: 8621, nt: 1, platform: 2 }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OutgoingExtendedHandshake {
     pub ace_metadata_version: i64,
@@ -26,11 +47,13 @@ pub struct OutgoingExtendedHandshake {
     pub ut_metadata_id: i64,
     /// Optional live position; when present, emitted as the `mi` sub-dict.
     pub mi: Option<LivePosition>,
+    /// Node identity/announce fields signed into the handshake.
+    pub node: NodeFields,
 }
 
 impl OutgoingExtendedHandshake {
-    /// Build the bencoded extended-handshake payload (the bytes after `<ext_id>`).
-    pub fn encode_payload(&self) -> Vec<u8> {
+    /// The base BEP-10 fields (no node identity): `ace_metadata_version`, `m`, `mi`.
+    fn base_fields(&self) -> BTreeMap<Vec<u8>, Bencode> {
         let mut root: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
         root.insert(
             b"ace_metadata_version".to_vec(),
@@ -52,8 +75,32 @@ impl OutgoingExtendedHandshake {
             );
             root.insert(b"mi".to_vec(), Bencode::Dict(mi));
         }
+        root
+    }
 
-        Bencode::Dict(root).encode()
+    /// Build the bencoded extended-handshake payload WITHOUT a node identity (BEP-10
+    /// base only). Use [`sign_and_encode`](Self::sign_and_encode) for a handshake peers
+    /// will accept.
+    pub fn encode_payload(&self) -> Vec<u8> {
+        Bencode::Dict(self.base_fields()).encode()
+    }
+
+    /// Build the payload carrying our node identity and a valid signature (note 17):
+    /// add `node_id` + announce fields, compute `SHA256(bencode(dict, signature=zeros))`,
+    /// Ed25519-sign it, and emit the dict with the real `signature`.
+    pub fn sign_and_encode(&self, id: &Identity) -> Vec<u8> {
+        let mut f = self.base_fields();
+        f.insert(b"node_id".to_vec(), Bencode::Bytes(id.node_id().to_vec()));
+        f.insert(b"ts".to_vec(), Bencode::Int(self.node.ts));
+        f.insert(b"v".to_vec(), Bencode::Int(self.node.v));
+        f.insert(b"pv".to_vec(), Bencode::Int(self.node.pv));
+        f.insert(b"p".to_vec(), Bencode::Int(self.node.p));
+        f.insert(b"nt".to_vec(), Bencode::Int(self.node.nt));
+        f.insert(b"platform".to_vec(), Bencode::Int(self.node.platform));
+        let digest = handshake_digest(&f);
+        let sig = id.sign(&digest);
+        f.insert(b"signature".to_vec(), Bencode::Bytes(sig.to_vec()));
+        Bencode::Dict(f).encode()
     }
 }
 
@@ -96,6 +143,7 @@ mod tests {
             ace_metadata_version: 1,
             ut_metadata_id: 2,
             mi: None,
+            node: NodeFields::default(),
         }
         .encode_payload();
         let parsed = ExtendedHandshake::parse(&payload).unwrap();
@@ -103,6 +151,36 @@ mod tests {
         assert_eq!(parsed.ut_metadata_id(), Some(2));
         // No live position advertised.
         assert!(parsed.raw.get(b"mi").is_none());
+    }
+
+    #[test]
+    fn signed_handshake_verifies_against_our_node_id() {
+        use crate::identity::{verify_handshake, Identity};
+        let id = Identity::generate();
+        let payload = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: Some(LivePosition {
+                min_piece: 100,
+                max_piece: 200,
+                position: 200,
+                distance_from_source: 0,
+            }),
+            node: NodeFields { ts: 12345, ..NodeFields::default() },
+        }
+        .sign_and_encode(&id);
+
+        let parsed = ExtendedHandshake::parse(&payload).unwrap();
+        let dict = match &parsed.raw {
+            Bencode::Dict(d) => d.clone(),
+            _ => panic!(),
+        };
+        let node_id: [u8; 32] =
+            dict[b"node_id".as_slice()].as_bytes().unwrap().try_into().unwrap();
+        let sig: [u8; 64] =
+            dict[b"signature".as_slice()].as_bytes().unwrap().try_into().unwrap();
+        assert_eq!(node_id, id.node_id());
+        assert!(verify_handshake(&node_id, &sig, &dict));
     }
 
     #[test]
@@ -116,6 +194,7 @@ mod tests {
                 position: 200,
                 distance_from_source: 5,
             }),
+            node: NodeFields::default(),
         }
         .encode_payload();
         let parsed = ExtendedHandshake::parse(&payload).unwrap();

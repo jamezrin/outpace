@@ -57,11 +57,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         Ok(())
     }
 
-    /// Send our BEP-10 extended handshake (id 20, sub-id 0).
+    /// Send our BEP-10 extended handshake (id 20, sub-id 0), unsigned (no node identity).
+    /// Real peers require a signed identity — see [`send_signed_extended_handshake`].
+    ///
+    /// [`send_signed_extended_handshake`]: Self::send_signed_extended_handshake
     pub async fn send_extended_handshake(
         &mut self, hs: &ace_wire::extended::OutgoingExtendedHandshake,
     ) -> Result<()> {
         let msg = PeerMessage::Extended { ext_id: 0, payload: hs.encode_payload() };
+        self.send(&msg).await
+    }
+
+    /// Send our extended handshake carrying our node identity + a valid signature
+    /// (note 17), which is what peers require before they will unchoke us.
+    pub async fn send_signed_extended_handshake(
+        &mut self,
+        hs: &ace_wire::extended::OutgoingExtendedHandshake,
+        identity: &ace_wire::identity::Identity,
+    ) -> Result<()> {
+        let msg = PeerMessage::Extended { ext_id: 0, payload: hs.sign_and_encode(identity) };
         self.send(&msg).await
     }
 
@@ -180,7 +194,12 @@ mod tests {
         });
 
         let mut session = PeerSession::new(client);
-        let hs = OutgoingExtendedHandshake { ace_metadata_version: 1, ut_metadata_id: 2, mi: None };
+        let hs = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: None,
+            node: Default::default(),
+        };
         session.send_extended_handshake(&hs).await.unwrap();
 
         match srv.await.unwrap() {
@@ -277,10 +296,21 @@ mod tests {
             })
         };
         let has_mi = mi.is_some();
-        let ours = OutgoingExtendedHandshake { ace_metadata_version: 1, ut_metadata_id: 2, mi };
-        session.send_extended_handshake(&ours).await.unwrap();
-        println!("[recon {peer}] sent our extended handshake (mi={})",
-                 if has_mi { "yes" } else { "no" });
+        // Mint our own Ed25519 identity (node_id = our pubkey) and send a SIGNED handshake.
+        let identity = ace_wire::identity::Identity::generate();
+        let ts: i64 = env("ACE_TS").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let ours = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi,
+            node: ace_wire::extended::NodeFields { ts, ..Default::default() },
+        };
+        session
+            .send_signed_extended_handshake(&ours, &identity)
+            .await
+            .unwrap();
+        println!("[recon {peer}] sent our SIGNED extended handshake (mi={}, node_id={})",
+                 if has_mi { "yes" } else { "no" }, hex::encode(identity.node_id()));
         if env("ACE_NO_INTERESTED").is_none() {
             session.send(&PeerMessage::Interested).await.unwrap();
             println!("[recon {peer}] sent interested");
