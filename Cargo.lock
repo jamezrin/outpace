@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "ace-media"
+version = "0.1.0"
+
+[[package]]
 name = "ace-peer"
 version = "0.1.0"
 dependencies = [
