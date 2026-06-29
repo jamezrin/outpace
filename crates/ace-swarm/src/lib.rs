@@ -9,6 +9,7 @@
 //! The async driver is validated against a live channel that is actually delivering data
 //! (see `docs/RESUME.md` — currently environment-gated); the scheduler is validated here.
 
+pub mod discover;
 pub mod driver;
 pub mod live;
 pub mod scheduler;
