@@ -58,20 +58,22 @@ distance, and even with the full key set if `node_id`/`signature` are dummies. T
 peers serve the official engine. So the gate is a **valid node identity**: `node_id`
 (32 B) + `signature` (64 B) — Ed25519-shaped. We must mint/sign a real one.
 
-**Identity scheme CRACKED (note 15):** `node_id` = an **Ed25519 public key** derived from
-`/root/.ACEStream/device.key` (a 32-byte seed in hex); `signature` = a 64-byte **Ed25519**
-signature (engine uses PyNaCl `_sodium.abi3.so`). Confirmed by exact pubkey match. The
-identity is **self-generated**, so we can mint our own keypair — no engine key needed.
+**Identity scheme CRACKED (notes 15–16):** `node_id` = an **Ed25519 public key** derived
+from `/root/.ACEStream/device.key` (a 32-byte seed in hex) — **confirmed by exact pubkey
+match**; `signature` = a 64-byte **Ed25519** signature. The identity is **self-generated**,
+so we can mint our own keypair — no engine key needed. Signer = **`LiveSourceAuth.sign`**
+(`core/src/live/LiveSourceAuth.pyx`), a Python orchestrator that delegates the actual sign.
 
-1. **Finish the preimage (last mile):** signer located via Ghidra (note 16) =
-   **`LiveSourceAuth.sign`** in `core/src/live/LiveSourceAuth.pyx`, using a **static Ed25519
-   inside `live.so`** (NOT PyNaCl — confirmed: zero `_sodium` `crypto_sign*` calls across an
-   engine restart + 8 handshake builds). So both black-box brute force AND the libsodium hook
-   are dead ends. UPDATE (note 16): `live.so` has NO ed25519/sha512 constants, and no `_sodium`/OpenSSL
-   call fires during handshake builds — the signature is computed **at engine startup / on a
-   timer and cached**, so all attach-after-boot hooks missed it. **Recommended: frida
-   SPAWN-GATE** the engine (hook `_sodium crypto_sign*` + OpenSSL `EVP_DigestSign`/`ED25519_sign`
-   BEFORE it runs) to capture the startup sign's message. Ghidra scripts in `tools/ghidra/`.
+1. **Finish the preimage (last mile) — only unknown left = the exact bytes signed.**
+   Ruled out (don't repeat): brute force (node_id/infohash/ts, all encodings), bencode-dict
+   hypotheses, and hooking `_sodium crypto_sign*` + OpenSSL `EVP_DigestSign`/SHA-512 — none
+   matched / none fired during handshake builds. `live.so` has **no** ed25519/sha512
+   constants. Conclusion: the signature is computed **at engine startup / on a timer and
+   cached** (peers just get the cached value), so every attach-after-boot hook missed it.
+   **Recommended: frida SPAWN-GATE** the engine — install the `_sodium crypto_sign*` +
+   OpenSSL `EVP_DigestSign`/`ED25519_sign` hooks *before* it runs (`frida -f /app/acestreamengine
+   <argv>` in the container, or hook+idle several minutes to catch a periodic re-sign) and
+   read the message (`m`/`mlen`). Ghidra scripts + decompiled `sign` in `tools/ghidra/`.
 2. **Mint + sign:** new `ace-identity` (Ed25519) + extend `OutgoingExtendedHandshake` to
    carry `node_id`/`signature`/`ts`/`v`/`pv`/`p`/`platform`/`nt`; re-run `live_recon_unchoke`
    → expect acceptance + unchoke.
