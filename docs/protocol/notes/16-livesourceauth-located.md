@@ -45,6 +45,23 @@ Scripts are committed in `tools/ghidra/`. A copy of the decompiled `sign` wrappe
   (`FUN_00286730`) is just a Python-level orchestrator (attribute calls, returns a
   `PyList_New(2)` — likely `[signature, ...]`); the byte assembly + sign are in a callee.
 
+## CORRECTION / key insight (most important for next session)
+`live.so` contains **no** SHA-512/SHA-256/ed25519 constants (searched IV `6a09e667…`,
+K `428a2f98…`, ed25519 `L`). So the Ed25519 is **not vendored in `live.so`** either.
+Reconciling with "no `_sodium`/OpenSSL calls fired during handshake builds": the signature
+is almost certainly computed **once at engine startup (or on a background timer), then
+cached** — every peer handshake just emits the cached `signature`/`ts`. The earlier
+observation that it "changes with `ts` over minutes" fits a periodic/lazy re-sign, not a
+per-handshake one. **All my hooks attached *after* boot, so they missed the startup sign.**
+→ This *reopens* the dynamic capture (likely PyNaCl `crypto_sign` or OpenSSL after all).
+**Next step: frida SPAWN-GATE the engine** (`frida -f /app/acestreamengine <args>` inside the
+container, or attach within the first ~100 ms of process start) with the `_sodium`
+`crypto_sign*` + OpenSSL `EVP_DigestSign`/`ED25519_sign` hooks installed *before* it runs,
+so the startup signing is captured with its `m`/`mlen`. Engine argv (PID 1 `start-engine`):
+`/app/acestreamengine --client-console --bind-all --log-stderr --log-stderr-level debug
+--log-modules root:D`. Confirm whether re-signs are periodic (hook + idle-wait several
+minutes) as a simpler alternative to spawn-gating.
+
 ## The remaining task (two viable routes)
 1. **Read the code (deterministic).** Trace `LiveSourceAuth`'s message assembly: the
    method that builds the bytes passed to the static Ed25519 sign. Obstacle: Cython

@@ -67,10 +67,11 @@ identity is **self-generated**, so we can mint our own keypair — no engine key
    **`LiveSourceAuth.sign`** in `core/src/live/LiveSourceAuth.pyx`, using a **static Ed25519
    inside `live.so`** (NOT PyNaCl — confirmed: zero `_sodium` `crypto_sign*` calls across an
    engine restart + 8 handshake builds). So both black-box brute force AND the libsodium hook
-   are dead ends. Two routes left: (a) trace the message assembly in the decompiled
-   `LiveSourceAuth` (resolve Cython interned-string globals), or (b) **recommended** — find
-   the static ed25519 sign callee in Ghidra and Frida-hook *that address in `live.so`* to dump
-   the message arg directly. Ghidra scripts + decompiled `sign` are in `tools/ghidra/`.
+   are dead ends. UPDATE (note 16): `live.so` has NO ed25519/sha512 constants, and no `_sodium`/OpenSSL
+   call fires during handshake builds — the signature is computed **at engine startup / on a
+   timer and cached**, so all attach-after-boot hooks missed it. **Recommended: frida
+   SPAWN-GATE** the engine (hook `_sodium crypto_sign*` + OpenSSL `EVP_DigestSign`/`ED25519_sign`
+   BEFORE it runs) to capture the startup sign's message. Ghidra scripts in `tools/ghidra/`.
 2. **Mint + sign:** new `ace-identity` (Ed25519) + extend `OutgoingExtendedHandshake` to
    carry `node_id`/`signature`/`ts`/`v`/`pv`/`p`/`platform`/`nt`; re-run `live_recon_unchoke`
    → expect acceptance + unchoke.
