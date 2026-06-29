@@ -10,5 +10,6 @@
 //! (see `docs/RESUME.md` — currently environment-gated); the scheduler is validated here.
 
 pub mod driver;
+pub mod live;
 pub mod scheduler;
 pub mod types;
