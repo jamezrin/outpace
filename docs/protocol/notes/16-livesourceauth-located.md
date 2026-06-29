@@ -30,6 +30,21 @@ Scripts are committed in `tools/ghidra/`. A copy of the decompiled `sign` wrappe
 `tools/ghidra/LiveSourceAuth.sign.decompiled.txt`. (`live.so` itself is under git-ignored
 `re/`.)
 
+## Ruled out (do not repeat)
+- **Brute force** of Ed25519 over the seed for node_id/infohash/ts in every encoding
+  (LE/BE 2/4/8, ASCII, hex) and orderings — no match (note 15).
+- **bencode-dict hypotheses**: `sign(bencode(handshake_dict))` minus `signature`, minus
+  `signature`+`yourip`, with `signature` set to `b""`/64 zeros — none match.
+- **libsodium** (`_sodium.abi3.so`): hooked every `crypto_sign*`/`*_seed_keypair` across an
+  engine restart + fresh handshake builds — **zero** calls.
+- **OpenSSL** (`libcrypto.so.3`): hooked `EVP_DigestSign`/`EVP_DigestSignUpdate`/
+  `EVP_DigestSignFinal`/`EVP_PKEY_sign` (and tried `ED25519_sign`, not exported) across a
+  restart + 6 fresh handshakes — **zero** calls.
+  → conclusion: the Ed25519 (and almost certainly its SHA-512) are **fully vendored inside
+  `live.so`** (no external crypto calls during signing). `LiveSourceAuth.sign`
+  (`FUN_00286730`) is just a Python-level orchestrator (attribute calls, returns a
+  `PyList_New(2)` — likely `[signature, ...]`); the byte assembly + sign are in a callee.
+
 ## The remaining task (two viable routes)
 1. **Read the code (deterministic).** Trace `LiveSourceAuth`'s message assembly: the
    method that builds the bytes passed to the static Ed25519 sign. Obstacle: Cython
@@ -45,6 +60,11 @@ Scripts are committed in `tools/ghidra/`. A copy of the decompiled `sign` wrappe
    the message buffer is assembled). Take its file offset, then Frida-hook that **address
    in `live.so`** (`Process.getModuleByName('live.so').base.add(0x...)`) and dump the
    message argument — exactly the preimage. This sidesteps the Cython-string problem.
+   *Concrete sub-step:* find the vendored **SHA-512** inside `live.so` (search for the
+   SHA-512 round-constant table starting `428a2f98d728ae22…` / IV `6a09e667f3bcc908`), then
+   Frida-hook the SHA-512 update at `live.so.base + offset`. Ed25519 sign hashes
+   `prefix(32) || message` and then `R(32) || A(32) || message`, so the **message bytes
+   appear in the SHA-512 input** — read them off directly. Likely the fastest finish.
 
 Once the preimage is known: mint our own Ed25519 keypair, replicate the signature over the
 same byte layout (with our own `node_id`/`ts`), put `node_id`/`signature`/`ts`/`v`/`pv`/`p`/
