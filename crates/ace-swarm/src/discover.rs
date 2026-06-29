@@ -1,10 +1,12 @@
 //! Peer discovery: announce to the stream's UDP trackers (BEP-15) and aggregate the unique
 //! peers they return. DHT discovery is a documented follow-up (see the design spec).
 
+use crate::dht::dht_get_peers;
 use ace_tracker::client::announce;
 use ace_tracker::codec::TransferState;
 use std::collections::BTreeSet;
 use std::net::SocketAddrV4;
+use std::time::Duration;
 use tokio::net::lookup_host;
 
 /// Resolve `udp://host:port[/...]` tracker URLs to socket addresses.
@@ -32,8 +34,9 @@ pub async fn resolve_trackers(trackers: &[String]) -> Vec<SocketAddrV4> {
     out
 }
 
-/// Announce to every tracker and return the union of returned peers. Tracker failures are
-/// skipped (best-effort); `left` advertises we still need data.
+/// Discover peers for `infohash` from both the UDP trackers and the mainline DHT, returning
+/// their union. Acestream swarms are largely DHT-populated, so DHT is the primary source;
+/// tracker announces are best-effort and skipped on failure.
 pub async fn discover_peers(
     trackers: &[String],
     infohash: &[u8; 20],
@@ -47,6 +50,7 @@ pub async fn discover_peers(
             peers.extend(found);
         }
     }
+    peers.extend(dht_get_peers(infohash, Duration::from_secs(15)).await);
     peers.into_iter().collect()
 }
 

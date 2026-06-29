@@ -7,8 +7,9 @@ edition = "2021"
 ace-wire = { path = "../ace-wire" }
 ace-peer = { path = "../ace-peer" }
 ace-tracker = { path = "../ace-tracker" }
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 bytes = "1"
+rand = "0.8"
 
 [dev-dependencies]
 ace-media = { path = "../ace-media" }
