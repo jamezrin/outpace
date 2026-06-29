@@ -1,12 +1,47 @@
-//! outpace engine daemon entry point.
-//!
-//! Scaffolding: the HTTP server + session manager are wired once the live piece path is
-//! unblocked (node-identity preimage → unchoke → piece loop). For now this reports the
-//! available route surface so the binary builds and runs.
+//! outpace daemon entry point: one shared swarm download per stream, fanned out to many
+//! HTTP clients behind a clean `/streams/{network}/{id}` API (no acexy wrapper needed).
 
-fn main() {
+use ace_engine::ace_provider::AceProvider;
+use ace_engine::config::{load_or_create_identity, Config};
+use ace_engine::http::{router, AppState};
+use ace_engine::manager::StreamManager;
+use ace_engine::provider::ProviderRegistry;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = Config::default();
+    if let Ok(bind) = std::env::var("OUTPACE_BIND") {
+        config.bind = bind.parse()?;
+    }
+    if let Ok(dir) = std::env::var("OUTPACE_DATA_DIR") {
+        config.data_dir = dir.into();
+    }
+    let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
     eprintln!(
-        "outpace ace-engine (scaffolding). HTTP route surface ready; \
-         live data path pending the node-identity preimage (see docs/protocol/notes/16)."
+        "outpace: node_id={} data_dir={}",
+        hex_node_id(&identity),
+        config.data_dir.display()
     );
+
+    // Register enabled providers. Only "ace" exists today; the registry is the seam for more.
+    let mut registry = ProviderRegistry::new();
+    if config.networks.iter().any(|n| n == "ace") {
+        registry.register(Arc::new(AceProvider::new(identity.clone(), config.bind.port())));
+    }
+    let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
+
+    let manager = StreamManager::new(registry);
+    manager.spawn_reaper();
+    let state = AppState { manager, networks: networks.clone() };
+
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    eprintln!("outpace: listening on http://{} networks={:?}", config.bind, networks);
+    eprintln!("  play:  http://{}/streams/ace/<infohash>.ts", config.bind);
+    axum::serve(listener, router(state)).await?;
+    Ok(())
+}
+
+fn hex_node_id(identity: &ace_wire::identity::Identity) -> String {
+    identity.node_id().iter().map(|b| format!("{b:02x}")).collect()
 }
