@@ -7,6 +7,7 @@ pub mod handshake;
 pub mod infohash;
 pub mod identity;
 pub mod live;
+pub mod live_codec;
 pub mod reassembly;
 pub mod message;
 pub mod transport;
