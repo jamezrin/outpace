@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ace-swarm"
+version = "0.1.0"
+dependencies = [
+ "ace-wire",
+]
+
+[[package]]
 name = "ace-tracker"
 version = "0.1.0"
 dependencies = [
