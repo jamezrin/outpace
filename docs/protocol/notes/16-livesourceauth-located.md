@@ -81,8 +81,21 @@ not per-handshake or per-stream); peers always receive that cached value. The ea
    required (start-engine sets only that).
 3. `frida.resume`, let it boot fully; the startup node-identity sign fires →
    `crypto_sign`/`EVP_DigestSign` `m`/`mlen` = **the exact preimage**.
-   (A port-conflicting spawn alongside PID 9 does NOT reach the sign — confirmed twice.)
+   (A port-conflicting spawn alongside PID 9 does NOT reach the sign — confirmed THREE
+   ways: crippled env, correct `LD_LIBRARY_PATH`, and the running engine's *exact*
+   `/proc/9/environ`. In every case the spawned instance never even loads `_sodium`/
+   `libcrypto` within 45–75 s — node-identity init isn't reached while ports are held.)
 Restore afterwards with `docker restart sandbox-acestream-1`.
+
+**Why step 1 (stop PID 9) is unavoidable for the dynamic route:** the container's PID 1 is
+`/bin/sh /app/start-engine`, which runs `acestreamengine` as a *child* (no `exec`), so
+killing the engine makes PID 1 exit → the container stops. A clean capture therefore needs
+the container re-architected (e.g. `docker compose run` an engine with a tweaked entrypoint
+that frida-spawns it), or just accept the container bounce: stop engine → spawn clean under
+frida → capture startup sign → `docker restart`. This is the deliberate, somewhat
+disruptive step left; everything non-disruptive is exhausted. The **static route (a)** —
+resolving Cython interned strings to read `LiveSourceAuth`'s message assembly — avoids the
+engine entirely and may be the calmer path.
 
 ## The remaining task (two viable routes)
 1. **Read the code (deterministic).** Trace `LiveSourceAuth`'s message assembly: the
