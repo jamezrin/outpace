@@ -12,5 +12,6 @@
 pub mod discover;
 pub mod driver;
 pub mod live;
+pub mod resolve;
 pub mod scheduler;
 pub mod types;
