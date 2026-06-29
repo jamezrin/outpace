@@ -68,25 +68,23 @@ match**; `signature` = a 64-byte **Ed25519** signature. The identity is **self-g
 so we can mint our own keypair — no engine key needed. Signer = **`LiveSourceAuth.sign`**
 (`core/src/live/LiveSourceAuth.pyx`), a Python orchestrator that delegates the actual sign.
 
-1. **Finish the preimage (last mile) — only unknown left = the exact bytes signed.**
-   Ruled out (don't repeat): brute force (node_id/infohash/ts, all encodings), bencode-dict
-   hypotheses, and hooking `_sodium crypto_sign*` + OpenSSL `EVP_DigestSign`/SHA-512 — none
-   matched / none fired during handshake builds. `live.so` has **no** ed25519/sha512
-   constants. Conclusion: the signature is computed **at engine startup / on a timer and
-   cached** (peers just get the cached value), so every attach-after-boot hook missed it.
-   CONCLUSIVE (note 16): a 400s window with hooks *definitively* installed + triggers caught
-   ZERO crypto calls — the signature is computed **once at engine startup** (engine-global
-   identity); it only changed across my restarts. **Capture procedure (disruptive):** stop
-   the running engine, then `frida.spawn` a clean instance with `env LD_LIBRARY_PATH=/app/lib`
-   and the lazy per-module hook (`scratchpad/spawn_driver2.py` + `hook_lazy.js`), resume, and
-   read `crypto_sign`/`EVP_DigestSign` `m`/`mlen` at startup = the preimage. (A port-conflicting
-   spawn alongside the running engine does NOT reach the sign — confirmed.) Ghidra scripts in
-   `tools/ghidra/`.
-2. **Mint + sign:** new `ace-identity` (Ed25519) + extend `OutgoingExtendedHandshake` to
-   carry `node_id`/`signature`/`ts`/`v`/`pv`/`p`/`platform`/`nt`; re-run `live_recon_unchoke`
+1. **Preimage — SOLVED & verified (note 17).** The signature is computed **per-connection**:
+   ```
+   digest32  = SHA256( bencode(handshake_dict, signature := 64 × 0x00) )   # canonical sorted-key bencode
+   signature = Ed25519_detached_sign(secret_key, digest32)
+   ```
+   `node_id` = the Ed25519 public key (self-generated; mint our own). Confirmed by
+   `Ed25519_verify(node_id, signature, digest32)` passing **6/6** on live engine handshakes.
+   (Note 16's "once at startup" was wrong — an attach-timing artifact; cracked by
+   `docker restart` + **race-attach during boot** so `crypto_sign_detached` is hooked before
+   the node signs.) Vectors: committed verify-only set in `tests/vectors/node-identity/`;
+   full RE artifacts in `re/captures/node-identity/` (gitignored).
+2. **Mint + sign:** Ed25519 identity in `ace_wire` + canonical bencode encoder; extend
+   `OutgoingExtendedHandshake` to carry `node_id`/`signature`/`ts`/`v`/`pv`/`p`/`platform`/`nt`
+   and sign (zero-sig → SHA256 → detached sign) before send; re-run `live_recon_unchoke`
    → expect acceptance + unchoke.
-3. Then: live piece loop (request within `[min_piece, max_piece]`), `ace-swarm` →
-   `ace-media` (MPEG-TS) → `ace-engine` (`:6878` `/ace/getstream`). Verify in VLC.
+3. Then: live piece loop (request within `[min_piece, max_piece]`), `ace-swarm` → wire
+   `ace-media` (MPEG-TS/HLS — built) + `ace-engine` (routes built) to it. Verify in VLC.
 
 The engine listens for peers on **TCP 8621** (container IP `172.23.0.2`): connecting there
 with our client + the current infohash makes it reply as a peer with its full signed
