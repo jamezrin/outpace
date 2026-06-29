@@ -11,3 +11,4 @@
 
 pub mod driver;
 pub mod scheduler;
+pub mod types;
