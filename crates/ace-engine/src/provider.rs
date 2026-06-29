@@ -1,0 +1,86 @@
+//! Provider abstraction: the single seam between the generic engine and a network's
+//! protocol. The `{network}` segment in the URL selects a `StreamProvider` via
+//! `ProviderRegistry`. The generic engine never names a network.
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Stats snapshot for `/status` (clean field names only).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceStats {
+    pub peers: u32,
+    pub bitrate: u64,  // bits/sec
+    pub buffer_ms: u64, // buffered duration estimate
+}
+
+/// A live MPEG-TS byte source for one stream.
+#[async_trait]
+pub trait TsSource: Send {
+    /// Next contiguous MPEG-TS chunk, or None at end-of-stream.
+    async fn next(&mut self) -> Option<Bytes>;
+    fn stats(&self) -> SourceStats;
+}
+
+/// Adapter for one network (e.g. "ace").
+#[async_trait]
+pub trait StreamProvider: Send + Sync {
+    fn network(&self) -> &'static str;
+    /// Open a live TS source for `id` (the provider resolves/discovers internally).
+    async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError>;
+}
+
+#[derive(Debug)]
+pub enum ProviderError {
+    NotFound,
+    Backend(String),
+}
+
+/// Maps network name → provider.
+#[derive(Default, Clone)]
+pub struct ProviderRegistry {
+    providers: HashMap<&'static str, Arc<dyn StreamProvider>>,
+}
+
+impl ProviderRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn register(&mut self, p: Arc<dyn StreamProvider>) {
+        self.providers.insert(p.network(), p);
+    }
+    pub fn get(&self, network: &str) -> Option<Arc<dyn StreamProvider>> {
+        self.providers.get(network).cloned()
+    }
+    pub fn networks(&self) -> Vec<&'static str> {
+        let mut v: Vec<_> = self.providers.keys().copied().collect();
+        v.sort();
+        v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyProvider;
+    #[async_trait]
+    impl StreamProvider for DummyProvider {
+        fn network(&self) -> &'static str {
+            "dummy"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Err(ProviderError::NotFound)
+        }
+    }
+
+    #[test]
+    fn registry_registers_and_looks_up() {
+        let mut r = ProviderRegistry::new();
+        r.register(Arc::new(DummyProvider));
+        assert!(r.get("dummy").is_some());
+        assert!(r.get("nope").is_none());
+        assert_eq!(r.networks(), vec!["dummy"]);
+    }
+}

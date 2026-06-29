@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "ace-engine"
+name = "outpace"
 path = "src/main.rs"
 
 [lib]
@@ -14,3 +14,6 @@ path = "src/lib.rs"
 [dependencies]
 ace-wire = { path = "../ace-wire" }
 ace-media = { path = "../ace-media" }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+async-trait = "0.1"
