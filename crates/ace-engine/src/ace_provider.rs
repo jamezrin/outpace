@@ -106,6 +106,7 @@ impl StreamProvider for AceProvider {
         let mut all = self.bootstrap_peers.clone();
         all.append(&mut peers);
         let peers = all;
+        eprintln!("[ace] open {id}: discovered {} peer(s)", peers.len());
         if peers.is_empty() {
             return Err(ProviderError::Backend("no peers (no trackers/bootstrap)".into()));
         }
@@ -138,11 +139,14 @@ async fn follow_live(
         let Ok(Ok(mut session)) =
             tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
         else {
+            eprintln!("[ace] {addr}: connect failed/timed out");
             continue;
         };
         if session.perform_handshake(info.infohash, random_peer_id()).await.is_err() {
+            eprintln!("[ace] {addr}: BT handshake failed");
             continue;
         }
+        eprintln!("[ace] {addr}: connected + handshaked");
         peer_count.store(1, Ordering::Relaxed);
         match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx).await {
             FollowEnd::ConsumerGone => return,
@@ -169,10 +173,12 @@ async fn follow_one_peer(
 ) -> FollowEnd {
     // 1. Read the peer's advertised live window (their unsolicited extended handshake).
     let Some(window) = read_peer_window(session).await else {
+        eprintln!("[ace] {addr}: no extended handshake / window");
         return FollowEnd::PeerLost;
     };
     let mut head = window.max_piece.max(0) as u64;
     let start = head.saturating_sub(PREFETCH_PIECES);
+    eprintln!("[ace] {addr}: window min={} max={} -> start={start} head={head}", window.min_piece, window.max_piece);
 
     // 2. Advertise our matching position + interest.
     let hs = OutgoingExtendedHandshake {
@@ -205,6 +211,7 @@ async fn follow_one_peer(
         match msg {
             PeerMessage::Unchoke => {
                 unchoked = true;
+                eprintln!("[ace] {addr}: UNCHOKE -> requesting pieces {start}..={head}");
                 if request_range(session, start, head, chunks_per_piece).await.is_err() {
                     return FollowEnd::PeerLost;
                 }
