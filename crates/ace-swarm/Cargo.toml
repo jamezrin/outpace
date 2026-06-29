@@ -5,3 +5,9 @@ edition = "2021"
 
 [dependencies]
 ace-wire = { path = "../ace-wire" }
+ace-peer = { path = "../ace-peer" }
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+
+[dev-dependencies]
+ace-media = { path = "../ace-media" }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }

@@ -27,7 +27,10 @@ dependencies = [
 name = "ace-swarm"
 version = "0.1.0"
 dependencies = [
+ "ace-media",
+ "ace-peer",
  "ace-wire",
+ "tokio",
 ]
 
 [[package]]
