@@ -10,7 +10,7 @@ use ace_wire::message::PeerMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn ts_byte(i: usize) -> u8 {
-    if i % 188 == 0 { 0x47 } else { (i % 251) as u8 }
+    if i.is_multiple_of(188) { 0x47 } else { (i % 251) as u8 }
 }
 
 #[tokio::test]
@@ -36,19 +36,14 @@ async fn live_session_emits_contiguous_ts_from_one_peer() {
         let _ = sess.read_message().await.unwrap();
         sess.send(&PeerMessage::Unchoke).await.unwrap();
         // serve every chunk request from the contiguous content
-        loop {
-            match sess.read_message().await {
-                Ok(PeerMessage::Unknown { id: 6, payload }) => {
-                    let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
-                    let chunk = u16::from_be_bytes(payload[8..10].try_into().unwrap());
-                    let off = ((piece - start_piece) as usize) * 8 + (chunk as usize) * 4;
-                    let mut block = vec![0u8; 8]; // 8-byte piece header
-                    block.extend_from_slice(&chunk.to_be_bytes());
-                    block.extend_from_slice(&content_peer[off..off + 4]);
-                    sess.send(&PeerMessage::Piece { index: 0, begin: piece, block }).await.unwrap();
-                }
-                _ => break,
-            }
+        while let Ok(PeerMessage::Unknown { id: 6, payload }) = sess.read_message().await {
+            let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+            let chunk = u16::from_be_bytes(payload[8..10].try_into().unwrap());
+            let off = ((piece - start_piece) as usize) * 8 + (chunk as usize) * 4;
+            let mut block = vec![0u8; 8]; // 8-byte piece header
+            block.extend_from_slice(&chunk.to_be_bytes());
+            block.extend_from_slice(&content_peer[off..off + 4]);
+            sess.send(&PeerMessage::Piece { index: 0, begin: piece, block }).await.unwrap();
         }
     });
 

@@ -102,6 +102,7 @@ async fn full_pipeline_mock_peer_to_mpegts() {
             distance_from_source: 1,
         }),
         node: ace_wire::extended::NodeFields { ts: 1, ..Default::default() },
+        peer_ip: None,
     };
     session.send_signed_extended_handshake(&hs, &identity).await.unwrap();
 
