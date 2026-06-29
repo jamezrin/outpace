@@ -5,4 +5,5 @@
 
 pub mod provider;
 pub mod routes;
+pub mod session;
 pub mod testprovider;
