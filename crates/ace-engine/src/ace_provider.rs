@@ -46,6 +46,16 @@ const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 /// Bytes of recently-downloaded data retained per active peer connection for reseeding.
 const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Seeding configuration threaded through the download loop: the shared per-infohash
+/// piece store (so downloaded data becomes servable to inbound peers too — T7), its size
+/// budget, and whether reciprocal serving over THIS outbound connection is enabled at all.
+#[derive(Clone)]
+struct SeedConfig {
+    registry: SeedRegistry,
+    store_bytes: u64,
+    enabled: bool,
+}
+
 pub struct AceProvider {
     identity: Arc<Identity>,
     port: u16,
@@ -54,6 +64,7 @@ pub struct AceProvider {
     resolve_cache: ResolveCache,
     seed_registry: SeedRegistry,
     seed_store_bytes: u64,
+    enable_seeding: bool,
 }
 
 impl AceProvider {
@@ -66,6 +77,7 @@ impl AceProvider {
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
+            enable_seeding: true,
         }
     }
 
@@ -96,6 +108,14 @@ impl AceProvider {
     /// created, so changing this after a stream has already opened has no effect on it.
     pub fn with_seed_store_bytes(mut self, bytes: u64) -> Self {
         self.seed_store_bytes = bytes;
+        self
+    }
+
+    /// Enable/disable reciprocal serving over outbound (leecher) connections — answering a
+    /// peer's `Interested`/chunk-requests and advertising `Have` for newly-completed pieces.
+    /// Defaults to `true` (S1 behavior). Setting `false` makes this provider a pure leecher.
+    pub fn with_seeding_enabled(mut self, enabled: bool) -> Self {
+        self.enable_seeding = enabled;
         self
     }
 
@@ -197,10 +217,13 @@ impl StreamProvider for AceProvider {
         let stats_peers = peer_count.clone();
         let stats_uploaded = uploaded.clone();
         let stats_peers_served = peers_served.clone();
-        let seed_registry = self.seed_registry.clone();
-        let seed_store_bytes = self.seed_store_bytes;
+        let seed = SeedConfig {
+            registry: self.seed_registry.clone(),
+            store_bytes: self.seed_store_bytes,
+            enabled: self.enable_seeding,
+        };
         tokio::spawn(async move {
-            follow_live(info, peers, identity, tx, stats_peers, uploaded, peers_served, seed_registry, seed_store_bytes).await;
+            follow_live(info, peers, identity, tx, stats_peers, uploaded, peers_served, seed).await;
         });
         Ok(Box::new(AceSource { rx, peers: peer_count, uploaded: stats_uploaded, peers_served: stats_peers_served }))
     }
@@ -217,8 +240,7 @@ async fn follow_live(
     peer_count: Arc<AtomicU32>,
     uploaded: Arc<AtomicU64>,
     peers_served: Arc<AtomicU32>,
-    seed_registry: SeedRegistry,
-    seed_store_bytes: u64,
+    seed: SeedConfig,
 ) {
     let chunks_per_piece = info.chunks_per_piece();
     for addr in peers {
@@ -237,7 +259,7 @@ async fn follow_live(
         }
         eprintln!("[ace] {addr}: connected + handshaked");
         peer_count.store(1, Ordering::Relaxed);
-        match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx, &uploaded, &peers_served, &seed_registry, seed_store_bytes).await {
+        match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx, &uploaded, &peers_served, &seed).await {
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost => {
                 peer_count.store(0, Ordering::Relaxed);
@@ -262,8 +284,7 @@ async fn follow_one_peer(
     tx: &mpsc::Sender<Bytes>,
     uploaded: &Arc<AtomicU64>,
     peers_served: &Arc<AtomicU32>,
-    seed_registry: &SeedRegistry,
-    seed_store_bytes: u64,
+    seed: &SeedConfig,
 ) -> FollowEnd {
     // 1. Read the peer's advertised live window (their unsolicited extended handshake).
     let Some(window) = read_peer_window(session).await else {
@@ -300,8 +321,9 @@ async fn follow_one_peer(
     let mut resync = ace_media::mpegts::TsResync::new();
     let mut requested_to: Option<u64> = None;
     let mut unchoked = false;
-    let store = seed_registry
-        .get_or_create(info.infohash, || PieceStore::new(info.piece_length, info.chunk_length, seed_store_bytes));
+    let store = seed
+        .registry
+        .get_or_create(info.infohash, || PieceStore::new(info.piece_length, info.chunk_length, seed.store_bytes));
     let mut unchoked_peer = false;
 
     loop {
@@ -339,7 +361,7 @@ async fn follow_one_peer(
                         s.put_chunk(piece, lc.chunk, &lc.data);
                         s.has_piece(piece)
                     };
-                    if completed {
+                    if completed && seed.enabled {
                         // Tell this peer what we now hold, so they can request it from us —
                         // S1 only answered requests; this is the proactive half of reciprocal
                         // seeding (a peer can't ask for something it doesn't know we have).
@@ -359,12 +381,12 @@ async fn follow_one_peer(
                 }
             }
             PeerMessage::Interested => {
-                if !unchoked_peer {
+                if seed.enabled && !unchoked_peer {
                     let _ = session.send(&PeerMessage::Unchoke).await;
                     unchoked_peer = true;
                 }
             }
-            PeerMessage::Unknown { id: 6, ref payload } if payload.len() >= 10 => {
+            PeerMessage::Unknown { id: 6, ref payload } if seed.enabled && payload.len() >= 10 => {
                 // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
                 let p = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 let c = u16::from_be_bytes([payload[8], payload[9]]);
