@@ -48,6 +48,9 @@ async fn unknown_infohash_is_refused_not_served() {
     tokio::spawn(PeerListener::serve(listener, registry, random_peer_id(), [0u8; 8], 8));
 
     let stream = TcpStream::connect(addr).await.unwrap();
+    // `with_timeout` is a safety net, not the expected failure mode: on refusal,
+    // `handle_inbound` returns immediately without replying, dropping the stream — so the
+    // client's read sees an immediate EOF, not a stalled connection.
     let mut client = PeerSession::new(stream).with_timeout(std::time::Duration::from_millis(300));
     let result = client.perform_handshake([0xAAu8; 20], random_peer_id()).await;
     assert!(result.is_err(), "must not reply to an infohash we don't serve");
