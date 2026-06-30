@@ -51,9 +51,8 @@ final whole-branch pass; all green, clippy clean):
   downloaded pieces and serves the peer's chunk-requests inline; `uploaded`/`peers_served`
   atomics surfaced at `/status`.
 
-### v2 offline foundations — DONE (built on branch `v2-offline-foundations`, plan
-`docs/superpowers/plans/2026-06-30-v2-offline-foundations.md`; not yet merged to main as of this
-writing — see git log/branches for current merge state)
+### v2 offline foundations — DONE (merged to main, plan
+`docs/superpowers/plans/2026-06-30-v2-offline-foundations.md`)
 Everything from S2/B1 that's buildable and testable WITHOUT a live Acestream swarm or RE sandbox.
 All green, clippy clean, full workspace:
 - `ace-wire::transport::encode_transport` — production transport-file encoder (inverse of
@@ -66,9 +65,12 @@ All green, clippy clean, full workspace:
   `event` field; added a seeder-announce helper (`left=0`, `Completed`). **No production caller
   yet** — wiring into the manager/session lifecycle is the remaining S2 item.
 - `ace-engine::config::Config` gained inbound-seeder knobs: `peer_listen`, `seed_store_bytes`,
-  `max_unchoked`, `max_inbound_peers`, `enable_seeding`, `enable_inbound`. **`max_unchoked` and
-  `enable_seeding` are accepted but not yet wired to anything** (no-op today — don't expect
-  `OUTPACE_ENABLE_SEEDING=false` to disable S1's reciprocal upload).
+  `max_unchoked`, `max_inbound_peers`, `enable_seeding`, `enable_inbound`. `enable_seeding` is
+  now wired (gates the three S1 serve arms in `follow_one_peer` — `Interested`, the chunk-serve
+  arm, and `Have`-on-completion; `false` makes the provider a pure leecher). **`max_unchoked` is
+  still accepted but not wired** — it configures `Choker`, which has no production caller until
+  S2's multi-peer serve coordinator exists (a single outbound connection or a single inbound
+  `SeederSession::serve` call has nobody to choose between).
 - `ace-swarm::listen::{SeedRegistry, PeerListener}` — inbound seeder plumbing: a registry
   mapping infohash → shared `PieceStore`, and a bounded-concurrency TCP accept loop handing
   accepted peers to `SeederSession::serve`. Real-TCP loopback-tested (accept+handshake+serve,
@@ -80,23 +82,47 @@ All green, clippy clean, full workspace:
   `PeerListener` — **gated OFF by default** (`enable_inbound=false`) because the served
   `piece_header` is still a placeholder `[0u8;8]`. Verified live: a default `cargo run` does
   NOT start the inbound listener; `OUTPACE_ENABLE_INBOUND=1` does.
+- `follow_one_peer` now also sends `Have(piece)` back to the peer it's downloading from the
+  moment a piece completes (previously S1 only ever *answered* requests, never proactively told
+  a peer what it newly holds) — the proactive half of reciprocal seeding. See note 21.
 - **Do not flip `enable_inbound`'s default to `true` before Task 7 (below) lands** — serving
   non-compliant pieces to the real swarm would violate the wire-compatibility constraint.
 
-### Remaining: Task 7 (S1), B0, B1's live/interop verification (RE/sandbox-gated)
-- **Task 7 (the S1/S2 interop linchpin, deferred):** the served `piece_header` is still
-  `[0u8;8]`. Capture engine-as-seeder ground truth (Frida/pcap) to pin the engine's real 8
-  bytes (→ note 21, `tests/vectors/seed/`), align the advertisement (HAVE_ALL/NONE/
-  ALLOWED_FAST?), then prove the real engine downloads FROM us — both over S1's reciprocal
-  path and S2's inbound listener. Needs a non-WARP host + the Docker sandbox engine. Once this
-  lands, flip `enable_inbound`'s default to `true`.
+### Task 7 — SUBSTANTIALLY ADVANCED, not closed (`docs/protocol/notes/21-seeder-ground-truth.md`)
+With Docker + a non-WARP host (confirmed available 2026-06-30), ran real verification against
+both the live swarm and the official engine itself (sandboxed):
+- **Captured real piece-header structure** from a live peer: the 8-byte header is constant
+  across every chunk of one piece (confirms it's per-piece, matching our `piece_header:[u8;8]`
+  assumption) — `header[0..4]` is constant across pieces (session-wide), `header[4..8]` varies
+  per piece with irregular deltas (hash? fine timestamp? undetermined).
+- **Proved the official engine accepts outpace's full protocol stack** — signed handshake,
+  Ed25519 identity, BEP-10 extended handshake, Acestream request/piece codec — by connecting
+  outpace directly to the engine's peer port inside its own Docker sandbox and downloading
+  9 MB of real live video from it. This is the harder, more rigorous half of wire-compatibility
+  (the *reference implementation* treats outpace indistinguishably from a real peer).
+- **Reverse direction (engine downloads FROM outpace) — still not exercised.** Root-caused
+  to the missing Have-advertisement (now fixed, see above) but re-verified live that the fix
+  alone doesn't trigger it in a synchronized-same-live-edge scenario, since outpace mirrors
+  the peer's own window and so never has genuine surplus to offer. Needs either a real
+  window-lead (not forceable with today's single-peer-at-a-time `follow_live`) or getting the
+  engine to dial outpace directly (needs DHT/tracker self-announce — `announce_seeder`
+  exists but is unwired — or the engine's I2I instance-coordination API on port 62062, briefly
+  probed, not HTTP, would need Frida/binary RE comparable to the node-identity crack).
+- `header[4..8]`'s exact semantics remain open; the served `piece_header` is still `[0u8;8]`.
+- **Next session, in order of leverage:** (1) try the reverse-direction proof again with a
+  deliberately staggered start time between outpace and a test client, to get a genuine
+  window-lead without needing S2; (2) wire `announce_seeder` into the manager lifecycle so
+  outpace becomes organically discoverable, then retry engine-dials-us; (3) only if those
+  don't converge, invest in I2I/binary RE for direct peer injection. Once the engine is shown
+  downloading from outpace (any route), flip `enable_inbound`'s default to `true`.
+
+### Remaining: B0, B1 (RE/sandbox-gated where noted)
 - **B0** live-source-auth RE spike (RSA-signed pieces, like the node-identity crack) — no plan
   written yet; can run in parallel as a research spike.
 - **B1 minting/origination + live verification**: the pure codecs (`encode_transport`,
   `TsChunker`) are done; remaining is the `PUT /broadcast/{name}` HTTP handler, the
   `BroadcastRegistry`, signing pieces per B0, and live verification that an official Acestream
-  client can discover and play a outpace-originated broadcast. Depends on S2 (done, pending
-  Task 7) + B0.
+  client can discover and play a outpace-originated broadcast. Depends on S2 (done) + B0.
 
 ## Run the daemon + verify VLC (live, operator-run)
 The daemon binary is `outpace` (`cargo run -p ace-engine --bin outpace`). The clean API:
