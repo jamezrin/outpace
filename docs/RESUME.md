@@ -32,6 +32,20 @@ Crates: `crates/{ace-wire,ace-tracker,ace-peer,ace-media,ace-engine}`. Workspace
 (TS align + HLS segment/manifest), `ace_engine::routes` (6878 URL surface). What's left needs
 the live byte path: peer download loop / `ace-swarm`, then wire `ace-media`+`ace-engine` to it.
 
+## Next: v2 — P2P compliance, seeding & broadcasting (specced, not yet built)
+The v1 daemon is **download-only (a pure leecher)** — confirmed in code: the only `TcpListener`
+is the HTTP API, we never accept inbound peers, never answer a peer's `Request`, never advertise
+`Have`/`Bitfield`, never send a `Piece`. v2 fixes that and adds origination. Spec:
+**`docs/superpowers/specs/2026-06-30-compliance-seeding-broadcasting-design.md`**. Four phases:
+**S1** reciprocal upload (retain pieces in a `PieceStore`, serve on connections we already hold),
+**S2** inbound seeder (TCP listener on the peer port + seeder announce), **B0** live-source-auth
+RE spike (the interop linchpin — RSA-signed pieces, like the node-identity crack), **B1** HTTP
+ingest (`PUT /broadcast/{name}`, OBS/ffmpeg MPEG-TS) → chunk → mint transport+infohash → originate
+the swarm as the signed source. **Hard constraint:** full **wire compatibility** with the official
+engine — outpace and Acestream peers must interoperate transparently (an Acestream peer can't
+tell it's talking to outpace), validated against engine-as-seeder ground-truth captures.
+RTMP/SRT ingest is a documented future follow-up, out of the v2 spec.
+
 ## Run the daemon + verify VLC (live, operator-run)
 The daemon binary is `outpace` (`cargo run -p ace-engine --bin outpace`). The clean API:
 `GET /healthz`, `/networks`, `/streams`, `/streams/{network}/{id}.ts` (live MPEG-TS),
