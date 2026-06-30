@@ -15,6 +15,18 @@ pub fn chunk_request(piece: u32, chunk: u16) -> PeerMessage {
     PeerMessage::Unknown { id: 6, payload }
 }
 
+/// Build the Acestream live `Piece` message (id=7) to SEND, the inverse of [`LiveChunk`]:
+/// payload `[stream u32][piece u32][8B piece header][chunk u16][data]`. The 8-byte
+/// `piece_header` is the engine's per-chunk header (pinned to ground truth in note 21; for a
+/// broadcast source it is synthesized in B0/B1).
+pub fn build_piece(stream: u32, piece: u32, chunk: u16, piece_header: [u8; 8], data: &[u8]) -> PeerMessage {
+    let mut block = Vec::with_capacity(8 + 2 + data.len());
+    block.extend_from_slice(&piece_header);
+    block.extend_from_slice(&chunk.to_be_bytes());
+    block.extend_from_slice(data);
+    PeerMessage::Piece { index: stream, begin: piece, block }
+}
+
 /// A received live chunk: its piece/chunk coordinates and the TS payload.
 #[derive(Debug, PartialEq, Eq)]
 pub struct LiveChunk {
@@ -68,5 +80,24 @@ mod tests {
     #[test]
     fn non_piece_message_is_none() {
         assert!(LiveChunk::from_message(&PeerMessage::Unchoke).is_none());
+    }
+
+    #[test]
+    fn build_piece_roundtrips_through_live_chunk() {
+        // What we SEND must decode back to the same (piece, chunk, data) a peer would read.
+        let data = [1u8, 2, 3, 4];
+        let msg = build_piece(0, 5269621, 7, [0xAB; 8], &data);
+        match &msg {
+            PeerMessage::Piece { index, begin, block } => {
+                assert_eq!(*index, 0); // stream
+                assert_eq!(*begin, 5269621); // piece
+                assert_eq!(&block[..8], &[0xAB; 8]); // 8-byte piece header
+                assert_eq!(&block[8..10], &7u16.to_be_bytes()); // chunk
+                assert_eq!(&block[10..], &data); // payload
+            }
+            _ => panic!("expected Piece"),
+        }
+        let lc = LiveChunk::from_message(&msg).unwrap();
+        assert_eq!(lc, LiveChunk { piece: 5269621, chunk: 7, data: data.to_vec() });
     }
 }
