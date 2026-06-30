@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::get, Json, Router};
+use bytes::Bytes;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
@@ -98,12 +99,21 @@ async fn stream_file(State(s): State<AppState>, Path((network, file)): Path<(Str
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
     let sub = session.subscribe();
+    // Per-client keyframe gate: a player joining mid-GOP is held until the first clean
+    // keyframe (with PAT/PMT prepended) so it starts on a decodable picture, not garbage.
+    let gate = ace_media::mpegts::KeyframeGate::new();
     // Bridge the broadcast receiver to an HTTP body stream; the Subscription rides along so
     // its Drop (decrementing the client count) fires when the client disconnects.
-    let stream = futures::stream::unfold(sub, |mut sub| async move {
+    let stream = futures::stream::unfold((sub, gate), |(mut sub, mut gate)| async move {
         loop {
             match sub.rx.recv().await {
-                Ok(chunk) => return Some((Ok::<_, std::io::Error>(chunk), sub)),
+                Ok(chunk) => {
+                    let out = gate.push(&chunk);
+                    if out.is_empty() {
+                        continue; // still waiting for the first keyframe
+                    }
+                    return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate)));
+                }
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => return None,
             }
@@ -118,16 +128,92 @@ async fn stream_file(State(s): State<AppState>, Path((network, file)): Path<(Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderRegistry;
+    use crate::provider::{ProviderError, ProviderRegistry, SourceStats, StreamProvider, TsSource};
     use crate::testprovider::TestProvider;
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
     use tower::ServiceExt;
 
     fn state() -> AppState {
         let mut r = ProviderRegistry::new();
         r.register(std::sync::Arc::new(TestProvider { chunks: 10 }));
         AppState { manager: StreamManager::new(r), networks: vec!["test".into()] }
+    }
+
+    /// A real libx264 MPEG-TS (committed fixture). Video PID 0x100; keyframes at byte
+    /// offsets 564 and 9400.
+    const FIXTURE: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors/media/h264-keyframes.ts"));
+
+    /// Provider that replays `FIXTURE` from byte `skip` (188-aligned), a few TS packets per
+    /// chunk — used to prove the per-client keyframe gate on a genuine stream.
+    struct FixtureProvider {
+        skip: usize,
+    }
+    struct FixtureSource {
+        pos: usize,
+    }
+    #[async_trait]
+    impl TsSource for FixtureSource {
+        async fn next(&mut self) -> Option<Bytes> {
+            if self.pos >= FIXTURE.len() {
+                return None;
+            }
+            let end = (self.pos + 188 * 3).min(FIXTURE.len());
+            let chunk = Bytes::copy_from_slice(&FIXTURE[self.pos..end]);
+            self.pos = end;
+            Some(chunk)
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats { peers: 1, bitrate: 0, buffer_ms: 0 }
+        }
+    }
+    #[async_trait]
+    impl StreamProvider for FixtureProvider {
+        fn network(&self) -> &'static str {
+            "fix"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(FixtureSource { pos: self.skip }))
+        }
+    }
+
+    fn fixture_state(skip: usize) -> AppState {
+        let mut r = ProviderRegistry::new();
+        r.register(std::sync::Arc::new(FixtureProvider { skip }));
+        AppState { manager: StreamManager::new(r), networks: vec!["fix".into()] }
+    }
+
+    #[tokio::test]
+    async fn stream_ts_starts_on_keyframe_when_joining_mid_gop() {
+        use futures::StreamExt;
+        const VIDEO_PID: u16 = 0x0100;
+        const KEYFRAME2: usize = 9400;
+        // Join the stream mid-GOP (a non-keyframe video packet between the two keyframes).
+        let resp = router(fixture_state(4136))
+            .oneshot(Request::get("/streams/fix/x.ts").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Collect a few KB of the served body.
+        let mut stream = resp.into_body().into_data_stream();
+        let mut body = Vec::new();
+        while body.len() < 4096 {
+            match stream.next().await {
+                Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        // The first video packet the client sees must be the real keyframe at byte 9400,
+        // not the mid-GOP packet we joined on.
+        let first_video = body
+            .chunks_exact(188)
+            .find(|p| (((p[1] & 0x1F) as u16) << 8 | p[2] as u16) == VIDEO_PID)
+            .expect("a video packet was served");
+        assert_eq!(first_video, &FIXTURE[KEYFRAME2..KEYFRAME2 + 188]);
     }
 
     #[tokio::test]
@@ -153,8 +239,9 @@ mod tests {
     #[tokio::test]
     async fn stream_ts_serves_mpegts_first_frame() {
         use futures::StreamExt;
-        let resp = router(state())
-            .oneshot(Request::get("/streams/test/somechannel.ts").body(Body::empty()).unwrap())
+        // Stream the real fixture from the start; the gate locks on its leading keyframe.
+        let resp = router(fixture_state(0))
+            .oneshot(Request::get("/streams/fix/somechannel.ts").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

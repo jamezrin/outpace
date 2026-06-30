@@ -24,7 +24,7 @@ Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 | 1 `ace-wire` | ✅ done | infohash, bencode, handshake, msg framing, extended HS, **transport decoder** |
 | 2 `ace-tracker` + `ace-peer` | ✅ done | BEP-15 UDP tracker; async peer session (handshake + read) — both verified live |
 | 3 piece download → media → engine | ✅ done | **live HD video downloaded from the real swarm** (note 19: full signed handshake → UNCHOKE → Acestream piece requests → MPEG-TS → ffmpeg decodes 1920×1080 H.264+AAC). Protocol promoted into `ace-wire`/`ace-swarm` |
-| 4 productization (outpace daemon) | ✅ built + **live-proven** | **Autonomous DHT discovery → connect → 9.4 MB live MPEG-TS downloaded from just an infohash (verified 2026-06-29).** Clean provider-abstracted daemon: `StreamProvider`/`TsSource` + `ProviderRegistry`, shared `StreamSession` broadcast fan-out (one download → many clients, **acexy-parity out of the box**), `StreamManager`, axum HTTP API, live HLS, config + persistent identity, tracker discovery, transport→`StreamInfo` resolve, `AceProvider`. All tests green + clippy clean; daemon boots & serves the clean API. **Remaining (live, operator-run):** point VLC at a real stream (Task 20) and root-cause the −4 B/piece muxing drift (Task 19) — both need the live swarm. Plan: `docs/superpowers/plans/2026-06-29-outpace-daemon.md`; spec: `docs/superpowers/specs/2026-06-29-outpace-daemon-design.md` |
+| 4 productization (outpace daemon) | ✅ built + **live-proven** | **Autonomous DHT discovery → connect → 9.4 MB live MPEG-TS downloaded from just an infohash (verified 2026-06-29).** Clean provider-abstracted daemon: `StreamProvider`/`TsSource` + `ProviderRegistry`, shared `StreamSession` broadcast fan-out (one download → many clients, **acexy-parity out of the box**), `StreamManager`, axum HTTP API, live HLS, config + persistent identity, tracker discovery, transport→`StreamInfo` resolve, `AceProvider`. All tests green + clippy clean; daemon boots & serves the clean API. Muxing drift (Task 19) fixed (`TsResync`); per-client start-on-keyframe done (`KeyframeGate`). **Remaining:** content-id→infohash resolution over `ut_metadata` (clean coding step, offline-buildable), and point VLC at a real stream end-to-end (Task 20, needs the live swarm). Plan: `docs/superpowers/plans/2026-06-29-outpace-daemon.md`; spec: `docs/superpowers/specs/2026-06-29-outpace-daemon-design.md` |
 
 Crates: `crates/{ace-wire,ace-tracker,ace-peer,ace-media,ace-engine}`. Workspace root `Cargo.toml`.
 **Pure Phase 3/4 logic done (no live data needed):** `ace_wire::live` (LiveWindow/LivePicker),
@@ -54,8 +54,18 @@ The served stream is **clean, packet-aligned MPEG-TS** — the −4 B/piece drif
 fixed by `ace_media::mpegts::TsResync` (Acestream's 1 MiB live pieces are each internally
 188-aligned but don't byte-chain; the resync filter drops the ~1 partial packet of junk per
 piece boundary and re-locks). **VERIFIED:** `ffmpeg` decodes the daemon's output to
-1280×720 50 fps H.264. (Playback starts ~mid-GOP since we begin 8 pieces behind the live
-edge, so expect a moment before the first keyframe; starting on a keyframe is future polish.)
+1280×720 50 fps H.264.
+
+**Start-on-keyframe (done).** Each `.ts` client is fed through a per-client
+`ace_media::mpegts::KeyframeGate`: a player joining mid-GOP is held until the first clean
+keyframe — it parses PAT→PMT to find the video PID, detects the random-access point (the
+adaptation-field RAI bit or an H.264 IDR/SPS NAL), then emits the cached PAT+PMT followed by
+the keyframe and passes everything through after. A safety budget falls back to passthrough
+if no keyframe appears. So players start on a decodable picture instead of garbage. Validated
+against a committed real-encoder fixture (`tests/vectors/media/h264-keyframes.ts`): joining
+mid-GOP, the gate locks exactly on the real keyframe and ffmpeg decodes the output I-frame
+first. Applied per-client (the broadcast is unchanged), so every joiner benefits, not just the
+first.
 
 **Getting an infohash from an `acestream://` content-id** (content-id→infohash resolution
 isn't wired yet — the engine does it; we don't): ask the running official engine once —
