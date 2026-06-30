@@ -91,7 +91,9 @@ impl AceProvider {
         self
     }
 
-    /// Override how many bytes of piece data each infohash's shared store retains.
+    /// Override how many bytes of piece data each infohash's shared store retains. First-writer
+    /// wins per infohash: `SeedRegistry::get_or_create` only sizes a store when it's first
+    /// created, so changing this after a stream has already opened has no effect on it.
     pub fn with_seed_store_bytes(mut self, bytes: u64) -> Self {
         self.seed_store_bytes = bytes;
         self
