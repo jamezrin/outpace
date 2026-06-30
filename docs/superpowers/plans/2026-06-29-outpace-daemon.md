@@ -1072,14 +1072,20 @@ decodes to 1280×720 50fps H.264.
 - [ ] **Step 3: Run** — `cargo test -p ace-wire reassembly 2>&1 | tail -3` → PASS.
 - [ ] **Step 4: Commit** — `git add -A && git commit -m "gapless cross-piece TS continuity (resolve -4B/piece drift)"`
 
-### Task 20: Live end-to-end verification (the deliverable) — ⏳ environment-gated (operator-run)
+### Task 20: Live end-to-end verification (the deliverable) — ✅ DONE (2026-06-30)
 
-**Status:** the ONLY remaining item. All spec code (T1–T19) is implemented, tested, and
-clippy-clean; the daemon boots and serves. This task is a live operator verification — it needs
-the real Acestream swarm reachable from the host (WARP off) and cannot run in CI/sandbox.
-Resolve `cid:<40hex>` for a content-id (or pass a bare infohash), then run the steps below.
+**Verified live** against the real swarm (WARP off) — see `docs/protocol/notes/20-vlc-playback.md`:
+the daemon autonomously discovered 25 peers for content-id cid1, connected + handshaked,
+got UNCHOKE, and downloaded **8.3 MB of live MPEG-TS**; ffprobe reports **1280×720 H.264 + 48 kHz
+AAC**; ffmpeg decoded a **720p frame** from the served output (Step 3); the served stream starts
+on a **keyframe** (`KeyframeGate`); and **two concurrent clients shared one session**
+(`GET /streams` → `clients:2`, Step 4). The literal VLC-GUI watch (Step 4's "open two VLC
+windows") is the only human-visual action; its shared-download behavior is what the two-client
+check proves. Content-id `cid:` finding: peers accept the content-id as the swarm key and
+advertise `ut_metadata` but send no `metadata_size` (the bare-id path drives playback) — a
+characterized live-RE follow-up that does not block playback.
 
-**Files:** none (manual/scripted verification); record results in `docs/protocol/notes/20-vlc-playback.md`.
+**Files:** none (manual/scripted verification); results recorded in `docs/protocol/notes/20-vlc-playback.md`.
 
 - [ ] **Step 1:** Start the daemon: `cargo run -p ace-engine`. Ensure WARP is off; the sandbox engine need not run.
 - [ ] **Step 2:** Resolve a known-live id (e.g. `acestream://cid2`). Confirm `curl -s localhost:8000/streams/ace/cid2/status` shows `peers>0` after a few seconds.

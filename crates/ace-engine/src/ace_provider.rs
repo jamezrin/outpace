@@ -10,7 +10,7 @@
 use crate::provider::{ProviderError, SourceStats, StreamProvider, TsSource};
 use ace_peer::session::{connect, PeerSession};
 use ace_swarm::discover::discover_peers;
-use ace_swarm::resolve::{hex20, resolve_via_peer, stream_info_from_infohash, ResolveCache};
+use ace_swarm::resolve::{hex20, resolve_via_peer, stream_info_from_infohash, ResolveCache, ResolveError};
 use ace_swarm::types::StreamInfo;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
@@ -30,6 +30,8 @@ use tokio::sync::mpsc;
 /// How many pieces behind the live edge to start, so we have buffer immediately.
 const PREFETCH_PIECES: u64 = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Per-peer read ceiling while resolving a content-id (a silent peer shouldn't stall us).
+const RESOLVE_PEER_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Acestream's hardcoded public UDP tracker (see `docs/protocol/notes/03`). A bare
 /// content-id/infohash carries no tracker of its own, so we announce here to find peers.
@@ -87,19 +89,22 @@ impl AceProvider {
         eprintln!("[ace] resolve cid:{content_id}: {} metadata peer(s)", all.len());
 
         for addr in all {
-            let Ok(Ok(mut session)) =
+            let Ok(Ok(session)) =
                 tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
             else {
-                continue;
+                continue; // unreachable peer; don't waste the log on it
             };
+            // Bound each peer's reads so a connected-but-silent peer doesn't stall resolution.
+            let mut session = session.with_timeout(RESOLVE_PEER_TIMEOUT);
             match resolve_via_peer(&mut session, key, &self.identity).await {
                 Ok(info) => {
                     let ih: String = info.infohash.iter().map(|b| format!("{b:02x}")).collect();
-                    eprintln!("[ace] resolved cid:{content_id} -> infohash {ih}");
+                    eprintln!("[ace] resolved cid:{content_id} via {addr} -> infohash {ih}");
                     self.resolve_cache.put(content_id, info.clone());
                     return Ok(info);
                 }
-                Err(_) => continue,
+                Err(ResolveError::Peer(why)) => eprintln!("[ace] resolve {addr}: {why}"),
+                Err(e) => eprintln!("[ace] resolve {addr}: {e:?}"),
             }
         }
         Err(ProviderError::Backend("content-id resolution: no metadata peer responded".into()))
