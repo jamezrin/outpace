@@ -30,6 +30,17 @@ impl SeedRegistry {
         self.stores.lock().unwrap().insert(infohash, store);
     }
 
+    /// The store for `infohash`, creating it via `make` (and registering it) if absent.
+    /// Atomic: the whole get-or-insert happens under one lock acquisition.
+    pub fn get_or_create(&self, infohash: [u8; 20], make: impl FnOnce() -> PieceStore) -> SharedStore {
+        self.stores
+            .lock()
+            .unwrap()
+            .entry(infohash)
+            .or_insert_with(|| Arc::new(Mutex::new(make())))
+            .clone()
+    }
+
     /// The store for `infohash`, if we serve it.
     pub fn get(&self, infohash: &[u8; 20]) -> Option<SharedStore> {
         self.stores.lock().unwrap().get(infohash).cloned()
@@ -99,4 +110,18 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     let peer_hs = session.accept_handshake(our_peer_id, |ih| registry.serves(ih)).await?;
     let store = registry.get(&peer_hs.infohash).ok_or(ace_peer::PeerError::InfohashMismatch)?;
     SeederSession::serve(&mut session, store, piece_header).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_or_create_is_idempotent() {
+        let reg = SeedRegistry::new();
+        let ih = [1u8; 20];
+        let a = reg.get_or_create(ih, || PieceStore::new(4, 4, 1024));
+        let b = reg.get_or_create(ih, || panic!("must not call make() again"));
+        assert!(Arc::ptr_eq(&a, &b), "second call must return the SAME store, not create a new one");
+    }
 }

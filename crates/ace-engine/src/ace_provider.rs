@@ -16,6 +16,7 @@ use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingEx
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
 use ace_swarm::store::PieceStore;
+use ace_swarm::listen::SeedRegistry;
 use ace_wire::live_codec::{build_piece, chunk_request, LiveChunk};
 use ace_wire::message::PeerMessage;
 use ace_wire::reassembly::PieceReassembler;
@@ -51,6 +52,8 @@ pub struct AceProvider {
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
     resolve_cache: ResolveCache,
+    seed_registry: SeedRegistry,
+    seed_store_bytes: u64,
 }
 
 impl AceProvider {
@@ -61,6 +64,8 @@ impl AceProvider {
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_peers: Vec::new(),
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
+            seed_registry: SeedRegistry::new(),
+            seed_store_bytes: SEED_STORE_BYTES,
         }
     }
 
@@ -76,6 +81,19 @@ impl AceProvider {
     /// ut_metadata discovery is wired.
     pub fn with_bootstrap_peers(mut self, peers: Vec<SocketAddrV4>) -> Self {
         self.bootstrap_peers = peers;
+        self
+    }
+
+    /// Share a `SeedRegistry` with the inbound listener, so pieces this provider downloads
+    /// become servable to peers connecting in. Defaults to a private (unshared) registry.
+    pub fn with_seed_registry(mut self, registry: SeedRegistry) -> Self {
+        self.seed_registry = registry;
+        self
+    }
+
+    /// Override how many bytes of piece data each infohash's shared store retains.
+    pub fn with_seed_store_bytes(mut self, bytes: u64) -> Self {
+        self.seed_store_bytes = bytes;
         self
     }
 
@@ -177,8 +195,10 @@ impl StreamProvider for AceProvider {
         let stats_peers = peer_count.clone();
         let stats_uploaded = uploaded.clone();
         let stats_peers_served = peers_served.clone();
+        let seed_registry = self.seed_registry.clone();
+        let seed_store_bytes = self.seed_store_bytes;
         tokio::spawn(async move {
-            follow_live(info, peers, identity, tx, stats_peers, uploaded, peers_served).await;
+            follow_live(info, peers, identity, tx, stats_peers, uploaded, peers_served, seed_registry, seed_store_bytes).await;
         });
         Ok(Box::new(AceSource { rx, peers: peer_count, uploaded: stats_uploaded, peers_served: stats_peers_served }))
     }
@@ -186,6 +206,7 @@ impl StreamProvider for AceProvider {
 
 /// Follow the live edge from the first responsive peer, pushing contiguous TS. Reconnects to
 /// the next peer on failure; ends when the consumer drops.
+#[allow(clippy::too_many_arguments)]
 async fn follow_live(
     info: StreamInfo,
     peers: Vec<SocketAddrV4>,
@@ -194,6 +215,8 @@ async fn follow_live(
     peer_count: Arc<AtomicU32>,
     uploaded: Arc<AtomicU64>,
     peers_served: Arc<AtomicU32>,
+    seed_registry: SeedRegistry,
+    seed_store_bytes: u64,
 ) {
     let chunks_per_piece = info.chunks_per_piece();
     for addr in peers {
@@ -212,7 +235,7 @@ async fn follow_live(
         }
         eprintln!("[ace] {addr}: connected + handshaked");
         peer_count.store(1, Ordering::Relaxed);
-        match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx, &uploaded, &peers_served).await {
+        match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx, &uploaded, &peers_served, &seed_registry, seed_store_bytes).await {
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost => {
                 peer_count.store(0, Ordering::Relaxed);
@@ -237,6 +260,8 @@ async fn follow_one_peer(
     tx: &mpsc::Sender<Bytes>,
     uploaded: &Arc<AtomicU64>,
     peers_served: &Arc<AtomicU32>,
+    seed_registry: &SeedRegistry,
+    seed_store_bytes: u64,
 ) -> FollowEnd {
     // 1. Read the peer's advertised live window (their unsolicited extended handshake).
     let Some(window) = read_peer_window(session).await else {
@@ -273,7 +298,8 @@ async fn follow_one_peer(
     let mut resync = ace_media::mpegts::TsResync::new();
     let mut requested_to: Option<u64> = None;
     let mut unchoked = false;
-    let mut store = PieceStore::new(info.piece_length, info.chunk_length, SEED_STORE_BYTES);
+    let store = seed_registry
+        .get_or_create(info.infohash, || PieceStore::new(info.piece_length, info.chunk_length, seed_store_bytes));
     let mut unchoked_peer = false;
 
     loop {
@@ -305,7 +331,7 @@ async fn follow_one_peer(
             }
             m @ PeerMessage::Piece { .. } => {
                 if let Some(lc) = LiveChunk::from_message(&m) {
-                    store.put_chunk(lc.piece as u64, lc.chunk, &lc.data);
+                    store.lock().await.put_chunk(lc.piece as u64, lc.chunk, &lc.data);
                     let begin = lc.chunk as u64 * info.chunk_length;
                     if reasm.add_block(lc.piece as u64, begin, &lc.data).is_err() {
                         continue;
@@ -329,7 +355,8 @@ async fn follow_one_peer(
                 // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
                 let p = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 let c = u16::from_be_bytes([payload[8], payload[9]]);
-                if let Some(data) = store.chunk(p as u64, c).map(|d| d.to_vec()) {
+                let data = store.lock().await.chunk(p as u64, c).map(|d| d.to_vec());
+                if let Some(data) = data {
                     // piece_header [0u8;8] until note 21 pins the engine's exact bytes.
                     if session.send(&build_piece(0, p, c, [0u8; 8], &data)).await.is_ok() {
                         uploaded.fetch_add(data.len() as u64, Ordering::Relaxed);
