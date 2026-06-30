@@ -3,7 +3,7 @@
 
 use crate::dht::dht_get_peers;
 use ace_tracker::client::announce;
-use ace_tracker::codec::TransferState;
+use ace_tracker::codec::{AnnounceEvent, TransferState};
 use std::collections::BTreeSet;
 use std::net::SocketAddrV4;
 use std::time::Duration;
@@ -46,11 +46,34 @@ pub async fn discover_peers(
     let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
     let transfer = TransferState { downloaded: 0, left: u64::MAX, uploaded: 0 };
     for tracker in resolve_trackers(trackers).await {
-        if let Ok(found) = announce(tracker, infohash, peer_id, port, 200, transfer).await {
+        if let Ok(found) = announce(tracker, infohash, peer_id, port, 200, transfer, AnnounceEvent::Started).await {
             peers.extend(found);
         }
     }
     peers.extend(dht_get_peers(infohash, Duration::from_secs(15)).await);
+    peers.into_iter().collect()
+}
+
+/// Announce ourselves as a SEEDER (`left=0`, event=Completed) for `infohash` to all `trackers`,
+/// aggregating the peers each tracker returns (best-effort — a non-responding tracker is
+/// skipped, mirroring `discover_peers`). A seeder still benefits from knowing other peers.
+///
+/// NOT YET WIRED: no production caller until announcing-as-seeder is hooked into the
+/// manager/session lifecycle (the spec's remaining S2 item).
+pub async fn announce_seeder(
+    trackers: &[String],
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+) -> Vec<SocketAddrV4> {
+    let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
+    let transfer = TransferState { downloaded: 0, left: 0, uploaded: 0 };
+    for tracker in resolve_trackers(trackers).await {
+        if let Ok(found) = announce(tracker, infohash, peer_id, port, 200, transfer, AnnounceEvent::Completed).await
+        {
+            peers.extend(found);
+        }
+    }
     peers.into_iter().collect()
 }
 
@@ -69,5 +92,11 @@ mod tests {
     async fn resolve_skips_garbage() {
         let got = resolve_trackers(&["".into(), "udp://".into()]).await;
         assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn announce_seeder_returns_empty_on_unreachable_tracker() {
+        let peers = announce_seeder(&["udp://127.0.0.1:1/announce".into()], &[0u8; 20], &[0u8; 20], 6881).await;
+        assert!(peers.is_empty());
     }
 }

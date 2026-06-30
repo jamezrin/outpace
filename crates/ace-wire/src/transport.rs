@@ -156,21 +156,37 @@ pub fn decode_transport_with_key(
     })
 }
 
+/// Encode an Acestream transport file from a bencode descriptor dict — the inverse of
+/// [`decode_transport`]: PKCS#7 + AES-128-CBC under the global key/IV, prefixed with the
+/// 18-byte magic + 2-byte version. Round-trips with the decoder. `descriptor` should be a
+/// `Bencode::Dict`.
+pub fn encode_transport(descriptor: &Bencode) -> Vec<u8> {
+    encode_transport_with_key(descriptor, &TRANSPORT_KEY, &TRANSPORT_IV)
+}
+
+/// Like [`encode_transport`] but with an explicit key/IV (for tests / synthetic vectors).
+pub fn encode_transport_with_key(descriptor: &Bencode, key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+    use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+    type Enc = cbc::Encryptor<aes::Aes128>;
+    let ct = Enc::new_from_slices(key, iv)
+        .expect("16-byte key/iv")
+        .encrypt_padded_vec::<Pkcs7>(&descriptor.encode());
+    let mut out = b"AceStreamTransport\x00\x02".to_vec();
+    out.extend_from_slice(&ct);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
-
-    type Enc = cbc::Encryptor<aes::Aes128>;
 
     /// Wrap raw bencode `plaintext` into a transport file under the global key/IV.
     fn make_transport(plaintext: &[u8]) -> Vec<u8> {
-        let ct = Enc::new_from_slices(&TRANSPORT_KEY, &TRANSPORT_IV)
-            .unwrap()
-            .encrypt_padded_vec::<Pkcs7>(plaintext);
-        let mut out = b"AceStreamTransport\x00\x02".to_vec();
-        out.extend_from_slice(&ct);
-        out
+        encode_transport_with_key(
+            &crate::bencode::Bencode::parse(plaintext).unwrap(),
+            &TRANSPORT_KEY,
+            &TRANSPORT_IV,
+        )
     }
 
     #[test]
@@ -196,6 +212,32 @@ mod tests {
         assert_eq!(d.piece_length, 131072);
         assert_eq!(d.chunk_length, 16384);
         assert_eq!(d.name, "hi");
+    }
+
+    #[test]
+    fn encode_then_decode_roundtrips() {
+        use crate::bencode::Bencode;
+        use std::collections::BTreeMap;
+        let mut d = BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"my broadcast".to_vec()));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(1_048_576));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16_384));
+        d.insert(
+            b"trackers".to_vec(),
+            Bencode::List(vec![Bencode::Bytes(b"udp://t1.example:2710/announce".to_vec())]),
+        );
+        let dict = Bencode::Dict(d);
+
+        let bytes = encode_transport(&dict);
+        assert!(crate::infohash::is_transport_file(&bytes), "must carry the transport magic");
+        assert_eq!(bytes.len() % 16, (20 % 16), "magic(20) + ciphertext(mult of 16)");
+
+        let got = decode_transport(&bytes).unwrap();
+        assert_eq!(got.name, "my broadcast");
+        assert_eq!(got.piece_length, 1_048_576);
+        assert_eq!(got.chunk_length, 16_384);
+        assert_eq!(got.trackers, vec!["udp://t1.example:2710/announce".to_string()]);
+        assert!(got.is_live, "no pieces key => live");
     }
 
     #[test]

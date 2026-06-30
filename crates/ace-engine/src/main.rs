@@ -17,6 +17,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(dir) = std::env::var("OUTPACE_DATA_DIR") {
         config.data_dir = dir.into();
     }
+    if let Ok(v) = std::env::var("OUTPACE_PEER_LISTEN") {
+        config.peer_listen = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_SEED_STORE_BYTES") {
+        config.seed_store_bytes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
+        config.max_unchoked = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_INBOUND") {
+        config.max_inbound_peers = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_ENABLE_SEEDING") {
+        config.enable_seeding = matches!(v.as_str(), "1" | "true");
+    }
+    if let Ok(v) = std::env::var("OUTPACE_ENABLE_INBOUND") {
+        config.enable_inbound = matches!(v.as_str(), "1" | "true");
+    }
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
     eprintln!(
         "outpace: node_id={} data_dir={}",
@@ -25,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Register enabled providers. Only "ace" exists today; the registry is the seam for more.
+    let seed_registry = ace_swarm::listen::SeedRegistry::new();
     let mut registry = ProviderRegistry::new();
     if config.networks.iter().any(|n| n == "ace") {
         // OUTPACE_ACE_PEERS=ip:port,ip:port — bootstrap peers for the proven live path
@@ -35,7 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_map(|s| s.trim().parse().ok())
             .collect::<Vec<_>>();
         let provider = AceProvider::new(identity.clone(), config.bind.port())
-            .with_bootstrap_peers(bootstrap);
+            .with_bootstrap_peers(bootstrap)
+            .with_seed_registry(seed_registry.clone())
+            .with_seed_store_bytes(config.seed_store_bytes);
         registry.register(Arc::new(provider));
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
@@ -43,6 +64,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = StreamManager::new(registry);
     manager.spawn_reaper();
     let state = AppState { manager, networks: networks.clone() };
+
+    // Inbound seeding (S2): OFF by default. The served piece_header is still a placeholder
+    // ([0u8;8]) pending a separate RE task that pins the real engine bytes from ground-truth
+    // captures — see docs/RESUME.md "Next: v2" / Task 7. Do not flip enable_inbound to true
+    // by default before that lands; serving non-compliant pieces to the real swarm would
+    // violate the project's transparent-interop constraint.
+    if config.enable_inbound {
+        let peer_listener = tokio::net::TcpListener::bind(config.peer_listen).await?;
+        eprintln!(
+            "outpace: inbound seeding ENABLED on {} (max {} peers) — piece_header is a \
+             PLACEHOLDER, not yet validated against real Acestream peers",
+            config.peer_listen, config.max_inbound_peers
+        );
+        let listener_peer_id = ace_wire::handshake::random_peer_id();
+        let inbound_registry = seed_registry.clone();
+        let max_inbound = config.max_inbound_peers;
+        tokio::spawn(async move {
+            ace_swarm::listen::PeerListener::serve(
+                peer_listener, inbound_registry, listener_peer_id, [0u8; 8], max_inbound,
+            )
+            .await;
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     eprintln!("outpace: listening on http://{} networks={:?}", config.bind, networks);

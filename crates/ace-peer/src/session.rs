@@ -51,6 +51,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         Ok(peer)
     }
 
+    /// Inbound handshake: read the peer's 66-byte handshake first, then — only if `serves`
+    /// returns true for the requested infohash — reply with ours. Used by the seeder listener
+    /// to avoid replying (and thus leaking which infohashes we serve) to a peer asking for one
+    /// we don't have. Returns the peer's handshake on success.
+    pub async fn accept_handshake<F>(
+        &mut self, our_peer_id: [u8; 20], serves: F,
+    ) -> Result<Handshake>
+    where
+        F: FnOnce(&[u8; 20]) -> bool,
+    {
+        let timeout = self.timeout;
+        let mut hs = [0u8; HANDSHAKE_LEN];
+        with_timeout(timeout, self.stream.read_exact(&mut hs)).await??;
+        let peer = Handshake::decode(&hs)?;
+        if !serves(&peer.infohash) {
+            return Err(PeerError::InfohashMismatch);
+        }
+        let ours = Handshake::new(peer.infohash, our_peer_id);
+        with_timeout(timeout, self.stream.write_all(&ours.encode())).await??;
+        Ok(peer)
+    }
+
     /// Send a peer message.
     pub async fn send(&mut self, msg: &PeerMessage) -> Result<()> {
         with_timeout(self.timeout, self.stream.write_all(&msg.encode())).await??;
@@ -518,5 +540,47 @@ mod tests {
         let res = session.perform_handshake([0x11u8; 20], *b"R30------CLIENTPEERy").await;
         assert!(matches!(res, Err(PeerError::InfohashMismatch)));
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_handshake_replies_when_we_serve_the_infohash() {
+        let (client, server) = tokio::io::duplex(256);
+        let ih = [0x42u8; 20];
+        let client_id = *b"R30------CLIENTPEERy";
+        let server_id = *b"R30------SERVERPEERy";
+
+        let client_task = tokio::spawn(async move {
+            let mut p = PeerSession::new(client);
+            p.perform_handshake(ih, client_id).await
+        });
+
+        let mut server_session = PeerSession::new(server);
+        let got = server_session.accept_handshake(server_id, |peer_ih| *peer_ih == ih).await.unwrap();
+        assert_eq!(got.infohash, ih);
+        assert_eq!(got.peer_id, client_id);
+
+        let client_got = client_task.await.unwrap().unwrap();
+        assert_eq!(client_got.infohash, ih);
+        assert_eq!(client_got.peer_id, server_id);
+    }
+
+    #[tokio::test]
+    async fn accept_handshake_refuses_an_infohash_we_dont_serve() {
+        let (client, server) = tokio::io::duplex(256);
+        let ih = [0x42u8; 20];
+
+        let client_task = tokio::spawn(async move {
+            let mut p = PeerSession::new(client).with_timeout(Duration::from_millis(200));
+            // The client performs its handshake write+read; if the server never replies,
+            // perform_handshake's own read will time out.
+            p.perform_handshake(ih, *b"R30------CLIENTPEERy").await
+        });
+
+        let mut server_session = PeerSession::new(server);
+        let result = server_session.accept_handshake(*b"R30------SERVERPEERy", |_| false).await;
+        assert!(result.is_err(), "must refuse an infohash we don't serve");
+
+        // The client never got a reply, so its own handshake read times out / errors.
+        assert!(client_task.await.unwrap().is_err());
     }
 }
