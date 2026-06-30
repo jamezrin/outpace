@@ -7,7 +7,6 @@ pub const PROTOCOL_ID: u64 = 0x41727101980;
 pub const ACTION_CONNECT: u32 = 0;
 pub const ACTION_ANNOUNCE: u32 = 1;
 pub const ACTION_ERROR: u32 = 3;
-pub const EVENT_STARTED: u32 = 2;
 
 /// BEP-15 announce `event` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -57,6 +57,9 @@ pub async fn discover_peers(
 /// Announce ourselves as a SEEDER (`left=0`, event=Completed) for `infohash` to all `trackers`,
 /// aggregating the peers each tracker returns (best-effort — a non-responding tracker is
 /// skipped, mirroring `discover_peers`). A seeder still benefits from knowing other peers.
+///
+/// NOT YET WIRED: no production caller until announcing-as-seeder is hooked into the
+/// manager/session lifecycle (the spec's remaining S2 item).
 pub async fn announce_seeder(
     trackers: &[String],
     infohash: &[u8; 20],

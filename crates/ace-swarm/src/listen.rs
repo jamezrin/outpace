@@ -15,6 +15,12 @@ type SharedStore = Arc<Mutex<PieceStore>>;
 
 /// Maps infohash -> the `PieceStore` we'd serve it from. Shared between whatever feeds pieces
 /// (a download loop, a broadcast source) and the inbound listener.
+///
+/// KNOWN GAP: entries are never evicted — every infohash ever followed by this process gets a
+/// permanent slot (bounded per-entry by each store's own `max_bytes`, but unbounded in entry
+/// count). A long-lived daemon that streams many distinct infohashes accumulates one store per
+/// infohash for its whole lifetime. No `unregister`/TTL exists yet; add one if this becomes a
+/// real memory concern (e.g. tied to `StreamSession` teardown).
 #[derive(Clone, Default)]
 pub struct SeedRegistry {
     stores: Arc<StdMutex<HashMap<[u8; 20], SharedStore>>>,
