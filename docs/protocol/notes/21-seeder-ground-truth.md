@@ -113,14 +113,27 @@ peer. It does **not** yet prove the *seeder* direction.
 
 ## What's left (not RE-blocked — just not done this session)
 
-1. **Reverse direction (engine downloads FROM outpace) — not exercised.** Root cause
-   identified: `follow_one_peer` (the outbound leecher loop) mirrors the peer's own
-   advertised window in our `mi` and never proactively sends `Have` for newly-acquired
+1. **Reverse direction (engine downloads FROM outpace) — root cause fixed, but the
+   specific scenario tested still doesn't trigger it; a genuine window-lead is needed.**
+   Root cause identified: `follow_one_peer` (the outbound leecher loop) mirrors the peer's
+   own advertised window in our `mi` and never proactively sends `Have` for newly-acquired
    pieces — so a peer (including the engine) has no signal that outpace holds anything
-   it might want. Fixed in a follow-up commit on this branch (`task7-have-advertisement`):
-   `follow_one_peer` now sends `Have(piece)` over the existing connection the moment a piece
-   completes. **Re-running this same experiment with that fix is the natural next step** —
-   not done in this note because the fix landed after this capture.
+   it might want. Fixed and merged to `main`: `follow_one_peer` now sends `Have(piece)`
+   over the existing connection the moment a piece completes (`ace_provider.rs`, commit
+   `02f6d05`).
+
+   **Re-ran the same experiment with the fix in place** (same infohash, same container):
+   outpace connected, was unchoked, requested+received pieces, and (confirmed via the
+   new code path) sent `Have` for each one back to the engine. `/status` on outpace's
+   side stayed `uploaded: 0` — **as architecturally predicted, not a bug**: because we
+   mirror the engine's own reported window at connect time (`start`/`head` computed from
+   *their* `mi`), every `Have` we send is for a piece the engine, by construction, already
+   has. The fix is necessary infrastructure and is now real and tested, but this exact
+   scenario (both clients freshly joining the same live edge of the same swarm at nearly
+   the same time) never gives outpace a genuine surplus to advertise. Proving the
+   reverse direction needs either: a real window-lead (timing-dependent, not forceable with
+   the current single-peer-at-a-time `follow_live` architecture — getting one would need
+   S2's multi-peer work, out of scope here), or one of item 3's two routes below.
 2. **Cross-peer header reproducibility** (does `header[4..8]` match across two different
    peers serving the same piece?) — would resolve whether it's source-derived or
    relay-specific. One query was attempted but the daemon reconnected to the same peer
