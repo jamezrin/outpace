@@ -20,8 +20,10 @@ impl SeederSession {
         store: Arc<Mutex<PieceStore>>,
         piece_header: [u8; 8],
     ) -> Result<()> {
-        // Advertise what we currently hold (one Have per complete piece).
-        for piece in store.lock().await.have_pieces() {
+        // Advertise what we currently hold (one Have per complete piece). Snapshot the list
+        // first so the store lock is not held across the network sends.
+        let pieces = store.lock().await.have_pieces();
+        for piece in pieces {
             session.send(&PeerMessage::Have(piece as u32)).await?;
         }
         let mut unchoked = false;
@@ -33,6 +35,7 @@ impl SeederSession {
                     unchoked = true;
                 }
                 PeerMessage::Unknown { id: 6, payload } if payload.len() >= 10 => {
+                    // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
                     let piece = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                     let chunk = u16::from_be_bytes([payload[8], payload[9]]);
                     let data = store.lock().await.chunk(piece as u64, chunk).map(|d| d.to_vec());
