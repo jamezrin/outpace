@@ -32,12 +32,29 @@ Crates: `crates/{ace-wire,ace-tracker,ace-peer,ace-media,ace-engine}`. Workspace
 (TS align + HLS segment/manifest), `ace_engine::routes` (6878 URL surface). What's left needs
 the live byte path: peer download loop / `ace-swarm`, then wire `ace-media`+`ace-engine` to it.
 
-## Next: v2 — P2P compliance, seeding & broadcasting (specced, not yet built)
-The v1 daemon is **download-only (a pure leecher)** — confirmed in code: the only `TcpListener`
-is the HTTP API, we never accept inbound peers, never answer a peer's `Request`, never advertise
-`Have`/`Bitfield`, never send a `Piece`. v2 fixes that and adds origination. Spec:
+## Next: v2 — P2P compliance, seeding & broadcasting
+The v1 daemon was **download-only (a pure leecher)**. v2 fixes that and adds origination. Spec:
 **`docs/superpowers/specs/2026-06-30-compliance-seeding-broadcasting-design.md`**. Four phases:
 **S1** reciprocal upload (retain pieces in a `PieceStore`, serve on connections we already hold),
+**S2** inbound seeder (TCP listener on the peer port + seeder announce), **B0** live-source-auth
+
+### S1 — DONE (merged to main 2026-06-30, branch `seeding-s1-compliance`, plan `docs/superpowers/plans/2026-06-30-seeding-s1-compliance.md`)
+Reciprocal upload over connections we already hold. Built + reviewed (spec + code-quality + a
+final whole-branch pass; all green, clippy clean):
+- `ace-swarm::store::PieceStore` — pure bounded rolling chunk store (FIFO evict lowest piece).
+- `ace-wire::live_codec::build_piece` — send side of the live piece codec (inverse of `LiveChunk`).
+- `ace-swarm::seed` — `Choker` (pure unchoke policy; **no production caller until S2**) and
+  `SeederSession::serve` (advertise Haves → unchoke on `Interested` → answer `Unknown{id:6}`
+  chunk-requests with `build_piece`).
+- `ace-engine::ace_provider::follow_one_peer` — feeds a per-connection `PieceStore` from
+  downloaded pieces and serves the peer's chunk-requests inline; `uploaded`/`peers_served`
+  atomics surfaced at `/status`.
+- **Deferred — Task 7 (RE/sandbox-gated):** the served `piece_header` is `[0u8;8]`; the engine's
+  real 8 bytes must be captured from engine-as-seeder ground truth (→ note 21, `tests/vectors/seed/`)
+  and the advertisement (HAVE_ALL/NONE/ALLOWED_FAST?) aligned, then prove the engine downloads
+  FROM us. Needs a non-WARP host + the Docker sandbox engine. **This is the S1 interop linchpin.**
+
+### Remaining: S2 / B0 / B1 (not yet built; no plans written yet)
 **S2** inbound seeder (TCP listener on the peer port + seeder announce), **B0** live-source-auth
 RE spike (the interop linchpin — RSA-signed pieces, like the node-identity crack), **B1** HTTP
 ingest (`PUT /broadcast/{name}`, OBS/ffmpeg MPEG-TS) → chunk → mint transport+infohash → originate
