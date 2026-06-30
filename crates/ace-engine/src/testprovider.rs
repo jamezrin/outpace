@@ -28,7 +28,7 @@ impl TsSource for TestSource {
         Some(Bytes::from(b))
     }
     fn stats(&self) -> SourceStats {
-        SourceStats { peers: 1, bitrate: 0, buffer_ms: 0 }
+        SourceStats { peers: 1, bitrate: 0, buffer_ms: 0, uploaded: 0, peers_served: 0 }
     }
 }
 

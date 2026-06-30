@@ -15,4 +15,6 @@ pub mod driver;
 pub mod live;
 pub mod resolve;
 pub mod scheduler;
+pub mod seed;
+pub mod store;
 pub mod types;

@@ -15,13 +15,14 @@ use ace_swarm::types::StreamInfo;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
-use ace_wire::live_codec::{chunk_request, LiveChunk};
+use ace_swarm::store::PieceStore;
+use ace_wire::live_codec::{build_piece, chunk_request, LiveChunk};
 use ace_wire::message::PeerMessage;
 use ace_wire::reassembly::PieceReassembler;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddrV4;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -40,6 +41,9 @@ const DEFAULT_ACE_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announc
 
 /// How long a resolved content-id → `StreamInfo` stays cached.
 const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Bytes of recently-downloaded data retained per active peer connection for reseeding.
+const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
 pub struct AceProvider {
     identity: Arc<Identity>,
@@ -114,6 +118,8 @@ impl AceProvider {
 struct AceSource {
     rx: mpsc::Receiver<Bytes>,
     peers: Arc<AtomicU32>,
+    uploaded: Arc<AtomicU64>,
+    peers_served: Arc<AtomicU32>,
 }
 
 #[async_trait]
@@ -122,7 +128,13 @@ impl TsSource for AceSource {
         self.rx.recv().await
     }
     fn stats(&self) -> SourceStats {
-        SourceStats { peers: self.peers.load(Ordering::Relaxed), bitrate: 0, buffer_ms: 0 }
+        SourceStats {
+            peers: self.peers.load(Ordering::Relaxed),
+            bitrate: 0,
+            buffer_ms: 0,
+            uploaded: self.uploaded.load(Ordering::Relaxed),
+            peers_served: self.peers_served.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -159,12 +171,16 @@ impl StreamProvider for AceProvider {
 
         let (tx, rx) = mpsc::channel::<Bytes>(256);
         let peer_count = Arc::new(AtomicU32::new(0));
+        let uploaded = Arc::new(AtomicU64::new(0));
+        let peers_served = Arc::new(AtomicU32::new(0));
         let identity = self.identity.clone();
         let stats_peers = peer_count.clone();
+        let stats_uploaded = uploaded.clone();
+        let stats_peers_served = peers_served.clone();
         tokio::spawn(async move {
-            follow_live(info, peers, identity, tx, stats_peers).await;
+            follow_live(info, peers, identity, tx, stats_peers, uploaded, peers_served).await;
         });
-        Ok(Box::new(AceSource { rx, peers: peer_count }))
+        Ok(Box::new(AceSource { rx, peers: peer_count, uploaded: stats_uploaded, peers_served: stats_peers_served }))
     }
 }
 
@@ -176,6 +192,8 @@ async fn follow_live(
     identity: Arc<Identity>,
     tx: mpsc::Sender<Bytes>,
     peer_count: Arc<AtomicU32>,
+    uploaded: Arc<AtomicU64>,
+    peers_served: Arc<AtomicU32>,
 ) {
     let chunks_per_piece = info.chunks_per_piece();
     for addr in peers {
@@ -194,7 +212,7 @@ async fn follow_live(
         }
         eprintln!("[ace] {addr}: connected + handshaked");
         peer_count.store(1, Ordering::Relaxed);
-        match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx).await {
+        match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx, &uploaded, &peers_served).await {
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost => {
                 peer_count.store(0, Ordering::Relaxed);
@@ -209,6 +227,7 @@ enum FollowEnd {
     PeerLost,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn follow_one_peer(
     session: &mut PeerSession<TcpStream>,
     info: &StreamInfo,
@@ -216,6 +235,8 @@ async fn follow_one_peer(
     addr: SocketAddrV4,
     chunks_per_piece: u16,
     tx: &mpsc::Sender<Bytes>,
+    uploaded: &Arc<AtomicU64>,
+    peers_served: &Arc<AtomicU32>,
 ) -> FollowEnd {
     // 1. Read the peer's advertised live window (their unsolicited extended handshake).
     let Some(window) = read_peer_window(session).await else {
@@ -252,6 +273,8 @@ async fn follow_one_peer(
     let mut resync = ace_media::mpegts::TsResync::new();
     let mut requested_to: Option<u64> = None;
     let mut unchoked = false;
+    let mut store = PieceStore::new(info.piece_length, info.chunk_length, SEED_STORE_BYTES);
+    let mut unchoked_peer = false;
 
     loop {
         let msg = match session.read_message().await {
@@ -282,6 +305,7 @@ async fn follow_one_peer(
             }
             m @ PeerMessage::Piece { .. } => {
                 if let Some(lc) = LiveChunk::from_message(&m) {
+                    store.put_chunk(lc.piece as u64, lc.chunk, &lc.data);
                     let begin = lc.chunk as u64 * info.chunk_length;
                     if reasm.add_block(lc.piece as u64, begin, &lc.data).is_err() {
                         continue;
@@ -292,6 +316,24 @@ async fn follow_one_peer(
                         if !aligned.is_empty() && tx.send(Bytes::from(aligned)).await.is_err() {
                             return FollowEnd::ConsumerGone;
                         }
+                    }
+                }
+            }
+            PeerMessage::Interested => {
+                if !unchoked_peer {
+                    let _ = session.send(&PeerMessage::Unchoke).await;
+                    unchoked_peer = true;
+                }
+            }
+            PeerMessage::Unknown { id: 6, ref payload } if payload.len() >= 10 => {
+                // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
+                let p = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                let c = u16::from_be_bytes([payload[8], payload[9]]);
+                if let Some(data) = store.chunk(p as u64, c).map(|d| d.to_vec()) {
+                    // piece_header [0u8;8] until note 21 pins the engine's exact bytes.
+                    if session.send(&build_piece(0, p, c, [0u8; 8], &data)).await.is_ok() {
+                        uploaded.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        peers_served.store(1, Ordering::Relaxed); // single-peer follow; multi-peer aggregation is S2
                     }
                 }
             }

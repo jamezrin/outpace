@@ -11,8 +11,12 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceStats {
     pub peers: u32,
-    pub bitrate: u64,  // bits/sec
+    pub bitrate: u64,   // bits/sec
     pub buffer_ms: u64, // buffered duration estimate
+    /// Bytes we have uploaded (served to peers) on this source.
+    pub uploaded: u64,
+    /// Distinct peers we have served at least one chunk to.
+    pub peers_served: u32,
 }
 
 /// A live MPEG-TS byte source for one stream.
@@ -82,5 +86,12 @@ mod tests {
         assert!(r.get("dummy").is_some());
         assert!(r.get("nope").is_none());
         assert_eq!(r.networks(), vec!["dummy"]);
+    }
+
+    #[test]
+    fn source_stats_has_upload_counters() {
+        let s = SourceStats { peers: 1, bitrate: 0, buffer_ms: 0, uploaded: 4096, peers_served: 2 };
+        assert_eq!(s.uploaded, 4096);
+        assert_eq!(s.peers_served, 2);
     }
 }
