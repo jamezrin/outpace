@@ -35,8 +35,10 @@ the live byte path: peer download loop / `ace-swarm`, then wire `ace-media`+`ace
 ## Run the daemon + verify VLC (live, operator-run)
 The daemon binary is `outpace` (`cargo run -p ace-engine --bin outpace`). The clean API:
 `GET /healthz`, `/networks`, `/streams`, `/streams/{network}/{id}.ts` (live MPEG-TS),
-`/streams/{network}/{id}.m3u8` (+ `/seg/{n}.ts`), `/streams/{network}/{id}/status`.
-`{network}` is the provider key (`ace` today). **No `ace`/`acestream` baggage** elsewhere.
+`/streams/{network}/{id}.m3u8` (+ `/seg/{n}.ts`), `/streams/{network}/{id}/status`,
+`DELETE /streams/{network}/{id}` (force-stop a session). `{network}` is the provider key
+(`ace` today). **No `ace`/`acestream` baggage** elsewhere. (Session teardown — idle-reaper or
+force-stop — now aborts the background pull task, so a stopped stream stops downloading.)
 
 Default bind is `127.0.0.1:6878` (collides with a running official engine — override with
 `OUTPACE_BIND`). **Peer discovery is autonomous via mainline DHT** (`ace_swarm::dht`) +

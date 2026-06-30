@@ -12,6 +12,16 @@ pub struct StreamSession {
     tx: broadcast::Sender<Bytes>,
     subscribers: Arc<AtomicU64>,
     stats: Arc<Mutex<SourceStats>>,
+    /// The background pull task; aborted when the session is dropped (last `Arc` gone, e.g.
+    /// the manager's idle reaper or an explicit force-stop) so a live download doesn't keep
+    /// running headless.
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StreamSession {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
 }
 
 /// A subscription that decrements the live subscriber count on drop.
@@ -33,19 +43,21 @@ impl StreamSession {
     pub fn start(mut source: Box<dyn TsSource>, buffer: usize) -> Arc<StreamSession> {
         let (tx, _rx) = broadcast::channel(buffer);
         let stats = Arc::new(Mutex::new(SourceStats::default()));
-        let session = Arc::new(StreamSession {
-            tx: tx.clone(),
-            subscribers: Arc::new(AtomicU64::new(0)),
-            stats: stats.clone(),
-        });
-        tokio::spawn(async move {
+        let pump_tx = tx.clone();
+        let pump_stats = stats.clone();
+        let pump = tokio::spawn(async move {
             while let Some(chunk) = source.next().await {
-                *stats.lock().await = source.stats();
+                *pump_stats.lock().await = source.stats();
                 // Err just means no live receivers right now; keep pulling (live).
-                let _ = tx.send(chunk);
+                let _ = pump_tx.send(chunk);
             }
         });
-        session
+        Arc::new(StreamSession {
+            tx,
+            subscribers: Arc::new(AtomicU64::new(0)),
+            stats,
+            pump,
+        })
     }
 
     pub fn subscribe(&self) -> Subscription {
@@ -88,5 +100,44 @@ mod tests {
         assert_eq!(ca[0], 0x47);
         drop(a);
         assert_eq!(session.subscriber_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_session_aborts_pump_and_drops_source() {
+        use async_trait::async_trait;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        // A source that never yields (like a live swarm) but flags when it is dropped.
+        struct BlockingSource(Arc<AtomicBool>);
+        impl Drop for BlockingSource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait]
+        impl TsSource for BlockingSource {
+            async fn next(&mut self) -> Option<Bytes> {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                None
+            }
+            fn stats(&self) -> SourceStats {
+                SourceStats::default()
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let session = StreamSession::start(Box::new(BlockingSource(dropped.clone())), 16);
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(session); // last Arc gone → pump aborted → source dropped
+
+        // The abort + drop run on the next runtime poll; give it a moment.
+        for _ in 0..50 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(dropped.load(Ordering::SeqCst), "pump must be aborted and source dropped");
     }
 }

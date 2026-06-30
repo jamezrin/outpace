@@ -67,6 +67,15 @@ impl StreamManager {
         Ok(map.entry(key).or_insert_with(|| HlsPackager::start(&session)).clone())
     }
 
+    /// Force-stop a session: remove it (and any HLS packager) so the shared download is torn
+    /// down — the session's `Drop` aborts its background pull task. Returns `true` if a session
+    /// for `(network, id)` existed. Connected clients see the stream end.
+    pub async fn stop(&self, network: &str, id: &str) -> bool {
+        let key = (network.to_string(), id.to_string());
+        self.packagers.lock().await.remove(&key);
+        self.sessions.lock().await.remove(&key).is_some()
+    }
+
     /// Active sessions as `(network, id, subscriber_count)`.
     pub async fn list(&self) -> Vec<(String, String, u64)> {
         self.sessions
@@ -125,5 +134,14 @@ mod tests {
         m.get_or_start("test", "a").await.unwrap();
         let list = m.list().await;
         assert!(list.iter().any(|(n, i, _)| n == "test" && i == "a"));
+    }
+
+    #[tokio::test]
+    async fn stop_removes_session_and_is_idempotent() {
+        let m = StreamManager::new(registry());
+        m.get_or_start("test", "a").await.unwrap();
+        assert!(m.stop("test", "a").await, "first stop removes the running session");
+        assert!(m.get("test", "a").await.is_none(), "session is gone afterwards");
+        assert!(!m.stop("test", "a").await, "stopping a missing session is a no-op");
     }
 }

@@ -23,7 +23,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/networks", get(networks))
         .route("/streams", get(list_streams))
-        .route("/streams/:network/:file", get(stream_file))
+        .route("/streams/:network/:file", get(stream_file).delete(delete_stream))
         .route("/streams/:network/:id/status", get(stream_status))
         .route("/streams/:network/:id/seg/:seg", get(stream_segment))
         .with_state(state)
@@ -43,6 +43,18 @@ async fn list_streams(State(s): State<AppState>) -> Json<serde_json::Value> {
         .map(|(network, id, clients)| json!({ "network": network, "id": id, "clients": clients }))
         .collect();
     Json(json!({ "streams": streams }))
+}
+
+/// `DELETE /streams/{network}/{id}` — force-stop a running session (admin). 204 if it was
+/// running, 404 otherwise. The `{id}` may carry a `.ts`/`.m3u8` suffix (mirroring the GET
+/// URL); it's stripped so either form stops the same session.
+async fn delete_stream(State(s): State<AppState>, Path((network, file)): Path<(String, String)>) -> Response {
+    let id = file.strip_suffix(".ts").or_else(|| file.strip_suffix(".m3u8")).unwrap_or(&file);
+    if s.manager.stop(&network, id).await {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
 }
 
 /// `GET /streams/{network}/{id}/status` — stats for a running session (404 if not active).
@@ -191,8 +203,12 @@ mod tests {
         use futures::StreamExt;
         const VIDEO_PID: u16 = 0x0100;
         const KEYFRAME2: usize = 9400;
+        // Hold the app (and thus the manager/session) alive while we read the streamed body;
+        // the session's pump is tied to the session's lifetime.
+        let app = router(fixture_state(4136));
         // Join the stream mid-GOP (a non-keyframe video packet between the two keyframes).
-        let resp = router(fixture_state(4136))
+        let resp = app
+            .clone()
             .oneshot(Request::get("/streams/fix/x.ts").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -240,7 +256,10 @@ mod tests {
     async fn stream_ts_serves_mpegts_first_frame() {
         use futures::StreamExt;
         // Stream the real fixture from the start; the gate locks on its leading keyframe.
-        let resp = router(fixture_state(0))
+        // Keep `app` alive so the session/pump survives while we read the body.
+        let app = router(fixture_state(0));
+        let resp = app
+            .clone()
             .oneshot(Request::get("/streams/fix/somechannel.ts").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -303,6 +322,27 @@ mod tests {
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/vnd.apple.mpegurl");
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         assert!(String::from_utf8_lossy(&body).starts_with("#EXTM3U"));
+    }
+
+    #[tokio::test]
+    async fn delete_stops_running_session_then_404() {
+        let st = state();
+        let app = router(st.clone());
+        st.manager.get_or_start("test", "z").await.unwrap();
+        // First delete stops the running session.
+        let resp = app
+            .clone()
+            .oneshot(Request::delete("/streams/test/z").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(st.manager.get("test", "z").await.is_none());
+        // Second delete finds nothing to stop.
+        let resp = app
+            .oneshot(Request::delete("/streams/test/z").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
