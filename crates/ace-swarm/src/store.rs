@@ -3,6 +3,7 @@
 //! piece index once the byte budget is exceeded.
 use std::collections::BTreeMap;
 
+#[derive(Debug)]
 pub struct PieceStore {
     piece_length: u64,
     chunk_length: u64,
@@ -13,6 +14,10 @@ pub struct PieceStore {
 }
 
 impl PieceStore {
+    /// # Panics
+    /// `chunk_length` must be > 0 (otherwise [`chunks_per_piece`](Self::chunks_per_piece) divides
+    /// by zero), and `piece_length` should be a multiple of `chunk_length`. Domain inputs are
+    /// always 1 MiB / 16 KiB, so this is documented rather than asserted at runtime.
     pub fn new(piece_length: u64, chunk_length: u64, max_bytes: u64) -> Self {
         PieceStore { piece_length, chunk_length, max_bytes, cur_bytes: 0, pieces: BTreeMap::new() }
     }
@@ -23,7 +28,8 @@ impl PieceStore {
     }
 
     /// Store a chunk's TS payload. Replacing an existing chunk adjusts the byte total. After the
-    /// insert, evict the lowest-index pieces until within `max_bytes`.
+    /// insert, evict the lowest-index pieces until within `max_bytes`. If `max_bytes` is smaller
+    /// than `data.len()`, the chunk is evicted immediately after insertion (a no-op write).
     pub fn put_chunk(&mut self, piece: u64, chunk: u16, data: &[u8]) {
         let entry = self.pieces.entry(piece).or_default();
         if let Some(old) = entry.insert(chunk, data.to_vec()) {
@@ -120,5 +126,33 @@ mod tests {
         // Still one piece (1) with two chunks = 8 bytes, nothing evicted.
         assert_eq!(s.chunk(1, 0), Some(&[9, 9, 9, 9][..]));
         assert!(s.has_piece(1));
+    }
+
+    #[test]
+    fn budget_smaller_than_one_chunk_discards_gracefully() {
+        let mut s = PieceStore::new(8, 4, 3); // max_bytes < chunk size
+        s.put_chunk(1, 0, &[0; 4]);
+        assert_eq!(s.chunk(1, 0), None); // evicted immediately, no panic
+        assert_eq!(s.window(), None);
+    }
+
+    #[test]
+    fn eviction_runs_multiple_iterations_if_needed() {
+        let mut s = store(4); // 1-chunk budget
+        s.put_chunk(1, 0, &[0; 4]);
+        s.put_chunk(2, 0, &[0; 4]); // evicts piece 1
+        s.put_chunk(3, 0, &[0; 4]); // evicts piece 2
+        assert_eq!(s.chunk(1, 0), None);
+        assert_eq!(s.chunk(2, 0), None);
+        assert_eq!(s.window(), Some((3, 3)));
+    }
+
+    #[test]
+    fn have_pieces_excludes_partial_pieces() {
+        let mut s = store(1024); // 2 chunks/piece
+        s.put_chunk(5, 0, &[0; 4]); // piece 5 partial
+        s.put_chunk(6, 0, &[0; 4]);
+        s.put_chunk(6, 1, &[0; 4]); // piece 6 complete
+        assert_eq!(s.have_pieces(), vec![6]);
     }
 }
