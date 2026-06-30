@@ -48,10 +48,14 @@ H.264) with no hand-fed peers.
 # Fully autonomous — just an infohash:
 OUTPACE_BIND=127.0.0.1:6900 cargo run -p ace-engine --bin outpace
 vlc http://127.0.0.1:6900/streams/ace/<40-hex-infohash>.ts
-# Gapless-muxing workaround for the known −4 B/piece drift (Task 19):
-ffmpeg -err_detect ignore_err -fflags +discardcorrupt -i \
-  http://127.0.0.1:6900/streams/ace/<infohash>.ts -c copy out.ts
 ```
+
+The served stream is **clean, packet-aligned MPEG-TS** — the −4 B/piece drift (Task 19) is
+fixed by `ace_media::mpegts::TsResync` (Acestream's 1 MiB live pieces are each internally
+188-aligned but don't byte-chain; the resync filter drops the ~1 partial packet of junk per
+piece boundary and re-locks). **VERIFIED:** `ffmpeg` decodes the daemon's output to
+1280×720 50 fps H.264. (Playback starts ~mid-GOP since we begin 8 pieces behind the live
+edge, so expect a moment before the first keyframe; starting on a keyframe is future polish.)
 
 **Getting an infohash from an `acestream://` content-id** (content-id→infohash resolution
 isn't wired yet — the engine does it; we don't): ask the running official engine once —
