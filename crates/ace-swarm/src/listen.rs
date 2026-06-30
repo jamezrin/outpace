@@ -48,6 +48,7 @@ pub struct PeerListener;
 impl PeerListener {
     /// Run the accept loop until `listener` errors. Per-connection errors (failed handshake,
     /// unknown infohash, peer disconnect) are non-fatal — logged and dropped, the loop continues.
+    /// `max_inbound == 0` is treated as `1` (a fully-closed listener would look like a hang).
     pub async fn serve(
         listener: TcpListener,
         registry: SeedRegistry,
@@ -60,7 +61,11 @@ impl PeerListener {
             let (stream, _addr) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => {
+                    // A backoff matters here: under fd exhaustion (EMFILE/ENFILE) accept()
+                    // fails repeatedly with no natural delay, and a tight retry loop would
+                    // busy-spin a core instead of giving the system room to recover.
                     eprintln!("[seed-listener] accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
             };
