@@ -9,6 +9,15 @@ pub const ACTION_ANNOUNCE: u32 = 1;
 pub const ACTION_ERROR: u32 = 3;
 pub const EVENT_STARTED: u32 = 2;
 
+/// BEP-15 announce `event` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnounceEvent {
+    None = 0,
+    Completed = 1,
+    Started = 2,
+    Stopped = 3,
+}
+
 pub fn build_connect_request(txid: u32) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&PROTOCOL_ID.to_be_bytes());
@@ -44,7 +53,7 @@ pub struct TransferState {
 #[allow(clippy::too_many_arguments)]
 pub fn build_announce_request(
     connection_id: u64, txid: u32, infohash: &[u8; 20], peer_id: &[u8; 20],
-    port: u16, num_want: i32, transfer: &TransferState,
+    port: u16, num_want: i32, transfer: &TransferState, event: AnnounceEvent,
 ) -> Vec<u8> {
     let mut b = Vec::with_capacity(98);
     b.extend_from_slice(&connection_id.to_be_bytes());
@@ -55,7 +64,7 @@ pub fn build_announce_request(
     b.extend_from_slice(&transfer.downloaded.to_be_bytes());
     b.extend_from_slice(&transfer.left.to_be_bytes());
     b.extend_from_slice(&transfer.uploaded.to_be_bytes());
-    b.extend_from_slice(&EVENT_STARTED.to_be_bytes());
+    b.extend_from_slice(&(event as u32).to_be_bytes());
     b.extend_from_slice(&0u32.to_be_bytes()); // ip (default)
     b.extend_from_slice(&0u32.to_be_bytes()); // key
     b.extend_from_slice(&num_want.to_be_bytes());
@@ -115,7 +124,7 @@ mod tests {
     #[test]
     fn announce_request_layout() {
         let req = build_announce_request(0x0102_0304_0506_0708, 0x1111_2222,
-            &[0xAB; 20], &[0xCD; 20], 6881, 50, &TransferState::default());
+            &[0xAB; 20], &[0xCD; 20], 6881, 50, &TransferState::default(), AnnounceEvent::Started);
         assert_eq!(req.len(), 98);
         assert_eq!(&req[0..8], &0x0102_0304_0506_0708u64.to_be_bytes()); // conn id
         assert_eq!(&req[8..12], &1u32.to_be_bytes());                    // action announce
@@ -128,10 +137,17 @@ mod tests {
     fn announce_request_encodes_caller_transfer_counters() {
         let t = TransferState { downloaded: 0x1122, left: 0x3344, uploaded: 0x5566 };
         let req = build_announce_request(0x0102_0304_0506_0708, 0x1111_2222,
-            &[0xAB; 20], &[0xCD; 20], 6881, 50, &t);
+            &[0xAB; 20], &[0xCD; 20], 6881, 50, &t, AnnounceEvent::Started);
         assert_eq!(&req[56..64], &0x1122u64.to_be_bytes()); // downloaded
         assert_eq!(&req[64..72], &0x3344u64.to_be_bytes()); // left
         assert_eq!(&req[72..80], &0x5566u64.to_be_bytes()); // uploaded
+    }
+
+    #[test]
+    fn announce_event_is_encoded_at_the_documented_offset() {
+        let t = TransferState { downloaded: 0, left: 0, uploaded: 0 };
+        let req = build_announce_request(1, 2, &[0u8; 20], &[0u8; 20], 6881, -1, &t, AnnounceEvent::Completed);
+        assert_eq!(&req[80..84], &1u32.to_be_bytes()); // Completed = 1
     }
 
     #[test]
