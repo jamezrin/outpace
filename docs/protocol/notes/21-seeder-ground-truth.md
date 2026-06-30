@@ -1,11 +1,15 @@
 # 21 — Seeder ground truth: piece-header structure + official-engine interop proof
 
-**Status: PARTIAL.** Captured the real 8-byte piece-header structure from the live swarm
-(structural finding, semantics of the varying half still open). Separately, proved
-**bidirectional protocol acceptance against the official engine itself** (not just real
-swarm peers) running in the `re/` Docker sandbox — outpace downloaded 9 MB of real live
-data through a direct connection to the official engine's peer port. The REVERSE direction
-(engine downloading FROM outpace) was not exercised in this session — see "What's left."
+**Status: PARTIAL — plus one important negative result.** Captured the real 8-byte
+piece-header structure from the live swarm (structural finding, semantics of the varying
+half still open). Proved **bidirectional protocol acceptance against the official engine
+itself** (not just real swarm peers) running in the `re/` Docker sandbox — outpace
+downloaded 9 MB of real live data through a direct connection to the official engine's
+peer port. Then, in pursuit of the REVERSE direction (engine downloading FROM
+outpace), added proactive `Have`-advertisement to the outbound leecher path —
+**discovered live (via VLC) that this breaks real downloads** (a real peer goes silent
+after receiving it) and reverted it. See "⚠️ Update" below for the full account; the
+reverse direction is unsolved again as a result.
 
 Both experiments ran with WARP off, Docker available, against the documented known-good
 live channel (`docs/protocol/notes/02-test-streams.md`): content_id
@@ -111,29 +115,53 @@ This is the harder, more rigorous half of the wire-compatibility question: it pr
 official engine's *leecher-acceptance* path treats outpace indistinguishably from a real
 peer. It does **not** yet prove the *seeder* direction.
 
+## ⚠️ Update: the Have-advertisement fix below was REVERTED — it broke real downloads
+
+Item 1 originally described adding proactive `Have` advertisement to `follow_one_peer`
+(commit `02f6d05`) and finding it inert against the sandbox engine (`uploaded` stayed 0).
+**Live testing against the real swarm afterward** (prompted by the daemon failing to
+serve VLC at all) found something much worse: **sending an unsolicited `Have` for a
+just-completed piece back to a real peer makes that peer go silent** — no error, no
+close, just no further data, which manifests as the daemon hanging forever with zero
+bytes delivered to any HTTP client.
+
+**Confirmed by bisection:** built the daemon at three points and ran the identical
+download against the identical live peer (`85.87.156.75:8621`, infohash
+`50e93529d3eb46a50506b14464185a15292d6e47`):
+- `3fdef29` (before the Have-advertisement commit): connects, unchokes, **downloads 8.3 MB**.
+- `02f6d05` (with Have-advertisement): connects, unchokes, requests pieces — **zero bytes
+  delivered in 45s**, even though a parallel raw-protocol probe (`live_recon_unchoke`)
+  against the *same* peer at the *same* time confirmed it was healthy and actively
+  sending real `Piece` data to a leecher that didn't send `Have`.
+- Reverted (this commit): **downloads 8.3 MB again**, confirmed via `ffprobe`
+  (1280×720 H.264 + AAC).
+
+**Root cause, best guess (not deeply RE'd — the fix is to not do this, not to understand
+exactly why):** a brand-new leecher connection proactively claiming to already hold
+pieces it just received moments ago looks anomalous to a real swarm peer's own
+heuristics, and the peer appears to defensively stop serving rather than erroring
+visibly. The benefit was never demonstrated either way (every live test showed
+`uploaded: 0`, since outbound connections mirror the peer's own window and structurally
+never have genuine surplus to advertise — see the now-superseded analysis below). Net:
+**actively harmful, no observed upside.** Reverted outright rather than gated behind a
+flag — see commit `0dcfe99`.
+
+**Lesson:** this was caught only because the user tried the daemon in VLC and reported
+"no video" — the existing test suite (duplex-mocked peers) had no way to catch a real
+swarm peer's defensive reaction to a structurally-valid-but-unusual message. Any future
+protocol-level addition to the outbound leecher path needs a live download smoke test
+before being treated as safe, not just unit/mock coverage.
+
 ## What's left (not RE-blocked — just not done this session)
 
-1. **Reverse direction (engine downloads FROM outpace) — root cause fixed, but the
-   specific scenario tested still doesn't trigger it; a genuine window-lead is needed.**
-   Root cause identified: `follow_one_peer` (the outbound leecher loop) mirrors the peer's
-   own advertised window in our `mi` and never proactively sends `Have` for newly-acquired
-   pieces — so a peer (including the engine) has no signal that outpace holds anything
-   it might want. Fixed and merged to `main`: `follow_one_peer` now sends `Have(piece)`
-   over the existing connection the moment a piece completes (`ace_provider.rs`, commit
-   `02f6d05`).
-
-   **Re-ran the same experiment with the fix in place** (same infohash, same container):
-   outpace connected, was unchoked, requested+received pieces, and (confirmed via the
-   new code path) sent `Have` for each one back to the engine. `/status` on outpace's
-   side stayed `uploaded: 0` — **as architecturally predicted, not a bug**: because we
-   mirror the engine's own reported window at connect time (`start`/`head` computed from
-   *their* `mi`), every `Have` we send is for a piece the engine, by construction, already
-   has. The fix is necessary infrastructure and is now real and tested, but this exact
-   scenario (both clients freshly joining the same live edge of the same swarm at nearly
-   the same time) never gives outpace a genuine surplus to advertise. Proving the
-   reverse direction needs either: a real window-lead (timing-dependent, not forceable with
-   the current single-peer-at-a-time `follow_live` architecture — getting one would need
-   S2's multi-peer work, out of scope here), or one of item 3's two routes below.
+1. **Reverse direction (engine downloads FROM outpace) — back to unsolved**, now that
+   the Have-advertisement approach is reverted. The original diagnosis (outbound
+   connections mirror the peer's window and never claim genuine surplus, so a peer has no
+   signal to request from us) still holds, but proactive `Have` is not a viable fix given
+   the above. Needs a different approach — most likely getting the engine to dial
+   outpace directly (so the *inbound* `SeederSession::serve` path, which already sends
+   `Have` correctly on accept and was never implicated in this regression, is what's
+   exercised), via one of item 3's two routes below.
 2. **Cross-peer header reproducibility** (does `header[4..8]` match across two different
    peers serving the same piece?) — would resolve whether it's source-derived or
    relay-specific. One query was attempted but the daemon reconnected to the same peer
