@@ -15,6 +15,10 @@ impl SeederSession {
     /// Acestream chunk-request (id=6 `[stream u32][piece u32][chunk u16]`) with a `Piece` built
     /// from the store, after unchoking on the peer's first `Interested`. `piece_header` is the
     /// 8-byte per-chunk header (pinned to engine ground truth in note 21). Returns on close.
+    ///
+    /// Upload accounting (bytes/peers served) is not tracked here; the S1 reciprocal seeder in
+    /// `ace_provider::follow_one_peer` inlines this loop and counts via atomics. A standalone
+    /// seeder built on this method (S2) will need its own counters.
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         session: &mut PeerSession<S>,
         store: Arc<Mutex<PieceStore>>,
@@ -53,6 +57,9 @@ impl SeederSession {
 
 /// Decides which interested peers to unchoke. Live-appropriate: unchoke up to `max_unchoked`
 /// interested peers (stable order) plus one rotating "optimistic" peer so newcomers get a turn.
+///
+/// S2: invoked by the multi-peer serve coordinator. The S1 reciprocal path serves a single
+/// peer and unchokes it inline, so this policy has no production caller yet.
 pub struct Choker {
     max_unchoked: usize,
 }
