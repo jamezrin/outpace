@@ -123,12 +123,12 @@ mod tests {
 
         // Our seeder serves the peer until it closes.
         let mut us = PeerSession::new(server);
-        let serve = SeederSession::serve(&mut us, store, [0u8; 8]);
-        // Run the serve loop until the peer has its chunk, then drop.
-        let got = tokio::select! {
-            r = peer => r.unwrap(),
-            _ = serve => panic!("serve ended before peer got its chunk"),
-        };
+        // Run the serve loop in the background; it exits on its own once the peer drops `client`.
+        let serve_task = tokio::spawn(async move {
+            let _ = SeederSession::serve(&mut us, store, [0u8; 8]).await;
+        });
+        let got = peer.await.unwrap();
         assert_eq!(got, LiveChunk { piece: 5, chunk: 0, data: vec![9, 9, 9, 9] });
+        serve_task.abort(); // stop the loop if it hasn't already returned
     }
 }
