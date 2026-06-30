@@ -42,7 +42,7 @@ const DEFAULT_ACE_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announc
 /// How long a resolved content-id → `StreamInfo` stays cached.
 const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// How many recently-downloaded bytes to retain for reseeding peers.
+/// Bytes of recently-downloaded data retained per active peer connection for reseeding.
 const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
 pub struct AceProvider {
