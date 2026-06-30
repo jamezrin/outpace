@@ -82,9 +82,6 @@ All green, clippy clean, full workspace:
   `PeerListener` — **gated OFF by default** (`enable_inbound=false`) because the served
   `piece_header` is still a placeholder `[0u8;8]`. Verified live: a default `cargo run` does
   NOT start the inbound listener; `OUTPACE_ENABLE_INBOUND=1` does.
-- `follow_one_peer` now also sends `Have(piece)` back to the peer it's downloading from the
-  moment a piece completes (previously S1 only ever *answered* requests, never proactively told
-  a peer what it newly holds) — the proactive half of reciprocal seeding. See note 21.
 - **Do not flip `enable_inbound`'s default to `true` before Task 7 (below) lands** — serving
   non-compliant pieces to the real swarm would violate the wire-compatibility constraint.
 
@@ -100,14 +97,18 @@ both the live swarm and the official engine itself (sandboxed):
   outpace directly to the engine's peer port inside its own Docker sandbox and downloading
   9 MB of real live video from it. This is the harder, more rigorous half of wire-compatibility
   (the *reference implementation* treats outpace indistinguishably from a real peer).
-- **Reverse direction (engine downloads FROM outpace) — still not exercised.** Root-caused
-  to the missing Have-advertisement (now fixed, see above) but re-verified live that the fix
-  alone doesn't trigger it in a synchronized-same-live-edge scenario, since outpace mirrors
-  the peer's own window and so never has genuine surplus to offer. Needs either a real
-  window-lead (not forceable with today's single-peer-at-a-time `follow_live`) or getting the
-  engine to dial outpace directly (needs DHT/tracker self-announce — `announce_seeder`
-  exists but is unwired — or the engine's I2I instance-coordination API on port 62062, briefly
-  probed, not HTTP, would need Frida/binary RE comparable to the node-identity crack).
+- **Tried, broke, and reverted a fix for the reverse direction (engine downloads FROM
+  outpace).** Added proactive `Have`-advertisement to `follow_one_peer` to give peers a
+  signal to request from us — **live testing (prompted by VLC showing no video) found this
+  makes a real swarm peer go silent**, confirmed by bisection (works before the commit, hangs
+  with it, works again reverted). Reverted outright (no demonstrated benefit either way — see
+  note 21's "⚠️ Update" section for the full account). **Lesson banked: any new behavior on
+  the outbound leecher path needs a live download smoke test, not just mock/duplex tests,
+  before being trusted.** The reverse direction is open again; needs getting the engine to
+  dial outpace directly so the *inbound* `SeederSession::serve` path (untouched, unaffected
+  by this regression) is what gets exercised — via DHT/tracker self-announce (`announce_seeder`
+  exists but is unwired), or the engine's I2I instance-coordination API on port 62062, briefly
+  probed, not HTTP, would need Frida/binary RE comparable to the node-identity crack.
 - `header[4..8]`'s exact semantics remain open; the served `piece_header` is still `[0u8;8]`.
 - **Next session, in order of leverage:** (1) try the reverse-direction proof again with a
   deliberately staggered start time between outpace and a test client, to get a genuine
