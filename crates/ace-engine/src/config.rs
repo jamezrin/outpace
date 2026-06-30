@@ -14,6 +14,21 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Networks (providers) to enable.
     pub networks: Vec<String>,
+    /// Address the peer-protocol listener binds to (inbound seeding). Not yet started by
+    /// default — see `enable_inbound`.
+    pub peer_listen: SocketAddr,
+    /// Bytes of recently-seen piece data retained per active peer connection for reseeding.
+    pub seed_store_bytes: u64,
+    /// Max simultaneously-unchoked peers per served stream.
+    pub max_unchoked: usize,
+    /// Max concurrent inbound peer connections accepted by the listener.
+    pub max_inbound_peers: usize,
+    /// Reciprocal upload over connections we initiate (S1). Already in production.
+    pub enable_seeding: bool,
+    /// Accept inbound peer connections and seed them (S2). Defaults OFF: the served piece
+    /// header is still a placeholder until engine ground truth pins its real bytes — see
+    /// docs/RESUME.md "Next: v2" / Task 7.
+    pub enable_inbound: bool,
 }
 
 impl Default for Config {
@@ -25,6 +40,12 @@ impl Default for Config {
             bind: "127.0.0.1:6878".parse().unwrap(),
             data_dir,
             networks: vec!["ace".into()],
+            peer_listen: "0.0.0.0:8621".parse().unwrap(),
+            seed_store_bytes: 128 * 1024 * 1024,
+            max_unchoked: 8,
+            max_inbound_peers: 64,
+            enable_seeding: true,
+            enable_inbound: false,
         }
     }
 }
@@ -82,5 +103,16 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.networks, vec!["ace".to_string()]);
         assert_eq!(c.bind.port(), 6878);
+    }
+
+    #[test]
+    fn default_config_has_seeding_on_and_inbound_off() {
+        let c = Config::default();
+        assert_eq!(c.peer_listen.port(), 8621);
+        assert_eq!(c.seed_store_bytes, 128 * 1024 * 1024);
+        assert_eq!(c.max_unchoked, 8);
+        assert_eq!(c.max_inbound_peers, 64);
+        assert!(c.enable_seeding);
+        assert!(!c.enable_inbound, "inbound serving must default off until piece_header is pinned");
     }
 }

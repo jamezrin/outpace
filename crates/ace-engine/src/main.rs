@@ -17,6 +17,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(dir) = std::env::var("OUTPACE_DATA_DIR") {
         config.data_dir = dir.into();
     }
+    if let Ok(v) = std::env::var("OUTPACE_PEER_LISTEN") {
+        config.peer_listen = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_SEED_STORE_BYTES") {
+        config.seed_store_bytes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
+        config.max_unchoked = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_INBOUND") {
+        config.max_inbound_peers = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_ENABLE_SEEDING") {
+        config.enable_seeding = matches!(v.as_str(), "1" | "true");
+    }
+    if let Ok(v) = std::env::var("OUTPACE_ENABLE_INBOUND") {
+        config.enable_inbound = matches!(v.as_str(), "1" | "true");
+    }
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
     eprintln!(
         "outpace: node_id={} data_dir={}",
