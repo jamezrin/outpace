@@ -56,7 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let provider = AceProvider::new(identity.clone(), config.bind.port())
             .with_bootstrap_peers(bootstrap)
             .with_seed_registry(seed_registry.clone())
-            .with_seed_store_bytes(config.seed_store_bytes);
+            .with_seed_store_bytes(config.seed_store_bytes)
+            .with_seeding_enabled(config.enable_seeding);
         registry.register(Arc::new(provider));
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();

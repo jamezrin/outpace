@@ -25,8 +25,8 @@ pub struct Config {
     pub max_unchoked: usize,
     /// Max concurrent inbound peer connections accepted by the listener.
     pub max_inbound_peers: usize,
-    /// Reciprocal upload over connections we initiate (S1). NOT YET WIRED: the serve arms in
-    /// `follow_one_peer` run unconditionally regardless of this flag.
+    /// Reciprocal upload over connections we initiate (S1): answering a peer's
+    /// `Interested`/chunk-requests and advertising `Have` for newly-completed pieces.
     pub enable_seeding: bool,
     /// Accept inbound peer connections and seed them (S2). Defaults OFF: the served piece
     /// header is still a placeholder until engine ground truth pins its real bytes — see
