@@ -122,7 +122,7 @@ impl TsSource for AceSource {
         self.rx.recv().await
     }
     fn stats(&self) -> SourceStats {
-        SourceStats { peers: self.peers.load(Ordering::Relaxed), bitrate: 0, buffer_ms: 0 }
+        SourceStats { peers: self.peers.load(Ordering::Relaxed), bitrate: 0, buffer_ms: 0, uploaded: 0, peers_served: 0 }
     }
 }
 

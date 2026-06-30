@@ -69,6 +69,8 @@ async fn stream_status(State(s): State<AppState>, Path((network, id)): Path<(Str
                 "peers": stats.peers,
                 "bitrate": stats.bitrate,
                 "buffer_ms": stats.buffer_ms,
+                "uploaded": stats.uploaded,
+                "peers_served": stats.peers_served,
             }))
             .into_response()
         }
@@ -179,7 +181,7 @@ mod tests {
             Some(chunk)
         }
         fn stats(&self) -> SourceStats {
-            SourceStats { peers: 1, bitrate: 0, buffer_ms: 0 }
+            SourceStats { peers: 1, bitrate: 0, buffer_ms: 0, uploaded: 0, peers_served: 0 }
         }
     }
     #[async_trait]
