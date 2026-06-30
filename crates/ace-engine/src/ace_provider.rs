@@ -333,7 +333,18 @@ async fn follow_one_peer(
             }
             m @ PeerMessage::Piece { .. } => {
                 if let Some(lc) = LiveChunk::from_message(&m) {
-                    store.lock().await.put_chunk(lc.piece as u64, lc.chunk, &lc.data);
+                    let piece = lc.piece as u64;
+                    let completed = {
+                        let mut s = store.lock().await;
+                        s.put_chunk(piece, lc.chunk, &lc.data);
+                        s.has_piece(piece)
+                    };
+                    if completed {
+                        // Tell this peer what we now hold, so they can request it from us —
+                        // S1 only answered requests; this is the proactive half of reciprocal
+                        // seeding (a peer can't ask for something it doesn't know we have).
+                        let _ = session.send(&PeerMessage::Have(lc.piece)).await;
+                    }
                     let begin = lc.chunk as u64 * info.chunk_length;
                     if reasm.add_block(lc.piece as u64, begin, &lc.data).is_err() {
                         continue;
