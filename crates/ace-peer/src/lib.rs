@@ -11,6 +11,8 @@ pub enum PeerError {
     Closed,
     /// A peer I/O operation exceeded its configured timeout.
     Timeout,
+    /// The peer violated an expected protocol exchange (e.g. rejected a metadata request).
+    Protocol(&'static str),
     /// Underlying I/O.
     Io(std::io::Error),
 }

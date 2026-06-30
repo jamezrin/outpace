@@ -155,6 +155,12 @@ impl ExtendedHandshake {
     pub fn ut_metadata_id(&self) -> Option<i64> {
         self.raw.get(b"m").and_then(|m| m.get(b"ut_metadata")).and_then(Bencode::as_int)
     }
+
+    /// The advertised total size (bytes) of the metadata blob (BEP-9 `metadata_size`),
+    /// needed to know how many 16 KiB pieces to request.
+    pub fn metadata_size(&self) -> Option<i64> {
+        self.raw.get(b"metadata_size").and_then(Bencode::as_int)
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +278,16 @@ mod tests {
         assert_eq!(eh.ace_metadata_version, Some(1));
         assert_eq!(eh.geoip_country.as_deref(), Some("ES"));
         assert_eq!(eh.ut_metadata_id(), Some(2));
+        assert_eq!(eh.metadata_size(), None);
+    }
+
+    #[test]
+    fn reads_metadata_size_when_present() {
+        // {m: {ut_metadata: 3}, metadata_size: 40000}
+        let payload = b"d1:md11:ut_metadatai3ee13:metadata_sizei40000ee";
+        let eh = ExtendedHandshake::parse(payload).unwrap();
+        assert_eq!(eh.ut_metadata_id(), Some(3));
+        assert_eq!(eh.metadata_size(), Some(40000));
     }
 
     #[test]

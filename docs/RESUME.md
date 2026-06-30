@@ -24,7 +24,7 @@ Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 | 1 `ace-wire` | ✅ done | infohash, bencode, handshake, msg framing, extended HS, **transport decoder** |
 | 2 `ace-tracker` + `ace-peer` | ✅ done | BEP-15 UDP tracker; async peer session (handshake + read) — both verified live |
 | 3 piece download → media → engine | ✅ done | **live HD video downloaded from the real swarm** (note 19: full signed handshake → UNCHOKE → Acestream piece requests → MPEG-TS → ffmpeg decodes 1920×1080 H.264+AAC). Protocol promoted into `ace-wire`/`ace-swarm` |
-| 4 productization (outpace daemon) | ✅ built + **live-proven** | **Autonomous DHT discovery → connect → 9.4 MB live MPEG-TS downloaded from just an infohash (verified 2026-06-29).** Clean provider-abstracted daemon: `StreamProvider`/`TsSource` + `ProviderRegistry`, shared `StreamSession` broadcast fan-out (one download → many clients, **acexy-parity out of the box**), `StreamManager`, axum HTTP API, live HLS, config + persistent identity, tracker discovery, transport→`StreamInfo` resolve, `AceProvider`. All tests green + clippy clean; daemon boots & serves the clean API. Muxing drift (Task 19) fixed (`TsResync`); per-client start-on-keyframe done (`KeyframeGate`). **Remaining:** content-id→infohash resolution over `ut_metadata` (clean coding step, offline-buildable), and point VLC at a real stream end-to-end (Task 20, needs the live swarm). Plan: `docs/superpowers/plans/2026-06-29-outpace-daemon.md`; spec: `docs/superpowers/specs/2026-06-29-outpace-daemon-design.md` |
+| 4 productization (outpace daemon) | ✅ built + **live-proven** | **Autonomous DHT discovery → connect → 9.4 MB live MPEG-TS downloaded from just an infohash (verified 2026-06-29).** Clean provider-abstracted daemon: `StreamProvider`/`TsSource` + `ProviderRegistry`, shared `StreamSession` broadcast fan-out (one download → many clients, **acexy-parity out of the box**), `StreamManager`, axum HTTP API, live HLS, config + persistent identity, tracker discovery, transport→`StreamInfo` resolve, `AceProvider`. All tests green + clippy clean; daemon boots & serves the clean API. Muxing drift (Task 19) fixed (`TsResync`); per-client start-on-keyframe done (`KeyframeGate`); content-id→infohash resolution over `ut_metadata` done (Task 18 — `ace_wire::ut_metadata`, `PeerSession::fetch_metadata`, `ace_swarm::resolve::resolve_via_peer`, offline mock-peer integration test). **All spec code is implemented.** The one remaining item is **Task 20 — live VLC end-to-end**, which is purely an operator/environmental verification (needs the live swarm with WARP off; cannot run in CI/sandbox), not code. Plan: `docs/superpowers/plans/2026-06-29-outpace-daemon.md`; spec: `docs/superpowers/specs/2026-06-29-outpace-daemon-design.md` |
 
 Crates: `crates/{ace-wire,ace-tracker,ace-peer,ace-media,ace-engine}`. Workspace root `Cargo.toml`.
 **Pure Phase 3/4 logic done (no live data needed):** `ace_wire::live` (LiveWindow/LivePicker),
@@ -67,11 +67,19 @@ mid-GOP, the gate locks exactly on the real keyframe and ffmpeg decodes the outp
 first. Applied per-client (the broadcast is unchanged), so every joiner benefits, not just the
 first.
 
-**Getting an infohash from an `acestream://` content-id** (content-id→infohash resolution
-isn't wired yet — the engine does it; we don't): ask the running official engine once —
-`curl 'http://127.0.0.1:6878/ace/getstream?content_id=<40hex-content-id>&format=json'` →
-`.response.infohash`. (e.g. content-id cid1 → infohash `50e935…2d6e47`.) Wiring this
-over the network via ut_metadata is the next clean step so `acestream://` links work directly.
+**Content-id → infohash resolution is now wired (network-native, no Acestream API).** Pass an
+`acestream://` content-id as `cid:<40hex>`:
+```sh
+vlc http://127.0.0.1:6900/streams/ace/cid:cid1.ts
+```
+The daemon announces the content-id to the tracker/DHT, connects to a metadata-swarm peer,
+fetches the `AceStreamTransport` file over **BEP-9 ut_metadata** (`ace_wire::ut_metadata` +
+`PeerSession::fetch_metadata`), and decodes it to the real infohash + geometry + trackers
+(`ace_swarm::resolve::resolve_via_peer`, TTL-cached). A bare `<40hex>` is still treated as an
+infohash directly (proven path). The full resolve flow is offline-proven by an in-memory
+mock-peer integration test (`crates/ace-swarm/tests/resolve_metadata.rs`); the live discovery
+half shares the same environment gate as the download path. (The old fallback — asking a
+running engine `getstream?content_id=…` for `.response.infohash` — is no longer needed.)
 
 `OUTPACE_ACE_PEERS=ip:port,…` still exists as an optional manual-peer override.
 

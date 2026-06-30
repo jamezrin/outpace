@@ -10,17 +10,33 @@
 //!     (documented in the design spec).
 
 use crate::types::StreamInfo;
+use ace_peer::session::PeerSession;
+use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
+use ace_wire::handshake::random_peer_id;
+use ace_wire::identity::Identity;
 use ace_wire::infohash::infohash_of_transport;
+use ace_wire::message::PeerMessage;
 use ace_wire::transport::decode_transport;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Default live geometry when only an infohash is known: 1 MiB pieces / 16 KiB chunks.
 pub const DEFAULT_PIECE_LENGTH: u64 = 1_048_576;
 pub const DEFAULT_CHUNK_LENGTH: u64 = 16_384;
 
+/// The ext id we assign to `ut_metadata` in our `m` dict (what the peer addresses replies to).
+const OUR_UT_METADATA_ID: i64 = 2;
+/// How many messages to read while waiting for the peer's extended handshake.
+const HANDSHAKE_READ_BUDGET: usize = 32;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResolveError {
     BadInfohash,
     Transport(&'static str),
+    /// A peer/network step failed during content-id resolution.
+    Peer(&'static str),
 }
 
 /// Build a [`StreamInfo`] from raw `AceStreamTransport` file bytes (the pure half of
@@ -45,6 +61,95 @@ pub fn stream_info_from_infohash(hex: &str, trackers: Vec<String>) -> Result<Str
         chunk_length: DEFAULT_CHUNK_LENGTH,
         trackers,
     })
+}
+
+/// Decode a 40-hex content-id/infohash into 20 bytes (the metadata-swarm handshake key).
+pub fn hex20(hex: &str) -> Result<[u8; 20], ResolveError> {
+    decode_hex20(hex).ok_or(ResolveError::BadInfohash)
+}
+
+/// Resolve a content-id to a [`StreamInfo`] over an already-connected peer, by fetching the
+/// `AceStreamTransport` metadata via BEP-9 `ut_metadata` and decoding it.
+///
+/// The content-id (`handshake_infohash`) is the metadata-swarm key used for the BT handshake;
+/// the returned `StreamInfo` carries the *real* infohash — `SHA1` of the fetched transport
+/// file — plus geometry and trackers. No Acestream HTTP/index API is involved.
+pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+    handshake_infohash: [u8; 20],
+    identity: &Identity,
+) -> Result<StreamInfo, ResolveError> {
+    session
+        .perform_handshake(handshake_infohash, random_peer_id())
+        .await
+        .map_err(|_| ResolveError::Peer("BT handshake failed"))?;
+
+    let hs = OutgoingExtendedHandshake {
+        ace_metadata_version: 1,
+        ut_metadata_id: OUR_UT_METADATA_ID,
+        mi: None,
+        node: NodeFields { ts: 5000, ..NodeFields::default() },
+        peer_ip: None,
+    };
+    session
+        .send_signed_extended_handshake(&hs, identity)
+        .await
+        .map_err(|_| ResolveError::Peer("send extended handshake failed"))?;
+
+    let (peer_ut_id, metadata_size) = read_metadata_params(session).await?;
+    let blob = session
+        .fetch_metadata(peer_ut_id, metadata_size)
+        .await
+        .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))?;
+    stream_info_from_transport(&blob)
+}
+
+/// Read messages until the peer's extended handshake arrives; extract its `ut_metadata` ext id
+/// and advertised `metadata_size`.
+async fn read_metadata_params<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+) -> Result<(u8, usize), ResolveError> {
+    for _ in 0..HANDSHAKE_READ_BUDGET {
+        let msg = session
+            .read_message()
+            .await
+            .map_err(|_| ResolveError::Peer("closed before extended handshake"))?;
+        if let PeerMessage::Extended { ext_id: 0, payload } = msg {
+            let eh = ExtendedHandshake::parse(&payload)
+                .map_err(|_| ResolveError::Peer("bad extended handshake"))?;
+            let ut_id = eh.ut_metadata_id().ok_or(ResolveError::Peer("peer has no ut_metadata"))?;
+            let size = eh.metadata_size().ok_or(ResolveError::Peer("peer sent no metadata_size"))?;
+            if !(0..=255).contains(&ut_id) || size <= 0 {
+                return Err(ResolveError::Peer("invalid ut_metadata params"));
+            }
+            return Ok((ut_id as u8, size as usize));
+        }
+    }
+    Err(ResolveError::Peer("no extended handshake"))
+}
+
+/// A small TTL cache of resolved `content-id → StreamInfo` so repeated `open()`s of the same
+/// stream don't re-fetch metadata.
+pub struct ResolveCache {
+    entries: Mutex<HashMap<String, (StreamInfo, Instant)>>,
+    ttl: Duration,
+}
+
+impl ResolveCache {
+    pub fn new(ttl: Duration) -> Self {
+        ResolveCache { entries: Mutex::new(HashMap::new()), ttl }
+    }
+
+    /// Return a cached, unexpired `StreamInfo` for `key`, if any.
+    pub fn get(&self, key: &str) -> Option<StreamInfo> {
+        let map = self.entries.lock().unwrap();
+        map.get(key).and_then(|(info, at)| (at.elapsed() < self.ttl).then(|| info.clone()))
+    }
+
+    /// Store `info` under `key` with the current time.
+    pub fn put(&self, key: &str, info: StreamInfo) {
+        self.entries.lock().unwrap().insert(key.to_string(), (info, Instant::now()));
+    }
 }
 
 fn decode_hex20(hex: &str) -> Option<[u8; 20]> {
@@ -101,5 +206,16 @@ mod tests {
     fn bad_infohash_rejected() {
         assert_eq!(stream_info_from_infohash("xyz", vec![]), Err(ResolveError::BadInfohash));
         assert_eq!(stream_info_from_infohash(&"z".repeat(40), vec![]), Err(ResolveError::BadInfohash));
+    }
+
+    #[test]
+    fn cache_returns_stored_value_then_expires() {
+        let c = ResolveCache::new(Duration::from_millis(40));
+        let info = StreamInfo { infohash: [7; 20], piece_length: 1, chunk_length: 1, trackers: vec![] };
+        assert_eq!(c.get("k"), None);
+        c.put("k", info.clone());
+        assert_eq!(c.get("k"), Some(info));
+        std::thread::sleep(Duration::from_millis(55));
+        assert_eq!(c.get("k"), None, "entry expires after the TTL");
     }
 }

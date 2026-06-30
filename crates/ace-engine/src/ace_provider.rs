@@ -10,7 +10,7 @@
 use crate::provider::{ProviderError, SourceStats, StreamProvider, TsSource};
 use ace_peer::session::{connect, PeerSession};
 use ace_swarm::discover::discover_peers;
-use ace_swarm::resolve::stream_info_from_infohash;
+use ace_swarm::resolve::{hex20, resolve_via_peer, stream_info_from_infohash, ResolveCache};
 use ace_swarm::types::StreamInfo;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
@@ -36,11 +36,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// DHT discovery is a documented follow-up.
 const DEFAULT_ACE_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announce"];
 
+/// How long a resolved content-id → `StreamInfo` stays cached.
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
+
 pub struct AceProvider {
     identity: Arc<Identity>,
     port: u16,
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
+    resolve_cache: ResolveCache,
 }
 
 impl AceProvider {
@@ -50,6 +54,7 @@ impl AceProvider {
             port,
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_peers: Vec::new(),
+            resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
         }
     }
 
@@ -66,6 +71,38 @@ impl AceProvider {
     pub fn with_bootstrap_peers(mut self, peers: Vec<SocketAddrV4>) -> Self {
         self.bootstrap_peers = peers;
         self
+    }
+
+    /// Resolve a content-id to a [`StreamInfo`] by fetching its `AceStreamTransport` metadata
+    /// over BEP-9 `ut_metadata` from a metadata-swarm peer (cached with a TTL). The content-id
+    /// itself is the metadata-swarm handshake key; the result carries the real infohash.
+    async fn resolve_content_id(&self, content_id: &str) -> Result<StreamInfo, ProviderError> {
+        if let Some(info) = self.resolve_cache.get(content_id) {
+            return Ok(info);
+        }
+        let key = hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
+        let mut peers = discover_peers(&self.default_trackers, &key, &random_peer_id(), self.port).await;
+        let mut all = self.bootstrap_peers.clone();
+        all.append(&mut peers);
+        eprintln!("[ace] resolve cid:{content_id}: {} metadata peer(s)", all.len());
+
+        for addr in all {
+            let Ok(Ok(mut session)) =
+                tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
+            else {
+                continue;
+            };
+            match resolve_via_peer(&mut session, key, &self.identity).await {
+                Ok(info) => {
+                    let ih: String = info.infohash.iter().map(|b| format!("{b:02x}")).collect();
+                    eprintln!("[ace] resolved cid:{content_id} -> infohash {ih}");
+                    self.resolve_cache.put(content_id, info.clone());
+                    return Ok(info);
+                }
+                Err(_) => continue,
+            }
+        }
+        Err(ProviderError::Backend("content-id resolution: no metadata peer responded".into()))
     }
 }
 
@@ -91,13 +128,17 @@ impl StreamProvider for AceProvider {
     }
 
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
-        // Infohash form resolves directly; content-id needs the ut_metadata fetch (live step).
-        let info = if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Two id shapes: a bare 40-hex infohash resolves directly with default live geometry;
+        // a `cid:<40hex>` content-id is resolved over the network via ut_metadata (the engine
+        // does content_id→infohash internally — we do it ourselves, no Acestream API).
+        let info = if let Some(content_id) = id.strip_prefix("cid:") {
+            self.resolve_content_id(content_id).await?
+        } else if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
             stream_info_from_infohash(id, self.default_trackers.clone())
                 .map_err(|_| ProviderError::Backend("bad infohash".into()))?
         } else {
             return Err(ProviderError::Backend(
-                "content-id resolution (ut_metadata transport fetch) not yet wired".into(),
+                "id must be a 40-hex infohash or cid:<40hex> content-id".into(),
             ));
         };
 
@@ -299,10 +340,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_id_form_is_unwired_backend_error() {
+    async fn unrecognized_id_shape_is_backend_error() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
-        // Non-hex id (a content-id shape) is rejected as the live-gated path.
+        // Neither a 40-hex infohash nor a cid:<40hex> content-id.
         assert!(matches!(p.open("not-a-hex-infohash").await, Err(ProviderError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn content_id_with_bad_hex_is_rejected_without_network() {
+        let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+        // `cid:` dispatch reaches resolution but the hex is invalid → immediate Backend error,
+        // no discovery/connect attempted.
+        assert!(matches!(p.open("cid:nothex").await, Err(ProviderError::Backend(_))));
     }
 
     // Note: the "no peers -> Backend error" path is intentionally not unit-tested, since

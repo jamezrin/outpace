@@ -1040,7 +1040,15 @@ async fn list_streams(State(s): State<AppState>) -> Json<serde_json::Value> {
 - [ ] **Step 3: Run** — `cargo test -p ace-engine --lib ace_provider 2>&1 | tail -3` → PASS.
 - [ ] **Step 4: Commit** — `git add -A && git commit -m "ace-engine: AceProvider wiring discovery->LiveSession->TsSource"`
 
-### Task 18: Network content-id resolution (ut_metadata + transport decode)
+### Task 18: Network content-id resolution (ut_metadata + transport decode) — ✅ DONE
+
+**Implemented:** pure BEP-9 codec `ace_wire::ut_metadata` (`request_piece`/`MetadataMessage`),
+`PeerSession::fetch_metadata` (mock-peer tested), `ace_swarm::resolve::resolve_via_peer` +
+`ResolveCache` (TTL), and an offline end-to-end mock-peer integration test
+(`crates/ace-swarm/tests/resolve_metadata.rs`: handshake → extended handshake → ut_metadata →
+transport decode → `StreamInfo` with the real infohash). Wired into `AceProvider::open` behind
+a `cid:<40hex>` id prefix (bare `<40hex>` stays infohash-direct). The live discovery half shares
+the same environment gate as the download path.
 
 **Files:** Create: `crates/ace-swarm/src/resolve.rs`; Modify: `lib.rs`. Reuses `ace-wire`'s transport decoder.
 
@@ -1050,7 +1058,12 @@ async fn list_streams(State(s): State<AppState>) -> Json<serde_json::Value> {
 - [ ] **Step 4: Run** — `cargo test -p ace-swarm --lib resolve 2>&1 | tail -3` and `cargo test -p ace-peer fetch_metadata 2>&1 | tail -3` → PASS.
 - [ ] **Step 5: Commit** — `git add -A && git commit -m "content-id resolution via ut_metadata + transport decode (no Acestream API)"`
 
-### Task 19: Gapless cross-piece muxing
+### Task 19: Gapless cross-piece muxing — ✅ DONE
+
+**Implemented** as `ace_media::mpegts::TsResync` (the −4 B/piece drift is a partial packet of
+junk per piece boundary; the resync filter drops it and re-locks). Plus per-client
+start-on-keyframe (`KeyframeGate`) so players begin on a decodable picture. Daemon output
+decodes to 1280×720 50fps H.264.
 
 **Files:** Modify: `crates/ace-wire/src/reassembly.rs` (or a new `ace-media` pass); add a fixture-based test using captured pieces under `tests/vectors/` if available.
 
@@ -1059,7 +1072,12 @@ async fn list_streams(State(s): State<AppState>) -> Json<serde_json::Value> {
 - [ ] **Step 3: Run** — `cargo test -p ace-wire reassembly 2>&1 | tail -3` → PASS.
 - [ ] **Step 4: Commit** — `git add -A && git commit -m "gapless cross-piece TS continuity (resolve -4B/piece drift)"`
 
-### Task 20: Live end-to-end verification (the deliverable)
+### Task 20: Live end-to-end verification (the deliverable) — ⏳ environment-gated (operator-run)
+
+**Status:** the ONLY remaining item. All spec code (T1–T19) is implemented, tested, and
+clippy-clean; the daemon boots and serves. This task is a live operator verification — it needs
+the real Acestream swarm reachable from the host (WARP off) and cannot run in CI/sandbox.
+Resolve `cid:<40hex>` for a content-id (or pass a bare infohash), then run the steps below.
 
 **Files:** none (manual/scripted verification); record results in `docs/protocol/notes/20-vlc-playback.md`.
 
