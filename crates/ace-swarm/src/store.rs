@@ -155,4 +155,16 @@ mod tests {
         s.put_chunk(6, 1, &[0; 4]); // piece 6 complete
         assert_eq!(s.have_pieces(), vec![6]);
     }
+
+    #[test]
+    fn has_piece_flips_true_on_the_chunk_that_completes_it() {
+        // Mirrors the Have-advertisement use case in ace-engine's follow_one_peer: check
+        // has_piece() right after each put_chunk to know exactly when to fire a Have.
+        let mut s = store(1024); // 2 chunks/piece (per the existing `store()` test helper)
+        assert!(!s.has_piece(9));
+        s.put_chunk(9, 0, &[0; 4]);
+        assert!(!s.has_piece(9), "still missing chunk 1");
+        s.put_chunk(9, 1, &[0; 4]);
+        assert!(s.has_piece(9), "both chunks present now");
+    }
 }
