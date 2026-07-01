@@ -99,19 +99,39 @@ and driving the stream through **VLC's own internal demuxer** (not just curl/ffm
 it finding PAT/PMT, locking H.264 SPS/PPS, hitting the `KeyframeGate`'s SEI recovery point,
 and detecting `AAC channels: 2 samplerate: 48000`.
 
-## What's still open
+## Follow-up fix: cumulative peer blacklist (same session, later)
 
-The daemon reconnects to the same "never unchokes" peer (`5.231.25.139:10022`) repeatedly
-across separate `open` calls in these logs. `connect_any`'s `exclude` only skips the single
-*most recently* lost peer, not a cumulative blacklist, so a consistently bad peer can be
-re-picked on a later reconnect within the same session. Not addressed here (didn't cause
-incorrect output, just a wasted connect+handshake round-trip); worth a small follow-up if it
-turns out to matter for reconnect latency.
+The daemon was seen reconnecting to the same "never unchokes" peer (`5.231.25.139:10022`)
+repeatedly across separate `open` calls in these logs. `connect_any`'s `exclude` only skipped
+the single *most recently* lost peer, not a cumulative blacklist, so a consistently bad peer
+could be re-picked on a later reconnect within the same session — a wasted connect+handshake
+round-trip, not an output-correctness bug (unlike the splice/stall issue above).
+
+**Fixed**: `follow_live` now keeps a cumulative `HashSet<SocketAddrV4>` of every peer lost
+this session (not just the last one), and `connect_any` excludes all of them via a new pure
+helper, `candidates_for_reconnect`. The one deliberate exception: since `peers` is a
+fixed, one-time-discovered list for this stream, if excluding everyone would leave nothing
+to try, the exclusion resets and the full list gets another chance — permanently
+blacklisting a peer that failed once (a transient timeout, or a peer that simply never
+happened to unchoke us that round) would end the session outright, which is worse than the
+wasted-reconnect problem being fixed.
+
+Unit-tested directly (`ace_provider::tests`): `candidates_exclude_previously_lost_peers`,
+`candidates_accumulate_across_multiple_losses` (the exact scenario that motivated this —
+two separate losses both stay excluded, not just the second), and
+`candidates_fall_back_to_the_full_list_once_everyone_has_failed`.
+
+Live-reran after this fix (same channel, same host): reconnect + resume behavior unchanged
+and correct (`reconnected; ... resuming from <X>`, matching the section above), a 122 s
+capture decoded cleanly. The multi-loss scenario itself wasn't observed live in this run
+(the session found a stable peer after its first reconnect and stayed on it) — deliberately
+not forcing an artificial multi-disconnect to manufacture that case; the unit test exercises
+it deterministically instead.
 
 ## Reproduce / verify
 ```sh
-cargo test -p ace-wire reassembly::    # skip_to
-cargo test -p ace-engine ace_provider::  # Continuity::fresh / resume
+cargo test -p ace-wire reassembly::      # skip_to
+cargo test -p ace-engine ace_provider::  # Continuity::fresh/resume + candidates_for_reconnect
 # live (operator), watch for a natural reconnect in the log and confirm it says
 # "reconnected; ... resuming from <X>" where X continues your own prior position, not a
 # fresh recompute from the new peer's window:

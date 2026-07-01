@@ -23,6 +23,7 @@ use ace_wire::message::PeerMessage;
 use ace_wire::reassembly::PieceReassembler;
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::collections::HashSet;
 use std::net::SocketAddrV4;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -238,18 +239,34 @@ impl StreamProvider for AceProvider {
     }
 }
 
+/// Which peers to try connecting to next: everyone except those already known bad this
+/// session — unless that would leave nothing to try, in which case give the whole list
+/// another chance. `peers` is a fixed, one-time-discovered set for this stream, so
+/// permanently avoiding every peer that ever failed once (a transient timeout, or a peer
+/// that just never happened to unchoke us) would end the session rather than let it retry —
+/// worse than the wasted reconnect attempt this is guarding against.
+fn candidates_for_reconnect(peers: &[SocketAddrV4], excluded: &HashSet<SocketAddrV4>) -> Vec<SocketAddrV4> {
+    let filtered: Vec<SocketAddrV4> = peers.iter().copied().filter(|a| !excluded.contains(a)).collect();
+    if filtered.is_empty() {
+        peers.to_vec()
+    } else {
+        filtered
+    }
+}
+
 /// Connect to and BT-handshake the peers **concurrently**, returning the first that
 /// succeeds (the rest are aborted). Dead/firewalled peers no longer serialize the time to
 /// first byte — a couple of unreachable peers at the front of the list used to cost
 /// `CONNECT_TIMEOUT` each before we ever reached a live one (the "slow to load" report).
-/// `exclude` skips a peer we just lost, so a reconnect doesn't immediately re-pick it.
+/// `excluded` accumulates every peer lost so far this session (not just the most recent),
+/// so a reconnect doesn't keep re-picking a peer that's already proven bad — see
+/// `candidates_for_reconnect` for the "everyone excluded" fallback.
 async fn connect_any(
     peers: &[SocketAddrV4],
     infohash: [u8; 20],
-    exclude: Option<SocketAddrV4>,
+    excluded: &HashSet<SocketAddrV4>,
 ) -> Option<(PeerSession<TcpStream>, SocketAddrV4)> {
-    let candidates: Vec<SocketAddrV4> =
-        peers.iter().copied().filter(|a| Some(*a) != exclude).collect();
+    let candidates = candidates_for_reconnect(peers, excluded);
     for batch in candidates.chunks(MAX_PARALLEL_CONNECT) {
         let mut set = tokio::task::JoinSet::new();
         for &addr in batch {
@@ -287,7 +304,9 @@ async fn follow_live(
     seed: SeedConfig,
 ) {
     let chunks_per_piece = info.chunks_per_piece();
-    let mut lost: Option<SocketAddrV4> = None;
+    // Every peer lost so far this session (cumulative, not just the most recent) — see
+    // `candidates_for_reconnect`.
+    let mut excluded: HashSet<SocketAddrV4> = HashSet::new();
     // Piece-continuity state (reassembler, resync filter, request frontier, head) survives
     // across reconnects — see `Continuity`. `None` only before the very first connection.
     let mut continuity: Option<Continuity> = None;
@@ -295,7 +314,7 @@ async fn follow_live(
         if tx.is_closed() {
             return;
         }
-        let Some((mut session, addr)) = connect_any(&peers, info.infohash, lost).await else {
+        let Some((mut session, addr)) = connect_any(&peers, info.infohash, &excluded).await else {
             eprintln!("[ace] no reachable peer among {} discovered", peers.len());
             return;
         };
@@ -318,7 +337,7 @@ async fn follow_live(
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost => {
                 peer_count.store(0, Ordering::Relaxed);
-                lost = Some(addr);
+                excluded.insert(addr);
                 continue;
             }
         }
@@ -448,7 +467,7 @@ async fn follow_one_peer(
         .get_or_create(info.infohash, || PieceStore::new(info.piece_length, info.chunk_length, seed.store_bytes));
     let mut unchoked_peer = false;
     // Diagnostic: surface each unmodelled Acestream message id once (note 22 follow-up).
-    let mut seen_ids: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let mut seen_ids: HashSet<u8> = HashSet::new();
 
     loop {
         let msg = match session.read_message().await {
@@ -798,5 +817,38 @@ mod tests {
         let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
         c.resume(addr, 100, 150); // a new peer with a "smaller" (staler) window
         assert_eq!(c.head, 200, "head must not go backward");
+    }
+
+    fn addrs(ports: &[u16]) -> Vec<SocketAddrV4> {
+        ports.iter().map(|&p| SocketAddrV4::new([1, 2, 3, 4].into(), p)).collect()
+    }
+
+    #[test]
+    fn candidates_exclude_previously_lost_peers() {
+        let peers = addrs(&[1, 2, 3]);
+        let excluded: HashSet<SocketAddrV4> = [addrs(&[2])[0]].into_iter().collect();
+        let candidates = candidates_for_reconnect(&peers, &excluded);
+        assert_eq!(candidates, addrs(&[1, 3]), "peer 2 was excluded, having failed before");
+    }
+
+    #[test]
+    fn candidates_accumulate_across_multiple_losses() {
+        // The bug this fixes: excluding only the MOST RECENT loss let a session flip-flop
+        // back to a peer that had already failed earlier in the same run.
+        let peers = addrs(&[1, 2, 3]);
+        let excluded: HashSet<SocketAddrV4> = addrs(&[1, 2]).into_iter().collect();
+        let candidates = candidates_for_reconnect(&peers, &excluded);
+        assert_eq!(candidates, addrs(&[3]), "both earlier failures stay excluded, not just the latest");
+    }
+
+    #[test]
+    fn candidates_fall_back_to_the_full_list_once_everyone_has_failed() {
+        // The peer list is fixed for this stream (discovered once at `open`); permanently
+        // blacklisting every peer that ever failed once would end the session rather than
+        // give a transient failure another chance.
+        let peers = addrs(&[1, 2]);
+        let excluded: HashSet<SocketAddrV4> = addrs(&[1, 2]).into_iter().collect();
+        let candidates = candidates_for_reconnect(&peers, &excluded);
+        assert_eq!(candidates, peers, "nothing left to try -> give the whole list another chance");
     }
 }

@@ -47,7 +47,11 @@ Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 > real reconnect captured mid-session correctly resumed from the pre-reconnect target
 > (not the new peer's own computed start), and a 172 s / 133 MB capture spanning that
 > reconnect showed **zero PTS anomalies** across 4,301 video frames (no backward jumps, no
-> gaps). See `docs/protocol/notes/23-reconnect-continuity.md`.
+> gaps). Also fixed a smaller related issue found in the same pass: `connect_any`'s exclude
+> list only remembered the single most-recently-lost peer, so a session could flip-flop back
+> to a peer already proven bad; it's now a cumulative per-session blacklist (falling back to
+> the full peer list only if excluding everyone would leave nothing to try). See
+> `docs/protocol/notes/23-reconnect-continuity.md`.
 
 | Phase | Status | Deliverable |
 |---|---|---|
