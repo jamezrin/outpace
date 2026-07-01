@@ -2,11 +2,19 @@
 //! HTTP clients behind a clean `/streams/{network}/{id}` API (no acexy wrapper needed).
 
 use ace_engine::ace_provider::AceProvider;
+use ace_engine::broadcast::BroadcastRegistry;
 use ace_engine::config::{load_or_create_identity, Config};
-use ace_engine::http::{router, AppState};
+use ace_engine::http::{router, AppState, BroadcastState};
 use ace_engine::manager::StreamManager;
 use ace_engine::provider::ProviderRegistry;
 use std::sync::Arc;
+
+/// Default tracker for minted broadcasts (B1) — the same public UDP tracker `AceProvider`
+/// falls back to for bare infohashes with none of their own. A freshly minted broadcast
+/// self-announces to this tracker *and* DHT (`ace_provider::announce_infohash_periodically`,
+/// spawned from `http.rs`'s ingest handler) as soon as it's minted, independent of whether
+/// anything is locally following it — a pure origin needs to be discoverable too.
+const DEFAULT_BROADCAST_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announce"];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let manager = StreamManager::new(registry);
     manager.spawn_reaper();
-    let state = AppState { manager, networks: networks.clone() };
+    let broadcasts = BroadcastState {
+        registry: BroadcastRegistry::new(),
+        seed_registry: seed_registry.clone(),
+        trackers: DEFAULT_BROADCAST_TRACKERS.iter().map(|s| s.to_string()).collect(),
+        store_bytes: config.seed_store_bytes,
+        inbound_peer_port: config.enable_inbound.then_some(config.peer_listen.port()),
+    };
+    let state = AppState { manager, networks: networks.clone(), broadcasts: Some(broadcasts) };
 
     // Inbound seeding (S2): OFF by default. The served piece_header is still a placeholder
     // ([0u8;8]) pending a separate RE task that pins the real engine bytes from ground-truth
@@ -81,9 +96,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener_peer_id = ace_wire::handshake::random_peer_id();
         let inbound_registry = seed_registry.clone();
         let max_inbound = config.max_inbound_peers;
+        let listener_identity = identity.clone();
         tokio::spawn(async move {
             ace_swarm::listen::PeerListener::serve(
                 peer_listener, inbound_registry, listener_peer_id, [0u8; 8], max_inbound,
+                listener_identity,
             )
             .await;
         });

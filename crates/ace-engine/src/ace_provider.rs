@@ -9,7 +9,8 @@
 
 use crate::provider::{ProviderError, SourceStats, StreamProvider, TsSource};
 use ace_peer::session::{connect, PeerSession};
-use ace_swarm::discover::discover_peers;
+use ace_swarm::dht::dht_announce_peer;
+use ace_swarm::discover::{announce_seeder, discover_peers};
 use ace_swarm::resolve::{hex20, resolve_via_peer, stream_info_from_infohash, ResolveCache, ResolveError};
 use ace_swarm::types::StreamInfo;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
@@ -42,6 +43,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How many peers to race connecting to at once (so dead peers don't serialize the time to
 /// first byte). A live swarm returns dozens; we only need one good upstream to follow.
 const MAX_PARALLEL_CONNECT: usize = 12;
+/// How often an active session re-announces itself as a seeder to its trackers, so
+/// outpace becomes organically discoverable while it's serving (Task 7 approach (2),
+/// `docs/RESUME.md`). Doesn't yet honor a tracker's returned `interval` — a fixed,
+/// conservative cadence is a deliberate simplification, not a correctness requirement.
+const SEEDER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(4 * 60);
+/// Time budget for each periodic DHT `announce_peer` walk (see `dht_announce_peer`) — bounds
+/// how long a self-announce round can take before the next one is due.
+const DHT_ANNOUNCE_BUDGET: Duration = Duration::from_secs(15);
 /// Per-peer read ceiling while resolving a content-id (a silent peer shouldn't stall us).
 const RESOLVE_PEER_TIMEOUT: Duration = Duration::from_secs(6);
 
@@ -232,10 +241,54 @@ impl StreamProvider for AceProvider {
             store_bytes: self.seed_store_bytes,
             enabled: self.enable_seeding,
         };
+        let announce_info = info.clone();
+        let announce_port = self.port;
+        let announce_enabled = self.enable_seeding;
         tokio::spawn(async move {
-            follow_live(info, peers, identity, tx, stats_peers, uploaded, peers_served, seed).await;
+            // Run the download loop and the periodic seeder self-announce concurrently;
+            // whichever ends first (normally `follow_live`, when the consumer drops or no
+            // peer is reachable) tears down the other — no separate lifecycle to manage.
+            tokio::select! {
+                _ = follow_live(info, peers, identity, tx, stats_peers, uploaded, peers_served, seed) => {},
+                _ = announce_seeder_periodically(announce_info, announce_port, announce_enabled) => {},
+            }
         });
         Ok(Box::new(AceSource { rx, peers: peer_count, uploaded: stats_uploaded, peers_served: stats_peers_served }))
+    }
+}
+
+/// Periodically re-announce this infohash as a seeder (`left=0`, event=Completed) to its
+/// trackers, so outpace becomes organically discoverable to peers looking for this stream
+/// while we're serving it — Task 7 approach (2), `docs/RESUME.md`. A no-op loop (never
+/// announces) when `enabled` is false, matching the S1 `enable_seeding` gate: we shouldn't
+/// advertise ourselves as a seeder if we've deliberately disabled serving.
+async fn announce_seeder_periodically(info: StreamInfo, port: u16, enabled: bool) {
+    if !enabled {
+        return std::future::pending().await;
+    }
+    announce_infohash_periodically(info.trackers, info.infohash, port).await
+}
+
+/// The tracker+DHT self-announce loop, decoupled from `StreamInfo` so both the leech path
+/// (a followed live stream) and B1 origination (a broadcast we minted ourselves, which has
+/// no `StreamInfo` at all — just an infohash and trackers) can reuse the same primitive.
+pub async fn announce_infohash_periodically(trackers: Vec<String>, infohash: [u8; 20], port: u16) {
+    let peer_id = random_peer_id();
+    loop {
+        let peers = announce_seeder(&trackers, &infohash, &peer_id, port).await;
+        // DHT self-announce too, not just tracker: real Acestream swarms are largely
+        // DHT-populated (docs/RESUME.md), so tracker-only self-announce under-serves
+        // discoverability. `dht_announce_peer` is a separate primitive (not folded into
+        // `announce_seeder` itself) because it's a multi-second live network call that
+        // would otherwise turn `announce_seeder`'s fast offline unit test into a slow,
+        // network-dependent one.
+        let dht_announced = dht_announce_peer(&infohash, port, DHT_ANNOUNCE_BUDGET).await;
+        eprintln!(
+            "[ace] seeder self-announce for {}: {} tracker peer(s) seen, DHT announce_peer sent to {dht_announced} node(s)",
+            hex_preview(&infohash),
+            peers.len(),
+        );
+        tokio::time::sleep(SEEDER_ANNOUNCE_INTERVAL).await;
     }
 }
 
@@ -766,6 +819,18 @@ mod tests {
 
     fn info() -> StreamInfo {
         StreamInfo { infohash: [0; 20], piece_length: 4, chunk_length: 2, trackers: vec![] }
+    }
+
+    #[tokio::test]
+    async fn seeder_announce_never_fires_when_seeding_disabled() {
+        // enabled=false must never even attempt a tracker announce (which would otherwise
+        // misrepresent us as a seeder while we've deliberately disabled serving).
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            announce_seeder_periodically(info(), 6878, false),
+        )
+        .await;
+        assert!(res.is_err(), "must never resolve when seeding is disabled");
     }
 
     #[test]

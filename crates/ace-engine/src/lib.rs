@@ -4,6 +4,7 @@
 //! [`provider::StreamProvider`] adapter (see the v1 design spec).
 
 pub mod ace_provider;
+pub mod broadcast;
 pub mod config;
 pub mod hls;
 pub mod http;
