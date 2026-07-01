@@ -97,8 +97,11 @@ All green, clippy clean, full workspace:
 - `ace-peer::session::PeerSession::accept_handshake` — inbound/responder-side BT handshake
   (reads peer's handshake first, replies only if we serve the requested infohash).
 - `ace-tracker`/`ace-swarm::discover::announce_seeder` — parameterized the tracker announce
-  `event` field; added a seeder-announce helper (`left=0`, `Completed`). **No production caller
-  yet** — wiring into the manager/session lifecycle is the remaining S2 item.
+  `event` field; added a seeder-announce helper (`left=0`, `Completed`). **Now wired** (note
+  24, 2026-07-01): `ace_provider::open` runs a periodic tracker+DHT self-announce alongside
+  the download loop, gated by `enable_seeding`. Also added `ace_swarm::dht::dht_announce_peer`
+  — BEP-5's `announce_peer`, which didn't exist before (only `get_peers`/read-side DHT existed).
+  Live-verified against the real mainline DHT and real trackers.
 - `ace-engine::config::Config` gained inbound-seeder knobs: `peer_listen`, `seed_store_bytes`,
   `max_unchoked`, `max_inbound_peers`, `enable_seeding`, `enable_inbound`. `enable_seeding` is
   now wired (gates the three S1 serve arms in `follow_one_peer` — `Interested`, the chunk-serve
@@ -120,7 +123,20 @@ All green, clippy clean, full workspace:
 - **Do not flip `enable_inbound`'s default to `true` before Task 7 (below) lands** — serving
   non-compliant pieces to the real swarm would violate the wire-compatibility constraint.
 
-### Task 7 — SUBSTANTIALLY ADVANCED, not closed (`docs/protocol/notes/21-seeder-ground-truth.md`)
+### Task 7 — SUBSTANTIALLY ADVANCED, not closed (`docs/protocol/notes/21`, `24`, `25`)
+**2026-07-01 update (note 25):** discovered `references/ace-network-docs/docs/broadcasting/`
+already documents `start-engine --stream-source-node`, letting the **official engine** run as
+a broadcast origin locally against our own tiny HTTP MPEG-TS loop — deterministic,
+reproducible ground truth (no live-swarm dependency). Reproduced note 21's full-protocol
+interop proof this way (signed handshake accepted, `UNCHOKE`, real `Piece` data, same
+`[8B header][2B chunk]` structure). Also confirmed the RSA key format for B0 (see note 25) and
+found a real bug in our documented infohash formula for freshly-minted transports (not yet
+fixed). **Reverse direction (engine downloads FROM outpace) is still unproven** — this
+session wired self-announce (tracker+DHT, note 24) as the prerequisite, but didn't get as far
+as observing an actual inbound connection; that (and a proper Frida capture of the
+`LiveSourceAuth` signing, attempted but not completed this session — tooling friction, not
+infeasibility) are the next-highest-leverage items.
+
 With Docker + a non-WARP host (confirmed available 2026-06-30), ran real verification against
 both the live swarm and the official engine itself (sandboxed):
 - **Captured real piece-header structure** from a live peer: the 8-byte header is constant
@@ -152,13 +168,93 @@ both the live swarm and the official engine itself (sandboxed):
   don't converge, invest in I2I/binary RE for direct peer injection. Once the engine is shown
   downloading from outpace (any route), flip `enable_inbound`'s default to `true`.
 
-### Remaining: B0, B1 (RE/sandbox-gated where noted)
-- **B0** live-source-auth RE spike (RSA-signed pieces, like the node-identity crack) — no plan
-  written yet; can run in parallel as a research spike.
-- **B1 minting/origination + live verification**: the pure codecs (`encode_transport`,
-  `TsChunker`) are done; remaining is the `PUT /broadcast/{name}` HTTP handler, the
-  `BroadcastRegistry`, signing pieces per B0, and live verification that an official Acestream
-  client can discover and play a outpace-originated broadcast. Depends on S2 (done) + B0.
+### B1 — DONE for outpace-to-outpace (2026-07-01, note 26); official-engine interop gated on B0
+`ace_wire::live_auth::LiveSourceAuth` (real RSA identity, byte-for-byte validated against a
+captured real engine key — note 25), `ace_engine::broadcast::BroadcastRegistry` (mint/resume
+a named broadcast; registers its `PieceStore` in the **existing** `SeedRegistry`, so it's
+immediately servable via S1/S2 with no new serving code), and `PUT /broadcast/{name}`
+(`http.rs`: responds instantly with the infohash, ingests the body — `TsResync` → `TsChunker`
+→ `PieceStore` — in a background task). **Live-verified, two real daemon processes, real
+TCP:** daemon A originates via `PUT /broadcast/bigchan`; daemon B, given daemon A's peer
+address as a bootstrap peer and the returned infohash, downloads via the **unmodified**
+`AceProvider` leech path; `ffprobe`/`ffmpeg` decode the served output to the real ingested
+video. This is the design spec's "reachable milestone" for B1.
+
+Along the way, found and fixed a real pre-existing gap: `SeederSession::serve` (S2, inbound)
+never sent an extended handshake at all, so **outpace could never leech from its own
+inbound listener** — our own `AceProvider` blocks waiting for that message. Fixed by signing
+and sending it (identity + the store's live window) before advertising `Have`s; see note 26.
+
+**Update (note 27, same day): B1 now signs pieces for real**, not a placeholder — see the B0
+entry below. `ace_engine::broadcast::Broadcast` carries its `LiveSourceAuth`; the ingest
+handler uses `ace_wire::signing_chunker::SigningChunker` (real RSA-PKCS1v15-SHA1 sign,
+embedded as each piece's trailing bytes). New integration test
+`ingested_piece_carries_a_real_verifiable_signature` proves this through the actual HTTP
+ingest path (not just unit-level).
+
+**Update (note 28, same day): B1 origination now self-announces for real.** Found a real
+bug: a minted broadcast never called `announce_seeder`/`dht_announce_peer` at all — only
+the leech path did. Fixed (`ace_provider::announce_infohash_periodically`, spawned once per
+freshly-minted name from `http.rs`'s ingest handler, gated on an inbound listener actually
+existing). Live-verified: minting now immediately produces a real DHT `announce_peer` to the
+public mainline DHT — previously nothing happened until this fix.
+
+**Still open, precisely characterized (note 28): the official engine computes a different
+infohash than we do for the same transport bytes.** Confirmed the engine's `GET
+/ace/getstream?url=<transport-url>` (documented API, used to fetch a outpace-minted
+transport directly — also motivated adding `GET /broadcast/{name}` to serve raw transport
+bytes) resolves fine but reports a different infohash than outpace computed for the
+identical file, reproduced across many fresh broadcasts; confirmed it's a pure function of
+content (not URL, not time/session). Exhaustively brute-forced ~20 candidate formulas
+against 3+ independent real (bytes, engine-infohash) pairs simultaneously — no match.
+Exhausted the static+dynamic RE angles this session: Ghidra-decompiled both `Transport.so`
+and `live.so` (fixed the export tooling along the way — use `re/ghidra/ExportDecomp.java`,
+not the `.py` version, which needs PyGhidra this install doesn't have) with no readable
+anchors near any hash logic; confirmed via `nm -D` that **no** engine `.so` imports any hash
+function natively (PyCryptodome's hash extensions are separately-`dlopen`ed and reached via
+Python's object layer, not ELF linkage — explaining why grepping decompiled C never finds a
+call site); 4 independent live Frida hook configurations (PyCryptodome untargeted, +EVP,
+thread/backtrace-filtered, fully unfiltered) all came back negative for this call site.
+Actually pulling playback (not just resolving via `getstream`) failed fast (`failed to
+start`) — possibly the same root cause, possibly independent; not yet distinguished. Next
+session's best lead: PyGhidra (Python scripting) to read the actual Python-level call graph,
+or CPython frame-eval-level hooking. See note 28 for the full account.
+
+Also still open: ingest-resume continuity (piece numbering restarts at 0 on every ingest
+task, a known gap); transport persistence / `ut_metadata` serving for a minted broadcast.
+
+### B0 — CRACKED (note 27, 2026-07-01)
+**The per-piece signing scheme is fully cracked and implemented**, not just researched.
+Scheme: `SHA1(piece_bytes[0 .. piece_length - sig_len])`, signed with standard **RSASSA-
+PKCS1-v1_5** (textbook RFC 8017 §8.2, no custom padding), with the signature embedded
+**in-band as the piece's own trailing `sig_len` bytes** (`sig_len` = the RSA modulus's byte
+length) — not a separate wire message. This means the pure P2P relay path (S1/S2) never
+needed to change; only the *source* (B1 origination) needed real signing.
+
+Found by hooking the official engine's own hash calls live while it signed real pieces
+(`references/ace-network-docs/docs/broadcasting/`'s local `--stream-source-node` setup from
+note 25) — two real obstacles hit and resolved: the engine uses **PyCryptodome, not
+OpenSSL** for hashing (confirmed via `/proc/<pid>/maps`, hooking the wrong library the first
+time round found nothing); and Frida's `setTimeout`-based polling proved unreliable for this
+target (fixed by hooking `dlopen` and installing hooks synchronously in its callback, no
+timers). Confirmed the crack three independent ways: (1) the captured hash's input length
+(`piece_length - 96`) matched a 768-bit RSA signature exactly; (2) `SHA1` of an independently
+downloaded real piece (via our own recon client) matched a captured digest byte-for-byte;
+(3) `pow(signature, e, n)` on a real piece's trailing bytes recovered **exact** standard
+PKCS#1 v1.5 padding around the matching SHA1 digest.
+
+Implemented in `ace_wire::live_auth` (`sign`/`verify_piece`/`split_piece`) and
+`ace_wire::signing_chunker::SigningChunker` (buffers payload, signs, appends signature,
+feeds an ordinary `TsChunker`) — a real bug in the first `flush()` draft (forgot to flush
+the *inner* chunker too, silently dropping a finite broadcast's last few bytes) was caught
+by its own unit test before it shipped. Verified against real captured ground truth
+(`tests/vectors/live-source-auth/piece-{0,1}.bin`): our verifier accepts the real engine's
+actual signatures, and re-signing the same payload with the same key reproduces the
+**exact** signature bytes the real engine produced (PKCS#1 v1.5's padding is deterministic,
+so this is a legitimate byte-for-byte check). See note 27 for the full account, including
+what's still open (a previously-attempted Ghidra static-analysis route hit an unrelated
+environment limitation — Python scripting not configured — and was abandoned in favor of
+the live capture, which succeeded).
 
 ## Run the daemon + verify VLC (live, operator-run)
 The daemon binary is `outpace` (`cargo run -p ace-engine --bin outpace`). The clean API:
