@@ -255,4 +255,33 @@ mod tests {
             decode_transport_with_key(magic_only, &TRANSPORT_KEY, &TRANSPORT_IV).is_err()
         );
     }
+
+    // Diagnostic tool: decode a real captured .acelive transport file and dump its fields
+    // (esp. `pubkey`, in hex, for cross-checking against an RSA key file — B0 ground truth).
+    //   ACE_TRANSPORT_FILE=/path/to/test.acelive cargo test -p ace-wire dump_real_transport -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_real_transport() {
+        let path = std::env::var("ACE_TRANSPORT_FILE").expect("set ACE_TRANSPORT_FILE=path");
+        let bytes = std::fs::read(&path).expect("read transport file");
+        let d = decode_transport(&bytes).expect("decode");
+        println!("name: {:?}", d.name);
+        println!("piece_length: {}", d.piece_length);
+        println!("chunk_length: {}", d.chunk_length);
+        println!("bitrate: {:?}", d.bitrate);
+        println!("trackers: {:?}", d.trackers);
+        println!("is_live: {}", d.is_live);
+        println!("pieces: {} entries", d.pieces.len());
+        println!("pubkey ({} bytes): {}", d.pubkey.len(), hex_encode(&d.pubkey));
+        if let crate::bencode::Bencode::Dict(map) = &d.raw {
+            println!("all top-level keys + values:");
+            for (k, v) in map.iter() {
+                println!("  {:?} = {:?}", String::from_utf8_lossy(k), v);
+            }
+        }
+    }
+
+    fn hex_encode(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
 }

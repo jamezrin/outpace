@@ -7,11 +7,13 @@ pub mod handshake;
 pub mod infohash;
 pub mod identity;
 pub mod live;
+pub mod live_auth;
 pub mod live_codec;
 pub mod ut_metadata;
 pub mod chunker;
 pub mod reassembly;
 pub mod message;
+pub mod signing_chunker;
 pub mod transport;
 
 /// Errors produced while decoding untrusted wire bytes.
