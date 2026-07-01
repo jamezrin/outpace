@@ -18,6 +18,21 @@ engine**) in a new Claude Code session with no prior context.
 ## Current state (what's on `main`, all committed + tests green)
 Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 
+> **⚠️ Correction (note 22):** the "downloaded 8.3 / 9.4 MB" results below were read as
+> *success* but were actually the bug — that is exactly the static initial prefetch window
+> (~9 pieces). The live download **never advanced past it** because the loop only requested
+> more pieces on a standard BT `Have`, which real Acestream peers don't send. **Fixed** in
+> three parts, all confirmed against a live operator run: (1) the real advancement signal is
+> an 8-byte custom `id=4` message (`[u32 stream][u32 piece]`), now decoded and driving the
+> request frontier; (2) peer connect is now raced in parallel (`connect_any`) instead of
+> serially trying dead peers, fixing a multi-second time-to-load; (3) `StreamManager` had a
+> start-race where concurrent first requests for the same id (VLC opens more than one
+> connection) each ran a full `provider.open()` — duplicate discovery + two connections from
+> our same node_id, which a real peer may drop — now serialized via a start lock. Throughput
+> is now logged (`served N MiB`) so silent freezes are directly observable. See
+> `docs/protocol/notes/22-live-edge-never-advances.md`. **Final full-VLC playback
+> confirmation is still live-gated** — run the daemon and confirm continuous video + audio.
+
 | Phase | Status | Deliverable |
 |---|---|---|
 | 0 Protocol recovery | ✅ done | Specs + vectors + go/no-go memo (GO) |

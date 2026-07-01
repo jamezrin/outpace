@@ -7,6 +7,8 @@
 //! `< min_piece`) is long evicted — request only within the window, and advance toward
 //! the head as it slides.
 
+use crate::bencode::Bencode;
+
 /// A snapshot of a peer's advertised live window (from its extended-handshake `mi`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveWindow {
@@ -23,6 +25,46 @@ impl LiveWindow {
     /// build a little playback cushion, but never below `min_piece` (evicted).
     pub fn start_piece(&self, buffer: u64) -> u64 {
         self.position.saturating_sub(buffer).max(self.min_piece)
+    }
+
+    /// Recognize a live-window ("myinfo") update inside a raw peer-message payload, by
+    /// **content** rather than by message id. Acestream advertises the advancing live
+    /// edge in a periodic `myinfo` message (`got_myinfo` in the engine's `live` module —
+    /// distinct from the one-shot extended handshake) carrying the same
+    /// `min_piece`/`max_piece`/`position` bencode shape as the handshake's `mi` sub-dict
+    /// (see `docs/protocol/notes/22-live-edge-never-advances.md`). The window keys may sit
+    /// at the dict root or under an `mi` sub-dict; either is accepted. Returns `None` for
+    /// any payload that isn't a bencode dict exposing a non-negative `max_piece`, so it
+    /// can be tried speculatively on every otherwise-unhandled message without false
+    /// positives driving requests.
+    pub fn from_myinfo_payload(payload: &[u8]) -> Option<LiveWindow> {
+        // parse_prefix tolerates trailing bytes after the dict (some messages append a
+        // suffix); a non-bencode or non-dict payload simply yields None.
+        let (root, _) = Bencode::parse_prefix(payload).ok()?;
+        let dict: &Bencode = if root.get(b"max_piece").is_some() {
+            &root
+        } else {
+            root.get(b"mi")?
+        };
+        let max = dict.get(b"max_piece").and_then(Bencode::as_int)?;
+        if max < 0 {
+            return None;
+        }
+        let max = max as u64;
+        // min/position are advisory; default to the head when a partial update omits them.
+        let min = dict
+            .get(b"min_piece")
+            .and_then(Bencode::as_int)
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(0)
+            .min(max);
+        let position = dict
+            .get(b"position")
+            .and_then(Bencode::as_int)
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(max)
+            .clamp(min, max);
+        Some(LiveWindow { min_piece: min, max_piece: max, position })
     }
 }
 
@@ -105,5 +147,43 @@ mod tests {
         let mut p = LivePicker::starting_at(50);
         assert_eq!(p.next_request(&w), Some(100)); // jumped past the evicted gap
         assert_eq!(p.next_request(&w), Some(101));
+    }
+
+    #[test]
+    fn myinfo_recognized_at_dict_root() {
+        // A standalone myinfo update: bencode dict with the window keys at the root.
+        let payload = b"d9:max_piecei14718275e9:min_piecei14718220e8:positioni14718275ee";
+        let w = LiveWindow::from_myinfo_payload(payload).expect("recognized");
+        assert_eq!(w.max_piece, 14718275);
+        assert_eq!(w.min_piece, 14718220);
+        assert_eq!(w.position, 14718275);
+    }
+
+    #[test]
+    fn myinfo_recognized_under_mi_subdict() {
+        // The same window nested under `mi` (as in a re-sent extended handshake).
+        let payload = b"d2:mid9:max_piecei205e9:min_piecei100e8:positioni200eee";
+        let w = LiveWindow::from_myinfo_payload(payload).expect("recognized");
+        assert_eq!((w.min_piece, w.max_piece, w.position), (100, 205, 200));
+    }
+
+    #[test]
+    fn partial_myinfo_defaults_missing_fields_to_head() {
+        // `send_partial_myinfo` may carry only max_piece; min/position default sanely.
+        let payload = b"d9:max_piecei500ee";
+        let w = LiveWindow::from_myinfo_payload(payload).expect("recognized");
+        assert_eq!(w.max_piece, 500);
+        assert_eq!(w.position, 500);
+        assert!(w.min_piece <= w.max_piece);
+    }
+
+    #[test]
+    fn non_window_payloads_are_not_mistaken_for_myinfo() {
+        // Not bencode, an unrelated dict, and a negative head must all be rejected so a
+        // speculative attempt on every message never drives a bogus request.
+        assert!(LiveWindow::from_myinfo_payload(b"\x00\x01\x02not-bencode").is_none());
+        assert!(LiveWindow::from_myinfo_payload(b"d3:fooi1ee").is_none());
+        assert!(LiveWindow::from_myinfo_payload(b"d9:max_piecei-1ee").is_none());
+        assert!(LiveWindow::from_myinfo_payload(b"").is_none());
     }
 }

@@ -17,6 +17,7 @@ use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
 use ace_swarm::store::PieceStore;
 use ace_swarm::listen::SeedRegistry;
+use ace_wire::live::LiveWindow;
 use ace_wire::live_codec::{build_piece, chunk_request, LiveChunk};
 use ace_wire::message::PeerMessage;
 use ace_wire::reassembly::PieceReassembler;
@@ -31,7 +32,15 @@ use tokio::sync::mpsc;
 
 /// How many pieces behind the live edge to start, so we have buffer immediately.
 const PREFETCH_PIECES: u64 = 8;
+/// Upper bound on pieces requested in a single forward step. A live window is ~100 pieces
+/// and advances ~1 piece per update, so this is only a guard: a malformed/garbled window
+/// update can never trigger an unbounded request burst (it just gets re-advanced next
+/// update). See `docs/protocol/notes/22-live-edge-never-advances.md`.
+const MAX_PIECE_ADVANCE: u64 = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How many peers to race connecting to at once (so dead peers don't serialize the time to
+/// first byte). A live swarm returns dozens; we only need one good upstream to follow.
+const MAX_PARALLEL_CONNECT: usize = 12;
 /// Per-peer read ceiling while resolving a content-id (a silent peer shouldn't stall us).
 const RESOLVE_PEER_TIMEOUT: Duration = Duration::from_secs(6);
 
@@ -229,8 +238,43 @@ impl StreamProvider for AceProvider {
     }
 }
 
-/// Follow the live edge from the first responsive peer, pushing contiguous TS. Reconnects to
-/// the next peer on failure; ends when the consumer drops.
+/// Connect to and BT-handshake the peers **concurrently**, returning the first that
+/// succeeds (the rest are aborted). Dead/firewalled peers no longer serialize the time to
+/// first byte — a couple of unreachable peers at the front of the list used to cost
+/// `CONNECT_TIMEOUT` each before we ever reached a live one (the "slow to load" report).
+/// `exclude` skips a peer we just lost, so a reconnect doesn't immediately re-pick it.
+async fn connect_any(
+    peers: &[SocketAddrV4],
+    infohash: [u8; 20],
+    exclude: Option<SocketAddrV4>,
+) -> Option<(PeerSession<TcpStream>, SocketAddrV4)> {
+    let candidates: Vec<SocketAddrV4> =
+        peers.iter().copied().filter(|a| Some(*a) != exclude).collect();
+    for batch in candidates.chunks(MAX_PARALLEL_CONNECT) {
+        let mut set = tokio::task::JoinSet::new();
+        for &addr in batch {
+            set.spawn(async move {
+                let mut session =
+                    tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string()))
+                        .await
+                        .ok()?
+                        .ok()?;
+                session.perform_handshake(infohash, random_peer_id()).await.ok()?;
+                Some((session, addr))
+            });
+        }
+        // First task to fully connect+handshake wins; dropping `set` aborts the others.
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Some(win)) = joined {
+                return Some(win);
+            }
+        }
+    }
+    None
+}
+
+/// Follow the live edge from a peer, pushing contiguous TS. Races a fresh connection on
+/// peer loss; ends when the consumer drops or no peer is reachable.
 #[allow(clippy::too_many_arguments)]
 async fn follow_live(
     info: StreamInfo,
@@ -243,26 +287,22 @@ async fn follow_live(
     seed: SeedConfig,
 ) {
     let chunks_per_piece = info.chunks_per_piece();
-    for addr in peers {
+    let mut lost: Option<SocketAddrV4> = None;
+    loop {
         if tx.is_closed() {
             return;
         }
-        let Ok(Ok(mut session)) =
-            tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
-        else {
-            eprintln!("[ace] {addr}: connect failed/timed out");
-            continue;
+        let Some((mut session, addr)) = connect_any(&peers, info.infohash, lost).await else {
+            eprintln!("[ace] no reachable peer among {} discovered", peers.len());
+            return;
         };
-        if session.perform_handshake(info.infohash, random_peer_id()).await.is_err() {
-            eprintln!("[ace] {addr}: BT handshake failed");
-            continue;
-        }
         eprintln!("[ace] {addr}: connected + handshaked");
         peer_count.store(1, Ordering::Relaxed);
         match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx, &uploaded, &peers_served, &seed).await {
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost => {
                 peer_count.store(0, Ordering::Relaxed);
+                lost = Some(addr);
                 continue;
             }
         }
@@ -325,6 +365,11 @@ async fn follow_one_peer(
         .registry
         .get_or_create(info.infohash, || PieceStore::new(info.piece_length, info.chunk_length, seed.store_bytes));
     let mut unchoked_peer = false;
+    // Diagnostic: surface each unmodelled Acestream message id once (note 22 follow-up).
+    let mut seen_ids: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    // Throughput visibility: confirm the stream keeps advancing (vs. the old freeze).
+    let mut emitted: u64 = 0;
+    let mut next_log: u64 = 1 << 20; // first at 1 MiB, then every 4 MiB
 
     loop {
         let msg = match session.read_message().await {
@@ -335,21 +380,39 @@ async fn follow_one_peer(
             PeerMessage::Unchoke => {
                 unchoked = true;
                 eprintln!("[ace] {addr}: UNCHOKE -> requesting pieces {start}..={head}");
-                if request_range(session, start, head, chunks_per_piece).await.is_err() {
+                if advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                    .await
+                    .is_err()
+                {
                     return FollowEnd::PeerLost;
                 }
-                requested_to = Some(head);
             }
             PeerMessage::Choke => unchoked = false,
             PeerMessage::Have(p) => {
                 head = head.max(p as u64);
-                if unchoked {
-                    let from = requested_to.map(|r| r + 1).unwrap_or(start);
-                    if from <= head {
-                        if request_range(session, from, head, chunks_per_piece).await.is_err() {
-                            return FollowEnd::PeerLost;
-                        }
-                        requested_to = Some(head);
+                if unchoked
+                    && advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                        .await
+                        .is_err()
+                {
+                    return FollowEnd::PeerLost;
+                }
+            }
+            // The live edge advances via a periodic `myinfo` window update (engine symbol
+            // `got_myinfo`), NOT a standard `Have` — see note 22. Depending on the peer it
+            // arrives as a re-sent extended handshake (ext_id 0) or a custom Acestream
+            // message id. Recognize it by content (a bencode window dict carrying
+            // `max_piece`) regardless of carrier, advance the head, and request the newly
+            // available pieces.
+            PeerMessage::Extended { ref payload, .. } => {
+                if let Some(new_head) = advance_head_from_window(payload, head) {
+                    head = new_head;
+                    if unchoked
+                        && advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                            .await
+                            .is_err()
+                    {
+                        return FollowEnd::PeerLost;
                     }
                 }
             }
@@ -364,8 +427,19 @@ async fn follow_one_peer(
                     let ready = reasm.take_ready();
                     if !ready.is_empty() {
                         let aligned = resync.push(&ready);
-                        if !aligned.is_empty() && tx.send(Bytes::from(aligned)).await.is_err() {
-                            return FollowEnd::ConsumerGone;
+                        if !aligned.is_empty() {
+                            emitted += aligned.len() as u64;
+                            if emitted >= next_log {
+                                eprintln!(
+                                    "[ace] {addr}: served {} MiB (head={head}, next piece needed={})",
+                                    emitted >> 20,
+                                    reasm.next_needed()
+                                );
+                                next_log = emitted + (4 << 20);
+                            }
+                            if tx.send(Bytes::from(aligned)).await.is_err() {
+                                return FollowEnd::ConsumerGone;
+                            }
                         }
                     }
                 }
@@ -389,9 +463,59 @@ async fn follow_one_peer(
                     }
                 }
             }
+            // Acestream live HAVE (note 22 capture): an 8-byte `[u32 stream=0][u32 piece]`.
+            // This is the live-edge advancement signal — the engine announces each new piece
+            // at the head with id=4 (NOT the standard 4-byte BT HAVE, which it never sends),
+            // and the advancing trailing edge / eviction pointer with id=10. Advance the head
+            // on id=4 and request the newly-available pieces.
+            PeerMessage::Unknown { id: 4, ref payload } if payload.len() == 8 => {
+                let piece = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as u64;
+                if piece > head {
+                    head = piece;
+                    if unchoked
+                        && advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                            .await
+                            .is_err()
+                    {
+                        return FollowEnd::PeerLost;
+                    }
+                }
+            }
+            // Trailing edge (oldest still-available piece). Informational: if it ever passes
+            // what we still need, we've fallen irrecoverably behind this peer's window.
+            PeerMessage::Unknown { id: 10, .. } => {}
+            // Any other Acestream-custom message: it may be a `myinfo` window update carried
+            // as a bencode dict (note 22). Recognize it by content and advance; if it isn't a
+            // window update, log the id once so a live run reveals carriers we don't decode.
+            PeerMessage::Unknown { id, ref payload } => {
+                if let Some(new_head) = advance_head_from_window(payload, head) {
+                    eprintln!("[ace] {addr}: live window update (msg id={id}) head {head} -> {new_head}");
+                    head = new_head;
+                    if unchoked
+                        && advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                            .await
+                            .is_err()
+                    {
+                        return FollowEnd::PeerLost;
+                    }
+                } else if seen_ids.insert(id) {
+                    eprintln!(
+                        "[ace] {addr}: unhandled msg id={id} ({} bytes) {}",
+                        payload.len(),
+                        hex_preview(payload)
+                    );
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// If `payload` carries a live-window (`myinfo`) update whose head is beyond `head`, return
+/// the new head; otherwise `None`. The single place window recognition feeds the loop.
+fn advance_head_from_window(payload: &[u8], head: u64) -> Option<u64> {
+    let w = LiveWindow::from_myinfo_payload(payload)?;
+    (w.max_piece > head).then_some(w.max_piece)
 }
 
 /// Send chunk requests for every chunk of pieces `[from, to]`.
@@ -407,6 +531,41 @@ async fn request_range(
         }
     }
     Ok(())
+}
+
+/// The next contiguous piece range to request given the frontier we've already requested
+/// up to (`requested_to`), the live start, and the best-known live head. `None` once we're
+/// caught up to the head (nothing new to ask for yet). Bounded by [`MAX_PIECE_ADVANCE`] so
+/// a bogus head can't produce an unbounded request. Pure (no I/O) so it is unit-tested.
+fn next_request_range(requested_to: Option<u64>, start: u64, head: u64) -> Option<(u64, u64)> {
+    let from = requested_to.map(|r| r + 1).unwrap_or(start);
+    if from > head {
+        return None;
+    }
+    let to = head.min(from + MAX_PIECE_ADVANCE - 1);
+    Some((from, to))
+}
+
+/// Request the next batch of pieces toward `head`, advancing `requested_to`. No-op when
+/// already caught up. This is the single forward-progress primitive every live-edge
+/// advancement signal (UNCHOKE, `Have`, a `myinfo` window update) funnels through.
+async fn advance_requests(
+    session: &mut PeerSession<TcpStream>,
+    requested_to: &mut Option<u64>,
+    start: u64,
+    head: u64,
+    chunks_per_piece: u16,
+) -> ace_peer::Result<()> {
+    if let Some((from, to)) = next_request_range(*requested_to, start, head) {
+        request_range(session, from, to, chunks_per_piece).await?;
+        *requested_to = Some(to);
+    }
+    Ok(())
+}
+
+/// Hex preview of a message prefix for diagnostics (avoids pulling in a hex crate).
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes.iter().take(24).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Read messages until the peer's extended handshake arrives; return its live `mi` window.
@@ -456,4 +615,53 @@ mod tests {
     // Note: the "no peers -> Backend error" path is intentionally not unit-tested, since
     // discovery now always consults the live DHT (network). It's exercised by the live
     // capture path instead.
+
+    #[test]
+    fn first_request_after_unchoke_covers_the_prefetch_window() {
+        // Fresh frontier (None): request from `start` up to the head.
+        assert_eq!(next_request_range(None, 100, 109), Some((100, 109)));
+    }
+
+    #[test]
+    fn caught_up_requests_nothing() {
+        // Already requested through the head -> nothing new yet (the old behavior that
+        // then stalled forever; now the loop keeps getting window updates to advance it).
+        assert_eq!(next_request_range(Some(109), 100, 109), None);
+    }
+
+    #[test]
+    fn window_update_drives_a_forward_request() {
+        // The head advanced by one piece -> request exactly that new piece. This is the
+        // step the pre-fix loop never took (it only advanced on a `Have` that never came).
+        assert_eq!(next_request_range(Some(109), 100, 110), Some((110, 110)));
+        assert_eq!(next_request_range(Some(109), 100, 113), Some((110, 113)));
+    }
+
+    #[test]
+    fn forward_request_is_bounded_against_a_bogus_head() {
+        // A garbled window update claiming a wildly-advanced head can't burst-request the
+        // whole range; it's clamped, and subsequent updates catch up.
+        let (from, to) = next_request_range(Some(100), 0, 10_000_000).unwrap();
+        assert_eq!(from, 101);
+        assert_eq!(to - from + 1, MAX_PIECE_ADVANCE);
+    }
+
+    #[test]
+    fn acestream_have_payload_decodes_to_the_head_piece() {
+        // The captured live HAVE (note 22): `[u32 stream=0][u32 piece]`. We read the piece
+        // at bytes [4..8]; this exact payload was `head -> 5360483` in the operator's log.
+        let payload = [0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0xcb, 0x63];
+        let piece = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as u64;
+        assert_eq!(piece, 5_360_483);
+    }
+
+    #[test]
+    fn advance_head_only_when_window_moves_forward() {
+        // A myinfo update past the head advances it; one at/behind the head is ignored.
+        let ahead = b"d9:max_piecei210ee";
+        let behind = b"d9:max_piecei150ee";
+        assert_eq!(advance_head_from_window(ahead, 200), Some(210));
+        assert_eq!(advance_head_from_window(behind, 200), None);
+        assert_eq!(advance_head_from_window(b"not-a-window", 200), None);
+    }
 }

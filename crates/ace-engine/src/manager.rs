@@ -13,6 +13,11 @@ pub struct StreamManager {
     registry: ProviderRegistry,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
     packagers: Mutex<HashMap<(String, String), Arc<HlsPackager>>>,
+    /// Serializes session *creation* so concurrent first requests for the same id (e.g. the
+    /// two connections VLC opens) trigger exactly ONE `provider.open()` — not duplicate
+    /// discovery + duplicate peer connections from our same node_id (which real peers drop).
+    /// Held only around start, never around the fast existing-session path.
+    start_lock: Mutex<()>,
     buffer: usize,
     grace: Duration,
 }
@@ -23,6 +28,7 @@ impl StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
             packagers: Mutex::new(HashMap::new()),
+            start_lock: Mutex::new(()),
             buffer: 256,
             grace: Duration::from_secs(30),
         })
@@ -42,11 +48,19 @@ impl StreamManager {
                 return Ok(s.clone());
             }
         }
+        // Serialize starts and re-check under the start lock: a concurrent request may have
+        // started this exact session while we were waiting, so we must not open a second.
+        let _starting = self.start_lock.lock().await;
+        {
+            let map = self.sessions.lock().await;
+            if let Some(s) = map.get(&key) {
+                return Ok(s.clone());
+            }
+        }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
         let source = provider.open(id).await?;
         let session = StreamSession::start(source, self.buffer);
         let mut map = self.sessions.lock().await;
-        // Double-check: another task may have started it concurrently.
         Ok(map.entry(key).or_insert(session).clone())
     }
 
@@ -120,6 +134,58 @@ mod tests {
         assert!(Arc::ptr_eq(&s1, &s2));
         let s3 = m.get_or_start("test", "different").await.unwrap();
         assert!(!Arc::ptr_eq(&s1, &s3));
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_requests_start_the_session_once() {
+        // A provider that counts how many times `open` is called.
+        use crate::provider::{SourceStats, StreamProvider, TsSource};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingProvider(Arc<AtomicUsize>);
+        struct IdleSource;
+        #[async_trait]
+        impl TsSource for IdleSource {
+            async fn next(&mut self) -> Option<bytes::Bytes> {
+                // Never yields, never ends — like a live session being followed.
+                std::future::pending().await
+            }
+            fn stats(&self) -> SourceStats {
+                SourceStats::default()
+            }
+        }
+        #[async_trait]
+        impl StreamProvider for CountingProvider {
+            fn network(&self) -> &'static str {
+                "count"
+            }
+            async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                // A small yield so concurrent callers genuinely overlap inside `open`.
+                tokio::task::yield_now().await;
+                Ok(Box::new(IdleSource))
+            }
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut r = ProviderRegistry::new();
+        r.register(Arc::new(CountingProvider(opens.clone())));
+        let m = StreamManager::new(r);
+
+        // Fire many concurrent first requests for the same id.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let m = m.clone();
+            handles.push(tokio::spawn(async move { m.get_or_start("count", "x").await.map(|s| Arc::as_ptr(&s) as usize) }));
+        }
+        let mut ptrs = Vec::new();
+        for h in handles {
+            ptrs.push(h.await.unwrap().unwrap());
+        }
+        // Exactly one open, and everyone got the same session.
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "session must be started exactly once");
+        assert!(ptrs.iter().all(|p| *p == ptrs[0]), "all callers share one session");
     }
 
     #[tokio::test]
