@@ -1,5 +1,8 @@
 //! Peer discovery: announce to the stream's UDP trackers (BEP-15) and aggregate the unique
-//! peers they return. DHT discovery is a documented follow-up (see the design spec).
+//! peers they return. Mainline DHT self-announce (`dht_announce_peer`, BEP-5) is a separate,
+//! composable primitive in `crate::dht` — callers that want both combine them explicitly
+//! (see `ace_engine::ace_provider`'s periodic self-announce), rather than baking a
+//! multi-second live network call into this module's fast, offline-testable functions.
 
 use crate::dht::dht_get_peers;
 use ace_tracker::client::announce;
@@ -54,12 +57,13 @@ pub async fn discover_peers(
     peers.into_iter().collect()
 }
 
-/// Announce ourselves as a SEEDER (`left=0`, event=Completed) for `infohash` to all `trackers`,
-/// aggregating the peers each tracker returns (best-effort — a non-responding tracker is
-/// skipped, mirroring `discover_peers`). A seeder still benefits from knowing other peers.
-///
-/// NOT YET WIRED: no production caller until announcing-as-seeder is hooked into the
-/// manager/session lifecycle (the spec's remaining S2 item).
+/// Announce ourselves as a SEEDER (`left=0`, event=Completed) for `infohash` to all
+/// `trackers`, aggregating the peers each tracker returns (best-effort — a non-responding
+/// tracker is skipped, mirroring `discover_peers`). A seeder still benefits from knowing
+/// other peers. Tracker-only: see `crate::dht::dht_announce_peer` for the DHT half — real
+/// Acestream swarms are largely DHT-populated (see `docs/RESUME.md`), so callers that want
+/// full self-announce coverage should call both (as `ace_engine::ace_provider`'s periodic
+/// self-announce does, Task 7 approach (2), `docs/protocol/notes/21-seeder-ground-truth.md`).
 pub async fn announce_seeder(
     trackers: &[String],
     infohash: &[u8; 20],

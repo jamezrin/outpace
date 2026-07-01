@@ -4,6 +4,7 @@
 use crate::seed::SeederSession;
 use crate::store::PieceStore;
 use ace_peer::session::PeerSession;
+use ace_wire::identity::Identity;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -66,16 +67,21 @@ impl PeerListener {
     /// Run the accept loop until `listener` errors. Per-connection errors (failed handshake,
     /// unknown infohash, peer disconnect) are non-fatal — logged and dropped, the loop continues.
     /// `max_inbound == 0` is treated as `1` (a fully-closed listener would look like a hang).
+    /// `identity` signs the extended handshake every accepted peer requires
+    /// (`SeederSession::serve`) — without it a real leech client (including our own
+    /// `AceProvider`) never proceeds past waiting for it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn serve(
         listener: TcpListener,
         registry: SeedRegistry,
         our_peer_id: [u8; 20],
         piece_header: [u8; 8],
         max_inbound: usize,
+        identity: Arc<Identity>,
     ) {
         let sem = Arc::new(tokio::sync::Semaphore::new(max_inbound.max(1)));
         loop {
-            let (stream, _addr) = match listener.accept().await {
+            let (stream, addr) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => {
                     // A backoff matters here: under fd exhaustion (EMFILE/ENFILE) accept()
@@ -96,10 +102,18 @@ impl PeerListener {
                 Err(_) => continue, // at capacity; drop the connection
             };
             let registry = registry.clone();
+            let identity = identity.clone();
+            let peer_ip = match addr.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets(),
+                std::net::IpAddr::V6(_) => [0, 0, 0, 0],
+            };
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(e) = handle_inbound(stream, registry, our_peer_id, piece_header).await {
-                    eprintln!("[seed-listener] peer error: {e:?}");
+                eprintln!("[seed-listener] accepted connection from {addr}");
+                if let Err(e) =
+                    handle_inbound(stream, registry, our_peer_id, piece_header, &identity, peer_ip).await
+                {
+                    eprintln!("[seed-listener] peer error from {addr}: {e:?}");
                 }
             });
         }
@@ -111,11 +125,13 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     registry: SeedRegistry,
     our_peer_id: [u8; 20],
     piece_header: [u8; 8],
+    identity: &Identity,
+    peer_ip: [u8; 4],
 ) -> ace_peer::Result<()> {
     let mut session = PeerSession::new(stream);
     let peer_hs = session.accept_handshake(our_peer_id, |ih| registry.serves(ih)).await?;
     let store = registry.get(&peer_hs.infohash).ok_or(ace_peer::PeerError::InfohashMismatch)?;
-    SeederSession::serve(&mut session, store, piece_header).await
+    SeederSession::serve(&mut session, store, piece_header, identity, peer_ip).await
 }
 
 #[cfg(test)]

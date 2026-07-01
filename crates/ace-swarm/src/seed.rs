@@ -2,6 +2,8 @@
 use crate::store::PieceStore;
 use ace_peer::session::PeerSession;
 use ace_peer::Result;
+use ace_wire::extended::{LivePosition, NodeFields, OutgoingExtendedHandshake};
+use ace_wire::identity::Identity;
 use ace_wire::live_codec::build_piece;
 use ace_wire::message::PeerMessage;
 use std::sync::Arc;
@@ -11,19 +13,44 @@ use tokio::sync::Mutex;
 pub struct SeederSession;
 
 impl SeederSession {
-    /// Serve one already-connected peer from `store`: advertise held pieces, then answer each
-    /// Acestream chunk-request (id=6 `[stream u32][piece u32][chunk u16]`) with a `Piece` built
-    /// from the store, after unchoking on the peer's first `Interested`. `piece_header` is the
-    /// 8-byte per-chunk header (pinned to engine ground truth in note 21). Returns on close.
+    /// Serve one already-connected peer from `store`: send our signed extended handshake
+    /// advertising the store's current live window (`mi`) — **required** before a real leech
+    /// client (including our own `AceProvider`, which waits for this as the peer's first
+    /// message) will proceed at all — then advertise held pieces, then answer each Acestream
+    /// chunk-request (id=6 `[stream u32][piece u32][chunk u16]`) with a `Piece` built from the
+    /// store, after unchoking on the peer's first `Interested`. `piece_header` is the 8-byte
+    /// per-chunk header (pinned to engine ground truth in note 21). Returns on close.
     ///
     /// Upload accounting (bytes/peers served) is not tracked here; the S1 reciprocal seeder in
     /// `ace_provider::follow_one_peer` inlines this loop and counts via atomics. A standalone
     /// seeder built on this method (S2) will need its own counters.
+    #[allow(clippy::too_many_arguments)]
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         session: &mut PeerSession<S>,
         store: Arc<Mutex<PieceStore>>,
         piece_header: [u8; 8],
+        identity: &Identity,
+        peer_ip: [u8; 4],
     ) -> Result<()> {
+        // Advertise our identity + current live window. A distance_from_source of 0 marks us
+        // as the origin (a broadcast source); a reciprocal-serve relay would use >=1, but
+        // SeederSession only backs the standalone inbound listener (S2) today — S1's
+        // reciprocal path inlines its own serve loop instead (see the doc comment above).
+        let (min, max) = store.lock().await.window().unwrap_or((0, 0));
+        let hs = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: Some(LivePosition {
+                min_piece: min as i64,
+                max_piece: max as i64,
+                position: max as i64,
+                distance_from_source: 0,
+            }),
+            node: NodeFields::default(),
+            peer_ip: Some(peer_ip),
+        };
+        session.send_signed_extended_handshake(&hs, identity).await?;
+
         // Advertise what we currently hold (one Have per complete piece). Snapshot the list
         // first so the store lock is not held across the network sends.
         let pieces = store.lock().await.have_pieces();
@@ -133,9 +160,10 @@ mod tests {
 
         // Our seeder serves the peer until it closes.
         let mut us = PeerSession::new(server);
+        let identity = Identity::generate();
         // Run the serve loop in the background; it exits on its own once the peer drops `client`.
         let serve_task = tokio::spawn(async move {
-            let _ = SeederSession::serve(&mut us, store, [0u8; 8]).await;
+            let _ = SeederSession::serve(&mut us, store, [0u8; 8], &identity, [127, 0, 0, 1]).await;
         });
         let got = peer.await.unwrap();
         assert_eq!(got, LiveChunk { piece: 5, chunk: 0, data: vec![9, 9, 9, 9] });
