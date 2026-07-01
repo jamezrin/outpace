@@ -288,6 +288,9 @@ async fn follow_live(
 ) {
     let chunks_per_piece = info.chunks_per_piece();
     let mut lost: Option<SocketAddrV4> = None;
+    // Piece-continuity state (reassembler, resync filter, request frontier, head) survives
+    // across reconnects — see `Continuity`. `None` only before the very first connection.
+    let mut continuity: Option<Continuity> = None;
     loop {
         if tx.is_closed() {
             return;
@@ -298,7 +301,20 @@ async fn follow_live(
         };
         eprintln!("[ace] {addr}: connected + handshaked");
         peer_count.store(1, Ordering::Relaxed);
-        match follow_one_peer(&mut session, &info, &identity, addr, chunks_per_piece, &tx, &uploaded, &peers_served, &seed).await {
+        match follow_one_peer(
+            &mut session,
+            &info,
+            &identity,
+            addr,
+            chunks_per_piece,
+            &tx,
+            &uploaded,
+            &peers_served,
+            &seed,
+            &mut continuity,
+        )
+        .await
+        {
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost => {
                 peer_count.store(0, Ordering::Relaxed);
@@ -314,6 +330,61 @@ enum FollowEnd {
     PeerLost,
 }
 
+/// Piece-continuity state that must survive a peer reconnect within one `follow_live`
+/// session. Recreating it fresh per connection (the pre-fix behavior) either re-emitted
+/// pieces already served into the live broadcast — a duplicate splice — or left the
+/// reassembler waiting forever for a piece the new peer's window had already evicted, since
+/// `PieceReassembler` only ever emits strictly contiguously from its cursor. Real swarm
+/// connections drop and reconnect routinely, so this was a guaranteed visible stutter on
+/// every hop, not an edge case. See `docs/protocol/notes/23-reconnect-continuity.md`.
+struct Continuity {
+    reasm: PieceReassembler,
+    resync: ace_media::mpegts::TsResync,
+    requested_to: Option<u64>,
+    head: u64,
+    emitted: u64,
+    next_log: u64,
+}
+
+impl Continuity {
+    /// The very first peer connection for this stream: bootstrap from its window.
+    fn fresh(info: &StreamInfo, min_piece: u64, max_piece: u64) -> (Continuity, u64) {
+        let start = max_piece.saturating_sub(PREFETCH_PIECES).max(min_piece);
+        (
+            Continuity {
+                reasm: PieceReassembler::new(info.piece_length, start),
+                resync: ace_media::mpegts::TsResync::new(),
+                requested_to: None,
+                head: max_piece,
+                emitted: 0,
+                next_log: 1 << 20,
+            },
+            start,
+        )
+    }
+
+    /// A reconnect to a new peer after losing the previous one: keep going from where we
+    /// left off rather than restarting near the new peer's head (which would duplicate
+    /// already-served pieces into the broadcast). Only skips forward — an unavoidable,
+    /// logged gap — if the new peer's window has already evicted the piece we still needed
+    /// (we were disconnected longer than the live window covers). Returns the piece index
+    /// to advertise as our position in the outgoing handshake.
+    fn resume(&mut self, addr: SocketAddrV4, min_piece: u64, max_piece: u64) -> u64 {
+        self.head = self.head.max(max_piece);
+        let next = self.requested_to.map(|r| r + 1).unwrap_or_else(|| self.reasm.next_needed());
+        let resume = next.max(min_piece);
+        if resume > next {
+            eprintln!(
+                "[ace] {addr}: reconnect gap — peer's window already evicted pieces {next}..{}; skipping ahead",
+                resume - 1
+            );
+            self.reasm.skip_to(resume);
+        }
+        self.requested_to = Some(resume.saturating_sub(1));
+        resume
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn follow_one_peer(
     session: &mut PeerSession<TcpStream>,
@@ -325,15 +396,32 @@ async fn follow_one_peer(
     uploaded: &Arc<AtomicU64>,
     peers_served: &Arc<AtomicU32>,
     seed: &SeedConfig,
+    continuity: &mut Option<Continuity>,
 ) -> FollowEnd {
     // 1. Read the peer's advertised live window (their unsolicited extended handshake).
     let Some(window) = read_peer_window(session).await else {
         eprintln!("[ace] {addr}: no extended handshake / window");
         return FollowEnd::PeerLost;
     };
-    let mut head = window.max_piece.max(0) as u64;
-    let start = head.saturating_sub(PREFETCH_PIECES);
-    eprintln!("[ace] {addr}: window min={} max={} -> start={start} head={head}", window.min_piece, window.max_piece);
+    let min_piece = window.min_piece.max(0) as u64;
+    let max_piece = window.max_piece.max(0) as u64;
+    let start = match continuity {
+        None => {
+            let (c, start) = Continuity::fresh(info, min_piece, max_piece);
+            *continuity = Some(c);
+            eprintln!("[ace] {addr}: window min={min_piece} max={max_piece} -> start={start} head={max_piece}");
+            start
+        }
+        Some(c) => {
+            let start = c.resume(addr, min_piece, max_piece);
+            eprintln!(
+                "[ace] {addr}: reconnected; window min={min_piece} max={max_piece} -> resuming from {start} head={}",
+                c.head
+            );
+            start
+        }
+    };
+    let continuity = continuity.as_mut().expect("initialized just above");
 
     // 2. Advertise our matching position + interest.
     let hs = OutgoingExtendedHandshake {
@@ -341,7 +429,7 @@ async fn follow_one_peer(
         ut_metadata_id: 2,
         mi: Some(LivePosition {
             min_piece: start as i64,
-            max_piece: head as i64,
+            max_piece: continuity.head as i64,
             position: -1,
             distance_from_source: 1,
         }),
@@ -354,12 +442,6 @@ async fn follow_one_peer(
         return FollowEnd::PeerLost;
     }
 
-    let mut reasm = PieceReassembler::new(info.piece_length, start);
-    // Acestream's 1 MiB live pieces are each internally TS-aligned but don't byte-chain
-    // (~one partial packet of junk per piece boundary); re-lock packet alignment so the
-    // served stream is clean MPEG-TS.
-    let mut resync = ace_media::mpegts::TsResync::new();
-    let mut requested_to: Option<u64> = None;
     let mut unchoked = false;
     let store = seed
         .registry
@@ -367,9 +449,6 @@ async fn follow_one_peer(
     let mut unchoked_peer = false;
     // Diagnostic: surface each unmodelled Acestream message id once (note 22 follow-up).
     let mut seen_ids: std::collections::HashSet<u8> = std::collections::HashSet::new();
-    // Throughput visibility: confirm the stream keeps advancing (vs. the old freeze).
-    let mut emitted: u64 = 0;
-    let mut next_log: u64 = 1 << 20; // first at 1 MiB, then every 4 MiB
 
     loop {
         let msg = match session.read_message().await {
@@ -379,8 +458,8 @@ async fn follow_one_peer(
         match msg {
             PeerMessage::Unchoke => {
                 unchoked = true;
-                eprintln!("[ace] {addr}: UNCHOKE -> requesting pieces {start}..={head}");
-                if advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                eprintln!("[ace] {addr}: UNCHOKE -> requesting pieces {start}..={}", continuity.head);
+                if advance_requests(session, &mut continuity.requested_to, start, continuity.head, chunks_per_piece)
                     .await
                     .is_err()
                 {
@@ -389,9 +468,9 @@ async fn follow_one_peer(
             }
             PeerMessage::Choke => unchoked = false,
             PeerMessage::Have(p) => {
-                head = head.max(p as u64);
+                continuity.head = continuity.head.max(p as u64);
                 if unchoked
-                    && advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                    && advance_requests(session, &mut continuity.requested_to, start, continuity.head, chunks_per_piece)
                         .await
                         .is_err()
                 {
@@ -405,10 +484,10 @@ async fn follow_one_peer(
             // `max_piece`) regardless of carrier, advance the head, and request the newly
             // available pieces.
             PeerMessage::Extended { ref payload, .. } => {
-                if let Some(new_head) = advance_head_from_window(payload, head) {
-                    head = new_head;
+                if let Some(new_head) = advance_head_from_window(payload, continuity.head) {
+                    continuity.head = new_head;
                     if unchoked
-                        && advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                        && advance_requests(session, &mut continuity.requested_to, start, continuity.head, chunks_per_piece)
                             .await
                             .is_err()
                     {
@@ -421,21 +500,22 @@ async fn follow_one_peer(
                     let piece = lc.piece as u64;
                     store.lock().await.put_chunk(piece, lc.chunk, &lc.data);
                     let begin = lc.chunk as u64 * info.chunk_length;
-                    if reasm.add_block(lc.piece as u64, begin, &lc.data).is_err() {
+                    if continuity.reasm.add_block(lc.piece as u64, begin, &lc.data).is_err() {
                         continue;
                     }
-                    let ready = reasm.take_ready();
+                    let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
-                        let aligned = resync.push(&ready);
+                        let aligned = continuity.resync.push(&ready);
                         if !aligned.is_empty() {
-                            emitted += aligned.len() as u64;
-                            if emitted >= next_log {
+                            continuity.emitted += aligned.len() as u64;
+                            if continuity.emitted >= continuity.next_log {
                                 eprintln!(
-                                    "[ace] {addr}: served {} MiB (head={head}, next piece needed={})",
-                                    emitted >> 20,
-                                    reasm.next_needed()
+                                    "[ace] {addr}: served {} MiB (head={}, next piece needed={})",
+                                    continuity.emitted >> 20,
+                                    continuity.head,
+                                    continuity.reasm.next_needed()
                                 );
-                                next_log = emitted + (4 << 20);
+                                continuity.next_log = continuity.emitted + (4 << 20);
                             }
                             if tx.send(Bytes::from(aligned)).await.is_err() {
                                 return FollowEnd::ConsumerGone;
@@ -470,10 +550,10 @@ async fn follow_one_peer(
             // on id=4 and request the newly-available pieces.
             PeerMessage::Unknown { id: 4, ref payload } if payload.len() == 8 => {
                 let piece = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as u64;
-                if piece > head {
-                    head = piece;
+                if piece > continuity.head {
+                    continuity.head = piece;
                     if unchoked
-                        && advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                        && advance_requests(session, &mut continuity.requested_to, start, continuity.head, chunks_per_piece)
                             .await
                             .is_err()
                     {
@@ -488,11 +568,11 @@ async fn follow_one_peer(
             // as a bencode dict (note 22). Recognize it by content and advance; if it isn't a
             // window update, log the id once so a live run reveals carriers we don't decode.
             PeerMessage::Unknown { id, ref payload } => {
-                if let Some(new_head) = advance_head_from_window(payload, head) {
-                    eprintln!("[ace] {addr}: live window update (msg id={id}) head {head} -> {new_head}");
-                    head = new_head;
+                if let Some(new_head) = advance_head_from_window(payload, continuity.head) {
+                    eprintln!("[ace] {addr}: live window update (msg id={id}) head {} -> {new_head}", continuity.head);
+                    continuity.head = new_head;
                     if unchoked
-                        && advance_requests(session, &mut requested_to, start, head, chunks_per_piece)
+                        && advance_requests(session, &mut continuity.requested_to, start, continuity.head, chunks_per_piece)
                             .await
                             .is_err()
                     {
@@ -663,5 +743,60 @@ mod tests {
         assert_eq!(advance_head_from_window(ahead, 200), Some(210));
         assert_eq!(advance_head_from_window(behind, 200), None);
         assert_eq!(advance_head_from_window(b"not-a-window", 200), None);
+    }
+
+    fn info() -> StreamInfo {
+        StreamInfo { infohash: [0; 20], piece_length: 4, chunk_length: 2, trackers: vec![] }
+    }
+
+    #[test]
+    fn fresh_starts_prefetch_pieces_behind_head_clamped_to_min() {
+        let (c, start) = Continuity::fresh(&info(), 100, 200);
+        assert_eq!(start, 200 - PREFETCH_PIECES);
+        assert_eq!(c.head, 200);
+        assert_eq!(c.requested_to, None);
+        assert_eq!(c.reasm.next_needed(), start);
+    }
+
+    #[test]
+    fn fresh_clamps_start_to_min_piece_on_a_narrow_window() {
+        // min_piece is closer to head than PREFETCH_PIECES allows -> clamp, don't request
+        // an evicted piece.
+        let (_c, start) = Continuity::fresh(&info(), 198, 200);
+        assert_eq!(start, 198);
+    }
+
+    #[test]
+    fn resume_continues_seamlessly_when_the_new_window_still_covers_our_position() {
+        // We'd already requested through piece 150; the new peer's window still has it.
+        let (mut c, _start) = Continuity::fresh(&info(), 100, 149);
+        c.requested_to = Some(150);
+        let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
+        let resume = c.resume(addr, 100, 160);
+        assert_eq!(resume, 151, "continues right after what we'd already requested");
+        assert_eq!(c.head, 160);
+        // No gap: the reassembler's cursor is untouched (still whatever fresh() set it to).
+        assert_eq!(c.reasm.next_needed(), 149 - PREFETCH_PIECES);
+    }
+
+    #[test]
+    fn resume_skips_forward_over_an_unrecoverable_eviction_gap() {
+        // We were disconnected long enough that the new peer's window no longer has the
+        // piece we needed next (min_piece has advanced past it) — must skip, not stall.
+        let (mut c, _start) = Continuity::fresh(&info(), 100, 149);
+        c.requested_to = Some(150);
+        let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
+        let resume = c.resume(addr, 500, 600); // min_piece way ahead of 151
+        assert_eq!(resume, 500);
+        assert_eq!(c.reasm.next_needed(), 500, "reassembler cursor jumped past the gap");
+        assert_eq!(c.requested_to, Some(499));
+    }
+
+    #[test]
+    fn resume_head_never_regresses() {
+        let (mut c, _start) = Continuity::fresh(&info(), 100, 200);
+        let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
+        c.resume(addr, 100, 150); // a new peer with a "smaller" (staler) window
+        assert_eq!(c.head, 200, "head must not go backward");
     }
 }

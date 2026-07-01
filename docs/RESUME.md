@@ -30,8 +30,24 @@ Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 > connection) each ran a full `provider.open()` — duplicate discovery + two connections from
 > our same node_id, which a real peer may drop — now serialized via a start lock. Throughput
 > is now logged (`served N MiB`) so silent freezes are directly observable. See
-> `docs/protocol/notes/22-live-edge-never-advances.md`. **Final full-VLC playback
-> confirmation is still live-gated** — run the daemon and confirm continuous video + audio.
+> `docs/protocol/notes/22-live-edge-never-advances.md`. **Live-verified in-session** (this
+> host, real swarm): 42–133 MB continuous captures, `ffprobe`/`ffmpeg` decode real
+> 1920×1080 H.264 + 48 kHz AAC with genuinely different content at the start vs. end of a
+> capture (not a frozen loop), and VLC's own internal demuxer locks PAT/PMT/SPS/PPS and the
+> `KeyframeGate`'s SEI recovery point end-to-end against the live daemon.
+>
+> **Follow-up (note 23):** a related but distinct bug — every peer reconnect (which real
+> swarm connections do routinely) recreated the piece-reassembly/resync state from scratch,
+> **splicing a duplicate chunk or silently stalling the reassembler** depending on where the
+> new peer's own window happened to land relative to where we'd left off. This is what the
+> operator then reported as "jittery/stuttery" playback after the freeze was already fixed.
+> **Fixed** by making that continuity state (`Continuity` in `ace_provider.rs`) survive
+> reconnects — resume from our own prior position, only skipping forward (via the new
+> `PieceReassembler::skip_to`) on a genuine, unavoidable eviction gap. **Live-verified**: a
+> real reconnect captured mid-session correctly resumed from the pre-reconnect target
+> (not the new peer's own computed start), and a 172 s / 133 MB capture spanning that
+> reconnect showed **zero PTS anomalies** across 4,301 video frames (no backward jumps, no
+> gaps). See `docs/protocol/notes/23-reconnect-continuity.md`.
 
 | Phase | Status | Deliverable |
 |---|---|---|

@@ -74,6 +74,21 @@ impl PieceReassembler {
     pub fn next_needed(&self) -> u64 {
         self.next_emit
     }
+
+    /// Force the emit cursor forward to `piece`, discarding any buffered data strictly
+    /// before it. For recovering from a genuine, unrecoverable gap (e.g. a peer reconnect
+    /// whose live window has already evicted the piece we still needed) — without this,
+    /// `take_ready` would wait forever for a piece index that will never arrive, silently
+    /// stalling the stream. No-ops if `piece` doesn't actually move the cursor forward, so
+    /// callers can call it unconditionally on every reconnect.
+    pub fn skip_to(&mut self, piece: u64) {
+        if piece <= self.next_emit {
+            return;
+        }
+        self.next_emit = piece;
+        self.partial.retain(|&idx, _| idx >= piece);
+        self.complete.retain(|&idx, _| idx >= piece);
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +142,33 @@ mod tests {
     fn rejects_block_past_piece_length() {
         let mut r = PieceReassembler::new(4, 0);
         assert!(r.add_block(0, 2, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn skip_to_advances_cursor_past_an_unrecoverable_gap() {
+        let mut r = PieceReassembler::new(2, 0);
+        r.skip_to(5);
+        assert_eq!(r.next_needed(), 5);
+        // The reassembler now accepts and emits piece 5 onward, not the old gap.
+        r.add_block(5, 0, &[9, 9]).unwrap();
+        assert_eq!(r.take_ready(), vec![9, 9]);
+    }
+
+    #[test]
+    fn skip_to_drops_stale_buffered_data_below_the_new_cursor() {
+        let mut r = PieceReassembler::new(2, 0);
+        r.add_block(1, 0, &[9, 9]).unwrap(); // completed, but before the skip target
+        r.add_block(2, 0, &[1]).unwrap(); // partial, also before the skip target
+        r.skip_to(3);
+        r.add_block(3, 0, &[7, 7]).unwrap();
+        // Only piece 3 onward emits; the stale piece 1/2 data must not leak out.
+        assert_eq!(r.take_ready(), vec![7, 7]);
+    }
+
+    #[test]
+    fn skip_to_never_moves_the_cursor_backward() {
+        let mut r = PieceReassembler::new(2, 10);
+        r.skip_to(3); // behind next_emit -> no-op
+        assert_eq!(r.next_needed(), 10);
     }
 }
