@@ -121,6 +121,7 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
             ..NodeFields::default()
         },
         peer_ip: None,
+        metadata_size: None,
     };
     session
         .send_signed_extended_handshake(&hs, identity)

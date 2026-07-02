@@ -60,6 +60,7 @@ impl SeederSession {
             }),
             node: NodeFields::default(),
             peer_ip: Some(peer_ip),
+            metadata_size: None,
         };
         session
             .send_signed_extended_handshake(&hs, identity)

@@ -126,6 +126,7 @@ async fn full_pipeline_mock_peer_to_mpegts() {
             ..Default::default()
         },
         peer_ip: None,
+        metadata_size: None,
     };
     session
         .send_signed_extended_handshake(&hs, &identity)

@@ -355,6 +355,7 @@ mod tests {
             mi: None,
             node: Default::default(),
             peer_ip: None,
+            metadata_size: None,
         };
         session.send_extended_handshake(&hs).await.unwrap();
 
@@ -488,6 +489,7 @@ mod tests {
                 ..Default::default()
             },
             peer_ip,
+            metadata_size: None,
         };
         session
             .send_signed_extended_handshake(&hs, &identity)

@@ -51,6 +51,7 @@ impl LiveSession {
                 ..NodeFields::default()
             },
             peer_ip: cfg.peer_ip,
+            metadata_size: None,
         };
         session
             .send_signed_extended_handshake(&hs, &cfg.identity)

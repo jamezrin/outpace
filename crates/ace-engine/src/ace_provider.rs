@@ -1022,6 +1022,7 @@ async fn activate_upstream_peer(
             ..NodeFields::default()
         },
         peer_ip: Some(upstream.addr.ip().octets()),
+        metadata_size: None,
     };
     if upstream
         .session
@@ -1811,6 +1812,7 @@ async fn follow_one_peer(
             ..NodeFields::default()
         },
         peer_ip: Some(addr.ip().octets()),
+        metadata_size: None,
     };
     if session
         .send_signed_extended_handshake(&hs, identity)

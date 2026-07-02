@@ -58,6 +58,8 @@ pub struct OutgoingExtendedHandshake {
     pub node: NodeFields,
     /// The recipient peer's IP as 4 bytes (the `yourip` field; anti-spoof). None to omit.
     pub peer_ip: Option<[u8; 4]>,
+    /// Optional BEP-9 total metadata size, advertised as `metadata_size`.
+    pub metadata_size: Option<i64>,
 }
 
 impl OutgoingExtendedHandshake {
@@ -83,6 +85,9 @@ impl OutgoingExtendedHandshake {
                 Bencode::Int(p.distance_from_source),
             );
             root.insert(b"mi".to_vec(), Bencode::Dict(mi));
+        }
+        if let Some(size) = self.metadata_size {
+            root.insert(b"metadata_size".to_vec(), Bencode::Int(size));
         }
         root
     }
@@ -222,6 +227,7 @@ mod tests {
             mi: None,
             node: NodeFields::default(),
             peer_ip: None,
+            metadata_size: None,
         }
         .encode_payload();
         let parsed = ExtendedHandshake::parse(&payload).unwrap();
@@ -229,6 +235,22 @@ mod tests {
         assert_eq!(parsed.ut_metadata_id(), Some(2));
         // No live position advertised.
         assert!(parsed.raw.get(b"mi").is_none());
+    }
+
+    #[test]
+    fn outgoing_handshake_can_advertise_metadata_size() {
+        let hs = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: None,
+            node: NodeFields::default(),
+            peer_ip: None,
+            metadata_size: Some(420),
+        };
+        let payload = hs.encode_payload();
+        let parsed = ExtendedHandshake::parse(&payload).unwrap();
+        assert_eq!(parsed.metadata_size(), Some(420));
+        assert_eq!(parsed.ut_metadata_id(), Some(2));
     }
 
     #[test]
@@ -249,6 +271,7 @@ mod tests {
                 ..NodeFields::default()
             },
             peer_ip: None,
+            metadata_size: None,
         }
         .sign_and_encode(&id);
 
@@ -289,6 +312,7 @@ mod tests {
                 ..NodeFields::default()
             },
             peer_ip: Some([95, 17, 44, 10]),
+            metadata_size: None,
         };
         let payload = hs.sign_and_encode(&id);
         let dict = match Bencode::parse(&payload).unwrap() {
@@ -358,6 +382,7 @@ mod tests {
             }),
             node: NodeFields::default(),
             peer_ip: None,
+            metadata_size: None,
         }
         .encode_payload();
         let parsed = ExtendedHandshake::parse(&payload).unwrap();
