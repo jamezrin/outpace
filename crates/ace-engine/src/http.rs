@@ -126,19 +126,28 @@ async fn broadcast_ingest(
             bs.store_bytes,
         )
         .await;
-    let infohash_hex: String = bc.infohash.iter().map(|b| format!("{b:02x}")).collect();
+    let infohash_hex = hex20_string(&bc.infohash);
+    let content_id_hex = hex20_string(&bc.content_id);
     crate::alog!("[broadcast] {name}: ingesting as infohash {infohash_hex}");
 
-    // Self-announce this broadcast to tracker + DHT (Task 7 discoverability), exactly once
-    // per freshly-minted name — resumed PUTs must not spawn a second competing loop. A no-op
-    // without an inbound listener: advertising a port nobody's serving on would misdirect
-    // real peers into a dead connection instead of outpace's own S1/S2 serve path.
+    // Self-announce this broadcast and its content-id metadata swarm to tracker + DHT,
+    // exactly once per freshly-minted name — resumed PUTs must not spawn duplicate loops.
+    // A no-op without an inbound listener: advertising a port nobody's serving on would
+    // misdirect real peers into a dead connection instead of outpace's own S1/S2 serve path.
     if freshly_minted {
         if let Some(port) = bs.inbound_peer_port {
             let trackers = bs.trackers.clone();
             let infohash = bc.infohash;
+            let content_key = bc.content_id;
             tokio::spawn(crate::ace_provider::announce_infohash_periodically(
-                trackers, infohash, port,
+                trackers.clone(),
+                infohash,
+                port,
+            ));
+            tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+                trackers,
+                content_key,
+                port,
             ));
         }
     }
@@ -172,7 +181,12 @@ async fn broadcast_ingest(
         }
     });
 
-    Json(json!({ "name": name, "infohash": infohash_hex })).into_response()
+    Json(json!({
+        "name": name,
+        "content_id": content_id_hex,
+        "infohash": infohash_hex,
+    }))
+    .into_response()
 }
 
 fn current_live_piece_header() -> [u8; 8] {
@@ -1079,6 +1093,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&respbody).unwrap();
         let infohash_hex = json["infohash"].as_str().unwrap().to_string();
         assert_eq!(infohash_hex.len(), 40, "a 20-byte infohash, hex-encoded");
+        let content_id_hex = json["content_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            content_id_hex.len(),
+            40,
+            "a 20-byte content-id, hex-encoded"
+        );
         assert_eq!(json["name"], "mychan");
 
         // The minted infohash must be immediately servable via the shared registry (S1/S2's
@@ -1087,7 +1107,12 @@ mod tests {
         for i in 0..20 {
             infohash[i] = u8::from_str_radix(&infohash_hex[i * 2..i * 2 + 2], 16).unwrap();
         }
+        let mut content_id = [0u8; 20];
+        for i in 0..20 {
+            content_id[i] = u8::from_str_radix(&content_id_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
         assert!(seed_registry.serves(&infohash));
+        assert!(seed_registry.serves(&content_id));
 
         // Give the background ingest task a moment to process the body. It's short (well
         // under a full 1 MiB piece), so this reaches the store via `SigningChunker::flush`'s

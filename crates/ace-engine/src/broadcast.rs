@@ -15,7 +15,7 @@
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::store::PieceStore;
 use ace_wire::bencode::Bencode;
-use ace_wire::infohash::infohash_of_descriptor;
+use ace_wire::infohash::{infohash_of_descriptor, transport_file_hash};
 use ace_wire::live_auth::LiveSourceAuth;
 use ace_wire::transport::encode_transport;
 use std::collections::BTreeMap;
@@ -34,6 +34,7 @@ pub const DEFAULT_BROADCAST_BITRATE: i64 = 8375;
 #[derive(Clone)]
 pub struct Broadcast {
     pub infohash: [u8; 20],
+    pub content_id: [u8; 20],
     pub transport_bytes: Arc<Vec<u8>>,
     pub store: Arc<Mutex<PieceStore>>,
     pub auth: Arc<LiveSourceAuth>,
@@ -85,11 +86,14 @@ impl BroadcastRegistry {
         let infohash = infohash_of_descriptor(&descriptor)
             .expect("broadcast descriptor has official infohash fields");
         let transport_bytes = encode_transport(&descriptor);
+        let content_id = transport_file_hash(&transport_bytes);
+        seed_registry.register_metadata(content_id, transport_bytes.clone());
         let store = seed_registry.get_or_create(infohash, || {
             PieceStore::new(PIECE_LENGTH, CHUNK_LENGTH, store_bytes)
         });
         let broadcast = Broadcast {
             infohash,
+            content_id,
             transport_bytes: Arc::new(transport_bytes),
             store,
             auth: Arc::new(auth),
@@ -201,6 +205,31 @@ mod tests {
             seed.serves(&bc.infohash),
             "minted broadcast must be immediately servable"
         );
+    }
+
+    #[tokio::test]
+    async fn minted_broadcast_has_content_id_and_registers_metadata() {
+        let (reg, seed) = registry();
+        let (bc, fresh) = reg
+            .start_or_resume(
+                "chan",
+                "Channel",
+                &["udp://tracker.example:2710/announce".to_string()],
+                &seed,
+                1024 * 1024,
+            )
+            .await;
+        assert!(fresh);
+        assert_eq!(
+            bc.content_id,
+            ace_wire::infohash::transport_file_hash(&bc.transport_bytes)
+        );
+        assert_eq!(
+            seed.metadata(&bc.content_id).as_deref().map(Vec::as_slice),
+            Some(bc.transport_bytes.as_slice())
+        );
+        assert!(seed.serves(&bc.infohash));
+        assert!(seed.serves(&bc.content_id));
     }
 
     #[tokio::test]
