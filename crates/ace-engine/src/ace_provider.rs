@@ -1191,6 +1191,11 @@ async fn follow_peer_pool(
     });
     let (event_tx, mut event_rx) = mpsc::channel(MAX_ACTIVE_UPSTREAMS * 32);
     let (refill_tx, mut refill_rx) = mpsc::channel(MAX_ACTIVE_UPSTREAMS);
+    // A live-held clone of the refill sender so peers learned from `id=12` peer-exchange
+    // gossip can be connected and fed into the same pool-add path (keeps `refill_rx` open
+    // even after the background refill task finishes).
+    let pex_tx = refill_tx.clone();
+    let mut pex_tried: HashSet<SocketAddrV4> = HashSet::new();
     let mut refill_handle = if refill_candidates.is_empty() {
         None
     } else {
@@ -1501,6 +1506,47 @@ async fn follow_peer_pool(
                 }
             }
             PeerMessage::Unknown { id: 10, .. } => {}
+            PeerMessage::Unknown {
+                id: 12,
+                ref payload,
+            } => {
+                // Peer-exchange gossip: connect to peers we don't already have and feed the
+                // successes into the same pool-add path as the background refill, so a stalled
+                // pool has fresh, swarm-sourced upstreams to fall back on (notes 41-43).
+                if peers.len() < MAX_ACTIVE_UPSTREAMS {
+                    let advertised = ace_wire::peer_exchange::parse_peer_exchange(payload);
+                    let total = advertised.len();
+                    let active: HashSet<SocketAddrV4> = peers.values().map(|p| p.addr).collect();
+                    if pex_tried.len() > 1024 {
+                        pex_tried.clear();
+                    }
+                    let mut spawned = 0usize;
+                    for cand in advertised {
+                        if spawned >= MAX_PARALLEL_CONNECT {
+                            break;
+                        }
+                        if active.contains(&cand) || !pex_tried.insert(cand) {
+                            continue;
+                        }
+                        let ih = info.infohash;
+                        let tx = pex_tx.clone();
+                        tokio::spawn(async move {
+                            if let PeerConnectAttempt::Connected(upstream) =
+                                connect_upstream(cand, ih).await
+                            {
+                                // Drop the connection if the pool isn't currently taking peers.
+                                let _ = tx.try_send(upstream);
+                            }
+                        });
+                        spawned += 1;
+                    }
+                    if spawned > 0 {
+                        crate::alog!(
+                            "[ace] peer-exchange from {addr}: {spawned} new peer(s) to try (of {total} advertised)"
+                        );
+                    }
+                }
+            }
             PeerMessage::Unknown { id, ref payload } => {
                 if let Some(new_head) = advance_head_from_window(payload, continuity.head) {
                     crate::alog!(

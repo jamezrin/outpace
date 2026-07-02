@@ -11,6 +11,7 @@ pub mod live;
 pub mod live_auth;
 pub mod live_codec;
 pub mod message;
+pub mod peer_exchange;
 pub mod reassembly;
 pub mod signing_chunker;
 pub mod transport;

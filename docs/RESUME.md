@@ -514,6 +514,28 @@ peers are unreachable (`no usable upstreams: tcp=22`). Three changes:
   stream (as designed) so they're unit-tested + reasoned, not yet observed firing live. Remaining:
   observe the retransmit/skip paths during an actual field stall via the new timestamped logs.
 
+**Update (note 49, 2026-07-02): the `id=12` peer message is decoded — it's peer-exchange
+gossip, now wired in as a peer source.** The frequently-logged `unhandled msg id=12` is
+Acestream's **peer-exchange (PEX)**: each connected peer periodically broadcasts a list of other
+peers it knows. Format (RE'd from a live capture, vector
+`tests/vectors/peer-exchange/id12-556.bin`): a 16-byte header
+`[u8 stream][u16 count][u32=17][u32 record_size=108][5B]` then `count` fixed 108-byte records,
+each carrying `IPv4(4B):port(2B)` at record offset 11 plus the peer's `R30-…` peer-id and its
+live-window piece positions (unused for now — we re-read the real window from the extended
+handshake on connect). Implemented `ace_wire::peer_exchange::parse_peer_exchange` (pure, tested
+against the real 556-byte / 5-peer capture: `37.11.110.121:8621`, `90.173.16.56:8621`,
+`87.217.156.180:8621`, `90.77.1.216:8621`, `88.26.18.27:8621`). Wired into `follow_peer_pool`:
+on `id=12`, while the pool is below `MAX_ACTIVE_UPSTREAMS`, new advertised peers (deduped via a
+per-session tried-set, skipping already-active ones) are connect-raced and fed into the existing
+refill→pool-add path through a live-held clone of the refill channel (`try_send`, so a full pool
+just drops the extra connection). This is a continuous, swarm-sourced supply of fresh upstreams
+near the live edge — directly targeting the notes 41-43 "only one usable upstream" acquisition
+gap and the intermittent post-window freeze (note 48). `id=12` is no longer logged as unhandled.
+Live-verified: a real `id=12` from `5.231.25.139` produced
+`peer-exchange from …: 4 new peer(s) to try (of 5 advertised)` and the pool grew. Possible
+follow-up: also use each PEX record's advertised window to prefer peers that already cover our
+next-needed piece.
+
 ### B0 — CRACKED (note 27, 2026-07-01)
 **The per-piece signing scheme is fully cracked and implemented**, not just researched.
 Scheme: `SHA1(piece_bytes[0 .. piece_length - sig_len])`, signed with standard **RSASSA-
