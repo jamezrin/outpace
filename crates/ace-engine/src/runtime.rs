@@ -7,7 +7,7 @@ use crate::http::{router, AppState, BroadcastState};
 use crate::manager::StreamManager;
 use crate::provider::ProviderRegistry;
 use std::collections::HashMap;
-use std::net::SocketAddrV4;
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 /// Default tracker for minted broadcasts (B1) — the same public UDP tracker `AceProvider`
@@ -78,16 +78,18 @@ pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
 }
 
 pub fn broadcast_ingest_urls(
-    http_bind: std::net::SocketAddr,
-    rtmp_bind: std::net::SocketAddr,
+    http_bind: SocketAddr,
+    rtmp_bind: SocketAddr,
     public_host: Option<String>,
     name: &str,
 ) -> BroadcastIngestUrls {
+    let public_host = public_host.as_deref();
     let raw_host = public_host
-        .as_deref()
-        .map(str::to_string)
-        .unwrap_or_else(|| http_bind.ip().to_string());
-    let rtmp_host = public_host.unwrap_or_else(|| rtmp_bind.ip().to_string());
+        .map(url_host)
+        .unwrap_or_else(|| url_host_from_ip(http_bind.ip()));
+    let rtmp_host = public_host
+        .map(url_host)
+        .unwrap_or_else(|| url_host_from_ip(rtmp_bind.ip()));
     BroadcastIngestUrls {
         raw: format!(
             "http://{}:{}/broadcast/{}",
@@ -96,6 +98,19 @@ pub fn broadcast_ingest_urls(
             name
         ),
         rtmp: format!("rtmp://{}:{}/live/{}", rtmp_host, rtmp_bind.port(), name),
+    }
+}
+
+fn url_host(host: &str) -> String {
+    host.parse()
+        .map(url_host_from_ip)
+        .unwrap_or_else(|_| host.to_string())
+}
+
+fn url_host_from_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
     }
 }
 
@@ -245,6 +260,24 @@ fn hex_node_id(identity: &ace_wire::identity::Identity) -> String {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn rtmp_bind_env_override_sets_config_rtmp_bind() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OUTPACE_RTMP_BIND");
+
+        std::env::set_var("OUTPACE_RTMP_BIND", "127.0.0.1:19935");
+        let config = config_from_env();
+        match old {
+            Some(value) => std::env::set_var("OUTPACE_RTMP_BIND", value),
+            None => std::env::remove_var("OUTPACE_RTMP_BIND"),
+        }
+
+        let config = config.unwrap();
+        assert_eq!(config.rtmp_bind, "127.0.0.1:19935".parse().unwrap());
+    }
+
     #[test]
     fn broadcast_urls_use_raw_and_rtmp_labels() {
         let http = "127.0.0.1:6878".parse().unwrap();
@@ -263,5 +296,15 @@ mod tests {
 
         assert_eq!(urls.raw, "http://stream.example:6878/broadcast/mychan");
         assert_eq!(urls.rtmp, "rtmp://stream.example:1935/live/mychan");
+    }
+
+    #[test]
+    fn broadcast_urls_use_bracketed_ipv6_bind_hosts() {
+        let http = "[::1]:6878".parse().unwrap();
+        let rtmp = "[::1]:1935".parse().unwrap();
+        let urls = broadcast_ingest_urls(http, rtmp, None, "mychan");
+
+        assert_eq!(urls.raw, "http://[::1]:6878/broadcast/mychan");
+        assert_eq!(urls.rtmp, "rtmp://[::1]:1935/live/mychan");
     }
 }

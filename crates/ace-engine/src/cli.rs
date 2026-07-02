@@ -116,21 +116,51 @@ async fn run_broadcast(args: BroadcastArgs) -> Result<(), Box<dyn std::error::Er
     let content_id = hex20(&bc.content_id);
     let infohash = hex20(&bc.infohash);
 
-    eprintln!("outpace broadcast: {name}");
-    eprintln!("RAW Ingest URL: {} (MPEG-TS)", urls.raw);
-    eprintln!("RTMP Ingest URL: {}", urls.rtmp);
-    eprintln!("Content ID: {content_id}");
-    eprintln!("Ace link: acestream://{content_id}");
-    eprintln!("Infohash: {infohash}");
-    eprintln!(
-        "Transport URL: http://{}:{}/broadcast/{}",
-        transport_host,
-        bind.port(),
-        name
+    eprint!(
+        "{}",
+        broadcast_output(
+            &name,
+            &urls,
+            &content_id,
+            &infohash,
+            &transport_host,
+            bind.port(),
+            runtime.config.peer_listen,
+        )
     );
-    eprintln!("Peer listen: {}", runtime.config.peer_listen);
 
     crate::runtime::serve_http(runtime).await
+}
+
+fn broadcast_output(
+    name: &str,
+    urls: &crate::runtime::BroadcastIngestUrls,
+    content_id: &str,
+    infohash: &str,
+    transport_host: &str,
+    transport_port: u16,
+    peer_listen: std::net::SocketAddr,
+) -> String {
+    format!(
+        concat!(
+            "outpace broadcast: {name}\n",
+            "RAW Ingest URL: {raw} (MPEG-TS)\n",
+            "RTMP Ingest URL: {rtmp}\n",
+            "Content ID: {content_id}\n",
+            "Ace link: acestream://{content_id}\n",
+            "Infohash: {infohash}\n",
+            "Transport URL: http://{transport_host}:{transport_port}/broadcast/{name}\n",
+            "Peer listen: {peer_listen}\n"
+        ),
+        name = name,
+        raw = urls.raw.as_str(),
+        rtmp = urls.rtmp.as_str(),
+        content_id = content_id,
+        infohash = infohash,
+        transport_host = transport_host,
+        transport_port = transport_port,
+        peer_listen = peer_listen,
+    )
 }
 
 async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -209,7 +239,7 @@ fn parse_query(query: &str) -> std::collections::BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, PlaybackTarget};
+    use super::{broadcast_output, Cli, Command, PlaybackTarget};
     use clap::Parser;
 
     #[test]
@@ -253,6 +283,30 @@ mod tests {
             }
             other => panic!("expected broadcast command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn broadcast_output_uses_raw_and_rtmp_ingest_labels() {
+        let urls = crate::runtime::BroadcastIngestUrls {
+            raw: "http://stream.example:6878/broadcast/sports".to_string(),
+            rtmp: "rtmp://stream.example:1935/live/sports".to_string(),
+        };
+        let output = broadcast_output(
+            "sports",
+            &urls,
+            "0123456789abcdef0123456789abcdef01234567",
+            "89abcdef0123456789abcdef0123456789abcdef",
+            "stream.example",
+            6878,
+            "127.0.0.1:8621".parse().unwrap(),
+        );
+
+        assert!(output
+            .contains("RAW Ingest URL: http://stream.example:6878/broadcast/sports (MPEG-TS)"));
+        assert!(output.contains("RTMP Ingest URL: rtmp://stream.example:1935/live/sports"));
+        assert!(output.contains("(MPEG-TS)"));
+        let old_label = ["OBS", " ingest URL"].concat();
+        assert!(!output.contains(&old_label));
     }
 
     #[test]
