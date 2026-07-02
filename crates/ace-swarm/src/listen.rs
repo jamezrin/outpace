@@ -14,7 +14,16 @@ use tokio::sync::Mutex;
 /// Per-infohash store, shared with whatever feeds pieces (a download loop, a broadcast source).
 type SharedStore = Arc<Mutex<PieceStore>>;
 
-/// Maps infohash -> the `PieceStore` we'd serve it from. Shared between whatever feeds pieces
+/// Per-infohash metadata blob, shared by inbound seed sessions serving BEP-9 metadata.
+type SharedMetadata = Arc<Vec<u8>>;
+
+#[derive(Clone, Default)]
+struct SeedEntry {
+    store: Option<SharedStore>,
+    metadata: Option<SharedMetadata>,
+}
+
+/// Maps infohash -> the store and/or metadata we'd serve. Shared between whatever feeds pieces
 /// (a download loop, a broadcast source) and the inbound listener.
 ///
 /// KNOWN GAP: entries are never evicted — every infohash ever followed by this process gets a
@@ -24,7 +33,7 @@ type SharedStore = Arc<Mutex<PieceStore>>;
 /// real memory concern (e.g. tied to `StreamSession` teardown).
 #[derive(Clone, Default)]
 pub struct SeedRegistry {
-    stores: Arc<StdMutex<HashMap<[u8; 20], SharedStore>>>,
+    stores: Arc<StdMutex<HashMap<[u8; 20], SeedEntry>>>,
 }
 
 impl SeedRegistry {
@@ -34,7 +43,17 @@ impl SeedRegistry {
 
     /// Register (or replace) the store for `infohash`.
     pub fn register(&self, infohash: [u8; 20], store: SharedStore) {
-        self.stores.lock().unwrap().insert(infohash, store);
+        self.stores
+            .lock()
+            .unwrap()
+            .entry(infohash)
+            .or_default()
+            .store = Some(store);
+    }
+
+    /// Register (or replace) the BEP-9 metadata for `key`.
+    pub fn register_metadata(&self, key: [u8; 20], metadata: Vec<u8>) {
+        self.stores.lock().unwrap().entry(key).or_default().metadata = Some(Arc::new(metadata));
     }
 
     /// The store for `infohash`, creating it via `make` (and registering it) if absent.
@@ -48,13 +67,20 @@ impl SeedRegistry {
             .lock()
             .unwrap()
             .entry(infohash)
-            .or_insert_with(|| Arc::new(Mutex::new(make())))
+            .or_default()
+            .store
+            .get_or_insert_with(|| Arc::new(Mutex::new(make())))
             .clone()
     }
 
     /// The store for `infohash`, if we serve it.
     pub fn get(&self, infohash: &[u8; 20]) -> Option<SharedStore> {
-        self.stores.lock().unwrap().get(infohash).cloned()
+        self.stores.lock().unwrap().get(infohash)?.store.clone()
+    }
+
+    /// The BEP-9 metadata for `key`, if we serve it.
+    pub fn metadata(&self, key: &[u8; 20]) -> Option<Arc<Vec<u8>>> {
+        self.stores.lock().unwrap().get(key)?.metadata.clone()
     }
 
     /// True iff we serve `infohash` (used as the inbound handshake's accept predicate).
@@ -143,10 +169,20 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     let peer_hs = session
         .accept_handshake(our_peer_id, |ih| registry.serves(ih))
         .await?;
-    let store = registry
-        .get(&peer_hs.infohash)
-        .ok_or(ace_peer::PeerError::InfohashMismatch)?;
-    SeederSession::serve(&mut session, store, piece_header, identity, peer_ip).await
+    let store = registry.get(&peer_hs.infohash);
+    let metadata = registry.metadata(&peer_hs.infohash);
+    if store.is_none() && metadata.is_none() {
+        return Err(ace_peer::PeerError::InfohashMismatch);
+    }
+    SeederSession::serve(
+        &mut session,
+        store,
+        metadata,
+        piece_header,
+        identity,
+        peer_ip,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -163,5 +199,15 @@ mod tests {
             Arc::ptr_eq(&a, &b),
             "second call must return the SAME store, not create a new one"
         );
+    }
+
+    #[test]
+    fn registry_serves_metadata_only_keys() {
+        let reg = SeedRegistry::new();
+        let key = [9u8; 20];
+        reg.register_metadata(key, vec![1, 2, 3, 4]);
+        assert!(reg.serves(&key));
+        assert_eq!(&*reg.metadata(&key).unwrap(), &[1, 2, 3, 4]);
+        assert!(reg.get(&key).is_none());
     }
 }

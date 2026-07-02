@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 pub struct SeederSession;
 
 impl SeederSession {
-    /// Serve one already-connected peer from `store`: send our signed extended handshake
+    /// Serve one already-connected peer from `store`/`metadata`: send our signed extended handshake
     /// advertising the store's current live window (`mi`) — **required** before a real leech
     /// client (including our own `AceProvider`, which waits for this as the peer's first
     /// message) will proceed at all — then advertise held pieces with Acestream's live
@@ -30,7 +30,8 @@ impl SeederSession {
     #[allow(clippy::too_many_arguments)]
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         session: &mut PeerSession<S>,
-        store: Arc<Mutex<PieceStore>>,
+        store: Option<Arc<Mutex<PieceStore>>>,
+        metadata: Option<Arc<Vec<u8>>>,
         piece_header: [u8; 8],
         identity: &Identity,
         peer_ip: [u8; 4],
@@ -39,9 +40,11 @@ impl SeederSession {
         // Advertise our identity + current live window using the profile observed from an
         // official local source node (note 32). SeederSession backs the standalone inbound
         // listener (S2) today; S1's reciprocal path inlines its own serve loop instead.
-        let (min, max) = {
+        let (min, max) = if let Some(store) = &store {
             let guard = store.lock().await;
             complete_piece_window(&guard).unwrap_or((0, 0))
+        } else {
+            (0, 0)
         };
         if debug {
             crate::swarm_log!(
@@ -60,7 +63,7 @@ impl SeederSession {
             }),
             node: NodeFields::default(),
             peer_ip: Some(peer_ip),
-            metadata_size: None,
+            metadata_size: metadata.as_ref().map(|m| m.len() as i64),
         };
         session
             .send_signed_extended_handshake(&hs, identity)
@@ -75,8 +78,32 @@ impl SeederSession {
             }
             match msg {
                 PeerMessage::Extended { ext_id: 0, .. } if !advertised_bitfields => {
-                    advertise_live_bitfields(session, &store, debug).await?;
+                    if let Some(store) = &store {
+                        advertise_live_bitfields(session, store, debug).await?;
+                    }
                     advertised_bitfields = true;
+                }
+                PeerMessage::Extended { ext_id, payload } if ext_id == 2 => {
+                    if let Some(metadata) = &metadata {
+                        if let Some(ace_wire::ut_metadata::MetadataMessage::Request { piece }) =
+                            ace_wire::ut_metadata::MetadataMessage::parse(&payload)
+                        {
+                            let piece = piece.max(0) as usize;
+                            let start = piece * ace_wire::ut_metadata::METADATA_BLOCK_LEN;
+                            if start < metadata.len() {
+                                let end = (start + ace_wire::ut_metadata::METADATA_BLOCK_LEN)
+                                    .min(metadata.len());
+                                let payload = ace_wire::ut_metadata::data_piece(
+                                    piece as i64,
+                                    metadata.len() as i64,
+                                    &metadata[start..end],
+                                );
+                                session
+                                    .send(&PeerMessage::Extended { ext_id: 2, payload })
+                                    .await?;
+                            }
+                        }
+                    }
                 }
                 PeerMessage::Interested if !unchoked => {
                     session.send(&PeerMessage::Unchoke).await?;
@@ -87,27 +114,29 @@ impl SeederSession {
                 }
                 PeerMessage::Unknown { id: 6, payload } if payload.len() >= 10 => {
                     // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
-                    let piece =
-                        u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                    let chunk = u16::from_be_bytes([payload[8], payload[9]]);
-                    let (data, header) = {
-                        let guard = store.lock().await;
-                        (
-                            guard.chunk(piece as u64, chunk).map(|d| d.to_vec()),
-                            guard.piece_header(piece as u64).unwrap_or(piece_header),
-                        )
-                    };
-                    if let Some(data) = data {
-                        let reply = build_piece(0, piece, chunk, header, &data);
-                        session.send(&reply).await?;
-                        if debug {
-                            crate::swarm_log!(
-                                "[seed-session] -> Piece stream=0 piece={piece} chunk={chunk} bytes={}",
-                                data.len()
-                            );
+                    if let Some(store) = &store {
+                        let piece =
+                            u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                        let chunk = u16::from_be_bytes([payload[8], payload[9]]);
+                        let (data, header) = {
+                            let guard = store.lock().await;
+                            (
+                                guard.chunk(piece as u64, chunk).map(|d| d.to_vec()),
+                                guard.piece_header(piece as u64).unwrap_or(piece_header),
+                            )
+                        };
+                        if let Some(data) = data {
+                            let reply = build_piece(0, piece, chunk, header, &data);
+                            session.send(&reply).await?;
+                            if debug {
+                                crate::swarm_log!(
+                                    "[seed-session] -> Piece stream=0 piece={piece} chunk={chunk} bytes={}",
+                                    data.len()
+                                );
+                            }
+                        } else if debug {
+                            crate::swarm_log!("[seed-session] miss piece={piece} chunk={chunk}");
                         }
-                    } else if debug {
-                        crate::swarm_log!("[seed-session] miss piece={piece} chunk={chunk}");
                     }
                     // Missing/evicted chunk: silently skip (a future task may send a reject).
                 }
@@ -296,6 +325,59 @@ mod tests {
     use tokio::sync::Mutex;
 
     #[tokio::test]
+    async fn serves_ut_metadata_piece_when_metadata_is_registered() {
+        use ace_wire::ut_metadata::{request_piece, MetadataMessage};
+        use tokio::io::duplex;
+
+        let metadata = Arc::new(b"AceStreamTransport-metadata".to_vec());
+        let (client, server) = duplex(4096);
+        let identity = Arc::new(ace_wire::identity::Identity::from_seed([7u8; 32]));
+        let mut server_session = PeerSession::new(server);
+        let mut client_session = PeerSession::new(client);
+
+        let server_task = tokio::spawn(async move {
+            SeederSession::serve(
+                &mut server_session,
+                None,
+                Some(metadata),
+                [0u8; 8],
+                &identity,
+                [127, 0, 0, 1],
+            )
+            .await
+        });
+
+        let msg = client_session.read_message().await.unwrap();
+        let PeerMessage::Extended { ext_id: 0, payload } = msg else {
+            panic!("expected extended handshake");
+        };
+        let parsed = ExtendedHandshake::parse(&payload).unwrap();
+        assert_eq!(parsed.metadata_size(), Some(27));
+
+        client_session
+            .send(&PeerMessage::Extended {
+                ext_id: 2,
+                payload: request_piece(0),
+            })
+            .await
+            .unwrap();
+        let msg = client_session.read_message().await.unwrap();
+        let PeerMessage::Extended { ext_id: 2, payload } = msg else {
+            panic!("expected ut_metadata data");
+        };
+        match MetadataMessage::parse(&payload).unwrap() {
+            MetadataMessage::Data { piece, data, .. } => {
+                assert_eq!(piece, 0);
+                assert_eq!(data, b"AceStreamTransport-metadata");
+            }
+            other => panic!("expected data, got {other:?}"),
+        }
+
+        drop(client_session);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn serve_advertises_complete_piece_window_in_extended_handshake() {
         let store = Arc::new(Mutex::new(PieceStore::new(8, 4, 1024)));
         store.lock().await.put_chunk(5, 0, &[5, 5, 5, 5]);
@@ -307,8 +389,15 @@ mod tests {
         let mut us = PeerSession::new(server);
         let serve_store = store.clone();
         let serve_task = tokio::spawn(async move {
-            let _ = SeederSession::serve(&mut us, serve_store, [0u8; 8], &identity, [127, 0, 0, 1])
-                .await;
+            let _ = SeederSession::serve(
+                &mut us,
+                Some(serve_store),
+                None,
+                [0u8; 8],
+                &identity,
+                [127, 0, 0, 1],
+            )
+            .await;
         });
 
         let mut peer = PeerSession::new(client).with_timeout(Duration::from_millis(30));
@@ -343,8 +432,15 @@ mod tests {
         let mut us = PeerSession::new(server);
         let serve_store = store.clone();
         let serve_task = tokio::spawn(async move {
-            let _ = SeederSession::serve(&mut us, serve_store, [0u8; 8], &identity, [127, 0, 0, 1])
-                .await;
+            let _ = SeederSession::serve(
+                &mut us,
+                Some(serve_store),
+                None,
+                [0u8; 8],
+                &identity,
+                [127, 0, 0, 1],
+            )
+            .await;
         });
 
         let mut peer = PeerSession::new(client).with_timeout(Duration::from_millis(30));
@@ -404,8 +500,15 @@ mod tests {
         let mut us = PeerSession::new(server);
         let serve_store = store.clone();
         let serve_task = tokio::spawn(async move {
-            let _ = SeederSession::serve(&mut us, serve_store, [0u8; 8], &identity, [127, 0, 0, 1])
-                .await;
+            let _ = SeederSession::serve(
+                &mut us,
+                Some(serve_store),
+                None,
+                [0u8; 8],
+                &identity,
+                [127, 0, 0, 1],
+            )
+            .await;
         });
 
         let mut peer = PeerSession::new(client).with_timeout(Duration::from_millis(30));
@@ -477,7 +580,15 @@ mod tests {
         let identity = Identity::generate();
         // Run the serve loop in the background; it exits on its own once the peer drops `client`.
         let serve_task = tokio::spawn(async move {
-            let _ = SeederSession::serve(&mut us, store, [0u8; 8], &identity, [127, 0, 0, 1]).await;
+            let _ = SeederSession::serve(
+                &mut us,
+                Some(store),
+                None,
+                [0u8; 8],
+                &identity,
+                [127, 0, 0, 1],
+            )
+            .await;
         });
         let got = peer.await.unwrap();
         assert_eq!(
@@ -519,7 +630,15 @@ mod tests {
         let mut us = PeerSession::new(server);
         let identity = Identity::generate();
         let serve_task = tokio::spawn(async move {
-            let _ = SeederSession::serve(&mut us, store, [0u8; 8], &identity, [127, 0, 0, 1]).await;
+            let _ = SeederSession::serve(
+                &mut us,
+                Some(store),
+                None,
+                [0u8; 8],
+                &identity,
+                [127, 0, 0, 1],
+            )
+            .await;
         });
         let got = peer.await.unwrap();
 

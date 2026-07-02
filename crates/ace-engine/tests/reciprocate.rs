@@ -29,7 +29,15 @@ async fn peer_downloads_a_chunk_from_us() {
     let mut us = PeerSession::new(server);
     let identity = Identity::generate();
     let serve_task = tokio::spawn(async move {
-        let _ = SeederSession::serve(&mut us, store, [0u8; 8], &identity, [127, 0, 0, 1]).await;
+        let _ = SeederSession::serve(
+            &mut us,
+            Some(store),
+            None,
+            [0u8; 8],
+            &identity,
+            [127, 0, 0, 1],
+        )
+        .await;
     });
     let got = peer.await.unwrap();
     assert_eq!(
