@@ -62,9 +62,51 @@ pub fn parse_peer_exchange(payload: &[u8]) -> Vec<SocketAddrV4> {
     out
 }
 
+/// Byte offset of the IPv4 in a single-peer announce (`id=36`); the port `u16` follows it.
+const ANNOUNCE_IP_OFFSET: usize = 8;
+
+/// Parse an `id=36` single-peer announce (the stream's source-node descriptor) into its
+/// address. Returns `None` if the buffer is too short or the address is a zero IP/port.
+pub fn parse_peer_announce(payload: &[u8]) -> Option<SocketAddrV4> {
+    let base = ANNOUNCE_IP_OFFSET;
+    if payload.len() < base + 6 {
+        return None;
+    }
+    let ip = Ipv4Addr::new(
+        payload[base],
+        payload[base + 1],
+        payload[base + 2],
+        payload[base + 3],
+    );
+    let port = u16::from_be_bytes([payload[base + 4], payload[base + 5]]);
+    if ip.is_unspecified() || port == 0 {
+        return None;
+    }
+    Some(SocketAddrV4::new(ip, port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_source_node_from_a_real_announce() {
+        // A real 80-byte id=36 (source-node descriptor): IPv4 at offset 8, port after it.
+        let bytes =
+            hex("00020034003f004005e7198b272a5233302d2d2d2d2d2d4c00000000000000000000000000000000");
+        assert_eq!(
+            parse_peer_announce(&bytes).map(|a| a.to_string()),
+            Some("5.231.25.139:10026".to_string())
+        );
+        assert!(parse_peer_announce(&[0u8; 6]).is_none());
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
 
     #[test]
     fn parses_addresses_from_a_real_capture() {

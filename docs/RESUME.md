@@ -536,6 +536,16 @@ Live-verified: a real `id=12` from `5.231.25.139` produced
 follow-up: also use each PEX record's advertised window to prefer peers that already cover our
 next-needed piece.
 
+The remaining custom peer-message ids were also classified and de-noised (no more
+`unhandled msg` spam): **`id=36`** is the **source-node descriptor** — an 80-byte single-peer
+announce (`IPv4@8:port@12` + `R30-…` id) that every peer re-broadcasts for the stream origin
+(observed constant at `5.231.25.139:10026`, note the non-8621 port). Since the source never
+stalls, it's now harvested once via the same dedup'd path
+(`ace_wire::peer_exchange::parse_peer_announce`), skipped when already active.
+**`id=11`** is a bencode stats dict (`d1:ai1e1:bi…e…`, single-letter counter keys),
+**`id=34`** an 8-byte `[u32=1][u32 counter]`, **`id=13`** an empty keepalive — all pure peer
+telemetry with nothing to act on, now explicit no-op match arms.
+
 ### B0 — CRACKED (note 27, 2026-07-01)
 **The per-piece signing scheme is fully cracked and implemented**, not just researched.
 Scheme: `SHA1(piece_bytes[0 .. piece_length - sig_len])`, signed with standard **RSASSA-
