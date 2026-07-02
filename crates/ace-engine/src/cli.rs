@@ -79,6 +79,29 @@ impl PlaybackTarget {
     }
 }
 
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    match Cli::parse_cli().command {
+        Command::Serve(_) => run_serve().await,
+        Command::Broadcast(args) => run_broadcast(args).await,
+        Command::Play(args) => run_play(args).await,
+    }
+}
+
+async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
+    let config = crate::runtime::config_from_env()?;
+    let peers = crate::runtime::bootstrap_peers_from_env();
+    let runtime = crate::runtime::build_runtime(config, peers).await?;
+    crate::runtime::serve_http(runtime).await
+}
+
+async fn run_broadcast(_args: BroadcastArgs) -> Result<(), Box<dyn std::error::Error>> {
+    Err("broadcast command is not wired yet".into())
+}
+
+async fn run_play(_args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
+    Err("play command is not wired yet".into())
+}
+
 fn content_id_target(id: &str) -> Result<PlaybackTarget, String> {
     let id = normalize_hex40(id)?;
     Ok(PlaybackTarget {
