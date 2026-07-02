@@ -13,7 +13,28 @@ engine**) in a new Claude Code session with no prior context.
 - **Read next, in order:** this file → `docs/superpowers/specs/2026-06-28-acestream-engine-reimplementation-design.md`
   (design) → `docs/protocol/wire-protocol.md` (the protocol) →
   `docs/protocol/transport-file.md`. The `docs/protocol/notes/` folder has the
-  detailed reverse-engineering findings (numbered 00–13).
+  detailed reverse-engineering findings (numbered 00-50).
+
+## Current actionable backlog
+As of 2026-07-02, the live byte path is built. Do **not** restart from the old Phase 3
+piece-loop blocker. The useful follow-ups are:
+- **Live robustness validation:** note 50 has a clean 180 s / 157 MB ffmpeg/curl soak on
+  `cid3` (0 CC discontinuities, no backward PTS,
+  no pool-stale teardown). Remaining: a longer VLC/user-player soak and a field stall where
+  `Continuity::skip_evicted_gap` actually fires; `REQUEST_TIMEOUT` retransmit was observed
+  once in the short pre-soak probe.
+- **PEX peer quality:** `id=12` peer-exchange is parsed and used as a peer source; next, use
+  each record's advertised window fields to prefer peers already covering `next_needed`.
+- **Broadcast durability:** persist minted broadcast transport/auth/geometry, serve minted
+  broadcasts over BEP-9 `ut_metadata`, and fix ingest-resume continuity so piece numbering
+  does not restart on every `PUT /broadcast/{name}` task.
+- **Inbound seeding productization:** add `SeedRegistry` eviction tied to stream/broadcast
+  teardown, wire `max_unchoked` into the future multi-peer S2 serve coordinator, and decide
+  whether `enable_inbound` should default to true.
+- **Native CLI/API polish:** the supported product surface is outpace's own `/streams`
+  and `/broadcast` API plus the daemon CLI. Legacy Acestream HTTP compatibility is
+  experimental and **off by default**; enable only with `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`.
+  If that adapter matters later, keep it thin/basic rather than chasing full engine parity.
 
 ## Current state (what's on `main`, all committed + tests green)
 Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
@@ -62,10 +83,10 @@ Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
 | 4 productization (outpace daemon) | ✅ built + **live-proven** | **Autonomous DHT discovery → connect → 9.4 MB live MPEG-TS downloaded from just an infohash (verified 2026-06-29).** Clean provider-abstracted daemon: `StreamProvider`/`TsSource` + `ProviderRegistry`, shared `StreamSession` broadcast fan-out (one download → many clients, **acexy-parity out of the box**), `StreamManager`, axum HTTP API, live HLS, config + persistent identity, tracker discovery, transport→`StreamInfo` resolve, `AceProvider`. All tests green + clippy clean; daemon boots & serves the clean API. Muxing drift (Task 19) fixed (`TsResync`); per-client start-on-keyframe done (`KeyframeGate`); content-id→infohash resolution over `ut_metadata` done (Task 18 — `ace_wire::ut_metadata`, `PeerSession::fetch_metadata`, `ace_swarm::resolve::resolve_via_peer`, offline mock-peer integration test); DELETE force-stop + abort-pump-on-teardown. **Spec complete, incl. live E2E (Task 20, verified 2026-06-30 — see `docs/protocol/notes/20-vlc-playback.md`):** daemon autonomously discovered 25 peers, downloaded 8.3 MB live MPEG-TS, ffmpeg decoded a 1280×720 H.264 frame from the served output, the served stream starts on a keyframe, and two clients shared one session (`/streams` → `clients:2`). Plan: `docs/superpowers/plans/2026-06-29-outpace-daemon.md`; spec: `docs/superpowers/specs/2026-06-29-outpace-daemon-design.md` |
 
 Crates: `crates/{ace-wire,ace-tracker,ace-peer,ace-media,ace-engine}`. Workspace root `Cargo.toml`.
-**Pure Phase 3/4 logic done (no live data needed):** `ace_wire::live` (LiveWindow/LivePicker),
-`ace_wire::reassembly` (PieceReassembler: chunks→ordered bytes), `ace_media::{mpegts,hls}`
-(TS align + HLS segment/manifest), `ace_engine::routes` (6878 URL surface). What's left needs
-the live byte path: peer download loop / `ace-swarm`, then wire `ace-media`+`ace-engine` to it.
+Core shipped pieces include `ace_wire::live` (LiveWindow/LivePicker), `ace_wire::reassembly`
+(PieceReassembler: chunks→ordered bytes), `ace_media::{mpegts,hls}` (TS align + HLS
+segment/manifest), `ace_engine::routes` (pure 6878-route parser), and the production live byte
+path in `ace_engine::ace_provider` / `ace-swarm`.
 
 ## Next: v2 — P2P compliance, seeding & broadcasting
 The v1 daemon was **download-only (a pure leecher)**. v2 fixes that and adds origination. Spec:
@@ -255,17 +276,18 @@ proven through media output.
 Also still open: ingest-resume continuity (piece numbering restarts at 0 on every ingest
 task, a known gap); transport persistence / `ut_metadata` serving for a minted broadcast.
 
-**Update (note 34, 2026-07-02; corrected by note 44): the Acestream-style HTTP
+**Update (note 34, 2026-07-02; corrected by notes 44/45): the Acestream-style HTTP
 content-id surface is wired.** Outpace serves
 `/ace/getstream?format=json&content_id=<40hex>` and returns Acestream-shaped
 `playback_url`, `stat_url`, and `command_url` values under `/ace/...`. The first
 implementation passed `content_id` directly as the playback/session swarm key; note 43's
 official-engine comparison proved that was wrong for real `acestream://` ids because the
-official engine maps content id cid1 to infohash `50e935...6e47`. As of note 44,
-`content_id=` returns URLs keyed as `/ace/.../cid:<content_id>/outpace`, so playback
-enters the `ut_metadata` resolver path. `infohash=` and `id=` remain direct swarm-infohash
-inputs. Full HTTP API parity (`/ace/manifest.m3u8`, `/server/api`, `getstream?url=...`)
-remains follow-up work.
+official engine maps content id cid1 to infohash `50e935...6e47`. Note 44 first
+routed content ids through the `cid:` resolver path; note 45 superseded that by resolving via
+the official signed catalog before responding, returning resolved-infohash URLs while
+internally aliasing playback back to `cid:<content_id>`. `infohash=` and `id=` remain direct
+swarm-infohash inputs. Full HTTP API parity (`/ace/manifest.m3u8`, `/server/api`,
+`getstream?url=...`) remains follow-up work.
 
 **Update (note 35, 2026-07-02): startup improved, but continuous playback is still not
 proven on the Synthetic Live Channel public id.** Official engine `3.2.11` maps
@@ -405,7 +427,7 @@ snapshot. Next lead: find a public content id where the official engine actually
 continuously, or use the controlled official source-node/local-tracker setup as the live
 continuity proof target.
 
-**Update (note 44, 2026-07-02): `/ace/getstream?content_id=` now routes to the real
+**Update (note 44, 2026-07-02; superseded by note 45): `/ace/getstream?content_id=` now routes to the real
 content-id resolver.** The compatibility handler no longer treats a 40-hex `content_id` as
 a direct swarm infohash. It returns playback/stat/command URLs containing
 `cid:<content_id>`, so `/ace/r/...` calls `AceProvider::open("cid:<content_id>")` and
@@ -415,10 +437,11 @@ that `content_id=` creates only the `cid:<id>` manager session, while `infohash=
 remain raw direct keys. A live smoke on the known public id returned the expected `cid:`
 URLs, then playback returned `HTTP 404` after `37.598872` s; daemon logs showed DHT found
 14 metadata peers and reached `85.87.156.75:8621`, but that peer sent no
-`metadata_size`. So the HTTP compatibility bug is fixed; the remaining content-id startup
-blocker is live metadata-resolution coverage for public ids. For regression smoke against
-the known Synthetic Live Channel target, `infohash=50e93529d3eb46a50506b14464185a15292d6e47` still
-exercises the direct swarm playback path.
+`metadata_size`. This proved the HTTP compatibility bug was fixed, but the live metadata
+coverage issue remained until note 45 added the official signed catalog resolver. For
+regression smoke against the known Synthetic Live Channel target,
+`infohash=50e93529d3eb46a50506b14464185a15292d6e47` still exercises the direct swarm playback
+path.
 
 **Update (note 45, 2026-07-02): the content-id startup blocker is fixed with the official
 signed catalog path.** Fresh official-engine tracing showed the engine resolves public
@@ -580,13 +603,17 @@ environment limitation — Python scripting not configured — and was abandoned
 the live capture, which succeeded).
 
 ## Run the daemon + verify VLC (live, operator-run)
-The daemon binary is `outpace` (`cargo run -p ace-engine --bin outpace`). The clean API:
+The daemon binary is `outpace` (`cargo run -p ace-engine --bin outpace`). The native API:
 `GET /healthz`, `/networks`, `/streams`, `/streams/{network}/{id}.ts` (live MPEG-TS),
 `/streams/{network}/{id}.m3u8` (+ `/seg/{n}.ts`), `/streams/{network}/{id}/status`,
 `DELETE /streams/{network}/{id}` (force-stop a session). `{network}` is the provider key
-(`ace` today). There is also an Acestream-compatible HTTP surface for existing clients:
-`/ace/getstream`, `/ace/r`, `/ace/stat`, and `/ace/cmd`. (Session teardown — idle-reaper or
-force-stop — now aborts the background pull task, so a stopped stream stops downloading.)
+(`ace` today). Session teardown — idle-reaper or force-stop — now aborts the background pull
+task, so a stopped stream stops downloading.
+
+The original-engine HTTP compatibility surface is **experimental and opt-in**. By default
+`/ace/*` and `/server/api` return 404. Set `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1` to expose the
+basic adapter for existing clients: `/ace/getstream`, `/ace/r`, `/ace/stat`, and `/ace/cmd`.
+Do not treat this as the primary product API.
 
 Default bind is `127.0.0.1:6878` (collides with a running official engine — override with
 `OUTPACE_BIND`). **Peer discovery is autonomous via mainline DHT** (`ace_swarm::dht`) +
@@ -599,7 +626,11 @@ H.264) with no hand-fed peers.
 OUTPACE_BIND=127.0.0.1:6900 cargo run -p ace-engine --bin outpace
 vlc http://127.0.0.1:6900/streams/ace/<40-hex-infohash>.ts
 
-# Acestream-compatible content_id startup:
+# Native content_id startup through the provider resolver:
+vlc http://127.0.0.1:6900/streams/ace/cid:<40-hex-content-id>.ts
+
+# Experimental Acestream-compatible content_id startup (requires
+# OUTPACE_EXPERIMENTAL_ACE_COMPAT=1):
 resp=$(curl -s "http://127.0.0.1:6900/ace/getstream?format=json&content_id=<40-hex-content-id>")
 vlc "$(printf '%s' "$resp" | jq -r '.response.playback_url')"
 ```
@@ -621,23 +652,26 @@ mid-GOP, the gate locks exactly on the real keyframe and ffmpeg decodes the outp
 first. Applied per-client (the broadcast is unchanged), so every joiner benefits, not just the
 first.
 
-**Content-id playback has two paths.** For Acestream-compatible clients, use the engine-style
-route above: `/ace/getstream?format=json&content_id=<40hex>` returns `/ace/.../cid:<id>/...`
-URLs and runs the metadata-resolution path. The clean API can run the same path by passing
-an `acestream://` content-id as `cid:<40hex>`:
+**Content-id playback has two paths.** The native API can run the resolver path directly by
+passing an `acestream://` content id as `cid:<40hex>`:
 ```sh
 vlc http://127.0.0.1:6900/streams/ace/cid:cid1.ts
 ```
-The daemon announces the content-id to the tracker/DHT, connects to a metadata-swarm peer,
-fetches the `AceStreamTransport` file over **BEP-9 ut_metadata** (`ace_wire::ut_metadata` +
-`PeerSession::fetch_metadata`), and decodes it to the real infohash + geometry + trackers
-(`ace_swarm::resolve::resolve_via_peer`, TTL-cached). A bare `<40hex>` is still treated as an
-infohash directly (proven path). The full resolve flow is offline-proven by an in-memory
-mock-peer integration test (`crates/ace-swarm/tests/resolve_metadata.rs`); the live discovery
-half shares the same environment gate as the download path. Current live smoke on the known
-Synthetic Live Channel public id reached 14 metadata peers but failed because the only responsive peer sent
-no `metadata_size`; for direct swarm regression testing use the official-resolved infohash
-`50e93529d3eb46a50506b14464185a15292d6e47`.
+With `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`, the engine-style route
+`/ace/getstream?format=json&content_id=<40hex>` resolves through the official signed catalog
+first, returns official-style URLs keyed by the resolved infohash, and internally aliases that
+public URL back to `cid:<content_id>` so playback keeps the catalog-derived transport
+geometry/trackers. If the catalog path fails, the provider still has the BEP-9 `ut_metadata`
+fallback.
+The catalog resolver fetches the `AceStreamTransport` file via the official `/gettorrent`
+path, verifies the returned checksum, and decodes it to the real infohash + geometry +
+trackers. The peer fallback announces the content-id to tracker/DHT, fetches the same
+descriptor over **BEP-9 ut_metadata** (`ace_wire::ut_metadata` +
+`PeerSession::fetch_metadata`), and decodes it through `ace_swarm::resolve::resolve_via_peer`
+(TTL-cached). A bare `<40hex>` is still treated as an infohash directly (proven path).
+For direct swarm regression testing on the Synthetic Live Channel public id, use the official-resolved
+infohash `50e93529d3eb46a50506b14464185a15292d6e47`; that target is a startup/protocol smoke,
+not a healthy continuity target in the current network snapshot.
 
 `OUTPACE_ACE_PEERS=ip:port,…` still exists as an optional manual-peer override.
 
@@ -647,7 +681,8 @@ with `clients: 2` (single shared swarm download).
 ## The protocol in one screen (all reverse-engineered + validated)
 - Acestream is a **BitTornado (BitTorrent) fork**.
 - **Discovery:** standard BitTorrent — UDP tracker (`t1.torrentstream.org:2710`) +
-  Mainline DHT + LSD. (DHT not yet implemented; plan is to borrow a vetted DHT crate.)
+  implemented Mainline DHT (`get_peers` + `announce_peer`) + Acestream PEX (`id=12`).
+  LSD is documented in the protocol notes but is not the active production discovery path.
 - **Peer handshake (66 bytes, plaintext):** `0x11` + `"AceStreamProtocol"` + 8 zero
   reserved + infohash(20) + peer_id(20). peer_id = `R30------` + 11 random (ephemeral).
 - **After handshake:** standard BT framing `<u32 len><u8 id><payload>` + a BEP-10
@@ -664,61 +699,13 @@ with `clients: 2` (single shared swarm download).
 - **No account/identity needed** for the public swarm. Public content is
   `is_encrypted=0` (no DRM); the AES `Encrypter` is only for premium (out of scope).
 
-## THE NEXT STEP (Phase 3.2 — piece download) — BLOCKER LOCATED
-The blocker to "play in VLC" is now **precisely characterized** (see
-`docs/protocol/notes/14-live-unchoke-recon.md`). `ace-peer` can now build + send its own
-BEP-10 extended handshake (`ace_wire::extended::OutgoingExtendedHandshake`,
-`PeerSession::send_extended_handshake`) and a recon harness (`live_recon_unchoke`,
-`#[ignore]`d, with env knobs) drove the full exchange against live peers.
-
-**Finding:** live peers accept our 66-byte handshake and send their extended handshake,
-then **insta-close (~0.1 s) the moment we send ours** — regardless of `mi`/`interested`/
-distance, and even with the full key set if `node_id`/`signature` are dummies. The same
-peers serve the official engine. So the gate is a **valid node identity**: `node_id`
-(32 B) + `signature` (64 B) — Ed25519-shaped. We must mint/sign a real one.
-
-**Identity scheme CRACKED (notes 15–16):** `node_id` = an **Ed25519 public key** derived
-from `/root/.ACEStream/device.key` (a 32-byte seed in hex) — **confirmed by exact pubkey
-match**; `signature` = a 64-byte **Ed25519** signature. The identity is **self-generated**,
-so we can mint our own keypair — no engine key needed. Signer = **`LiveSourceAuth.sign`**
-(`core/src/live/LiveSourceAuth.pyx`), a Python orchestrator that delegates the actual sign.
-
-1. **Preimage — SOLVED & verified (note 17).** The signature is computed **per-connection**:
-   ```
-   digest32  = SHA256( bencode(handshake_dict, signature := 64 × 0x00) )   # canonical sorted-key bencode
-   signature = Ed25519_detached_sign(secret_key, digest32)
-   ```
-   `node_id` = the Ed25519 public key (self-generated; mint our own). Confirmed by
-   `Ed25519_verify(node_id, signature, digest32)` passing **6/6** on live engine handshakes.
-   (Note 16's "once at startup" was wrong — an attach-timing artifact; cracked by
-   `docker restart` + **race-attach during boot** so `crypto_sign_detached` is hooked before
-   the node signs.) Vectors: committed verify-only set in `tests/vectors/node-identity/`;
-   full RE artifacts in `re/captures/node-identity/` (gitignored).
-2. **Mint + sign:** Ed25519 identity in `ace_wire` + canonical bencode encoder; extend
-   `OutgoingExtendedHandshake` to carry `node_id`/`signature`/`ts`/`v`/`pv`/`p`/`platform`/`nt`
-   and sign (zero-sig → SHA256 → detached sign) before send; re-run `live_recon_unchoke`
-   → expect acceptance + unchoke.
-3. Then: live piece loop (request within `[min_piece, max_piece]`), `ace-swarm` → wire
-   `ace-media` (MPEG-TS/HLS — built) + `ace-engine` (routes built) to it. Verify in VLC.
-
-The engine listens for peers on **TCP 8621** (container IP `172.23.0.2`): connecting there
-with our client + the current infohash makes it reply as a peer with its full signed
-handshake — the ground-truth probe used to crack the above.
-
-**Identity gate is now PASSED (notes 17–18).** Hooking the engine's
-`crypto_sign_verify_detached` while our signed client connects shows `ret=0` with
-`pk = our node_id` and `m = the digest the engine recomputed` — the official engine accepts
-our minted identity. The engine-as-peer still closes us afterward, but that is **not**
-identity rejection: in the current sandbox the channel is `status=prebuf, downloaded=0`
-(the engine itself is pulling no data), so there is nothing to transact. **Validating live
-unchoke + piece flow needs a live channel that is actually delivering data** (and likely
-real swarm peers reachable from the host with WARP off) — an environmental gate, not a code
-one. A VOD acestream id (static piece-hash list) would let the piece loop be validated
-offline.
-
-This step is RE-ish (a live experiment + binary RE), like the handshake/transport spikes —
-not clean coding. A **VOD acestream id** would also help (static piece-hash list to
-validate against; we've only had live fixtures).
+## Historical Phase 3.2 blocker (solved)
+Older sessions treated "make peers accept our extended handshake and serve pieces" as the
+next step. That blocker is closed: notes 14-18 document the identity gate and notes 19-49
+document live download, daemon playback, reconnect continuity, multi-upstream scheduling,
+catalog resolution, signature stripping, retransmit recovery, PEX, and the note-50 live soak.
+Keep this history in
+mind for protocol context, but use **Current actionable backlog** above for new work.
 
 ## Environment & gotchas (HARD-WON — don't relearn these)
 - **Cloudflare WARP breaks P2P** (drops inbound UDP, exits in-country). Keep it OFF for
@@ -727,10 +714,11 @@ validate against; we've only had live fixtures).
   `docker compose -f re/sandbox/docker-compose.yml up -d acestream` (HTTP API on
   `127.0.0.1:6878`; `frida-tools` installed inside the container; SYS_PTRACE+seccomp
   unconfined so Frida attaches). `re/sandbox/` is git-ignored.
-- **API quirks:** read `/ace/stat` fields under **`.response`** (not top-level — all
-  top-level keys are null). Use **`content_id=`** for `acestream://` ids, not
-  `infohash=`. A `status=prebuf, peers=0` forever = a **dead live channel** (the old
-  docs' promo `685e…6067` is dead — don't use it).
+- **API quirks:** Acestream-compatible `/ace/*` routes are experimental and require
+  `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`. On that surface, read `/ace/stat` fields under
+  **`.response`** (not top-level), and use **`content_id=`** for `acestream://` ids, not
+  `infohash=`. A `status=prebuf, peers=0` forever = a **dead live channel** (the old docs'
+  promo `685e…6067` is dead — don't use it).
 - **Known-good LIVE test:** content_id `cid1`
   (resolve to the current infohash via `analyze_content` — it rotates).
 - **`re/` is git-ignored and local-only** (NOT in version control): the extracted

@@ -32,6 +32,10 @@ pub struct Config {
     /// expose a peer listener unless they opt in, even though the live piece-header acceptance
     /// gap is closed (note 33).
     pub enable_inbound: bool,
+    /// Expose Acestream-engine-compatible HTTP routes (`/ace/*`, `/server/api`). This is an
+    /// experimental legacy adapter; outpace's native `/streams` and `/broadcast` API is the
+    /// supported surface.
+    pub experimental_ace_compat: bool,
 }
 
 impl Default for Config {
@@ -49,6 +53,7 @@ impl Default for Config {
             max_inbound_peers: 64,
             enable_seeding: true,
             enable_inbound: false,
+            experimental_ace_compat: false,
         }
     }
 }
@@ -119,6 +124,10 @@ mod tests {
         assert!(
             !c.enable_inbound,
             "inbound serving remains opt-in by default"
+        );
+        assert!(
+            !c.experimental_ace_compat,
+            "Acestream HTTP compatibility must be opt-in"
         );
     }
 }

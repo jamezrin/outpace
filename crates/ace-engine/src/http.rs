@@ -31,6 +31,9 @@ pub struct AppState {
     /// Internally, keep using `cid:<content_id>` so playback gets the catalog-derived
     /// transport geometry/trackers instead of degrading to bare-infohash defaults.
     pub ace_session_aliases: Arc<Mutex<HashMap<String, String>>>,
+    /// Experimental legacy Acestream HTTP compatibility surface. Native `/streams` and
+    /// `/broadcast` routes remain available regardless of this flag.
+    pub experimental_ace_compat: bool,
     /// B1: origination state. `None` disables `PUT /broadcast/{name}` (404) — e.g. in tests
     /// that don't need it.
     pub broadcasts: Option<BroadcastState>,
@@ -51,12 +54,9 @@ pub struct BroadcastState {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let compat = state.experimental_ace_compat;
+    let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/ace/getstream", get(ace_getstream))
-        .route("/ace/r/:id/:token", get(ace_playback))
-        .route("/ace/stat/:id/:token", get(ace_stat))
-        .route("/ace/cmd/:id/:token", get(ace_command))
         .route("/networks", get(networks))
         .route("/streams", get(list_streams))
         .route(
@@ -68,8 +68,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/broadcast/:name",
             put(broadcast_ingest).get(broadcast_transport),
-        )
-        .with_state(state)
+        );
+    if compat {
+        router = router
+            .route("/ace/getstream", get(ace_getstream))
+            .route("/ace/r/:id/:token", get(ace_playback))
+            .route("/ace/stat/:id/:token", get(ace_stat))
+            .route("/ace/cmd/:id/:token", get(ace_command));
+    }
+    router.with_state(state)
 }
 
 /// `GET /broadcast/{name}` — the minted broadcast's raw transport-file bytes (the
@@ -531,6 +538,7 @@ mod tests {
             networks: vec!["test".into()],
             resolve_content_ids_in_getstream: false,
             ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            experimental_ace_compat: false,
             broadcasts: None,
         }
     }
@@ -591,8 +599,15 @@ mod tests {
             networks: vec!["fix".into()],
             resolve_content_ids_in_getstream: false,
             ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            experimental_ace_compat: false,
             broadcasts: None,
         }
+    }
+
+    fn ace_compat_state(skip: usize) -> AppState {
+        let mut st = fixture_state(skip);
+        st.experimental_ace_compat = true;
+        st
     }
 
     #[test]
@@ -698,7 +713,7 @@ mod tests {
     async fn ace_getstream_content_id_returns_a_playback_url_that_streams() {
         use futures::StreamExt;
         let content_id = "2123456789abcdef0123456789abcdef01234567";
-        let state = fixture_state(0);
+        let state = ace_compat_state(0);
         let manager = state.manager.clone();
         let app = router(state);
 
@@ -756,7 +771,7 @@ mod tests {
     async fn ace_stat_and_stop_track_content_id_session() {
         use futures::StreamExt;
         let content_id = "2123456789abcdef0123456789abcdef01234567";
-        let state = fixture_state(0);
+        let state = ace_compat_state(0);
         let manager = state.manager.clone();
         let app = router(state);
 
@@ -824,6 +839,23 @@ mod tests {
             .await
             .is_none());
         assert!(manager.get("fix", content_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ace_compat_routes_are_404_by_default() {
+        for path in [
+            "/ace/getstream?format=json&infohash=0123456789012345678901234567890123456789",
+            "/ace/r/0123456789012345678901234567890123456789/outpace",
+            "/ace/stat/0123456789012345678901234567890123456789/outpace",
+            "/ace/cmd/0123456789012345678901234567890123456789/outpace?method=stop",
+            "/server/api?method=get_version",
+        ] {
+            let resp = router(fixture_state(0))
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[tokio::test]

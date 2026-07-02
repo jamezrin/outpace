@@ -44,6 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_ENABLE_INBOUND") {
         config.enable_inbound = matches!(v.as_str(), "1" | "true");
     }
+    if let Ok(v) = std::env::var("OUTPACE_EXPERIMENTAL_ACE_COMPAT") {
+        config.experimental_ace_compat = matches!(v.as_str(), "1" | "true");
+    }
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
     eprintln!(
         "outpace: node_id={} data_dir={}",
@@ -88,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         networks: networks.clone(),
         resolve_content_ids_in_getstream: true,
         ace_session_aliases: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        experimental_ace_compat: config.experimental_ace_compat,
         broadcasts: Some(broadcasts),
     };
 
