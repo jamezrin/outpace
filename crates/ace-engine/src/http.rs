@@ -1,12 +1,11 @@
 //! HTTP API (axum): the clean `/streams`/`/broadcast` surface plus the official-engine
 //! compatibility `/ace/...` playback surface.
 
-use crate::broadcast::{BroadcastRegistry, CHUNK_LENGTH, PIECE_LENGTH};
+use crate::broadcast::BroadcastRegistry;
 use crate::manager::StreamManager;
 use crate::session::StreamSession;
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::resolve_via_catalog;
-use ace_wire::live_codec::piece_header_from_unix_seconds;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -17,7 +16,6 @@ use futures::StreamExt;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast::error::RecvError;
 
 #[derive(Clone)]
@@ -155,30 +153,13 @@ async fn broadcast_ingest(
     let store = bc.store.clone();
     let auth = bc.auth.clone();
     tokio::spawn(async move {
-        let mut resync = ace_media::mpegts::TsResync::new();
-        let sig_len = auth.signature_len() as u64;
-        let mut chunker =
-            ace_wire::signing_chunker::SigningChunker::new(PIECE_LENGTH, CHUNK_LENGTH, 0, sig_len);
-        let mut current_header: Option<(u64, [u8; 8])> = None;
+        let mut ingest = crate::broadcast_ingest::BroadcastIngest::new(store, auth);
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
             let Ok(chunk) = chunk else { break };
-            let aligned = resync.push(&chunk);
-            for out in chunker.push(&aligned, &auth) {
-                let header = header_for_piece(&mut current_header, out.piece);
-                store
-                    .lock()
-                    .await
-                    .put_chunk_with_header(out.piece, out.chunk, header, &out.data);
-            }
+            ingest.push_bytes(&chunk).await;
         }
-        for out in chunker.flush(&auth) {
-            let header = header_for_piece(&mut current_header, out.piece);
-            store
-                .lock()
-                .await
-                .put_chunk_with_header(out.piece, out.chunk, header, &out.data);
-        }
+        ingest.finish().await;
     });
 
     Json(json!({
@@ -187,25 +168,6 @@ async fn broadcast_ingest(
         "infohash": infohash_hex,
     }))
     .into_response()
-}
-
-fn current_live_piece_header() -> [u8; 8] {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    piece_header_from_unix_seconds(seconds)
-}
-
-fn header_for_piece(current: &mut Option<(u64, [u8; 8])>, piece: u64) -> [u8; 8] {
-    match current {
-        Some((current_piece, header)) if *current_piece == piece => *header,
-        _ => {
-            let header = current_live_piece_header();
-            *current = Some((piece, header));
-            header
-        }
-    }
 }
 
 async fn ace_getstream(
@@ -536,6 +498,7 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broadcast::{CHUNK_LENGTH, PIECE_LENGTH};
     use crate::provider::{ProviderError, ProviderRegistry, SourceStats, StreamProvider, TsSource};
     use crate::testprovider::TestProvider;
     use async_trait::async_trait;
