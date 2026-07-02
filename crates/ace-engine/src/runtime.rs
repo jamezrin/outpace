@@ -1,7 +1,7 @@
 //! Shared outpace runtime setup for the daemon and CLI commands.
 
 use crate::ace_provider::AceProvider;
-use crate::broadcast::BroadcastRegistry;
+use crate::broadcast::{Broadcast, BroadcastRegistry};
 use crate::config::{load_or_create_identity, Config};
 use crate::http::{router, AppState, BroadcastState};
 use crate::manager::StreamManager;
@@ -169,6 +169,37 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
     eprintln!("  play:  http://{}/streams/ace/<infohash>.ts", config.bind);
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+pub async fn mint_broadcast(runtime: &EngineRuntime, name: &str) -> Broadcast {
+    let (bc, _) = runtime
+        .broadcasts
+        .registry
+        .start_or_resume(
+            name,
+            name,
+            &runtime.broadcasts.trackers,
+            &runtime.broadcasts.seed_registry,
+            runtime.broadcasts.store_bytes,
+        )
+        .await;
+    bc
+}
+
+pub fn announce_broadcast(runtime: &EngineRuntime, bc: &Broadcast) {
+    if let Some(port) = runtime.broadcasts.inbound_peer_port {
+        let trackers = runtime.broadcasts.trackers.clone();
+        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+            trackers.clone(),
+            bc.infohash,
+            port,
+        ));
+        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+            trackers,
+            bc.content_id,
+            port,
+        ));
+    }
 }
 
 fn hex_node_id(identity: &ace_wire::identity::Identity) -> String {

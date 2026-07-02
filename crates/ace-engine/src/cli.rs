@@ -44,6 +44,8 @@ pub struct ServeArgs {}
 #[derive(Debug, Args)]
 pub struct BroadcastArgs {
     pub name: String,
+    #[arg(long = "public-host")]
+    pub public_host: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -94,12 +96,47 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
     crate::runtime::serve_http(runtime).await
 }
 
-async fn run_broadcast(_args: BroadcastArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("broadcast command is not wired yet".into())
+async fn run_broadcast(args: BroadcastArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let BroadcastArgs { name, public_host } = args;
+    let mut config = crate::runtime::config_from_env()?;
+    config.enable_inbound = true;
+    let peers = crate::runtime::bootstrap_peers_from_env();
+    let runtime = crate::runtime::build_runtime(config, peers).await?;
+    let bc = crate::runtime::mint_broadcast(&runtime, &name).await;
+    crate::runtime::announce_broadcast(&runtime, &bc);
+
+    let bind = runtime.config.bind;
+    let host = public_host.unwrap_or_else(|| bind.ip().to_string());
+    let content_id = hex20(&bc.content_id);
+    let infohash = hex20(&bc.infohash);
+
+    eprintln!("outpace broadcast: {name}");
+    eprintln!(
+        "OBS ingest URL: http://{}:{}/broadcast/{}",
+        bind.ip(),
+        bind.port(),
+        name
+    );
+    eprintln!("Content ID: {content_id}");
+    eprintln!("Ace link: acestream://{content_id}");
+    eprintln!("Infohash: {infohash}");
+    eprintln!(
+        "Transport URL: http://{}:{}/broadcast/{}",
+        host,
+        bind.port(),
+        name
+    );
+    eprintln!("Peer listen: {}", runtime.config.peer_listen);
+
+    crate::runtime::serve_http(runtime).await
 }
 
 async fn run_play(_args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     Err("play command is not wired yet".into())
+}
+
+fn hex20(bytes: &[u8; 20]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn content_id_target(id: &str) -> Result<PlaybackTarget, String> {
@@ -164,6 +201,25 @@ mod tests {
 
         match cli.command {
             Command::Broadcast(args) => assert_eq!(args.name, "sports"),
+            other => panic!("expected broadcast command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_broadcast_public_host() {
+        let cli = Cli::parse_from([
+            "outpace",
+            "broadcast",
+            "sports",
+            "--public-host",
+            "stream.example",
+        ]);
+
+        match cli.command {
+            Command::Broadcast(args) => {
+                assert_eq!(args.name, "sports");
+                assert_eq!(args.public_host.as_deref(), Some("stream.example"));
+            }
             other => panic!("expected broadcast command, got {other:?}"),
         }
     }
