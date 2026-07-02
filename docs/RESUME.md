@@ -13,7 +13,7 @@ engine**) in a new Claude Code session with no prior context.
 - **Read next, in order:** this file → `docs/superpowers/specs/2026-06-28-acestream-engine-reimplementation-design.md`
   (design) → `docs/protocol/wire-protocol.md` (the protocol) →
   `docs/protocol/transport-file.md`. The `docs/protocol/notes/` folder has the
-  detailed reverse-engineering findings (numbered 00-50).
+  detailed reverse-engineering findings (numbered 00-51).
 
 ## Current actionable backlog
 As of 2026-07-02, the live byte path is built. Do **not** restart from the old Phase 3
@@ -25,9 +25,9 @@ piece-loop blocker. The useful follow-ups are:
   once in the short pre-soak probe.
 - **PEX peer quality:** `id=12` peer-exchange is parsed and used as a peer source; next, use
   each record's advertised window fields to prefer peers already covering `next_needed`.
-- **Broadcast durability:** persist minted broadcast transport/auth/geometry, serve minted
-  broadcasts over BEP-9 `ut_metadata`, and fix ingest-resume continuity so piece numbering
-  does not restart on every `PUT /broadcast/{name}` task.
+- **Broadcast durability:** persist minted broadcast transport/auth/geometry and fix
+  ingest-resume continuity so piece numbering does not restart on every
+  `PUT /broadcast/{name}` task.
 - **Inbound seeding productization:** add `SeedRegistry` eviction tied to stream/broadcast
   teardown, wire `max_unchoked` into the future multi-peer S2 serve coordinator, and decide
   whether `enable_inbound` should default to true.
@@ -35,6 +35,12 @@ piece-loop blocker. The useful follow-ups are:
   and `/broadcast` API plus the daemon CLI. Legacy Acestream HTTP compatibility is
   experimental and **off by default**; enable only with `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`.
   If that adapter matters later, keep it thin/basic rather than chasing full engine parity.
+- **CLI/content-id result (note 51):** the three-command CLI is implemented:
+  `outpace serve`, `outpace broadcast <name>`, and
+  `outpace play <acestream-url>`. For outpace-originated broadcasts,
+  `acestream://<content_id>` is backed by the broadcaster announcing the raw
+  transport-file hash and serving the minted transport over BEP-9 `ut_metadata`; it is not a
+  guessed official catalog algorithm.
 
 ## Current state (what's on `main`, all committed + tests green)
 Run `cargo test` — should be all green (live-network tests are `#[ignore]`d).
