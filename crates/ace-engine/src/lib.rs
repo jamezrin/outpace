@@ -14,5 +14,6 @@ pub mod http;
 pub mod manager;
 pub mod provider;
 pub mod routes;
+pub mod runtime;
 pub mod session;
 pub mod testprovider;
