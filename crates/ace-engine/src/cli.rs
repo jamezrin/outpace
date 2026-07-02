@@ -131,8 +131,37 @@ async fn run_broadcast(args: BroadcastArgs) -> Result<(), Box<dyn std::error::Er
     crate::runtime::serve_http(runtime).await
 }
 
-async fn run_play(_args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("play command is not wired yet".into())
+async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::provider::StreamProvider;
+    use tokio::io::AsyncWriteExt;
+
+    let target = PlaybackTarget::parse(&args.input)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let config = crate::runtime::config_from_env()?;
+    let mut peers = crate::runtime::bootstrap_peers_from_env();
+    peers.extend(args.peers);
+
+    let identity = std::sync::Arc::new(crate::config::load_or_create_identity(&config.data_dir)?);
+    let seed_registry = ace_swarm::listen::SeedRegistry::new();
+    let provider = crate::ace_provider::AceProvider::new(identity, config.bind.port())
+        .with_bootstrap_peers(peers)
+        .with_seed_registry(seed_registry)
+        .with_seed_store_bytes(config.seed_store_bytes)
+        .with_seeding_enabled(config.enable_seeding);
+
+    eprintln!("outpace play: {}", args.input);
+    eprintln!("outpace play: provider id {}", target.provider_id);
+
+    let mut source = provider
+        .open(&target.provider_id)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+    let mut stdout = tokio::io::stdout();
+    while let Some(chunk) = source.next().await {
+        stdout.write_all(&chunk).await?;
+        stdout.flush().await?;
+    }
+    Ok(())
 }
 
 fn hex20(bytes: &[u8; 20]) -> String {

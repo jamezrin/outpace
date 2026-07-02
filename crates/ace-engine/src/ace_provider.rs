@@ -194,10 +194,11 @@ impl AceProvider {
             Err(e) => crate::alog!("[ace] resolve cid:{content_id}: catalog failed: {e:?}"),
         }
 
-        let mut peers =
-            discover_peers(&self.default_trackers, &key, &random_peer_id(), self.port).await;
-        let mut all = self.bootstrap_peers.clone();
-        all.append(&mut peers);
+        let all = if self.bootstrap_peers.is_empty() {
+            discover_peers(&self.default_trackers, &key, &random_peer_id(), self.port).await
+        } else {
+            self.bootstrap_peers.clone()
+        };
         crate::alog!(
             "[ace] resolve cid:{content_id}: {} metadata peer(s)",
             all.len()
@@ -274,12 +275,13 @@ impl StreamProvider for AceProvider {
             ));
         };
 
-        let mut peers =
-            discover_peers(&info.trackers, &info.infohash, &random_peer_id(), self.port).await;
-        // Bootstrap peers (proven live path) are tried first.
-        let mut all = self.bootstrap_peers.clone();
-        all.append(&mut peers);
-        let peers = all;
+        // Bootstrap peers are the proven/direct path and must be tried without waiting for
+        // tracker/DHT discovery. Background refill can still discover more peers after start.
+        let peers = if self.bootstrap_peers.is_empty() {
+            discover_peers(&info.trackers, &info.infohash, &random_peer_id(), self.port).await
+        } else {
+            self.bootstrap_peers.clone()
+        };
         crate::alog!("[ace] open {id}: discovered {} peer(s)", peers.len());
         if peers.is_empty() {
             return Err(ProviderError::Backend(
