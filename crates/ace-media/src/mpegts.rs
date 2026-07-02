@@ -203,9 +203,9 @@ fn ts_pusi(pkt: &[u8]) -> bool {
 fn ts_payload_offset(pkt: &[u8]) -> Option<usize> {
     let afc = (pkt[3] >> 4) & 0x03;
     let start = match afc {
-        0b01 => 4,                                          // payload only
-        0b11 => 5 + pkt[4] as usize,                        // adaptation field, then payload
-        _ => return None,                                   // 0b10 adaptation-only / 0b00 reserved
+        0b01 => 4,                   // payload only
+        0b11 => 5 + pkt[4] as usize, // adaptation field, then payload
+        _ => return None,            // 0b10 adaptation-only / 0b00 reserved
     };
     (start < TS_PACKET_LEN).then_some(start)
 }
@@ -236,9 +236,8 @@ fn payload_has_idr_or_sps(pkt: &[u8]) -> bool {
         return false;
     };
     let p = &pkt[off..];
-    p.windows(4).any(|w| {
-        w[0] == 0 && w[1] == 0 && w[2] == 1 && matches!(w[3] & 0x1F, 5 | 7)
-    })
+    p.windows(4)
+        .any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && matches!(w[3] & 0x1F, 5 | 7))
 }
 
 /// Parse a PAT packet, returning the PMT PID of the first real program.
@@ -248,7 +247,9 @@ fn parse_pat_pmt_pid(pkt: &[u8]) -> Option<u16> {
         return None; // table_id must be PAT
     }
     let section_length = ((pkt.get(sec + 1)? & 0x0F) as usize) << 8 | *pkt.get(sec + 2)? as usize;
-    let end = (sec + 3 + section_length).saturating_sub(4).min(TS_PACKET_LEN); // drop CRC
+    let end = (sec + 3 + section_length)
+        .saturating_sub(4)
+        .min(TS_PACKET_LEN); // drop CRC
     let mut pos = sec + 8;
     while pos + 4 <= end {
         let program = ((pkt[pos] as u16) << 8) | pkt[pos + 1] as u16;
@@ -268,7 +269,9 @@ fn parse_pmt_video_pid(pkt: &[u8]) -> Option<u16> {
         return None; // table_id must be PMT
     }
     let section_length = ((pkt.get(sec + 1)? & 0x0F) as usize) << 8 | *pkt.get(sec + 2)? as usize;
-    let end = (sec + 3 + section_length).saturating_sub(4).min(TS_PACKET_LEN); // drop CRC
+    let end = (sec + 3 + section_length)
+        .saturating_sub(4)
+        .min(TS_PACKET_LEN); // drop CRC
     let program_info_length =
         ((pkt.get(sec + 10)? & 0x0F) as usize) << 8 | *pkt.get(sec + 11)? as usize;
     let mut pos = sec + 12 + program_info_length;
@@ -365,10 +368,16 @@ mod tests {
         s.push(0xC1); // version 0, current
         s.push(0x00); // section_number
         s.push(0x00); // last_section_number
-        s.extend_from_slice(&[0xE0 | ((video_pid >> 8) as u8 & 0x1F), (video_pid & 0xFF) as u8]); // PCR_PID = video
+        s.extend_from_slice(&[
+            0xE0 | ((video_pid >> 8) as u8 & 0x1F),
+            (video_pid & 0xFF) as u8,
+        ]); // PCR_PID = video
         s.extend_from_slice(&[0xF0, 0x00]); // program_info_length = 0
         s.push(0x1B); // stream_type = H.264
-        s.extend_from_slice(&[0xE0 | ((video_pid >> 8) as u8 & 0x1F), (video_pid & 0xFF) as u8]);
+        s.extend_from_slice(&[
+            0xE0 | ((video_pid >> 8) as u8 & 0x1F),
+            (video_pid & 0xFF) as u8,
+        ]);
         s.extend_from_slice(&[0xF0, 0x00]); // ES_info_length = 0
         s.extend_from_slice(&[0, 0, 0, 0]); // CRC32 placeholder
         psi(pmt_pid, &s)
@@ -440,7 +449,10 @@ mod tests {
         let pes = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x65];
         let out = g.push(&ts(VIDEO_PID, true, false, &pes));
         assert_eq!(packet_count(&out), 3, "IDR NAL should lock the gate");
-        assert_eq!(pid_of(out.chunks_exact(TS_PACKET_LEN).nth(2).unwrap()), VIDEO_PID);
+        assert_eq!(
+            pid_of(out.chunks_exact(TS_PACKET_LEN).nth(2).unwrap()),
+            VIDEO_PID
+        );
     }
 
     #[test]
@@ -505,7 +517,10 @@ mod tests {
     fn gate_locks_on_real_encoder_keyframe() {
         // A genuine libx264 MPEG-TS (committed). ffprobe ground truth: video PID 0x100,
         // PMT PID 0x1000, keyframes at byte offsets 564 and 9400, PAT/PMT recurring throughout.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors/media/h264-keyframes.ts");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/vectors/media/h264-keyframes.ts"
+        );
         let data = std::fs::read(path).expect("fixture present");
         const FIX_VIDEO_PID: u16 = 0x0100;
         const FIX_PMT_PID: u16 = 0x1000;
@@ -520,7 +535,10 @@ mod tests {
         let pkts: Vec<&[u8]> = out.chunks_exact(TS_PACKET_LEN).collect();
         assert_eq!(pid_of(pkts[0]), 0, "tables prepended: PAT first");
         assert_eq!(pid_of(pkts[1]), FIX_PMT_PID, "then PMT");
-        let first_video = pkts.iter().find(|p| pid_of(p) == FIX_VIDEO_PID).expect("video emitted");
+        let first_video = pkts
+            .iter()
+            .find(|p| pid_of(p) == FIX_VIDEO_PID)
+            .expect("video emitted");
         // The first picture the player sees is the real keyframe at byte 9400 — not the
         // mid-GOP packet we joined on.
         assert_eq!(*first_video, &data[KEYFRAME2..KEYFRAME2 + TS_PACKET_LEN]);

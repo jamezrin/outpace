@@ -11,6 +11,8 @@ pub struct PieceStore {
     cur_bytes: u64,
     /// piece index -> (chunk index -> TS payload bytes)
     pieces: BTreeMap<u64, BTreeMap<u16, Vec<u8>>>,
+    /// piece index -> Acestream's 8-byte live piece header.
+    headers: BTreeMap<u64, [u8; 8]>,
 }
 
 impl PieceStore {
@@ -19,7 +21,14 @@ impl PieceStore {
     /// by zero), and `piece_length` should be a multiple of `chunk_length`. Domain inputs are
     /// always 1 MiB / 16 KiB, so this is documented rather than asserted at runtime.
     pub fn new(piece_length: u64, chunk_length: u64, max_bytes: u64) -> Self {
-        PieceStore { piece_length, chunk_length, max_bytes, cur_bytes: 0, pieces: BTreeMap::new() }
+        PieceStore {
+            piece_length,
+            chunk_length,
+            max_bytes,
+            cur_bytes: 0,
+            pieces: BTreeMap::new(),
+            headers: BTreeMap::new(),
+        }
     }
 
     /// Chunks per piece (`piece_length / chunk_length`).
@@ -31,17 +40,41 @@ impl PieceStore {
     /// insert, evict the lowest-index pieces until within `max_bytes`. If `max_bytes` is smaller
     /// than `data.len()`, the chunk is evicted immediately after insertion (a no-op write).
     pub fn put_chunk(&mut self, piece: u64, chunk: u16, data: &[u8]) {
+        self.put_chunk_with_header(piece, chunk, [0u8; 8], data);
+    }
+
+    /// Store a chunk plus the piece-scoped 8-byte live header observed on the wire. The header is
+    /// stable for every chunk in a piece; a later nonzero header replaces an earlier zero
+    /// placeholder so old call sites remain compatible while relay/source paths preserve real
+    /// headers.
+    pub fn put_chunk_with_header(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) {
+        self.headers
+            .entry(piece)
+            .and_modify(|stored| {
+                if *stored == [0u8; 8] && header != [0u8; 8] {
+                    *stored = header;
+                }
+            })
+            .or_insert(header);
         let entry = self.pieces.entry(piece).or_default();
         if let Some(old) = entry.insert(chunk, data.to_vec()) {
             self.cur_bytes -= old.len() as u64;
         }
         self.cur_bytes += data.len() as u64;
         while self.cur_bytes > self.max_bytes {
-            let Some((&lowest, _)) = self.pieces.iter().next() else { break };
+            let Some((&lowest, _)) = self.pieces.iter().next() else {
+                break;
+            };
             if let Some(removed) = self.pieces.remove(&lowest) {
                 self.cur_bytes -= removed.values().map(|d| d.len() as u64).sum::<u64>();
+                self.headers.remove(&lowest);
             }
         }
+    }
+
+    /// The Acestream live piece header for `piece`, if known.
+    pub fn piece_header(&self, piece: u64) -> Option<[u8; 8]> {
+        self.headers.get(&piece).copied()
     }
 
     /// The TS payload of `(piece, chunk)` if still held.
@@ -51,12 +84,18 @@ impl PieceStore {
 
     /// True iff every chunk of `piece` is present.
     pub fn has_piece(&self, piece: u64) -> bool {
-        self.pieces.get(&piece).is_some_and(|c| c.len() as u16 == self.chunks_per_piece())
+        self.pieces
+            .get(&piece)
+            .is_some_and(|c| c.len() as u16 == self.chunks_per_piece())
     }
 
     /// Sorted indices of fully-held pieces (for `Have` advertisement).
     pub fn have_pieces(&self) -> Vec<u64> {
-        self.pieces.keys().copied().filter(|&p| self.has_piece(p)).collect()
+        self.pieces
+            .keys()
+            .copied()
+            .filter(|&p| self.has_piece(p))
+            .collect()
     }
 
     /// `(min, max)` stored piece indices, or None if empty.
@@ -166,5 +205,28 @@ mod tests {
         assert!(!s.has_piece(9), "still missing chunk 1");
         s.put_chunk(9, 1, &[0; 4]);
         assert!(s.has_piece(9), "both chunks present now");
+    }
+
+    #[test]
+    fn stores_a_piece_header_with_its_chunks() {
+        let mut s = store(1024);
+        let header = [0x41, 0xda, 0x91, 0x52, 0x26, 0x34, 0xc2, 0xee];
+
+        s.put_chunk_with_header(9, 0, header, &[0; 4]);
+        s.put_chunk_with_header(9, 1, header, &[1; 4]);
+
+        assert_eq!(s.piece_header(9), Some(header));
+    }
+
+    #[test]
+    fn evicts_piece_header_with_piece_data() {
+        let mut s = store(8);
+
+        s.put_chunk_with_header(1, 0, [1; 8], &[0; 4]);
+        s.put_chunk_with_header(1, 1, [1; 8], &[0; 4]);
+        s.put_chunk_with_header(2, 0, [2; 8], &[0; 4]);
+
+        assert_eq!(s.piece_header(1), None);
+        assert_eq!(s.piece_header(2), Some([2; 8]));
     }
 }

@@ -10,7 +10,7 @@
 use crate::bencode::Bencode;
 use crate::{Result, WireError};
 
-use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
+use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 
 /// AES-128-CBC key for transport-file decryption.
 ///
@@ -18,16 +18,14 @@ use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 /// `block_decrypt`).  Fixed global constant — the same key decrypts all
 /// Acestream transport files, making it a required protocol interop constant.
 pub const TRANSPORT_KEY: [u8; 16] = [
-    0xa5, 0x0c, 0x4e, 0x33, 0xa2, 0xf4, 0x8c, 0xc5,
-    0x0c, 0xe2, 0x75, 0xc9, 0xff, 0x3a, 0x31, 0xbf,
+    0xa5, 0x0c, 0x4e, 0x33, 0xa2, 0xf4, 0x8c, 0xc5, 0x0c, 0xe2, 0x75, 0xc9, 0xff, 0x3a, 0x31, 0xbf,
 ];
 
 /// AES-128-CBC initialisation vector for transport-file decryption.
 ///
 /// Paired with [`TRANSPORT_KEY`]; both were captured from the engine source.
 pub const TRANSPORT_IV: [u8; 16] = [
-    0x74, 0xe9, 0xcd, 0xd6, 0x39, 0x1b, 0xcb, 0xd5,
-    0x65, 0xf9, 0x95, 0x03, 0x31, 0x33, 0x29, 0xa3,
+    0x74, 0xe9, 0xcd, 0xd6, 0x39, 0x1b, 0xcb, 0xd5, 0x65, 0xf9, 0x95, 0x03, 0x31, 0x33, 0x29, 0xa3,
 ];
 
 /// Decoded Acestream transport descriptor.
@@ -62,7 +60,9 @@ type Dec = cbc::Decryptor<aes::Aes128>;
 fn required_positive(raw: &Bencode, key: &[u8]) -> Result<u64> {
     match raw.get(key).and_then(|v| v.as_int()) {
         Some(i) if i > 0 => Ok(i as u64),
-        _ => Err(WireError::Invalid("missing or non-positive descriptor field")),
+        _ => Err(WireError::Invalid(
+            "missing or non-positive descriptor field",
+        )),
     }
 }
 
@@ -224,19 +224,31 @@ mod tests {
         d.insert(b"chunk_length".to_vec(), Bencode::Int(16_384));
         d.insert(
             b"trackers".to_vec(),
-            Bencode::List(vec![Bencode::Bytes(b"udp://t1.example:2710/announce".to_vec())]),
+            Bencode::List(vec![Bencode::Bytes(
+                b"udp://t1.example:2710/announce".to_vec(),
+            )]),
         );
         let dict = Bencode::Dict(d);
 
         let bytes = encode_transport(&dict);
-        assert!(crate::infohash::is_transport_file(&bytes), "must carry the transport magic");
-        assert_eq!(bytes.len() % 16, (20 % 16), "magic(20) + ciphertext(mult of 16)");
+        assert!(
+            crate::infohash::is_transport_file(&bytes),
+            "must carry the transport magic"
+        );
+        assert_eq!(
+            bytes.len() % 16,
+            (20 % 16),
+            "magic(20) + ciphertext(mult of 16)"
+        );
 
         let got = decode_transport(&bytes).unwrap();
         assert_eq!(got.name, "my broadcast");
         assert_eq!(got.piece_length, 1_048_576);
         assert_eq!(got.chunk_length, 16_384);
-        assert_eq!(got.trackers, vec!["udp://t1.example:2710/announce".to_string()]);
+        assert_eq!(
+            got.trackers,
+            vec!["udp://t1.example:2710/announce".to_string()]
+        );
         assert!(got.is_live, "no pieces key => live");
     }
 
@@ -251,9 +263,7 @@ mod tests {
         );
         // magic but empty body
         let magic_only = b"AceStreamTransport\x00\x02";
-        assert!(
-            decode_transport_with_key(magic_only, &TRANSPORT_KEY, &TRANSPORT_IV).is_err()
-        );
+        assert!(decode_transport_with_key(magic_only, &TRANSPORT_KEY, &TRANSPORT_IV).is_err());
     }
 
     // Diagnostic tool: decode a real captured .acelive transport file and dump its fields
@@ -272,7 +282,11 @@ mod tests {
         println!("trackers: {:?}", d.trackers);
         println!("is_live: {}", d.is_live);
         println!("pieces: {} entries", d.pieces.len());
-        println!("pubkey ({} bytes): {}", d.pubkey.len(), hex_encode(&d.pubkey));
+        println!(
+            "pubkey ({} bytes): {}",
+            d.pubkey.len(),
+            hex_encode(&d.pubkey)
+        );
         if let crate::bencode::Bencode::Dict(map) = &d.raw {
             println!("all top-level keys + values:");
             for (k, v) in map.iter() {

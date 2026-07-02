@@ -46,10 +46,15 @@ impl LiveSession {
                 position: -1,
                 distance_from_source: 1,
             }),
-            node: NodeFields { ts: 5000, ..NodeFields::default() },
+            node: NodeFields {
+                ts: 5000,
+                ..NodeFields::default()
+            },
             peer_ip: cfg.peer_ip,
         };
-        session.send_signed_extended_handshake(&hs, &cfg.identity).await?;
+        session
+            .send_signed_extended_handshake(&hs, &cfg.identity)
+            .await?;
 
         let chunks_per_piece = info.chunks_per_piece();
         let mut reasm = PieceReassembler::new(info.piece_length, cfg.start_piece);

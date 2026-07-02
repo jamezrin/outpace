@@ -7,6 +7,7 @@ use ace_engine::config::{load_or_create_identity, Config};
 use ace_engine::http::{router, AppState, BroadcastState};
 use ace_engine::manager::StreamManager;
 use ace_engine::provider::ProviderRegistry;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Default tracker for minted broadcasts (B1) — the same public UDP tracker `AceProvider`
@@ -75,22 +76,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broadcasts = BroadcastState {
         registry: BroadcastRegistry::new(),
         seed_registry: seed_registry.clone(),
-        trackers: DEFAULT_BROADCAST_TRACKERS.iter().map(|s| s.to_string()).collect(),
+        trackers: DEFAULT_BROADCAST_TRACKERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         store_bytes: config.seed_store_bytes,
         inbound_peer_port: config.enable_inbound.then_some(config.peer_listen.port()),
     };
-    let state = AppState { manager, networks: networks.clone(), broadcasts: Some(broadcasts) };
+    let state = AppState {
+        manager,
+        networks: networks.clone(),
+        resolve_content_ids_in_getstream: true,
+        ace_session_aliases: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        broadcasts: Some(broadcasts),
+    };
 
-    // Inbound seeding (S2): OFF by default. The served piece_header is still a placeholder
-    // ([0u8;8]) pending a separate RE task that pins the real engine bytes from ground-truth
-    // captures — see docs/RESUME.md "Next: v2" / Task 7. Do not flip enable_inbound to true
-    // by default before that lands; serving non-compliant pieces to the real swarm would
-    // violate the project's transparent-interop constraint.
+    // Inbound seeding (S2): OFF by default so operators do not expose a peer listener unless
+    // they opt in. Piece headers are now preserved/generated and official-consumer piece
+    // acceptance is live-proven (note 33).
     if config.enable_inbound {
         let peer_listener = tokio::net::TcpListener::bind(config.peer_listen).await?;
         eprintln!(
-            "outpace: inbound seeding ENABLED on {} (max {} peers) — piece_header is a \
-             PLACEHOLDER, not yet validated against real Acestream peers",
+            "outpace: inbound seeding ENABLED on {} (max {} peers)",
             config.peer_listen, config.max_inbound_peers
         );
         let listener_peer_id = ace_wire::handshake::random_peer_id();
@@ -99,7 +106,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener_identity = identity.clone();
         tokio::spawn(async move {
             ace_swarm::listen::PeerListener::serve(
-                peer_listener, inbound_registry, listener_peer_id, [0u8; 8], max_inbound,
+                peer_listener,
+                inbound_registry,
+                listener_peer_id,
+                [0u8; 8],
+                max_inbound,
                 listener_identity,
             )
             .await;
@@ -107,12 +118,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    eprintln!("outpace: listening on http://{} networks={:?}", config.bind, networks);
+    eprintln!(
+        "outpace: listening on http://{} networks={:?}",
+        config.bind, networks
+    );
     eprintln!("  play:  http://{}/streams/ace/<infohash>.ts", config.bind);
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
 
 fn hex_node_id(identity: &ace_wire::identity::Identity) -> String {
-    identity.node_id().iter().map(|b| format!("{b:02x}")).collect()
+    identity
+        .node_id()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }

@@ -79,12 +79,18 @@ mod tests {
 
     #[test]
     fn rejects_unaligned_input() {
-        assert_eq!(segment(&[0x47, 0x00, 0x01], 2), Err(MediaError::NotTsAligned));
+        assert_eq!(
+            segment(&[0x47, 0x00, 0x01], 2),
+            Err(MediaError::NotTsAligned)
+        );
     }
 
     #[test]
     fn rejects_zero_packets_per_segment() {
-        assert_eq!(segment(&ts(2), 0), Err(MediaError::BadParam("packets_per_segment must be > 0")));
+        assert_eq!(
+            segment(&ts(2), 0),
+            Err(MediaError::BadParam("packets_per_segment must be > 0"))
+        );
     }
 
     #[test]

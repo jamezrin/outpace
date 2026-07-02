@@ -66,7 +66,11 @@ impl StreamManager {
 
     /// Peek at an already-running session without starting one.
     pub async fn get(&self, network: &str, id: &str) -> Option<Arc<StreamSession>> {
-        self.sessions.lock().await.get(&(network.to_string(), id.to_string())).cloned()
+        self.sessions
+            .lock()
+            .await
+            .get(&(network.to_string(), id.to_string()))
+            .cloned()
     }
 
     /// Get (or lazily start) the HLS packager for `(network, id)`, starting the session too.
@@ -78,7 +82,10 @@ impl StreamManager {
         let session = self.get_or_start(network, id).await?;
         let key = (network.to_string(), id.to_string());
         let mut map = self.packagers.lock().await;
-        Ok(map.entry(key).or_insert_with(|| HlsPackager::start(&session)).clone())
+        Ok(map
+            .entry(key)
+            .or_insert_with(|| HlsPackager::start(&session))
+            .clone())
     }
 
     /// Force-stop a session: remove it (and any HLS packager) so the shared download is torn
@@ -177,21 +184,35 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..16 {
             let m = m.clone();
-            handles.push(tokio::spawn(async move { m.get_or_start("count", "x").await.map(|s| Arc::as_ptr(&s) as usize) }));
+            handles.push(tokio::spawn(async move {
+                m.get_or_start("count", "x")
+                    .await
+                    .map(|s| Arc::as_ptr(&s) as usize)
+            }));
         }
         let mut ptrs = Vec::new();
         for h in handles {
             ptrs.push(h.await.unwrap().unwrap());
         }
         // Exactly one open, and everyone got the same session.
-        assert_eq!(opens.load(Ordering::SeqCst), 1, "session must be started exactly once");
-        assert!(ptrs.iter().all(|p| *p == ptrs[0]), "all callers share one session");
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "session must be started exactly once"
+        );
+        assert!(
+            ptrs.iter().all(|p| *p == ptrs[0]),
+            "all callers share one session"
+        );
     }
 
     #[tokio::test]
     async fn unknown_network_is_not_found() {
         let m = StreamManager::new(registry());
-        assert!(matches!(m.get_or_start("nope", "x").await, Err(ProviderError::NotFound)));
+        assert!(matches!(
+            m.get_or_start("nope", "x").await,
+            Err(ProviderError::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -206,8 +227,17 @@ mod tests {
     async fn stop_removes_session_and_is_idempotent() {
         let m = StreamManager::new(registry());
         m.get_or_start("test", "a").await.unwrap();
-        assert!(m.stop("test", "a").await, "first stop removes the running session");
-        assert!(m.get("test", "a").await.is_none(), "session is gone afterwards");
-        assert!(!m.stop("test", "a").await, "stopping a missing session is a no-op");
+        assert!(
+            m.stop("test", "a").await,
+            "first stop removes the running session"
+        );
+        assert!(
+            m.get("test", "a").await.is_none(),
+            "session is gone afterwards"
+        );
+        assert!(
+            !m.stop("test", "a").await,
+            "stopping a missing session is a no-op"
+        );
     }
 }

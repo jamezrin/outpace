@@ -1,24 +1,36 @@
-//! Clean HTTP API (axum). No `ace`/`acestream` tokens in paths or JSON keys — the only
-//! `ace` on the surface is the `{network}` value, selecting a provider.
+//! HTTP API (axum): the clean `/streams`/`/broadcast` surface plus the official-engine
+//! compatibility `/ace/...` playback surface.
 
 use crate::broadcast::{BroadcastRegistry, CHUNK_LENGTH, PIECE_LENGTH};
 use crate::manager::StreamManager;
+use crate::session::StreamSession;
 use ace_swarm::listen::SeedRegistry;
+use ace_swarm::resolve::resolve_via_catalog;
+use ace_wire::live_codec::piece_header_from_unix_seconds;
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::get, routing::put, Json, Router};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast::error::RecvError;
 
 #[derive(Clone)]
 pub struct AppState {
     pub manager: Arc<StreamManager>,
     pub networks: Vec<String>,
+    /// Resolve `content_id=` to the official infohash before returning `/ace/getstream`
+    /// URLs. Tests disable this to keep the compatibility route offline/deterministic.
+    pub resolve_content_ids_in_getstream: bool,
+    /// Official `/ace/getstream?content_id=` returns URLs keyed by the resolved infohash.
+    /// Internally, keep using `cid:<content_id>` so playback gets the catalog-derived
+    /// transport geometry/trackers instead of degrading to bare-infohash defaults.
+    pub ace_session_aliases: Arc<Mutex<HashMap<String, String>>>,
     /// B1: origination state. `None` disables `PUT /broadcast/{name}` (404) — e.g. in tests
     /// that don't need it.
     pub broadcasts: Option<BroadcastState>,
@@ -41,12 +53,22 @@ pub struct BroadcastState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/ace/getstream", get(ace_getstream))
+        .route("/ace/r/:id/:token", get(ace_playback))
+        .route("/ace/stat/:id/:token", get(ace_stat))
+        .route("/ace/cmd/:id/:token", get(ace_command))
         .route("/networks", get(networks))
         .route("/streams", get(list_streams))
-        .route("/streams/:network/:file", get(stream_file).delete(delete_stream))
+        .route(
+            "/streams/:network/:file",
+            get(stream_file).delete(delete_stream),
+        )
         .route("/streams/:network/:id/status", get(stream_status))
         .route("/streams/:network/:id/seg/:seg", get(stream_segment))
-        .route("/broadcast/:name", put(broadcast_ingest).get(broadcast_transport))
+        .route(
+            "/broadcast/:name",
+            put(broadcast_ingest).get(broadcast_transport),
+        )
         .with_state(state)
 }
 
@@ -79,16 +101,26 @@ async fn broadcast_transport(State(s): State<AppState>, Path(name): Path<String>
 /// yet persist) — a second `PUT` to the same name after the first ingest ends would
 /// overwrite piece indices rather than continuing them. Fine for a single continuous ingest
 /// (the only case exercised so far); flagged for whoever adds ingest-reconnect support.
-async fn broadcast_ingest(State(s): State<AppState>, Path(name): Path<String>, body: Body) -> Response {
+async fn broadcast_ingest(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    body: Body,
+) -> Response {
     let Some(bs) = &s.broadcasts else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let (bc, freshly_minted) = bs
         .registry
-        .start_or_resume(&name, &name, &bs.trackers, &bs.seed_registry, bs.store_bytes)
+        .start_or_resume(
+            &name,
+            &name,
+            &bs.trackers,
+            &bs.seed_registry,
+            bs.store_bytes,
+        )
         .await;
     let infohash_hex: String = bc.infohash.iter().map(|b| format!("{b:02x}")).collect();
-    eprintln!("[broadcast] {name}: ingesting as infohash {infohash_hex}");
+    crate::alog!("[broadcast] {name}: ingesting as infohash {infohash_hex}");
 
     // Self-announce this broadcast to tracker + DHT (Task 7 discoverability), exactly once
     // per freshly-minted name — resumed PUTs must not spawn a second competing loop. A no-op
@@ -111,20 +143,244 @@ async fn broadcast_ingest(State(s): State<AppState>, Path(name): Path<String>, b
         let sig_len = auth.signature_len() as u64;
         let mut chunker =
             ace_wire::signing_chunker::SigningChunker::new(PIECE_LENGTH, CHUNK_LENGTH, 0, sig_len);
+        let mut current_header: Option<(u64, [u8; 8])> = None;
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
             let Ok(chunk) = chunk else { break };
             let aligned = resync.push(&chunk);
             for out in chunker.push(&aligned, &auth) {
-                store.lock().await.put_chunk(out.piece, out.chunk, &out.data);
+                let header = header_for_piece(&mut current_header, out.piece);
+                store
+                    .lock()
+                    .await
+                    .put_chunk_with_header(out.piece, out.chunk, header, &out.data);
             }
         }
         for out in chunker.flush(&auth) {
-            store.lock().await.put_chunk(out.piece, out.chunk, &out.data);
+            let header = header_for_piece(&mut current_header, out.piece);
+            store
+                .lock()
+                .await
+                .put_chunk_with_header(out.piece, out.chunk, header, &out.data);
         }
     });
 
     Json(json!({ "name": name, "infohash": infohash_hex })).into_response()
+}
+
+fn current_live_piece_header() -> [u8; 8] {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    piece_header_from_unix_seconds(seconds)
+}
+
+fn header_for_piece(current: &mut Option<(u64, [u8; 8])>, piece: u64) -> [u8; 8] {
+    match current {
+        Some((current_piece, header)) if *current_piece == piece => *header,
+        _ => {
+            let header = current_live_piece_header();
+            *current = Some((piece, header));
+            header
+        }
+    }
+}
+
+async fn ace_getstream(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let Some(mut selection) = ace_selected_stream(&params) else {
+        return Json(json!({ "response": null, "error": "missing content_id/infohash/id" }));
+    };
+    if ace_network(&s).is_none() {
+        return Json(json!({ "response": null, "error": "no ace network registered" }));
+    }
+    if s.resolve_content_ids_in_getstream {
+        if let Some(content_id) = selection.content_id.as_deref() {
+            match resolve_via_catalog(content_id).await {
+                Ok(info) => selection = selection.with_resolved_infohash(hex20_string(&info.infohash)),
+                Err(e) => crate::alog!(
+                    "[ace] getstream content_id catalog resolution failed, falling back to cid: {e:?}"
+                ),
+            }
+        }
+    }
+
+    let token = "outpace";
+    let base = request_base(&headers);
+    let playback_id = selection.playback_id;
+    let session_key = selection.session_key;
+    if playback_id != session_key {
+        s.ace_session_aliases
+            .lock()
+            .unwrap()
+            .insert(playback_id.clone(), session_key);
+    }
+    let public_id = selection.public_id;
+    Json(json!({
+        "response": {
+            "infohash": public_id,
+            "playback_url": format!("{base}/ace/r/{playback_id}/{token}"),
+            "stat_url": format!("{base}/ace/stat/{playback_id}/{token}"),
+            "command_url": format!("{base}/ace/cmd/{playback_id}/{token}"),
+            "playback_session_id": token,
+            "client_session_id": -1,
+            "is_live": 1,
+            "is_encrypted": 0
+        },
+        "error": null
+    }))
+}
+
+async fn ace_playback(
+    State(s): State<AppState>,
+    Path((id, _token)): Path<(String, String)>,
+) -> Response {
+    let Some(network) = ace_network(&s) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let session_key = ace_session_key(&s, &id);
+    match s.manager.get_or_start(&network, &session_key).await {
+        Ok(session) => stream_session_response(session),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn ace_stat(
+    State(s): State<AppState>,
+    Path((id, token)): Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    let Some(network) = ace_network(&s) else {
+        return Json(json!({ "response": null, "error": "no ace network registered" }));
+    };
+    let public_id = ace_public_id(&id);
+    let session_key = ace_session_key(&s, &id);
+    let Some(session) = s.manager.get(&network, &session_key).await else {
+        return Json(json!({
+            "response": {
+                "status": "idle",
+                "peers": 0,
+                "downloaded": 0,
+                "uploaded": 0,
+                "infohash": public_id,
+                "is_live": 1,
+                "is_encrypted": 0,
+                "playback_session_id": token,
+                "client_session_id": -1
+            },
+            "error": null
+        }));
+    };
+
+    let stats = session.stats().await;
+    Json(json!({
+        "response": {
+            "status": "dl",
+            "peers": stats.peers,
+            "downloaded": stats.downloaded,
+            "uploaded": stats.uploaded,
+            "infohash": public_id,
+            "is_live": 1,
+            "is_encrypted": 0,
+            "playback_session_id": token,
+            "client_session_id": -1
+        },
+        "error": null
+    }))
+}
+
+async fn ace_command(
+    State(s): State<AppState>,
+    Path((id, _token)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    if params.get("method").is_some_and(|m| m == "stop") {
+        if let Some(network) = ace_network(&s) {
+            let session_key = ace_session_key(&s, &id);
+            s.manager.stop(&network, &session_key).await;
+        }
+        return Json(json!({ "response": "ok", "error": null }));
+    }
+    Json(json!({ "response": null, "error": "missing method" }))
+}
+
+struct AceStreamSelection {
+    public_id: String,
+    playback_id: String,
+    session_key: String,
+    content_id: Option<String>,
+}
+
+impl AceStreamSelection {
+    fn with_resolved_infohash(mut self, infohash: String) -> Self {
+        self.public_id = infohash.clone();
+        self.playback_id = infohash;
+        self.content_id = None;
+        self
+    }
+}
+
+fn ace_selected_stream(params: &HashMap<String, String>) -> Option<AceStreamSelection> {
+    if let Some(content_id) = ace_nonempty_param(params, "content_id") {
+        return Some(AceStreamSelection {
+            public_id: content_id.to_string(),
+            playback_id: format!("cid:{content_id}"),
+            session_key: format!("cid:{content_id}"),
+            content_id: Some(content_id.to_string()),
+        });
+    }
+    ace_nonempty_param(params, "infohash")
+        .or_else(|| ace_nonempty_param(params, "id"))
+        .map(|id| AceStreamSelection {
+            public_id: id.to_string(),
+            playback_id: id.to_string(),
+            session_key: id.to_string(),
+            content_id: None,
+        })
+}
+
+fn ace_nonempty_param<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    params
+        .get(key)
+        .map(String::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn ace_public_id(id: &str) -> &str {
+    id.strip_prefix("cid:").unwrap_or(id)
+}
+
+fn ace_session_key(s: &AppState, id: &str) -> String {
+    s.ace_session_aliases
+        .lock()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn hex20_string(bytes: &[u8; 20]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn ace_network(s: &AppState) -> Option<String> {
+    if s.networks.iter().any(|n| n == "ace") {
+        Some("ace".to_string())
+    } else {
+        s.networks.first().cloned()
+    }
+}
+
+fn request_base(headers: &HeaderMap) -> String {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .filter(|h| !h.is_empty())
+        .unwrap_or("127.0.0.1:6878");
+    format!("http://{host}")
 }
 
 async fn networks(State(s): State<AppState>) -> Json<serde_json::Value> {
@@ -146,8 +402,14 @@ async fn list_streams(State(s): State<AppState>) -> Json<serde_json::Value> {
 /// `DELETE /streams/{network}/{id}` — force-stop a running session (admin). 204 if it was
 /// running, 404 otherwise. The `{id}` may carry a `.ts`/`.m3u8` suffix (mirroring the GET
 /// URL); it's stripped so either form stops the same session.
-async fn delete_stream(State(s): State<AppState>, Path((network, file)): Path<(String, String)>) -> Response {
-    let id = file.strip_suffix(".ts").or_else(|| file.strip_suffix(".m3u8")).unwrap_or(&file);
+async fn delete_stream(
+    State(s): State<AppState>,
+    Path((network, file)): Path<(String, String)>,
+) -> Response {
+    let id = file
+        .strip_suffix(".ts")
+        .or_else(|| file.strip_suffix(".m3u8"))
+        .unwrap_or(&file);
     if s.manager.stop(&network, id).await {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -156,7 +418,10 @@ async fn delete_stream(State(s): State<AppState>, Path((network, file)): Path<(S
 }
 
 /// `GET /streams/{network}/{id}/status` — stats for a running session (404 if not active).
-async fn stream_status(State(s): State<AppState>, Path((network, id)): Path<(String, String)>) -> Response {
+async fn stream_status(
+    State(s): State<AppState>,
+    Path((network, id)): Path<(String, String)>,
+) -> Response {
     match s.manager.get(&network, &id).await {
         Some(session) => {
             let stats = session.stats().await;
@@ -177,7 +442,10 @@ async fn stream_status(State(s): State<AppState>, Path((network, id)): Path<(Str
 }
 
 /// `GET /streams/{network}/{id}/seg/{n}.ts` — a retained HLS segment.
-async fn stream_segment(State(s): State<AppState>, Path((network, id, seg)): Path<(String, String, String)>) -> Response {
+async fn stream_segment(
+    State(s): State<AppState>,
+    Path((network, id, seg)): Path<(String, String, String)>,
+) -> Response {
     let Some(seq) = seg.strip_suffix(".ts").and_then(|n| n.parse::<u64>().ok()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -192,7 +460,10 @@ async fn stream_segment(State(s): State<AppState>, Path((network, id, seg)): Pat
 }
 
 /// `GET /streams/{network}/{id}.ts` (continuous MPEG-TS) or `.m3u8` (live HLS playlist).
-async fn stream_file(State(s): State<AppState>, Path((network, file)): Path<(String, String)>) -> Response {
+async fn stream_file(
+    State(s): State<AppState>,
+    Path((network, file)): Path<(String, String)>,
+) -> Response {
     if let Some(id) = file.strip_suffix(".m3u8") {
         return match s.manager.get_or_start_hls(&network, id).await {
             Ok(pkg) => (
@@ -210,6 +481,10 @@ async fn stream_file(State(s): State<AppState>, Path((network, file)): Path<(Str
         Ok(sess) => sess,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
+    stream_session_response(session)
+}
+
+fn stream_session_response(session: Arc<StreamSession>) -> Response {
     let sub = session.subscribe();
     // Per-client keyframe gate: a player joining mid-GOP is held until the first clean
     // keyframe (with PAT/PMT prepended) so it starts on a decodable picture, not garbage.
@@ -251,13 +526,21 @@ mod tests {
     fn state() -> AppState {
         let mut r = ProviderRegistry::new();
         r.register(std::sync::Arc::new(TestProvider { chunks: 10 }));
-        AppState { manager: StreamManager::new(r), networks: vec!["test".into()], broadcasts: None }
+        AppState {
+            manager: StreamManager::new(r),
+            networks: vec!["test".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            broadcasts: None,
+        }
     }
 
     /// A real libx264 MPEG-TS (committed fixture). Video PID 0x100; keyframes at byte
     /// offsets 564 and 9400.
-    const FIXTURE: &[u8] =
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors/media/h264-keyframes.ts"));
+    const FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/vectors/media/h264-keyframes.ts"
+    ));
 
     /// Provider that replays `FIXTURE` from byte `skip` (188-aligned), a few TS packets per
     /// chunk — used to prove the per-client keyframe gate on a genuine stream.
@@ -271,15 +554,23 @@ mod tests {
     impl TsSource for FixtureSource {
         async fn next(&mut self) -> Option<Bytes> {
             if self.pos >= FIXTURE.len() {
-                return None;
+                std::future::pending().await
             }
+            tokio::task::yield_now().await;
             let end = (self.pos + 188 * 3).min(FIXTURE.len());
             let chunk = Bytes::copy_from_slice(&FIXTURE[self.pos..end]);
             self.pos = end;
             Some(chunk)
         }
         fn stats(&self) -> SourceStats {
-            SourceStats { peers: 1, bitrate: 0, buffer_ms: 0, uploaded: 0, peers_served: 0 }
+            SourceStats {
+                peers: 1,
+                bitrate: 0,
+                buffer_ms: 0,
+                downloaded: self.pos as u64,
+                uploaded: 0,
+                peers_served: 0,
+            }
         }
     }
     #[async_trait]
@@ -295,7 +586,29 @@ mod tests {
     fn fixture_state(skip: usize) -> AppState {
         let mut r = ProviderRegistry::new();
         r.register(std::sync::Arc::new(FixtureProvider { skip }));
-        AppState { manager: StreamManager::new(r), networks: vec!["fix".into()], broadcasts: None }
+        AppState {
+            manager: StreamManager::new(r),
+            networks: vec!["fix".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            broadcasts: None,
+        }
+    }
+
+    #[test]
+    fn content_id_selection_uses_resolved_infohash_when_available() {
+        let content_id = "2123456789abcdef0123456789abcdef01234567";
+        let resolved = "50e93529d3eb46a50506b14464185a15292d6e47";
+        let mut params = HashMap::new();
+        params.insert("content_id".to_string(), content_id.to_string());
+
+        let selection = ace_selected_stream(&params)
+            .unwrap()
+            .with_resolved_infohash(resolved.to_string());
+
+        assert_eq!(selection.public_id, resolved);
+        assert_eq!(selection.playback_id, resolved);
+        assert_eq!(selection.session_key, format!("cid:{content_id}"));
     }
 
     #[tokio::test]
@@ -309,7 +622,11 @@ mod tests {
         // Join the stream mid-GOP (a non-keyframe video packet between the two keyframes).
         let resp = app
             .clone()
-            .oneshot(Request::get("/streams/fix/x.ts").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/streams/fix/x.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -348,7 +665,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("\"test\""));
     }
 
@@ -360,7 +679,11 @@ mod tests {
         let app = router(fixture_state(0));
         let resp = app
             .clone()
-            .oneshot(Request::get("/streams/fix/somechannel.ts").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/streams/fix/somechannel.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -372,9 +695,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ace_getstream_content_id_returns_a_playback_url_that_streams() {
+        use futures::StreamExt;
+        let content_id = "2123456789abcdef0123456789abcdef01234567";
+        let state = fixture_state(0);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/ace/getstream?format=json&content_id={content_id}"
+                ))
+                .header(header::HOST, "localhost:6900")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["response"]["is_live"], 1);
+        assert_eq!(json["response"]["is_encrypted"], 0);
+        assert_eq!(json["response"]["infohash"], content_id);
+
+        let playback_url = json["response"]["playback_url"].as_str().unwrap();
+        let playback_path = playback_url
+            .strip_prefix("http://localhost:6900")
+            .expect("playback URL should point back at this daemon");
+        assert_eq!(
+            playback_path,
+            format!("/ace/r/cid:{content_id}/outpace"),
+            "content_id playback must enter the provider through the cid: resolver path"
+        );
+        // Keep `app` alive while reading, as in the clean `/streams` tests: the test
+        // manager owns the live session.
+        let media = app
+            .clone()
+            .oneshot(Request::get(playback_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(media.status(), StatusCode::OK);
+        assert_eq!(media.headers()[header::CONTENT_TYPE], "video/mp2t");
+        let mut stream = media.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first[0], 0x47);
+        assert!(manager
+            .get("fix", &format!("cid:{content_id}"))
+            .await
+            .is_some());
+        assert!(manager.get("fix", content_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ace_stat_and_stop_track_content_id_session() {
+        use futures::StreamExt;
+        let content_id = "2123456789abcdef0123456789abcdef01234567";
+        let state = fixture_state(0);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let stat_path = format!("/ace/stat/cid:{content_id}/outpace");
+        let idle = app
+            .clone()
+            .oneshot(Request::get(&stat_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(idle.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(idle.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["response"]["status"], "idle");
+        assert_eq!(json["response"]["infohash"], content_id);
+
+        let media = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/r/cid:{content_id}/outpace"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(media.status(), StatusCode::OK);
+        let mut stream = media.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first[0], 0x47);
+
+        let running = app
+            .clone()
+            .oneshot(Request::get(&stat_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(running.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(running.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["response"]["status"], "dl");
+        assert_eq!(json["response"]["peers"], 1);
+        assert!(json["response"]["downloaded"].as_u64().unwrap() > 0);
+
+        let stop = app
+            .oneshot(
+                Request::get(format!("/ace/cmd/cid:{content_id}/outpace?method=stop"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(stop.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["response"], "ok");
+        assert!(manager
+            .get("fix", &format!("cid:{content_id}"))
+            .await
+            .is_none());
+        assert!(manager.get("fix", content_id).await.is_none());
+    }
+
+    #[tokio::test]
     async fn unknown_network_returns_404() {
         let resp = router(state())
-            .oneshot(Request::get("/streams/nope/x.ts").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/streams/nope/x.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -383,7 +842,11 @@ mod tests {
     #[tokio::test]
     async fn non_ts_extension_returns_404() {
         let resp = router(state())
-            .oneshot(Request::get("/streams/test/x.foo").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/streams/test/x.foo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -396,18 +859,28 @@ mod tests {
         // Not started yet.
         let resp = app
             .clone()
-            .oneshot(Request::get("/streams/test/chan/status").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/streams/test/chan/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         // Start it, then status reports it with clean keys.
         st.manager.get_or_start("test", "chan").await.unwrap();
         let resp = app
-            .oneshot(Request::get("/streams/test/chan/status").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/streams/test/chan/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let txt = String::from_utf8_lossy(&body);
         assert!(txt.contains("\"clients\"") && txt.contains("\"peers\""));
     }
@@ -415,12 +888,21 @@ mod tests {
     #[tokio::test]
     async fn m3u8_serves_hls_playlist() {
         let resp = router(state())
-            .oneshot(Request::get("/streams/test/chan.m3u8").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/streams/test/chan.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/vnd.apple.mpegurl");
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&body).starts_with("#EXTM3U"));
     }
 
@@ -432,14 +914,22 @@ mod tests {
         // First delete stops the running session.
         let resp = app
             .clone()
-            .oneshot(Request::delete("/streams/test/z").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::delete("/streams/test/z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert!(st.manager.get("test", "z").await.is_none());
         // Second delete finds nothing to stop.
         let resp = app
-            .oneshot(Request::delete("/streams/test/z").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::delete("/streams/test/z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -453,7 +943,9 @@ mod tests {
             .oneshot(Request::get("/streams").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("\"abc\""));
     }
 
@@ -477,7 +969,11 @@ mod tests {
     #[tokio::test]
     async fn broadcast_put_returns_404_when_disabled() {
         let resp = router(state()) // plain `state()`: broadcasts: None
-            .oneshot(Request::put("/broadcast/x").body(Body::from(vec![0u8; 4])).unwrap())
+            .oneshot(
+                Request::put("/broadcast/x")
+                    .body(Body::from(vec![0u8; 4]))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -497,7 +993,11 @@ mod tests {
 
         let put_resp = app
             .clone()
-            .oneshot(Request::put("/broadcast/x").body(Body::from(vec![0x47u8; 8])).unwrap())
+            .oneshot(
+                Request::put("/broadcast/x")
+                    .body(Body::from(vec![0x47u8; 8]))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(put_resp.status(), StatusCode::OK);
@@ -507,7 +1007,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(get_resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(get_resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert!(
             ace_wire::infohash::is_transport_file(&body),
             "GET /broadcast/{{name}} must serve real transport-file bytes"
@@ -531,11 +1033,17 @@ mod tests {
             body.extend(std::iter::repeat_n((i % 256) as u8, TS_PACKET_LEN - 1));
         }
         let resp = app
-            .oneshot(Request::put("/broadcast/mychan").body(Body::from(body)).unwrap())
+            .oneshot(
+                Request::put("/broadcast/mychan")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let respbody = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let respbody = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&respbody).unwrap();
         let infohash_hex = json["infohash"].as_str().unwrap().to_string();
         assert_eq!(infohash_hex.len(), 40, "a 20-byte infohash, hex-encoded");
@@ -553,13 +1061,26 @@ mod tests {
         // under a full 1 MiB piece), so this reaches the store via `SigningChunker::flush`'s
         // short-final-piece path (see `ace_wire::signing_chunker`), not a full-piece `push`.
         for _ in 0..50 {
-            if seed_registry.get(&infohash).unwrap().lock().await.chunk(0, 0).is_some() {
+            if seed_registry
+                .get(&infohash)
+                .unwrap()
+                .lock()
+                .await
+                .chunk(0, 0)
+                .is_some()
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(
-            seed_registry.get(&infohash).unwrap().lock().await.chunk(0, 0).is_some(),
+            seed_registry
+                .get(&infohash)
+                .unwrap()
+                .lock()
+                .await
+                .chunk(0, 0)
+                .is_some(),
             "ingested bytes must reach the piece store as chunk (0, 0)"
         );
     }
@@ -585,11 +1106,17 @@ mod tests {
             body.extend(std::iter::repeat_n((i % 256) as u8, TS_PACKET_LEN - 1));
         }
         let resp = app
-            .oneshot(Request::put("/broadcast/bigchan").body(Body::from(body)).unwrap())
+            .oneshot(
+                Request::put("/broadcast/bigchan")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let respbody = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let respbody = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&respbody).unwrap();
         let infohash_hex = json["infohash"].as_str().unwrap().to_string();
         let mut infohash = [0u8; 20];
@@ -599,7 +1126,13 @@ mod tests {
 
         // Wait for piece 0 to fully complete (all chunks present).
         for _ in 0..500 {
-            if seed_registry.get(&infohash).unwrap().lock().await.has_piece(0) {
+            if seed_registry
+                .get(&infohash)
+                .unwrap()
+                .lock()
+                .await
+                .has_piece(0)
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -610,6 +1143,17 @@ mod tests {
             let window = guard.window();
             panic!("piece 0 never completed; store window = {window:?}");
         }
+        let piece_header = guard
+            .piece_header(0)
+            .expect("ingest records a live piece header");
+        assert_ne!(
+            piece_header, [0u8; 8],
+            "broadcast-originated pieces must not serve the old zero header placeholder"
+        );
+        assert!(
+            f64::from_be_bytes(piece_header) > 1_700_000_000.0,
+            "live piece header should decode as a modern Unix timestamp"
+        );
         let chunks_per_piece = guard.chunks_per_piece();
         let mut piece_bytes = Vec::with_capacity(PIECE_LENGTH as usize);
         for c in 0..chunks_per_piece {

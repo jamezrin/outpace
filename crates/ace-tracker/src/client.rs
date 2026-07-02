@@ -14,8 +14,13 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(8);
 /// Announce to a UDP tracker and return its peer list.
 #[allow(clippy::too_many_arguments)]
 pub async fn announce(
-    tracker: SocketAddrV4, infohash: &[u8; 20], peer_id: &[u8; 20], port: u16, num_want: i32,
-    transfer: TransferState, event: AnnounceEvent,
+    tracker: SocketAddrV4,
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    num_want: i32,
+    transfer: TransferState,
+    event: AnnounceEvent,
 ) -> Result<Vec<SocketAddrV4>> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect(SocketAddr::V4(tracker)).await?;
@@ -29,7 +34,16 @@ pub async fn announce(
 
     // announce
     let atxid: u32 = rand::random();
-    let req = build_announce_request(connection_id, atxid, infohash, peer_id, port, num_want, &transfer, event);
+    let req = build_announce_request(
+        connection_id,
+        atxid,
+        infohash,
+        peer_id,
+        port,
+        num_want,
+        &transfer,
+        event,
+    );
     sock.send(&req).await?;
     let n = recv(&sock, &mut buf).await?;
     let (_interval, peers) = parse_announce_response(&buf[..n], atxid)?;
@@ -73,15 +87,26 @@ mod tests {
             ar.extend_from_slice(&1800u32.to_be_bytes());
             ar.extend_from_slice(&0u32.to_be_bytes());
             ar.extend_from_slice(&1u32.to_be_bytes());
-            ar.extend_from_slice(&[9, 9, 9, 9]); ar.extend_from_slice(&1234u16.to_be_bytes());
+            ar.extend_from_slice(&[9, 9, 9, 9]);
+            ar.extend_from_slice(&1234u16.to_be_bytes());
             server.send_to(&ar, peer).await.unwrap();
         });
 
-        let server_v4 = match server_addr { std::net::SocketAddr::V4(a) => a, _ => panic!("want v4") };
+        let server_v4 = match server_addr {
+            std::net::SocketAddr::V4(a) => a,
+            _ => panic!("want v4"),
+        };
         let peers = announce(
-            server_v4, &[1u8; 20], &[2u8; 20], 6881, 50, TransferState::default(), AnnounceEvent::Started,
+            server_v4,
+            &[1u8; 20],
+            &[2u8; 20],
+            6881,
+            50,
+            TransferState::default(),
+            AnnounceEvent::Started,
         )
-            .await.unwrap();
+        .await
+        .unwrap();
         assert_eq!(peers, vec!["9.9.9.9:1234".parse().unwrap()]);
         handle.await.unwrap();
     }
@@ -90,12 +115,29 @@ mod tests {
     #[ignore] // live network: hits the real Acestream tracker
     async fn announce_against_real_tracker() {
         use tokio::net::lookup_host;
-        let addr = lookup_host("t1.torrentstream.org:2710").await.unwrap().next().unwrap();
-        let v4 = match addr { std::net::SocketAddr::V4(a) => a, _ => panic!("want v4") };
+        let addr = lookup_host("t1.torrentstream.org:2710")
+            .await
+            .unwrap()
+            .next()
+            .unwrap();
+        let v4 = match addr {
+            std::net::SocketAddr::V4(a) => a,
+            _ => panic!("want v4"),
+        };
         let infohash = hex::decode("50e93529d3eb46a50506b14464185a15292d6e47").unwrap();
-        let mut ih = [0u8; 20]; ih.copy_from_slice(&infohash);
-        let peers = announce(v4, &ih, &[7u8; 20], 6881, 50, TransferState::default(), AnnounceEvent::Started)
-            .await.unwrap();
+        let mut ih = [0u8; 20];
+        ih.copy_from_slice(&infohash);
+        let peers = announce(
+            v4,
+            &ih,
+            &[7u8; 20],
+            6881,
+            50,
+            TransferState::default(),
+            AnnounceEvent::Started,
+        )
+        .await
+        .unwrap();
         println!("live tracker returned {} peers", peers.len());
     }
 }

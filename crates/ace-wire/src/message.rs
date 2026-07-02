@@ -19,14 +19,32 @@ pub enum PeerMessage {
     NotInterested,
     Have(u32),
     Bitfield(Vec<u8>),
-    Request { index: u32, begin: u32, length: u32 },
-    Piece { index: u32, begin: u32, block: Vec<u8> },
-    Cancel { index: u32, begin: u32, length: u32 },
-    Extended { ext_id: u8, payload: Vec<u8> },
+    Request {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        block: Vec<u8>,
+    },
+    Cancel {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Extended {
+        ext_id: u8,
+        payload: Vec<u8>,
+    },
     /// A message id we don't model (Acestream/BEP-6 extras like HAVE_ALL/HAVE_NONE,
     /// reject/allowed-fast, or vendor-custom). Preserved so callers can skip it rather
     /// than tear down the connection.
-    Unknown { id: u8, payload: Vec<u8> },
+    Unknown {
+        id: u8,
+        payload: Vec<u8>,
+    },
 }
 
 impl PeerMessage {
@@ -38,25 +56,52 @@ impl PeerMessage {
             PeerMessage::Unchoke => body.push(1),
             PeerMessage::Interested => body.push(2),
             PeerMessage::NotInterested => body.push(3),
-            PeerMessage::Have(i) => { body.push(4); body.extend_from_slice(&i.to_be_bytes()); }
-            PeerMessage::Bitfield(b) => { body.push(5); body.extend_from_slice(b); }
-            PeerMessage::Request { index, begin, length } => {
-                body.push(6); body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes()); body.extend_from_slice(&length.to_be_bytes());
+            PeerMessage::Have(i) => {
+                body.push(4);
+                body.extend_from_slice(&i.to_be_bytes());
             }
-            PeerMessage::Piece { index, begin, block } => {
-                body.push(7); body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes()); body.extend_from_slice(block);
+            PeerMessage::Bitfield(b) => {
+                body.push(5);
+                body.extend_from_slice(b);
             }
-            PeerMessage::Cancel { index, begin, length } => {
-                body.push(8); body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes()); body.extend_from_slice(&length.to_be_bytes());
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => {
+                body.push(6);
+                body.extend_from_slice(&index.to_be_bytes());
+                body.extend_from_slice(&begin.to_be_bytes());
+                body.extend_from_slice(&length.to_be_bytes());
+            }
+            PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            } => {
+                body.push(7);
+                body.extend_from_slice(&index.to_be_bytes());
+                body.extend_from_slice(&begin.to_be_bytes());
+                body.extend_from_slice(block);
+            }
+            PeerMessage::Cancel {
+                index,
+                begin,
+                length,
+            } => {
+                body.push(8);
+                body.extend_from_slice(&index.to_be_bytes());
+                body.extend_from_slice(&begin.to_be_bytes());
+                body.extend_from_slice(&length.to_be_bytes());
             }
             PeerMessage::Extended { ext_id, payload } => {
-                body.push(20); body.push(*ext_id); body.extend_from_slice(payload);
+                body.push(20);
+                body.push(*ext_id);
+                body.extend_from_slice(payload);
             }
             PeerMessage::Unknown { id, payload } => {
-                body.push(*id); body.extend_from_slice(payload);
+                body.push(*id);
+                body.extend_from_slice(payload);
             }
         }
         let mut out = (body.len() as u32).to_be_bytes().to_vec();
@@ -67,15 +112,21 @@ impl PeerMessage {
     /// Decode one frame from the front of `buf`.
     /// Returns Ok(None) if more bytes are needed (incomplete frame).
     pub fn decode(buf: &[u8]) -> Result<Option<(PeerMessage, usize)>> {
-        if buf.len() < 4 { return Ok(None); }
+        if buf.len() < 4 {
+            return Ok(None);
+        }
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         if len > MAX_FRAME_LEN {
             return Err(WireError::Invalid("frame too large"));
         }
         let total = 4 + len;
-        if buf.len() < total { return Ok(None); }
+        if buf.len() < total {
+            return Ok(None);
+        }
         let body = &buf[4..total];
-        if len == 0 { return Ok(Some((PeerMessage::KeepAlive, total))); }
+        if len == 0 {
+            return Ok(Some((PeerMessage::KeepAlive, total)));
+        }
         let id = body[0];
         let p = &body[1..];
         // Standard BT ids decode to their typed variant only when the payload length is
@@ -89,13 +140,31 @@ impl PeerMessage {
             3 if p.is_empty() => Some(PeerMessage::NotInterested),
             4 if p.len() == 4 => Some(PeerMessage::Have(be32(p, 0)?)),
             5 => Some(PeerMessage::Bitfield(p.to_vec())),
-            6 if p.len() == 12 => Some(PeerMessage::Request { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? }),
-            7 if p.len() >= 8 => Some(PeerMessage::Piece { index: be32(p, 0)?, begin: be32(p, 4)?, block: p[8..].to_vec() }),
-            8 if p.len() == 12 => Some(PeerMessage::Cancel { index: be32(p, 0)?, begin: be32(p, 4)?, length: be32(p, 8)? }),
-            20 if !p.is_empty() => Some(PeerMessage::Extended { ext_id: p[0], payload: p[1..].to_vec() }),
+            6 if p.len() == 12 => Some(PeerMessage::Request {
+                index: be32(p, 0)?,
+                begin: be32(p, 4)?,
+                length: be32(p, 8)?,
+            }),
+            7 if p.len() >= 8 => Some(PeerMessage::Piece {
+                index: be32(p, 0)?,
+                begin: be32(p, 4)?,
+                block: p[8..].to_vec(),
+            }),
+            8 if p.len() == 12 => Some(PeerMessage::Cancel {
+                index: be32(p, 0)?,
+                begin: be32(p, 4)?,
+                length: be32(p, 8)?,
+            }),
+            20 if !p.is_empty() => Some(PeerMessage::Extended {
+                ext_id: p[0],
+                payload: p[1..].to_vec(),
+            }),
             _ => None,
         };
-        let msg = typed.unwrap_or(PeerMessage::Unknown { id, payload: p.to_vec() });
+        let msg = typed.unwrap_or(PeerMessage::Unknown {
+            id,
+            payload: p.to_vec(),
+        });
         Ok(Some((msg, total)))
     }
 }
@@ -112,12 +181,19 @@ mod tests {
     #[test]
     fn keepalive_roundtrip() {
         assert_eq!(PeerMessage::KeepAlive.encode(), vec![0, 0, 0, 0]);
-        assert_eq!(PeerMessage::decode(&[0, 0, 0, 0]).unwrap(), Some((PeerMessage::KeepAlive, 4)));
+        assert_eq!(
+            PeerMessage::decode(&[0, 0, 0, 0]).unwrap(),
+            Some((PeerMessage::KeepAlive, 4))
+        );
     }
 
     #[test]
     fn request_roundtrip() {
-        let m = PeerMessage::Request { index: 1, begin: 16384, length: 16384 };
+        let m = PeerMessage::Request {
+            index: 1,
+            begin: 16384,
+            length: 16384,
+        };
         let enc = m.encode();
         // len = 13 (1 id + 12 payload)
         assert_eq!(&enc[..5], &[0, 0, 0, 13, 6]);
@@ -126,7 +202,10 @@ mod tests {
 
     #[test]
     fn extended_roundtrip() {
-        let m = PeerMessage::Extended { ext_id: 0, payload: b"de".to_vec() };
+        let m = PeerMessage::Extended {
+            ext_id: 0,
+            payload: b"de".to_vec(),
+        };
         let enc = m.encode();
         assert_eq!(&enc[..6], &[0, 0, 0, 4, 20, 0]); // len=4, id=20, ext_id=0
         assert_eq!(PeerMessage::decode(&enc).unwrap(), Some((m, enc.len())));
@@ -161,7 +240,13 @@ mod tests {
         let buf = [0, 0, 0, 2, 0, 0xFF];
         assert_eq!(
             PeerMessage::decode(&buf).unwrap(),
-            Some((PeerMessage::Unknown { id: 0, payload: vec![0xFF] }, 6))
+            Some((
+                PeerMessage::Unknown {
+                    id: 0,
+                    payload: vec![0xFF]
+                },
+                6
+            ))
         );
     }
 
@@ -171,7 +256,13 @@ mod tests {
         let buf = [0, 0, 0, 6, 4, 0, 0, 0, 1, 0xFF];
         assert_eq!(
             PeerMessage::decode(&buf).unwrap(),
-            Some((PeerMessage::Unknown { id: 4, payload: vec![0, 0, 0, 1, 0xFF] }, 10))
+            Some((
+                PeerMessage::Unknown {
+                    id: 4,
+                    payload: vec![0, 0, 0, 1, 0xFF]
+                },
+                10
+            ))
         );
     }
 

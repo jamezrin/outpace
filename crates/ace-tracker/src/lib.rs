@@ -17,7 +17,9 @@ pub enum TrackerError {
 }
 
 impl From<std::io::Error> for TrackerError {
-    fn from(e: std::io::Error) -> Self { TrackerError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        TrackerError::Io(e)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, TrackerError>;

@@ -30,7 +30,11 @@ struct HlsState {
 impl HlsPackager {
     fn new(seg_packets: usize, window: usize, seg_duration: f32) -> Arc<HlsPackager> {
         Arc::new(HlsPackager {
-            state: Mutex::new(HlsState { media_seq: 0, segments: VecDeque::new(), cur: Vec::new() }),
+            state: Mutex::new(HlsState {
+                media_seq: 0,
+                segments: VecDeque::new(),
+                cur: Vec::new(),
+            }),
             seg_packets,
             window,
             seg_duration,
@@ -75,11 +79,17 @@ impl HlsPackager {
     pub fn playlist(&self, network: &str, id: &str) -> String {
         let st = self.state.lock().unwrap();
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
-        out.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", self.seg_duration.ceil() as u64));
+        out.push_str(&format!(
+            "#EXT-X-TARGETDURATION:{}\n",
+            self.seg_duration.ceil() as u64
+        ));
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", st.media_seq));
         for i in 0..st.segments.len() as u64 {
             out.push_str(&format!("#EXTINF:{:.3},\n", self.seg_duration));
-            out.push_str(&format!("/streams/{network}/{id}/seg/{}.ts\n", st.media_seq + i));
+            out.push_str(&format!(
+                "/streams/{network}/{id}/seg/{}.ts\n",
+                st.media_seq + i
+            ));
         }
         out
     }

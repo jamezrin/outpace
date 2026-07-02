@@ -26,11 +26,17 @@ pub fn build_connect_request(txid: u32) -> [u8; 16] {
 }
 
 pub fn parse_connect_response(buf: &[u8], txid: u32) -> Result<u64> {
-    if buf.len() < 16 { return Err(TrackerError::Malformed("connect resp < 16")); }
+    if buf.len() < 16 {
+        return Err(TrackerError::Malformed("connect resp < 16"));
+    }
     let action = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let rtxid = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    if rtxid != txid { return Err(TrackerError::TransactionMismatch); }
-    if action != ACTION_CONNECT { return Err(TrackerError::Malformed("not a connect action")); }
+    if rtxid != txid {
+        return Err(TrackerError::TransactionMismatch);
+    }
+    if action != ACTION_CONNECT {
+        return Err(TrackerError::Malformed("not a connect action"));
+    }
     let mut c = [0u8; 8];
     c.copy_from_slice(&buf[8..16]);
     Ok(u64::from_be_bytes(c))
@@ -51,8 +57,14 @@ pub struct TransferState {
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_announce_request(
-    connection_id: u64, txid: u32, infohash: &[u8; 20], peer_id: &[u8; 20],
-    port: u16, num_want: i32, transfer: &TransferState, event: AnnounceEvent,
+    connection_id: u64,
+    txid: u32,
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    num_want: i32,
+    transfer: &TransferState,
+    event: AnnounceEvent,
 ) -> Vec<u8> {
     let mut b = Vec::with_capacity(98);
     b.extend_from_slice(&connection_id.to_be_bytes());
@@ -73,16 +85,24 @@ pub fn build_announce_request(
 
 /// Returns (interval_seconds, peers).
 pub fn parse_announce_response(buf: &[u8], txid: u32) -> Result<(u32, Vec<SocketAddrV4>)> {
-    if buf.len() < 8 { return Err(TrackerError::Malformed("announce resp < 8")); }
+    if buf.len() < 8 {
+        return Err(TrackerError::Malformed("announce resp < 8"));
+    }
     let action = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let rtxid = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    if rtxid != txid { return Err(TrackerError::TransactionMismatch); }
+    if rtxid != txid {
+        return Err(TrackerError::TransactionMismatch);
+    }
     if action == ACTION_ERROR {
         let msg = String::from_utf8_lossy(&buf[8..]).into_owned();
         return Err(TrackerError::Tracker(msg));
     }
-    if action != ACTION_ANNOUNCE { return Err(TrackerError::Malformed("not an announce action")); }
-    if buf.len() < 20 { return Err(TrackerError::Malformed("announce header < 20")); }
+    if action != ACTION_ANNOUNCE {
+        return Err(TrackerError::Malformed("not an announce action"));
+    }
+    if buf.len() < 20 {
+        return Err(TrackerError::Malformed("announce header < 20"));
+    }
     let interval = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let mut peers = Vec::new();
     let mut i = 20;
@@ -104,7 +124,7 @@ mod tests {
     fn connect_request_layout() {
         let req = build_connect_request(0x1122_3344);
         assert_eq!(&req[0..8], &0x41727101980u64.to_be_bytes()); // magic protocol id
-        assert_eq!(&req[8..12], &0u32.to_be_bytes());            // action = connect
+        assert_eq!(&req[8..12], &0u32.to_be_bytes()); // action = connect
         assert_eq!(&req[12..16], &0x1122_3344u32.to_be_bytes()); // txid
     }
 
@@ -112,31 +132,54 @@ mod tests {
     fn parse_connect_roundtrip() {
         let txid: u32 = 0xAABB_CCDD;
         let mut resp = Vec::new();
-        resp.extend_from_slice(&0u32.to_be_bytes());          // action connect
-        resp.extend_from_slice(&txid.to_be_bytes());          // txid
+        resp.extend_from_slice(&0u32.to_be_bytes()); // action connect
+        resp.extend_from_slice(&txid.to_be_bytes()); // txid
         resp.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes()); // conn id
-        assert_eq!(parse_connect_response(&resp, txid).unwrap(), 0x0102_0304_0506_0708);
+        assert_eq!(
+            parse_connect_response(&resp, txid).unwrap(),
+            0x0102_0304_0506_0708
+        );
         // wrong txid rejected
         assert!(parse_connect_response(&resp, txid ^ 1).is_err());
     }
 
     #[test]
     fn announce_request_layout() {
-        let req = build_announce_request(0x0102_0304_0506_0708, 0x1111_2222,
-            &[0xAB; 20], &[0xCD; 20], 6881, 50, &TransferState::default(), AnnounceEvent::Started);
+        let req = build_announce_request(
+            0x0102_0304_0506_0708,
+            0x1111_2222,
+            &[0xAB; 20],
+            &[0xCD; 20],
+            6881,
+            50,
+            &TransferState::default(),
+            AnnounceEvent::Started,
+        );
         assert_eq!(req.len(), 98);
         assert_eq!(&req[0..8], &0x0102_0304_0506_0708u64.to_be_bytes()); // conn id
-        assert_eq!(&req[8..12], &1u32.to_be_bytes());                    // action announce
-        assert_eq!(&req[16..36], &[0xABu8; 20]);                         // infohash
-        assert_eq!(&req[36..56], &[0xCDu8; 20]);                         // peer id
-        assert_eq!(&req[96..98], &6881u16.to_be_bytes());                // port
+        assert_eq!(&req[8..12], &1u32.to_be_bytes()); // action announce
+        assert_eq!(&req[16..36], &[0xABu8; 20]); // infohash
+        assert_eq!(&req[36..56], &[0xCDu8; 20]); // peer id
+        assert_eq!(&req[96..98], &6881u16.to_be_bytes()); // port
     }
 
     #[test]
     fn announce_request_encodes_caller_transfer_counters() {
-        let t = TransferState { downloaded: 0x1122, left: 0x3344, uploaded: 0x5566 };
-        let req = build_announce_request(0x0102_0304_0506_0708, 0x1111_2222,
-            &[0xAB; 20], &[0xCD; 20], 6881, 50, &t, AnnounceEvent::Started);
+        let t = TransferState {
+            downloaded: 0x1122,
+            left: 0x3344,
+            uploaded: 0x5566,
+        };
+        let req = build_announce_request(
+            0x0102_0304_0506_0708,
+            0x1111_2222,
+            &[0xAB; 20],
+            &[0xCD; 20],
+            6881,
+            50,
+            &t,
+            AnnounceEvent::Started,
+        );
         assert_eq!(&req[56..64], &0x1122u64.to_be_bytes()); // downloaded
         assert_eq!(&req[64..72], &0x3344u64.to_be_bytes()); // left
         assert_eq!(&req[72..80], &0x5566u64.to_be_bytes()); // uploaded
@@ -144,8 +187,21 @@ mod tests {
 
     #[test]
     fn announce_event_is_encoded_at_the_documented_offset() {
-        let t = TransferState { downloaded: 0, left: 0, uploaded: 0 };
-        let req = build_announce_request(1, 2, &[0u8; 20], &[0u8; 20], 6881, -1, &t, AnnounceEvent::Completed);
+        let t = TransferState {
+            downloaded: 0,
+            left: 0,
+            uploaded: 0,
+        };
+        let req = build_announce_request(
+            1,
+            2,
+            &[0u8; 20],
+            &[0u8; 20],
+            6881,
+            -1,
+            &t,
+            AnnounceEvent::Completed,
+        );
         assert_eq!(&req[80..84], &1u32.to_be_bytes()); // Completed = 1
     }
 
@@ -153,19 +209,24 @@ mod tests {
     fn parse_announce_peers() {
         let txid: u32 = 0x1111_2222;
         let mut resp = Vec::new();
-        resp.extend_from_slice(&1u32.to_be_bytes());   // action announce
-        resp.extend_from_slice(&txid.to_be_bytes());   // txid
+        resp.extend_from_slice(&1u32.to_be_bytes()); // action announce
+        resp.extend_from_slice(&txid.to_be_bytes()); // txid
         resp.extend_from_slice(&1800u32.to_be_bytes()); // interval
-        resp.extend_from_slice(&0u32.to_be_bytes());    // leechers
-        resp.extend_from_slice(&2u32.to_be_bytes());    // seeders
-        resp.extend_from_slice(&[5, 252, 161, 218]); resp.extend_from_slice(&2710u16.to_be_bytes());
-        resp.extend_from_slice(&[1, 2, 3, 4]);          resp.extend_from_slice(&8621u16.to_be_bytes());
+        resp.extend_from_slice(&0u32.to_be_bytes()); // leechers
+        resp.extend_from_slice(&2u32.to_be_bytes()); // seeders
+        resp.extend_from_slice(&[5, 252, 161, 218]);
+        resp.extend_from_slice(&2710u16.to_be_bytes());
+        resp.extend_from_slice(&[1, 2, 3, 4]);
+        resp.extend_from_slice(&8621u16.to_be_bytes());
         let (interval, peers) = parse_announce_response(&resp, txid).unwrap();
         assert_eq!(interval, 1800);
-        assert_eq!(peers, vec![
-            "5.252.161.218:2710".parse::<SocketAddrV4>().unwrap(),
-            "1.2.3.4:8621".parse::<SocketAddrV4>().unwrap(),
-        ]);
+        assert_eq!(
+            peers,
+            vec![
+                "5.252.161.218:2710".parse::<SocketAddrV4>().unwrap(),
+                "1.2.3.4:8621".parse::<SocketAddrV4>().unwrap(),
+            ]
+        );
     }
 
     #[test]
@@ -175,6 +236,9 @@ mod tests {
         resp.extend_from_slice(&3u32.to_be_bytes()); // action = error
         resp.extend_from_slice(&txid.to_be_bytes());
         resp.extend_from_slice(b"nope");
-        assert!(matches!(parse_announce_response(&resp, txid), Err(crate::TrackerError::Tracker(_))));
+        assert!(matches!(
+            parse_announce_response(&resp, txid),
+            Err(crate::TrackerError::Tracker(_))
+        ));
     }
 }

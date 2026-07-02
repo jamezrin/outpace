@@ -16,7 +16,11 @@ pub enum Route {
     /// `GET /ace/stat/<infohash>/<token>` — session stats.
     Stat { infohash: String, token: String },
     /// `GET /ace/cmd/<infohash>/<token>?method=<m>` — session command (e.g. stop).
-    Command { infohash: String, token: String, method: String },
+    Command {
+        infohash: String,
+        token: String,
+        method: String,
+    },
     /// `/server/api` — JSON control API.
     ServerApi,
     /// Anything unmatched.
@@ -45,7 +49,12 @@ fn query_pairs(query: &str) -> Vec<(&str, &str)> {
 
 fn selector_from(query: &str) -> ContentSelector {
     let pairs = query_pairs(query);
-    let get = |k: &str| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| v.to_string());
+    let get = |k: &str| {
+        pairs
+            .iter()
+            .find(|(pk, _)| *pk == k)
+            .map(|(_, v)| v.to_string())
+    };
     // content_id wins (acestream ids), per the engine API quirk.
     if let Some(v) = get("content_id") {
         ContentSelector::ContentId(v)
@@ -65,10 +74,14 @@ pub fn parse(method: &str, path: &str, query: &str) -> Route {
         return Route::NotFound;
     }
     if path == "/ace/getstream" {
-        return Route::GetStream { selector: selector_from(query) };
+        return Route::GetStream {
+            selector: selector_from(query),
+        };
     }
     if path == "/ace/manifest.m3u8" {
-        return Route::Manifest { selector: selector_from(query) };
+        return Route::Manifest {
+            selector: selector_from(query),
+        };
     }
     if path == "/server/api" {
         return Route::ServerApi;
@@ -77,11 +90,17 @@ pub fn parse(method: &str, path: &str, query: &str) -> Route {
     match seg.as_slice() {
         ["ace", "c", session, file] if file.ends_with(".ts") => {
             if let Ok(n) = file.trim_end_matches(".ts").parse::<u64>() {
-                return Route::Segment { session: (*session).to_string(), seq: n };
+                return Route::Segment {
+                    session: (*session).to_string(),
+                    seq: n,
+                };
             }
         }
         ["ace", "stat", ih, token] => {
-            return Route::Stat { infohash: (*ih).to_string(), token: (*token).to_string() };
+            return Route::Stat {
+                infohash: (*ih).to_string(),
+                token: (*token).to_string(),
+            };
         }
         ["ace", "cmd", ih, token] => {
             let method_q = query_pairs(query)
@@ -108,7 +127,9 @@ mod tests {
     fn getstream_prefers_content_id() {
         assert_eq!(
             parse("GET", "/ace/getstream", "content_id=abc&infohash=def"),
-            Route::GetStream { selector: ContentSelector::ContentId("abc".into()) }
+            Route::GetStream {
+                selector: ContentSelector::ContentId("abc".into())
+            }
         );
     }
 
@@ -116,15 +137,21 @@ mod tests {
     fn getstream_falls_back_to_infohash_then_id() {
         assert_eq!(
             parse("GET", "/ace/getstream", "infohash=def"),
-            Route::GetStream { selector: ContentSelector::Infohash("def".into()) }
+            Route::GetStream {
+                selector: ContentSelector::Infohash("def".into())
+            }
         );
         assert_eq!(
             parse("GET", "/ace/getstream", "id=xyz"),
-            Route::GetStream { selector: ContentSelector::Id("xyz".into()) }
+            Route::GetStream {
+                selector: ContentSelector::Id("xyz".into())
+            }
         );
         assert_eq!(
             parse("GET", "/ace/getstream", ""),
-            Route::GetStream { selector: ContentSelector::Missing }
+            Route::GetStream {
+                selector: ContentSelector::Missing
+            }
         );
     }
 
@@ -132,7 +159,10 @@ mod tests {
     fn parses_segment_path() {
         assert_eq!(
             parse("GET", "/ace/c/sess123/42.ts", ""),
-            Route::Segment { session: "sess123".into(), seq: 42 }
+            Route::Segment {
+                session: "sess123".into(),
+                seq: 42
+            }
         );
     }
 
@@ -140,11 +170,18 @@ mod tests {
     fn parses_stat_and_command() {
         assert_eq!(
             parse("GET", "/ace/stat/IH/TOK", ""),
-            Route::Stat { infohash: "IH".into(), token: "TOK".into() }
+            Route::Stat {
+                infohash: "IH".into(),
+                token: "TOK".into()
+            }
         );
         assert_eq!(
             parse("GET", "/ace/cmd/IH/TOK", "method=stop"),
-            Route::Command { infohash: "IH".into(), token: "TOK".into(), method: "stop".into() }
+            Route::Command {
+                infohash: "IH".into(),
+                token: "TOK".into(),
+                method: "stop".into()
+            }
         );
     }
 
@@ -152,7 +189,9 @@ mod tests {
     fn manifest_and_server_api() {
         assert_eq!(
             parse("GET", "/ace/manifest.m3u8", "id=z"),
-            Route::Manifest { selector: ContentSelector::Id("z".into()) }
+            Route::Manifest {
+                selector: ContentSelector::Id("z".into())
+            }
         );
         assert_eq!(parse("GET", "/server/api", ""), Route::ServerApi);
     }
@@ -160,7 +199,13 @@ mod tests {
     #[test]
     fn unknown_and_non_get_are_not_found() {
         assert_eq!(parse("GET", "/nope", ""), Route::NotFound);
-        assert_eq!(parse("POST", "/ace/getstream", "content_id=a"), Route::NotFound);
-        assert_eq!(parse("GET", "/ace/c/sess/notanumber.ts", ""), Route::NotFound);
+        assert_eq!(
+            parse("POST", "/ace/getstream", "content_id=a"),
+            Route::NotFound
+        );
+        assert_eq!(
+            parse("GET", "/ace/c/sess/notanumber.ts", ""),
+            Route::NotFound
+        );
     }
 }

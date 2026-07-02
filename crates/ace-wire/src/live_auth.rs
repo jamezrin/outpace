@@ -33,8 +33,8 @@
 //! - `authmethod` = literal ASCII `"RSA"`.
 
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
-use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::pkcs1v15::Pkcs1v15Sign;
+use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sha1::{Digest, Sha1};
@@ -52,8 +52,8 @@ pub struct LiveSourceAuth {
 impl LiveSourceAuth {
     /// Mint a fresh keypair.
     pub fn generate() -> Self {
-        let key = RsaPrivateKey::new(&mut rand::thread_rng(), KEY_BITS)
-            .expect("RSA key generation");
+        let key =
+            RsaPrivateKey::new(&mut rand::thread_rng(), KEY_BITS).expect("RSA key generation");
         LiveSourceAuth { key }
     }
 
@@ -109,7 +109,19 @@ pub fn verify_piece(pubkey_der: &[u8], payload: &[u8], signature: &[u8]) -> bool
         return false;
     };
     let digest = Sha1::digest(payload);
-    pubkey.verify(Pkcs1v15Sign::new::<Sha1>(), &digest, signature).is_ok()
+    pubkey
+        .verify(Pkcs1v15Sign::new::<Sha1>(), &digest, signature)
+        .is_ok()
+}
+
+/// The live-source signature length for a broadcaster's `pubkey` (the transport descriptor's
+/// DER SubjectPublicKeyInfo) — the RSA modulus's byte length, i.e. how many trailing bytes of
+/// each wire piece are the in-band signature (see the module docs / B0). Returns `None` if the
+/// bytes aren't a parseable RSA public key.
+pub fn signature_len_from_pubkey_der(pubkey_der: &[u8]) -> Option<usize> {
+    RsaPublicKey::from_public_key_der(pubkey_der)
+        .ok()
+        .map(|k| k.size())
 }
 
 /// Split a wire piece into `(payload, signature)` given the signer's signature length —
@@ -131,7 +143,11 @@ mod tests {
         let a = LiveSourceAuth::generate();
         let pem = a.to_pkcs1_pem();
         let b = LiveSourceAuth::from_pkcs1_pem(&pem).unwrap();
-        assert_eq!(a.pubkey_der(), b.pubkey_der(), "same key reloaded from PEM -> same pubkey");
+        assert_eq!(
+            a.pubkey_der(),
+            b.pubkey_der(),
+            "same key reloaded from PEM -> same pubkey"
+        );
     }
 
     #[test]
@@ -169,7 +185,11 @@ lFnyUtHCJzkA4A01o5sLQecDwC9Zvq0jlUltCeM=\n\
 3910699a8eca3fad941fa05fc5572320b06b8a985a0a86f1679c63f2841aac37bb7b6db2a359b5d60fdd2a3020103";
 
         let auth = LiveSourceAuth::from_pkcs1_pem(pem).unwrap();
-        let der_hex: String = auth.pubkey_der().iter().map(|b| format!("{b:02x}")).collect();
+        let der_hex: String = auth
+            .pubkey_der()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert_eq!(der_hex, expected_pubkey_der);
     }
 
@@ -207,7 +227,10 @@ w7burR2QqD9OS/n92TGQ2S3yyv5k6oG00re0J44=\n\
 
     fn captured_piece(idx: u32) -> Vec<u8> {
         let path = format!(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors/live-source-auth/piece-{}.bin"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/vectors/live-source-auth/piece-{}.bin"
+            ),
             idx
         );
         std::fs::read(path).expect("real captured piece vector")
@@ -254,7 +277,10 @@ w7burR2QqD9OS/n92TGQ2S3yyv5k6oG00re0J44=\n\
             let piece = captured_piece(idx);
             let (payload, real_sig) = split_piece(&piece, auth.signature_len()).unwrap();
             let our_sig = auth.sign(payload);
-            assert_eq!(our_sig, real_sig, "piece {idx}: re-signing must match the real engine byte-for-byte");
+            assert_eq!(
+                our_sig, real_sig,
+                "piece {idx}: re-signing must match the real engine byte-for-byte"
+            );
         }
     }
 }

@@ -98,6 +98,11 @@ against a real live channel; this one is self-contained, no real swarm dependenc
 
 ## Infohash formula bug found — IMPORTANT, needs fixing before B1
 
+> **2026-07-01 correction:** resolved in `29-infohash-formula-cracked.md`. The
+> `SHA1(bytes)` value is the raw transport-file/cache hash. The peer-wire infohash is the
+> selected-field descriptor hash; the "does not contradict" explanation below was the
+> intermediate wrong interpretation.
+
 `docs/protocol/transport-file.md` states (as "VALIDATED"): `infohash = SHA1(entire
 transport-file bytes, including the magic)`. **This is wrong for at least the freshly-minted
 source-node case**: `SHA1(test.acelive)` = `8123456789abcdef0123456789abcdef01234567`, but the

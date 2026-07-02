@@ -27,7 +27,13 @@ pub struct TsChunker {
 impl TsChunker {
     /// `piece_length` must be a positive multiple of `chunk_length`, and `chunk_length` > 0.
     pub fn new(piece_length: u64, chunk_length: u64, start_piece: u64) -> Self {
-        TsChunker { piece_length, chunk_length, start_piece, buf: Vec::new(), abs: 0 }
+        TsChunker {
+            piece_length,
+            chunk_length,
+            start_piece,
+            buf: Vec::new(),
+            abs: 0,
+        }
     }
 
     /// Append `bytes`; return every full `chunk_length` chunk now available, in order.
@@ -98,7 +104,10 @@ mod tests {
         let input: Vec<u8> = (0..24u8).collect();
         let mut c = TsChunker::new(8, 4, 0);
         let chunks = c.push(&input);
-        assert!(c.flush().is_none(), "input is a multiple of chunk_length; nothing to flush");
+        assert!(
+            c.flush().is_none(),
+            "input is a multiple of chunk_length; nothing to flush"
+        );
 
         let mut r = PieceReassembler::new(8, 0);
         for chunk in &chunks {

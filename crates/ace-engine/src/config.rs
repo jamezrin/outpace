@@ -28,9 +28,9 @@ pub struct Config {
     /// Reciprocal upload over connections we initiate (S1): answering a peer's
     /// `Interested`/chunk-requests and advertising `Have` for newly-completed pieces.
     pub enable_seeding: bool,
-    /// Accept inbound peer connections and seed them (S2). Defaults OFF: the served piece
-    /// header is still a placeholder until engine ground truth pins its real bytes — see
-    /// docs/RESUME.md "Next: v2" / Task 7.
+    /// Accept inbound peer connections and seed them (S2). Defaults OFF so operators do not
+    /// expose a peer listener unless they opt in, even though the live piece-header acceptance
+    /// gap is closed (note 33).
     pub enable_inbound: bool,
 }
 
@@ -71,8 +71,8 @@ pub fn load_or_create_identity(data_dir: &Path) -> std::io::Result<Identity> {
 
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -116,6 +116,9 @@ mod tests {
         assert_eq!(c.max_unchoked, 8);
         assert_eq!(c.max_inbound_peers, 64);
         assert!(c.enable_seeding);
-        assert!(!c.enable_inbound, "inbound serving must default off until piece_header is pinned");
+        assert!(
+            !c.enable_inbound,
+            "inbound serving remains opt-in by default"
+        );
     }
 }

@@ -17,6 +17,10 @@ struct Partial {
 pub struct PieceReassembler {
     piece_length: u64,
     next_emit: u64,
+    /// Trailing bytes of every piece that are NOT media and must be dropped before emitting
+    /// (Acestream live pieces carry a per-piece RSA source signature as their last `sig_len`
+    /// bytes; emitting it would inject non-TS bytes at every piece boundary — see B0/note 27).
+    piece_trailer: u64,
     partial: BTreeMap<u64, Partial>,
     complete: BTreeMap<u64, Vec<u8>>,
 }
@@ -28,9 +32,20 @@ impl PieceReassembler {
         PieceReassembler {
             piece_length,
             next_emit: start_piece,
+            piece_trailer: 0,
             partial: BTreeMap::new(),
             complete: BTreeMap::new(),
         }
+    }
+
+    /// Set the number of trailing bytes to drop from each emitted piece — the live-source
+    /// signature length (`sig_len`, the RSA modulus's byte length). Blocks are still received
+    /// over the full `piece_length`; only the emitted media stream has the tail removed, so
+    /// the pieces byte-chain into a clean, packet-aligned MPEG-TS stream. `0` (the default)
+    /// emits pieces verbatim.
+    pub fn with_piece_trailer(mut self, sig_len: u64) -> Self {
+        self.piece_trailer = sig_len.min(self.piece_length);
+        self
     }
 
     /// Place a received block at `begin` within piece `index`. Blocks for already-emitted
@@ -46,10 +61,10 @@ impl PieceReassembler {
         if end > self.piece_length {
             return Err(WireError::Invalid("block exceeds piece length"));
         }
-        let p = self
-            .partial
-            .entry(index)
-            .or_insert_with(|| Partial { buf: vec![0u8; self.piece_length as usize], filled: 0 });
+        let p = self.partial.entry(index).or_insert_with(|| Partial {
+            buf: vec![0u8; self.piece_length as usize],
+            filled: 0,
+        });
         p.buf[begin as usize..end as usize].copy_from_slice(block);
         p.filled += block.len() as u64;
         if p.filled >= self.piece_length {
@@ -64,7 +79,8 @@ impl PieceReassembler {
     pub fn take_ready(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         while let Some(bytes) = self.complete.remove(&self.next_emit) {
-            out.extend_from_slice(&bytes);
+            let media_end = bytes.len().saturating_sub(self.piece_trailer as usize);
+            out.extend_from_slice(&bytes[..media_end]);
             self.next_emit += 1;
         }
         out
@@ -163,6 +179,23 @@ mod tests {
         r.add_block(3, 0, &[7, 7]).unwrap();
         // Only piece 3 onward emits; the stale piece 1/2 data must not leak out.
         assert_eq!(r.take_ready(), vec![7, 7]);
+    }
+
+    #[test]
+    fn piece_trailer_is_dropped_from_each_emitted_piece() {
+        // piece_length 6, 2-byte signature trailer: only the first 4 media bytes of each
+        // piece are emitted, and consecutive pieces byte-chain with no trailer bytes between.
+        let mut r = PieceReassembler::new(6, 0).with_piece_trailer(2);
+        r.add_block(0, 0, &[1, 2, 3, 4, 0xAA, 0xBB]).unwrap(); // 0xAA,0xBB = signature
+        r.add_block(1, 0, &[5, 6, 7, 8, 0xCC, 0xDD]).unwrap();
+        assert_eq!(r.take_ready(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn piece_trailer_defaults_to_zero() {
+        let mut r = PieceReassembler::new(4, 0);
+        r.add_block(0, 0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(r.take_ready(), vec![1, 2, 3, 4]);
     }
 
     #[test]

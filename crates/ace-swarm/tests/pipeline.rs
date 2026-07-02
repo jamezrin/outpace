@@ -7,11 +7,11 @@
 //! Only the real-network leg remains untested; the wiring is exercised here.
 
 use ace_peer::session::PeerSession;
+use ace_swarm::driver::{download_from_peer, DownloadParams};
 use ace_wire::bencode::Bencode;
 use ace_wire::handshake::Handshake;
 use ace_wire::identity::verify_handshake;
 use ace_wire::message::PeerMessage;
-use ace_swarm::driver::{download_from_peer, DownloadParams};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TS_PACKET: usize = 188;
@@ -21,7 +21,11 @@ const TS_PACKET: usize = 188;
 fn make_ts_content(total: usize) -> Vec<u8> {
     let mut v = vec![0u8; total];
     for (i, b) in v.iter_mut().enumerate() {
-        *b = if i % TS_PACKET == 0 { 0x47 } else { (i % 251) as u8 };
+        *b = if i % TS_PACKET == 0 {
+            0x47
+        } else {
+            (i % 251) as u8
+        };
     }
     v
 }
@@ -57,10 +61,16 @@ async fn full_pipeline_mock_peer_to_mpegts() {
                     Bencode::Dict(d) => d,
                     _ => panic!("handshake not a dict"),
                 };
-                let node_id: [u8; 32] =
-                    dict[b"node_id".as_slice()].as_bytes().unwrap().try_into().unwrap();
-                let sig: [u8; 64] =
-                    dict[b"signature".as_slice()].as_bytes().unwrap().try_into().unwrap();
+                let node_id: [u8; 32] = dict[b"node_id".as_slice()]
+                    .as_bytes()
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let sig: [u8; 64] = dict[b"signature".as_slice()]
+                    .as_bytes()
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
                 assert!(
                     verify_handshake(&node_id, &sig, &dict),
                     "mock peer rejected our signature"
@@ -74,10 +84,20 @@ async fn full_pipeline_mock_peer_to_mpegts() {
         let total_blocks = n_pieces * 2; // 2 blocks per piece
         for _ in 0..total_blocks {
             match sess.read_message().await.unwrap() {
-                PeerMessage::Request { index, begin, length } => {
+                PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                } => {
                     let off = index as usize * piece_length as usize + begin as usize;
                     let block = content_for_peer[off..off + length as usize].to_vec();
-                    sess.send(&PeerMessage::Piece { index, begin, block }).await.unwrap();
+                    sess.send(&PeerMessage::Piece {
+                        index,
+                        begin,
+                        block,
+                    })
+                    .await
+                    .unwrap();
                 }
                 other => panic!("expected request, got {other:?}"),
             }
@@ -101,10 +121,16 @@ async fn full_pipeline_mock_peer_to_mpegts() {
             position: head as i64,
             distance_from_source: 1,
         }),
-        node: ace_wire::extended::NodeFields { ts: 1, ..Default::default() },
+        node: ace_wire::extended::NodeFields {
+            ts: 1,
+            ..Default::default()
+        },
         peer_ip: None,
     };
-    session.send_signed_extended_handshake(&hs, &identity).await.unwrap();
+    session
+        .send_signed_extended_handshake(&hs, &identity)
+        .await
+        .unwrap();
 
     let params = DownloadParams {
         piece_length,
@@ -113,7 +139,9 @@ async fn full_pipeline_mock_peer_to_mpegts() {
         head,
         max_in_flight: 4,
     };
-    let got = download_from_peer(&mut session, params, start_piece, head).await.unwrap();
+    let got = download_from_peer(&mut session, params, start_piece, head)
+        .await
+        .unwrap();
     peer.await.unwrap();
 
     // The reassembled stream is byte-identical to the source...

@@ -174,9 +174,11 @@ is one we serve), and hands the socket to a `SeederSession`. Bounded concurrency
   into `piece_length` (1 MiB) pieces with ascending live indices from an epoch; push completed
   pieces into a `PieceStore`. Inverse of `PieceReassembler` — a chunk-then-reassemble round-trip
   is the identity, which is the core test.
-- **Minting:** build a `TransportDescriptor` (`name`, `piece_length`, `chunk_length`, our
-  trackers, our RSA `pubkey`), `encode_transport` → bytes → `infohash = SHA1(bytes)`; persist
-  the transport file under the data dir (so consumers/ut_metadata can fetch it).
+- **Minting:** build a `TransportDescriptor` (`name`, `piece_length`, `chunk_length`,
+  `bitrate`, `authmethod`, trackers, our RSA `pubkey`), `encode_transport` → bytes; compute
+  the official swarm infohash from the descriptor selected-field hash (see
+  `docs/protocol/notes/29-infohash-formula-cracked.md`); persist the transport file under
+  the data dir (so consumers/ut_metadata can fetch it).
 - **Source:** announce the infohash; run `SeederSession`s as `distance_from_source=0`, signing
   pieces. The broadcast registers as a normal stream: listable in `/streams`, playable at
   `/streams/ace/<infohash>.ts` on any daemon.

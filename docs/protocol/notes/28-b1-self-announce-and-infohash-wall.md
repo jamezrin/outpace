@@ -1,5 +1,10 @@
 # 28 — B1 self-announce fix, and the infohash-formula wall (Task 7 reverse direction)
 
+> **2026-07-01 update:** the infohash wall described here is resolved in
+> `29-infohash-formula-cracked.md`. The self-announce fix remains accurate. The corrected
+> official-engine-as-consumer playback proof was rerun in note 30; the remaining blocker is
+> peer discovery / direct peer injection, not infohash computation.
+
 Follow-up to note 27 (B0 cracked). While pursuing Task 7's reverse-direction proof (get the
 **official engine itself** to download from outpace), found and fixed a real bug, then
 hit a real, precisely-scoped wall that blocks the full proof this session.
@@ -132,6 +137,13 @@ CPython bytecode/frame-eval level (`sys.settrace`-style, or Frida's `Interceptor
 sequence around `TorrentDef`/`TransportDescriptor` construction.
 
 ## Net effect on the parity goal
+
+> **2026-07-01 correction:** the infohash wall below is resolved in note 29. The official
+> swarm infohash is the selected-field descriptor hash, while `SHA1(raw transport bytes)` is
+> only the transport-file/cache identifier. The official-engine-as-consumer proof was rerun
+> in note 30: the official engine now agrees with outpace's infohash, but playback still
+> stays at `prebuf`/`peers=0`. The current blocker is peer discovery / direct peer injection,
+> not infohash computation.
 
 - **B0**: cracked, implemented, tested (note 27) — unaffected by this wall.
 - **B1**: origination + real signing + **now real tracker/DHT self-announce** — a

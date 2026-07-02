@@ -70,7 +70,11 @@ pub async fn download_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
         match session.read_message().await {
             Ok(PeerMessage::Unchoke) => unchoked = true,
             Ok(PeerMessage::Choke) => unchoked = false,
-            Ok(PeerMessage::Piece { index, begin, block }) => {
+            Ok(PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            }) => {
                 let idx = index as u64;
                 let n = block.len() as u64;
                 reasm.add_block(idx, begin as u64, &block)?;

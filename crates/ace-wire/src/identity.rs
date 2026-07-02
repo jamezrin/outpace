@@ -26,12 +26,16 @@ impl Identity {
     /// Deterministically derive an identity from a 32-byte seed (the engine's
     /// `device.key` is such a seed; ours can be any 32 random bytes).
     pub fn from_seed(seed: [u8; 32]) -> Self {
-        Identity { key: SigningKey::from_bytes(&seed) }
+        Identity {
+            key: SigningKey::from_bytes(&seed),
+        }
     }
 
     /// Mint a fresh random identity.
     pub fn generate() -> Self {
-        Identity { key: SigningKey::generate(&mut rand::rngs::OsRng) }
+        Identity {
+            key: SigningKey::generate(&mut rand::rngs::OsRng),
+        }
     }
 
     /// The `node_id` peers see: the 32-byte Ed25519 public key.
@@ -49,7 +53,10 @@ impl Identity {
 /// with the `signature` key forced to 64 zero bytes, then SHA-256.
 pub fn handshake_digest(fields: &BTreeMap<Vec<u8>, Bencode>) -> [u8; 32] {
     let mut d = fields.clone();
-    d.insert(b"signature".to_vec(), Bencode::Bytes(vec![0u8; SIGNATURE_LEN]));
+    d.insert(
+        b"signature".to_vec(),
+        Bencode::Bytes(vec![0u8; SIGNATURE_LEN]),
+    );
     let encoded = Bencode::Dict(d).encode();
     let mut h = Sha256::new();
     h.update(&encoded);
@@ -68,7 +75,8 @@ pub fn verify_handshake(
         Ok(v) => v,
         Err(_) => return false,
     };
-    vk.verify(&digest, &Signature::from_bytes(signature)).is_ok()
+    vk.verify(&digest, &Signature::from_bytes(signature))
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -86,16 +94,22 @@ mod tests {
     /// digest formula + node_id-as-pubkey by Ed25519-verifying the captured signature.
     #[test]
     fn verifies_live_engine_handshake() {
-        let hexstr = include_str!(
-            "../../../tests/vectors/node-identity/engine-extended-handshake.hex"
-        )
-        .trim();
+        let hexstr =
+            include_str!("../../../tests/vectors/node-identity/engine-extended-handshake.hex")
+                .trim();
         let raw = hex::decode(hexstr).unwrap();
         let dict = dict_of(&Bencode::parse(&raw).unwrap());
 
-        let node_id: [u8; 32] = dict[b"node_id".as_slice()].as_bytes().unwrap().try_into().unwrap();
-        let signature: [u8; 64] =
-            dict[b"signature".as_slice()].as_bytes().unwrap().try_into().unwrap();
+        let node_id: [u8; 32] = dict[b"node_id".as_slice()]
+            .as_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signature: [u8; 64] = dict[b"signature".as_slice()]
+            .as_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
 
         assert!(verify_handshake(&node_id, &signature, &dict));
         // tampering a signed field must break verification
@@ -107,7 +121,10 @@ mod tests {
     #[test]
     fn from_seed_is_deterministic() {
         let seed = [7u8; 32];
-        assert_eq!(Identity::from_seed(seed).node_id(), Identity::from_seed(seed).node_id());
+        assert_eq!(
+            Identity::from_seed(seed).node_id(),
+            Identity::from_seed(seed).node_id()
+        );
     }
 
     #[test]

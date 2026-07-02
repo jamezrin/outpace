@@ -64,7 +64,11 @@ impl LiveWindow {
             .map(|v| v.max(0) as u64)
             .unwrap_or(max)
             .clamp(min, max);
-        Some(LiveWindow { min_piece: min, max_piece: max, position })
+        Some(LiveWindow {
+            min_piece: min,
+            max_piece: max,
+            position,
+        })
     }
 }
 
@@ -84,7 +88,9 @@ impl LivePicker {
 
     /// Start a fresh live download `buffer` pieces behind `window`'s head.
     pub fn new(window: &LiveWindow, buffer: u64) -> Self {
-        LivePicker { next: window.start_piece(buffer) }
+        LivePicker {
+            next: window.start_piece(buffer),
+        }
     }
 
     /// The next piece index to request given the current window, or `None` if we've
@@ -108,7 +114,11 @@ mod tests {
     use super::*;
 
     fn win(min: u64, max: u64, pos: u64) -> LiveWindow {
-        LiveWindow { min_piece: min, max_piece: max, position: pos }
+        LiveWindow {
+            min_piece: min,
+            max_piece: max,
+            position: pos,
+        }
     }
 
     #[test]

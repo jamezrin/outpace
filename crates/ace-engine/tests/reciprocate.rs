@@ -32,6 +32,14 @@ async fn peer_downloads_a_chunk_from_us() {
         let _ = SeederSession::serve(&mut us, store, [0u8; 8], &identity, [127, 0, 0, 1]).await;
     });
     let got = peer.await.unwrap();
-    assert_eq!(got, LiveChunk { piece: 42, chunk: 0, data: vec![7, 7, 7, 7] });
+    assert_eq!(
+        got,
+        LiveChunk {
+            piece: 42,
+            piece_header: [0u8; 8],
+            chunk: 0,
+            data: vec![7, 7, 7, 7]
+        }
+    );
     serve_task.abort();
 }

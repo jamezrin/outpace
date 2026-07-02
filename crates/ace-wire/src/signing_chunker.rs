@@ -22,7 +22,10 @@ impl SigningChunker {
     /// `piece_length` must exceed `sig_len` (the signer's `signature_len()`) — the signable
     /// payload capacity is `piece_length - sig_len`.
     pub fn new(piece_length: u64, chunk_length: u64, start_piece: u64, sig_len: u64) -> Self {
-        assert!(piece_length > sig_len, "piece_length must leave room for the signature");
+        assert!(
+            piece_length > sig_len,
+            "piece_length must leave room for the signature"
+        );
         SigningChunker {
             payload_capacity: piece_length - sig_len,
             buf: Vec::new(),
@@ -69,8 +72,8 @@ impl SigningChunker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reassembly::PieceReassembler;
     use crate::live_auth::{split_piece, verify_piece};
+    use crate::reassembly::PieceReassembler;
 
     #[test]
     fn chunked_pieces_reassemble_and_verify() {
@@ -83,9 +86,14 @@ mod tests {
         // Enough input for exactly 2 full pieces' worth of PAYLOAD (piece_length - sig_len
         // each), so both pieces complete without needing flush().
         let payload_capacity = (piece_length - sig_len) as usize;
-        let input: Vec<u8> = (0..(payload_capacity * 2) as u32).map(|i| (i % 256) as u8).collect();
+        let input: Vec<u8> = (0..(payload_capacity * 2) as u32)
+            .map(|i| (i % 256) as u8)
+            .collect();
         let chunks = sc.push(&input, &auth);
-        assert!(sc.flush(&auth).is_empty(), "exact multiple of payload_capacity -> nothing to flush");
+        assert!(
+            sc.flush(&auth).is_empty(),
+            "exact multiple of payload_capacity -> nothing to flush"
+        );
 
         // Reassemble via the ordinary reassembler, exactly like a real leech client would.
         let mut r = PieceReassembler::new(piece_length, 0);
@@ -100,9 +108,15 @@ mod tests {
         let pubkey_der = auth.pubkey_der();
         for (i, piece_bytes) in assembled.chunks(piece_length as usize).enumerate() {
             let (payload, sig) = split_piece(piece_bytes, sig_len as usize).unwrap();
-            assert!(verify_piece(&pubkey_der, payload, sig), "piece {i} must verify");
+            assert!(
+                verify_piece(&pubkey_der, payload, sig),
+                "piece {i} must verify"
+            );
             let expected_payload = &input[i * payload_capacity..(i + 1) * payload_capacity];
-            assert_eq!(payload, expected_payload, "piece {i} payload must be the original bytes");
+            assert_eq!(
+                payload, expected_payload,
+                "piece {i} payload must be the original bytes"
+            );
         }
     }
 
@@ -118,7 +132,10 @@ mod tests {
         let piece_length = 128u64;
         let mut sc = SigningChunker::new(piece_length, 8, 0, sig_len);
         let input = b"short tail data";
-        assert!(sc.push(input, &auth).is_empty(), "not enough for a full piece yet");
+        assert!(
+            sc.push(input, &auth).is_empty(),
+            "not enough for a full piece yet"
+        );
         let mut chunks = sc.flush(&auth);
         assert!(!chunks.is_empty());
         chunks.sort_by_key(|c| c.begin);

@@ -44,9 +44,11 @@ dependencies = [
  "ace-tracker",
  "ace-wire",
  "aes",
+ "base64ct",
  "bytes",
  "cbc",
  "rand",
+ "sha1",
  "tokio",
 ]
 

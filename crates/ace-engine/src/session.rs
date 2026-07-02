@@ -62,7 +62,10 @@ impl StreamSession {
 
     pub fn subscribe(&self) -> Subscription {
         self.subscribers.fetch_add(1, Ordering::SeqCst);
-        Subscription { rx: self.tx.subscribe(), count: self.subscribers.clone() }
+        Subscription {
+            rx: self.tx.subscribe(),
+            count: self.subscribers.clone(),
+        }
     }
 
     pub fn subscriber_count(&self) -> u64 {
@@ -138,6 +141,9 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(dropped.load(Ordering::SeqCst), "pump must be aborted and source dropped");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "pump must be aborted and source dropped"
+        );
     }
 }

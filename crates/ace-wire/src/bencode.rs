@@ -14,7 +14,9 @@ impl Bencode {
     /// Parse exactly one bencode value from the whole buffer; trailing bytes = error.
     pub fn parse(buf: &[u8]) -> Result<Bencode> {
         let (v, n) = parse_value(buf, 0)?;
-        if n != buf.len() { return Err(WireError::Invalid("trailing bytes")); }
+        if n != buf.len() {
+            return Err(WireError::Invalid("trailing bytes"));
+        }
         Ok(v)
     }
 
@@ -31,19 +33,55 @@ impl Bencode {
 
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            Bencode::Int(i) => { out.push(b'i'); out.extend_from_slice(i.to_string().as_bytes()); out.push(b'e'); }
-            Bencode::Bytes(b) => { out.extend_from_slice(b.len().to_string().as_bytes()); out.push(b':'); out.extend_from_slice(b); }
-            Bencode::List(l) => { out.push(b'l'); for e in l { e.encode_into(out); } out.push(b'e'); }
-            Bencode::Dict(d) => { out.push(b'd'); for (k, v) in d { Bencode::Bytes(k.clone()).encode_into(out); v.encode_into(out); } out.push(b'e'); }
+            Bencode::Int(i) => {
+                out.push(b'i');
+                out.extend_from_slice(i.to_string().as_bytes());
+                out.push(b'e');
+            }
+            Bencode::Bytes(b) => {
+                out.extend_from_slice(b.len().to_string().as_bytes());
+                out.push(b':');
+                out.extend_from_slice(b);
+            }
+            Bencode::List(l) => {
+                out.push(b'l');
+                for e in l {
+                    e.encode_into(out);
+                }
+                out.push(b'e');
+            }
+            Bencode::Dict(d) => {
+                out.push(b'd');
+                for (k, v) in d {
+                    Bencode::Bytes(k.clone()).encode_into(out);
+                    v.encode_into(out);
+                }
+                out.push(b'e');
+            }
         }
     }
 
     /// Convenience: borrow a dict entry.
     pub fn get<'a>(&'a self, key: &[u8]) -> Option<&'a Bencode> {
-        match self { Bencode::Dict(d) => d.get(key), _ => None }
+        match self {
+            Bencode::Dict(d) => d.get(key),
+            _ => None,
+        }
     }
-    pub fn as_int(&self) -> Option<i64> { if let Bencode::Int(i) = self { Some(*i) } else { None } }
-    pub fn as_bytes(&self) -> Option<&[u8]> { if let Bencode::Bytes(b) = self { Some(b) } else { None } }
+    pub fn as_int(&self) -> Option<i64> {
+        if let Bencode::Int(i) = self {
+            Some(*i)
+        } else {
+            None
+        }
+    }
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        if let Bencode::Bytes(b) = self {
+            Some(b)
+        } else {
+            None
+        }
+    }
 }
 
 fn parse_value(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
@@ -58,19 +96,36 @@ fn parse_value(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
 
 fn parse_int(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
     // buf[pos] == 'i'
-    let end = buf[pos + 1..].iter().position(|&b| b == b'e').ok_or(WireError::Truncated)? + pos + 1;
+    let end = buf[pos + 1..]
+        .iter()
+        .position(|&b| b == b'e')
+        .ok_or(WireError::Truncated)?
+        + pos
+        + 1;
     let s = std::str::from_utf8(&buf[pos + 1..end]).map_err(|_| WireError::Invalid("int utf8"))?;
-    let i = s.parse::<i64>().map_err(|_| WireError::Invalid("int parse"))?;
+    let i = s
+        .parse::<i64>()
+        .map_err(|_| WireError::Invalid("int parse"))?;
     Ok((Bencode::Int(i), end + 1))
 }
 
 fn parse_bytes(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
-    let colon = buf[pos..].iter().position(|&b| b == b':').ok_or(WireError::Truncated)? + pos;
+    let colon = buf[pos..]
+        .iter()
+        .position(|&b| b == b':')
+        .ok_or(WireError::Truncated)?
+        + pos;
     let len: usize = std::str::from_utf8(&buf[pos..colon])
-        .ok().and_then(|s| s.parse().ok()).ok_or(WireError::Invalid("bad length"))?;
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or(WireError::Invalid("bad length"))?;
     let start = colon + 1;
-    let end = start.checked_add(len).ok_or(WireError::Invalid("len overflow"))?;
-    if end > buf.len() { return Err(WireError::Truncated); }
+    let end = start
+        .checked_add(len)
+        .ok_or(WireError::Invalid("len overflow"))?;
+    if end > buf.len() {
+        return Err(WireError::Truncated);
+    }
     Ok((Bencode::Bytes(buf[start..end].to_vec()), end))
 }
 
@@ -80,7 +135,11 @@ fn parse_list(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
     loop {
         match buf.get(i).ok_or(WireError::Truncated)? {
             b'e' => return Ok((Bencode::List(items), i + 1)),
-            _ => { let (v, n) = parse_value(buf, i)?; items.push(v); i = n; }
+            _ => {
+                let (v, n) = parse_value(buf, i)?;
+                items.push(v);
+                i = n;
+            }
         }
     }
 }
@@ -93,7 +152,11 @@ fn parse_dict(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
             b'e' => return Ok((Bencode::Dict(map), i + 1)),
             _ => {
                 let (k, n) = parse_bytes(buf, i)?;
-                let key = if let Bencode::Bytes(b) = k { b } else { unreachable!() };
+                let key = if let Bencode::Bytes(b) = k {
+                    b
+                } else {
+                    unreachable!()
+                };
                 let (v, n2) = parse_value(buf, n)?;
                 map.insert(key, v);
                 i = n2;
@@ -121,13 +184,16 @@ mod tests {
     #[test]
     fn parses_list_and_negative_int() {
         let v = Bencode::parse(b"li-3e1:ae").unwrap();
-        assert_eq!(v, Bencode::List(vec![Bencode::Int(-3), Bencode::Bytes(b"a".to_vec())]));
+        assert_eq!(
+            v,
+            Bencode::List(vec![Bencode::Int(-3), Bencode::Bytes(b"a".to_vec())])
+        );
     }
 
     #[test]
     fn rejects_trailing_and_truncated() {
-        assert!(Bencode::parse(b"i42").is_err());      // truncated
-        assert!(Bencode::parse(b"i42eX").is_err());     // trailing byte
-        assert!(Bencode::parse(b"3:ab").is_err());      // short string
+        assert!(Bencode::parse(b"i42").is_err()); // truncated
+        assert!(Bencode::parse(b"i42eX").is_err()); // trailing byte
+        assert!(Bencode::parse(b"3:ab").is_err()); // short string
     }
 }

@@ -13,6 +13,8 @@ pub struct SourceStats {
     pub peers: u32,
     pub bitrate: u64,   // bits/sec
     pub buffer_ms: u64, // buffered duration estimate
+    /// Bytes downloaded from the source and emitted as MPEG-TS.
+    pub downloaded: u64,
     /// Bytes we have uploaded (served to peers) on this source.
     pub uploaded: u64,
     /// Distinct peers we have served at least one chunk to.
@@ -90,7 +92,15 @@ mod tests {
 
     #[test]
     fn source_stats_has_upload_counters() {
-        let s = SourceStats { peers: 1, bitrate: 0, buffer_ms: 0, uploaded: 4096, peers_served: 2 };
+        let s = SourceStats {
+            peers: 1,
+            bitrate: 0,
+            buffer_ms: 0,
+            downloaded: 8192,
+            uploaded: 4096,
+            peers_served: 2,
+        };
+        assert_eq!(s.downloaded, 8192);
         assert_eq!(s.uploaded, 4096);
         assert_eq!(s.peers_served, 2);
     }

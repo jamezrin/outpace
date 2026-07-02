@@ -3,6 +3,8 @@
 //! `/streams/{network}/{id}` API. All network-specific protocol lives behind the
 //! [`provider::StreamProvider`] adapter (see the v1 design spec).
 
+#[macro_use]
+pub mod logts;
 pub mod ace_provider;
 pub mod broadcast;
 pub mod config;

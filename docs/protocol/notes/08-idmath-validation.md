@@ -1,6 +1,11 @@
 # Task 8: Rust Harness — infohash = SHA1(transport file) — Validation
 
-**Status:** VALIDATED
+**Status:** SUPERSEDED by `29-infohash-formula-cracked.md`
+
+2026-07-01 correction: this note validated a real engine-computed **raw transport-file
+hash**, but mislabeled it as the peer-wire infohash. The official swarm infohash is the
+selected-field descriptor hash documented in note 29. The old `SHA1(transport file)` value
+is still useful as a cache/transport-file identifier.
 
 ## Summary
 

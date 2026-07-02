@@ -25,7 +25,11 @@ pub enum MetadataMessage {
     /// A peer asking us for a metadata piece (we don't serve, but parse it cleanly).
     Request { piece: i64 },
     /// A metadata block: its index, the advertised total size, and the raw bytes.
-    Data { piece: i64, total_size: Option<i64>, data: Vec<u8> },
+    Data {
+        piece: i64,
+        total_size: Option<i64>,
+        data: Vec<u8>,
+    },
     /// The peer has no metadata / declines piece.
     Reject { piece: i64 },
 }
@@ -101,7 +105,11 @@ mod tests {
         let m = MetadataMessage::parse(&payload).unwrap();
         assert_eq!(
             m,
-            MetadataMessage::Data { piece: 2, total_size: Some(40000), data: vec![0xAA, 0xBB, 0xCC] }
+            MetadataMessage::Data {
+                piece: 2,
+                total_size: Some(40000),
+                data: vec![0xAA, 0xBB, 0xCC]
+            }
         );
     }
 

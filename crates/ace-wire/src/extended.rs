@@ -36,7 +36,14 @@ pub struct NodeFields {
 impl Default for NodeFields {
     fn default() -> Self {
         // Mirrors observed engine 3.2.11 handshakes.
-        NodeFields { ts: 0, v: 3021100, pv: 2, p: 8621, nt: 1, platform: 2 }
+        NodeFields {
+            ts: 0,
+            v: 3021100,
+            pv: 2,
+            p: 8621,
+            nt: 1,
+            platform: 2,
+        }
     }
 }
 
@@ -94,24 +101,51 @@ impl OutgoingExtendedHandshake {
         let bi = |n: i64| Bencode::Int(n);
         let bb = |b: &[u8]| Bencode::Bytes(b.to_vec());
         let mut f = self.base_fields(); // ace_metadata_version, m, mi(min/max/pos/dist)
-        // Promote `mi` to the full live-position dict peers expect.
+                                        // Promote `mi` to the full live-position dict peers expect.
         if let Some(p) = self.mi {
             let mut mi: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+            let has_live_head = p.position >= 0 && p.max_piece >= p.min_piece && p.max_piece >= 0;
+            let source_end = if has_live_head { p.max_piece } else { -1 };
+            let live_window_size = if has_live_head {
+                115
+            } else {
+                (p.max_piece - p.min_piece + 1).max(0)
+            };
             for (k, v) in [
-                ("distance_from_source", p.distance_from_source), ("down_rate", 0),
-                ("download_window_end", -1), ("is_accessible", 0),
-                ("live_window_size", (p.max_piece - p.min_piece + 1).max(0)), ("lsp", -1),
-                ("mam", -1), ("max_piece", p.max_piece), ("min_piece", p.min_piece),
-                ("peer_type", 0), ("ping_from_source", -1), ("position", p.position),
-                ("time_from_source", -1), ("top_session_up_rate", 0), ("top_up_rate", 0),
-                ("up_rate", 0), ("upload_rating", 0),
-            ] { mi.insert(k.as_bytes().to_vec(), bi(v)); }
+                ("distance_from_source", p.distance_from_source),
+                ("down_rate", 0),
+                ("download_window_end", source_end),
+                ("is_accessible", 0),
+                ("live_window_size", live_window_size),
+                ("lsp", source_end),
+                ("mam", -1),
+                ("max_piece", p.max_piece),
+                ("min_piece", p.min_piece),
+                ("peer_type", 0),
+                ("ping_from_source", -1),
+                ("position", p.position),
+                ("time_from_source", -1),
+                ("top_session_up_rate", 0),
+                ("top_up_rate", 0),
+                ("up_rate", 0),
+                ("upload_rating", 0),
+            ] {
+                mi.insert(k.as_bytes().to_vec(), bi(v));
+            }
             f.insert(b"mi".to_vec(), Bencode::Dict(mi));
         }
         f.insert(b"asn".to_vec(), bi(0));
         f.insert(b"asn_country".to_vec(), bb(b""));
         f.insert(b"geoip_country".to_vec(), bb(b""));
-        f.insert(b"lsp".to_vec(), bi(-1));
+        let root_lsp = self
+            .mi
+            .filter(|p| p.position >= 0 && p.max_piece >= p.min_piece && p.max_piece >= 0)
+            .map(|p| p.max_piece)
+            .unwrap_or(-1);
+        f.insert(b"lsp".to_vec(), bi(root_lsp));
+        if root_lsp >= 0 {
+            f.insert(b"node_state".to_vec(), bi(1));
+        }
         f.insert(b"node_id".to_vec(), bb(&id.node_id()));
         f.insert(b"nt".to_vec(), bi(self.node.nt));
         f.insert(b"p".to_vec(), bi(self.node.p));
@@ -121,9 +155,14 @@ impl OutgoingExtendedHandshake {
         f.insert(b"ts".to_vec(), bi(self.node.ts));
         f.insert(b"tt".to_vec(), bb(b"bt"));
         f.insert(b"v".to_vec(), bi(self.node.v));
-        if let Some(ip) = self.peer_ip { f.insert(b"yourip".to_vec(), bb(&ip)); }
+        if let Some(ip) = self.peer_ip {
+            f.insert(b"yourip".to_vec(), bb(&ip));
+        }
         let digest = handshake_digest(&f);
-        f.insert(b"signature".to_vec(), Bencode::Bytes(id.sign(&digest).to_vec()));
+        f.insert(
+            b"signature".to_vec(),
+            Bencode::Bytes(id.sign(&digest).to_vec()),
+        );
         Bencode::Dict(f).encode()
     }
 }
@@ -144,16 +183,24 @@ impl ExtendedHandshake {
             return Err(WireError::Invalid("extended handshake not a dict"));
         }
         let ace_metadata_version = raw.get(b"ace_metadata_version").and_then(Bencode::as_int);
-        let geoip_country = raw.get(b"geoip_country")
+        let geoip_country = raw
+            .get(b"geoip_country")
             .and_then(Bencode::as_bytes)
             .and_then(|b| std::str::from_utf8(b).ok())
             .map(|s| s.to_string());
-        Ok(ExtendedHandshake { raw, ace_metadata_version, geoip_country })
+        Ok(ExtendedHandshake {
+            raw,
+            ace_metadata_version,
+            geoip_country,
+        })
     }
 
     /// The peer's extension id for `ut_metadata` (BEP-9), from the `m` dict.
     pub fn ut_metadata_id(&self) -> Option<i64> {
-        self.raw.get(b"m").and_then(|m| m.get(b"ut_metadata")).and_then(Bencode::as_int)
+        self.raw
+            .get(b"m")
+            .and_then(|m| m.get(b"ut_metadata"))
+            .and_then(Bencode::as_int)
     }
 
     /// The advertised total size (bytes) of the metadata blob (BEP-9 `metadata_size`),
@@ -197,7 +244,10 @@ mod tests {
                 position: 200,
                 distance_from_source: 0,
             }),
-            node: NodeFields { ts: 12345, ..NodeFields::default() },
+            node: NodeFields {
+                ts: 12345,
+                ..NodeFields::default()
+            },
             peer_ip: None,
         }
         .sign_and_encode(&id);
@@ -207,10 +257,16 @@ mod tests {
             Bencode::Dict(d) => d.clone(),
             _ => panic!(),
         };
-        let node_id: [u8; 32] =
-            dict[b"node_id".as_slice()].as_bytes().unwrap().try_into().unwrap();
-        let sig: [u8; 64] =
-            dict[b"signature".as_slice()].as_bytes().unwrap().try_into().unwrap();
+        let node_id: [u8; 32] = dict[b"node_id".as_slice()]
+            .as_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sig: [u8; 64] = dict[b"signature".as_slice()]
+            .as_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
         assert_eq!(node_id, id.node_id());
         assert!(verify_handshake(&node_id, &sig, &dict));
     }
@@ -222,24 +278,70 @@ mod tests {
         let hs = OutgoingExtendedHandshake {
             ace_metadata_version: 1,
             ut_metadata_id: 2,
-            mi: Some(LivePosition { min_piece: 100, max_piece: 163, position: -1, distance_from_source: -1 }),
-            node: NodeFields { ts: 5000, ..NodeFields::default() },
+            mi: Some(LivePosition {
+                min_piece: 100,
+                max_piece: 163,
+                position: -1,
+                distance_from_source: -1,
+            }),
+            node: NodeFields {
+                ts: 5000,
+                ..NodeFields::default()
+            },
             peer_ip: Some([95, 17, 44, 10]),
         };
         let payload = hs.sign_and_encode(&id);
-        let dict = match Bencode::parse(&payload).unwrap() { Bencode::Dict(d) => d, _ => panic!() };
-        for k in [b"ace_metadata_version".as_slice(), b"asn", b"asn_country", b"geoip_country",
-                  b"lsp", b"m", b"mi", b"node_id", b"nt", b"p", b"platform", b"pv",
-                  b"signature", b"stream_statuses", b"ts", b"tt", b"v", b"yourip"] {
-            assert!(dict.contains_key(k), "missing key {:?}", std::str::from_utf8(k));
+        let dict = match Bencode::parse(&payload).unwrap() {
+            Bencode::Dict(d) => d,
+            _ => panic!(),
+        };
+        for k in [
+            b"ace_metadata_version".as_slice(),
+            b"asn",
+            b"asn_country",
+            b"geoip_country",
+            b"lsp",
+            b"m",
+            b"mi",
+            b"node_id",
+            b"nt",
+            b"p",
+            b"platform",
+            b"pv",
+            b"signature",
+            b"stream_statuses",
+            b"ts",
+            b"tt",
+            b"v",
+            b"yourip",
+        ] {
+            assert!(
+                dict.contains_key(k),
+                "missing key {:?}",
+                std::str::from_utf8(k)
+            );
         }
         assert_eq!(dict[b"tt".as_slice()].as_bytes(), Some(b"bt".as_slice()));
-        assert_eq!(dict[b"yourip".as_slice()].as_bytes(), Some([95u8, 17, 44, 10].as_slice()));
-        let mi = match &dict[b"mi".as_slice()] { Bencode::Dict(d) => d, _ => panic!() };
+        assert_eq!(
+            dict[b"yourip".as_slice()].as_bytes(),
+            Some([95u8, 17, 44, 10].as_slice())
+        );
+        let mi = match &dict[b"mi".as_slice()] {
+            Bencode::Dict(d) => d,
+            _ => panic!(),
+        };
         assert_eq!(mi[b"min_piece".as_slice()].as_int(), Some(100));
         assert_eq!(mi[b"max_piece".as_slice()].as_int(), Some(163));
-        let node_id: [u8; 32] = dict[b"node_id".as_slice()].as_bytes().unwrap().try_into().unwrap();
-        let sig: [u8; 64] = dict[b"signature".as_slice()].as_bytes().unwrap().try_into().unwrap();
+        let node_id: [u8; 32] = dict[b"node_id".as_slice()]
+            .as_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sig: [u8; 64] = dict[b"signature".as_slice()]
+            .as_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
         assert!(verify_handshake(&node_id, &sig, &dict));
     }
 

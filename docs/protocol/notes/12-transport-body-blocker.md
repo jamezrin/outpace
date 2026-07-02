@@ -5,6 +5,10 @@
 > Frida (pycryptodome `AESNI_start_operation`/`CBC_start_operation`/`CBC_decrypt`
 > hooks) and validated by decoding both vectors offline. The notes below are the
 > historical pre-crack analysis.
+>
+> **2026-07-01 correction:** the line below saying `infohash = SHA1(whole file)` was
+> later proven to be the raw transport-file/cache hash, not the peer-wire swarm
+> infohash. See `29-infohash-formula-cracked.md`.
 
 
 ## What we know

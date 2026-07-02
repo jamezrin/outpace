@@ -1,6 +1,6 @@
 //! Async peer session over any AsyncRead+AsyncWrite stream.
 use crate::{PeerError, Result};
-use ace_wire::handshake::{Handshake, HANDSHAKE_LEN};
+use ace_wire::handshake::{Handshake, HANDSHAKE_LEN, HANDSHAKE_PREFIX_LEN};
 use ace_wire::message::PeerMessage;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// would block a session task indefinitely — a real hazard once swarm orchestration
 /// fans out across many flaky peers.
 pub const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(20);
+const INBOUND_PEER_ID_GRACE: Duration = Duration::from_millis(20);
 
 pub struct PeerSession<S> {
     stream: S,
@@ -37,7 +38,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
 
     /// Send our handshake, read the peer's, and verify the infohash matches.
     pub async fn perform_handshake(
-        &mut self, infohash: [u8; 20], peer_id: [u8; 20],
+        &mut self,
+        infohash: [u8; 20],
+        peer_id: [u8; 20],
     ) -> Result<Handshake> {
         let ours = Handshake::new(infohash, peer_id);
         let timeout = self.timeout;
@@ -56,21 +59,71 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// to avoid replying (and thus leaking which infohashes we serve) to a peer asking for one
     /// we don't have. Returns the peer's handshake on success.
     pub async fn accept_handshake<F>(
-        &mut self, our_peer_id: [u8; 20], serves: F,
+        &mut self,
+        our_peer_id: [u8; 20],
+        serves: F,
     ) -> Result<Handshake>
     where
         F: FnOnce(&[u8; 20]) -> bool,
     {
         let timeout = self.timeout;
-        let mut hs = [0u8; HANDSHAKE_LEN];
-        with_timeout(timeout, self.stream.read_exact(&mut hs)).await??;
-        let peer = Handshake::decode(&hs)?;
+        let mut prefix = [0u8; HANDSHAKE_PREFIX_LEN];
+        with_timeout(timeout, self.stream.read_exact(&mut prefix)).await??;
+        let mut peer = Handshake::decode_prefix(&prefix)?;
         if !serves(&peer.infohash) {
             return Err(PeerError::InfohashMismatch);
         }
+        let mut peer_id_seen = false;
+        if let Some(peer_id) = self.read_optional_inbound_peer_id().await? {
+            peer.peer_id = peer_id;
+            peer_id_seen = true;
+        }
         let ours = Handshake::new(peer.infohash, our_peer_id);
         with_timeout(timeout, self.stream.write_all(&ours.encode())).await??;
+        if !peer_id_seen {
+            if let Some(peer_id) = self.read_optional_deferred_peer_id().await? {
+                peer.peer_id = peer_id;
+            }
+        }
         Ok(peer)
+    }
+
+    async fn read_optional_inbound_peer_id(&mut self) -> Result<Option<[u8; 20]>> {
+        let mut peer_id = [0u8; 20];
+        let n = match tokio::time::timeout(INBOUND_PEER_ID_GRACE, self.stream.read(&mut peer_id))
+            .await
+        {
+            Ok(r) => r?,
+            Err(_) => return Ok(None),
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        if n < peer_id.len() {
+            with_timeout(self.timeout, self.stream.read_exact(&mut peer_id[n..])).await??;
+        }
+        Ok(Some(peer_id))
+    }
+
+    async fn read_optional_deferred_peer_id(&mut self) -> Result<Option<[u8; 20]>> {
+        let mut peer_id = [0u8; 20];
+        let n = match tokio::time::timeout(INBOUND_PEER_ID_GRACE, self.stream.read(&mut peer_id))
+            .await
+        {
+            Ok(r) => r?,
+            Err(_) => return Ok(None),
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        if !looks_like_acestream_peer_id_prefix(&peer_id[..n]) {
+            self.buf.extend_from_slice(&peer_id[..n]);
+            return Ok(None);
+        }
+        if n < peer_id.len() {
+            with_timeout(self.timeout, self.stream.read_exact(&mut peer_id[n..])).await??;
+        }
+        Ok(Some(peer_id))
     }
 
     /// Send a peer message.
@@ -84,9 +137,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     ///
     /// [`send_signed_extended_handshake`]: Self::send_signed_extended_handshake
     pub async fn send_extended_handshake(
-        &mut self, hs: &ace_wire::extended::OutgoingExtendedHandshake,
+        &mut self,
+        hs: &ace_wire::extended::OutgoingExtendedHandshake,
     ) -> Result<()> {
-        let msg = PeerMessage::Extended { ext_id: 0, payload: hs.encode_payload() };
+        let msg = PeerMessage::Extended {
+            ext_id: 0,
+            payload: hs.encode_payload(),
+        };
         self.send(&msg).await
     }
 
@@ -97,7 +154,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         hs: &ace_wire::extended::OutgoingExtendedHandshake,
         identity: &ace_wire::identity::Identity,
     ) -> Result<()> {
-        let msg = PeerMessage::Extended { ext_id: 0, payload: hs.sign_and_encode(identity) };
+        let msg = PeerMessage::Extended {
+            ext_id: 0,
+            payload: hs.sign_and_encode(identity),
+        };
         self.send(&msg).await
     }
 
@@ -113,14 +173,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         peer_ut_metadata_id: u8,
         metadata_size: usize,
     ) -> Result<Vec<u8>> {
-        use ace_wire::ut_metadata::{piece_count, request_piece, MetadataMessage, METADATA_BLOCK_LEN};
+        use ace_wire::ut_metadata::{
+            piece_count, request_piece, MetadataMessage, METADATA_BLOCK_LEN,
+        };
         let pieces = piece_count(metadata_size);
         if pieces == 0 {
             return Ok(Vec::new());
         }
         for i in 0..pieces {
             let payload = request_piece(i as i64);
-            self.send(&PeerMessage::Extended { ext_id: peer_ut_metadata_id, payload }).await?;
+            self.send(&PeerMessage::Extended {
+                ext_id: peer_ut_metadata_id,
+                payload,
+            })
+            .await?;
         }
         let mut blob = vec![0u8; metadata_size];
         let mut have = vec![false; pieces];
@@ -173,6 +239,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     }
 }
 
+fn looks_like_acestream_peer_id_prefix(bytes: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"R30------";
+    bytes.len() <= PREFIX.len() && PREFIX.starts_with(bytes)
+        || bytes.len() > PREFIX.len() && bytes.starts_with(PREFIX)
+}
+
 /// Apply `dur` as a ceiling to `fut`, mapping elapsed time to `PeerError::Timeout`.
 async fn with_timeout<F, T>(dur: Duration, fut: F) -> Result<T>
 where
@@ -213,12 +285,18 @@ mod tests {
             server.read_exact(&mut hs).await.unwrap();
             let peer_hs = Handshake::new(infohash, *b"R30------SERVERPEERx");
             server.write_all(&peer_hs.encode()).await.unwrap();
-            let ext = PeerMessage::Extended { ext_id: 0, payload: b"d1:md11:ut_metadatai2eee".to_vec() };
+            let ext = PeerMessage::Extended {
+                ext_id: 0,
+                payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+            };
             server.write_all(&ext.encode()).await.unwrap();
         });
 
         let mut session = PeerSession::new(client);
-        let got = session.perform_handshake(infohash, *b"R30------CLIENTPEERy").await.unwrap();
+        let got = session
+            .perform_handshake(infohash, *b"R30------CLIENTPEERy")
+            .await
+            .unwrap();
         assert_eq!(got.infohash, infohash);
 
         let msg = session.read_message().await.unwrap();
@@ -295,8 +373,7 @@ mod tests {
     async fn read_message_times_out_on_silent_peer() {
         // Keep `_server` alive so the read pends (open but idle) rather than EOF-ing.
         let (client, _server) = tokio::io::duplex(4096);
-        let mut session =
-            PeerSession::new(client).with_timeout(std::time::Duration::from_secs(5));
+        let mut session = PeerSession::new(client).with_timeout(std::time::Duration::from_secs(5));
         let res = session.read_message().await;
         assert!(matches!(res, Err(PeerError::Timeout)));
     }
@@ -304,8 +381,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn perform_handshake_times_out_when_peer_never_replies() {
         let (client, _server) = tokio::io::duplex(4096);
-        let mut session =
-            PeerSession::new(client).with_timeout(std::time::Duration::from_secs(5));
+        let mut session = PeerSession::new(client).with_timeout(std::time::Duration::from_secs(5));
         let res = session
             .perform_handshake([0x11u8; 20], *b"R30------CLIENTPEERy")
             .await;
@@ -339,7 +415,11 @@ mod tests {
         // The peer's first message is its extended handshake — read its live window.
         let first = session.read_message().await.unwrap();
         let mut their_pos: Option<LivePosition> = None;
-        if let PeerMessage::Extended { ext_id: 0, ref payload } = first {
+        if let PeerMessage::Extended {
+            ext_id: 0,
+            ref payload,
+        } = first
+        {
             if let Ok(eh) = ExtendedHandshake::parse(payload) {
                 let top = |k: &[u8]| eh.raw.get(k).and_then(|v| v.as_int());
                 println!(
@@ -350,14 +430,18 @@ mod tests {
                 let get = |k: &[u8]| mi.and_then(|m| m.get(k)).and_then(|v| v.as_int());
                 println!(
                     "[recon {peer}] mi: min={:?} max={:?} pos={:?} dist={:?}",
-                    get(b"min_piece"), get(b"max_piece"), get(b"position"),
+                    get(b"min_piece"),
+                    get(b"max_piece"),
+                    get(b"position"),
                     get(b"distance_from_source"),
                 );
                 if let (Some(min), Some(max), Some(pos)) =
                     (get(b"min_piece"), get(b"max_piece"), get(b"position"))
                 {
                     their_pos = Some(LivePosition {
-                        min_piece: min, max_piece: max, position: pos,
+                        min_piece: min,
+                        max_piece: max,
+                        position: pos,
                         distance_from_source: get(b"distance_from_source").unwrap_or(99),
                     });
                 }
@@ -387,7 +471,10 @@ mod tests {
         // The peer's IP (for `yourip`), parsed from the ip:port we connected to.
         let peer_ip: Option<[u8; 4]> = {
             let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(&peer);
-            let octets: Vec<u8> = host.split('.').filter_map(|o| o.parse::<u8>().ok()).collect();
+            let octets: Vec<u8> = host
+                .split('.')
+                .filter_map(|o| o.parse::<u8>().ok())
+                .collect();
             <[u8; 4]>::try_from(octets.as_slice()).ok()
         };
 
@@ -396,12 +483,21 @@ mod tests {
             ace_metadata_version: 1,
             ut_metadata_id: 2,
             mi,
-            node: ace_wire::extended::NodeFields { ts, ..Default::default() },
+            node: ace_wire::extended::NodeFields {
+                ts,
+                ..Default::default()
+            },
             peer_ip,
         };
-        session.send_signed_extended_handshake(&hs, &identity).await.unwrap();
-        println!("[recon {peer}] sent FULL SIGNED handshake (mi={}, node_id={})",
-                 if has_mi { "yes" } else { "no" }, hex::encode(identity.node_id()));
+        session
+            .send_signed_extended_handshake(&hs, &identity)
+            .await
+            .unwrap();
+        println!(
+            "[recon {peer}] sent FULL SIGNED handshake (mi={}, node_id={})",
+            if has_mi { "yes" } else { "no" },
+            hex::encode(identity.node_id())
+        );
         if env("ACE_NO_INTERESTED").is_none() {
             session.send(&PeerMessage::Interested).await.unwrap();
             println!("[recon {peer}] sent interested");
@@ -413,10 +509,19 @@ mod tests {
             match session.read_message().await {
                 Ok(msg) => {
                     match &msg {
-                        PeerMessage::Unchoke => { unchoked = true; println!("[recon {peer}] >>> UNCHOKE"); }
-                        PeerMessage::Bitfield(b) => println!("[recon {peer}] bitfield ({} bytes)", b.len()),
+                        PeerMessage::Unchoke => {
+                            unchoked = true;
+                            println!("[recon {peer}] >>> UNCHOKE");
+                        }
+                        PeerMessage::Bitfield(b) => {
+                            println!("[recon {peer}] bitfield ({} bytes)", b.len())
+                        }
                         PeerMessage::Have(i) => println!("[recon {peer}] have {i}"),
-                        PeerMessage::Piece { index, begin, block } => {
+                        PeerMessage::Piece {
+                            index,
+                            begin,
+                            block,
+                        } => {
                             println!("[recon {peer}] >>> PIECE idx={index} begin={begin} ({} bytes) head={}",
                                 block.len(), hex::encode(&block[..block.len().min(24)]));
                             if let Ok(path) = std::env::var("ACE_DUMP") {
@@ -432,14 +537,20 @@ mod tests {
                                     rec.extend_from_slice(&chunk.to_be_bytes());
                                     rec.extend_from_slice(&(data.len() as u32).to_be_bytes());
                                     rec.extend_from_slice(data);
-                                    let mut fh = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+                                    let mut fh = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&path)
+                                        .unwrap();
                                     fh.write_all(&rec).unwrap();
                                 }
                             }
                         }
                         PeerMessage::Unknown { id, payload } => println!(
                             "[recon {peer}] >>> msg id={id} ({} bytes) head={}",
-                            payload.len(), hex::encode(&payload[..payload.len().min(16)])),
+                            payload.len(),
+                            hex::encode(&payload[..payload.len().min(16)])
+                        ),
                         other => println!("[recon {peer}] {other:?}"),
                     }
                     if unchoked {
@@ -447,20 +558,28 @@ mod tests {
                             // Acestream request (id=6, 10-byte payload): [stream u32=0]
                             // [piece u32][chunk u16]. Pull ACE_CHUNKS chunks each across
                             // ACE_PIECES consecutive complete pieces ending below the head.
-                            let chunks: u16 = env("ACE_CHUNKS").and_then(|v| v.parse().ok()).unwrap_or(4);
-                            let pieces: u32 = env("ACE_PIECES").and_then(|v| v.parse().ok()).unwrap_or(1);
+                            let chunks: u16 =
+                                env("ACE_CHUNKS").and_then(|v| v.parse().ok()).unwrap_or(4);
+                            let pieces: u32 =
+                                env("ACE_PIECES").and_then(|v| v.parse().ok()).unwrap_or(1);
                             let base = (p.max_piece as u32).saturating_sub(pieces);
                             for piece in base..base + pieces {
                                 for chunk in 0..chunks {
                                     session.send(&chunk_request(piece, chunk)).await.unwrap();
                                 }
                             }
-                            println!("[recon {peer}] requested pieces {base}..{} x {chunks} chunks", base + pieces);
+                            println!(
+                                "[recon {peer}] requested pieces {base}..{} x {chunks} chunks",
+                                base + pieces
+                            );
                             unchoked = false; // request once; keep reading for the data
                         }
                     }
                 }
-                Err(e) => { println!("[recon {peer}] read ended: {e:?}"); break; }
+                Err(e) => {
+                    println!("[recon {peer}] read ended: {e:?}");
+                    break;
+                }
             }
         }
     }
@@ -469,8 +588,9 @@ mod tests {
     async fn fetch_metadata_assembles_multi_piece_blob() {
         use ace_wire::ut_metadata::{data_piece, MetadataMessage, METADATA_BLOCK_LEN};
         // A 2-piece blob: one full 16 KiB block + a 100-byte remainder.
-        let metadata: Vec<u8> =
-            (0..(METADATA_BLOCK_LEN + 100)).map(|i| (i % 251) as u8).collect();
+        let metadata: Vec<u8> = (0..(METADATA_BLOCK_LEN + 100))
+            .map(|i| (i % 251) as u8)
+            .collect();
         let total = metadata.len();
         let meta_peer = metadata.clone();
         let peer_ut_id = 2u8;
@@ -490,9 +610,12 @@ mod tests {
                             let off = piece as usize * METADATA_BLOCK_LEN;
                             let end = (off + METADATA_BLOCK_LEN).min(total);
                             let resp = data_piece(piece, total as i64, &meta_peer[off..end]);
-                            sess.send(&PeerMessage::Extended { ext_id: peer_ut_id, payload: resp })
-                                .await
-                                .unwrap();
+                            sess.send(&PeerMessage::Extended {
+                                ext_id: peer_ut_id,
+                                payload: resp,
+                            })
+                            .await
+                            .unwrap();
                             served += 1;
                         }
                     }
@@ -516,7 +639,12 @@ mod tests {
             if let Ok(PeerMessage::Extended { .. }) = sess.read_message().await {
                 // Reject piece 0: {msg_type: 2, piece: 0}.
                 let reject = b"d8:msg_typei2e5:piecei0ee".to_vec();
-                let _ = sess.send(&PeerMessage::Extended { ext_id: peer_ut_id, payload: reject }).await;
+                let _ = sess
+                    .send(&PeerMessage::Extended {
+                        ext_id: peer_ut_id,
+                        payload: reject,
+                    })
+                    .await;
             }
         });
         let mut session = PeerSession::new(client);
@@ -537,7 +665,9 @@ mod tests {
             server.write_all(&peer_hs.encode()).await.unwrap();
         });
         let mut session = PeerSession::new(client);
-        let res = session.perform_handshake([0x11u8; 20], *b"R30------CLIENTPEERy").await;
+        let res = session
+            .perform_handshake([0x11u8; 20], *b"R30------CLIENTPEERy")
+            .await;
         assert!(matches!(res, Err(PeerError::InfohashMismatch)));
         srv.await.unwrap();
     }
@@ -555,9 +685,81 @@ mod tests {
         });
 
         let mut server_session = PeerSession::new(server);
-        let got = server_session.accept_handshake(server_id, |peer_ih| *peer_ih == ih).await.unwrap();
+        let got = server_session
+            .accept_handshake(server_id, |peer_ih| *peer_ih == ih)
+            .await
+            .unwrap();
         assert_eq!(got.infohash, ih);
         assert_eq!(got.peer_id, client_id);
+
+        let client_got = client_task.await.unwrap().unwrap();
+        assert_eq!(client_got.infohash, ih);
+        assert_eq!(client_got.peer_id, server_id);
+    }
+
+    #[tokio::test]
+    async fn accept_handshake_replies_to_official_short_inbound_handshake() {
+        let (mut client, server) = tokio::io::duplex(256);
+        let ih = [0x43u8; 20];
+        let client_id = *b"R30------CLIENTPEERy";
+        let server_id = *b"R30------SERVERPEERy";
+
+        let short = Handshake::new(ih, client_id).encode()[..46].to_vec();
+        let client_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            client.write_all(&short).await.unwrap();
+            let mut reply = [0u8; HANDSHAKE_LEN];
+            client.read_exact(&mut reply).await.unwrap();
+            Handshake::decode(&reply)
+        });
+
+        let mut server_session = PeerSession::new(server).with_timeout(Duration::from_millis(100));
+        let got = server_session
+            .accept_handshake(server_id, |peer_ih| *peer_ih == ih)
+            .await
+            .unwrap();
+        assert_eq!(got.infohash, ih);
+        assert_eq!(
+            got.peer_id, [0u8; 20],
+            "the official short inbound handshake omits peer_id; keep that explicit"
+        );
+
+        let client_got = client_task.await.unwrap().unwrap();
+        assert_eq!(client_got.infohash, ih);
+        assert_eq!(client_got.peer_id, server_id);
+    }
+
+    #[tokio::test]
+    async fn accept_handshake_drains_deferred_peer_id_after_official_short_handshake() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let ih = [0x44u8; 20];
+        let client_id = *b"R30------CLIENTPEERy";
+        let server_id = *b"R30------SERVERPEERy";
+        let ext = PeerMessage::Extended {
+            ext_id: 0,
+            payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+        };
+        let ext_wire = ext.encode();
+
+        let short = Handshake::new(ih, client_id).encode()[..46].to_vec();
+        let client_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            client.write_all(&short).await.unwrap();
+            let mut reply = [0u8; HANDSHAKE_LEN];
+            client.read_exact(&mut reply).await.unwrap();
+            client.write_all(&client_id).await.unwrap();
+            client.write_all(&ext_wire).await.unwrap();
+            Handshake::decode(&reply)
+        });
+
+        let mut server_session = PeerSession::new(server).with_timeout(Duration::from_millis(200));
+        let got = server_session
+            .accept_handshake(server_id, |peer_ih| *peer_ih == ih)
+            .await
+            .unwrap();
+        assert_eq!(got.infohash, ih);
+        assert_eq!(got.peer_id, client_id);
+        assert_eq!(server_session.read_message().await.unwrap(), ext);
 
         let client_got = client_task.await.unwrap().unwrap();
         assert_eq!(client_got.infohash, ih);
@@ -577,7 +779,9 @@ mod tests {
         });
 
         let mut server_session = PeerSession::new(server);
-        let result = server_session.accept_handshake(*b"R30------SERVERPEERy", |_| false).await;
+        let result = server_session
+            .accept_handshake(*b"R30------SERVERPEERy", |_| false)
+            .await;
         assert!(result.is_err(), "must refuse an infohash we don't serve");
 
         // The client never got a reply, so its own handshake read times out / errors.

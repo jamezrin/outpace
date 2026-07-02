@@ -44,18 +44,32 @@ Validated decode:
 - `transport-01.bin` → name "Synthetic Live Channel 1080 …", `piece_length=1048576`, RSA, 2 trackers, **live (no `pieces`)**.
 - `transport-02.bin` → name "Synthetic Demo Channel", `piece_length=131072`, tracker `udp://t1.torrentstream.org:2710/announce`, **live (no `pieces`)**.
 
-## Infohash derivation — VALIDATED
+## Infohash derivation — VALIDATED, corrected 2026-07-01
 ```
-infohash = SHA1( entire transport-file bytes, including the "AceStreamTransport" magic )
+infohash = SHA1(bencode([
+  ["name",         descriptor["name"]],
+  ["authmethod",   descriptor["authmethod"]],
+  ["pubkey",       descriptor["pubkey"]],
+  ["piece_length", descriptor["piece_length"]],
+  ["chunk_length", descriptor["chunk_length"]],
+  ["bitrate",      descriptor["bitrate"]],
+]))
 ```
-Confirmed byte-for-byte against engine ground truth (the engine names each cached
-transport file by its infohash):
-- `tests/vectors/transport-01.bin` → SHA1 = `34df422b80a4bd94ac1e51be9ede60364ec7a7dd` ✓
-- `tests/vectors/transport-02.bin` → SHA1 = `ed2c05b3b022e9cc7b7c1ca46d20f10839dc4108` ✓
+Confirmed by importing the official `Transport.so` in the sandbox and calling
+`load_transport_file_from_string(...).get_infohash()` while wrapping `hashlib.sha1`.
+Ground-truth vectors:
+- `tests/vectors/transport-01.bin` → official infohash =
+  `50e93529d3eb46a50506b14464185a15292d6e47`
+- `tests/vectors/transport-02.bin` → official infohash =
+  `685edf209ccfdf88977c0d317e1407baca486067`
 
-This matches the Ghidra finding that `TorrentDef.finalize()` computes a SHA1
-(`hash_sha1`) used as the 20-byte infohash (plus secondary `hash_md5`/`hash_crc32`).
-NOTE: this is SHA1 over the **whole wrapped file**, not over a BitTorrent info-dict.
+The engine also computes `SHA1(entire wrapped transport-file bytes)`, but that is a
+separate transport-file hash/cache identifier, not the swarm infohash used in peer
+handshakes:
+- `tests/vectors/transport-01.bin` → transport-file hash =
+  `34df422b80a4bd94ac1e51be9ede60364ec7a7dd`
+- `tests/vectors/transport-02.bin` → transport-file hash =
+  `ed2c05b3b022e9cc7b7c1ca46d20f10839dc4108`
 
 ## content_id — PARTIAL
 - The engine maps content_id ⇄ infohash (verified): content_id
@@ -65,8 +79,11 @@ NOTE: this is SHA1 over the **whole wrapped file**, not over a BitTorrent info-d
   `cid4`.
 - For live broadcasts the content_id is stable while the infohash rotates, so
   content_id is almost certainly derived from the broadcaster **`pubkey`** in the
-  descriptor (now decodable — see above). Likely `content_id = SHA1(pubkey)` or a
-  hash of a descriptor subset; to be confirmed against the known pairs.
+  descriptor (now decodable — see above), but the exact preimage is not simple
+  `SHA1(pubkey)`: for `transport-01.bin`, `SHA1(pubkey)` is
+  `3fe25f036fa7d30550a2c0e566a6c1005ac86906`, not the official content_id
+  `cid1`. Common DER-prefix / modulus-like slices
+  checked in note 35 also did not match.
 - `OPEN:` confirm the exact content_id algorithm from the decoded `pubkey`.
   `get_content_id` (HTTP API) resolves it today, so it is not an MVP blocker.
 
@@ -77,7 +94,8 @@ piece integrity). The decoder already surfaces `pieces` when present; this just 
 a VOD fixture to confirm the exact encoding.
 
 ## Implementation note
-`ace-wire` can: (1) compute/verify infohash = SHA1(file); (2) **decode the descriptor**
+`ace-wire` can: (1) compute the official descriptor-derived swarm infohash and the
+separate raw transport-file hash; (2) **decode the descriptor**
 via AES-128-CBC(fixed key/IV) → PKCS#7 → bencode, exposing `piece_length`,
 `chunk_length`, `trackers`, `pubkey`, and (VOD) `pieces`. The AES key/IV must be
 embedded as protocol constants. Live integrity uses the RSA `pubkey` + per-piece

@@ -10,14 +10,24 @@ use ace_wire::message::PeerMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn ts_byte(i: usize) -> u8 {
-    if i.is_multiple_of(188) { 0x47 } else { (i % 251) as u8 }
+    if i.is_multiple_of(188) {
+        0x47
+    } else {
+        (i % 251) as u8
+    }
 }
 
 #[tokio::test]
 async fn live_session_emits_contiguous_ts_from_one_peer() {
     let infohash = [0x42u8; 20];
     // Tiny geometry for the test: 2 chunks/piece, 4 bytes/chunk.
-    let info = StreamInfo { infohash, piece_length: 8, chunk_length: 4, trackers: vec![] };
+    let info = StreamInfo {
+        infohash,
+        piece_length: 8,
+        chunk_length: 4,
+        trackers: vec![],
+        sig_len: 0,
+    };
     let start_piece = 10u32;
     let pieces = 3u32;
     let content: Vec<u8> = (0..(pieces as usize * 8)).map(ts_byte).collect();
@@ -43,7 +53,13 @@ async fn live_session_emits_contiguous_ts_from_one_peer() {
             let mut block = vec![0u8; 8]; // 8-byte piece header
             block.extend_from_slice(&chunk.to_be_bytes());
             block.extend_from_slice(&content_peer[off..off + 4]);
-            sess.send(&PeerMessage::Piece { index: 0, begin: piece, block }).await.unwrap();
+            sess.send(&PeerMessage::Piece {
+                index: 0,
+                begin: piece,
+                block,
+            })
+            .await
+            .unwrap();
         }
     });
 

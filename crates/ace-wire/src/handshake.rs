@@ -1,10 +1,16 @@
-//! Acestream peer handshake: 66 bytes, BitTorrent layout with a custom pstr.
+//! Acestream peer handshake: BitTorrent layout with a custom pstr.
 //! `0x11 "AceStreamProtocol" + 8 reserved + infohash(20) + peer_id(20)`.
+//!
+//! Most peers use the full 66-byte form, but the official engine as an inbound leecher has
+//! also been observed opening with only the 46-byte prefix through `infohash`; responders
+//! must accept that short form and reply with their full handshake.
 use crate::{Result, WireError};
 use rand::Rng;
 
 /// Protocol string (length 17). Replaces BitTorrent's "BitTorrent protocol".
 pub const PSTR: &[u8] = b"AceStreamProtocol";
+/// Prefix length through the infohash: 1 + 17 + 8 + 20.
+pub const HANDSHAKE_PREFIX_LEN: usize = 46;
 /// Total handshake length: 1 + 17 + 8 + 20 + 20.
 pub const HANDSHAKE_LEN: usize = 66;
 
@@ -18,7 +24,11 @@ pub struct Handshake {
 impl Handshake {
     /// Build an outgoing handshake with zero reserved bits.
     pub fn new(infohash: [u8; 20], peer_id: [u8; 20]) -> Self {
-        Handshake { reserved: [0; 8], infohash, peer_id }
+        Handshake {
+            reserved: [0; 8],
+            infohash,
+            peer_id,
+        }
     }
 
     pub fn encode(&self) -> [u8; HANDSHAKE_LEN] {
@@ -32,7 +42,18 @@ impl Handshake {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Handshake> {
-        if buf.len() < HANDSHAKE_LEN { return Err(WireError::Truncated); }
+        if buf.len() < HANDSHAKE_LEN {
+            return Err(WireError::Truncated);
+        }
+        let mut hs = Self::decode_prefix(&buf[..HANDSHAKE_PREFIX_LEN])?;
+        hs.peer_id.copy_from_slice(&buf[46..66]);
+        Ok(hs)
+    }
+
+    pub fn decode_prefix(buf: &[u8]) -> Result<Handshake> {
+        if buf.len() < HANDSHAKE_PREFIX_LEN {
+            return Err(WireError::Truncated);
+        }
         if buf[0] as usize != PSTR.len() || &buf[1..18] != PSTR {
             return Err(WireError::Invalid("not an AceStreamProtocol handshake"));
         }
@@ -40,9 +61,11 @@ impl Handshake {
         reserved.copy_from_slice(&buf[18..26]);
         let mut infohash = [0u8; 20];
         infohash.copy_from_slice(&buf[26..46]);
-        let mut peer_id = [0u8; 20];
-        peer_id.copy_from_slice(&buf[46..66]);
-        Ok(Handshake { reserved, infohash, peer_id })
+        Ok(Handshake {
+            reserved,
+            infohash,
+            peer_id: [0u8; 20],
+        })
     }
 }
 

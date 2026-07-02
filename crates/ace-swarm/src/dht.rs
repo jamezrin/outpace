@@ -19,6 +19,9 @@ const BOOTSTRAP: &[&str] = &[
     "dht.transmissionbt.com:6881",
     "dht.libtorrent.org:25401",
 ];
+/// Enough peers to start racing TCP connects. Waiting for a much larger DHT harvest delays
+/// first byte even though the engine only needs one good upstream.
+const DHT_PEER_TARGET: usize = 8;
 
 /// Build a `get_peers` KRPC query for `infohash` from our `node_id`.
 pub fn build_get_peers(node_id: &[u8; 20], infohash: &[u8; 20], txid: &[u8]) -> Vec<u8> {
@@ -38,7 +41,13 @@ pub fn build_get_peers(node_id: &[u8; 20], infohash: &[u8; 20], txid: &[u8]) -> 
 /// its own `get_peers` response (anti-spoofing: a node only accepts an announce echoing a
 /// token it issued). `implied_port=0` and an explicit `port` — we advertise our real
 /// listening port rather than relying on the sender's UDP source port.
-pub fn build_announce_peer(node_id: &[u8; 20], infohash: &[u8; 20], port: u16, token: &[u8], txid: &[u8]) -> Vec<u8> {
+pub fn build_announce_peer(
+    node_id: &[u8; 20],
+    infohash: &[u8; 20],
+    port: u16,
+    token: &[u8],
+    txid: &[u8],
+) -> Vec<u8> {
     let mut a: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
     a.insert(b"id".to_vec(), Bencode::Bytes(node_id.to_vec()));
     a.insert(b"info_hash".to_vec(), Bencode::Bytes(infohash.to_vec()));
@@ -86,7 +95,10 @@ pub fn parse_response(buf: &[u8]) -> Option<GetPeersResponse> {
             }
         }
     }
-    out.token = r.get(b"token").and_then(Bencode::as_bytes).map(|b| b.to_vec());
+    out.token = r
+        .get(b"token")
+        .and_then(Bencode::as_bytes)
+        .map(|b| b.to_vec());
     Some(out)
 }
 
@@ -99,7 +111,10 @@ fn compact_peer(b: &[u8]) -> Option<SocketAddrV4> {
     if port == 0 {
         return None;
     }
-    Some(SocketAddrV4::new(Ipv4Addr::new(b[0], b[1], b[2], b[3]), port))
+    Some(SocketAddrV4::new(
+        Ipv4Addr::new(b[0], b[1], b[2], b[3]),
+        port,
+    ))
 }
 
 /// XOR distance between a node id and the target (BTreeSet-orderable key).
@@ -120,10 +135,8 @@ async fn dht_walk(
     infohash: &[u8; 20],
     budget: Duration,
     sock: &UdpSocket,
-    mut on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
+    on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
 ) {
-    let node_id: [u8; 20] = rand::random();
-
     // Frontier of candidate nodes keyed by XOR distance; seed with bootstrap routers.
     let mut frontier: BTreeMap<[u8; 20], SocketAddrV4> = BTreeMap::new();
     for (i, host) in BOOTSTRAP.iter().enumerate() {
@@ -140,11 +153,39 @@ async fn dht_walk(
             }
         }
     }
+    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await;
+}
+
+#[cfg(test)]
+async fn dht_walk_from_seeds(
+    infohash: &[u8; 20],
+    budget: Duration,
+    sock: &UdpSocket,
+    seeds: Vec<SocketAddrV4>,
+    on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
+) {
+    let mut frontier: BTreeMap<[u8; 20], SocketAddrV4> = BTreeMap::new();
+    for (i, seed) in seeds.into_iter().enumerate() {
+        let mut key = [0xffu8; 20];
+        key[19] = i as u8;
+        frontier.insert(key, seed);
+    }
+    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await;
+}
+
+async fn dht_walk_frontier(
+    infohash: &[u8; 20],
+    budget: Duration,
+    sock: &UdpSocket,
+    mut frontier: BTreeMap<[u8; 20], SocketAddrV4>,
+    mut on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
+) {
+    let node_id: [u8; 20] = rand::random();
 
     let mut queried: HashSet<SocketAddrV4> = HashSet::new();
     let deadline = Instant::now() + budget;
     let mut buf = [0u8; 2048];
-    eprintln!("[dht] seeded {} bootstrap node(s)", frontier.len());
+    crate::swarm_log!("[dht] seeded {} bootstrap node(s)", frontier.len());
 
     'outer: while Instant::now() < deadline {
         // Send to up to 8 closest not-yet-queried nodes.
@@ -155,7 +196,7 @@ async fn dht_walk(
             .copied()
             .collect();
         if batch.is_empty() {
-            eprintln!("[dht] frontier exhausted: queried={}", queried.len());
+            crate::swarm_log!("[dht] frontier exhausted: queried={}", queried.len());
             break;
         }
         for addr in &batch {
@@ -196,6 +237,14 @@ async fn dht_walk(
 
 /// Iterative `get_peers` toward `infohash`, bounded by `budget`. Returns discovered peers.
 pub async fn dht_get_peers(infohash: &[u8; 20], budget: Duration) -> Vec<SocketAddrV4> {
+    dht_get_peers_with_target(infohash, budget, DHT_PEER_TARGET).await
+}
+
+pub async fn dht_get_peers_with_target(
+    infohash: &[u8; 20],
+    budget: Duration,
+    peer_target: usize,
+) -> Vec<SocketAddrV4> {
     let sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -203,7 +252,27 @@ pub async fn dht_get_peers(infohash: &[u8; 20], budget: Duration) -> Vec<SocketA
     let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
     dht_walk(infohash, budget, &sock, |_src, resp| {
         peers.extend(resp.peers.iter().copied());
-        peers.len() >= 30
+        peers.len() >= peer_target
+    })
+    .await;
+    peers.into_iter().collect()
+}
+
+#[cfg(test)]
+async fn dht_get_peers_from_seeds(
+    infohash: &[u8; 20],
+    budget: Duration,
+    peer_target: usize,
+    seeds: Vec<SocketAddrV4>,
+) -> Vec<SocketAddrV4> {
+    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
+    dht_walk_from_seeds(infohash, budget, &sock, seeds, |_src, resp| {
+        peers.extend(resp.peers.iter().copied());
+        peers.len() >= peer_target
     })
     .await;
     peers.into_iter().collect()
@@ -255,23 +324,38 @@ mod tests {
     fn get_peers_query_roundtrips() {
         let q = build_get_peers(&[1u8; 20], &[2u8; 20], b"aa");
         let d = Bencode::parse(&q).unwrap();
-        assert_eq!(d.get(b"q").unwrap().as_bytes(), Some(b"get_peers".as_slice()));
+        assert_eq!(
+            d.get(b"q").unwrap().as_bytes(),
+            Some(b"get_peers".as_slice())
+        );
         assert_eq!(d.get(b"y").unwrap().as_bytes(), Some(b"q".as_slice()));
         let a = d.get(b"a").unwrap();
-        assert_eq!(a.get(b"info_hash").unwrap().as_bytes(), Some([2u8; 20].as_slice()));
+        assert_eq!(
+            a.get(b"info_hash").unwrap().as_bytes(),
+            Some([2u8; 20].as_slice())
+        );
     }
 
     #[test]
     fn announce_peer_query_roundtrips() {
         let q = build_announce_peer(&[1u8; 20], &[2u8; 20], 8621, b"tok123", b"aa");
         let d = Bencode::parse(&q).unwrap();
-        assert_eq!(d.get(b"q").unwrap().as_bytes(), Some(b"announce_peer".as_slice()));
+        assert_eq!(
+            d.get(b"q").unwrap().as_bytes(),
+            Some(b"announce_peer".as_slice())
+        );
         assert_eq!(d.get(b"y").unwrap().as_bytes(), Some(b"q".as_slice()));
         let a = d.get(b"a").unwrap();
-        assert_eq!(a.get(b"info_hash").unwrap().as_bytes(), Some([2u8; 20].as_slice()));
+        assert_eq!(
+            a.get(b"info_hash").unwrap().as_bytes(),
+            Some([2u8; 20].as_slice())
+        );
         assert_eq!(a.get(b"id").unwrap().as_bytes(), Some([1u8; 20].as_slice()));
         assert_eq!(a.get(b"port").unwrap().as_int(), Some(8621));
-        assert_eq!(a.get(b"token").unwrap().as_bytes(), Some(b"tok123".as_slice()));
+        assert_eq!(
+            a.get(b"token").unwrap().as_bytes(),
+            Some(b"tok123".as_slice())
+        );
         assert_eq!(a.get(b"implied_port").unwrap().as_int(), Some(0));
     }
 
@@ -281,7 +365,10 @@ mod tests {
         let mut r: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
         r.insert(b"id".to_vec(), Bencode::Bytes(vec![0; 20]));
         let peer = vec![87u8, 221, 96, 148, 0x21, 0xAD]; // 87.221.96.148:8621
-        r.insert(b"values".to_vec(), Bencode::List(vec![Bencode::Bytes(peer)]));
+        r.insert(
+            b"values".to_vec(),
+            Bencode::List(vec![Bencode::Bytes(peer)]),
+        );
         let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
         top.insert(b"r".to_vec(), Bencode::Dict(r));
         top.insert(b"y".to_vec(), Bencode::Bytes(b"r".to_vec()));
@@ -329,6 +416,54 @@ mod tests {
         assert!(distance(&[0; 20], &[1; 20]) < distance(&[0xff; 20], &[0; 20]));
     }
 
+    #[tokio::test]
+    async fn dht_lookup_stops_once_peer_target_is_met() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = match server.local_addr().unwrap() {
+            SocketAddr::V4(v4) => v4,
+            _ => panic!("test server must be IPv4"),
+        };
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (_n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let mut peer1 = Vec::new();
+            peer1.extend_from_slice(&[10, 0, 0, 1]);
+            peer1.extend_from_slice(&1111u16.to_be_bytes());
+            let mut peer2 = Vec::new();
+            peer2.extend_from_slice(&[10, 0, 0, 2]);
+            peer2.extend_from_slice(&2222u16.to_be_bytes());
+
+            let mut r: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+            r.insert(b"id".to_vec(), Bencode::Bytes(vec![7; 20]));
+            r.insert(
+                b"values".to_vec(),
+                Bencode::List(vec![Bencode::Bytes(peer1), Bencode::Bytes(peer2)]),
+            );
+            let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+            top.insert(b"r".to_vec(), Bencode::Dict(r));
+            server
+                .send_to(&Bencode::Dict(top).encode(), peer)
+                .await
+                .unwrap();
+        });
+
+        let start = Instant::now();
+        let peers =
+            dht_get_peers_from_seeds(&[9u8; 20], Duration::from_secs(5), 2, vec![seed]).await;
+        assert_eq!(
+            peers,
+            vec![
+                "10.0.0.1:1111".parse().unwrap(),
+                "10.0.0.2:2222".parse().unwrap()
+            ]
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "lookup should return as soon as enough peers are available"
+        );
+        handle.await.unwrap();
+    }
+
     // Live DHT lookup against a real infohash:
     //   ACE_INFOHASH=50e935...2d6e47 cargo test -p ace-swarm dht_live -- --ignored --nocapture
     #[tokio::test]
@@ -361,6 +496,9 @@ mod tests {
         }
         let announced = dht_announce_peer(&ih, 8621, std::time::Duration::from_secs(20)).await;
         println!("DHT announce_peer sent to {announced} node(s)");
-        assert!(announced > 0, "no node handed us a token to announce back with");
+        assert!(
+            announced > 0,
+            "no node handed us a token to announce back with"
+        );
     }
 }

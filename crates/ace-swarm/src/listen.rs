@@ -39,7 +39,11 @@ impl SeedRegistry {
 
     /// The store for `infohash`, creating it via `make` (and registering it) if absent.
     /// Atomic: the whole get-or-insert happens under one lock acquisition.
-    pub fn get_or_create(&self, infohash: [u8; 20], make: impl FnOnce() -> PieceStore) -> SharedStore {
+    pub fn get_or_create(
+        &self,
+        infohash: [u8; 20],
+        make: impl FnOnce() -> PieceStore,
+    ) -> SharedStore {
         self.stores
             .lock()
             .unwrap()
@@ -87,7 +91,7 @@ impl PeerListener {
                     // A backoff matters here: under fd exhaustion (EMFILE/ENFILE) accept()
                     // fails repeatedly with no natural delay, and a tight retry loop would
                     // busy-spin a core instead of giving the system room to recover.
-                    eprintln!("[seed-listener] accept error: {e}");
+                    crate::swarm_log!("[seed-listener] accept error: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -109,11 +113,18 @@ impl PeerListener {
             };
             tokio::spawn(async move {
                 let _permit = permit;
-                eprintln!("[seed-listener] accepted connection from {addr}");
-                if let Err(e) =
-                    handle_inbound(stream, registry, our_peer_id, piece_header, &identity, peer_ip).await
+                crate::swarm_log!("[seed-listener] accepted connection from {addr}");
+                if let Err(e) = handle_inbound(
+                    stream,
+                    registry,
+                    our_peer_id,
+                    piece_header,
+                    &identity,
+                    peer_ip,
+                )
+                .await
                 {
-                    eprintln!("[seed-listener] peer error from {addr}: {e:?}");
+                    crate::swarm_log!("[seed-listener] peer error from {addr}: {e:?}");
                 }
             });
         }
@@ -129,8 +140,12 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     peer_ip: [u8; 4],
 ) -> ace_peer::Result<()> {
     let mut session = PeerSession::new(stream);
-    let peer_hs = session.accept_handshake(our_peer_id, |ih| registry.serves(ih)).await?;
-    let store = registry.get(&peer_hs.infohash).ok_or(ace_peer::PeerError::InfohashMismatch)?;
+    let peer_hs = session
+        .accept_handshake(our_peer_id, |ih| registry.serves(ih))
+        .await?;
+    let store = registry
+        .get(&peer_hs.infohash)
+        .ok_or(ace_peer::PeerError::InfohashMismatch)?;
     SeederSession::serve(&mut session, store, piece_header, identity, peer_ip).await
 }
 
@@ -144,6 +159,9 @@ mod tests {
         let ih = [1u8; 20];
         let a = reg.get_or_create(ih, || PieceStore::new(4, 4, 1024));
         let b = reg.get_or_create(ih, || panic!("must not call make() again"));
-        assert!(Arc::ptr_eq(&a, &b), "second call must return the SAME store, not create a new one");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second call must return the SAME store, not create a new one"
+        );
     }
 }

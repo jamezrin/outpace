@@ -15,18 +15,18 @@
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::store::PieceStore;
 use ace_wire::bencode::Bencode;
-use ace_wire::infohash::infohash_of_transport;
+use ace_wire::infohash::infohash_of_descriptor;
 use ace_wire::live_auth::LiveSourceAuth;
 use ace_wire::transport::encode_transport;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Acestream's live geometry (matches the real engine's default for this bitrate class —
-/// see notes 19/20; our own originated content doesn't need to match exactly, but doing so
-/// avoids being trivially fingerprinted as a different implementation).
-pub const PIECE_LENGTH: u64 = 1_048_576;
+/// Acestream source-node live geometry (captured from the official `--stream-source-node`
+/// default for an 8375 kbps MPEG-TS source).
+pub const PIECE_LENGTH: u64 = 65_536;
 pub const CHUNK_LENGTH: u64 = 16_384;
+pub const DEFAULT_BROADCAST_BITRATE: i64 = 8375;
 
 /// A minted, originated broadcast: its infohash, the transport file bytes (for persistence /
 /// future `ut_metadata` serving), the shared piece store peers are served from, and the
@@ -48,7 +48,9 @@ pub struct BroadcastRegistry {
 
 impl BroadcastRegistry {
     pub fn new() -> Arc<Self> {
-        Arc::new(BroadcastRegistry { by_name: Mutex::new(BTreeMap::new()) })
+        Arc::new(BroadcastRegistry {
+            by_name: Mutex::new(BTreeMap::new()),
+        })
     }
 
     /// The broadcast already minted under `name`, if any.
@@ -80,10 +82,12 @@ impl BroadcastRegistry {
         }
         let auth = LiveSourceAuth::generate();
         let descriptor = build_descriptor(name, title, trackers, &auth.pubkey_der());
+        let infohash = infohash_of_descriptor(&descriptor)
+            .expect("broadcast descriptor has official infohash fields");
         let transport_bytes = encode_transport(&descriptor);
-        let infohash = infohash_of_transport(&transport_bytes);
-        let store = seed_registry
-            .get_or_create(infohash, || PieceStore::new(PIECE_LENGTH, CHUNK_LENGTH, store_bytes));
+        let store = seed_registry.get_or_create(infohash, || {
+            PieceStore::new(PIECE_LENGTH, CHUNK_LENGTH, store_bytes)
+        });
         let broadcast = Broadcast {
             infohash,
             transport_bytes: Arc::new(transport_bytes),
@@ -104,25 +108,37 @@ fn build_descriptor(name: &str, title: &str, trackers: &[String], pubkey_der: &[
     d.insert(b"name".to_vec(), Bencode::Bytes(title.as_bytes().to_vec()));
     d.insert(b"piece_length".to_vec(), Bencode::Int(PIECE_LENGTH as i64));
     d.insert(b"chunk_length".to_vec(), Bencode::Int(CHUNK_LENGTH as i64));
-    d.insert(b"bitrate".to_vec(), Bencode::Int(0));
+    d.insert(b"bitrate".to_vec(), Bencode::Int(DEFAULT_BROADCAST_BITRATE));
     d.insert(b"quality".to_vec(), Bencode::Bytes(b"auto".to_vec()));
-    d.insert(b"categories".to_vec(), Bencode::List(vec![Bencode::Bytes(b"other".to_vec())]));
+    d.insert(
+        b"categories".to_vec(),
+        Bencode::List(vec![Bencode::Bytes(b"other".to_vec())]),
+    );
     d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"RSA".to_vec()));
     d.insert(b"pubkey".to_vec(), Bencode::Bytes(pubkey_der.to_vec()));
     d.insert(
         b"trackers".to_vec(),
-        Bencode::List(trackers.iter().map(|t| Bencode::Bytes(t.as_bytes().to_vec())).collect()),
+        Bencode::List(
+            trackers
+                .iter()
+                .map(|t| Bencode::Bytes(t.as_bytes().to_vec()))
+                .collect(),
+        ),
     );
     d.insert(b"allow_public_trackers".to_vec(), Bencode::Int(1));
     // `name` above is actually reused for outpace's internal identifier too; keep the
     // ingest path segment discoverable via a dedicated key for operator tooling.
-    d.insert(b"outpace_name".to_vec(), Bencode::Bytes(name.as_bytes().to_vec()));
+    d.insert(
+        b"outpace_name".to_vec(),
+        Bencode::Bytes(name.as_bytes().to_vec()),
+    );
     Bencode::Dict(d)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ace_wire::infohash::infohash_of_transport;
     use ace_wire::transport::decode_transport;
 
     fn registry() -> (Arc<BroadcastRegistry>, SeedRegistry) {
@@ -133,13 +149,24 @@ mod tests {
     async fn minted_broadcast_decodes_to_a_live_descriptor_with_our_pubkey() {
         let (reg, seed) = registry();
         let (bc, fresh) = reg
-            .start_or_resume("test", "Test Stream", &["udp://t.example:1/announce".into()], &seed, 1 << 20)
+            .start_or_resume(
+                "test",
+                "Test Stream",
+                &["udp://t.example:1/announce".into()],
+                &seed,
+                1 << 20,
+            )
             .await;
         assert!(fresh, "first mint of this name must report fresh=true");
         let decoded = decode_transport(&bc.transport_bytes).unwrap();
         assert_eq!(decoded.name, "Test Stream");
         assert_eq!(decoded.piece_length, PIECE_LENGTH);
         assert_eq!(decoded.chunk_length, CHUNK_LENGTH);
+        assert_eq!(
+            decoded.bitrate,
+            Some(8375),
+            "official source-node transports carry a nonzero bitrate hint"
+        );
         assert!(decoded.is_live, "no pieces key -> live");
         // DER SPKI-encoded RSA pubkey (note 25 captured 124 bytes for one specific 768-bit
         // key; the exact length varies +/- a couple bytes with modulus/exponent leading-zero
@@ -149,32 +176,51 @@ mod tests {
             "expected a DER SPKI RSA pubkey, got {} bytes",
             decoded.pubkey.len()
         );
-        assert_eq!(decoded.trackers, vec!["udp://t.example:1/announce".to_string()]);
+        assert_eq!(
+            decoded.trackers,
+            vec!["udp://t.example:1/announce".to_string()]
+        );
     }
 
     #[tokio::test]
-    async fn infohash_matches_sha1_of_the_minted_transport_bytes() {
+    async fn infohash_matches_official_descriptor_hash_of_the_minted_transport_bytes() {
         let (reg, seed) = registry();
-        let (bc, _fresh) = reg.start_or_resume("test", "Test", &[], &seed, 1 << 20).await;
+        let (bc, _fresh) = reg
+            .start_or_resume("test", "Test", &[], &seed, 1 << 20)
+            .await;
         assert_eq!(bc.infohash, infohash_of_transport(&bc.transport_bytes));
     }
 
     #[tokio::test]
     async fn store_is_registered_in_the_shared_seed_registry_under_the_infohash() {
         let (reg, seed) = registry();
-        let (bc, _fresh) = reg.start_or_resume("test", "Test", &[], &seed, 1 << 20).await;
-        assert!(seed.serves(&bc.infohash), "minted broadcast must be immediately servable");
+        let (bc, _fresh) = reg
+            .start_or_resume("test", "Test", &[], &seed, 1 << 20)
+            .await;
+        assert!(
+            seed.serves(&bc.infohash),
+            "minted broadcast must be immediately servable"
+        );
     }
 
     #[tokio::test]
     async fn re_putting_the_same_name_resumes_rather_than_reminting() {
         let (reg, seed) = registry();
-        let (a, first_fresh) = reg.start_or_resume("test", "Test", &[], &seed, 1 << 20).await;
-        let (b, second_fresh) =
-            reg.start_or_resume("test", "A different title now", &[], &seed, 1 << 20).await;
-        assert_eq!(a.infohash, b.infohash, "same name -> same, already-minted broadcast");
+        let (a, first_fresh) = reg
+            .start_or_resume("test", "Test", &[], &seed, 1 << 20)
+            .await;
+        let (b, second_fresh) = reg
+            .start_or_resume("test", "A different title now", &[], &seed, 1 << 20)
+            .await;
+        assert_eq!(
+            a.infohash, b.infohash,
+            "same name -> same, already-minted broadcast"
+        );
         assert!(first_fresh, "first PUT mints");
-        assert!(!second_fresh, "second PUT of the same name resumes, not a fresh mint");
+        assert!(
+            !second_fresh,
+            "second PUT of the same name resumes, not a fresh mint"
+        );
     }
 
     #[tokio::test]
