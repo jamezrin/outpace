@@ -17,6 +17,12 @@ use std::sync::Arc;
 /// anything is locally following it — a pure origin needs to be discoverable too.
 const DEFAULT_BROADCAST_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announce"];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastIngestUrls {
+    pub raw: String,
+    pub rtmp: String,
+}
+
 pub struct EngineRuntime {
     pub config: Config,
     pub networks: Vec<String>,
@@ -30,6 +36,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     let mut config = Config::default();
     if let Ok(bind) = std::env::var("OUTPACE_BIND") {
         config.bind = bind.parse()?;
+    }
+    if let Ok(bind) = std::env::var("OUTPACE_RTMP_BIND") {
+        config.rtmp_bind = bind.parse()?;
     }
     if let Ok(dir) = std::env::var("OUTPACE_DATA_DIR") {
         config.data_dir = dir.into();
@@ -66,6 +75,28 @@ pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
         .collect()
+}
+
+pub fn broadcast_ingest_urls(
+    http_bind: std::net::SocketAddr,
+    rtmp_bind: std::net::SocketAddr,
+    public_host: Option<String>,
+    name: &str,
+) -> BroadcastIngestUrls {
+    let raw_host = public_host
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| http_bind.ip().to_string());
+    let rtmp_host = public_host.unwrap_or_else(|| rtmp_bind.ip().to_string());
+    BroadcastIngestUrls {
+        raw: format!(
+            "http://{}:{}/broadcast/{}",
+            raw_host,
+            http_bind.port(),
+            name
+        ),
+        rtmp: format!("rtmp://{}:{}/live/{}", rtmp_host, rtmp_bind.port(), name),
+    }
 }
 
 pub async fn build_runtime(
@@ -208,4 +239,29 @@ fn hex_node_id(identity: &ace_wire::identity::Identity) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_urls_use_raw_and_rtmp_labels() {
+        let http = "127.0.0.1:6878".parse().unwrap();
+        let rtmp = "127.0.0.1:1935".parse().unwrap();
+        let urls = broadcast_ingest_urls(http, rtmp, None, "mychan");
+
+        assert_eq!(urls.raw, "http://127.0.0.1:6878/broadcast/mychan");
+        assert_eq!(urls.rtmp, "rtmp://127.0.0.1:1935/live/mychan");
+    }
+
+    #[test]
+    fn broadcast_urls_use_public_host_for_displayed_hosts() {
+        let http = "0.0.0.0:6878".parse().unwrap();
+        let rtmp = "0.0.0.0:1935".parse().unwrap();
+        let urls = broadcast_ingest_urls(http, rtmp, Some("stream.example".to_string()), "mychan");
+
+        assert_eq!(urls.raw, "http://stream.example:6878/broadcast/mychan");
+        assert_eq!(urls.rtmp, "rtmp://stream.example:1935/live/mychan");
+    }
 }

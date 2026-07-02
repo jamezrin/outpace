@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// Address the HTTP API binds to.
     pub bind: SocketAddr,
+    /// Address the RTMP ingest listener binds to.
+    pub rtmp_bind: SocketAddr,
     /// Directory for the persistent identity seed and any caches.
     pub data_dir: PathBuf,
     /// Networks (providers) to enable.
@@ -45,6 +47,7 @@ impl Default for Config {
             .join("outpace");
         Config {
             bind: "127.0.0.1:6878".parse().unwrap(),
+            rtmp_bind: "127.0.0.1:1935".parse().unwrap(),
             data_dir,
             networks: vec!["ace".into()],
             peer_listen: "0.0.0.0:8621".parse().unwrap(),
@@ -111,6 +114,12 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.networks, vec!["ace".to_string()]);
         assert_eq!(c.bind.port(), 6878);
+    }
+
+    #[test]
+    fn default_config_has_rtmp_bind_on_localhost_1935() {
+        let c = Config::default();
+        assert_eq!(c.rtmp_bind, "127.0.0.1:1935".parse().unwrap());
     }
 
     #[test]

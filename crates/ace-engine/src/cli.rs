@@ -106,23 +106,25 @@ async fn run_broadcast(args: BroadcastArgs) -> Result<(), Box<dyn std::error::Er
     crate::runtime::announce_broadcast(&runtime, &bc);
 
     let bind = runtime.config.bind;
-    let host = public_host.unwrap_or_else(|| bind.ip().to_string());
+    let urls = crate::runtime::broadcast_ingest_urls(
+        runtime.config.bind,
+        runtime.config.rtmp_bind,
+        public_host.clone(),
+        &name,
+    );
+    let transport_host = public_host.unwrap_or_else(|| bind.ip().to_string());
     let content_id = hex20(&bc.content_id);
     let infohash = hex20(&bc.infohash);
 
     eprintln!("outpace broadcast: {name}");
-    eprintln!(
-        "OBS ingest URL: http://{}:{}/broadcast/{}",
-        bind.ip(),
-        bind.port(),
-        name
-    );
+    eprintln!("RAW Ingest URL: {} (MPEG-TS)", urls.raw);
+    eprintln!("RTMP Ingest URL: {}", urls.rtmp);
     eprintln!("Content ID: {content_id}");
     eprintln!("Ace link: acestream://{content_id}");
     eprintln!("Infohash: {infohash}");
     eprintln!(
         "Transport URL: http://{}:{}/broadcast/{}",
-        host,
+        transport_host,
         bind.port(),
         name
     );
