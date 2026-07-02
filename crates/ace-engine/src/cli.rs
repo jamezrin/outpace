@@ -53,9 +53,72 @@ pub struct PlayArgs {
     pub peers: Vec<SocketAddrV4>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackTarget {
+    pub provider_id: String,
+}
+
+impl PlaybackTarget {
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let input = input.trim();
+        if let Some(rest) = input.strip_prefix("acestream://") {
+            let id = rest.split(['?', '#']).next().unwrap_or("");
+            return content_id_target(id);
+        }
+        if let Some(query) = input.strip_prefix("acestream:?") {
+            let params = parse_query(query);
+            if let Some(id) = params.get("content_id") {
+                return content_id_target(id);
+            }
+            if let Some(id) = params.get("infohash") {
+                return infohash_target(id);
+            }
+            return Err("acestream URL must contain content_id or infohash".into());
+        }
+        Err("expected an acestream:// or acestream:? URL".into())
+    }
+}
+
+fn content_id_target(id: &str) -> Result<PlaybackTarget, String> {
+    let id = normalize_hex40(id)?;
+    Ok(PlaybackTarget {
+        provider_id: format!("cid:{id}"),
+    })
+}
+
+fn infohash_target(id: &str) -> Result<PlaybackTarget, String> {
+    Ok(PlaybackTarget {
+        provider_id: normalize_hex40(id)?,
+    })
+}
+
+fn normalize_hex40(id: &str) -> Result<String, String> {
+    if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(id.to_ascii_lowercase())
+    } else {
+        Err("identifier must be 40 hex characters".into())
+    }
+}
+
+fn parse_query(query: &str) -> std::collections::BTreeMap<String, String> {
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?.trim();
+            let value = parts.next().unwrap_or("").trim();
+            if key.is_empty() {
+                None
+            } else {
+                Some((key.to_string(), value.to_string()))
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, PlaybackTarget};
     use clap::Parser;
 
     #[test]
@@ -99,5 +162,42 @@ mod tests {
             }
             other => panic!("expected play command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn old_acestream_url_is_content_id() {
+        let parsed =
+            PlaybackTarget::parse("acestream://0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(
+            parsed.provider_id,
+            "cid:0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn query_content_id_is_content_id() {
+        let parsed =
+            PlaybackTarget::parse("acestream:?content_id=0123456789abcdef0123456789abcdef01234567")
+                .unwrap();
+        assert_eq!(
+            parsed.provider_id,
+            "cid:0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn query_infohash_is_direct_infohash() {
+        let parsed =
+            PlaybackTarget::parse("acestream:?infohash=89abcdef0123456789abcdef0123456789abcdef")
+                .unwrap();
+        assert_eq!(
+            parsed.provider_id,
+            "89abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn invalid_playback_input_is_rejected() {
+        assert!(PlaybackTarget::parse("acestream://nothex").is_err());
     }
 }
