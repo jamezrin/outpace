@@ -144,7 +144,7 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager = StreamManager::new(registry);
+    let manager = StreamManager::with_buffer(registry, config.session_buffer);
     manager.spawn_reaper();
     let broadcasts = BroadcastState {
         registry: BroadcastRegistry::new(),

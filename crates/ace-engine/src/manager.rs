@@ -24,14 +24,23 @@ pub struct StreamManager {
 
 impl StreamManager {
     pub fn new(registry: ProviderRegistry) -> Arc<StreamManager> {
+        Self::with_buffer(registry, 256)
+    }
+
+    pub fn with_buffer(registry: ProviderRegistry, buffer: usize) -> Arc<StreamManager> {
         Arc::new(StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
             packagers: Mutex::new(HashMap::new()),
             start_lock: Mutex::new(()),
-            buffer: 256,
+            buffer,
             grace: Duration::from_secs(30),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer(&self) -> usize {
+        self.buffer
     }
 
     /// Get the running session for `(network, id)` or start one via the provider. Returns
@@ -131,6 +140,13 @@ mod tests {
         let mut r = ProviderRegistry::new();
         r.register(Arc::new(TestProvider { chunks: 1000 }));
         r
+    }
+
+    #[test]
+    fn with_buffer_sets_the_fanout_depth() {
+        let reg = ProviderRegistry::new();
+        let mgr = StreamManager::with_buffer(reg, 4);
+        assert_eq!(mgr.buffer(), 4);
     }
 
     #[tokio::test]
