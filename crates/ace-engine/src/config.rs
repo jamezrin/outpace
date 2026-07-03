@@ -21,6 +21,11 @@ pub struct Config {
     pub peer_listen: SocketAddr,
     /// Bytes of recently-seen piece data retained per active peer connection for reseeding.
     pub seed_store_bytes: u64,
+    /// Pieces behind the live edge to start at, giving an immediate playback cushion.
+    pub prefetch_pieces: u64,
+    /// Depth of the per-session fan-out broadcast channel (messages buffered per client).
+    /// Must be >= 1.
+    pub session_buffer: usize,
     /// Max simultaneously-unchoked peers per served stream. NOT YET WIRED: `Choker` (the
     /// policy this would configure) has no production caller until the multi-peer S2 serve
     /// coordinator lands.
@@ -52,6 +57,8 @@ impl Default for Config {
             networks: vec!["ace".into()],
             peer_listen: "0.0.0.0:8621".parse().unwrap(),
             seed_store_bytes: 128 * 1024 * 1024,
+            prefetch_pieces: 8,
+            session_buffer: 256,
             max_unchoked: 8,
             max_inbound_peers: 64,
             enable_seeding: true,
@@ -127,6 +134,8 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.peer_listen.port(), 8621);
         assert_eq!(c.seed_store_bytes, 128 * 1024 * 1024);
+        assert_eq!(c.prefetch_pieces, 8);
+        assert_eq!(c.session_buffer, 256);
         assert_eq!(c.max_unchoked, 8);
         assert_eq!(c.max_inbound_peers, 64);
         assert!(c.enable_seeding);

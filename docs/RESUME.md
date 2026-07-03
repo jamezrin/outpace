@@ -727,6 +727,16 @@ mind for protocol context, but use **Current actionable backlog** above for new 
   **`.response`** (not top-level), and use **`content_id=`** for `acestream://` ids, not
   `infohash=`. A `status=prebuf, peers=0` forever = a **dead live channel** (the old docs'
   promo `685e…6067` is dead — don't use it).
+- **Config tunables (env vars):** in addition to the inbound-seeder knobs, two buffer sizes
+  are env-configurable (parsed in `runtime::config_from_env`, same pattern as
+  `OUTPACE_SEED_STORE_BYTES`):
+  - `OUTPACE_PREFETCH_PIECES` (default `8`) — pieces behind the live edge to start at; a
+    bigger value deepens the startup/stall cushion at the cost of extra initial latency.
+  - `OUTPACE_SESSION_BUFFER` (default `256`, must be >= 1) — per-session fan-out channel
+    depth (messages buffered per client).
+  Not yet exposed (scheduler internals, same wiring pattern if needed later):
+  `MAX_PIECE_ADVANCE`, `MAX_PARALLEL_CONNECT`, `MAX_ACTIVE_UPSTREAMS`,
+  `BACKGROUND_DISCOVERY_PEER_TARGET` in `crates/ace-engine/src/ace_provider.rs`.
 - **Known-good LIVE test:** content_id `cid1`
   (resolve to the current infohash via `analyze_content` — it rotates).
 - **`re/` is git-ignored and local-only** (NOT in version control): the extracted
