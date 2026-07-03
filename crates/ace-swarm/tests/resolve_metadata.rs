@@ -115,3 +115,45 @@ async fn resolve_via_peer_fetches_and_decodes_transport() {
     assert_eq!(info.trackers, vec!["udp://t.example:80".to_string()]);
     srv.await.unwrap();
 }
+
+#[tokio::test]
+async fn resolve_via_peer_rejects_oversized_metadata_size() {
+    // A hostile metadata peer advertises a huge `metadata_size` to force a large BEP-9 request
+    // fan-out and allocation. Resolution must fail at the handshake before any ut_metadata is
+    // requested — the server task below never serves a piece.
+    let content_id = [0xC2u8; 20];
+    let oversized = ace_swarm::resolve::MAX_METADATA_SIZE + 1;
+
+    let (client, mut server) = tokio::io::duplex(128 * 1024);
+    let srv = tokio::spawn(async move {
+        let mut hs = [0u8; 66];
+        server.read_exact(&mut hs).await.unwrap();
+        let reply = Handshake::new(content_id, *b"R30------RESOLVEPEER");
+        server.write_all(&reply.encode()).await.unwrap();
+
+        let mut sess = PeerSession::new(server);
+        let _ = sess.read_message().await.unwrap();
+        sess.send(&PeerMessage::Extended {
+            ext_id: 0,
+            payload: peer_extended_handshake(oversized),
+        })
+        .await
+        .unwrap();
+        // The client must not request any metadata piece; it should drop the connection.
+        assert!(
+            sess.read_message().await.is_err(),
+            "peer should see no ut_metadata request after an oversized advertisement"
+        );
+    });
+
+    let identity = Identity::generate();
+    let mut session = PeerSession::new(client);
+    let result = resolve_via_peer(&mut session, content_id, &identity).await;
+    assert!(
+        result.is_err(),
+        "oversized metadata_size must be rejected, got {result:?}"
+    );
+    // Close our end so the peer task's read observes EOF instead of waiting for the timeout.
+    drop(session);
+    srv.await.unwrap();
+}
