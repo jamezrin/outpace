@@ -21,6 +21,12 @@ pub struct RtmpTsMuxer {
     wrote_tables: bool,
 }
 
+impl Default for RtmpTsMuxer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RtmpTsMuxer {
     pub fn new() -> Self {
         Self {

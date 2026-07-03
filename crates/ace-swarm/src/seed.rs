@@ -83,7 +83,7 @@ impl SeederSession {
                     }
                     advertised_bitfields = true;
                 }
-                PeerMessage::Extended { ext_id, payload } if ext_id == 2 => {
+                PeerMessage::Extended { ext_id: 2, payload } => {
                     if let Some(metadata) = &metadata {
                         if let Some(ace_wire::ut_metadata::MetadataMessage::Request { piece }) =
                             ace_wire::ut_metadata::MetadataMessage::parse(&payload)

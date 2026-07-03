@@ -187,7 +187,7 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut source = provider
         .open(&target.provider_id)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
     let mut stdout = tokio::io::stdout();
     while let Some(chunk) = source.next().await {
         stdout.write_all(&chunk).await?;
