@@ -150,6 +150,8 @@ mod tests {
     use rtmp_rs::protocol::message::{ConnectParams, PublishParams};
     use rtmp_rs::server::handler::{AuthResult, RtmpHandler};
     use rtmp_rs::session::SessionContext;
+    use std::process::Stdio;
+    use tokio::process::Command;
 
     fn state() -> BroadcastState {
         BroadcastState {
@@ -215,5 +217,76 @@ mod tests {
             registry.get("mychan").await.is_some(),
             "RTMP publish must mint/resume the broadcast named by stream key"
         );
+    }
+
+    async fn wait_for_tcp(addr: std::net::SocketAddr) {
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("RTMP server did not start on {addr}");
+    }
+
+    #[tokio::test]
+    async fn rtmp_publish_reaches_broadcast_piece_store() {
+        let bs = state();
+        let registry = bs.registry.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = tokio::spawn(async move {
+            let _ = serve_rtmp(addr, bs).await;
+        });
+        wait_for_tcp(addr).await;
+
+        let output = format!("rtmp://{addr}/live/loop");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=128x96:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=44100",
+                "-t",
+                "2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-f",
+                "flv",
+            ])
+            .arg(output)
+            .stdin(Stdio::null())
+            .status()
+            .await
+            .expect("ffmpeg is installed for RTMP loopback test");
+        assert!(status.success(), "ffmpeg RTMP publish failed: {status}");
+
+        let bc = registry.get("loop").await.expect("broadcast was minted");
+        for _ in 0..100 {
+            if bc.store.lock().await.chunk(0, 0).is_some() {
+                server.abort();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        server.abort();
+        panic!("RTMP publish did not reach broadcast piece store");
     }
 }
