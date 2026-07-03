@@ -49,6 +49,16 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_SEED_STORE_BYTES") {
         config.seed_store_bytes = v.parse()?;
     }
+    if let Ok(v) = std::env::var("OUTPACE_PREFETCH_PIECES") {
+        config.prefetch_pieces = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_SESSION_BUFFER") {
+        let n: usize = v.parse()?;
+        if n == 0 {
+            return Err("OUTPACE_SESSION_BUFFER must be >= 1".into());
+        }
+        config.session_buffer = n;
+    }
     if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
         config.max_unchoked = v.parse()?;
     }
@@ -318,5 +328,26 @@ mod tests {
 
         assert_eq!(urls.raw, "http://[::1]:6878/broadcast/mychan");
         assert_eq!(urls.rtmp, "rtmp://[::1]:1935/live/mychan");
+    }
+
+    #[test]
+    fn parses_prefetch_and_session_buffer() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_PREFETCH_PIECES", "32");
+        std::env::set_var("OUTPACE_SESSION_BUFFER", "512");
+        let c = config_from_env().unwrap();
+        assert_eq!(c.prefetch_pieces, 32);
+        assert_eq!(c.session_buffer, 512);
+        std::env::remove_var("OUTPACE_PREFETCH_PIECES");
+        std::env::remove_var("OUTPACE_SESSION_BUFFER");
+    }
+
+    #[test]
+    fn rejects_zero_session_buffer() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_SESSION_BUFFER", "0");
+        let err = config_from_env().err();
+        std::env::remove_var("OUTPACE_SESSION_BUFFER");
+        assert!(err.is_some(), "session_buffer=0 must be rejected");
     }
 }
