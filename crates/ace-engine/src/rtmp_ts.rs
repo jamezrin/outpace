@@ -223,7 +223,7 @@ fn pat_section() -> Vec<u8> {
 }
 
 fn pmt_section() -> Vec<u8> {
-    let section_len = 13 + 5 + 5 + 4;
+    let section_len = 9 + 5 + 5 + 4;
     let mut section = vec![
         0x00,
         0x02,
@@ -328,5 +328,18 @@ mod tests {
                 .any(|window| window == [0x00, 0x00, 0x00, 0x01]),
             "H.264 frames must be converted to Annex B start-code form"
         );
+    }
+
+    #[test]
+    fn psi_section_lengths_match_encoded_payloads() {
+        for section in [pat_section(), pmt_section()] {
+            let section_length =
+                (usize::from(section[2] & 0x0f) << 8) | usize::from(section[3]);
+            assert_eq!(
+                section_length,
+                section.len() - 4,
+                "PSI section_length must cover bytes after length field through CRC"
+            );
+        }
     }
 }
