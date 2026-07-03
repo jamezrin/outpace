@@ -223,7 +223,7 @@ can run in parallel as a research spike. Recommended first plan: **S1**.
 ### B0 — Live-source authentication (RE spike, go/no-go gate)
 1. Sandbox the official engine **as a broadcaster** (it has a "start broadcast"/source mode);
    feed it a test TS.
-2. Frida-hook its signing path (the transport RSA key + per-piece/segment signing — RESUME notes
+2. Frida-hook its signing path (the transport RSA key + per-piece/segment signing — protocol notes
    `LiveSourceAuth.sign`); recover the exact preimage + algorithm; capture **verify-only**
    vectors (committed under `tests/vectors/live-source-auth/`).
 3. Implement `ace_wire::live_auth::LiveSourceAuth`; prove `verify` passes on captured engine

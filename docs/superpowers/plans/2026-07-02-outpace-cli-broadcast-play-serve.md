@@ -21,7 +21,7 @@
 - Modify `crates/ace-swarm/src/listen.rs`: let `SeedRegistry` hold both piece stores and metadata blobs.
 - Modify `crates/ace-swarm/src/seed.rs`: advertise `metadata_size` and answer `ut_metadata` requests.
 - Modify `crates/ace-wire/src/extended.rs`: add optional outgoing `metadata_size`.
-- Modify `docs/RESUME.md` and add `docs/protocol/notes/51-cli-and-broadcast-content-id.md`: document the CLI and the content-id convention.
+- Modify `README.md` and add `docs/protocol/notes/51-cli-and-broadcast-content-id.md`: document the CLI and the content-id convention.
 
 ## Content ID Policy
 
@@ -1152,7 +1152,7 @@ git commit -m "ace-engine: add stdout play command"
 **Files:**
 - No production file changes expected.
 - Add note: `docs/protocol/notes/51-cli-and-broadcast-content-id.md`
-- Modify: `docs/RESUME.md`
+- Modify: `README.md`
 
 - [ ] **Step 1: Build binary**
 
@@ -1252,14 +1252,14 @@ Smoke result:
 
 Fill the six smoke-result values from the commands above.
 
-- [ ] **Step 7: Update RESUME**
+- [ ] **Step 7: Update README**
 
-In `docs/RESUME.md`, add a current-backlog/result bullet saying the three-command CLI is implemented and that `acestream://<content_id>` for outpace broadcasts is backed by BEP-9 metadata serving, not a guessed official catalog algorithm.
+In `README.md`, add a current-backlog/result bullet saying the three-command CLI is implemented and that `acestream://<content_id>` for outpace broadcasts is backed by BEP-9 metadata serving, not a guessed official catalog algorithm.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add docs/protocol/notes/51-cli-and-broadcast-content-id.md docs/RESUME.md
+git add docs/protocol/notes/51-cli-and-broadcast-content-id.md README.md
 git commit -m "docs: record outpace cli content id smoke"
 ```
 

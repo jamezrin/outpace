@@ -133,7 +133,7 @@ This is a conscious v1 simplification, called out so review can veto it.
   fresh; a stale directory from a prior run is wiped first. This also sidesteps
   serving-evicted-stale-data correctness questions.
 - On stream/broadcast teardown, remove the infohash directory (ties into the existing
-  `SeedRegistry` eviction follow-up noted in `docs/RESUME.md`).
+  `SeedRegistry` eviction follow-up tracked in issue #4).
 - If disk mode is selected but the cache dir is unwritable, fail fast at startup with a clear
   error rather than silently degrading to memory.
 

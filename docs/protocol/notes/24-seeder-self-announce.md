@@ -1,7 +1,7 @@
 # 24 — Seeder self-announce wired (tracker + DHT), live-verified
 
-**Status: DONE.** Part of the `/goal` push toward full leech+seed parity with the official
-engine (`docs/RESUME.md` "Next: v2", Task 7 approach (2)).
+**Status: DONE.** Part of the push toward full leech+seed parity with the official
+engine; see the v2 compliance design and issue #4 for remaining productization work.
 
 ## What changed
 

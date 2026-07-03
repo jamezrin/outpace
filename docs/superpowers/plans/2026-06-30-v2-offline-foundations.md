@@ -4,7 +4,7 @@ Branch: `v2-offline-foundations`. Executes the parts of the v2 spec
 (`docs/superpowers/specs/2026-06-30-compliance-seeding-broadcasting-design.md`) that are
 **buildable and fully testable without the RE/sandbox/live-swarm environment**. The hard-gated
 remainder (B0 RSA-signed pieces, S1 Task 7 piece_header ground truth, and all real-peer interop /
-broadcast-origination verification) stays deferred — see RESUME.md.
+broadcast-origination verification) stays deferred — see README.md.
 
 **Compatibility guard:** because the served `piece_header` is still `[0u8;8]` (Task 7 will pin the
 engine's real bytes) and the inbound advertisement is unvalidated against engine ground truth, the
@@ -179,6 +179,6 @@ manager seams as needed).
 ---
 
 ## After all tasks
-Final whole-branch review, update RESUME.md (S2 plumbing + B1 pure codecs landed; remaining =
+Final whole-branch review, update README.md (S2 plumbing + B1 pure codecs landed; remaining =
 B0 RSA signing, Task 7 ground truth, live/interop verification — all RE/sandbox-gated), then finish
 the branch.

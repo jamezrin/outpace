@@ -284,7 +284,7 @@ async fn dht_get_peers_from_seeds(
 /// `get_peers` token (required — a node only accepts an announce echoing a token it itself
 /// issued), sends it `announce_peer` for our `peer_port`. Makes outpace organically
 /// discoverable via the DHT, not just tracker-discoverable (`announce_seeder`) — real
-/// Acestream swarms are largely DHT-populated (see `docs/RESUME.md`).
+/// Acestream swarms are largely DHT-populated (see `README.md`).
 ///
 /// Best-effort and fire-and-forget by nature (DHT is UDP): returns how many `announce_peer`
 /// queries were sent, not a delivery/propagation guarantee.

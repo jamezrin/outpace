@@ -30,7 +30,7 @@ the same pattern; Task A5 records this.
 - Modify `crates/ace-engine/src/runtime.rs`: parse `OUTPACE_PREFETCH_PIECES` + `OUTPACE_SESSION_BUFFER`; thread both into `build_runtime`.
 - Modify `crates/ace-engine/src/ace_provider.rs`: `prefetch_pieces` field + `with_prefetch_pieces` builder; use it at the start-piece computation.
 - Modify `crates/ace-engine/src/manager.rs`: `StreamManager::with_buffer` constructor.
-- Modify `docs/RESUME.md`: document the two new env vars.
+- Modify `README.md`: document the two new env vars.
 
 ---
 
@@ -342,11 +342,11 @@ git commit -m "ace-engine: make session fan-out buffer configurable"
 ## Task A5: docs
 
 **Files:**
-- Modify: `docs/RESUME.md`
+- Modify: `README.md`
 
 - [ ] **Step 1: Document the new env vars**
 
-Add to the config/env section of `docs/RESUME.md`:
+Add to the config/env section of `README.md`:
 
 ```markdown
 - `OUTPACE_PREFETCH_PIECES` (default `8`) — pieces behind the live edge to start at; a
@@ -362,7 +362,7 @@ Not yet exposed (scheduler internals, same wiring pattern if needed later):
 - [ ] **Step 2: Commit**
 
 ```bash
-git add docs/RESUME.md
+git add README.md
 git commit -m "docs: document prefetch + session-buffer env vars"
 ```
 

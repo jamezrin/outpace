@@ -333,8 +333,7 @@ mod tests {
     #[test]
     fn psi_section_lengths_match_encoded_payloads() {
         for section in [pat_section(), pmt_section()] {
-            let section_length =
-                (usize::from(section[2] & 0x0f) << 8) | usize::from(section[3]);
+            let section_length = (usize::from(section[2] & 0x0f) << 8) | usize::from(section[3]);
             assert_eq!(
                 section_length,
                 section.len() - 4,

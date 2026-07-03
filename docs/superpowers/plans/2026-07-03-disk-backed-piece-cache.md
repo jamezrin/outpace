@@ -40,7 +40,7 @@ implemented, in v1.
 - Modify `crates/ace-engine/src/runtime.rs`: parse `OUTPACE_CACHE_TYPE` + `OUTPACE_CACHE_DIR`; thread into providers/broadcast.
 - Modify `crates/ace-engine/src/ace_provider.rs`: `SeedConfig` carries backend choice; build store via `with_backend` at both `get_or_create` sites.
 - Modify `crates/ace-engine/src/broadcast.rs` + `crates/ace-engine/src/broadcast_ingest.rs` (via caller): same backend choice for origination/ingest stores.
-- Modify `docs/RESUME.md`: document the new env vars + behavior.
+- Modify `README.md`: document the new env vars + behavior.
 
 ---
 
@@ -507,7 +507,7 @@ chain (runtime.rs:81) and the broadcast registry construction.
 - [ ] **Step 5: Add a teardown cleanup**
 
 On stream/broadcast teardown, remove `<cache_dir>/<infohash_hex>` (folds into the
-`SeedRegistry` eviction follow-up already noted in `docs/RESUME.md`). If that eviction hook
+`SeedRegistry` eviction follow-up already noted in `README.md`). If that eviction hook
 doesn't exist yet, add a `remove_infohash_dir` call at the existing teardown/reaper path.
 
 - [ ] **Step 6: Write an integration test for disk-mode file creation**
@@ -541,7 +541,7 @@ git commit -m "ace-engine: select PieceStore backend from cache config"
 ## Task B6: docs
 
 **Files:**
-- Modify: `docs/RESUME.md`
+- Modify: `README.md`
 
 - [ ] **Step 1: Document the disk cache**
 
@@ -558,7 +558,7 @@ git commit -m "ace-engine: select PieceStore backend from cache config"
 - [ ] **Step 2: Commit**
 
 ```bash
-git add docs/RESUME.md
+git add README.md
 git commit -m "docs: document disk-backed piece cache"
 ```
 

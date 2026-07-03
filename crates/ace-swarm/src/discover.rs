@@ -159,7 +159,7 @@ fn unique_peers(peers: Vec<SocketAddrV4>) -> Vec<SocketAddrV4> {
 /// `trackers`, aggregating the peers each tracker returns (best-effort — a non-responding
 /// tracker is skipped, mirroring `discover_peers`). A seeder still benefits from knowing
 /// other peers. Tracker-only: see `crate::dht::dht_announce_peer` for the DHT half — real
-/// Acestream swarms are largely DHT-populated (see `docs/RESUME.md`), so callers that want
+/// Acestream swarms are largely DHT-populated (see `README.md`), so callers that want
 /// full self-announce coverage should call both (as `ace_engine::ace_provider`'s periodic
 /// self-announce does, Task 7 approach (2), `docs/protocol/notes/21-seeder-ground-truth.md`).
 pub async fn announce_seeder(

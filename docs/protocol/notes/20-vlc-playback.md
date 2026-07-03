@@ -1,8 +1,8 @@
 # 20 — Live end-to-end playback through the outpace daemon (Task 20)
 
-**Date:** 2026-06-30. **Network:** Spain, **WARP off** (mandatory — see RESUME gotchas).
+**Date:** 2026-06-30. **Network:** Spain, **WARP off** (mandatory — see README operational notes).
 **Daemon:** `cargo run -p ace-engine --bin outpace` on `127.0.0.1:696x`.
-**Test id:** content-id `cid1` (RESUME known-good live).
+**Test id:** content-id `cid1` (README known-good live).
 
 This is the spec's deliverable: real live video pulled from the Acestream swarm and served
 through the clean daemon API, verified end-to-end. All steps were run against the **live

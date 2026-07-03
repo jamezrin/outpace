@@ -7,7 +7,8 @@
 //! tested); the async peer I/O loop wraps it.
 //!
 //! The async driver is validated against a live channel that is actually delivering data
-//! (see `docs/RESUME.md` — currently environment-gated); the scheduler is validated here.
+//! (see `README.md` and `docs/protocol/notes/20-vlc-playback.md`); the scheduler is
+//! validated here.
 
 #[macro_use]
 pub mod logts;

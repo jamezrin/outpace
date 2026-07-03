@@ -16,7 +16,7 @@
 - The daemon entry point reads `OUTPACE_*` env vars in `crates/ace-engine/src/main.rs`.
 - The default persistent data directory currently ends in `outpace` in `crates/ace-engine/src/config.rs`.
 - Broadcast metadata currently writes the key `outpace_name` in `crates/ace-engine/src/broadcast.rs`.
-- Product-name references exist in code comments and docs, including files under `docs/protocol/notes`, `docs/superpowers/plans`, `docs/superpowers/specs`, and `docs/RESUME.md`.
+- Product-name references exist in code comments and docs, including files under `docs/protocol/notes`, `docs/superpowers/plans`, `docs/superpowers/specs`, and `README.md`.
 - At the time this plan was written, the worktree already had unrelated uncommitted work. Future implementation must preserve it.
 
 ## Task 1: Rename Runtime Surfaces
@@ -203,7 +203,7 @@
   2026-06-29-outpace-daemon-design.md -> 2026-06-29-outpace-daemon-design.md
   ```
 
-  Include historical notes, plans, specs, and `docs/RESUME.md`; the requested docs scope is "everything".
+  Include historical notes, plans, specs, and `README.md`; the requested docs scope is "everything".
 
 - [ ] **Step 3: Verify docs references**
 

@@ -1099,7 +1099,7 @@ ffprobe -v error -show_entries stream=codec_name,width,height shot.jpg
 Expected: a 1920×1080 frame written (mjpeg).
 
 - [ ] **Step 4:** Open `http://localhost:8000/streams/ace/<id>.ts` in **VLC** and confirm playback; open a second VLC simultaneously and confirm `GET /streams` shows one session with `clients: 2` (one shared download).
-- [ ] **Step 5:** Write `docs/protocol/notes/20-vlc-playback.md` with the outcome; update `docs/RESUME.md` Phase 3 to ✅. Commit.
+- [ ] **Step 5:** Write `docs/protocol/notes/20-vlc-playback.md` with the outcome; update `README.md` Phase 3 to ✅. Commit.
 
 ```bash
 git add docs/ && git commit -m "docs: Phase 3 complete — VLC plays from the outpace daemon (multi-client verified)"

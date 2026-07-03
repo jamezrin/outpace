@@ -62,9 +62,10 @@ const SINGLE_PEER_ID: u64 = 0;
 /// the full timeout of dead peers.
 const UPSTREAM_SELECTION_GRACE: Duration = Duration::from_millis(250);
 /// How often an active session re-announces itself as a seeder to its trackers, so
-/// outpace becomes organically discoverable while it's serving (Task 7 approach (2),
-/// `docs/RESUME.md`). Doesn't yet honor a tracker's returned `interval` — a fixed,
-/// conservative cadence is a deliberate simplification, not a correctness requirement.
+/// outpace becomes organically discoverable while it's serving (see
+/// `docs/protocol/notes/24-seeder-self-announce.md`). Doesn't yet honor a tracker's
+/// returned `interval` — a fixed, conservative cadence is a deliberate simplification,
+/// not a correctness requirement.
 const SEEDER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(4 * 60);
 /// Time budget for each periodic DHT `announce_peer` walk (see `dht_announce_peer`) — bounds
 /// how long a self-announce round can take before the next one is due.
@@ -341,7 +342,8 @@ impl StreamProvider for AceProvider {
 
 /// Periodically re-announce this infohash as a seeder (`left=0`, event=Completed) to its
 /// trackers, so outpace becomes organically discoverable to peers looking for this stream
-/// while we're serving it — Task 7 approach (2), `docs/RESUME.md`. A no-op loop (never
+/// while we're serving it; see `docs/protocol/notes/24-seeder-self-announce.md`.
+/// A no-op loop (never
 /// announces) when `enabled` is false, matching the S1 `enable_seeding` gate: we shouldn't
 /// advertise ourselves as a seeder if we've deliberately disabled serving.
 async fn announce_seeder_periodically(info: StreamInfo, port: u16, enabled: bool) {
@@ -359,7 +361,7 @@ pub async fn announce_infohash_periodically(trackers: Vec<String>, infohash: [u8
     loop {
         let peers = announce_seeder(&trackers, &infohash, &peer_id, port).await;
         // DHT self-announce too, not just tracker: real Acestream swarms are largely
-        // DHT-populated (docs/RESUME.md), so tracker-only self-announce under-serves
+        // DHT-populated (README.md), so tracker-only self-announce under-serves
         // discoverability. `dht_announce_peer` is a separate primitive (not folded into
         // `announce_seeder` itself) because it's a multi-second live network call that
         // would otherwise turn `announce_seeder`'s fast offline unit test into a slow,
@@ -896,7 +898,12 @@ fn prefetch_start(min_piece: u64, max_piece: u64, prefetch: u64) -> u64 {
 
 impl Continuity {
     /// The very first peer connection for this stream: bootstrap from its window.
-    fn fresh(info: &StreamInfo, min_piece: u64, max_piece: u64, prefetch: u64) -> (Continuity, u64) {
+    fn fresh(
+        info: &StreamInfo,
+        min_piece: u64,
+        max_piece: u64,
+        prefetch: u64,
+    ) -> (Continuity, u64) {
         let start = prefetch_start(min_piece, max_piece, prefetch);
         (
             Continuity {

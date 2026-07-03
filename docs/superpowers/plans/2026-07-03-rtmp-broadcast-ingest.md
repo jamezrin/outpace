@@ -21,7 +21,7 @@
 - Create `crates/ace-engine/src/rtmp.rs`: RTMP handler, stream-key routing, and media forwarding into the shared ingest helper.
 - Create `crates/ace-engine/src/rtmp_ts.rs`: narrow H.264/AAC to MPEG-TS remuxer.
 - Modify `crates/ace-engine/src/lib.rs`: export new modules.
-- Modify `docs/protocol/notes/51-cli-and-broadcast-content-id.md` and `docs/RESUME.md`: document raw + RTMP ingest surfaces.
+- Modify `docs/protocol/notes/51-cli-and-broadcast-content-id.md` and `README.md`: document raw + RTMP ingest surfaces.
 
 ---
 
@@ -1226,7 +1226,7 @@ git commit -m "ace-engine: verify rtmp broadcast loopback"
 
 **Files:**
 - Modify: `docs/protocol/notes/51-cli-and-broadcast-content-id.md`
-- Modify: `docs/RESUME.md`
+- Modify: `README.md`
 
 - [ ] **Step 1: Update protocol note**
 
@@ -1244,7 +1244,7 @@ the same signing/chunking/store pipeline used by raw ingest.
 
 - [ ] **Step 2: Update resume**
 
-In `docs/RESUME.md`, replace the sentence that says RTMP/SRT ingest is a future follow-up with:
+In `README.md`, replace the sentence that says RTMP/SRT ingest is a future follow-up with:
 
 ```markdown
 RTMP ingest is implemented for broadcast origination at `rtmp://<host>:<rtmp-port>/live/<name>`;
@@ -1280,7 +1280,7 @@ Expected output contains `RAW Ingest URL` and `RTMP Ingest URL`; it does not con
 - [ ] **Step 5: Commit**
 
 ```bash
-git add docs/protocol/notes/51-cli-and-broadcast-content-id.md docs/RESUME.md
+git add docs/protocol/notes/51-cli-and-broadcast-content-id.md README.md
 git commit -m "docs: document rtmp broadcast ingest"
 ```
 
