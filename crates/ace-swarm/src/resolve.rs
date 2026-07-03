@@ -31,6 +31,16 @@ use tokio::net::TcpStream;
 pub const DEFAULT_PIECE_LENGTH: u64 = 1_048_576;
 pub const DEFAULT_CHUNK_LENGTH: u64 = 16_384;
 
+/// Upper bound on a metadata-swarm peer's advertised `metadata_size` (bytes).
+///
+/// The `metadata_size` in a peer's extended handshake is untrusted: it drives both the BEP-9
+/// request fan-out (one request per 16 KiB block) and a `vec![0u8; metadata_size]` allocation
+/// before any transport descriptor is decoded. Acestream `AceStreamTransport` files are small
+/// bencoded dicts (geometry + trackers + pubkey), far under this ceiling — which also matches
+/// the 1 MiB limit the signed catalog path imposes on the same descriptor. Anything larger is
+/// a hostile peer trying to force a large fan-out/allocation, and is rejected before the fetch.
+pub const MAX_METADATA_SIZE: usize = 1_048_576;
+
 /// The ext id we assign to `ut_metadata` in our `m` dict (what the peer addresses replies to).
 const OUR_UT_METADATA_ID: i64 = 2;
 /// How many messages to read while waiting for the peer's extended handshake.
@@ -321,13 +331,24 @@ async fn read_metadata_params<S: AsyncRead + AsyncWrite + Unpin>(
             let size = eh
                 .metadata_size()
                 .ok_or(ResolveError::Peer("peer sent no metadata_size"))?;
-            if !(0..=255).contains(&ut_id) || size <= 0 {
+            if !(0..=255).contains(&ut_id) {
                 return Err(ResolveError::Peer("invalid ut_metadata params"));
             }
-            return Ok((ut_id as u8, size as usize));
+            return Ok((ut_id as u8, checked_metadata_size(size)?));
         }
     }
     Err(ResolveError::Peer("no extended handshake"))
+}
+
+/// Validate a peer-advertised `metadata_size` before it drives a BEP-9 fetch/allocation.
+///
+/// Rejects non-positive sizes and anything above [`MAX_METADATA_SIZE`] (a hostile peer trying
+/// to force a large request fan-out / allocation before any descriptor is decoded).
+fn checked_metadata_size(size: i64) -> Result<usize, ResolveError> {
+    if size <= 0 || size > MAX_METADATA_SIZE as i64 {
+        return Err(ResolveError::Peer("invalid ut_metadata params"));
+    }
+    Ok(size as usize)
 }
 
 /// A small TTL cache of resolved `content-id → StreamInfo` so repeated `open()`s of the same
@@ -467,6 +488,42 @@ mod tests {
     fn http_response_body_decodes_chunked_catalog_response() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n";
         assert_eq!(http_response_body(response).unwrap(), b"abcdefg");
+    }
+
+    #[test]
+    fn metadata_size_accepts_plausible_values() {
+        assert_eq!(checked_metadata_size(1), Ok(1));
+        assert_eq!(checked_metadata_size(4096), Ok(4096));
+        assert_eq!(
+            checked_metadata_size(MAX_METADATA_SIZE as i64),
+            Ok(MAX_METADATA_SIZE)
+        );
+    }
+
+    #[test]
+    fn metadata_size_rejects_non_positive() {
+        assert_eq!(
+            checked_metadata_size(0),
+            Err(ResolveError::Peer("invalid ut_metadata params"))
+        );
+        assert_eq!(
+            checked_metadata_size(-1),
+            Err(ResolveError::Peer("invalid ut_metadata params"))
+        );
+    }
+
+    #[test]
+    fn metadata_size_rejects_oversize() {
+        // A hostile peer advertising a huge metadata_size would force a large BEP-9 request
+        // fan-out and a `vec![0u8; metadata_size]` allocation before any descriptor is decoded.
+        assert_eq!(
+            checked_metadata_size(MAX_METADATA_SIZE as i64 + 1),
+            Err(ResolveError::Peer("invalid ut_metadata params"))
+        );
+        assert_eq!(
+            checked_metadata_size(i64::MAX),
+            Err(ResolveError::Peer("invalid ut_metadata params"))
+        );
     }
 
     #[test]
