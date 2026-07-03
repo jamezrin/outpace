@@ -100,7 +100,9 @@ The v1 daemon was **download-only (a pure leecher)**. v2 fixes that and adds ori
 **S1** reciprocal upload, **S2** inbound seeder, **B0** live-source-auth RE spike, **B1** HTTP
 broadcast ingest. **Hard constraint throughout:** full **wire compatibility** with the official
 engine — outpace and Acestream peers must interoperate transparently (an Acestream peer can't
-tell it's talking to outpace). RTMP/SRT ingest is a documented future follow-up, out of scope.
+tell it's talking to outpace). RTMP ingest is implemented for broadcast origination at
+`rtmp://<host>:<rtmp-port>/live/<name>`; it accepts H.264/AAC and remuxes to the same MPEG-TS
+ingest path as raw HTTP PUT. SRT ingest remains a future follow-up.
 
 ### S1 — DONE (merged to main 2026-06-30, branch `seeding-s1-compliance`, plan `docs/superpowers/plans/2026-06-30-seeding-s1-compliance.md`)
 Reciprocal upload over connections we already hold. Built + reviewed (spec + code-quality + a

@@ -13,6 +13,14 @@ The broadcaster announces that key and serves the minted `AceStreamTransport` ov
 BEP-9 `ut_metadata`, so `outpace play acestream://<content_id>` resolves metadata
 before joining the actual broadcast infohash.
 
+Broadcast ingest is now exposed through two inputs:
+
+- raw MPEG-TS over HTTP PUT: `http://<host>:<http-port>/broadcast/<name>`
+- RTMP publish: `rtmp://<host>:<rtmp-port>/live/<name>`
+
+The RTMP path accepts H.264/AAC publisher input and remuxes it to MPEG-TS before entering
+the same signing/chunking/store pipeline used by raw ingest.
+
 Smoke result:
 
 - broadcaster bind: `127.0.0.1:6990`
