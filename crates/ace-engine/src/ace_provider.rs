@@ -109,6 +109,8 @@ struct SeedConfig {
     registry: SeedRegistry,
     store_bytes: u64,
     enabled: bool,
+    /// Pieces behind the live edge the fresh follower starts at (playback cushion).
+    prefetch_pieces: u64,
 }
 
 pub struct AceProvider {
@@ -119,6 +121,7 @@ pub struct AceProvider {
     resolve_cache: ResolveCache,
     seed_registry: SeedRegistry,
     seed_store_bytes: u64,
+    prefetch_pieces: u64,
     enable_seeding: bool,
 }
 
@@ -132,6 +135,7 @@ impl AceProvider {
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
+            prefetch_pieces: PREFETCH_PIECES,
             enable_seeding: true,
         }
     }
@@ -163,6 +167,13 @@ impl AceProvider {
     /// created, so changing this after a stream has already opened has no effect on it.
     pub fn with_seed_store_bytes(mut self, bytes: u64) -> Self {
         self.seed_store_bytes = bytes;
+        self
+    }
+
+    /// Override how many pieces behind the live edge a fresh follower starts at, tuning the
+    /// immediate playback cushion against extra startup latency. Defaults to `PREFETCH_PIECES`.
+    pub fn with_prefetch_pieces(mut self, pieces: u64) -> Self {
+        self.prefetch_pieces = pieces;
         self
     }
 
@@ -303,6 +314,7 @@ impl StreamProvider for AceProvider {
             registry: self.seed_registry.clone(),
             store_bytes: self.seed_store_bytes,
             enabled: self.enable_seeding,
+            prefetch_pieces: self.prefetch_pieces,
         };
         let announce_info = info.clone();
         let announce_port = self.port;
@@ -877,10 +889,15 @@ struct Continuity {
     next_log: u64,
 }
 
+/// First piece to request given a peer window and a configured prefetch depth.
+fn prefetch_start(min_piece: u64, max_piece: u64, prefetch: u64) -> u64 {
+    max_piece.saturating_sub(prefetch).max(min_piece)
+}
+
 impl Continuity {
     /// The very first peer connection for this stream: bootstrap from its window.
-    fn fresh(info: &StreamInfo, min_piece: u64, max_piece: u64) -> (Continuity, u64) {
-        let start = max_piece.saturating_sub(PREFETCH_PIECES).max(min_piece);
+    fn fresh(info: &StreamInfo, min_piece: u64, max_piece: u64, prefetch: u64) -> (Continuity, u64) {
+        let start = prefetch_start(min_piece, max_piece, prefetch);
         (
             Continuity {
                 reasm: PieceReassembler::new(info.piece_length, start)
@@ -1172,7 +1189,7 @@ async fn follow_peer_pool(
     let max_piece = primary.max_piece.max(0) as u64;
     let start = match continuity {
         None => {
-            let (c, start) = Continuity::fresh(info, min_piece, max_piece);
+            let (c, start) = Continuity::fresh(info, min_piece, max_piece, seed.prefetch_pieces);
             *continuity = Some(c);
             crate::alog!(
                 "[ace] {primary_addr}: window min={min_piece} max={max_piece} -> start={start} head={max_piece}"
@@ -1782,7 +1799,7 @@ async fn follow_one_peer(
     let max_piece = window.max_piece.max(0) as u64;
     let start = match continuity {
         None => {
-            let (c, start) = Continuity::fresh(info, min_piece, max_piece);
+            let (c, start) = Continuity::fresh(info, min_piece, max_piece, seed.prefetch_pieces);
             *continuity = Some(c);
             crate::alog!("[ace] {addr}: window min={min_piece} max={max_piece} -> start={start} head={max_piece}");
             start
@@ -2342,7 +2359,7 @@ mod tests {
 
     #[test]
     fn timed_out_requests_returns_only_aged_pieces_and_prunes_passed_ones() {
-        let (mut c, _) = Continuity::fresh(&info(), 5, 15); // next_needed = 7
+        let (mut c, _) = Continuity::fresh(&info(), 5, 15, PREFETCH_PIECES); // next_needed = 7
         let base = Instant::now();
         c.requested_at.insert(4, base); // below cursor -> pruned, not returned
         c.requested_at.insert(8, base); // aged
@@ -2356,7 +2373,7 @@ mod tests {
 
     #[test]
     fn skip_evicted_gap_jumps_to_lowest_covered_when_cursor_is_stranded() {
-        let (mut c, _) = Continuity::fresh(&info(), 100, 110); // next_needed = 102
+        let (mut c, _) = Continuity::fresh(&info(), 100, 110, PREFETCH_PIECES); // next_needed = 102
         c.register_active_peer(1, test_addr(), win(105, 120)); // evicted 102..104
         c.set_peer_unchoked(1, true);
         // Not stuck long enough yet.
@@ -2369,7 +2386,7 @@ mod tests {
 
     #[test]
     fn skip_evicted_gap_does_not_skip_while_a_peer_still_covers_the_cursor() {
-        let (mut c, _) = Continuity::fresh(&info(), 100, 110); // next_needed = 102
+        let (mut c, _) = Continuity::fresh(&info(), 100, 110, PREFETCH_PIECES); // next_needed = 102
         c.register_active_peer(1, test_addr(), win(100, 120)); // still covers 102
         c.set_peer_unchoked(1, true);
         let now = c.next_needed_since + REQUEST_TIMEOUT * 3;
@@ -2435,8 +2452,16 @@ mod tests {
     }
 
     #[test]
+    fn prefetch_start_honors_configured_depth() {
+        // window 100..=200, prefetch 32 -> start 168 (not 200 - 8)
+        assert_eq!(prefetch_start(100, 200, 32), 168);
+        // clamps to min_piece when the window is shorter than prefetch
+        assert_eq!(prefetch_start(195, 200, 32), 195);
+    }
+
+    #[test]
     fn fresh_starts_prefetch_pieces_behind_head_clamped_to_min() {
-        let (c, start) = Continuity::fresh(&info(), 100, 200);
+        let (c, start) = Continuity::fresh(&info(), 100, 200, PREFETCH_PIECES);
         assert_eq!(start, 200 - PREFETCH_PIECES);
         assert_eq!(c.head, 200);
         assert_eq!(c.scheduler.in_flight_count(), 0);
@@ -2447,7 +2472,7 @@ mod tests {
     fn fresh_clamps_start_to_min_piece_on_a_narrow_window() {
         // min_piece is closer to head than PREFETCH_PIECES allows -> clamp, don't request
         // an evicted piece.
-        let (_c, start) = Continuity::fresh(&info(), 198, 200);
+        let (_c, start) = Continuity::fresh(&info(), 198, 200, PREFETCH_PIECES);
         assert_eq!(start, 198);
     }
 
@@ -2455,7 +2480,7 @@ mod tests {
     fn resume_continues_seamlessly_when_the_new_window_still_covers_our_position() {
         // We'd already emitted through piece 150; the new peer's window still covers the
         // next needed piece, so resume exactly there.
-        let (mut c, start) = Continuity::fresh(&info(), 100, 149);
+        let (mut c, start) = Continuity::fresh(&info(), 100, 149, PREFETCH_PIECES);
         for piece in start..=150 {
             c.reasm.add_block(piece, 0, &[1, 1]).unwrap();
             c.reasm.add_block(piece, 2, &[2, 2]).unwrap();
@@ -2477,7 +2502,7 @@ mod tests {
         // In-flight scheduler entries only mean "asked the previous peer", not "received".
         // If that peer dies before delivery, the next peer must be asked for the first
         // still-missing piece rather than skipping past the old request frontier.
-        let (mut c, start) = Continuity::fresh(&info(), 100, 149);
+        let (mut c, start) = Continuity::fresh(&info(), 100, 149, PREFETCH_PIECES);
         c.active_peers = single_active_peer(100, 150);
         let assigned = c.active_peers.assign(&mut c.scheduler, start, 150);
         assert!(!assigned.is_empty());
@@ -2497,7 +2522,7 @@ mod tests {
 
     #[test]
     fn peer_window_must_cover_the_next_needed_piece_on_reconnect() {
-        let (c, start) = Continuity::fresh(&info(), 100, 149);
+        let (c, start) = Continuity::fresh(&info(), 100, 149, PREFETCH_PIECES);
         let stale = LivePosition {
             min_piece: 100,
             max_piece: (start - 1) as i64,
@@ -2585,7 +2610,7 @@ mod tests {
     fn resume_skips_forward_over_an_unrecoverable_eviction_gap() {
         // We were disconnected long enough that the new peer's window no longer has the
         // piece we needed next (min_piece has advanced past it) — must skip, not stall.
-        let (mut c, _start) = Continuity::fresh(&info(), 100, 149);
+        let (mut c, _start) = Continuity::fresh(&info(), 100, 149, PREFETCH_PIECES);
         let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
         let resume = c.resume(addr, 500, 600); // min_piece way ahead of 151
         assert_eq!(resume, 500);
@@ -2599,7 +2624,7 @@ mod tests {
 
     #[test]
     fn resume_head_never_regresses() {
-        let (mut c, _start) = Continuity::fresh(&info(), 100, 200);
+        let (mut c, _start) = Continuity::fresh(&info(), 100, 200, PREFETCH_PIECES);
         let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
         c.resume(addr, 100, 150); // a new peer with a "smaller" (staler) window
         assert_eq!(c.head, 200, "head must not go backward");

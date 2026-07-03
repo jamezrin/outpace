@@ -138,6 +138,7 @@ pub async fn build_runtime(
             .with_bootstrap_peers(bootstrap_peers)
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
+            .with_prefetch_pieces(config.prefetch_pieces)
             .with_seeding_enabled(config.enable_seeding);
         registry.register(Arc::new(provider));
     }
