@@ -172,6 +172,8 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         config.data_dir.display()
     );
 
+    let rtmp_bind = config.rtmp_bind;
+    let rtmp_broadcasts = broadcasts.clone();
     let state = AppState {
         manager,
         networks: networks.clone(),
@@ -206,6 +208,16 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
             .await;
         });
     }
+
+    tokio::spawn(async move {
+        if let Err(e) = crate::rtmp::serve_rtmp(rtmp_bind, rtmp_broadcasts).await {
+            eprintln!("outpace: RTMP ingest stopped: {e}");
+        }
+    });
+    eprintln!(
+        "outpace: RTMP ingest listening on rtmp://{}/live/<name>",
+        config.rtmp_bind
+    );
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     eprintln!(

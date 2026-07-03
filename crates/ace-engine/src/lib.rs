@@ -15,6 +15,7 @@ pub mod http;
 pub mod manager;
 pub mod provider;
 pub mod routes;
+pub mod rtmp;
 pub mod rtmp_ts;
 pub mod runtime;
 pub mod session;
