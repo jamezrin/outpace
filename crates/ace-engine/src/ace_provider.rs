@@ -46,6 +46,12 @@ const PREFETCH_PIECES: u64 = 8;
 /// update can never trigger an unbounded request burst (it just gets re-advanced next
 /// update). See `docs/protocol/notes/22-live-edge-never-advances.md`.
 const MAX_PIECE_ADVANCE: u64 = 256;
+/// Reassembler accept window: how far ahead of the emit cursor an incoming piece index may be
+/// before it's rejected as unsolicited (#13). The scheduler assigns pieces contiguously from
+/// the cursor with at most `MAX_PIECE_ADVANCE` requests in flight, so 2x that leaves ample
+/// headroom over anything we legitimately request while bounding the reassembler's
+/// buffered-ahead pieces against a peer streaming far-future indices.
+const MAX_REASM_PIECES_AHEAD: u64 = 2 * MAX_PIECE_ADVANCE;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How many peers to race connecting to at once (so dead peers don't serialize the time to
 /// first byte). A live swarm returns dozens; we only need one good upstream to follow.
@@ -911,7 +917,8 @@ impl Continuity {
         // `source_pubkey`, so it only strips; `with_source_pubkey` is then a no-op.
         let reasm = PieceReassembler::new(info.piece_length, start)
             .with_piece_trailer(info.sig_len as u64)
-            .with_source_pubkey(info.source_pubkey.clone());
+            .with_source_pubkey(info.source_pubkey.clone())
+            .with_max_pieces_ahead(MAX_REASM_PIECES_AHEAD);
         (
             Continuity {
                 reasm,

@@ -35,7 +35,10 @@ pub async fn download_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
     peer_max: u64,
 ) -> Result<Vec<u8>> {
     let mut sched = Scheduler::new(p.max_in_flight);
-    let mut reasm = PieceReassembler::new(p.piece_length, p.start_piece);
+    // We only ever request `[start_piece, head]`; reject peer chunks for indices beyond that
+    // window rather than buffering unsolicited far-future pieces (#13).
+    let mut reasm = PieceReassembler::new(p.piece_length, p.start_piece)
+        .with_max_pieces_ahead(p.head.saturating_sub(p.start_piece).saturating_add(1));
     let mut received: BTreeMap<u64, u64> = BTreeMap::new();
     let mut out = Vec::new();
     let mut unchoked = false;

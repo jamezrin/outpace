@@ -62,7 +62,10 @@ impl LiveSession {
         // pubkey — verify the piece's in-band RSA signature before emitting it (issue #10).
         let mut reasm = PieceReassembler::new(info.piece_length, cfg.start_piece)
             .with_piece_trailer(info.sig_len as u64)
-            .with_source_pubkey(info.source_pubkey.clone());
+            .with_source_pubkey(info.source_pubkey.clone())
+            // We only ever request `[start_piece, head]`; reject peer chunks for indices
+            // beyond that window rather than buffering unsolicited far-future pieces (#13).
+            .with_max_pieces_ahead(cfg.head.saturating_sub(cfg.start_piece).saturating_add(1));
         let mut unchoked = false;
         let mut requested = false;
 
