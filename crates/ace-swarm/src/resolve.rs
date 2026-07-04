@@ -82,15 +82,22 @@ pub enum ResolveError {
 pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveError> {
     let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
     validate_geometry(d.piece_length, d.chunk_length)?;
+    // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip *and* a key
+    // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
+    // treat pieces as unsigned (don't strip, nothing to verify).
+    let sig_len = ace_wire::live_auth::signature_len_from_pubkey_der(&d.pubkey);
     Ok(StreamInfo {
         infohash: infohash_of_descriptor(&d.raw)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
         piece_length: d.piece_length,
         chunk_length: d.chunk_length,
         trackers: d.trackers,
-        // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip; no
-        // parseable pubkey => treat pieces as unsigned (don't strip).
-        sig_len: ace_wire::live_auth::signature_len_from_pubkey_der(&d.pubkey).unwrap_or(0),
+        sig_len: sig_len.unwrap_or(0),
+        source_pubkey: if sig_len.is_some() {
+            d.pubkey
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -137,8 +144,10 @@ pub fn stream_info_from_infohash(
         chunk_length: DEFAULT_CHUNK_LENGTH,
         trackers,
         // No transport => no pubkey to measure; assume the standard Acestream 768-bit
-        // source key (96-byte signature tail). See DEFAULT_SIG_LEN.
+        // source key (96-byte signature tail). See DEFAULT_SIG_LEN. Without the actual pubkey
+        // we can strip that tail but cannot *verify* it, so `source_pubkey` stays empty (#10).
         sig_len: crate::types::DEFAULT_SIG_LEN,
+        source_pubkey: Vec::new(),
     })
 }
 
@@ -622,6 +631,7 @@ mod tests {
             chunk_length: 1,
             trackers: vec![],
             sig_len: 0,
+            source_pubkey: vec![],
         };
         assert_eq!(c.get("k"), None);
         c.put("k", info.clone());

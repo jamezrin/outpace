@@ -58,7 +58,11 @@ impl LiveSession {
             .await?;
 
         let chunks_per_piece = info.chunks_per_piece();
-        let mut reasm = PieceReassembler::new(info.piece_length, cfg.start_piece);
+        // Strip each piece's signature tail, and — when the transport gave us the source's
+        // pubkey — verify the piece's in-band RSA signature before emitting it (issue #10).
+        let mut reasm = PieceReassembler::new(info.piece_length, cfg.start_piece)
+            .with_piece_trailer(info.sig_len as u64)
+            .with_source_pubkey(info.source_pubkey.clone());
         let mut unchoked = false;
         let mut requested = false;
 

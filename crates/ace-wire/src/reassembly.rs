@@ -21,6 +21,13 @@ pub struct PieceReassembler {
     /// (Acestream live pieces carry a per-piece RSA source signature as their last `sig_len`
     /// bytes; emitting it would inject non-TS bytes at every piece boundary — see B0/note 27).
     piece_trailer: u64,
+    /// Broadcaster's DER SubjectPublicKeyInfo (the transport descriptor's `pubkey` field).
+    /// When set, every completed piece's in-band RSA source signature — its trailing
+    /// `piece_trailer` bytes — is verified before the piece is marked complete; a piece that
+    /// fails is dropped and never emitted, so unauthenticated peer bytes can't reach the
+    /// consumer (B0/note 27). `None` (a bare-infohash stream with no known source key) leaves
+    /// verification off, stripping the trailer without authenticating it.
+    verify_pubkey: Option<Vec<u8>>,
     partial: BTreeMap<u64, Partial>,
     complete: BTreeMap<u64, Vec<u8>>,
 }
@@ -33,6 +40,7 @@ impl PieceReassembler {
             piece_length,
             next_emit: start_piece,
             piece_trailer: 0,
+            verify_pubkey: None,
             partial: BTreeMap::new(),
             complete: BTreeMap::new(),
         }
@@ -45,6 +53,23 @@ impl PieceReassembler {
     /// emits pieces verbatim.
     pub fn with_piece_trailer(mut self, sig_len: u64) -> Self {
         self.piece_trailer = sig_len.min(self.piece_length);
+        self
+    }
+
+    /// Authenticate every completed piece against the broadcast source's `pubkey_der` (the
+    /// transport descriptor's DER SubjectPublicKeyInfo). The trailing signature length is
+    /// derived from the key's own modulus, so this also sets the piece trailer — no separate
+    /// [`Self::with_piece_trailer`] call is needed, and callers can't accidentally verify over
+    /// a differently-sized tail than they strip. A completed piece whose in-band RSASSA-
+    /// PKCS1-v1_5/SHA1 signature (B0/note 27) does not verify is dropped and never emitted.
+    ///
+    /// An empty or unparseable `pubkey_der` is a no-op (verification stays off) — a bare
+    /// infohash carries no source key, so its pieces can only be stripped, not authenticated.
+    pub fn with_source_pubkey(mut self, pubkey_der: Vec<u8>) -> Self {
+        if let Some(sig_len) = crate::live_auth::signature_len_from_pubkey_der(&pubkey_der) {
+            self.piece_trailer = (sig_len as u64).min(self.piece_length);
+            self.verify_pubkey = Some(pubkey_der);
+        }
         self
     }
 
@@ -69,6 +94,22 @@ impl PieceReassembler {
         p.filled += block.len() as u64;
         if p.filled >= self.piece_length {
             let done = self.partial.remove(&index).unwrap();
+            if let Some(pubkey) = &self.verify_pubkey {
+                // Authenticate before the piece can ever be emitted. A forged/corrupt piece is
+                // already removed from `partial` above, so returning an error simply drops it —
+                // the cursor doesn't advance and the caller re-requests, rather than serving
+                // unauthenticated bytes to the consumer (see the module docs / B0/note 27).
+                let verified =
+                    crate::live_auth::split_piece(&done.buf, self.piece_trailer as usize)
+                        .is_some_and(|(payload, sig)| {
+                            crate::live_auth::verify_piece(pubkey, payload, sig)
+                        });
+                if !verified {
+                    return Err(WireError::Invalid(
+                        "live-source piece signature verification failed",
+                    ));
+                }
+            }
             self.complete.insert(index, done.buf);
         }
         Ok(())
@@ -203,5 +244,122 @@ mod tests {
         let mut r = PieceReassembler::new(2, 10);
         r.skip_to(3); // behind next_emit -> no-op
         assert_eq!(r.next_needed(), 10);
+    }
+
+    /// Build a wire piece (`payload || signature`) of exactly `piece_length` bytes, signed by
+    /// `auth` — the same layout `SigningChunker` and a real Acestream source produce.
+    fn signed_piece(
+        auth: &crate::live_auth::LiveSourceAuth,
+        piece_length: usize,
+        fill: u8,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let payload = vec![fill; piece_length - auth.signature_len()];
+        let mut piece = payload.clone();
+        piece.extend_from_slice(&auth.sign(&payload));
+        assert_eq!(piece.len(), piece_length);
+        (piece, payload)
+    }
+
+    #[test]
+    fn verifies_and_emits_a_valid_signed_piece() {
+        let auth = crate::live_auth::LiveSourceAuth::generate();
+        let piece_length = 128; // > 96-byte signature of the generated 768-bit key
+        let (piece, payload) = signed_piece(&auth, piece_length, 0x5A);
+
+        let mut r =
+            PieceReassembler::new(piece_length as u64, 0).with_source_pubkey(auth.pubkey_der());
+        // Deliver as two blocks to exercise reassembly + verification of the whole piece.
+        r.add_block(0, 0, &piece[..64]).unwrap();
+        r.add_block(0, 64, &piece[64..]).unwrap();
+        assert_eq!(
+            r.take_ready(),
+            payload,
+            "a valid piece emits its media payload with the signature trailer stripped"
+        );
+    }
+
+    #[test]
+    fn rejects_a_piece_whose_signature_does_not_verify() {
+        let auth = crate::live_auth::LiveSourceAuth::generate();
+        let piece_length = 128;
+        let (mut piece, _) = signed_piece(&auth, piece_length, 0x11);
+        piece[0] ^= 0xFF; // tamper a media byte after signing -> signature no longer matches
+
+        let mut r =
+            PieceReassembler::new(piece_length as u64, 0).with_source_pubkey(auth.pubkey_der());
+        r.add_block(0, 0, &piece[..64]).unwrap();
+        let err = r.add_block(0, 64, &piece[64..]).unwrap_err();
+        assert!(
+            matches!(err, WireError::Invalid(_)),
+            "the block completing a forged piece is rejected"
+        );
+        assert_eq!(
+            r.take_ready(),
+            Vec::<u8>::new(),
+            "a forged piece is never emitted"
+        );
+        assert_eq!(
+            r.next_needed(),
+            0,
+            "the cursor stays put; the forged piece was never marked complete"
+        );
+    }
+
+    #[test]
+    fn a_forged_piece_can_be_replaced_by_a_valid_re_request() {
+        let auth = crate::live_auth::LiveSourceAuth::generate();
+        let piece_length = 128;
+        let (good, payload) = signed_piece(&auth, piece_length, 0x33);
+        let mut forged = good.clone();
+        forged[10] ^= 0xAA;
+
+        let mut r =
+            PieceReassembler::new(piece_length as u64, 0).with_source_pubkey(auth.pubkey_der());
+        assert!(
+            r.add_block(0, 0, &forged).is_err(),
+            "forged piece rejected on completion"
+        );
+        assert_eq!(r.take_ready(), Vec::<u8>::new());
+        // The honest re-request rebuilds piece 0 from scratch and now verifies + emits.
+        r.add_block(0, 0, &good).unwrap();
+        assert_eq!(r.take_ready(), payload);
+    }
+
+    #[test]
+    fn a_piece_signed_by_the_wrong_key_is_rejected() {
+        let source = crate::live_auth::LiveSourceAuth::generate();
+        let attacker = crate::live_auth::LiveSourceAuth::generate();
+        let piece_length = 128;
+        // Signed by the attacker's key but presented against the real source's pubkey.
+        let (piece, _) = signed_piece(&attacker, piece_length, 0x77);
+
+        let mut r =
+            PieceReassembler::new(piece_length as u64, 0).with_source_pubkey(source.pubkey_der());
+        assert!(r.add_block(0, 0, &piece).is_err());
+        assert_eq!(r.take_ready(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn without_a_pubkey_pieces_are_stripped_but_not_verified() {
+        // A bare-infohash stream knows the signature length but not the source key, so it can
+        // only strip the trailer — an unverifiable (here arbitrary) tail still passes through.
+        let mut r = PieceReassembler::new(6, 0).with_piece_trailer(2);
+        r.add_block(0, 0, &[1, 2, 3, 4, 0xAA, 0xBB]).unwrap();
+        assert_eq!(r.take_ready(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn an_empty_or_unparseable_pubkey_leaves_verification_off() {
+        let mut r = PieceReassembler::new(4, 0).with_source_pubkey(Vec::new());
+        r.add_block(0, 0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(r.take_ready(), vec![1, 2, 3, 4], "empty pubkey is a no-op");
+
+        let mut r = PieceReassembler::new(4, 0).with_source_pubkey(vec![0xDE, 0xAD]);
+        r.add_block(0, 0, &[5, 6, 7, 8]).unwrap();
+        assert_eq!(
+            r.take_ready(),
+            vec![5, 6, 7, 8],
+            "garbage that isn't an RSA key is a no-op, not a reject-everything trap"
+        );
     }
 }
