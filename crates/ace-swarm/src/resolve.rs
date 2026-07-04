@@ -41,6 +41,16 @@ pub const DEFAULT_CHUNK_LENGTH: u64 = 16_384;
 /// a hostile peer trying to force a large fan-out/allocation, and is rejected before the fetch.
 pub const MAX_METADATA_SIZE: usize = 1_048_576;
 
+/// Upper bound on a transport descriptor's advertised `piece_length` (bytes).
+///
+/// The piece length is untrusted and sizes the [`PieceReassembler`](ace_wire::reassembly)
+/// per-piece buffer (`vec![0u8; piece_length]`, allocated on the first block of every
+/// in-flight piece) as well as the request fan-out. Real Acestream geometry is small: 64 KiB
+/// source-node pieces (`broadcast::PIECE_LENGTH`) and 1 MiB default live pieces
+/// ([`DEFAULT_PIECE_LENGTH`]). This ceiling leaves generous headroom for higher-bitrate
+/// sources while bounding the allocation a hostile transport can force at stream start.
+pub const MAX_PIECE_LENGTH: u64 = 8 * 1_048_576;
+
 /// The ext id we assign to `ut_metadata` in our `m` dict (what the peer addresses replies to).
 const OUR_UT_METADATA_ID: i64 = 2;
 /// How many messages to read while waiting for the peer's extended handshake.
@@ -71,6 +81,7 @@ pub enum ResolveError {
 /// content-id resolution): official swarm infohash + geometry + trackers from the descriptor.
 pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveError> {
     let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    validate_geometry(d.piece_length, d.chunk_length)?;
     Ok(StreamInfo {
         infohash: infohash_of_descriptor(&d.raw)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
@@ -81,6 +92,36 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
         // parseable pubkey => treat pieces as unsigned (don't strip).
         sig_len: ace_wire::live_auth::signature_len_from_pubkey_der(&d.pubkey).unwrap_or(0),
     })
+}
+
+/// Validate untrusted transport geometry before it becomes a [`StreamInfo`].
+///
+/// `piece_length`/`chunk_length` come from a metadata-swarm peer's transport descriptor. The
+/// wire codec addresses chunks within a piece by a `u16` index and assumes the fixed Acestream
+/// chunk size, so a downloadable descriptor must satisfy:
+/// - `chunk_length == DEFAULT_CHUNK_LENGTH` — the 16 KiB protocol constant the wire codec and
+///   both live/broadcast paths use; any other value is rejected rather than trusted.
+/// - `piece_length <= MAX_PIECE_LENGTH` — bounds the per-piece reassembly allocation.
+/// - `piece_length` is an exact multiple of `chunk_length` — whole chunks per piece, so request
+///   generation stays consistent with the descriptor.
+/// - `piece_length / chunk_length <= u16::MAX` — the chunks-per-piece count must fit the wire
+///   chunk index without truncation (see [`StreamInfo::chunks_per_piece`]).
+fn validate_geometry(piece_length: u64, chunk_length: u64) -> Result<(), ResolveError> {
+    if chunk_length != DEFAULT_CHUNK_LENGTH {
+        return Err(ResolveError::Transport("unexpected chunk_length"));
+    }
+    if piece_length > MAX_PIECE_LENGTH {
+        return Err(ResolveError::Transport("piece_length too large"));
+    }
+    if !piece_length.is_multiple_of(chunk_length) {
+        return Err(ResolveError::Transport(
+            "piece_length not a multiple of chunk_length",
+        ));
+    }
+    if piece_length / chunk_length > u16::MAX as u64 {
+        return Err(ResolveError::Transport("too many chunks per piece"));
+    }
+    Ok(())
 }
 
 /// Build a [`StreamInfo`] from a 40-char hex infohash with default live geometry. `trackers`
@@ -429,6 +470,52 @@ mod tests {
                 0x6d, 0x42, 0xae, 0xa7, 0xf8, 0x8c,
             ]
         );
+    }
+
+    #[test]
+    fn rejects_oversized_piece_length() {
+        // 100 MiB pieces would force a huge per-piece reassembly buffer at stream start;
+        // reject the untrusted geometry before it becomes a StreamInfo.
+        let tf = make_transport(b"d12:chunk_lengthi16384e12:piece_lengthi104857600ee");
+        assert_eq!(
+            stream_info_from_transport(&tf),
+            Err(ResolveError::Transport("piece_length too large"))
+        );
+    }
+
+    #[test]
+    fn rejects_unexpected_chunk_length() {
+        // The wire codec's chunk size is the fixed Acestream protocol constant (16 KiB).
+        let tf = make_transport(b"d12:chunk_lengthi8192e12:piece_lengthi65536ee");
+        assert_eq!(
+            stream_info_from_transport(&tf),
+            Err(ResolveError::Transport("unexpected chunk_length"))
+        );
+    }
+
+    #[test]
+    fn rejects_piece_length_not_multiple_of_chunk() {
+        // A piece that isn't a whole number of chunks makes chunk request generation
+        // inconsistent with the descriptor.
+        let tf = make_transport(b"d12:chunk_lengthi16384e12:piece_lengthi65537ee");
+        assert_eq!(
+            stream_info_from_transport(&tf),
+            Err(ResolveError::Transport(
+                "piece_length not a multiple of chunk_length"
+            ))
+        );
+    }
+
+    #[test]
+    fn accepts_broadcast_geometry() {
+        // 64 KiB pieces / 16 KiB chunks — the source-node geometry outpace itself mints.
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei8375e12:chunk_lengthi16384e4:name4:Test12:piece_lengthi65536e6:pubkey3:abce",
+        );
+        let si = stream_info_from_transport(&tf).unwrap();
+        assert_eq!(si.piece_length, 65_536);
+        assert_eq!(si.chunk_length, 16_384);
+        assert_eq!(si.chunks_per_piece(), 4);
     }
 
     #[test]
