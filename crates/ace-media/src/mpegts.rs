@@ -51,11 +51,19 @@ pub fn packet_count(buf: &[u8]) -> usize {
     buf.len() / TS_PACKET_LEN
 }
 
+/// Maximum unconfirmed tail retained between pushes. Confirming a packet start needs the
+/// byte AND its `+TS_PACKET_LEN` neighbor, so only the final `2 * TS_PACKET_LEN - 1` bytes
+/// can still become sync-lockable once more data arrives — any earlier byte already has its
+/// neighbor present and has been scan-rejected. Capping the retained tail to this window
+/// bounds memory against a peer that streams unsynchronizable (non-TS) data forever (#14),
+/// without dropping anything a later push could have re-locked.
+const MAX_UNSYNCED_TAIL: usize = 2 * TS_PACKET_LEN - 1;
+
 /// Stateful TS packet re-aligner for a continuous byte stream that may contain misaligned
 /// regions (e.g. Acestream live pieces, which are each internally 188-aligned but don't
 /// byte-chain — ~one partial packet of junk at each piece boundary). Feed arbitrary byte
 /// runs; it emits only sync-locked 188-byte packets, discarding bytes as needed to re-lock,
-/// and buffers the unconfirmed tail until more data arrives.
+/// and buffers the unconfirmed tail (bounded to [`MAX_UNSYNCED_TAIL`]) until more data arrives.
 #[derive(Default)]
 pub struct TsResync {
     buf: Vec<u8>,
@@ -94,6 +102,14 @@ impl TsResync {
             }
         }
         self.buf.drain(0..i);
+        // Bound the unconfirmed tail: if a run of unsynchronizable bytes has accumulated
+        // past the sync lookahead, everything before the last `MAX_UNSYNCED_TAIL` bytes has
+        // already been scan-rejected (its `+TS_PACKET_LEN` neighbor is present) and can never
+        // re-lock, so drop it. Bounds memory against a non-TS junk flood (#14).
+        if self.buf.len() > MAX_UNSYNCED_TAIL {
+            let excess = self.buf.len() - MAX_UNSYNCED_TAIL;
+            self.buf.drain(0..excess);
+        }
         out
     }
 }
@@ -622,5 +638,41 @@ mod tests {
         out.extend(r.push(&packet(4))); // flush trailer
         assert!(is_aligned(&out));
         assert!(packet_count(&out) >= 3);
+    }
+
+    #[test]
+    fn resync_caps_unconfirmed_tail_on_junk_flood() {
+        // A hostile peer supplies complete pieces of non-TS data that never sync-lock.
+        // The unconfirmed tail must stay bounded to the sync lookahead instead of retaining
+        // every pushed byte (a memory-exhaustion DoS — issue #14).
+        let mut r = TsResync::new();
+        let junk = vec![0x00u8; 64 * 1024]; // no 0x47, so no confirmable packet ever
+        for _ in 0..16 {
+            let out = r.push(&junk);
+            assert!(out.is_empty(), "non-TS junk must not emit packets");
+        }
+        assert!(
+            r.buf.len() <= MAX_UNSYNCED_TAIL,
+            "unconfirmed tail buffer must be capped to the sync lookahead, got {} bytes",
+            r.buf.len()
+        );
+    }
+
+    #[test]
+    fn resync_recovers_alignment_after_capped_junk_flood() {
+        // Capping the tail must not break re-locking: after a junk flood, a real aligned
+        // run that follows still sync-locks and is emitted.
+        let mut r = TsResync::new();
+        let junk = vec![0x13u8; 64 * 1024]; // arbitrary non-sync filler
+        for _ in 0..8 {
+            let _ = r.push(&junk);
+        }
+        let mut good = packet(1);
+        for k in 2..6 {
+            good.extend(packet(k));
+        }
+        let out = r.push(&good);
+        assert!(is_aligned(&out), "must re-lock on the aligned run after junk");
+        assert!(packet_count(&out) >= 3, "should emit the recovered packets");
     }
 }
