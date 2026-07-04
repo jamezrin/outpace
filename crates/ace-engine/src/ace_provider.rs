@@ -905,10 +905,16 @@ impl Continuity {
         prefetch: u64,
     ) -> (Continuity, u64) {
         let start = prefetch_start(min_piece, max_piece, prefetch);
+        // Strip the per-piece signature tail from the emitted media stream, and — when the
+        // resolved transport gave us the source's `pubkey` — verify each piece's in-band RSA
+        // signature before its bytes can be served (issue #10). A bare-infohash stream has no
+        // `source_pubkey`, so it only strips; `with_source_pubkey` is then a no-op.
+        let reasm = PieceReassembler::new(info.piece_length, start)
+            .with_piece_trailer(info.sig_len as u64)
+            .with_source_pubkey(info.source_pubkey.clone());
         (
             Continuity {
-                reasm: PieceReassembler::new(info.piece_length, start)
-                    .with_piece_trailer(info.sig_len as u64),
+                reasm,
                 resync: ace_media::mpegts::TsResync::new(),
                 scheduler: Scheduler::new(MAX_PIECE_ADVANCE as usize),
                 active_peers: ActivePeers::new(),
@@ -1432,11 +1438,11 @@ async fn follow_peer_pool(
                         &lc.data,
                     );
                     let begin = lc.chunk as u64 * info.chunk_length;
-                    if continuity
-                        .reasm
-                        .add_block(lc.piece as u64, begin, &lc.data)
-                        .is_err()
-                    {
+                    if let Err(e) = continuity.reasm.add_block(lc.piece as u64, begin, &lc.data) {
+                        // A malformed block, or a completed piece whose live-source signature
+                        // didn't verify (#10): drop it rather than emit unauthenticated bytes.
+                        // The piece stays incomplete, so it's re-requested from the pool.
+                        crate::alog!("[ace] {addr}: dropped piece {piece} block: {e:?}");
                         continue;
                     }
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
@@ -1941,11 +1947,11 @@ async fn follow_one_peer(
                         &lc.data,
                     );
                     let begin = lc.chunk as u64 * info.chunk_length;
-                    if continuity
-                        .reasm
-                        .add_block(lc.piece as u64, begin, &lc.data)
-                        .is_err()
-                    {
+                    if let Err(e) = continuity.reasm.add_block(lc.piece as u64, begin, &lc.data) {
+                        // A malformed block, or a completed piece whose live-source signature
+                        // didn't verify (#10): drop it rather than emit unauthenticated bytes.
+                        // The piece stays incomplete, so it's re-requested from the pool.
+                        crate::alog!("[ace] {addr}: dropped piece {piece} block: {e:?}");
                         continue;
                     }
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
@@ -2443,6 +2449,7 @@ mod tests {
             chunk_length: 2,
             trackers: vec![],
             sig_len: 0,
+            source_pubkey: vec![],
         }
     }
 

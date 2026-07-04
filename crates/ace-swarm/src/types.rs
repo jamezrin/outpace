@@ -15,6 +15,11 @@ pub struct StreamInfo {
     /// wire piece carries this many trailing signature bytes that are NOT media and must be
     /// stripped before the MPEG-TS layer (B0/note 27). `0` means unsigned pieces.
     pub sig_len: usize,
+    /// The broadcast source's DER SubjectPublicKeyInfo — the transport descriptor's `pubkey`
+    /// field — used to *verify* each piece's in-band RSA signature before its bytes are served
+    /// (issue #10, B0/note 27). Only a resolved transport descriptor carries this; a bare
+    /// infohash has no source key, so this is empty and pieces are stripped but not verified.
+    pub source_pubkey: Vec<u8>,
 }
 
 /// Default per-piece live-source signature length: Acestream source nodes generate 768-bit
@@ -41,6 +46,7 @@ mod tests {
             chunk_length: 16_384,
             trackers: vec![],
             sig_len: DEFAULT_SIG_LEN,
+            source_pubkey: vec![],
         };
         assert_eq!(si.chunks_per_piece(), 64);
     }
