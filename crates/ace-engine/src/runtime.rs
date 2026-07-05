@@ -147,7 +147,7 @@ pub async fn build_runtime(
     let manager = StreamManager::with_buffer(registry, config.session_buffer);
     manager.spawn_reaper();
     let broadcasts = BroadcastState {
-        registry: BroadcastRegistry::new(),
+        registry: BroadcastRegistry::with_persist(&config.data_dir),
         seed_registry: seed_registry.clone(),
         trackers: DEFAULT_BROADCAST_TRACKERS
             .iter()
@@ -156,6 +156,19 @@ pub async fn build_runtime(
         store_bytes: config.seed_store_bytes,
         inbound_peer_port: config.enable_inbound.then_some(config.peer_listen.port()),
     };
+
+    // Reload any broadcasts persisted by a previous run so their identity/infohash survives
+    // the restart and they are immediately servable, then restart each one's self-announce.
+    let reloaded = broadcasts
+        .registry
+        .reload_persisted(&broadcasts.seed_registry, broadcasts.store_bytes)
+        .await;
+    if !reloaded.is_empty() {
+        crate::alog!("[broadcast] reloaded {} persisted broadcast(s)", reloaded.len());
+    }
+    for bc in &reloaded {
+        broadcasts.spawn_announce(bc);
+    }
 
     Ok(EngineRuntime {
         config,
@@ -350,5 +363,44 @@ mod tests {
         let err = config_from_env().err();
         std::env::remove_var("OUTPACE_SESSION_BUFFER");
         assert!(err.is_some(), "session_buffer=0 must be rejected");
+    }
+
+    #[tokio::test]
+    async fn build_runtime_reloads_persisted_broadcasts_and_serves_them() {
+        use crate::broadcast::BroadcastRegistry;
+
+        let data_dir =
+            std::env::temp_dir().join(format!("outpace-rt-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Mint a broadcast under this data_dir with a throwaway registry (writes the record),
+        // capturing its identity, then drop the registry to simulate a shutdown.
+        let infohash = {
+            let seed = ace_swarm::listen::SeedRegistry::new();
+            let reg = BroadcastRegistry::with_persist(&data_dir);
+            let (bc, fresh) = reg
+                .start_or_resume("news", "News", &[], &seed, 1 << 20)
+                .await;
+            assert!(fresh);
+            bc.infohash
+        };
+
+        // A fresh daemon start over the same data_dir must reload it and serve it.
+        let config = Config {
+            data_dir: data_dir.clone(),
+            networks: vec![],
+            ..Config::default()
+        };
+        let runtime = build_runtime(config, vec![]).await.unwrap();
+
+        let reloaded = runtime.broadcasts.registry.get("news").await;
+        assert!(reloaded.is_some(), "persisted broadcast reloaded into the registry");
+        assert_eq!(reloaded.unwrap().infohash, infohash, "identity survives restart");
+        assert!(
+            runtime.seed_registry.serves(&infohash),
+            "reloaded broadcast is immediately servable"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

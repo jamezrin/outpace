@@ -51,6 +51,29 @@ pub struct BroadcastState {
     pub inbound_peer_port: Option<u16>,
 }
 
+impl BroadcastState {
+    /// Start the periodic tracker/DHT self-announce loops for `bc` (its infohash + content-id
+    /// metadata swarm). A no-op without an inbound listener: advertising a port nobody serves
+    /// on would misdirect real peers. Shared by fresh mint (`PUT`/RTMP) and startup reload, so
+    /// each runs exactly once per broadcast.
+    pub fn spawn_announce(&self, bc: &crate::broadcast::Broadcast) {
+        let Some(port) = self.inbound_peer_port else {
+            return;
+        };
+        let trackers = self.trackers.clone();
+        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+            trackers.clone(),
+            bc.infohash,
+            port,
+        ));
+        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+            trackers,
+            bc.content_id,
+            port,
+        ));
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     let compat = state.experimental_ace_compat;
     let mut router = Router::new()
@@ -65,7 +88,9 @@ pub fn router(state: AppState) -> Router {
         .route("/streams/:network/:id/seg/:seg", get(stream_segment))
         .route(
             "/broadcast/:name",
-            put(broadcast_ingest).get(broadcast_transport),
+            put(broadcast_ingest)
+                .get(broadcast_transport)
+                .delete(broadcast_delete),
         );
     if compat {
         router = router
@@ -95,22 +120,35 @@ async fn broadcast_transport(State(s): State<AppState>, Path(name): Path<String>
     }
 }
 
+/// Whether `name` is safe to use as both a registry key and a persistence filename. Names
+/// come straight from the URL path, so this closes a path-traversal vector: allow only
+/// `[A-Za-z0-9._-]`, length 1..=64, and never `.`/`..`.
+fn valid_broadcast_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// `PUT /broadcast/{name}` (B1) — accepts a chunked MPEG-TS body and originates it as an
 /// Acestream-compatible live swarm. Responds immediately with the minted infohash (identical
 /// name -> identical, already-minted broadcast; see `BroadcastRegistry::start_or_resume`)
 /// while ingest continues in a background task — the request body may be a long-lived,
 /// effectively-unbounded stream (a live source), so the handler can't wait for it to finish.
 ///
-/// KNOWN GAP: piece numbering restarts at 0 on every ingest task, even when resuming an
-/// already-minted name (mirrors the real engine's `.restart` file semantics, which we don't
-/// yet persist) — a second `PUT` to the same name after the first ingest ends would
-/// overwrite piece indices rather than continuing them. Fine for a single continuous ingest
-/// (the only case exercised so far); flagged for whoever adds ingest-reconnect support.
+/// Piece numbering resumes from the broadcast's persisted cursor, so a second `PUT` to the
+/// same name continues the sequence rather than restarting at 0 (issue #3).
 async fn broadcast_ingest(
     State(s): State<AppState>,
     Path(name): Path<String>,
     body: Body,
 ) -> Response {
+    if !valid_broadcast_name(&name) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let Some(bs) = &s.broadcasts else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -128,32 +166,17 @@ async fn broadcast_ingest(
     let content_id_hex = hex20_string(&bc.content_id);
     crate::alog!("[broadcast] {name}: ingesting as infohash {infohash_hex}");
 
-    // Self-announce this broadcast and its content-id metadata swarm to tracker + DHT,
-    // exactly once per freshly-minted name — resumed PUTs must not spawn duplicate loops.
-    // A no-op without an inbound listener: advertising a port nobody's serving on would
-    // misdirect real peers into a dead connection instead of outpace's own S1/S2 serve path.
+    // Self-announce to tracker + DHT exactly once per freshly-minted name — resumed PUTs and
+    // disk reloads must not spawn duplicate loops.
     if freshly_minted {
-        if let Some(port) = bs.inbound_peer_port {
-            let trackers = bs.trackers.clone();
-            let infohash = bc.infohash;
-            let content_key = bc.content_id;
-            tokio::spawn(crate::ace_provider::announce_infohash_periodically(
-                trackers.clone(),
-                infohash,
-                port,
-            ));
-            tokio::spawn(crate::ace_provider::announce_infohash_periodically(
-                trackers,
-                content_key,
-                port,
-            ));
-        }
+        bs.spawn_announce(&bc);
     }
 
     let store = bc.store.clone();
     let auth = bc.auth.clone();
+    let cursor = bc.cursor.clone();
     tokio::spawn(async move {
-        let mut ingest = crate::broadcast_ingest::BroadcastIngest::new(store, auth);
+        let mut ingest = crate::broadcast_ingest::BroadcastIngest::new(store, auth, cursor);
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
             let Ok(chunk) = chunk else { break };
@@ -168,6 +191,24 @@ async fn broadcast_ingest(
         "infohash": infohash_hex,
     }))
     .into_response()
+}
+
+/// `DELETE /broadcast/{name}` — purge a broadcast: drop it from the registry (and its persisted
+/// record) and stop serving its infohash/content_id, so a subsequent `PUT` mints a fresh
+/// identity. Idempotent: `204 No Content` whether or not the name existed.
+async fn broadcast_delete(State(s): State<AppState>, Path(name): Path<String>) -> Response {
+    if !valid_broadcast_name(&name) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(bs) = &s.broadcasts else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(bc) = bs.registry.delete(&name).await {
+        bs.seed_registry.remove(&bc.infohash);
+        bs.seed_registry.remove(&bc.content_id);
+        crate::alog!("[broadcast] {name}: deleted");
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn ace_getstream(
@@ -1189,5 +1230,91 @@ mod tests {
             ace_wire::live_auth::verify_piece(&bc.auth.pubkey_der(), payload, sig),
             "the ingested piece's embedded signature must verify against the broadcast's own pubkey"
         );
+    }
+
+    #[test]
+    fn broadcast_name_validation_rejects_traversal_and_junk() {
+        assert!(valid_broadcast_name("news"));
+        assert!(valid_broadcast_name("sports-2.hd_1"));
+        assert!(!valid_broadcast_name(""));
+        assert!(!valid_broadcast_name("."));
+        assert!(!valid_broadcast_name(".."));
+        assert!(!valid_broadcast_name("../etc/passwd"));
+        assert!(!valid_broadcast_name("a/b"));
+        assert!(!valid_broadcast_name("has space"));
+        assert!(!valid_broadcast_name(&"x".repeat(65)));
+    }
+
+    #[tokio::test]
+    async fn broadcast_put_and_delete_reject_invalid_names_with_400() {
+        let app = router(broadcast_state());
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/broadcast/bad%2Fname")
+                    .body(Body::from(vec![0x47u8; 8]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::BAD_REQUEST);
+        let del = app
+            .oneshot(
+                Request::delete("/broadcast/bad%2Fname")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn broadcast_delete_purges_and_is_idempotent() {
+        let st = broadcast_state();
+        let seed_registry = st.broadcasts.as_ref().unwrap().seed_registry.clone();
+        let app = router(st);
+
+        // Mint it.
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/broadcast/gone")
+                    .body(Body::from(vec![0x47u8; 8]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(put.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ih_hex = json["infohash"].as_str().unwrap();
+        let mut infohash = [0u8; 20];
+        for i in 0..20 {
+            infohash[i] = u8::from_str_radix(&ih_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        assert!(seed_registry.serves(&infohash));
+
+        // Delete it -> 204, no longer served, GET 404s.
+        let del = app
+            .clone()
+            .oneshot(Request::delete("/broadcast/gone").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+        assert!(!seed_registry.serves(&infohash), "no longer served after delete");
+        let get = app
+            .clone()
+            .oneshot(Request::get("/broadcast/gone").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+
+        // Deleting again is idempotent.
+        let del2 = app
+            .oneshot(Request::delete("/broadcast/gone").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(del2.status(), StatusCode::NO_CONTENT);
     }
 }
