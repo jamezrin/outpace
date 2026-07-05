@@ -1,7 +1,17 @@
 //! A bounded, rolling store of downloaded (or broadcast) piece data, keyed by piece then chunk.
-//! Feeds the seeder: we serve chunks we still hold. Pure (no I/O); eviction is FIFO by lowest
-//! piece index once the byte budget is exceeded.
+//! Feeds the seeder: we serve chunks we still hold. Eviction is FIFO by lowest piece index once
+//! the byte budget is exceeded.
+//!
+//! The store's internals sit behind a [`Backend`]: the default `Memory` backend keeps piece data
+//! in RAM (pure, no I/O), while the optional `Disk` backend spills chunk payloads to one file per
+//! piece so operators can retain far more reseed data without paying RAM. Both share the same
+//! `max_bytes` budget and public API; only the disk backend touches the filesystem, and only in
+//! [`chunk`](PieceStore::chunk) / the `put_chunk*` writers.
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+
+mod disk;
+use disk::DiskBackend;
 
 #[derive(Debug)]
 pub struct PieceStore {
@@ -9,10 +19,162 @@ pub struct PieceStore {
     chunk_length: u64,
     max_bytes: u64,
     cur_bytes: u64,
+    backend: Backend,
+}
+
+/// How a [`PieceStore`] keeps its piece data. Selected once at construction.
+pub enum BackendKind {
+    /// Keep piece data in RAM (default; pure, no I/O).
+    Memory,
+    /// Spill chunk payloads to one file per piece under `dir`. The directory is treated as
+    /// ephemeral: any stale contents from a prior run are wiped when the store is created.
+    Disk { dir: std::path::PathBuf },
+}
+
+/// The storage implementation backing a [`PieceStore`]. Byte accounting and eviction policy live
+/// on `PieceStore`; a backend only owns the piece maps and reports how many bytes an insert
+/// replaced or an eviction freed so the accounting stays backend-agnostic.
+#[derive(Debug)]
+enum Backend {
+    Memory(MemoryBackend),
+    Disk(DiskBackend),
+}
+
+/// Byte-accounting deltas from a single insert, so `PieceStore` can keep `cur_bytes` exact
+/// without knowing which backend actually stored the data. On the disk backend a failed write
+/// reports `added: 0` so a dropped chunk never inflates the running total.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Stored {
+    /// Bytes newly written and now counted toward the budget.
+    added: u64,
+    /// Bytes freed by replacing an existing chunk at the same `(piece, chunk)` slot.
+    removed: u64,
+}
+
+impl Backend {
+    /// Insert `(piece, chunk)`, applying the header-upgrade rule. Returns the byte deltas the
+    /// caller should apply to its running total.
+    fn put(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) -> Stored {
+        match self {
+            Backend::Memory(m) => m.put(piece, chunk, header, data),
+            Backend::Disk(d) => d.put(piece, chunk, header, data),
+        }
+    }
+
+    fn get(&self, piece: u64, chunk: u16) -> Option<Cow<'_, [u8]>> {
+        match self {
+            Backend::Memory(m) => m.get(piece, chunk),
+            Backend::Disk(d) => d.get(piece, chunk),
+        }
+    }
+
+    fn header(&self, piece: u64) -> Option<[u8; 8]> {
+        match self {
+            Backend::Memory(m) => m.header(piece),
+            Backend::Disk(d) => d.header(piece),
+        }
+    }
+
+    fn has_piece(&self, piece: u64, chunks_per_piece: u16) -> bool {
+        match self {
+            Backend::Memory(m) => m.has_piece(piece, chunks_per_piece),
+            Backend::Disk(d) => d.has_piece(piece, chunks_per_piece),
+        }
+    }
+
+    fn have_pieces(&self, chunks_per_piece: u16) -> Vec<u64> {
+        match self {
+            Backend::Memory(m) => m.have_pieces(chunks_per_piece),
+            Backend::Disk(d) => d.have_pieces(chunks_per_piece),
+        }
+    }
+
+    fn window(&self) -> Option<(u64, u64)> {
+        match self {
+            Backend::Memory(m) => m.window(),
+            Backend::Disk(d) => d.window(),
+        }
+    }
+
+    /// Evict the lowest-index piece; return the byte total it freed (0 if the store is empty).
+    fn evict_lowest(&mut self) -> u64 {
+        match self {
+            Backend::Memory(m) => m.evict_lowest(),
+            Backend::Disk(d) => d.evict_lowest(),
+        }
+    }
+}
+
+/// In-RAM backend: today's `BTreeMap` piece store, moved verbatim behind the backend boundary.
+#[derive(Debug, Default)]
+struct MemoryBackend {
     /// piece index -> (chunk index -> TS payload bytes)
     pieces: BTreeMap<u64, BTreeMap<u16, Vec<u8>>>,
     /// piece index -> Acestream's 8-byte live piece header.
     headers: BTreeMap<u64, [u8; 8]>,
+}
+
+impl MemoryBackend {
+    fn put(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) -> Stored {
+        self.headers
+            .entry(piece)
+            .and_modify(|stored| {
+                if *stored == [0u8; 8] && header != [0u8; 8] {
+                    *stored = header;
+                }
+            })
+            .or_insert(header);
+        let entry = self.pieces.entry(piece).or_default();
+        let removed = entry
+            .insert(chunk, data.to_vec())
+            .map_or(0, |old| old.len() as u64);
+        Stored {
+            added: data.len() as u64,
+            removed,
+        }
+    }
+
+    fn get(&self, piece: u64, chunk: u16) -> Option<Cow<'_, [u8]>> {
+        self.pieces
+            .get(&piece)?
+            .get(&chunk)
+            .map(|v| Cow::Borrowed(v.as_slice()))
+    }
+
+    fn header(&self, piece: u64) -> Option<[u8; 8]> {
+        self.headers.get(&piece).copied()
+    }
+
+    fn has_piece(&self, piece: u64, chunks_per_piece: u16) -> bool {
+        self.pieces
+            .get(&piece)
+            .is_some_and(|c| c.len() as u16 == chunks_per_piece)
+    }
+
+    fn have_pieces(&self, chunks_per_piece: u16) -> Vec<u64> {
+        self.pieces
+            .keys()
+            .copied()
+            .filter(|&p| self.has_piece(p, chunks_per_piece))
+            .collect()
+    }
+
+    fn window(&self) -> Option<(u64, u64)> {
+        let min = *self.pieces.keys().next()?;
+        let max = *self.pieces.keys().next_back()?;
+        Some((min, max))
+    }
+
+    fn evict_lowest(&mut self) -> u64 {
+        let Some((&lowest, _)) = self.pieces.iter().next() else {
+            return 0;
+        };
+        let removed = self.pieces.remove(&lowest);
+        self.headers.remove(&lowest);
+        removed
+            .map(|c| c.values().map(|d| d.len() as u64).sum())
+            .unwrap_or(0)
+    }
 }
 
 impl PieceStore {
@@ -21,14 +183,40 @@ impl PieceStore {
     /// by zero), and `piece_length` should be a multiple of `chunk_length`. Domain inputs are
     /// always 1 MiB / 16 KiB, so this is documented rather than asserted at runtime.
     pub fn new(piece_length: u64, chunk_length: u64, max_bytes: u64) -> Self {
-        PieceStore {
+        // Memory backend never fails to build, so this stays infallible for back-compat.
+        Self::with_backend(piece_length, chunk_length, max_bytes, BackendKind::Memory)
+            .expect("memory backend is infallible")
+    }
+
+    /// Build a store with an explicitly chosen [`BackendKind`]. Fails only when a `Disk` backend
+    /// cannot prepare its cache directory.
+    pub fn with_backend(
+        piece_length: u64,
+        chunk_length: u64,
+        max_bytes: u64,
+        kind: BackendKind,
+    ) -> std::io::Result<Self> {
+        let backend = match kind {
+            BackendKind::Memory => Backend::Memory(MemoryBackend::default()),
+            BackendKind::Disk { dir } => Backend::Disk(DiskBackend::new(dir, chunk_length)?),
+        };
+        Ok(PieceStore {
             piece_length,
             chunk_length,
             max_bytes,
             cur_bytes: 0,
-            pieces: BTreeMap::new(),
-            headers: BTreeMap::new(),
-        }
+            backend,
+        })
+    }
+
+    /// Convenience: a disk-backed store rooted at `dir` (its contents are wiped on creation).
+    pub fn new_disk(
+        piece_length: u64,
+        chunk_length: u64,
+        max_bytes: u64,
+        dir: std::path::PathBuf,
+    ) -> std::io::Result<Self> {
+        Self::with_backend(piece_length, chunk_length, max_bytes, BackendKind::Disk { dir })
     }
 
     /// Chunks per piece (`piece_length / chunk_length`).
@@ -48,61 +236,42 @@ impl PieceStore {
     /// placeholder so old call sites remain compatible while relay/source paths preserve real
     /// headers.
     pub fn put_chunk_with_header(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) {
-        self.headers
-            .entry(piece)
-            .and_modify(|stored| {
-                if *stored == [0u8; 8] && header != [0u8; 8] {
-                    *stored = header;
-                }
-            })
-            .or_insert(header);
-        let entry = self.pieces.entry(piece).or_default();
-        if let Some(old) = entry.insert(chunk, data.to_vec()) {
-            self.cur_bytes -= old.len() as u64;
-        }
-        self.cur_bytes += data.len() as u64;
+        let stored = self.backend.put(piece, chunk, header, data);
+        self.cur_bytes -= stored.removed;
+        self.cur_bytes += stored.added;
         while self.cur_bytes > self.max_bytes {
-            let Some((&lowest, _)) = self.pieces.iter().next() else {
+            let freed = self.backend.evict_lowest();
+            if freed == 0 {
                 break;
-            };
-            if let Some(removed) = self.pieces.remove(&lowest) {
-                self.cur_bytes -= removed.values().map(|d| d.len() as u64).sum::<u64>();
-                self.headers.remove(&lowest);
             }
+            self.cur_bytes -= freed;
         }
     }
 
     /// The Acestream live piece header for `piece`, if known.
     pub fn piece_header(&self, piece: u64) -> Option<[u8; 8]> {
-        self.headers.get(&piece).copied()
+        self.backend.header(piece)
     }
 
-    /// The TS payload of `(piece, chunk)` if still held.
-    pub fn chunk(&self, piece: u64, chunk: u16) -> Option<&[u8]> {
-        self.pieces.get(&piece)?.get(&chunk).map(|v| v.as_slice())
+    /// The TS payload of `(piece, chunk)` if still held. Borrowed from RAM on the memory backend;
+    /// read from disk (and owned) on the disk backend — hence [`Cow`].
+    pub fn chunk(&self, piece: u64, chunk: u16) -> Option<Cow<'_, [u8]>> {
+        self.backend.get(piece, chunk)
     }
 
     /// True iff every chunk of `piece` is present.
     pub fn has_piece(&self, piece: u64) -> bool {
-        self.pieces
-            .get(&piece)
-            .is_some_and(|c| c.len() as u16 == self.chunks_per_piece())
+        self.backend.has_piece(piece, self.chunks_per_piece())
     }
 
     /// Sorted indices of fully-held pieces (for `Have` advertisement).
     pub fn have_pieces(&self) -> Vec<u64> {
-        self.pieces
-            .keys()
-            .copied()
-            .filter(|&p| self.has_piece(p))
-            .collect()
+        self.backend.have_pieces(self.chunks_per_piece())
     }
 
     /// `(min, max)` stored piece indices, or None if empty.
     pub fn window(&self) -> Option<(u64, u64)> {
-        let min = *self.pieces.keys().next()?;
-        let max = *self.pieces.keys().next_back()?;
-        Some((min, max))
+        self.backend.window()
     }
 }
 
@@ -119,9 +288,9 @@ mod tests {
     fn stores_and_returns_a_chunk() {
         let mut s = store(1024);
         s.put_chunk(10, 0, &[1, 2, 3, 4]);
-        assert_eq!(s.chunk(10, 0), Some(&[1, 2, 3, 4][..]));
-        assert_eq!(s.chunk(10, 1), None);
-        assert_eq!(s.chunk(11, 0), None);
+        assert_eq!(s.chunk(10, 0).as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(s.chunk(10, 1).as_deref(), None);
+        assert_eq!(s.chunk(11, 0).as_deref(), None);
     }
 
     #[test]
@@ -152,7 +321,7 @@ mod tests {
         s.put_chunk(2, 0, &[0; 4]);
         assert_eq!(s.window(), Some((1, 2)));
         s.put_chunk(3, 0, &[0; 4]); // over budget -> drop piece 1
-        assert_eq!(s.chunk(1, 0), None, "lowest piece evicted");
+        assert_eq!(s.chunk(1, 0).as_deref(), None, "lowest piece evicted");
         assert_eq!(s.window(), Some((2, 3)));
     }
 
@@ -163,7 +332,7 @@ mod tests {
         s.put_chunk(1, 0, &[9; 4]); // replace, not add
         s.put_chunk(1, 1, &[0; 4]);
         // Still one piece (1) with two chunks = 8 bytes, nothing evicted.
-        assert_eq!(s.chunk(1, 0), Some(&[9, 9, 9, 9][..]));
+        assert_eq!(s.chunk(1, 0).as_deref(), Some(&[9, 9, 9, 9][..]));
         assert!(s.has_piece(1));
     }
 
@@ -171,7 +340,7 @@ mod tests {
     fn budget_smaller_than_one_chunk_discards_gracefully() {
         let mut s = PieceStore::new(8, 4, 3); // max_bytes < chunk size
         s.put_chunk(1, 0, &[0; 4]);
-        assert_eq!(s.chunk(1, 0), None); // evicted immediately, no panic
+        assert_eq!(s.chunk(1, 0).as_deref(), None); // evicted immediately, no panic
         assert_eq!(s.window(), None);
     }
 
@@ -181,8 +350,8 @@ mod tests {
         s.put_chunk(1, 0, &[0; 4]);
         s.put_chunk(2, 0, &[0; 4]); // evicts piece 1
         s.put_chunk(3, 0, &[0; 4]); // evicts piece 2
-        assert_eq!(s.chunk(1, 0), None);
-        assert_eq!(s.chunk(2, 0), None);
+        assert_eq!(s.chunk(1, 0).as_deref(), None);
+        assert_eq!(s.chunk(2, 0).as_deref(), None);
         assert_eq!(s.window(), Some((3, 3)));
     }
 
@@ -228,5 +397,83 @@ mod tests {
 
         assert_eq!(s.piece_header(1), None);
         assert_eq!(s.piece_header(2), Some([2; 8]));
+    }
+
+    // ---- Disk backend ----
+
+    #[test]
+    fn disk_backend_round_trips_and_evicts() {
+        let dir = tempfile::tempdir().unwrap();
+        // piece_length 8, chunk_length 4, budget 8 bytes -> holds 1 piece (2 chunks).
+        let mut s = PieceStore::new_disk(8, 4, 8, dir.path().join("ih")).unwrap();
+        s.put_chunk_with_header(10, 0, [7u8; 8], &[1, 2, 3, 4]);
+        s.put_chunk(10, 1, &[5, 6, 7, 8]);
+        assert_eq!(s.chunk(10, 0).as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(s.chunk(10, 1).as_deref(), Some(&[5, 6, 7, 8][..]));
+        assert_eq!(s.piece_header(10), Some([7u8; 8]));
+        assert!(s.has_piece(10));
+        assert_eq!(s.have_pieces(), vec![10]);
+        assert_eq!(s.window(), Some((10, 10)));
+        assert!(dir.path().join("ih/10.piece").exists());
+
+        // Writing a second piece exceeds the 8-byte budget -> evict piece 10 (lowest).
+        s.put_chunk(11, 0, &[9, 9, 9, 9]);
+        assert!(!s.has_piece(10), "lowest piece evicted");
+        assert_eq!(s.chunk(10, 0).as_deref(), None, "evicted chunk unreadable");
+        assert!(
+            !dir.path().join("ih/10.piece").exists(),
+            "evicted file deleted"
+        );
+        assert!(dir.path().join("ih/11.piece").exists());
+    }
+
+    #[test]
+    fn disk_backend_wipes_stale_dir_on_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("ih");
+        // A prior run left a piece file behind.
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("99.piece"), b"stale").unwrap();
+
+        let s = PieceStore::new_disk(8, 4, 1024, cache.clone()).unwrap();
+        assert!(!cache.join("99.piece").exists(), "stale file wiped");
+        assert_eq!(s.window(), None, "index starts empty");
+    }
+
+    #[test]
+    fn disk_backend_fails_fast_on_unwritable_dir() {
+        // A path *under a file* (not a directory) cannot be created.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let bad = tmp.path().join("cannot/exist");
+        assert!(PieceStore::new_disk(8, 4, 8, bad).is_err());
+    }
+
+    #[test]
+    fn disk_backend_replacing_a_chunk_does_not_double_count_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PieceStore::new_disk(8, 4, 8, dir.path().join("ih")).unwrap();
+        s.put_chunk(1, 0, &[0; 4]);
+        s.put_chunk(1, 0, &[9; 4]); // replace, not add
+        s.put_chunk(1, 1, &[0; 4]);
+        // Still one piece (1) with two chunks = 8 bytes, nothing evicted.
+        assert_eq!(s.chunk(1, 0).as_deref(), Some(&[9, 9, 9, 9][..]));
+        assert!(s.has_piece(1));
+    }
+
+    #[test]
+    fn with_backend_disk_matches_memory_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PieceStore::with_backend(
+            8,
+            4,
+            1024,
+            BackendKind::Disk {
+                dir: dir.path().join("ih"),
+            },
+        )
+        .unwrap();
+        s.put_chunk(3, 0, &[1, 2, 3, 4]);
+        assert_eq!(s.chunk(3, 0).as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert!(!s.has_piece(3), "partial piece (1 of 2 chunks) not complete");
     }
 }

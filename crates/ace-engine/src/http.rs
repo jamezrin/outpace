@@ -1219,7 +1219,7 @@ mod tests {
         let chunks_per_piece = guard.chunks_per_piece();
         let mut piece_bytes = Vec::with_capacity(PIECE_LENGTH as usize);
         for c in 0..chunks_per_piece {
-            piece_bytes.extend_from_slice(guard.chunk(0, c).unwrap());
+            piece_bytes.extend_from_slice(&guard.chunk(0, c).unwrap());
         }
         drop(guard);
 

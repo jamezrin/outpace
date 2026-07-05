@@ -18,3 +18,4 @@ ace-media = { path = "../ace-media" }
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
+tempfile = "3"
