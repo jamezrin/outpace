@@ -5,6 +5,19 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+/// Where the seed store (`PieceStore`) keeps piece data. Mirrors Acestream's
+/// `--live-cache-type`. The disk backend trades RAM for capacity; both honor the same
+/// `seed_store_bytes` budget.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheType {
+    /// Keep piece data in RAM (default).
+    #[default]
+    Memory,
+    /// Spill piece data to disk under `cache_dir`.
+    Disk,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -21,6 +34,11 @@ pub struct Config {
     pub peer_listen: SocketAddr,
     /// Bytes of recently-seen piece data retained per active peer connection for reseeding.
     pub seed_store_bytes: u64,
+    /// Backend the seed store uses for piece data (`memory` | `disk`).
+    pub cache_type: CacheType,
+    /// Root directory for disk-mode piece files (one subdirectory per infohash). Only used when
+    /// `cache_type` is `Disk`. Defaults to `<data_dir>/cache`.
+    pub cache_dir: PathBuf,
     /// Pieces behind the live edge to start at, giving an immediate playback cushion.
     pub prefetch_pieces: u64,
     /// Depth of the per-session fan-out broadcast channel (messages buffered per client).
@@ -53,6 +71,7 @@ impl Default for Config {
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("outpace");
+        let cache_dir = data_dir.join("cache");
         Config {
             bind: "127.0.0.1:6878".parse().unwrap(),
             rtmp_bind: "127.0.0.1:1935".parse().unwrap(),
@@ -60,6 +79,8 @@ impl Default for Config {
             networks: vec!["ace".into()],
             peer_listen: "0.0.0.0:8621".parse().unwrap(),
             seed_store_bytes: 128 * 1024 * 1024,
+            cache_type: CacheType::Memory,
+            cache_dir,
             prefetch_pieces: 8,
             session_buffer: 256,
             max_unchoked: 8,
@@ -150,5 +171,12 @@ mod tests {
             !c.experimental_ace_compat,
             "Acestream HTTP compatibility must be opt-in"
         );
+    }
+
+    #[test]
+    fn default_cache_is_memory_under_data_dir() {
+        let c = Config::default();
+        assert_eq!(c.cache_type, CacheType::Memory);
+        assert_eq!(c.cache_dir, c.data_dir.join("cache"));
     }
 }

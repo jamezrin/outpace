@@ -2,7 +2,7 @@
 
 use crate::ace_provider::AceProvider;
 use crate::broadcast::{Broadcast, BroadcastRegistry};
-use crate::config::{load_or_create_identity, Config};
+use crate::config::{load_or_create_identity, CacheType, Config};
 use crate::http::{router, AppState, BroadcastState};
 use crate::manager::StreamManager;
 use crate::provider::ProviderRegistry;
@@ -48,6 +48,16 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     }
     if let Ok(v) = std::env::var("OUTPACE_SEED_STORE_BYTES") {
         config.seed_store_bytes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_CACHE_TYPE") {
+        config.cache_type = match v.as_str() {
+            "memory" => CacheType::Memory,
+            "disk" => CacheType::Disk,
+            other => return Err(format!("invalid OUTPACE_CACHE_TYPE: {other}").into()),
+        };
+    }
+    if let Ok(v) = std::env::var("OUTPACE_CACHE_DIR") {
+        config.cache_dir = v.into();
     }
     if let Ok(v) = std::env::var("OUTPACE_PREFETCH_PIECES") {
         config.prefetch_pieces = v.parse()?;
@@ -370,6 +380,27 @@ mod tests {
         let err = config_from_env().err();
         std::env::remove_var("OUTPACE_SESSION_BUFFER");
         assert!(err.is_some(), "session_buffer=0 must be rejected");
+    }
+
+    #[test]
+    fn parses_cache_type_and_dir() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_CACHE_TYPE", "disk");
+        std::env::set_var("OUTPACE_CACHE_DIR", "/tmp/outpace-cache-test");
+        let c = config_from_env().unwrap();
+        assert_eq!(c.cache_type, CacheType::Disk);
+        assert_eq!(c.cache_dir, std::path::PathBuf::from("/tmp/outpace-cache-test"));
+        std::env::remove_var("OUTPACE_CACHE_TYPE");
+        std::env::remove_var("OUTPACE_CACHE_DIR");
+    }
+
+    #[test]
+    fn rejects_invalid_cache_type() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_CACHE_TYPE", "nvme");
+        let err = config_from_env().err();
+        std::env::remove_var("OUTPACE_CACHE_TYPE");
+        assert!(err.is_some(), "unknown cache type must be rejected");
     }
 
     #[tokio::test]
