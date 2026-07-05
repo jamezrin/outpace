@@ -16,8 +16,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Networks (providers) to enable.
     pub networks: Vec<String>,
-    /// Address the peer-protocol listener binds to (inbound seeding). Not yet started by
-    /// default — see `enable_inbound`.
+    /// Address the peer-protocol listener binds to (inbound seeding). Started by default —
+    /// see `enable_inbound`.
     pub peer_listen: SocketAddr,
     /// Bytes of recently-seen piece data retained per active peer connection for reseeding.
     pub seed_store_bytes: u64,
@@ -35,9 +35,12 @@ pub struct Config {
     /// Reciprocal upload over connections we initiate (S1): answering a peer's
     /// `Interested`/chunk-requests and advertising `Have` for newly-completed pieces.
     pub enable_seeding: bool,
-    /// Accept inbound peer connections and seed them (S2). Defaults OFF so operators do not
-    /// expose a peer listener unless they opt in, even though the live piece-header acceptance
-    /// gap is closed (note 33).
+    /// Accept inbound peer connections and seed them (S2). Defaults ON to match how the
+    /// original Acestream engine behaves out of the box — a full P2P participant that binds
+    /// its peer port, accepts inbound peers, seeds, and self-announces to trackers + DHT. The
+    /// live piece-header acceptance gap is closed (note 33). Only the HTTP API `bind` stays on
+    /// localhost by default; the exposed listener is the peer port (`peer_listen`), as with
+    /// Acestream. Set `OUTPACE_ENABLE_INBOUND=0` for a pure-leecher deployment.
     pub enable_inbound: bool,
     /// Expose Acestream-engine-compatible HTTP routes (`/ace/*`, `/server/api`). This is an
     /// experimental legacy adapter; outpace's native `/streams` and `/broadcast` API is the
@@ -62,7 +65,7 @@ impl Default for Config {
             max_unchoked: 8,
             max_inbound_peers: 64,
             enable_seeding: true,
-            enable_inbound: false,
+            enable_inbound: true,
             experimental_ace_compat: false,
         }
     }
@@ -130,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn default_config_has_seeding_on_and_inbound_off() {
+    fn default_config_has_seeding_and_inbound_on() {
         let c = Config::default();
         assert_eq!(c.peer_listen.port(), 8621);
         assert_eq!(c.seed_store_bytes, 128 * 1024 * 1024);
@@ -140,8 +143,8 @@ mod tests {
         assert_eq!(c.max_inbound_peers, 64);
         assert!(c.enable_seeding);
         assert!(
-            !c.enable_inbound,
-            "inbound serving remains opt-in by default"
+            c.enable_inbound,
+            "inbound serving is on by default, matching the Acestream engine"
         );
         assert!(
             !c.experimental_ace_compat,

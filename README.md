@@ -95,8 +95,10 @@ Environment variables parsed by the daemon include:
   must be at least `1`.
 - `OUTPACE_MAX_UNCHOKED` - accepted config knob for future multi-peer S2 policy.
 - `OUTPACE_MAX_INBOUND` - inbound peer connection limit.
-- `OUTPACE_ENABLE_SEEDING` - reciprocal upload/self-announce gate.
-- `OUTPACE_ENABLE_INBOUND` - inbound peer listener gate; off by default.
+- `OUTPACE_ENABLE_SEEDING` - reciprocal upload gate over outbound leech connections
+  (answering peers' chunk requests). Self-announce is gated on `OUTPACE_ENABLE_INBOUND`.
+- `OUTPACE_ENABLE_INBOUND` - inbound peer listener gate; on by default (matching
+  the Acestream engine's full P2P participation). Set `0` for a pure leecher.
 - `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - enables legacy compatibility routes.
 - `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
 

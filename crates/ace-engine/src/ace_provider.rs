@@ -122,7 +122,16 @@ struct SeedConfig {
 
 pub struct AceProvider {
     identity: Arc<Identity>,
-    port: u16,
+    /// The local peer-listener port (`config.peer_listen.port()`) — our designated AceStream
+    /// peer endpoint, never the HTTP API port. This is what we send on tracker/DHT
+    /// **discovery** announces (finding peers to leech from also registers us as a peer). The
+    /// seeder self-announce advertises `announce_peer_port` instead, not this field.
+    peer_port: u16,
+    /// External inbound endpoint to advertise as a dial-able seeder on the periodic tracker +
+    /// DHT self-announce. `None` when inbound seeding is disabled — we run no listener, so we
+    /// must not invite peers to dial us (mirrors `BroadcastState::inbound_peer_port`). `Some`
+    /// is the local `peer_port` today, or the mapped external port once #20 lands.
+    announce_peer_port: Option<u16>,
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
     resolve_cache: ResolveCache,
@@ -133,10 +142,15 @@ pub struct AceProvider {
 }
 
 impl AceProvider {
-    pub fn new(identity: Arc<Identity>, port: u16) -> Self {
+    /// `peer_port` is the local AceStream peer-listener port (`config.peer_listen.port()`),
+    /// used for discovery announces. Self-announcing as a dial-able seeder is opt-in via
+    /// [`with_inbound_announce_port`](Self::with_inbound_announce_port); by default we do not
+    /// advertise an inbound endpoint (a pure leecher / one-shot CLI play has no listener).
+    pub fn new(identity: Arc<Identity>, peer_port: u16) -> Self {
         AceProvider {
             identity,
-            port,
+            peer_port,
+            announce_peer_port: None,
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_peers: Vec::new(),
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
@@ -145,6 +159,24 @@ impl AceProvider {
             prefetch_pieces: PREFETCH_PIECES,
             enable_seeding: true,
         }
+    }
+
+    /// Set the external inbound endpoint advertised by the periodic seeder self-announce so
+    /// tracker + DHT (and, by the same token, peers that discover us) all learn the same
+    /// dial-able port. Pass `config.enable_inbound.then_some(config.peer_listen.port())` — the
+    /// same resolved value threaded into `BroadcastState::inbound_peer_port`, so the leech and
+    /// broadcast paths advertise the identical endpoint (the mapped external port once #20
+    /// lands). `None` disables the self-announce entirely.
+    pub fn with_inbound_announce_port(mut self, port: Option<u16>) -> Self {
+        self.announce_peer_port = port;
+        self
+    }
+
+    /// Port to advertise on the periodic seeder self-announce, or `None` to not announce at
+    /// all. This is always the peer endpoint (`peer_port`/external), **never** the HTTP API
+    /// port, and is `None` without an inbound listener to back it.
+    fn seeder_announce_port(&self) -> Option<u16> {
+        self.announce_peer_port
     }
 
     /// Trackers used for a bare infohash (which carries none); transport files supply their
@@ -186,7 +218,9 @@ impl AceProvider {
 
     /// Enable/disable reciprocal serving over outbound (leecher) connections — answering a
     /// peer's `Interested`/chunk-requests and advertising `Have` for newly-completed pieces.
-    /// Defaults to `true` (S1 behavior). Setting `false` makes this provider a pure leecher.
+    /// Defaults to `true` (S1 behavior). Setting `false` stops reciprocal serving on these
+    /// outbound connections; it does not gate the inbound peer listener or the seeder
+    /// self-announce (both keyed on `enable_inbound`).
     pub fn with_seeding_enabled(mut self, enabled: bool) -> Self {
         self.enable_seeding = enabled;
         self
@@ -213,7 +247,7 @@ impl AceProvider {
         }
 
         let all = if self.bootstrap_peers.is_empty() {
-            discover_peers(&self.default_trackers, &key, &random_peer_id(), self.port).await
+            discover_peers(&self.default_trackers, &key, &random_peer_id(), self.peer_port).await
         } else {
             self.bootstrap_peers.clone()
         };
@@ -296,7 +330,7 @@ impl StreamProvider for AceProvider {
         // Bootstrap peers are the proven/direct path and must be tried without waiting for
         // tracker/DHT discovery. Background refill can still discover more peers after start.
         let peers = if self.bootstrap_peers.is_empty() {
-            discover_peers(&info.trackers, &info.infohash, &random_peer_id(), self.port).await
+            discover_peers(&info.trackers, &info.infohash, &random_peer_id(), self.peer_port).await
         } else {
             self.bootstrap_peers.clone()
         };
@@ -324,16 +358,15 @@ impl StreamProvider for AceProvider {
             prefetch_pieces: self.prefetch_pieces,
         };
         let announce_info = info.clone();
-        let announce_port = self.port;
-        let discovery_port = self.port;
-        let announce_enabled = self.enable_seeding;
+        let announce_port = self.seeder_announce_port();
+        let discovery_port = self.peer_port;
         tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
             // whichever ends first (normally `follow_live`, when the consumer drops) tears
             // down the other — no separate lifecycle to manage.
             tokio::select! {
                 _ = follow_live(info, peers, identity, tx, stats_peers, downloaded, uploaded, peers_served, seed, discovery_port) => {},
-                _ = announce_seeder_periodically(announce_info, announce_port, announce_enabled) => {},
+                _ = announce_seeder_periodically(announce_info, announce_port) => {},
             }
         });
         Ok(Box::new(AceSource {
@@ -349,13 +382,14 @@ impl StreamProvider for AceProvider {
 /// Periodically re-announce this infohash as a seeder (`left=0`, event=Completed) to its
 /// trackers, so outpace becomes organically discoverable to peers looking for this stream
 /// while we're serving it; see `docs/protocol/notes/24-seeder-self-announce.md`.
-/// A no-op loop (never
-/// announces) when `enabled` is false, matching the S1 `enable_seeding` gate: we shouldn't
-/// advertise ourselves as a seeder if we've deliberately disabled serving.
-async fn announce_seeder_periodically(info: StreamInfo, port: u16, enabled: bool) {
-    if !enabled {
+/// A no-op loop (never announces) when `port` is `None` — i.e. no inbound listener backs an
+/// advertisable endpoint (`enable_inbound` off, or a one-shot CLI leech): we must not invite
+/// peers to dial a port nobody is serving on. The advertised `port` is always the peer
+/// endpoint, never the HTTP API port (issue #21).
+async fn announce_seeder_periodically(info: StreamInfo, port: Option<u16>) {
+    let Some(port) = port else {
         return std::future::pending().await;
-    }
+    };
     announce_infohash_periodically(info.trackers, info.infohash, port).await
 }
 
@@ -2461,15 +2495,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeder_announce_never_fires_when_seeding_disabled() {
-        // enabled=false must never even attempt a tracker announce (which would otherwise
-        // misrepresent us as a seeder while we've deliberately disabled serving).
+    async fn seeder_announce_never_fires_without_an_inbound_port() {
+        // `None` (no inbound listener to back an advertisable endpoint) must never even attempt
+        // a tracker announce, which would otherwise invite peers to dial a port nobody serves.
         let res = tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            announce_seeder_periodically(info(), 6878, false),
+            announce_seeder_periodically(info(), None),
         )
         .await;
-        assert!(res.is_err(), "must never resolve when seeding is disabled");
+        assert!(res.is_err(), "must never resolve without an inbound port");
+    }
+
+    #[test]
+    fn leech_self_announce_uses_the_peer_port_never_the_http_port() {
+        // Regression for #21: a leeching provider configured the way `build_runtime` wires it
+        // (peer_listen 8621, HTTP/bind 6878, inbound enabled) must advertise the PEER port on
+        // its seeder self-announce — dialing the HTTP port would speak the wrong protocol.
+        const PEER_PORT: u16 = 8621;
+        const HTTP_PORT: u16 = 6878;
+        let p = AceProvider::new(Arc::new(Identity::generate()), PEER_PORT)
+            .with_inbound_announce_port(Some(PEER_PORT));
+        assert_eq!(p.seeder_announce_port(), Some(PEER_PORT));
+        assert_ne!(
+            p.seeder_announce_port(),
+            Some(HTTP_PORT),
+            "must never advertise the HTTP API port"
+        );
+        // Discovery announces (which also register us as a peer) likewise use the peer port.
+        assert_eq!(p.peer_port, PEER_PORT);
+
+        // Without an inbound listener (the default, and `enable_inbound = false`), we advertise
+        // no dial-able endpoint at all — matching the broadcast path's `inbound_peer_port`.
+        let leech_only = AceProvider::new(Arc::new(Identity::generate()), PEER_PORT);
+        assert_eq!(leech_only.seeder_announce_port(), None);
     }
 
     #[test]

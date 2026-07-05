@@ -13,6 +13,9 @@ engine; see the v2 compliance design and issue #4 for remaining productization w
    the other, so there's no separate lifecycle to manage. Gated by `enable_seeding` (if
    disabled, the announce future is `std::future::pending()` — never fires, since we shouldn't
    claim to be a seeder while deliberately not serving).
+   **Superseded by note 52:** the self-announce now advertises the *peer* port (not the HTTP
+   API port) and is gated on having an inbound listener (`enable_inbound`) rather than on
+   `enable_seeding`.
 
 2. **DHT `announce_peer` (BEP-5) implemented — this didn't exist at all before.**
    `ace_swarm::dht` only ever implemented `get_peers` (the read half of the DHT). Real

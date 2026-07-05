@@ -133,13 +133,19 @@ pub async fn build_runtime(
     // Register enabled providers. Only "ace" exists today; the registry is the path for more.
     let seed_registry = ace_swarm::listen::SeedRegistry::new();
     let mut registry = ProviderRegistry::new();
+    // The single resolved external inbound endpoint. Advertise the *peer* port, never the HTTP
+    // API port (issue #21); `None` when inbound serving is off (no listener to back it). Both
+    // the leech/seeder self-announce and `broadcasts.inbound_peer_port` are threaded from this
+    // one value so tracker + DHT + PEX advertise one identical endpoint.
+    let inbound_peer_port = config.enable_inbound.then_some(config.peer_listen.port());
     if config.networks.iter().any(|n| n == "ace") {
-        let provider = AceProvider::new(identity.clone(), config.bind.port())
+        let provider = AceProvider::new(identity.clone(), config.peer_listen.port())
             .with_bootstrap_peers(bootstrap_peers)
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
             .with_prefetch_pieces(config.prefetch_pieces)
-            .with_seeding_enabled(config.enable_seeding);
+            .with_seeding_enabled(config.enable_seeding)
+            .with_inbound_announce_port(inbound_peer_port);
         registry.register(Arc::new(provider));
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
@@ -154,7 +160,7 @@ pub async fn build_runtime(
             .map(|s| s.to_string())
             .collect(),
         store_bytes: config.seed_store_bytes,
-        inbound_peer_port: config.enable_inbound.then_some(config.peer_listen.port()),
+        inbound_peer_port,
     };
 
     // Reload any broadcasts persisted by a previous run so their identity/infohash survives
@@ -207,9 +213,10 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         broadcasts: Some(broadcasts),
     };
 
-    // Inbound seeding (S2): OFF by default so operators do not expose a peer listener unless
-    // they opt in. Piece headers are now preserved/generated and official-consumer piece
-    // acceptance is live-proven (note 33).
+    // Inbound seeding (S2): ON by default, matching the Acestream engine's out-of-the-box
+    // behavior as a full P2P participant (bind the peer port, accept inbound peers, seed,
+    // self-announce). Piece headers are preserved/generated and official-consumer piece
+    // acceptance is live-proven (note 33). Opt out with `OUTPACE_ENABLE_INBOUND=0`.
     if config.enable_inbound {
         let peer_listener = tokio::net::TcpListener::bind(config.peer_listen).await?;
         eprintln!(
@@ -386,9 +393,12 @@ mod tests {
         };
 
         // A fresh daemon start over the same data_dir must reload it and serve it.
+        // `enable_inbound` off keeps the reload path offline — this test covers reload+serve,
+        // not the (network) self-announce that a reloaded broadcast would otherwise spawn.
         let config = Config {
             data_dir: data_dir.clone(),
             networks: vec![],
+            enable_inbound: false,
             ..Config::default()
         };
         let runtime = build_runtime(config, vec![]).await.unwrap();

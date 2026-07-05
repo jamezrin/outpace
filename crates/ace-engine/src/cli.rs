@@ -175,7 +175,9 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let identity = std::sync::Arc::new(crate::config::load_or_create_identity(&config.data_dir)?);
     let seed_registry = ace_swarm::listen::SeedRegistry::new();
-    let provider = crate::ace_provider::AceProvider::new(identity, config.bind.port())
+    // One-shot leech to stdout: it runs no inbound listener, so it discovers on the peer port
+    // (never the HTTP port — issue #21) and does not self-announce as a dial-able seeder.
+    let provider = crate::ace_provider::AceProvider::new(identity, config.peer_listen.port())
         .with_bootstrap_peers(peers)
         .with_seed_registry(seed_registry)
         .with_seed_store_bytes(config.seed_store_bytes)
