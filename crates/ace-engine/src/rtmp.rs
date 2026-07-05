@@ -91,10 +91,10 @@ impl RtmpHandler for RtmpIngestHandler {
             )
             .await;
         if freshly_minted {
-            announce_broadcast(&self.broadcasts, &bc);
+            self.broadcasts.spawn_announce(&bc);
         }
 
-        let ingest = BroadcastIngest::new(bc.store.clone(), bc.auth.clone());
+        let ingest = BroadcastIngest::new(bc.store.clone(), bc.auth.clone(), bc.cursor.clone());
         self.streams.lock().unwrap().insert(
             name.to_string(),
             RtmpStreamIngest {
@@ -124,22 +124,6 @@ impl RtmpHandler for RtmpIngestHandler {
 
     fn media_delivery_mode(&self) -> MediaDeliveryMode {
         MediaDeliveryMode::ParsedFrames
-    }
-}
-
-fn announce_broadcast(bs: &BroadcastState, bc: &crate::broadcast::Broadcast) {
-    if let Some(port) = bs.inbound_peer_port {
-        let trackers = bs.trackers.clone();
-        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
-            trackers.clone(),
-            bc.infohash,
-            port,
-        ));
-        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
-            trackers,
-            bc.content_id,
-            port,
-        ));
     }
 }
 

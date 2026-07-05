@@ -46,13 +46,13 @@ RSA private key). Mirrors `config.rs::load_or_create_identity` / `write_private`
 
 ```json
 {
-  "transport_b64": "<base64 of the minted transport bytes>",
+  "transport_hex": "<hex of the minted transport bytes>",
   "key_pkcs1_pem": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n",
   "next_piece": 51234
 }
 ```
 
-- `transport_b64` is the **identity source of truth**. infohash (`infohash_of_transport`),
+- `transport_hex` is the **identity source of truth**. infohash (`infohash_of_transport`),
   content_id (`transport_file_hash`), and geometry (`piece_length`/`chunk_length` via
   `decode_transport`) are all re-derived from it on load — no re-minting, so the infohash can
   never drift from a future `build_descriptor` change.
@@ -61,8 +61,9 @@ RSA private key). Mirrors `config.rs::load_or_create_identity` / `write_private`
   a mismatch marks the record invalid.
 - `next_piece` is the last-persisted piece cursor (see Continuity).
 
-`serde` + `serde_json` are already engine dependencies; `base64` is added (small, widely used)
-for the transport bytes.
+`serde` + `serde_json` are already engine dependencies. The transport bytes are stored as
+lowercase hex via small local helpers (no new dependency — the project deliberately hand-rolls
+hex rather than pulling in a crate).
 
 ### Name validation (path-traversal safety)
 
@@ -116,8 +117,10 @@ impl BroadcastPersist {
 }
 ```
 
-`load_all` reads every `*.json`, deserializes, and validates (pubkey match, decodable
-transport); an invalid or unreadable file is logged and skipped, never aborting startup.
+`load_all` reads every `*.json` and deserializes (JSON + hex); a file that fails to
+read/parse is logged and skipped, never aborting startup. Semantic validation (transport
+decodes, embedded pubkey matches the key) happens in the registry reload, keeping this module
+free of `ace_wire` knowledge.
 
 ### `broadcast.rs` (`BroadcastRegistry`, `Broadcast`)
 
@@ -229,4 +232,3 @@ geometry constants.
 - `crates/ace-engine/src/http.rs` — DELETE route/handler, name validation, cursor wiring.
 - `crates/ace-engine/src/runtime.rs` — `with_persist`, startup reload, shared announce helper.
 - `crates/ace-engine/src/rtmp.rs` — use the shared announce helper; pass the cursor through.
-- `crates/ace-engine/Cargo.toml` — add `base64`.

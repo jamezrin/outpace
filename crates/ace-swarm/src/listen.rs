@@ -87,6 +87,12 @@ impl SeedRegistry {
     pub fn serves(&self, infohash: &[u8; 20]) -> bool {
         self.stores.lock().unwrap().contains_key(infohash)
     }
+
+    /// Stop serving `key` (an infohash or a metadata content_id): drops both the piece store
+    /// and any registered metadata under it. Idempotent — removing an absent key is a no-op.
+    pub fn remove(&self, key: &[u8; 20]) {
+        self.stores.lock().unwrap().remove(key);
+    }
 }
 
 /// Accepts inbound peer connections, verifies the requested infohash against `registry`, and
@@ -209,5 +215,23 @@ mod tests {
         assert!(reg.serves(&key));
         assert_eq!(&*reg.metadata(&key).unwrap(), &[1, 2, 3, 4]);
         assert!(reg.get(&key).is_none());
+    }
+
+    #[test]
+    fn remove_drops_both_store_and_metadata_and_is_idempotent() {
+        let reg = SeedRegistry::new();
+        let key = [7u8; 20];
+        reg.get_or_create(key, || PieceStore::new(4, 4, 1024));
+        reg.register_metadata(key, vec![1, 2, 3, 4]);
+        assert!(reg.serves(&key));
+
+        reg.remove(&key);
+        assert!(!reg.serves(&key), "removed key is no longer served");
+        assert!(reg.get(&key).is_none());
+        assert!(reg.metadata(&key).is_none());
+
+        // Removing an absent key is a no-op.
+        reg.remove(&key);
+        assert!(!reg.serves(&key));
     }
 }

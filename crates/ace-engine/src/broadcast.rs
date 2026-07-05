@@ -12,13 +12,15 @@
 //! PKCS1-v1_5 over SHA1 of the piece payload, signature embedded as the piece's trailing
 //! bytes) using the broadcast's own `LiveSourceAuth` identity — not a placeholder.
 
+use crate::broadcast_persist::{BroadcastPersist, PersistedBroadcast};
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::store::PieceStore;
 use ace_wire::bencode::Bencode;
-use ace_wire::infohash::{infohash_of_descriptor, transport_file_hash};
+use ace_wire::infohash::{infohash_of_descriptor, infohash_of_transport, transport_file_hash};
 use ace_wire::live_auth::LiveSourceAuth;
-use ace_wire::transport::encode_transport;
+use ace_wire::transport::{decode_transport, encode_transport};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -27,6 +29,93 @@ use tokio::sync::Mutex;
 pub const PIECE_LENGTH: u64 = 65_536;
 pub const CHUNK_LENGTH: u64 = 16_384;
 pub const DEFAULT_BROADCAST_BITRATE: i64 = 8375;
+
+/// How often (in pieces produced) the ingest cursor is flushed to disk during a live ingest.
+/// On a daemon restart we resume at `persisted_next_piece + CURSOR_PERSIST_INTERVAL`, which
+/// guarantees a piece number is never reused (reuse corrupts followers) at the cost of a
+/// ≤`CURSOR_PERSIST_INTERVAL`-piece forward gap that the consumer's skip-evicted-gap path
+/// already tolerates. 128 pieces ≈ 8 MiB ≈ ~8 s at the 8375 kbps default. See note 25's
+/// `.restart` file, whose semantics this mirrors.
+pub const CURSOR_PERSIST_INTERVAL: u64 = 128;
+
+/// Immutable record parts a cursor needs to rewrite its broadcast's on-disk record when it
+/// flushes a new `next_piece`.
+struct CursorSink {
+    persist: BroadcastPersist,
+    name: String,
+    transport: Vec<u8>,
+    key_pkcs1_pem: String,
+}
+
+/// Tracks a broadcast's next piece index for ingest-resume continuity, and (when persistence
+/// is enabled) throttle-persists it so numbering survives a daemon restart. Shared between the
+/// registry's `Broadcast` and each `BroadcastIngest` task via `Arc`.
+pub struct BroadcastCursor {
+    next: AtomicU64,
+    last_persisted: AtomicU64,
+    removed: AtomicBool,
+    sink: Option<CursorSink>,
+}
+
+impl BroadcastCursor {
+    fn new(start: u64, sink: Option<CursorSink>) -> Arc<Self> {
+        Arc::new(BroadcastCursor {
+            next: AtomicU64::new(start),
+            last_persisted: AtomicU64::new(start),
+            removed: AtomicBool::new(false),
+            sink,
+        })
+    }
+
+    /// A cursor with no persistence sink — continuity tracking only (tests).
+    #[cfg(test)]
+    pub(crate) fn detached(start: u64) -> Arc<Self> {
+        Self::new(start, None)
+    }
+
+    /// The piece index a new ingest's chunker should start from.
+    pub fn start_piece(&self) -> u64 {
+        self.next.load(Ordering::SeqCst)
+    }
+
+    /// Record that pieces up to (but not including) `next_piece` now exist. Monotonic — an
+    /// out-of-order lower value is ignored. Persists to disk once the cursor has advanced at
+    /// least `CURSOR_PERSIST_INTERVAL` past the last flush.
+    pub fn advance_to(&self, next_piece: u64) {
+        let prev = self.next.fetch_max(next_piece, Ordering::SeqCst);
+        let now = prev.max(next_piece);
+        if now >= self.last_persisted.load(Ordering::SeqCst) + CURSOR_PERSIST_INTERVAL {
+            self.persist(now);
+        }
+    }
+
+    /// Force-persist the current cursor (called when an ingest finishes).
+    pub fn flush(&self) {
+        self.persist(self.next.load(Ordering::SeqCst));
+    }
+
+    /// Stop persisting — a deleted broadcast must not have its file resurrected by a stale
+    /// in-flight ingest's later flush.
+    pub fn mark_removed(&self) {
+        self.removed.store(true, Ordering::SeqCst);
+    }
+
+    fn persist(&self, next_piece: u64) {
+        if self.removed.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(sink) = &self.sink else { return };
+        self.last_persisted.store(next_piece, Ordering::SeqCst);
+        let rec = PersistedBroadcast {
+            transport: sink.transport.clone(),
+            key_pkcs1_pem: sink.key_pkcs1_pem.clone(),
+            next_piece,
+        };
+        if let Err(e) = sink.persist.save(&sink.name, &rec) {
+            crate::alog!("[broadcast] {}: cursor persist failed: {e}", sink.name);
+        }
+    }
+}
 
 /// A minted, originated broadcast: its infohash, the transport file bytes (for persistence /
 /// future `ut_metadata` serving), the shared piece store peers are served from, and the
@@ -38,6 +127,8 @@ pub struct Broadcast {
     pub transport_bytes: Arc<Vec<u8>>,
     pub store: Arc<Mutex<PieceStore>>,
     pub auth: Arc<LiveSourceAuth>,
+    /// Piece-numbering cursor for ingest-resume continuity (and its throttled persistence).
+    pub cursor: Arc<BroadcastCursor>,
 }
 
 /// Maps a human `{name}` (the ingest path segment) to its minted `Broadcast`. Separate from
@@ -45,12 +136,26 @@ pub struct Broadcast {
 /// operator-facing name -> infohash lookup.
 pub struct BroadcastRegistry {
     by_name: Mutex<BTreeMap<String, Broadcast>>,
+    /// `None` disables persistence (unit tests / disk-less runs); `Some` reads and writes
+    /// `<data_dir>/broadcasts/`.
+    persist: Option<BroadcastPersist>,
 }
 
 impl BroadcastRegistry {
+    /// A disk-less registry: minted broadcasts live only in memory (used by tests).
     pub fn new() -> Arc<Self> {
         Arc::new(BroadcastRegistry {
             by_name: Mutex::new(BTreeMap::new()),
+            persist: None,
+        })
+    }
+
+    /// A registry that persists minted broadcasts under `<data_dir>/broadcasts/` and reloads
+    /// them across restarts.
+    pub fn with_persist(data_dir: &std::path::Path) -> Arc<Self> {
+        Arc::new(BroadcastRegistry {
+            by_name: Mutex::new(BTreeMap::new()),
+            persist: Some(BroadcastPersist::new(data_dir)),
         })
     }
 
@@ -59,16 +164,14 @@ impl BroadcastRegistry {
         self.by_name.lock().await.get(name).cloned()
     }
 
-    /// Mint (or return the existing) broadcast for `name`: build + encode the transport
-    /// descriptor, compute its infohash, and register an empty `PieceStore` for it in the
-    /// shared `seed_registry` (making it immediately servable via S1/S2's existing serve
-    /// path). Idempotent per `name` for the life of this registry — re-`PUT`ting the same
-    /// name resumes the same broadcast rather than minting a new infohash each time.
+    /// Mint, resume-from-memory, or reload-from-disk the broadcast for `name`, and register its
+    /// `PieceStore` + metadata in the shared `seed_registry` (making it immediately servable via
+    /// S1/S2's existing serve path). Idempotent per `name`: a re-`PUT` resumes the same
+    /// broadcast (same infohash + continuing piece cursor) rather than minting a new one.
     ///
-    /// Returns `(broadcast, freshly_minted)` — the bool is `true` only the first time a
-    /// given `name` is minted, so a caller can do mint-only setup (like starting the
-    /// tracker/DHT self-announce loop) exactly once instead of re-triggering it on every
-    /// resumed `PUT`.
+    /// Returns `(broadcast, freshly_minted)` — the bool is `true` only when a brand-new
+    /// identity is minted (not on an in-memory resume or a disk reload), so a caller can do
+    /// mint-only setup (like starting the tracker/DHT self-announce loop) exactly once.
     pub async fn start_or_resume(
         &self,
         name: &str,
@@ -81,6 +184,17 @@ impl BroadcastRegistry {
         if let Some(existing) = map.get(name) {
             return (existing.clone(), false);
         }
+        // Reload a persisted identity before minting a fresh one, so the infohash survives a
+        // restart and the piece cursor continues.
+        if let Some(persist) = &self.persist {
+            if let Some(rec) = persist.load(name) {
+                if let Some(bc) = self.reconstruct(name, &rec, seed_registry, store_bytes) {
+                    map.insert(name.to_string(), bc.clone());
+                    return (bc, false);
+                }
+                crate::alog!("[broadcast] {name}: persisted record invalid; re-minting");
+            }
+        }
         let auth = LiveSourceAuth::generate();
         let descriptor = build_descriptor(name, title, trackers, &auth.pubkey_der());
         let infohash = infohash_of_descriptor(&descriptor)
@@ -91,15 +205,124 @@ impl BroadcastRegistry {
         let store = seed_registry.get_or_create(infohash, || {
             PieceStore::new(PIECE_LENGTH, CHUNK_LENGTH, store_bytes)
         });
+        // Persist the fresh identity (cursor at 0) before wiring the cursor's sink, so the
+        // record exists immediately (matching the engine writing `.acelive`/`.sauth` at mint).
+        let key_pem = auth.to_pkcs1_pem();
+        if let Some(persist) = &self.persist {
+            let rec = PersistedBroadcast {
+                transport: transport_bytes.clone(),
+                key_pkcs1_pem: key_pem.clone(),
+                next_piece: 0,
+            };
+            if let Err(e) = persist.save(name, &rec) {
+                crate::alog!("[broadcast] {name}: identity persist failed: {e}");
+            }
+        }
+        let cursor = BroadcastCursor::new(0, self.sink_for(name, &transport_bytes, key_pem));
         let broadcast = Broadcast {
             infohash,
             content_id,
             transport_bytes: Arc::new(transport_bytes),
             store,
             auth: Arc::new(auth),
+            cursor,
         };
         map.insert(name.to_string(), broadcast.clone());
         (broadcast, true)
+    }
+
+    /// Reload all persisted broadcasts into memory + `seed_registry` at daemon startup.
+    /// Returns the reconstructed broadcasts so the caller can restart their announce loops.
+    /// A no-op when persistence is disabled.
+    pub async fn reload_persisted(
+        &self,
+        seed_registry: &SeedRegistry,
+        store_bytes: u64,
+    ) -> Vec<Broadcast> {
+        let Some(persist) = &self.persist else {
+            return Vec::new();
+        };
+        let mut map = self.by_name.lock().await;
+        let mut out = Vec::new();
+        for (name, rec) in persist.load_all() {
+            if map.contains_key(&name) {
+                continue;
+            }
+            match self.reconstruct(&name, &rec, seed_registry, store_bytes) {
+                Some(bc) => {
+                    map.insert(name.clone(), bc.clone());
+                    out.push(bc);
+                }
+                None => crate::alog!("[broadcast] {name}: persisted record invalid; skipping"),
+            }
+        }
+        out
+    }
+
+    /// Forget `name`: drop it from memory (marking its cursor removed so a stale in-flight
+    /// ingest can't rewrite the file) and delete its persisted record. Returns the removed
+    /// broadcast so the caller can drop it from `seed_registry`.
+    pub async fn delete(&self, name: &str) -> Option<Broadcast> {
+        let removed = self.by_name.lock().await.remove(name);
+        if let Some(bc) = &removed {
+            bc.cursor.mark_removed();
+        }
+        if let Some(persist) = &self.persist {
+            if let Err(e) = persist.delete(name) {
+                crate::alog!("[broadcast] {name}: delete failed: {e}");
+            }
+        }
+        removed
+    }
+
+    /// Build a cursor persistence sink for `name`, or `None` when persistence is disabled.
+    fn sink_for(&self, name: &str, transport: &[u8], key_pkcs1_pem: String) -> Option<CursorSink> {
+        self.persist.clone().map(|persist| CursorSink {
+            persist,
+            name: name.to_string(),
+            transport: transport.to_vec(),
+            key_pkcs1_pem,
+        })
+    }
+
+    /// Rebuild a `Broadcast` from a persisted record: restore the signing key, re-derive
+    /// identity + geometry from the transport bytes, register the store + metadata, and seed
+    /// the cursor at `next_piece + CURSOR_PERSIST_INTERVAL` (the no-reuse resume margin).
+    /// Returns `None` if the record is semantically invalid (bad key, undecodable transport,
+    /// or a pubkey that does not match the key).
+    fn reconstruct(
+        &self,
+        name: &str,
+        rec: &PersistedBroadcast,
+        seed_registry: &SeedRegistry,
+        store_bytes: u64,
+    ) -> Option<Broadcast> {
+        let auth = LiveSourceAuth::from_pkcs1_pem(&rec.key_pkcs1_pem).ok()?;
+        let decoded = decode_transport(&rec.transport).ok()?;
+        if decoded.pubkey != auth.pubkey_der() {
+            return None;
+        }
+        let infohash = infohash_of_transport(&rec.transport);
+        let content_id = transport_file_hash(&rec.transport);
+        let piece_length = decoded.piece_length;
+        let chunk_length = decoded.chunk_length;
+        seed_registry.register_metadata(content_id, rec.transport.clone());
+        let store = seed_registry.get_or_create(infohash, || {
+            PieceStore::new(piece_length, chunk_length, store_bytes)
+        });
+        let resume_at = rec.next_piece.saturating_add(CURSOR_PERSIST_INTERVAL);
+        let cursor = BroadcastCursor::new(
+            resume_at,
+            self.sink_for(name, &rec.transport, rec.key_pkcs1_pem.clone()),
+        );
+        Some(Broadcast {
+            infohash,
+            content_id,
+            transport_bytes: Arc::new(rec.transport.clone()),
+            store,
+            auth: Arc::new(auth),
+            cursor,
+        })
     }
 }
 
@@ -142,11 +365,15 @@ fn build_descriptor(name: &str, title: &str, trackers: &[String], pubkey_der: &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ace_wire::infohash::infohash_of_transport;
-    use ace_wire::transport::decode_transport;
 
     fn registry() -> (Arc<BroadcastRegistry>, SeedRegistry) {
         (BroadcastRegistry::new(), SeedRegistry::new())
+    }
+
+    fn tmp_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("outpace-bc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[tokio::test]
@@ -258,5 +485,158 @@ mod tests {
         let (a, _) = reg.start_or_resume("a", "A", &[], &seed, 1 << 20).await;
         let (b, _) = reg.start_or_resume("b", "B", &[], &seed, 1 << 20).await;
         assert_ne!(a.infohash, b.infohash);
+    }
+
+    // ---- continuity cursor ----
+
+    #[test]
+    fn cursor_starts_at_its_seed_and_is_monotonic() {
+        let c = BroadcastCursor::new(100, None);
+        assert_eq!(c.start_piece(), 100);
+        c.advance_to(50); // out-of-order lower value ignored
+        assert_eq!(c.start_piece(), 100);
+        c.advance_to(150);
+        assert_eq!(c.start_piece(), 150);
+    }
+
+    #[tokio::test]
+    async fn cursor_persists_on_the_interval_and_on_flush() {
+        let dir = tmp_dir();
+        let seed = SeedRegistry::new();
+        let reg = BroadcastRegistry::with_persist(&dir);
+        let (bc, _) = reg.start_or_resume("c", "C", &[], &seed, 1 << 20).await;
+        let persist = BroadcastPersist::new(&dir);
+
+        // Freshly minted: cursor at 0 on disk.
+        assert_eq!(persist.load("c").unwrap().next_piece, 0);
+        // Advancing less than the interval does not rewrite the cursor.
+        bc.cursor.advance_to(CURSOR_PERSIST_INTERVAL - 1);
+        assert_eq!(persist.load("c").unwrap().next_piece, 0);
+        // Crossing the interval persists.
+        bc.cursor.advance_to(CURSOR_PERSIST_INTERVAL);
+        assert_eq!(
+            persist.load("c").unwrap().next_piece,
+            CURSOR_PERSIST_INTERVAL
+        );
+        // flush() persists the exact current value.
+        bc.cursor.advance_to(CURSOR_PERSIST_INTERVAL + 5);
+        bc.cursor.flush();
+        assert_eq!(
+            persist.load("c").unwrap().next_piece,
+            CURSOR_PERSIST_INTERVAL + 5
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- persistence across "restart" (fresh registry, same data_dir) ----
+
+    #[tokio::test]
+    async fn identity_survives_a_restart() {
+        let dir = tmp_dir();
+        let seed1 = SeedRegistry::new();
+        let reg1 = BroadcastRegistry::with_persist(&dir);
+        let (a, fresh1) = reg1
+            .start_or_resume("news", "News", &["udp://t:1/announce".into()], &seed1, 1 << 20)
+            .await;
+        assert!(fresh1, "first ever PUT mints");
+
+        // Simulate a daemon restart: brand-new registry + seed registry, same data_dir.
+        let seed2 = SeedRegistry::new();
+        let reg2 = BroadcastRegistry::with_persist(&dir);
+        let (b, fresh2) = reg2
+            .start_or_resume("news", "Ignored On Resume", &[], &seed2, 1 << 20)
+            .await;
+        assert!(!fresh2, "reloaded from disk, not a fresh mint");
+        assert_eq!(a.infohash, b.infohash, "infohash stable across restart");
+        assert_eq!(a.content_id, b.content_id);
+        assert_eq!(a.transport_bytes, b.transport_bytes);
+        assert_eq!(a.auth.pubkey_der(), b.auth.pubkey_der(), "same signing key");
+        assert!(seed2.serves(&b.infohash), "reloaded broadcast is servable");
+        assert!(seed2.serves(&b.content_id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cursor_resumes_with_the_no_reuse_margin_after_restart() {
+        let dir = tmp_dir();
+        let seed1 = SeedRegistry::new();
+        let reg1 = BroadcastRegistry::with_persist(&dir);
+        let (a, _) = reg1.start_or_resume("m", "M", &[], &seed1, 1 << 20).await;
+        a.cursor.advance_to(500);
+        a.cursor.flush();
+
+        let seed2 = SeedRegistry::new();
+        let reg2 = BroadcastRegistry::with_persist(&dir);
+        let (b, _) = reg2.start_or_resume("m", "M", &[], &seed2, 1 << 20).await;
+        assert_eq!(
+            b.cursor.start_piece(),
+            500 + CURSOR_PERSIST_INTERVAL,
+            "resume past the last persisted piece so numbers are never reused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- delete / reset ----
+
+    #[tokio::test]
+    async fn delete_then_put_re_mints_a_fresh_identity() {
+        let dir = tmp_dir();
+        let seed = SeedRegistry::new();
+        let reg = BroadcastRegistry::with_persist(&dir);
+        let (a, _) = reg.start_or_resume("x", "X", &[], &seed, 1 << 20).await;
+
+        let removed = reg.delete("x").await;
+        assert!(removed.is_some());
+        assert!(BroadcastPersist::new(&dir).load("x").is_none(), "file purged");
+
+        let (b, fresh) = reg.start_or_resume("x", "X", &[], &seed, 1 << 20).await;
+        assert!(fresh, "after delete, next PUT mints fresh");
+        assert_ne!(a.infohash, b.infohash, "fresh key -> different infohash");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn removed_cursor_does_not_resurrect_the_file() {
+        let dir = tmp_dir();
+        let seed = SeedRegistry::new();
+        let reg = BroadcastRegistry::with_persist(&dir);
+        let (a, _) = reg.start_or_resume("y", "Y", &[], &seed, 1 << 20).await;
+        reg.delete("y").await;
+        // A stale in-flight ingest's late flush must not recreate the record.
+        a.cursor.advance_to(1000);
+        a.cursor.flush();
+        assert!(BroadcastPersist::new(&dir).load("y").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- invalid persisted record ----
+
+    #[tokio::test]
+    async fn a_record_whose_pubkey_mismatches_the_key_is_rejected_and_re_minted() {
+        let dir = tmp_dir();
+        let seed = SeedRegistry::new();
+        // Mint one broadcast to get valid transport bytes...
+        let reg0 = BroadcastRegistry::with_persist(&dir);
+        let (a, _) = reg0.start_or_resume("bad", "Bad", &[], &seed, 1 << 20).await;
+        // ...then corrupt the record: keep the transport but swap in a different key.
+        let other = LiveSourceAuth::generate();
+        let persist = BroadcastPersist::new(&dir);
+        persist
+            .save(
+                "bad",
+                &PersistedBroadcast {
+                    transport: (*a.transport_bytes).clone(),
+                    key_pkcs1_pem: other.to_pkcs1_pem(),
+                    next_piece: 0,
+                },
+            )
+            .unwrap();
+
+        let seed2 = SeedRegistry::new();
+        let reg = BroadcastRegistry::with_persist(&dir);
+        let (b, fresh) = reg.start_or_resume("bad", "Bad", &[], &seed2, 1 << 20).await;
+        assert!(fresh, "an invalid record is discarded and a fresh identity minted");
+        assert_ne!(a.infohash, b.infohash);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
