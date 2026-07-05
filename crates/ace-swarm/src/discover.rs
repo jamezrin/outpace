@@ -30,29 +30,70 @@ impl Default for DiscoveryOptions {
     }
 }
 
-/// Resolve `udp://host:port[/...]` tracker URLs to socket addresses.
+/// How the resolver treats a tracker list. Tracker URLs from a `cid:<40hex>` transport come
+/// from an untrusted metadata peer, so by default we refuse to turn them into DNS lookups and
+/// UDP announce traffic aimed at non-globally-routable hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrackerPolicy {
+    /// Allow private/loopback/link-local/multicast destinations. Off by default (`false`); opt
+    /// in only for trusted/local deployments (or offline tests).
+    pub allow_non_global: bool,
+}
+
+/// Maximum number of tracker URLs processed from one (untrusted) list.
+pub const MAX_TRACKERS: usize = 64;
+/// Maximum accepted length of a single tracker URL string.
+pub const MAX_TRACKER_URL_LEN: usize = 256;
+
+/// Resolve `udp://host:port[/...]` tracker URLs to socket addresses under the default policy
+/// (reject non-global destinations). See [`resolve_trackers_with_policy`].
 pub async fn resolve_trackers(trackers: &[String]) -> Vec<SocketAddrV4> {
+    resolve_trackers_with_policy(trackers, TrackerPolicy::default()).await
+}
+
+/// Resolve `udp://host:port[/...]` tracker URLs to socket addresses under `policy`.
+pub async fn resolve_trackers_with_policy(
+    trackers: &[String],
+    policy: TrackerPolicy,
+) -> Vec<SocketAddrV4> {
     let mut out = Vec::new();
-    for t in trackers {
-        let hostport = t
-            .strip_prefix("udp://")
-            .unwrap_or(t)
-            .split('/')
-            .next()
-            .unwrap_or("");
+    for t in trackers.iter().take(MAX_TRACKERS) {
+        if t.len() > MAX_TRACKER_URL_LEN {
+            continue;
+        }
+        // Require an explicit udp:// scheme; a bare host:port is rejected.
+        let Some(rest) = t.strip_prefix("udp://") else {
+            continue;
+        };
+        let hostport = rest.split('/').next().unwrap_or("");
         if hostport.is_empty() {
             continue;
         }
         if let Ok(addrs) = lookup_host(hostport).await {
             for a in addrs {
                 if let std::net::SocketAddr::V4(v4) = a {
-                    out.push(v4);
+                    if policy.allow_non_global || !is_non_global_v4(v4.ip()) {
+                        out.push(v4);
+                    }
                     break; // one resolved addr per tracker is enough
                 }
             }
         }
     }
     out
+}
+
+/// True for IPv4 destinations we refuse to send untrusted-tracker traffic to by default:
+/// loopback, private, link-local (incl. the 169.254.169.254 cloud metadata endpoint),
+/// multicast, broadcast, unspecified, and documentation ranges.
+fn is_non_global_v4(ip: &std::net::Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || ip.is_documentation()
 }
 
 /// Discover peers for `infohash` from both the UDP trackers and the mainline DHT. A source
@@ -183,10 +224,18 @@ pub async fn announce_seeder(
 mod tests {
     use super::*;
 
+    /// Policy that permits loopback so scheme/path handling can be exercised offline.
+    fn local_ok() -> TrackerPolicy {
+        TrackerPolicy {
+            allow_non_global: true,
+        }
+    }
+
     #[tokio::test]
     async fn resolve_strips_scheme_and_path() {
         // 127.0.0.1 resolves without network; the path/scheme must be stripped.
-        let got = resolve_trackers(&["udp://127.0.0.1:80/announce".into()]).await;
+        let got =
+            resolve_trackers_with_policy(&["udp://127.0.0.1:80/announce".into()], local_ok()).await;
         assert_eq!(got, vec!["127.0.0.1:80".parse().unwrap()]);
     }
 
@@ -194,6 +243,51 @@ mod tests {
     async fn resolve_skips_garbage() {
         let got = resolve_trackers(&["".into(), "udp://".into()]).await;
         assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_requires_udp_scheme() {
+        // A bare host:port (no udp://) must be rejected even when non-global is allowed.
+        let got = resolve_trackers_with_policy(&["127.0.0.1:80".into()], local_ok()).await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_non_global_destinations_by_default() {
+        // Loopback/private/link-local (incl. the 169.254.169.254 metadata endpoint) must not
+        // be contacted for untrusted trackers unless explicitly allowed.
+        let got = resolve_trackers(&[
+            "udp://127.0.0.1:80/announce".into(),
+            "udp://10.0.0.1:80".into(),
+            "udp://169.254.169.254:80".into(),
+        ])
+        .await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_allows_non_global_when_configured() {
+        let got =
+            resolve_trackers_with_policy(&["udp://127.0.0.1:80/announce".into()], local_ok()).await;
+        assert_eq!(got, vec!["127.0.0.1:80".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_caps_tracker_count() {
+        // Distinct ports so dedup does not collapse them; only the first MAX_TRACKERS resolve.
+        let trackers: Vec<String> = (0..MAX_TRACKERS + 10)
+            .map(|i| format!("udp://127.0.0.1:{}", 1000 + i))
+            .collect();
+        let got = resolve_trackers_with_policy(&trackers, local_ok()).await;
+        assert_eq!(got.len(), MAX_TRACKERS);
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_overlong_urls() {
+        let overlong = format!("udp://{}:80", "a".repeat(MAX_TRACKER_URL_LEN));
+        let got =
+            resolve_trackers_with_policy(&[overlong, "udp://127.0.0.1:80".into()], local_ok()).await;
+        assert_eq!(got, vec!["127.0.0.1:80".parse().unwrap()]);
     }
 
     #[tokio::test]
