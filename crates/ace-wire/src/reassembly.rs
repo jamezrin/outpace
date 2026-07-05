@@ -28,6 +28,13 @@ pub struct PieceReassembler {
     /// consumer (B0/note 27). `None` (a bare-infohash stream with no known source key) leaves
     /// verification off, stripping the trailer without authenticating it.
     verify_pubkey: Option<Vec<u8>>,
+    /// Largest distance ahead of `next_emit` an incoming piece index may have before it is
+    /// rejected. Peers deliver `piece` blocks for untrusted indices, and every new index
+    /// allocates a full `piece_length` buffer retained until the intervening pieces arrive; a
+    /// hostile peer streaming far-future indices could otherwise force unbounded allocation
+    /// (issue #13). Defaults to `u64::MAX` (unbounded — legacy/trusted callers); live callers
+    /// set a window that comfortably covers what they actually request.
+    max_ahead: u64,
     partial: BTreeMap<u64, Partial>,
     complete: BTreeMap<u64, Vec<u8>>,
 }
@@ -41,6 +48,7 @@ impl PieceReassembler {
             next_emit: start_piece,
             piece_trailer: 0,
             verify_pubkey: None,
+            max_ahead: u64::MAX,
             partial: BTreeMap::new(),
             complete: BTreeMap::new(),
         }
@@ -73,12 +81,32 @@ impl PieceReassembler {
         self
     }
 
+    /// Bound how far ahead of the emit cursor a piece index may be before [`Self::add_block`]
+    /// rejects it. Blocks are received for untrusted peer-supplied indices and each new index
+    /// allocates a full `piece_length` buffer held until the intervening pieces arrive, so a
+    /// peer streaming far-future indices could otherwise force unbounded allocation (issue #13).
+    /// `max_pieces_ahead` must comfortably exceed the largest distance the caller ever legitimately
+    /// requests ahead of `next_emit`; a piece at `next_emit + max_pieces_ahead` or beyond is
+    /// rejected. The default is unbounded.
+    pub fn with_max_pieces_ahead(mut self, max_pieces_ahead: u64) -> Self {
+        self.max_ahead = max_pieces_ahead;
+        self
+    }
+
     /// Place a received block at `begin` within piece `index`. Blocks for already-emitted
-    /// pieces (`index < start/next_emit`) are dropped. Assumes non-overlapping blocks that
-    /// together cover `[0, piece_length)`.
+    /// pieces (`index < start/next_emit`) are dropped; blocks for indices more than
+    /// [`Self::with_max_pieces_ahead`] beyond `next_emit` are rejected (an unsolicited
+    /// far-future index that would otherwise pin a `piece_length` buffer — issue #13).
+    /// Assumes non-overlapping blocks that together cover `[0, piece_length)`.
     pub fn add_block(&mut self, index: u64, begin: u64, block: &[u8]) -> Result<()> {
         if index < self.next_emit || self.complete.contains_key(&index) {
             return Ok(()); // stale or already complete
+        }
+        if index >= self.next_emit.saturating_add(self.max_ahead) {
+            // Outside the accept window: reject before allocating a piece buffer. The caller
+            // drops the block (and re-requests in-window pieces from the pool), so a peer
+            // streaming far-future indices can't force unbounded reassembly allocation.
+            return Err(WireError::Invalid("piece index too far ahead of emit cursor"));
         }
         let end = begin
             .checked_add(block.len() as u64)
@@ -361,5 +389,46 @@ mod tests {
             vec![5, 6, 7, 8],
             "garbage that isn't an RSA key is a no-op, not a reject-everything trap"
         );
+    }
+
+    #[test]
+    fn rejects_pieces_too_far_ahead_of_the_emit_cursor() {
+        // A hostile peer sends blocks for far-future piece indices. Each new index would
+        // allocate a full piece_length buffer held until the intervening pieces arrive, so
+        // out-of-window indices must be rejected, not buffered (issue #13).
+        let mut r = PieceReassembler::new(4, 0).with_max_pieces_ahead(8);
+        assert!(r.add_block(7, 0, &[1, 2, 3, 4]).is_ok(), "within window [0,8)");
+        assert!(
+            r.add_block(8, 0, &[1, 2, 3, 4]).is_err(),
+            "at the window edge -> rejected"
+        );
+        assert!(
+            r.add_block(9999, 0, &[1, 2, 3, 4]).is_err(),
+            "far beyond the window -> rejected"
+        );
+    }
+
+    #[test]
+    fn accept_window_slides_forward_with_the_emit_cursor() {
+        // As pieces emit and next_emit advances, the window slides so pieces just ahead of
+        // the new cursor are accepted again — a legitimately-requested piece is never
+        // permanently rejected just because playback started further back.
+        let mut r = PieceReassembler::new(2, 0).with_max_pieces_ahead(4);
+        assert!(r.add_block(4, 0, &[9, 9]).is_err(), "outside [0,4) at first");
+        r.add_block(0, 0, &[1, 1]).unwrap();
+        r.add_block(1, 0, &[2, 2]).unwrap();
+        assert_eq!(r.take_ready(), vec![1, 1, 2, 2]);
+        assert_eq!(r.next_needed(), 2);
+        assert!(
+            r.add_block(4, 0, &[9, 9]).is_ok(),
+            "now within [2,6) -> accepted"
+        );
+    }
+
+    #[test]
+    fn accepts_arbitrarily_far_pieces_when_window_is_unbounded() {
+        // Default (no window set): behavior is unchanged for legacy/trusted callers.
+        let mut r = PieceReassembler::new(2, 0);
+        assert!(r.add_block(1_000_000, 0, &[9, 9]).is_ok());
     }
 }
