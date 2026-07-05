@@ -97,6 +97,15 @@ impl StreamManager {
             .clone())
     }
 
+    /// Peek at an already-running HLS packager without starting a session or packager.
+    pub async fn get_hls(&self, network: &str, id: &str) -> Option<Arc<HlsPackager>> {
+        self.packagers
+            .lock()
+            .await
+            .get(&(network.to_string(), id.to_string()))
+            .cloned()
+    }
+
     /// Force-stop a session: remove it (and any HLS packager) so the shared download is torn
     /// down — the session's `Drop` aborts its background pull task. Returns `true` if a session
     /// for `(network, id)` existed. Connected clients see the stream end.
@@ -220,6 +229,20 @@ mod tests {
             ptrs.iter().all(|p| *p == ptrs[0]),
             "all callers share one session"
         );
+    }
+
+    #[tokio::test]
+    async fn get_hls_only_returns_an_already_running_packager() {
+        let m = StreamManager::new(registry());
+        // Nothing running yet: peeking must not start a session or packager.
+        assert!(m.get_hls("test", "a").await.is_none());
+        assert!(
+            m.get("test", "a").await.is_none(),
+            "peeking must not have started a session"
+        );
+        // Once the packager exists (e.g. after a playlist fetch), peeking finds it.
+        m.get_or_start_hls("test", "a").await.unwrap();
+        assert!(m.get_hls("test", "a").await.is_some());
     }
 
     #[tokio::test]

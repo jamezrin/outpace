@@ -432,9 +432,10 @@ async fn stream_segment(
     let Some(seq) = seg.strip_suffix(".ts").and_then(|n| n.parse::<u64>().ok()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let pkg = match s.manager.get_or_start_hls(&network, &id).await {
-        Ok(p) => p,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    // Segment probes must NOT start a stream: only serve from an already-running packager
+    // (started when the playlist was fetched). Unknown streams 404 without any provider work.
+    let Some(pkg) = s.manager.get_hls(&network, &id).await else {
+        return StatusCode::NOT_FOUND.into_response();
     };
     match pkg.segment(seq) {
         Some(bytes) => ([(header::CONTENT_TYPE, "video/mp2t")], bytes).into_response(),
