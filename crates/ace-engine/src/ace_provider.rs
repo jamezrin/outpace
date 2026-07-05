@@ -19,8 +19,9 @@ use ace_swarm::resolve::{
     ResolveError,
 };
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
-use ace_swarm::store::PieceStore;
+use ace_swarm::store::{BackendKind, PieceStore};
 use ace_swarm::types::StreamInfo;
+use crate::config::CacheType;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
@@ -32,6 +33,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddrV4;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -108,6 +110,48 @@ const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 /// Bytes of recently-downloaded data retained per active peer connection for reseeding.
 const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Build a [`PieceStore`] for `infohash` honoring the configured cache backend. In disk mode the
+/// store lives under `<cache_dir>/<infohash_hex>`; if that directory cannot be prepared (an
+/// unexpected mid-run I/O error — the common misconfiguration is caught at startup) we log and
+/// fall back to a memory store so a live stream keeps serving rather than dying.
+pub(crate) fn build_piece_store(
+    piece_length: u64,
+    chunk_length: u64,
+    max_bytes: u64,
+    cache_type: CacheType,
+    cache_dir: &Path,
+    infohash: &[u8; 20],
+) -> PieceStore {
+    match cache_type {
+        CacheType::Memory => PieceStore::new(piece_length, chunk_length, max_bytes),
+        CacheType::Disk => {
+            let dir = cache_dir.join(infohash_hex(infohash));
+            PieceStore::with_backend(
+                piece_length,
+                chunk_length,
+                max_bytes,
+                BackendKind::Disk { dir: dir.clone() },
+            )
+            .unwrap_or_else(|e| {
+                crate::alog!(
+                    "[cache] disk cache unavailable at {}: {e}; falling back to memory",
+                    dir.display()
+                );
+                PieceStore::new(piece_length, chunk_length, max_bytes)
+            })
+        }
+    }
+}
+
+/// Lowercase hex of a 20-byte infohash, used as the per-stream disk cache subdirectory name.
+pub(crate) fn infohash_hex(infohash: &[u8; 20]) -> String {
+    use std::fmt::Write;
+    infohash.iter().fold(String::with_capacity(40), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// Seeding configuration threaded through the download loop: the shared per-infohash
 /// piece store (so downloaded data becomes servable to inbound peers too — T7), its size
 /// budget, and whether reciprocal serving over THIS outbound connection is enabled at all.
@@ -118,6 +162,10 @@ struct SeedConfig {
     enabled: bool,
     /// Pieces behind the live edge the fresh follower starts at (playback cushion).
     prefetch_pieces: u64,
+    /// Backend the per-infohash seed store uses for piece data.
+    cache_type: CacheType,
+    /// Root dir for disk-mode piece files (per-infohash subdir derived from this).
+    cache_dir: PathBuf,
 }
 
 pub struct AceProvider {
@@ -139,6 +187,8 @@ pub struct AceProvider {
     seed_store_bytes: u64,
     prefetch_pieces: u64,
     enable_seeding: bool,
+    cache_type: CacheType,
+    cache_dir: PathBuf,
 }
 
 impl AceProvider {
@@ -158,6 +208,8 @@ impl AceProvider {
             seed_store_bytes: SEED_STORE_BYTES,
             prefetch_pieces: PREFETCH_PIECES,
             enable_seeding: true,
+            cache_type: CacheType::Memory,
+            cache_dir: PathBuf::new(),
         }
     }
 
@@ -206,6 +258,15 @@ impl AceProvider {
     /// created, so changing this after a stream has already opened has no effect on it.
     pub fn with_seed_store_bytes(mut self, bytes: u64) -> Self {
         self.seed_store_bytes = bytes;
+        self
+    }
+
+    /// Select where the per-infohash seed store keeps piece data. In `Disk` mode each store
+    /// lives under `<cache_dir>/<infohash_hex>`; `cache_dir` is ignored in `Memory` mode.
+    /// Defaults to `Memory`.
+    pub fn with_cache(mut self, cache_type: CacheType, cache_dir: PathBuf) -> Self {
+        self.cache_type = cache_type;
+        self.cache_dir = cache_dir;
         self
     }
 
@@ -356,6 +417,8 @@ impl StreamProvider for AceProvider {
             store_bytes: self.seed_store_bytes,
             enabled: self.enable_seeding,
             prefetch_pieces: self.prefetch_pieces,
+            cache_type: self.cache_type,
+            cache_dir: self.cache_dir.clone(),
         };
         let announce_info = info.clone();
         let announce_port = self.seeder_announce_port();
@@ -1261,7 +1324,14 @@ async fn follow_peer_pool(
     };
     let continuity = continuity.as_mut().expect("initialized just above");
     let store = seed.registry.get_or_create(info.infohash, || {
-        PieceStore::new(info.piece_length, info.chunk_length, seed.store_bytes)
+        build_piece_store(
+            info.piece_length,
+            info.chunk_length,
+            seed.store_bytes,
+            seed.cache_type,
+            &seed.cache_dir,
+            &info.infohash,
+        )
     });
     let (event_tx, mut event_rx) = mpsc::channel(MAX_ACTIVE_UPSTREAMS * 32);
     let (refill_tx, mut refill_rx) = mpsc::channel(MAX_ACTIVE_UPSTREAMS);
@@ -1900,7 +1970,14 @@ async fn follow_one_peer(
     let peer_min = min_piece;
     let mut peer_max = max_piece;
     let store = seed.registry.get_or_create(info.infohash, || {
-        PieceStore::new(info.piece_length, info.chunk_length, seed.store_bytes)
+        build_piece_store(
+            info.piece_length,
+            info.chunk_length,
+            seed.store_bytes,
+            seed.cache_type,
+            &seed.cache_dir,
+            &info.infohash,
+        )
     });
     let mut unchoked_peer = false;
     let mut last_progress = Instant::now();

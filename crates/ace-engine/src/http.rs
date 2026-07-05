@@ -206,6 +206,7 @@ async fn broadcast_delete(State(s): State<AppState>, Path(name): Path<String>) -
     if let Some(bc) = bs.registry.delete(&name).await {
         bs.seed_registry.remove(&bc.infohash);
         bs.seed_registry.remove(&bc.content_id);
+        bs.registry.remove_cache_dir(&bc.infohash);
         crate::alog!("[broadcast] {name}: deleted");
     }
     StatusCode::NO_CONTENT.into_response()

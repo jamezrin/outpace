@@ -140,6 +140,17 @@ pub async fn build_runtime(
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
 
+    // Fail fast on a misconfigured disk cache: prepare the cache root once at startup so a bad
+    // OUTPACE_CACHE_DIR surfaces here rather than silently degrading to memory per stream.
+    if config.cache_type == CacheType::Disk {
+        std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
+            format!(
+                "cannot create OUTPACE_CACHE_DIR {}: {e}",
+                config.cache_dir.display()
+            )
+        })?;
+    }
+
     // Register enabled providers. Only "ace" exists today; the registry is the path for more.
     let seed_registry = ace_swarm::listen::SeedRegistry::new();
     let mut registry = ProviderRegistry::new();
@@ -153,6 +164,7 @@ pub async fn build_runtime(
             .with_bootstrap_peers(bootstrap_peers)
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
+            .with_cache(config.cache_type, config.cache_dir.clone())
             .with_prefetch_pieces(config.prefetch_pieces)
             .with_seeding_enabled(config.enable_seeding)
             .with_inbound_announce_port(inbound_peer_port);
@@ -163,7 +175,11 @@ pub async fn build_runtime(
     let manager = StreamManager::with_buffer(registry, config.session_buffer);
     manager.spawn_reaper();
     let broadcasts = BroadcastState {
-        registry: BroadcastRegistry::with_persist(&config.data_dir),
+        registry: BroadcastRegistry::with_persist(
+            &config.data_dir,
+            config.cache_type,
+            config.cache_dir.clone(),
+        ),
         seed_registry: seed_registry.clone(),
         trackers: DEFAULT_BROADCAST_TRACKERS
             .iter()
@@ -415,7 +431,11 @@ mod tests {
         // capturing its identity, then drop the registry to simulate a shutdown.
         let infohash = {
             let seed = ace_swarm::listen::SeedRegistry::new();
-            let reg = BroadcastRegistry::with_persist(&data_dir);
+            let reg = BroadcastRegistry::with_persist(
+                &data_dir,
+                CacheType::Memory,
+                std::path::PathBuf::new(),
+            );
             let (bc, fresh) = reg
                 .start_or_resume("news", "News", &[], &seed, 1 << 20)
                 .await;
