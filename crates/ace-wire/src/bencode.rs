@@ -2,6 +2,11 @@
 use crate::{Result, WireError};
 use std::collections::BTreeMap;
 
+/// Maximum container nesting accepted when parsing untrusted bencode. Peer extended
+/// handshakes and DHT replies are shallow in practice; this bounds recursion so a
+/// small deeply nested value cannot exhaust the stack.
+const MAX_DEPTH: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bencode {
     Int(i64),
@@ -13,7 +18,7 @@ pub enum Bencode {
 impl Bencode {
     /// Parse exactly one bencode value from the whole buffer; trailing bytes = error.
     pub fn parse(buf: &[u8]) -> Result<Bencode> {
-        let (v, n) = parse_value(buf, 0)?;
+        let (v, n) = parse_value(buf, 0, 0)?;
         if n != buf.len() {
             return Err(WireError::Invalid("trailing bytes"));
         }
@@ -22,7 +27,7 @@ impl Bencode {
 
     /// Parse one value from the front; return (value, bytes_consumed).
     pub fn parse_prefix(buf: &[u8]) -> Result<(Bencode, usize)> {
-        parse_value(buf, 0)
+        parse_value(buf, 0, 0)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -84,11 +89,14 @@ impl Bencode {
     }
 }
 
-fn parse_value(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
+/// `depth` is the number of container (list/dict) ancestors already open. It bounds
+/// recursion so untrusted, deeply nested bencode cannot exhaust the stack.
+fn parse_value(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
     match buf.get(pos).ok_or(WireError::Truncated)? {
         b'i' => parse_int(buf, pos),
-        b'l' => parse_list(buf, pos),
-        b'd' => parse_dict(buf, pos),
+        b'l' | b'd' if depth >= MAX_DEPTH => Err(WireError::Invalid("bencode nesting too deep")),
+        b'l' => parse_list(buf, pos, depth),
+        b'd' => parse_dict(buf, pos, depth),
         b'0'..=b'9' => parse_bytes(buf, pos),
         _ => Err(WireError::Invalid("unexpected bencode token")),
     }
@@ -129,14 +137,14 @@ fn parse_bytes(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
     Ok((Bencode::Bytes(buf[start..end].to_vec()), end))
 }
 
-fn parse_list(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
+fn parse_list(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
     let mut i = pos + 1;
     let mut items = Vec::new();
     loop {
         match buf.get(i).ok_or(WireError::Truncated)? {
             b'e' => return Ok((Bencode::List(items), i + 1)),
             _ => {
-                let (v, n) = parse_value(buf, i)?;
+                let (v, n) = parse_value(buf, i, depth + 1)?;
                 items.push(v);
                 i = n;
             }
@@ -144,7 +152,7 @@ fn parse_list(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
     }
 }
 
-fn parse_dict(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
+fn parse_dict(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
     let mut i = pos + 1;
     let mut map = BTreeMap::new();
     loop {
@@ -157,7 +165,7 @@ fn parse_dict(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
                 } else {
                     unreachable!()
                 };
-                let (v, n2) = parse_value(buf, n)?;
+                let (v, n2) = parse_value(buf, n, depth + 1)?;
                 map.insert(key, v);
                 i = n2;
             }
@@ -195,5 +203,42 @@ mod tests {
         assert!(Bencode::parse(b"i42").is_err()); // truncated
         assert!(Bencode::parse(b"i42eX").is_err()); // trailing byte
         assert!(Bencode::parse(b"3:ab").is_err()); // short string
+    }
+
+    /// Build a value nested `depth` levels deep: `depth` opening tokens, an inner
+    /// int, then `depth` closing tokens. `container` is b'l' (list) or b'd' (dict).
+    fn nested(container: u8, depth: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for _ in 0..depth {
+            if container == b'd' {
+                buf.extend_from_slice(b"d1:k"); // open dict, then a key for the nested value
+            } else {
+                buf.push(b'l'); // open list
+            }
+        }
+        buf.extend_from_slice(b"i0e");
+        for _ in 0..depth {
+            buf.push(b'e');
+        }
+        buf
+    }
+
+    #[test]
+    fn accepts_nesting_at_the_limit() {
+        assert!(Bencode::parse(&nested(b'l', MAX_DEPTH)).is_ok());
+        assert!(Bencode::parse(&nested(b'd', MAX_DEPTH)).is_ok());
+    }
+
+    #[test]
+    fn rejects_nesting_beyond_the_limit() {
+        assert!(Bencode::parse(&nested(b'l', MAX_DEPTH + 1)).is_err());
+        assert!(Bencode::parse(&nested(b'd', MAX_DEPTH + 1)).is_err());
+    }
+
+    #[test]
+    fn rejects_pathologically_deep_nesting_without_overflow() {
+        // A small input can still describe very deep recursion; this must return a
+        // clean error rather than exhausting the stack.
+        assert!(Bencode::parse(&nested(b'l', 100_000)).is_err());
     }
 }
