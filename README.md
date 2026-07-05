@@ -89,7 +89,11 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_DATA_DIR` - persistent identity/cache root, default platform data dir
   plus `outpace`.
 - `OUTPACE_PEER_LISTEN` - inbound peer listener bind, default `0.0.0.0:8621`.
-- `OUTPACE_SEED_STORE_BYTES` - byte budget for retained piece data.
+- `OUTPACE_SEED_STORE_BYTES` - byte budget for retained piece data (sizes both cache backends).
+- `OUTPACE_CACHE_TYPE` - where the seed store keeps piece data: `memory` (default) or `disk`.
+  `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
+- `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per infohash),
+  default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`.
 - `OUTPACE_PREFETCH_PIECES` - pieces behind the live edge to start at, default `8`.
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
@@ -102,8 +106,11 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - enables legacy compatibility routes.
 - `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
 
-Disk-backed cache configuration is tracked separately in issue #5. The documented
-`OUTPACE_CACHE_TYPE` and `OUTPACE_CACHE_DIR` knobs are not production code yet.
+The disk cache is **ephemeral**: its directory is cleared when a store is created and
+never reloaded across restarts (live piece data goes stale), which also avoids serving
+evicted-stale pieces. Disk I/O is currently synchronous; a write failure logs and falls
+back to memory rather than crashing. A stopped broadcast's cache dir is removed on
+`DELETE /broadcast/{name}`.
 
 ## Project Docs
 
