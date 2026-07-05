@@ -197,9 +197,19 @@ impl Scheduler {
             .map(|p| (*p, self.max_in_flight.saturating_sub(p.in_flight)))
             .collect();
 
+        // Bound the scan (and thus per-tick fan-out) to the number of request slots we can
+        // actually fill this tick. `head` comes from untrusted peer `Have`/window
+        // advertisements, so an implausibly large jump must not make us iterate over billions
+        // of piece indices and tie up the session task. We never assign more than the total
+        // spare capacity, so scanning that far past the cursor suffices; anything beyond is
+        // scheduled on later ticks as the cursor advances, and a genuinely evicted cursor is
+        // moved forward by the driver's skip-evicted-gap path.
+        let total_spare: u64 = cap.iter().map(|(_, c)| *c as u64).sum();
+        let ceiling = head.min(next_needed.saturating_add(total_spare));
+
         let mut out = Vec::new();
         let mut piece = next_needed;
-        while piece <= head {
+        while piece <= ceiling {
             if !self.requested.contains(&piece) {
                 // Prefer the peer with the most spare capacity that covers this piece —
                 // spreads load and keeps the rarest-window peers in reserve.
@@ -265,6 +275,26 @@ mod tests {
     fn skips_choked_peers() {
         let mut s = Scheduler::new(5);
         assert!(s.assign(0, 10, &[peer(1, 0, 10, false, 0)]).is_empty());
+    }
+
+    #[test]
+    fn does_not_schedule_beyond_a_bounded_window_ahead_of_the_cursor() {
+        // A hostile peer can advertise an implausibly large head while only actually covering
+        // a far-away piece. The scheduler must bound its scan to a window ahead of the cursor
+        // rather than iterating toward the advertised head, so nothing is assigned this tick.
+        let mut s = Scheduler::new(4);
+        let far = peer(1, 100_000, 100_000, true, 0);
+        assert!(s.assign(0, 200_000, &[far]).is_empty());
+    }
+
+    #[test]
+    fn a_huge_head_stays_bounded_and_returns_promptly() {
+        // With an absurd head (e.g. a Have(u32::MAX)-driven jump), scheduling must still only
+        // consider a bounded batch — never spin over billions of piece indices.
+        let mut s = Scheduler::new(4);
+        let p = peer(1, 0, u64::MAX, true, 0);
+        let got = s.assign(0, u64::MAX, &[p]);
+        assert_eq!(got, vec![(1, 0), (1, 1), (1, 2), (1, 3)]);
     }
 
     #[test]
