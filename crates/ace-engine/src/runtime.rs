@@ -140,14 +140,18 @@ pub async fn build_runtime(
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
 
-    // Fail fast on a misconfigured disk cache: prepare the cache root once at startup so a bad
-    // OUTPACE_CACHE_DIR surfaces here rather than silently degrading to memory per stream.
+    // Fail fast on a misconfigured disk cache, and start from a clean slate: wipe the cache root
+    // so per-infohash dirs orphaned by a hard crash (no `Drop` ran) don't survive a restart. The
+    // cache is ephemeral (piece data goes stale; broadcasts rebuild theirs from live ingest), so
+    // wiping is always safe. A bad OUTPACE_CACHE_DIR surfaces here rather than degrading per stream.
     if config.cache_type == CacheType::Disk {
+        if config.cache_dir.exists() {
+            std::fs::remove_dir_all(&config.cache_dir).map_err(|e| {
+                format!("cannot clear OUTPACE_CACHE_DIR {}: {e}", config.cache_dir.display())
+            })?;
+        }
         std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
-            format!(
-                "cannot create OUTPACE_CACHE_DIR {}: {e}",
-                config.cache_dir.display()
-            )
+            format!("cannot create OUTPACE_CACHE_DIR {}: {e}", config.cache_dir.display())
         })?;
     }
 

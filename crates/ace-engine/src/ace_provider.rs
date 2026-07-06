@@ -111,9 +111,11 @@ const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Build a [`PieceStore`] for `infohash` honoring the configured cache backend. In disk mode the
-/// store lives under `<cache_dir>/<infohash_hex>`; if that directory cannot be prepared (an
-/// unexpected mid-run I/O error — the common misconfiguration is caught at startup) we log and
-/// fall back to a memory store so a live stream keeps serving rather than dying.
+/// store lives under `<cache_dir>/<infohash_hex>-<generation>`, where `generation` is a
+/// process-unique counter so each store instance owns a private directory no other instance can
+/// touch (its `Drop` removes exactly that dir — see `DiskBackend`). If the directory cannot be
+/// prepared (an unexpected mid-run I/O error — the common misconfiguration is caught at startup)
+/// we log and fall back to a memory store so a live stream keeps serving rather than dying.
 pub(crate) fn build_piece_store(
     piece_length: u64,
     chunk_length: u64,
@@ -125,7 +127,7 @@ pub(crate) fn build_piece_store(
     match cache_type {
         CacheType::Memory => PieceStore::new(piece_length, chunk_length, max_bytes),
         CacheType::Disk => {
-            let dir = cache_dir.join(infohash_hex(infohash));
+            let dir = cache_dir.join(disk_store_subdir(infohash));
             PieceStore::with_backend(
                 piece_length,
                 chunk_length,
@@ -141,6 +143,16 @@ pub(crate) fn build_piece_store(
             })
         }
     }
+}
+
+/// Per-instance disk cache subdirectory name: `<infohash_hex>-<generation>`. The readable infohash
+/// prefix aids operators; the monotonic suffix guarantees a fresh directory per store instance so
+/// a stale store's `Drop` can never delete a re-created same-infohash store's data.
+fn disk_store_subdir(infohash: &[u8; 20]) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{gen}", infohash_hex(infohash))
 }
 
 /// Lowercase hex of a 20-byte infohash, used as the per-stream disk cache subdirectory name.
@@ -2303,6 +2315,27 @@ mod tests {
     async fn network_is_ace() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
         assert_eq!(p.network(), "ace");
+    }
+
+    #[test]
+    fn disk_store_dir_is_process_unique_per_instance() {
+        let tmp = std::env::temp_dir().join(format!("outpace-uniqdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ih = [7u8; 20];
+        // Two stores for the SAME infohash must land in DIFFERENT directories.
+        let _s1 = build_piece_store(1 << 20, 1 << 14, 1 << 20, CacheType::Disk, &tmp, &ih);
+        let _s2 = build_piece_store(1 << 20, 1 << 14, 1 << 20, CacheType::Disk, &tmp, &ih);
+        let dirs: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(dirs.len(), 2, "each store instance owns its own dir: {dirs:?}");
+        assert!(
+            dirs.iter().all(|d| d.starts_with(&infohash_hex(&ih))),
+            "dir names keep the readable infohash prefix: {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
