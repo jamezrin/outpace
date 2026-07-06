@@ -6,10 +6,20 @@ use crate::store::PieceStore;
 use ace_peer::session::PeerSession;
 use ace_wire::identity::Identity;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+
+/// Monotonic id stamped on each `SeedEntry` at creation so a `SeedLease` only ever mutates the
+/// exact entry it was issued against — not a later entry that happens to reuse the same key after
+/// a force-remove (the idle-TTL reaper). Guards against ABA lease-accounting corruption.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Per-infohash store, shared with whatever feeds pieces (a download loop, a broadcast source).
 type SharedStore = Arc<Mutex<PieceStore>>;
@@ -34,6 +44,11 @@ struct SeedEntry {
     /// Number of live `SeedLease`s referencing this key; the entry is removed at zero.
     producers: usize,
     kind: OwnerKind,
+    /// Unique id stamped at creation (see `next_generation`). A `SeedLease` records the generation
+    /// it saw and only mutates the entry if it still matches — so a stale lease can't corrupt a
+    /// different entry that reused the key. `Default` gives 0, but entries are never created via
+    /// bare `or_default()`; always `or_insert_with(|| SeedEntry { generation: next_generation(), .. })`.
+    generation: u64,
 }
 
 /// Maps infohash -> the store and/or metadata we'd serve. Entry lifetime is anchored by
@@ -56,13 +71,24 @@ impl SeedRegistry {
             .lock()
             .unwrap()
             .entry(infohash)
-            .or_default()
+            .or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                ..Default::default()
+            })
             .store = Some(store);
     }
 
     /// Register (or replace) the BEP-9 metadata for `key`.
     pub fn register_metadata(&self, key: [u8; 20], metadata: Vec<u8>) {
-        self.stores.lock().unwrap().entry(key).or_default().metadata = Some(Arc::new(metadata));
+        self.stores
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                ..Default::default()
+            })
+            .metadata = Some(Arc::new(metadata));
     }
 
     /// The store for `infohash`, creating it via `make` (and registering it) if absent.
@@ -76,7 +102,10 @@ impl SeedRegistry {
             .lock()
             .unwrap()
             .entry(infohash)
-            .or_default()
+            .or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                ..Default::default()
+            })
             .store
             .get_or_insert_with(|| Arc::new(Mutex::new(make())))
             .clone()
@@ -86,13 +115,19 @@ impl SeedRegistry {
     /// The returned `SeedLease` refcounts the entry; when the last lease for this infohash drops,
     /// the entry (and its store) is evicted. Two concurrent leech sessions for one infohash share
     /// a single store and the entry survives until both leases drop.
+    ///
+    /// The registry's `StdMutex` is held across `make`, so `make` must not drop a `SeedLease` for
+    /// this same registry (it would re-lock the non-reentrant mutex and deadlock).
     pub fn lease_store(
         &self,
         infohash: [u8; 20],
         make: impl FnOnce() -> PieceStore,
     ) -> (SharedStore, SeedLease) {
         let mut map = self.stores.lock().unwrap();
-        let entry = map.entry(infohash).or_default();
+        let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
+            generation: next_generation(),
+            ..Default::default()
+        });
         let store = entry
             .store
             .get_or_insert_with(|| Arc::new(Mutex::new(make())))
@@ -100,7 +135,7 @@ impl SeedRegistry {
         entry.producers += 1;
         let lease = SeedLease {
             registry: Arc::downgrade(&self.stores),
-            keys: vec![infohash],
+            keys: vec![(infohash, entry.generation)],
         };
         (store, lease)
     }
@@ -108,6 +143,12 @@ impl SeedRegistry {
     /// Acquire a broadcast producer lease owning both the `infohash` (store) and `content_id`
     /// (BEP-9 metadata) keys, creating the store via `make` if absent. Marks the entries
     /// `Broadcast` (reaper-exempt). Dropping the returned lease evicts both keys.
+    ///
+    /// Overwrites any existing `content_id` metadata; content is content-addressed by `content_id`,
+    /// so the blob is deterministic for a given key and the overwrite is a no-op in practice.
+    ///
+    /// The registry's `StdMutex` is held across `make`, so `make` must not drop a `SeedLease` for
+    /// this same registry (it would re-lock the non-reentrant mutex and deadlock).
     pub fn lease_broadcast(
         &self,
         infohash: [u8; 20],
@@ -116,24 +157,32 @@ impl SeedRegistry {
         make: impl FnOnce() -> PieceStore,
     ) -> (SharedStore, SeedLease) {
         let mut map = self.stores.lock().unwrap();
-        let store = {
-            let entry = map.entry(infohash).or_default();
+        let (store, ih_generation) = {
+            let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                ..Default::default()
+            });
             entry.producers += 1;
             entry.kind = OwnerKind::Broadcast;
-            entry
+            let store = entry
                 .store
                 .get_or_insert_with(|| Arc::new(Mutex::new(make())))
-                .clone()
+                .clone();
+            (store, entry.generation)
         };
-        {
-            let meta_entry = map.entry(content_id).or_default();
+        let cid_generation = {
+            let meta_entry = map.entry(content_id).or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                ..Default::default()
+            });
             meta_entry.producers += 1;
             meta_entry.kind = OwnerKind::Broadcast;
             meta_entry.metadata = Some(Arc::new(metadata));
-        }
+            meta_entry.generation
+        };
         let lease = SeedLease {
             registry: Arc::downgrade(&self.stores),
-            keys: vec![infohash, content_id],
+            keys: vec![(infohash, ih_generation), (content_id, cid_generation)],
         };
         (store, lease)
     }
@@ -162,10 +211,11 @@ impl SeedRegistry {
 
 /// RAII producer handle for one or more `SeedRegistry` keys. Dropping it decrements each key's
 /// producer count and evicts any entry that reaches zero. Not `Clone` — a clone would need to bump
-/// the count; acquire another lease via the registry instead.
+/// the count; acquire another lease via the registry instead. Each key is paired with the entry
+/// generation seen at issue, so a stale lease never touches a different entry that reused the key.
 pub struct SeedLease {
     registry: std::sync::Weak<StdMutex<HashMap<[u8; 20], SeedEntry>>>,
-    keys: Vec<[u8; 20]>,
+    keys: Vec<([u8; 20], u64)>,
 }
 
 impl Drop for SeedLease {
@@ -174,11 +224,15 @@ impl Drop for SeedLease {
             return;
         };
         let mut map = map.lock().unwrap();
-        for key in &self.keys {
+        for (key, generation) in &self.keys {
             if let Some(entry) = map.get_mut(key) {
-                entry.producers = entry.producers.saturating_sub(1);
-                if entry.producers == 0 {
-                    map.remove(key);
+                // Only decrement the exact entry this lease was issued against; a force-remove +
+                // recreate at the same key bumps the generation and makes this a no-op.
+                if entry.generation == *generation {
+                    entry.producers = entry.producers.saturating_sub(1);
+                    if entry.producers == 0 {
+                        map.remove(key);
+                    }
                 }
             }
         }
@@ -369,5 +423,24 @@ mod tests {
         drop(lease);
         assert!(!reg.serves(&ih), "infohash entry evicted");
         assert!(!reg.serves(&cid), "content_id entry evicted");
+    }
+
+    #[test]
+    fn stale_lease_drop_does_not_evict_a_reborn_entry_at_the_same_key() {
+        let reg = SeedRegistry::new();
+        let ih = [12u8; 20];
+        let (_s1, l1) = reg.lease_store(ih, || PieceStore::new(4, 4, 1024));
+        // Simulate the reaper force-removing the entry while the lease is still outstanding.
+        reg.remove(&ih);
+        assert!(!reg.serves(&ih));
+        // A new producer re-creates the entry (new generation).
+        let (_s2, _l2) = reg.lease_store(ih, || PieceStore::new(4, 4, 1024));
+        assert!(reg.serves(&ih));
+        // Dropping the STALE lease must NOT evict the reborn entry.
+        drop(l1);
+        assert!(
+            reg.serves(&ih),
+            "stale lease drop must not touch the reborn entry"
+        );
     }
 }
