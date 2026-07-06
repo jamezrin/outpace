@@ -44,9 +44,9 @@ pub struct Config {
     /// Depth of the per-session fan-out broadcast channel (messages buffered per client).
     /// Must be >= 1.
     pub session_buffer: usize,
-    /// Max simultaneously-unchoked peers per served stream. NOT YET WIRED: `Choker` (the
-    /// policy this would configure) has no production caller until the multi-peer S2 serve
-    /// coordinator lands.
+    /// Max simultaneously-unchoked peers per served stream (S2). Wired into the inbound serve
+    /// path via the per-infohash `ServeCoordinator`: each stream unchokes up to this many
+    /// interested peers plus one rotating optimistic slot (rotated by the daemon's rechoke ticker).
     pub max_unchoked: usize,
     /// Max concurrent inbound peer connections accepted by the listener.
     pub max_inbound_peers: usize,

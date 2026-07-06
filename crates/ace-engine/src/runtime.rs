@@ -202,6 +202,18 @@ pub async fn build_runtime(
             }
         });
     }
+    if config.enable_inbound {
+        let rechoke_registry = seed_registry.clone();
+        tokio::spawn(async move {
+            // BitTorrent's classic rechoke cadence is ~10s; rotate the optimistic-unchoke slot on
+            // that beat so newcomers periodically get a turn even on a saturated stream.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                ticker.tick().await;
+                rechoke_registry.rechoke_all();
+            }
+        });
+    }
     let broadcasts = BroadcastState {
         registry: BroadcastRegistry::with_persist(
             &config.data_dir,
@@ -506,5 +518,25 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn build_runtime_wires_max_unchoked_without_error() {
+        let dir = std::env::temp_dir().join(format!("outpace-rt-mu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            cache_dir: dir.join("cache"),
+            max_unchoked: 2,
+            enable_inbound: true,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            peer_listen: "127.0.0.1:0".parse().unwrap(),
+            rtmp_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        };
+        let runtime = build_runtime(config, vec![]).await.unwrap();
+        assert_eq!(runtime.config.max_unchoked, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
