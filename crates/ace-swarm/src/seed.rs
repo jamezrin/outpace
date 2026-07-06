@@ -423,16 +423,20 @@ mod tests {
 
     #[test]
     fn coordinator_rechokes_when_a_peer_leaves() {
+        // max_unchoked = 1 with three interested peers: `a` takes the guaranteed slot; the single
+        // optimistic slot at tick 0 goes to the first of the remainder (`b`), so `c` is CHOKED.
         let coord = ServeCoordinator::new(1);
         let (a, rx_a) = coord.join();
-        let (b, rx_b) = coord.join();
+        let (b, _rx_b) = coord.join();
+        let (c, rx_c) = coord.join();
         coord.set_interested(a, true);
         coord.set_interested(b, true);
-        // With max_unchoked=1, first-come `a` is unchoked; `b` is the optimistic (+1) slot.
-        assert!(*rx_a.borrow());
+        coord.set_interested(c, true);
+        assert!(*rx_a.borrow(), "first-come peer holds the guaranteed slot");
+        assert!(!*rx_c.borrow(), "third peer is choked (past max + optimistic)");
+        // When `a` leaves, the guaranteed slot frees up and `c` must get unchoked.
         coord.leave(a);
-        // `b` must now be in the guaranteed slot.
-        assert!(*rx_b.borrow(), "remaining interested peer is unchoked after the other leaves");
+        assert!(*rx_c.borrow(), "a genuinely-choked peer becomes unchoked after another leaves");
     }
 
     #[test]
