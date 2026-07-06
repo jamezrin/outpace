@@ -283,6 +283,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         let listener_peer_id = ace_wire::handshake::random_peer_id();
         let inbound_registry = seed_registry.clone();
         let max_inbound = config.max_inbound_peers;
+        let max_unchoked = config.max_unchoked;
         let listener_identity = identity.clone();
         tokio::spawn(async move {
             ace_swarm::listen::PeerListener::serve(
@@ -292,6 +293,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
                 [0u8; 8],
                 max_inbound,
                 listener_identity,
+                max_unchoked,
             )
             .await;
         });

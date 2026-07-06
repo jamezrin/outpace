@@ -330,6 +330,7 @@ impl PeerListener {
         piece_header: [u8; 8],
         max_inbound: usize,
         identity: Arc<Identity>,
+        max_unchoked: usize,
     ) {
         let sem = Arc::new(tokio::sync::Semaphore::new(max_inbound.max(1)));
         loop {
@@ -369,6 +370,7 @@ impl PeerListener {
                     piece_header,
                     &identity,
                     peer_ip,
+                    max_unchoked,
                 )
                 .await
                 {
@@ -386,6 +388,7 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     piece_header: [u8; 8],
     identity: &Identity,
     peer_ip: [u8; 4],
+    max_unchoked: usize,
 ) -> ace_peer::Result<()> {
     let mut session = PeerSession::new(stream);
     let peer_hs = session
@@ -396,6 +399,7 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     if store.is_none() && metadata.is_none() {
         return Err(ace_peer::PeerError::InfohashMismatch);
     }
+    let coordinator = registry.coordinator_for(&peer_hs.infohash, max_unchoked);
     SeederSession::serve(
         &mut session,
         store,
@@ -403,6 +407,7 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
         piece_header,
         identity,
         peer_ip,
+        coordinator,
     )
     .await
 }

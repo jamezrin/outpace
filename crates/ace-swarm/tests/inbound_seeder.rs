@@ -27,7 +27,7 @@ async fn peer_connects_handshakes_and_downloads_a_chunk_from_us() {
     let our_id = random_peer_id();
     let identity = Arc::new(Identity::generate());
     tokio::spawn(PeerListener::serve(
-        listener, registry, our_id, [0u8; 8], 8, identity,
+        listener, registry, our_id, [0u8; 8], 8, identity, 8,
     ));
 
     let stream = TcpStream::connect(addr).await.unwrap();
@@ -80,6 +80,7 @@ async fn accepted_peer_gets_a_signed_extended_handshake_with_the_live_window() {
         [0u8; 8],
         8,
         identity,
+        8,
     ));
 
     let stream = TcpStream::connect(addr).await.unwrap();
@@ -116,6 +117,7 @@ async fn unknown_infohash_is_refused_not_served() {
         [0u8; 8],
         8,
         identity,
+        8,
     ));
 
     let stream = TcpStream::connect(addr).await.unwrap();

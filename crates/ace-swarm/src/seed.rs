@@ -23,10 +23,13 @@ impl SeederSession {
     /// client (including our own `AceProvider`, which waits for this as the peer's first
     /// message) will proceed at all — then advertise held pieces with Acestream's live
     /// bitfield, then answer each Acestream chunk-request (id=6
-    /// `[stream u32][piece u32][chunk u16]`) with a `Piece` built from the store, after
-    /// unchoking on the peer's first `Interested`. `piece_header` is the fallback 8-byte
-    /// per-piece timestamp header used only when the store has no header for that piece
-    /// (note 33). Returns on close.
+    /// `[stream u32][piece u32][chunk u16]`) with a `Piece` built from the store. Unchoking is
+    /// gated by `coordinator` when `Some` — the peer is unchoked/choked as the coordinator's
+    /// `max_unchoked` policy flips its watch, so a choked peer's chunk-requests are dropped
+    /// (`Unknown { id: 6, .. }` requires `unchoked`). When `coordinator` is `None`, falls back to
+    /// legacy behavior: unchoke inline on the peer's first `Interested` and never choke again.
+    /// `piece_header` is the fallback 8-byte per-piece timestamp header used only when the store
+    /// has no header for that piece (note 33). Returns on close.
     ///
     /// Upload accounting (bytes/peers served) is not tracked here; the S1 reciprocal seeder in
     /// `ace_provider::follow_one_peer` inlines this loop and counts via atomics. A standalone
@@ -39,6 +42,7 @@ impl SeederSession {
         piece_header: [u8; 8],
         identity: &Identity,
         peer_ip: [u8; 4],
+        coordinator: Option<Arc<ServeCoordinator>>,
     ) -> Result<()> {
         let debug = std::env::var_os("OUTPACE_SEED_DEBUG").is_some();
         // Advertise our identity + current live window using the profile observed from an
@@ -73,10 +77,52 @@ impl SeederSession {
             .send_signed_extended_handshake(&hs, identity)
             .await?;
 
+        // Coordinator-gated (S2 multi-peer) unchoke, or legacy inline unchoke when absent.
+        let mut coord_rx = coordinator.as_ref().map(|c| c.join());
+        let peer_id = coord_rx.as_ref().map(|(id, _)| *id);
+        // Deregister on every exit path (error, close, drop).
+        struct LeaveGuard(Option<(Arc<ServeCoordinator>, u64)>);
+        impl Drop for LeaveGuard {
+            fn drop(&mut self) {
+                if let Some((c, id)) = self.0.take() {
+                    c.leave(id);
+                }
+            }
+        }
+        let _leave = LeaveGuard(match (&coordinator, peer_id) {
+            (Some(c), Some(id)) => Some((c.clone(), id)),
+            _ => None,
+        });
         let mut unchoked = false;
         let mut advertised_bitfields = false;
         loop {
-            let msg = session.read_message().await?;
+            let msg = if let Some((_, rx)) = coord_rx.as_mut() {
+                tokio::select! {
+                    m = session.read_message() => m?,
+                    changed = rx.changed() => {
+                        // Sender dropped (entry/coordinator gone) → end the session cleanly.
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                        let want = *rx.borrow();
+                        if want != unchoked {
+                            unchoked = want;
+                            session
+                                .send(&if want { PeerMessage::Unchoke } else { PeerMessage::Choke })
+                                .await?;
+                            if debug {
+                                crate::swarm_log!(
+                                    "[seed-session] -> {}",
+                                    if want { "Unchoke" } else { "Choke" }
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                session.read_message().await?
+            };
             if debug {
                 crate::swarm_log!("[seed-session] <- {}", seed_message_summary(&msg));
             }
@@ -109,14 +155,26 @@ impl SeederSession {
                         }
                     }
                 }
-                PeerMessage::Interested if !unchoked => {
-                    session.send(&PeerMessage::Unchoke).await?;
-                    unchoked = true;
-                    if debug {
-                        crate::swarm_log!("[seed-session] -> Unchoke");
+                PeerMessage::Interested => {
+                    match (&coordinator, peer_id) {
+                        (Some(c), Some(id)) => c.set_interested(id, true),
+                        _ => {
+                            if !unchoked {
+                                session.send(&PeerMessage::Unchoke).await?;
+                                unchoked = true;
+                                if debug {
+                                    crate::swarm_log!("[seed-session] -> Unchoke");
+                                }
+                            }
+                        }
                     }
                 }
-                PeerMessage::Unknown { id: 6, payload } if payload.len() >= 10 => {
+                PeerMessage::NotInterested => {
+                    if let (Some(c), Some(id)) = (&coordinator, peer_id) {
+                        c.set_interested(id, false);
+                    }
+                }
+                PeerMessage::Unknown { id: 6, payload } if payload.len() >= 10 && unchoked => {
                     // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
                     if let Some(store) = &store {
                         let piece =
@@ -478,6 +536,7 @@ mod tests {
                 [0u8; 8],
                 &identity,
                 [127, 0, 0, 1],
+                None,
             )
             .await
         });
@@ -531,6 +590,7 @@ mod tests {
                 [0u8; 8],
                 &identity,
                 [127, 0, 0, 1],
+                None,
             )
             .await;
         });
@@ -574,6 +634,7 @@ mod tests {
                 [0u8; 8],
                 &identity,
                 [127, 0, 0, 1],
+                None,
             )
             .await;
         });
@@ -642,6 +703,7 @@ mod tests {
                 [0u8; 8],
                 &identity,
                 [127, 0, 0, 1],
+                None,
             )
             .await;
         });
@@ -688,6 +750,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_gated_serve_unchokes_only_when_chosen() {
+        use tokio::time::timeout;
+
+        let store = Arc::new(Mutex::new(PieceStore::new(4, 4, 1024)));
+        store.lock().await.put_chunk(5, 0, &[9, 9, 9, 9]);
+
+        let coord = ServeCoordinator::new(1);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let identity = Identity::generate();
+        let mut server_session = PeerSession::new(server);
+        let mut client_session = PeerSession::new(client);
+
+        let srv = tokio::spawn(async move {
+            SeederSession::serve(
+                &mut server_session,
+                Some(store),
+                None,
+                [0u8; 8],
+                &identity,
+                [0, 0, 0, 0],
+                Some(coord),
+            )
+            .await
+        });
+
+        // Signed extended handshake first, as always.
+        let msg = timeout(Duration::from_millis(500), client_session.read_message())
+            .await
+            .expect("timed out waiting for extended handshake")
+            .unwrap();
+        assert!(matches!(msg, PeerMessage::Extended { ext_id: 0, .. }));
+
+        // The peer's own extended handshake triggers the live-bitfield advertisement.
+        client_session
+            .send(&PeerMessage::Extended {
+                ext_id: 0,
+                payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+            })
+            .await
+            .unwrap();
+        let msg = timeout(Duration::from_millis(500), client_session.read_message())
+            .await
+            .expect("timed out waiting for bitfield")
+            .unwrap();
+        assert!(matches!(msg, PeerMessage::Bitfield(_)));
+
+        client_session
+            .send(&PeerMessage::Interested)
+            .await
+            .unwrap();
+        let msg = timeout(Duration::from_millis(500), client_session.read_message())
+            .await
+            .expect("timed out waiting for Unchoke")
+            .unwrap();
+        assert_eq!(
+            msg,
+            PeerMessage::Unchoke,
+            "the lone interested peer, chosen by the coordinator under max_unchoked=1, must be unchoked"
+        );
+
+        srv.abort();
+    }
+
+    #[tokio::test]
     async fn serves_a_requested_chunk_from_the_store() {
         // Store holds piece 5, chunk 0 = [9,9,9,9] (geometry: 4-byte chunks, 1 chunk/piece).
         let store = Arc::new(Mutex::new(PieceStore::new(4, 4, 1024)));
@@ -722,6 +848,7 @@ mod tests {
                 [0u8; 8],
                 &identity,
                 [127, 0, 0, 1],
+                None,
             )
             .await;
         });
@@ -772,6 +899,7 @@ mod tests {
                 [0u8; 8],
                 &identity,
                 [127, 0, 0, 1],
+                None,
             )
             .await;
         });
