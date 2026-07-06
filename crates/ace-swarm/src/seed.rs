@@ -323,8 +323,8 @@ fn hex_preview(bytes: &[u8]) -> String {
 /// Decides which interested peers to unchoke. Live-appropriate: unchoke up to `max_unchoked`
 /// interested peers (stable order) plus one rotating "optimistic" peer so newcomers get a turn.
 ///
-/// S2: invoked by the multi-peer serve coordinator. The S1 reciprocal path serves a single
-/// peer and unchokes it inline, so this policy has no production caller yet.
+/// S2: invoked by the multi-peer [`ServeCoordinator`] on every recompute. The S1 reciprocal path
+/// serves a single peer and unchokes it inline, so it does not use this policy.
 pub struct Choker {
     max_unchoked: usize,
 }

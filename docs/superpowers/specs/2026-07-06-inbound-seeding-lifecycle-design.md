@@ -265,6 +265,15 @@ change.
   legacy serve path never re-choked, so this was previously unreachable. **File as a follow-up**
   (leech-side robustness; orthogonal to inbound serving). Mitigations: reset the leech's
   requested-set on `Choke` and re-request on `Unchoke`, or adopt a sticky-unchoke policy for live.
+- **Coordinator rechoke-detachment on entry eviction (edge, surfaced by the final review).** The
+  coordinator lives in the `SeedEntry`, but a `SeederSession` mid-serve holds its own `Arc` clone,
+  so evicting the entry does not drop the coordinator under a live session (no hang/crash). It does
+  mean `rechoke_all` (which iterates entries still in the map) stops rotating that orphaned
+  coordinator's optimistic slot: peers still connected through a just-evicted stream's coordinator
+  keep working for interest/join/leave but stop getting the ~10s rotation. Only reachable during
+  teardown (the producer is already gone, so the stream is ending and no new peers can join), so it
+  is a minor fairness edge, not corruption. Left as a follow-up rather than complicating the entry
+  lifetime model.
 - #16 (richer `Choker` fairness beyond what this coordinator exercises) — this design wires the
   existing policy; #16 can extend it.
 - #18 (seeder reject messages for choked/missing chunks) — same serve path, separate change.

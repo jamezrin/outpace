@@ -97,7 +97,13 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_PREFETCH_PIECES` - pieces behind the live edge to start at, default `8`.
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
-- `OUTPACE_MAX_UNCHOKED` - accepted config knob for future multi-peer S2 policy.
+- `OUTPACE_MAX_UNCHOKED` - max simultaneously-unchoked peers per served stream (default 8). Wired
+  into the inbound serve path via the per-infohash serve coordinator: each stream unchokes up to
+  this many interested peers plus one rotating optimistic slot (rotated on a ~10s rechoke tick).
+- `OUTPACE_SEED_TTL_SECS` - idle-TTL (seconds, default 300; 0 disables) after which an *ownerless*
+  seed-registry entry (one with no live producer lease) is force-evicted by the reaper. A backstop
+  only — normal teardown rides the lease drop, and entries held by a live producer or a broadcast
+  are never reaped.
 - `OUTPACE_MAX_INBOUND` - inbound peer connection limit.
 - `OUTPACE_ENABLE_SEEDING` - reciprocal upload gate over outbound leech connections
   (answering peers' chunk requests). Self-announce is gated on `OUTPACE_ENABLE_INBOUND`.
