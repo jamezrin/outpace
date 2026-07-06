@@ -814,6 +814,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_gated_serve_keeps_a_non_chosen_peer_choked() {
+        use tokio::time::timeout;
+
+        // max_unchoked = 0: no guaranteed slot; `Choker::choose` fills only the single rotating
+        // optimistic slot, which at tick 0 goes to the FIRST interested peer. Peer A becomes
+        // interested first (and is fully driven to its Unchoke before B even sends Interested), so
+        // A deterministically holds the optimistic slot and B must stay choked over the real wire.
+        let coord = ServeCoordinator::new(0);
+
+        // Spin up one serve session and drive its client past the handshake to the point where the
+        // next message the seeder would send is the Choke/Unchoke reaction to interest. Returns the
+        // client session with A/B's own extended handshake already exchanged and bitfield consumed.
+        async fn drive_to_interest_ready(
+            coord: Arc<ServeCoordinator>,
+        ) -> (
+            PeerSession<tokio::io::DuplexStream>,
+            tokio::task::JoinHandle<Result<()>>,
+        ) {
+            let store = Arc::new(Mutex::new(PieceStore::new(4, 4, 1024)));
+            store.lock().await.put_chunk(5, 0, &[9, 9, 9, 9]);
+            let identity = Identity::generate();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let mut server_session = PeerSession::new(server);
+            let mut client_session = PeerSession::new(client);
+
+            let srv = tokio::spawn(async move {
+                SeederSession::serve(
+                    &mut server_session,
+                    Some(store),
+                    None,
+                    [0u8; 8],
+                    &identity,
+                    [0, 0, 0, 0],
+                    Some(coord),
+                )
+                .await
+            });
+
+            let msg = timeout(Duration::from_millis(500), client_session.read_message())
+                .await
+                .expect("timed out waiting for extended handshake")
+                .unwrap();
+            assert!(matches!(msg, PeerMessage::Extended { ext_id: 0, .. }));
+            client_session
+                .send(&PeerMessage::Extended {
+                    ext_id: 0,
+                    payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+                })
+                .await
+                .unwrap();
+            let msg = timeout(Duration::from_millis(500), client_session.read_message())
+                .await
+                .expect("timed out waiting for bitfield")
+                .unwrap();
+            assert!(matches!(msg, PeerMessage::Bitfield(_)));
+
+            (client_session, srv)
+        }
+
+        // Bring A fully up and INTERESTED first, and confirm it is unchoked — so A deterministically
+        // occupies the sole optimistic slot before B expresses any interest.
+        let (mut a, srv_a) = drive_to_interest_ready(coord.clone()).await;
+        a.send(&PeerMessage::Interested).await.unwrap();
+        let msg = timeout(Duration::from_millis(500), a.read_message())
+            .await
+            .expect("timed out waiting for peer A's Unchoke")
+            .unwrap();
+        assert_eq!(
+            msg,
+            PeerMessage::Unchoke,
+            "peer A holds the single optimistic slot and must be unchoked"
+        );
+
+        // Now bring B up and interested. With A already in the optimistic slot, B is beyond capacity
+        // and must NOT be unchoked — assert no Unchoke arrives within a generous window.
+        let (mut b, srv_b) = drive_to_interest_ready(coord.clone()).await;
+        b.send(&PeerMessage::Interested).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            match timeout(deadline - tokio::time::Instant::now(), b.read_message()).await {
+                Err(_) => break, // window elapsed with no Unchoke — the choked peer stayed choked.
+                Ok(Ok(PeerMessage::Unchoke)) => {
+                    panic!("peer B is beyond capacity (max_unchoked=0) and must stay choked");
+                }
+                Ok(Ok(_)) => continue, // ignore any other frame the seeder may emit
+                Ok(Err(_)) => break,   // stream closed — also no Unchoke observed.
+            }
+        }
+
+        srv_a.abort();
+        srv_b.abort();
+    }
+
+    #[tokio::test]
     async fn serves_a_requested_chunk_from_the_store() {
         // Store holds piece 5, chunk 0 = [9,9,9,9] (geometry: 4-byte chunks, 1 chunk/piece).
         let store = Arc::new(Mutex::new(PieceStore::new(4, 4, 1024)));
