@@ -75,6 +75,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_MAX_INBOUND") {
         config.max_inbound_peers = v.parse()?;
     }
+    if let Ok(v) = std::env::var("OUTPACE_SEED_TTL_SECS") {
+        config.seed_ttl_secs = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_ENABLE_SEEDING") {
         config.enable_seeding = matches!(v.as_str(), "1" | "true");
     }
@@ -184,6 +187,21 @@ pub async fn build_runtime(
 
     let manager = StreamManager::with_buffer(registry, config.session_buffer);
     manager.spawn_reaper();
+    if config.seed_ttl_secs > 0 {
+        let seed_registry_reap = seed_registry.clone();
+        let ttl = std::time::Duration::from_secs(config.seed_ttl_secs);
+        tokio::spawn(async move {
+            // Sweep at a fraction of the TTL so an idle entry is reclaimed within ~1.25x the TTL.
+            let interval = (ttl / 4).max(std::time::Duration::from_secs(5));
+            loop {
+                tokio::time::sleep(interval).await;
+                let n = seed_registry_reap.reap(ttl);
+                if n > 0 {
+                    crate::alog!("[seed] reaped {n} idle leech registry entr(y/ies)");
+                }
+            }
+        });
+    }
     let broadcasts = BroadcastState {
         registry: BroadcastRegistry::with_persist(
             &config.data_dir,

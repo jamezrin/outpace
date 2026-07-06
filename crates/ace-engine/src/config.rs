@@ -50,6 +50,10 @@ pub struct Config {
     pub max_unchoked: usize,
     /// Max concurrent inbound peer connections accepted by the listener.
     pub max_inbound_peers: usize,
+    /// Idle-TTL (seconds) after which a leech `SeedRegistry` entry with a leaked producer lease is
+    /// force-evicted by the reaper. Broadcasts are exempt. Backstop only — normal teardown rides
+    /// the lease. `OUTPACE_SEED_TTL_SECS`.
+    pub seed_ttl_secs: u64,
     /// Reciprocal upload over connections we initiate (S1): answering a peer's
     /// `Interested`/chunk-requests and advertising `Have` for newly-completed pieces.
     pub enable_seeding: bool,
@@ -85,6 +89,7 @@ impl Default for Config {
             session_buffer: 256,
             max_unchoked: 8,
             max_inbound_peers: 64,
+            seed_ttl_secs: 300,
             enable_seeding: true,
             enable_inbound: true,
             experimental_ace_compat: false,
@@ -178,5 +183,10 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.cache_type, CacheType::Memory);
         assert_eq!(c.cache_dir, c.data_dir.join("cache"));
+    }
+
+    #[test]
+    fn default_seed_ttl_is_300s() {
+        assert_eq!(Config::default().seed_ttl_secs, 300);
     }
 }

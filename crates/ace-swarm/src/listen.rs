@@ -21,6 +21,13 @@ fn next_generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Per-infohash store, shared with whatever feeds pieces (a download loop, a broadcast source).
 type SharedStore = Arc<Mutex<PieceStore>>;
 
@@ -49,6 +56,9 @@ struct SeedEntry {
     /// different entry that reused the key. `Default` gives 0, but entries are never created via
     /// bare `or_default()`; always `or_insert_with(|| SeedEntry { generation: next_generation(), .. })`.
     generation: u64,
+    /// Millis-since-epoch timestamp of the last activity (creation or `get`), used by the
+    /// idle-TTL reaper to decide whether a `Leech` entry has been abandoned.
+    last_active: u64,
 }
 
 /// Maps infohash -> the store and/or metadata we'd serve. Entry lifetime is anchored by
@@ -133,6 +143,7 @@ impl SeedRegistry {
             .get_or_insert_with(|| Arc::new(Mutex::new(make())))
             .clone();
         entry.producers += 1;
+        entry.last_active = now_millis();
         let lease = SeedLease {
             registry: Arc::downgrade(&self.stores),
             keys: vec![(infohash, entry.generation)],
@@ -164,6 +175,7 @@ impl SeedRegistry {
             });
             entry.producers += 1;
             entry.kind = OwnerKind::Broadcast;
+            entry.last_active = now_millis();
             let store = entry
                 .store
                 .get_or_insert_with(|| Arc::new(Mutex::new(make())))
@@ -178,6 +190,7 @@ impl SeedRegistry {
             meta_entry.producers += 1;
             meta_entry.kind = OwnerKind::Broadcast;
             meta_entry.metadata = Some(Arc::new(metadata));
+            meta_entry.last_active = now_millis();
             meta_entry.generation
         };
         let lease = SeedLease {
@@ -187,9 +200,13 @@ impl SeedRegistry {
         (store, lease)
     }
 
-    /// The store for `infohash`, if we serve it.
+    /// The store for `infohash`, if we serve it. Touches the entry's activity clock (used by the
+    /// idle-TTL reaper) so an actively-served stream is never reaped.
     pub fn get(&self, infohash: &[u8; 20]) -> Option<SharedStore> {
-        self.stores.lock().unwrap().get(infohash)?.store.clone()
+        let mut map = self.stores.lock().unwrap();
+        let entry = map.get_mut(infohash)?;
+        entry.last_active = now_millis();
+        entry.store.clone()
     }
 
     /// The BEP-9 metadata for `key`, if we serve it.
@@ -206,6 +223,20 @@ impl SeedRegistry {
     /// and any registered metadata under it. Idempotent — removing an absent key is a no-op.
     pub fn remove(&self, key: &[u8; 20]) {
         self.stores.lock().unwrap().remove(key);
+    }
+
+    /// Force-evict `Leech` entries idle for longer than `ttl` (a leaked-lease backstop; `Broadcast`
+    /// entries are operator-controlled and exempt). Returns how many entries were removed. The
+    /// primary teardown path is `SeedLease` drop; this only catches producers that never dropped.
+    pub fn reap(&self, ttl: std::time::Duration) -> usize {
+        let now = now_millis();
+        let ttl_ms = ttl.as_millis() as u64;
+        let mut map = self.stores.lock().unwrap();
+        let before = map.len();
+        map.retain(|_, e| {
+            e.kind == OwnerKind::Broadcast || now.saturating_sub(e.last_active) < ttl_ms
+        });
+        before - map.len()
     }
 }
 
@@ -442,5 +473,37 @@ mod tests {
             reg.serves(&ih),
             "stale lease drop must not touch the reborn entry"
         );
+    }
+
+    #[test]
+    fn reaper_evicts_idle_leech_entries_but_spares_broadcasts() {
+        let reg = SeedRegistry::new();
+        let leech = [1u8; 20];
+        let bcast_ih = [2u8; 20];
+        let bcast_cid = [3u8; 20];
+        // Leak the leases so only the reaper can reclaim them.
+        std::mem::forget(reg.lease_store(leech, || PieceStore::new(4, 4, 1024)).1);
+        std::mem::forget(
+            reg.lease_broadcast(bcast_ih, bcast_cid, vec![9], || PieceStore::new(4, 4, 1024))
+                .1,
+        );
+
+        // A zero TTL makes every entry "idle now".
+        let evicted = reg.reap(std::time::Duration::from_secs(0));
+        assert_eq!(evicted, 1, "exactly the leech entry is reaped");
+        assert!(!reg.serves(&leech), "idle leech entry evicted");
+        assert!(reg.serves(&bcast_ih), "broadcast infohash exempt");
+        assert!(reg.serves(&bcast_cid), "broadcast content_id exempt");
+    }
+
+    #[test]
+    fn get_touches_last_active_so_a_served_entry_is_not_reaped() {
+        let reg = SeedRegistry::new();
+        let ih = [8u8; 20];
+        std::mem::forget(reg.lease_store(ih, || PieceStore::new(4, 4, 1024)).1);
+        let _ = reg.get(&ih); // touch
+        let evicted = reg.reap(std::time::Duration::from_secs(3600));
+        assert_eq!(evicted, 0);
+        assert!(reg.serves(&ih));
     }
 }
