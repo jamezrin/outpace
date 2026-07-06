@@ -438,9 +438,9 @@ git commit -m "ace-swarm: SeedRegistry producer refcount + SeedLease"
 ## Task 4: Leech loop holds a SeedLease
 
 **Files:**
-- Modify: `crates/ace-engine/src/ace_provider.rs` (`follow_live` store acquisition near line 1326)
+- Modify: `crates/ace-engine/src/ace_provider.rs` (`follow_live` + `follow_peer_pool`)
 
-**Context:** `follow_live` currently does `let store = seed.registry.get_or_create(info.infohash, || build_piece_store(...))`. The store is used for the whole loop. Holding the lease for the loop's lifetime and dropping it on return is the leak fix.
+**Context:** IMPORTANT structural correction to the original plan: the `get_or_create` call is **not** directly in `follow_live` — it lives inside `follow_peer_pool`, which `follow_live` calls *fresh on every reconnect cycle* of its `loop`. `get_or_create` is idempotent, so it returns the *same* store across reconnects and thereby preserves buffered pieces. Therefore the lease must be acquired **once in `follow_live` before its `loop`**, and the store threaded into `follow_peer_pool` as a parameter (removing its internal `get_or_create`). Leasing inside `follow_peer_pool` would drop the lease every reconnect → evict + rebuild an empty store → lose all buffered pieces (a real regression). (Note: a dead `follow_one_peer`, `#[allow(dead_code)]`, also calls `get_or_create` — leave it; `broadcast.rs` still uses it until Task 5.)
 
 - [ ] **Step 1: Write the failing test** — add to the `ace_provider.rs` tests module:
 
@@ -464,7 +464,7 @@ async fn leech_lease_evicts_registry_entry_when_dropped() {
 Run: `cargo test -p ace-engine leech_lease_evicts_registry_entry_when_dropped`
 Expected: PASS (this asserts the Task 3 API from the engine crate). If it fails to compile, ensure `PieceStore` and `SeedRegistry` are reachable (`ace_swarm::store::PieceStore`, `ace_swarm::listen::SeedRegistry`).
 
-- [ ] **Step 3: Wire `follow_live`** — replace the store acquisition at `ace_provider.rs:1326`:
+- [ ] **Step 3: Wire `follow_live`** — acquire the lease **once, before the `loop`** in `follow_live`:
 
 ```rust
     let (store, _seed_lease) = seed.registry.lease_store(info.infohash, || {
@@ -479,7 +479,9 @@ Expected: PASS (this asserts the Task 3 API from the engine crate). If it fails 
     });
 ```
 
-The `_seed_lease` binding lives until `follow_live` returns (when the consumer drops the `AceSource` receiver → the download task ends), at which point its `Drop` evicts the registry entry. Do **not** drop it early or bind it to `_` (which drops immediately). Confirm no `return`/`?` path in `follow_live` moves `store` out in a way that shortens the lease — the lease is independent of `store`, so any early return still drops it correctly.
+Then add a `store: &Arc<Mutex<PieceStore>>` parameter to `follow_peer_pool`, **delete** its internal `get_or_create` block, and pass `&store` at the single call site inside `follow_live`'s loop. `store` was an owned `Arc` inside `follow_peer_pool`; it becomes `&Arc`, so add `.clone()` where an owned handle is moved out (e.g. into peer tasks).
+
+The `_seed_lease` binding lives until `follow_live` returns (when the consumer drops the `AceSource` receiver → the download task ends), at which point its `Drop` evicts the registry entry. Bind it to `_seed_lease` (leading underscore), **never** bare `_` (drops immediately). The store is now created once up front (slightly earlier than before — before the first connect — which is harmless: an empty store just becomes servable a bit sooner).
 
 - [ ] **Step 4: Run the gates**
 
