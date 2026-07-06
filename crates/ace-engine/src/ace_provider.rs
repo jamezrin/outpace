@@ -7,6 +7,7 @@
 //! resolution first uses the official signed catalog path, with BEP-9 `ut_metadata` as a
 //! fallback (see [`ace_swarm::resolve`]); the infohash form works directly.
 
+use crate::config::CacheType;
 use crate::provider::{ProviderError, SourceStats, StreamProvider, TsSource};
 use ace_peer::session::{connect, PeerSession};
 use ace_swarm::dht::dht_announce_peer;
@@ -21,7 +22,6 @@ use ace_swarm::resolve::{
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
 use ace_swarm::types::StreamInfo;
-use crate::config::CacheType;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
@@ -112,10 +112,10 @@ const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Build a [`PieceStore`] for `infohash` honoring the configured cache backend. In disk mode the
 /// store lives under `<cache_dir>/<infohash_hex>-<generation>`, where `generation` is a
-/// process-unique counter so each store instance owns a private directory no other instance can
-/// touch (its `Drop` removes exactly that dir — see `DiskBackend`). If the directory cannot be
-/// prepared (an unexpected mid-run I/O error — the common misconfiguration is caught at startup)
-/// we log and fall back to a memory store so a live stream keeps serving rather than dying.
+/// process-unique counter so each store instance owns a private directory — a stale store instance
+/// can never clobber a re-created same-infohash store's data. If the directory cannot be prepared
+/// (an unexpected mid-run I/O error — the common misconfiguration is caught at startup) we log and
+/// fall back to a memory store so a live stream keeps serving rather than dying.
 pub(crate) fn build_piece_store(
     piece_length: u64,
     chunk_length: u64,
@@ -151,11 +151,12 @@ pub(crate) fn build_piece_store(
 fn disk_store_subdir(infohash: &[u8; 20]) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static GENERATION: AtomicU64 = AtomicU64::new(0);
-    let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{gen}", infohash_hex(infohash))
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{generation}", infohash_hex(infohash))
 }
 
-/// Lowercase hex of a 20-byte infohash, used as the per-stream disk cache subdirectory name.
+/// Lowercase hex of a 20-byte infohash; the readable prefix of the per-instance disk cache
+/// subdirectory name (`<infohash_hex>-<generation>`).
 pub(crate) fn infohash_hex(infohash: &[u8; 20]) -> String {
     use std::fmt::Write;
     infohash.iter().fold(String::with_capacity(40), |mut s, b| {
@@ -320,7 +321,13 @@ impl AceProvider {
         }
 
         let all = if self.bootstrap_peers.is_empty() {
-            discover_peers(&self.default_trackers, &key, &random_peer_id(), self.peer_port).await
+            discover_peers(
+                &self.default_trackers,
+                &key,
+                &random_peer_id(),
+                self.peer_port,
+            )
+            .await
         } else {
             self.bootstrap_peers.clone()
         };
@@ -403,7 +410,13 @@ impl StreamProvider for AceProvider {
         // Bootstrap peers are the proven/direct path and must be tried without waiting for
         // tracker/DHT discovery. Background refill can still discover more peers after start.
         let peers = if self.bootstrap_peers.is_empty() {
-            discover_peers(&info.trackers, &info.infohash, &random_peer_id(), self.peer_port).await
+            discover_peers(
+                &info.trackers,
+                &info.infohash,
+                &random_peer_id(),
+                self.peer_port,
+            )
+            .await
         } else {
             self.bootstrap_peers.clone()
         };
@@ -2330,7 +2343,11 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(dirs.len(), 2, "each store instance owns its own dir: {dirs:?}");
+        assert_eq!(
+            dirs.len(),
+            2,
+            "each store instance owns its own dir: {dirs:?}"
+        );
         assert!(
             dirs.iter().all(|d| d.starts_with(&infohash_hex(&ih))),
             "dir names keep the readable infohash prefix: {dirs:?}"

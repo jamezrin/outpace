@@ -147,11 +147,17 @@ pub async fn build_runtime(
     if config.cache_type == CacheType::Disk {
         if config.cache_dir.exists() {
             std::fs::remove_dir_all(&config.cache_dir).map_err(|e| {
-                format!("cannot clear OUTPACE_CACHE_DIR {}: {e}", config.cache_dir.display())
+                format!(
+                    "cannot clear OUTPACE_CACHE_DIR {}: {e}",
+                    config.cache_dir.display()
+                )
             })?;
         }
         std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
-            format!("cannot create OUTPACE_CACHE_DIR {}: {e}", config.cache_dir.display())
+            format!(
+                "cannot create OUTPACE_CACHE_DIR {}: {e}",
+                config.cache_dir.display()
+            )
         })?;
     }
 
@@ -200,7 +206,10 @@ pub async fn build_runtime(
         .reload_persisted(&broadcasts.seed_registry, broadcasts.store_bytes)
         .await;
     if !reloaded.is_empty() {
-        crate::alog!("[broadcast] reloaded {} persisted broadcast(s)", reloaded.len());
+        crate::alog!(
+            "[broadcast] reloaded {} persisted broadcast(s)",
+            reloaded.len()
+        );
     }
     for bc in &reloaded {
         broadcasts.spawn_announce(bc);
@@ -409,7 +418,10 @@ mod tests {
         std::env::set_var("OUTPACE_CACHE_DIR", "/tmp/outpace-cache-test");
         let c = config_from_env().unwrap();
         assert_eq!(c.cache_type, CacheType::Disk);
-        assert_eq!(c.cache_dir, std::path::PathBuf::from("/tmp/outpace-cache-test"));
+        assert_eq!(
+            c.cache_dir,
+            std::path::PathBuf::from("/tmp/outpace-cache-test")
+        );
         std::env::remove_var("OUTPACE_CACHE_TYPE");
         std::env::remove_var("OUTPACE_CACHE_DIR");
     }
@@ -459,8 +471,15 @@ mod tests {
         let runtime = build_runtime(config, vec![]).await.unwrap();
 
         let reloaded = runtime.broadcasts.registry.get("news").await;
-        assert!(reloaded.is_some(), "persisted broadcast reloaded into the registry");
-        assert_eq!(reloaded.unwrap().infohash, infohash, "identity survives restart");
+        assert!(
+            reloaded.is_some(),
+            "persisted broadcast reloaded into the registry"
+        );
+        assert_eq!(
+            reloaded.unwrap().infohash,
+            infohash,
+            "identity survives restart"
+        );
         assert!(
             runtime.seed_registry.serves(&infohash),
             "reloaded broadcast is immediately servable"
