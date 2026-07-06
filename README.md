@@ -101,8 +101,13 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_MAX_INBOUND` - inbound peer connection limit.
 - `OUTPACE_ENABLE_SEEDING` - reciprocal upload gate over outbound leech connections
   (answering peers' chunk requests). Self-announce is gated on `OUTPACE_ENABLE_INBOUND`.
-- `OUTPACE_ENABLE_INBOUND` - inbound peer listener gate; on by default (matching
-  the Acestream engine's full P2P participation). Set `0` for a pure leecher.
+- `OUTPACE_ENABLE_INBOUND` (default: on) - inbound peer serving (S2) gate. On by default,
+  intentionally matching the Acestream engine's out-of-the-box behavior: a full P2P participant
+  that binds its peer port (`OUTPACE_PEER_LISTEN`), accepts inbound peers, seeds, and
+  self-announces to trackers + DHT. Only the HTTP API (`OUTPACE_BIND`) stays on localhost by
+  default; the exposed surface is the peer port, as with Acestream. Set
+  `OUTPACE_ENABLE_INBOUND=0` for a pure-leecher deployment (no inbound listener, no seeder
+  self-announce).
 - `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - enables legacy compatibility routes.
 - `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
 
