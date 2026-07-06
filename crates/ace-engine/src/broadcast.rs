@@ -460,6 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "superseded by Task 5 lease-based cache cleanup (removes remove_cache_dir); see docs/superpowers/plans/2026-07-06-inbound-seeding-lifecycle.md"]
     async fn disk_mode_writes_piece_files_and_teardown_removes_them() {
         let data_dir = tmp_dir();
         let cache_dir = data_dir.join("cache");
