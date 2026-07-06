@@ -256,6 +256,15 @@ change.
 
 ## Out of scope / follow-ups
 
+- **Leech re-request after a mid-stream unchoke (NEW — surfaced by the Task 10 review).** The
+  coordinator can now `Choke` a peer that was previously unchoked (optimistic-slot rotation, or
+  swarm churn changing the interested set). Our own leech logic (`ace-swarm/src/live.rs` one-shot
+  `requested` flag; `driver.rs` `Scheduler.requested` never reset on `Choke`) requests each chunk
+  exactly once and never re-requests after a later `Unchoke`, so a peer running this codebase that
+  gets re-choked mid-download can stall on the chunks it requested during the choke window. The
+  legacy serve path never re-choked, so this was previously unreachable. **File as a follow-up**
+  (leech-side robustness; orthogonal to inbound serving). Mitigations: reset the leech's
+  requested-set on `Choke` and re-request on `Unchoke`, or adopt a sticky-unchoke policy for live.
 - #16 (richer `Choker` fairness beyond what this coordinator exercises) — this design wires the
   existing policy; #16 can extend it.
 - #18 (seeder reject messages for choked/missing chunks) — same serve path, separate change.
