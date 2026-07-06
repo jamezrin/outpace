@@ -161,3 +161,52 @@ impl DiskBackend {
         Some(entry.present.values().map(|&len| len as u64).sum())
     }
 }
+
+impl Drop for DiskBackend {
+    /// Remove this store's private directory. Because the owning `PieceStore` is `Arc`-shared,
+    /// this runs only when the last holder (registry entry, in-flight seed peers, ingest) releases
+    /// it — so a live writer can never resurrect a dir after teardown, and the per-instance
+    /// `-<generation>` name means we only ever delete our own data. Best-effort: a failed unlink is
+    /// logged, not fatal. Sync I/O (v1 tradeoff, see module header / #37).
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                crate::swarm_log!("[cache] disk cleanup failed for {}: {e}", self.dir.display());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_backend_removes_its_directory() {
+        let tmp = std::env::temp_dir().join(format!("outpace-diskdrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join("aabb-0");
+        {
+            let mut b = DiskBackend::new(dir.clone(), 4).unwrap();
+            b.put(0, 0, [0u8; 8], b"data");
+            assert!(dir.exists(), "dir exists while backend is alive");
+        }
+        assert!(!dir.exists(), "dir is removed when the backend drops");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dropping_one_backend_does_not_touch_another_infohash_generation() {
+        let tmp = std::env::temp_dir().join(format!("outpace-diskdrop2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir_a = tmp.join("aabb-0");
+        let dir_b = tmp.join("aabb-1"); // same infohash, newer generation
+        let b_new = DiskBackend::new(dir_b.clone(), 4).unwrap();
+        {
+            let _b_old = DiskBackend::new(dir_a.clone(), 4).unwrap();
+        } // old drops here
+        assert!(dir_b.exists(), "the newer instance's dir survives the old one's Drop");
+        drop(b_new);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
