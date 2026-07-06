@@ -73,6 +73,13 @@ impl DiskBackend {
             // Best-effort, non-fatal: drop the chunk and leave accounting untouched. The index is
             // not updated, so the chunk simply reads back as absent.
             crate::swarm_log!("[cache] disk write failed for piece {piece} chunk {chunk}: {e}");
+            // `.create(true)` may have made the file before the write failed. If this piece has no
+            // index entry yet, that file is untracked — eviction (index-driven) would never reclaim
+            // it — so remove it now. A piece already in the index keeps its file (it holds valid
+            // earlier chunks).
+            if !self.index.contains_key(&piece) {
+                let _ = std::fs::remove_file(self.piece_path(piece));
+            }
             return Stored::default();
         }
         let entry = self.index.entry(piece).or_insert_with(|| PieceIndex {
@@ -95,13 +102,26 @@ impl DiskBackend {
     }
 
     pub(super) fn get(&self, piece: u64, chunk: u16) -> Option<Cow<'_, [u8]>> {
+        // A chunk absent from the index is a normal miss (evicted / never held) — stay quiet.
         let len = *self.index.get(&piece)?.present.get(&chunk)? as usize;
         let off = chunk as u64 * self.chunk_length;
-        let mut f = std::fs::File::open(self.piece_path(piece)).ok()?;
-        f.seek(SeekFrom::Start(off)).ok()?;
-        let mut buf = vec![0u8; len];
-        f.read_exact(&mut buf).ok()?;
-        Some(Cow::Owned(buf))
+        let read = || -> std::io::Result<Vec<u8>> {
+            let mut f = std::fs::File::open(self.piece_path(piece))?;
+            f.seek(SeekFrom::Start(off))?;
+            let mut buf = vec![0u8; len];
+            f.read_exact(&mut buf)?;
+            Ok(buf)
+        };
+        match read() {
+            Ok(buf) => Some(Cow::Owned(buf)),
+            // The index says this chunk is present (so it may already be advertised via `Have`),
+            // yet the disk read failed. Log it — a silent `None` here looks like an ordinary miss
+            // to the seeder but is really an unservable advertised piece.
+            Err(e) => {
+                crate::swarm_log!("[cache] disk read failed for present piece {piece} chunk {chunk}: {e}");
+                None
+            }
+        }
     }
 
     pub(super) fn header(&self, piece: u64) -> Option<[u8; 8]> {
@@ -128,12 +148,16 @@ impl DiskBackend {
         Some((min, max))
     }
 
-    pub(super) fn evict_lowest(&mut self) -> u64 {
-        let Some((&lowest, _)) = self.index.iter().next() else {
-            return 0;
-        };
+    pub(super) fn evict_lowest(&mut self) -> Option<u64> {
+        let (&lowest, _) = self.index.iter().next()?;
         let entry = self.index.remove(&lowest).expect("key just observed");
-        let _ = std::fs::remove_file(self.piece_path(lowest));
-        entry.present.values().map(|&len| len as u64).sum()
+        if let Err(e) = std::fs::remove_file(self.piece_path(lowest)) {
+            // The bytes are dropped from the budget regardless (the index entry is gone), but a
+            // failed unlink means they still occupy disk — surface it rather than leaking silently.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                crate::swarm_log!("[cache] disk evict failed to remove piece {lowest} file: {e}");
+            }
+        }
+        Some(entry.present.values().map(|&len| len as u64).sum())
     }
 }

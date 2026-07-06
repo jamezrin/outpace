@@ -96,8 +96,10 @@ impl Backend {
         }
     }
 
-    /// Evict the lowest-index piece; return the byte total it freed (0 if the store is empty).
-    fn evict_lowest(&mut self) -> u64 {
+    /// Evict the lowest-index piece; return the byte total it freed, or `None` if the store was
+    /// already empty. `Some(0)` (a zero-byte piece) is distinct from `None` so the eviction loop
+    /// keeps going until the store is actually empty rather than halting on a zero-byte piece.
+    fn evict_lowest(&mut self) -> Option<u64> {
         match self {
             Backend::Memory(m) => m.evict_lowest(),
             Backend::Disk(d) => d.evict_lowest(),
@@ -165,15 +167,15 @@ impl MemoryBackend {
         Some((min, max))
     }
 
-    fn evict_lowest(&mut self) -> u64 {
-        let Some((&lowest, _)) = self.pieces.iter().next() else {
-            return 0;
-        };
+    fn evict_lowest(&mut self) -> Option<u64> {
+        let (&lowest, _) = self.pieces.iter().next()?;
         let removed = self.pieces.remove(&lowest);
         self.headers.remove(&lowest);
-        removed
-            .map(|c| c.values().map(|d| d.len() as u64).sum())
-            .unwrap_or(0)
+        Some(
+            removed
+                .map(|c| c.values().map(|d| d.len() as u64).sum())
+                .unwrap_or(0),
+        )
     }
 }
 
@@ -240,10 +242,11 @@ impl PieceStore {
         self.cur_bytes -= stored.removed;
         self.cur_bytes += stored.added;
         while self.cur_bytes > self.max_bytes {
-            let freed = self.backend.evict_lowest();
-            if freed == 0 {
+            // Stop only when the store is empty (`None`); a zero-byte piece (`Some(0)`) must not
+            // halt eviction while real over-budget bytes remain in higher pieces.
+            let Some(freed) = self.backend.evict_lowest() else {
                 break;
-            }
+            };
             self.cur_bytes -= freed;
         }
     }
@@ -352,6 +355,21 @@ mod tests {
         s.put_chunk(3, 0, &[0; 4]); // evicts piece 2
         assert_eq!(s.chunk(1, 0).as_deref(), None);
         assert_eq!(s.chunk(2, 0).as_deref(), None);
+        assert_eq!(s.window(), Some((3, 3)));
+    }
+
+    #[test]
+    fn eviction_does_not_halt_on_a_zero_byte_lowest_piece() {
+        // budget = 4 bytes. Piece 1 holds a zero-length chunk (0 bytes); pieces 2 and 3 each hold
+        // a real 4-byte chunk. Adding piece 3 pushes over budget; eviction must skip past the
+        // zero-byte piece 1 and keep evicting real bytes, not stop at the Some(0) piece.
+        let mut s = store(4);
+        s.put_chunk(1, 0, &[]); // 0 bytes, creates piece 1
+        s.put_chunk(2, 0, &[0; 4]); // cur = 4 (at budget)
+        s.put_chunk(3, 0, &[0; 4]); // cur = 8 > 4 -> must evict down to <= 4
+        assert!(!s.has_piece(1), "zero-byte piece evicted, not skipped");
+        assert_eq!(s.chunk(1, 0).as_deref(), None);
+        assert_eq!(s.chunk(2, 0).as_deref(), None, "real bytes above it also evicted");
         assert_eq!(s.window(), Some((3, 3)));
     }
 
