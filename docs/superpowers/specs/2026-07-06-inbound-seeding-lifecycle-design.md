@@ -68,7 +68,7 @@ struct SeedEntry {
     coordinator: Option<Arc<ServeCoordinator>>, // section C
     producers: usize,
     kind: OwnerKind,
-    last_active: Arc<AtomicU64>, // millis; bumped on get()/writes (section B)
+    last_active: u64, // millis; set at creation, bumped on get() (section B)
 }
 ```
 
@@ -114,18 +114,28 @@ coordinator).
 ## B. Idle-TTL reaper — the backstop
 
 The lease refcount is the primary mechanism; the issue also asks for an eviction policy for
-"stale entries that cannot be tied to an active owner" (a producer that leaked its lease by
-getting stuck without dropping — Drop already runs on task abort/panic-unwind, so this is a
-true belt-and-suspenders).
+"stale entries that cannot be tied to an active owner." With leases, **every production entry is
+lease-created with `producers >= 1`** and is removed the instant its count hits 0 — so the only
+entries that can persist "untied to an active owner" are `producers == 0` orphans created outside
+the lease API (the legacy `register*`/`get_or_create` methods). The reaper targets exactly those.
 
-- Each entry carries `last_active: Arc<AtomicU64>` (millis since epoch), bumped cheaply on
-  `registry.get()` (inbound serve touch) and on store writes fed by the producer.
-- A periodic sweep (spawned in `build_runtime` / the listener, reusing a coarse cadence)
-  force-evicts **`Leech`-kind** entries whose `last_active` is older than a TTL
-  (`OUTPACE_SEED_TTL_SECS`, default e.g. 300s). `Broadcast`-kind entries are **exempt** —
-  their lifetime is operator-controlled (a broadcast with no active ingest and no peers must
-  stay servable/resumable until `DELETE`).
-- This bounds registry growth by an explicit, testable policy independent of the lease path.
+> **Design correction (during implementation):** the original draft had the reaper evict any idle
+> `Leech` entry keyed on `last_active`. That is unsound: the leech producer writes chunks straight
+> into its held store `Arc` and never re-touches the registry, so an idle-from-the-registry's-view
+> but actively-writing leech (its lease still held, `producers > 0`) would be wrongly evicted. The
+> corrected reaper only evicts **ownerless** (`producers == 0`) idle entries. A genuinely leaked
+> lease (a stuck task that holds `producers > 0` forever) is deliberately left alone — it cannot be
+> soundly distinguished from a slow-but-alive producer, and reaping it would not fix the stuck task.
+
+- Each entry carries a `last_active` millis stamp, set at creation and bumped on `registry.get()`
+  (the inbound serve touch), giving a fresh orphan a full TTL grace.
+- A periodic sweep (spawned in `build_runtime`) force-evicts entries that are **`Leech`-kind AND
+  `producers == 0` AND idle** beyond a TTL (`OUTPACE_SEED_TTL_SECS`, default 300s; 0 disables).
+  Owned entries (`producers > 0`) and all `Broadcast`-kind entries are **never** reaped —
+  broadcast lifetime is operator-controlled (servable/resumable until `DELETE`).
+- This bounds registry growth by an explicit, testable policy that can never evict a live producer.
+  In today's code no production path creates ownerless entries, so the reaper is a pure invariant
+  backstop (a no-op unless a future non-lease caller leaves an orphan).
 
 **Interaction with in-flight serves:** eviction removes the registry's strong `Arc`, but an
 inbound peer mid-serve holds its own clone; the store stays alive for that peer and is fully
@@ -223,8 +233,9 @@ change.
 - **Registry / leases:** lease drop at `producers == 0` removes the entry; two leases on one
   infohash keep it alive until both drop; broadcast lease drop removes **both** keys; `get` on
   a removed key is `None`.
-- **TTL reaper:** an idle `Leech` entry past the TTL is force-evicted; a `Broadcast` entry past
-  the TTL is exempt; `last_active` bumps on `get`.
+- **TTL reaper:** an idle **ownerless** (`producers == 0`) `Leech` entry past the TTL is
+  force-evicted; an owned (`producers > 0`) entry and a `Broadcast` entry are **not** reaped even
+  when idle; `last_active` bumps on `get`.
 - **Disk (#36):** disk store instance dir is `<infohash_hex>-<generation>`; `Drop` removes its
   own dir; two same-infohash instances have distinct dirs and one's `Drop` never deletes the
   other's; startup root wipe clears pre-existing orphans; after `DELETE` + ingest-Arc release

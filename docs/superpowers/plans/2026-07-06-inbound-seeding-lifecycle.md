@@ -771,7 +771,7 @@ git commit -m "ace-engine: broadcasts hold a SeedLease; drop bespoke remove_cach
 - Modify: `crates/ace-swarm/src/listen.rs` (`last_active` on entry; `touch` on `get`; `reap` method)
 - Test: `crates/ace-swarm/src/listen.rs` tests
 
-**Context:** The lease is the primary mechanism; this reaper force-evicts `Leech` entries idle beyond a TTL (a leaked lease). `Broadcast` entries are exempt.
+**Context:** The lease is the primary mechanism. **Design correction (applied during implementation):** the reaper must only force-evict **ownerless** (`producers == 0`) idle `Leech` entries — NOT any idle Leech entry. Reaping a `producers > 0` entry is unsound because the leech producer writes straight into its held store `Arc` without re-touching the registry, so an actively-writing leech would be wrongly evicted. Owned entries and `Broadcast` entries are never reaped. Since every production entry is lease-created (`producers >= 1`), the reaper is a pure orphan backstop (a no-op unless a non-lease caller leaves a `producers == 0` entry).
 
 - [ ] **Step 1: Write the failing test** — add to `listen.rs` tests:
 
@@ -1577,7 +1577,7 @@ git push -u origin feat/inbound-seeding-lifecycle
 gh pr create --title "Productize inbound seeding lifecycle & policy (#4, #36)" \
   --body "Implements #4 and folds in #36. See docs/superpowers/specs/2026-07-06-inbound-seeding-lifecycle-design.md.
 
-- SeedRegistry entries are refcounted by RAII SeedLease (leech loop + broadcasts); evicted on producer teardown, with an idle-TTL reaper backstop for leaked leases.
+- SeedRegistry entries are refcounted by RAII SeedLease (leech loop + broadcasts); evicted on producer teardown, with an idle-TTL reaper backstop that force-evicts only ownerless (producers==0) orphan entries.
 - Disk stores get a process-unique <infohash_hex>-<generation> dir and a Drop that removes it; cache root wiped on startup. Closes the DELETE-vs-ingest race and removes bespoke remove_cache_dir (#36).
 - max_unchoked wired via a per-infohash ServeCoordinator driving the existing Choker; SeederSession consults it instead of unchoking inline (unblocks #16).
 - enable_inbound stays ON, now documented as an intentional decision.
