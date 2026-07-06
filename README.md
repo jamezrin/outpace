@@ -92,8 +92,8 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_SEED_STORE_BYTES` - byte budget for retained piece data (sizes both cache backends).
 - `OUTPACE_CACHE_TYPE` - where the seed store keeps piece data: `memory` (default) or `disk`.
   `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
-- `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per infohash),
-  default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`.
+- `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per served stream; see
+  below), default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`.
 - `OUTPACE_PREFETCH_PIECES` - pieces behind the live edge to start at, default `8`.
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
@@ -109,8 +109,13 @@ Environment variables parsed by the daemon include:
 The disk cache is **ephemeral**: its directory is cleared when a store is created and
 never reloaded across restarts (live piece data goes stale), which also avoids serving
 evicted-stale pieces. Disk I/O is currently synchronous; a write failure logs and falls
-back to memory rather than crashing. A stopped broadcast's cache dir is removed on
-`DELETE /broadcast/{name}`.
+back to memory rather than crashing.
+
+In disk mode each served stream keeps its pieces under
+`<OUTPACE_CACHE_DIR>/<infohash_hex>-<generation>` (a process-unique suffix per store instance).
+The directory is removed automatically when the stream is torn down (leech consumer disconnects,
+broadcast `DELETE`, or process exit), and the whole cache root is wiped on startup, so no
+per-stream directories accumulate.
 
 ## Project Docs
 

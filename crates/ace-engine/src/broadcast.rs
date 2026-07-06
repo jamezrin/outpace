@@ -134,11 +134,19 @@ pub struct Broadcast {
     pub cursor: Arc<BroadcastCursor>,
 }
 
+/// A minted broadcast plus the `SeedLease` anchoring its `SeedRegistry` entries. The lease is kept
+/// out of the cloneable `Broadcast` (ingest holds a clone) so that removing this wrapper from
+/// `by_name` — and nothing else — evicts the registry entries.
+struct BroadcastEntry {
+    broadcast: Broadcast,
+    _lease: ace_swarm::listen::SeedLease,
+}
+
 /// Maps a human `{name}` (the ingest path segment) to its minted `Broadcast`. Separate from
 /// `SeedRegistry` (which is keyed by infohash, for the wire protocol) — this is the
 /// operator-facing name -> infohash lookup.
 pub struct BroadcastRegistry {
-    by_name: Mutex<BTreeMap<String, Broadcast>>,
+    by_name: Mutex<BTreeMap<String, BroadcastEntry>>,
     /// `None` disables persistence (unit tests / disk-less runs); `Some` reads and writes
     /// `<data_dir>/broadcasts/`.
     persist: Option<BroadcastPersist>,
@@ -175,16 +183,11 @@ impl BroadcastRegistry {
 
     /// The broadcast already minted under `name`, if any.
     pub async fn get(&self, name: &str) -> Option<Broadcast> {
-        self.by_name.lock().await.get(name).cloned()
-    }
-
-    /// Remove the on-disk piece cache for `infohash` (a no-op in memory mode). Best-effort; called
-    /// on broadcast teardown so a stopped broadcast does not leave its cache directory behind.
-    pub fn remove_cache_dir(&self, infohash: &[u8; 20]) {
-        if self.cache_type == CacheType::Disk {
-            let dir = self.cache_dir.join(crate::ace_provider::infohash_hex(infohash));
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        self.by_name
+            .lock()
+            .await
+            .get(name)
+            .map(|e| e.broadcast.clone())
     }
 
     /// Mint, resume-from-memory, or reload-from-disk the broadcast for `name`, and register its
@@ -205,14 +208,21 @@ impl BroadcastRegistry {
     ) -> (Broadcast, bool) {
         let mut map = self.by_name.lock().await;
         if let Some(existing) = map.get(name) {
-            return (existing.clone(), false);
+            return (existing.broadcast.clone(), false);
         }
         // Reload a persisted identity before minting a fresh one, so the infohash survives a
         // restart and the piece cursor continues.
         if let Some(persist) = &self.persist {
             if let Some(rec) = persist.load(name) {
-                if let Some(bc) = self.reconstruct(name, &rec, seed_registry, store_bytes) {
-                    map.insert(name.to_string(), bc.clone());
+                if let Some((bc, lease)) = self.reconstruct(name, &rec, seed_registry, store_bytes)
+                {
+                    map.insert(
+                        name.to_string(),
+                        BroadcastEntry {
+                            broadcast: bc.clone(),
+                            _lease: lease,
+                        },
+                    );
                     return (bc, false);
                 }
                 crate::alog!("[broadcast] {name}: persisted record invalid; re-minting");
@@ -224,17 +234,21 @@ impl BroadcastRegistry {
             .expect("broadcast descriptor has official infohash fields");
         let transport_bytes = encode_transport(&descriptor);
         let content_id = transport_file_hash(&transport_bytes);
-        seed_registry.register_metadata(content_id, transport_bytes.clone());
-        let store = seed_registry.get_or_create(infohash, || {
-            build_piece_store(
-                PIECE_LENGTH,
-                CHUNK_LENGTH,
-                store_bytes,
-                self.cache_type,
-                &self.cache_dir,
-                &infohash,
-            )
-        });
+        let (store, lease) = seed_registry.lease_broadcast(
+            infohash,
+            content_id,
+            transport_bytes.clone(),
+            || {
+                build_piece_store(
+                    PIECE_LENGTH,
+                    CHUNK_LENGTH,
+                    store_bytes,
+                    self.cache_type,
+                    &self.cache_dir,
+                    &infohash,
+                )
+            },
+        );
         // Persist the fresh identity (cursor at 0) before wiring the cursor's sink, so the
         // record exists immediately (matching the engine writing `.acelive`/`.sauth` at mint).
         let key_pem = auth.to_pkcs1_pem();
@@ -257,7 +271,13 @@ impl BroadcastRegistry {
             auth: Arc::new(auth),
             cursor,
         };
-        map.insert(name.to_string(), broadcast.clone());
+        map.insert(
+            name.to_string(),
+            BroadcastEntry {
+                broadcast: broadcast.clone(),
+                _lease: lease,
+            },
+        );
         (broadcast, true)
     }
 
@@ -279,8 +299,14 @@ impl BroadcastRegistry {
                 continue;
             }
             match self.reconstruct(&name, &rec, seed_registry, store_bytes) {
-                Some(bc) => {
-                    map.insert(name.clone(), bc.clone());
+                Some((bc, lease)) => {
+                    map.insert(
+                        name.clone(),
+                        BroadcastEntry {
+                            broadcast: bc.clone(),
+                            _lease: lease,
+                        },
+                    );
                     out.push(bc);
                 }
                 None => crate::alog!("[broadcast] {name}: persisted record invalid; skipping"),
@@ -289,20 +315,21 @@ impl BroadcastRegistry {
         out
     }
 
-    /// Forget `name`: drop it from memory (marking its cursor removed so a stale in-flight
-    /// ingest can't rewrite the file) and delete its persisted record. Returns the removed
-    /// broadcast so the caller can drop it from `seed_registry`.
+    /// Forget `name`: drop it from memory (dropping its `SeedLease`, which evicts its `SeedRegistry`
+    /// entries and, in disk mode, lets the store's `Drop` clean the cache dir once ingest releases
+    /// its `Arc`) and delete its persisted record. Marks the cursor removed so a stale in-flight
+    /// ingest can't rewrite the file. Returns the removed broadcast.
     pub async fn delete(&self, name: &str) -> Option<Broadcast> {
         let removed = self.by_name.lock().await.remove(name);
-        if let Some(bc) = &removed {
-            bc.cursor.mark_removed();
+        if let Some(entry) = &removed {
+            entry.broadcast.cursor.mark_removed();
         }
         if let Some(persist) = &self.persist {
             if let Err(e) = persist.delete(name) {
                 crate::alog!("[broadcast] {name}: delete failed: {e}");
             }
         }
-        removed
+        removed.map(|e| e.broadcast)
     }
 
     /// Build a cursor persistence sink for `name`, or `None` when persistence is disabled.
@@ -326,7 +353,7 @@ impl BroadcastRegistry {
         rec: &PersistedBroadcast,
         seed_registry: &SeedRegistry,
         store_bytes: u64,
-    ) -> Option<Broadcast> {
+    ) -> Option<(Broadcast, ace_swarm::listen::SeedLease)> {
         let auth = LiveSourceAuth::from_pkcs1_pem(&rec.key_pkcs1_pem).ok()?;
         let decoded = decode_transport(&rec.transport).ok()?;
         if decoded.pubkey != auth.pubkey_der() {
@@ -336,30 +363,37 @@ impl BroadcastRegistry {
         let content_id = transport_file_hash(&rec.transport);
         let piece_length = decoded.piece_length;
         let chunk_length = decoded.chunk_length;
-        seed_registry.register_metadata(content_id, rec.transport.clone());
-        let store = seed_registry.get_or_create(infohash, || {
-            build_piece_store(
-                piece_length,
-                chunk_length,
-                store_bytes,
-                self.cache_type,
-                &self.cache_dir,
-                &infohash,
-            )
-        });
+        let (store, lease) = seed_registry.lease_broadcast(
+            infohash,
+            content_id,
+            rec.transport.clone(),
+            || {
+                build_piece_store(
+                    piece_length,
+                    chunk_length,
+                    store_bytes,
+                    self.cache_type,
+                    &self.cache_dir,
+                    &infohash,
+                )
+            },
+        );
         let resume_at = rec.next_piece.saturating_add(CURSOR_PERSIST_INTERVAL);
         let cursor = BroadcastCursor::new(
             resume_at,
             self.sink_for(name, &rec.transport, rec.key_pkcs1_pem.clone()),
         );
-        Some(Broadcast {
-            infohash,
-            content_id,
-            transport_bytes: Arc::new(rec.transport.clone()),
-            store,
-            auth: Arc::new(auth),
-            cursor,
-        })
+        Some((
+            Broadcast {
+                infohash,
+                content_id,
+                transport_bytes: Arc::new(rec.transport.clone()),
+                store,
+                auth: Arc::new(auth),
+                cursor,
+            },
+            lease,
+        ))
     }
 }
 
@@ -460,45 +494,23 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "superseded by Task 5 lease-based cache cleanup (removes remove_cache_dir); see docs/superpowers/plans/2026-07-06-inbound-seeding-lifecycle.md"]
-    async fn disk_mode_writes_piece_files_and_teardown_removes_them() {
-        let data_dir = tmp_dir();
-        let cache_dir = data_dir.join("cache");
-        let reg = BroadcastRegistry::with_persist(&data_dir, CacheType::Disk, cache_dir.clone());
+    async fn deleting_a_broadcast_evicts_its_seed_registry_entries() {
+        let dir = tmp_dir();
+        let cache_dir = dir.join("cache");
+        let reg = BroadcastRegistry::with_persist(&dir, CacheType::Memory, cache_dir);
         let seed = SeedRegistry::new();
-        let (bc, _fresh) = reg
-            .start_or_resume("disk", "Disk", &[], &seed, 1 << 20)
+        let (bc, _) = reg
+            .start_or_resume("chan", "Chan", &[], &seed, 1 << 20)
             .await;
+        assert!(seed.serves(&bc.infohash) && seed.serves(&bc.content_id));
 
-        // Feed a full piece into the (disk-backed) origination store.
-        {
-            let mut guard = bc.store.lock().await;
-            let chunks = guard.chunks_per_piece();
-            for c in 0..chunks {
-                guard.put_chunk(0, c, &vec![7u8; CHUNK_LENGTH as usize]);
-            }
-            assert!(guard.has_piece(0));
-            assert_eq!(
-                guard.chunk(0, 0).as_deref(),
-                Some(&vec![7u8; CHUNK_LENGTH as usize][..]),
-                "chunk reads back from disk"
-            );
-        }
-
-        let hex = crate::ace_provider::infohash_hex(&bc.infohash);
-        let piece_file = cache_dir.join(&hex).join("0.piece");
+        reg.delete("chan").await;
+        assert!(!seed.serves(&bc.infohash), "infohash entry evicted on delete");
         assert!(
-            piece_file.exists(),
-            "disk backend wrote a piece file at {}",
-            piece_file.display()
+            !seed.serves(&bc.content_id),
+            "content_id entry evicted on delete"
         );
-
-        reg.remove_cache_dir(&bc.infohash);
-        assert!(
-            !cache_dir.join(&hex).exists(),
-            "teardown removed the per-infohash cache dir"
-        );
-        std::fs::remove_dir_all(&data_dir).ok();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
