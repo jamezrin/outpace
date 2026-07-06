@@ -2,6 +2,7 @@
 //! connections, verifies the requested infohash against the registry, and hands the socket to
 //! `SeederSession::serve`.
 use crate::seed::SeederSession;
+use crate::seed::ServeCoordinator;
 use crate::store::PieceStore;
 use ace_peer::session::PeerSession;
 use ace_wire::identity::Identity;
@@ -59,6 +60,8 @@ struct SeedEntry {
     /// Millis-since-epoch timestamp of the last activity (creation or `get`), used by the
     /// idle-TTL reaper to decide whether a `Leech` entry has been abandoned.
     last_active: u64,
+    /// Lazily-created multi-peer serve coordinator (S2). Shares the entry's lifetime.
+    coordinator: Option<Arc<ServeCoordinator>>,
 }
 
 /// Maps infohash -> the store and/or metadata we'd serve. Entry lifetime is anchored by
@@ -220,6 +223,36 @@ impl SeedRegistry {
     /// True iff we serve `infohash` (used as the inbound handshake's accept predicate).
     pub fn serves(&self, infohash: &[u8; 20]) -> bool {
         self.stores.lock().unwrap().contains_key(infohash)
+    }
+
+    /// The serve coordinator for `infohash`, creating it (with `max_unchoked`) on first use.
+    /// Returns `None` if we don't serve this infohash (entry absent), so a racing eviction can't
+    /// resurrect a bare entry.
+    pub fn coordinator_for(
+        &self,
+        infohash: &[u8; 20],
+        max_unchoked: usize,
+    ) -> Option<Arc<ServeCoordinator>> {
+        let mut map = self.stores.lock().unwrap();
+        let entry = map.get_mut(infohash)?;
+        Some(
+            entry
+                .coordinator
+                .get_or_insert_with(|| ServeCoordinator::new(max_unchoked))
+                .clone(),
+        )
+    }
+
+    /// Advance every live coordinator's optimistic-unchoke rotation. Called by the listener's
+    /// periodic rechoke ticker.
+    pub fn rechoke_all(&self) {
+        let coords: Vec<_> = {
+            let map = self.stores.lock().unwrap();
+            map.values().filter_map(|e| e.coordinator.clone()).collect()
+        };
+        for c in coords {
+            c.rechoke();
+        }
     }
 
     /// Stop serving `key` (an infohash or a metadata content_id): drops both the piece store
@@ -524,5 +557,19 @@ mod tests {
         let evicted = reg.reap(std::time::Duration::from_secs(3600));
         assert_eq!(evicted, 0);
         assert!(reg.serves(&ih));
+    }
+
+    #[test]
+    fn coordinator_for_is_stable_per_infohash() {
+        let reg = SeedRegistry::new();
+        let ih = [11u8; 20];
+        let (_s, _l) = reg.lease_store(ih, || PieceStore::new(4, 4, 1024));
+        let c1 = reg.coordinator_for(&ih, 4).unwrap();
+        let c2 = reg.coordinator_for(&ih, 4).unwrap();
+        assert!(Arc::ptr_eq(&c1, &c2), "one coordinator per served infohash");
+        assert!(
+            reg.coordinator_for(&[99u8; 20], 4).is_none(),
+            "no coordinator for an unserved infohash"
+        );
     }
 }
