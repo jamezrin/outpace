@@ -7,8 +7,12 @@ use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingEx
 use ace_wire::identity::Identity;
 use ace_wire::live_codec::{build_piece, live_bitfield};
 use ace_wire::message::PeerMessage;
+use std::collections::HashMap as StdHashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 
 pub struct SeederSession;
@@ -284,6 +288,92 @@ impl Choker {
     }
 }
 
+/// Per-infohash multi-peer serve coordinator. Tracks every inbound connection for one stream and
+/// applies [`Choker`] so no more than `max_unchoked` (+1 rotating optimistic) peers are unchoked at
+/// once. Each connection observes a `watch<bool>` (true = unchoked) and sends Choke/Unchoke on the
+/// wire when it flips. Recompute runs on every interest change, peer leave, and rechoke tick.
+pub struct ServeCoordinator {
+    choker: Choker,
+    next_id: AtomicU64,
+    state: StdMutex<CoordState>,
+}
+
+#[derive(Default)]
+struct CoordState {
+    /// Interested peers in stable (join) order — the order `Choker::choose` consumes.
+    interested: Vec<u64>,
+    /// Per-peer unchoke signal sender.
+    senders: StdHashMap<u64, watch::Sender<bool>>,
+    tick: u64,
+}
+
+impl ServeCoordinator {
+    pub fn new(max_unchoked: usize) -> Arc<Self> {
+        Arc::new(ServeCoordinator {
+            choker: Choker::new(max_unchoked),
+            next_id: AtomicU64::new(1),
+            state: StdMutex::new(CoordState::default()),
+        })
+    }
+
+    /// Register a connection. Returns its peer id and a receiver that reports its unchoke state
+    /// (starts choked). Call [`leave`](Self::leave) when the connection ends.
+    pub fn join(&self) -> (u64, watch::Receiver<bool>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = watch::channel(false);
+        self.state.lock().unwrap().senders.insert(id, tx);
+        (id, rx)
+    }
+
+    /// Report a peer's interest. Recomputes the unchoked set.
+    pub fn set_interested(&self, peer: u64, interested: bool) {
+        {
+            let mut st = self.state.lock().unwrap();
+            let present = st.interested.iter().position(|&p| p == peer);
+            match (interested, present) {
+                (true, None) => st.interested.push(peer),
+                (false, Some(i)) => {
+                    st.interested.remove(i);
+                }
+                _ => {}
+            }
+        }
+        self.recompute();
+    }
+
+    /// Deregister a connection (also drops it from the interested set). Recomputes.
+    pub fn leave(&self, peer: u64) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.senders.remove(&peer);
+            if let Some(i) = st.interested.iter().position(|&p| p == peer) {
+                st.interested.remove(i);
+            }
+        }
+        self.recompute();
+    }
+
+    /// Advance the optimistic-unchoke rotation and recompute. Called periodically by the listener's
+    /// rechoke ticker (via `SeedRegistry::rechoke_all`).
+    pub fn rechoke(&self) {
+        self.state.lock().unwrap().tick += 1;
+        self.recompute();
+    }
+
+    /// Apply the choker and flip each peer's watch to its desired state. `watch::send` only wakes
+    /// receivers when the value actually changes, so unchanged peers cost nothing.
+    fn recompute(&self) {
+        let st = self.state.lock().unwrap();
+        let chosen = self.choker.choose(&st.interested, st.tick);
+        for (id, tx) in st.senders.iter() {
+            let want = chosen.contains(id);
+            if *tx.borrow() != want {
+                let _ = tx.send(want);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +392,47 @@ mod tests {
         let c = Choker::new(4);
         assert_eq!(c.choose(&[10, 20], 0), vec![10, 20]);
         assert_eq!(c.choose(&[], 0), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn coordinator_never_unchokes_more_than_max_plus_optimistic() {
+        let coord = ServeCoordinator::new(2);
+        let mut rxs = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let (id, rx) = coord.join();
+            ids.push(id);
+            rxs.push(rx);
+        }
+        for id in &ids {
+            coord.set_interested(*id, true);
+        }
+        let unchoked = rxs.iter().filter(|rx| *rx.borrow()).count();
+        assert!(unchoked <= 3, "max_unchoked(2) + 1 optimistic = 3, got {unchoked}");
+        assert!(unchoked >= 2, "should unchoke up to the cap when enough are interested");
+    }
+
+    #[test]
+    fn coordinator_unchokes_a_single_interested_peer() {
+        let coord = ServeCoordinator::new(4);
+        let (id, rx) = coord.join();
+        assert!(!*rx.borrow(), "not unchoked before Interested");
+        coord.set_interested(id, true);
+        assert!(*rx.borrow(), "unchoked after Interested when under the cap");
+    }
+
+    #[test]
+    fn coordinator_rechokes_when_a_peer_leaves() {
+        let coord = ServeCoordinator::new(1);
+        let (a, rx_a) = coord.join();
+        let (b, rx_b) = coord.join();
+        coord.set_interested(a, true);
+        coord.set_interested(b, true);
+        // With max_unchoked=1, first-come `a` is unchoked; `b` is the optimistic (+1) slot.
+        assert!(*rx_a.borrow());
+        coord.leave(a);
+        // `b` must now be in the guaranteed slot.
+        assert!(*rx_b.borrow(), "remaining interested peer is unchoked after the other leaves");
     }
 
     #[test]
