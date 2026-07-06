@@ -50,9 +50,10 @@ pub struct Config {
     pub max_unchoked: usize,
     /// Max concurrent inbound peer connections accepted by the listener.
     pub max_inbound_peers: usize,
-    /// Idle-TTL (seconds) after which a leech `SeedRegistry` entry with a leaked producer lease is
-    /// force-evicted by the reaper. Broadcasts are exempt. Backstop only — normal teardown rides
-    /// the lease. `OUTPACE_SEED_TTL_SECS`.
+    /// Idle-TTL (seconds) after which an OWNERLESS leech `SeedRegistry` entry (one with no live
+    /// producer lease) is force-evicted by the reaper — a backstop against orphans created outside
+    /// the lease API. Entries held by a live lease and all broadcasts are never reaped; normal
+    /// teardown rides the lease drop. `OUTPACE_SEED_TTL_SECS`. 0 disables the reaper.
     pub seed_ttl_secs: u64,
     /// Reciprocal upload over connections we initiate (S1): answering a peer's
     /// `Interested`/chunk-requests and advertising `Have` for newly-completed pieces.

@@ -83,6 +83,7 @@ impl SeedRegistry {
             .entry(infohash)
             .or_insert_with(|| SeedEntry {
                 generation: next_generation(),
+                last_active: now_millis(),
                 ..Default::default()
             })
             .store = Some(store);
@@ -96,6 +97,7 @@ impl SeedRegistry {
             .entry(key)
             .or_insert_with(|| SeedEntry {
                 generation: next_generation(),
+                last_active: now_millis(),
                 ..Default::default()
             })
             .metadata = Some(Arc::new(metadata));
@@ -114,6 +116,7 @@ impl SeedRegistry {
             .entry(infohash)
             .or_insert_with(|| SeedEntry {
                 generation: next_generation(),
+                last_active: now_millis(),
                 ..Default::default()
             })
             .store
@@ -136,6 +139,7 @@ impl SeedRegistry {
         let mut map = self.stores.lock().unwrap();
         let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
             generation: next_generation(),
+            last_active: now_millis(),
             ..Default::default()
         });
         let store = entry
@@ -143,7 +147,6 @@ impl SeedRegistry {
             .get_or_insert_with(|| Arc::new(Mutex::new(make())))
             .clone();
         entry.producers += 1;
-        entry.last_active = now_millis();
         let lease = SeedLease {
             registry: Arc::downgrade(&self.stores),
             keys: vec![(infohash, entry.generation)],
@@ -171,11 +174,11 @@ impl SeedRegistry {
         let (store, ih_generation) = {
             let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
                 generation: next_generation(),
+                last_active: now_millis(),
                 ..Default::default()
             });
             entry.producers += 1;
             entry.kind = OwnerKind::Broadcast;
-            entry.last_active = now_millis();
             let store = entry
                 .store
                 .get_or_insert_with(|| Arc::new(Mutex::new(make())))
@@ -185,12 +188,12 @@ impl SeedRegistry {
         let cid_generation = {
             let meta_entry = map.entry(content_id).or_insert_with(|| SeedEntry {
                 generation: next_generation(),
+                last_active: now_millis(),
                 ..Default::default()
             });
             meta_entry.producers += 1;
             meta_entry.kind = OwnerKind::Broadcast;
             meta_entry.metadata = Some(Arc::new(metadata));
-            meta_entry.last_active = now_millis();
             meta_entry.generation
         };
         let lease = SeedLease {
@@ -225,16 +228,21 @@ impl SeedRegistry {
         self.stores.lock().unwrap().remove(key);
     }
 
-    /// Force-evict `Leech` entries idle for longer than `ttl` (a leaked-lease backstop; `Broadcast`
-    /// entries are operator-controlled and exempt). Returns how many entries were removed. The
-    /// primary teardown path is `SeedLease` drop; this only catches producers that never dropped.
+    /// Force-evict idle **ownerless** `Leech` entries (`producers == 0`, i.e. created outside the
+    /// lease API and never tied to a live producer). Entries held by a live `SeedLease`
+    /// (`producers > 0`) and all `Broadcast` entries are NEVER reaped — normal teardown rides the
+    /// lease drop. This is a backstop against orphans, not a way to reclaim a live-but-slow producer
+    /// (a stuck task holding a lease is left alone; it can't be soundly told apart from a slow one).
+    /// Returns how many entries were removed.
     pub fn reap(&self, ttl: std::time::Duration) -> usize {
         let now = now_millis();
         let ttl_ms = ttl.as_millis() as u64;
         let mut map = self.stores.lock().unwrap();
         let before = map.len();
         map.retain(|_, e| {
-            e.kind == OwnerKind::Broadcast || now.saturating_sub(e.last_active) < ttl_ms
+            e.kind == OwnerKind::Broadcast
+                || e.producers > 0
+                || now.saturating_sub(e.last_active) < ttl_ms
         });
         before - map.len()
     }
@@ -476,31 +484,42 @@ mod tests {
     }
 
     #[test]
-    fn reaper_evicts_idle_leech_entries_but_spares_broadcasts() {
+    fn reaper_evicts_idle_ownerless_leech_entry() {
+        let reg = SeedRegistry::new();
+        let ih = [1u8; 20];
+        // An ownerless entry (created outside the lease API — producers == 0).
+        reg.get_or_create(ih, || PieceStore::new(4, 4, 1024));
+        let evicted = reg.reap(std::time::Duration::from_secs(0));
+        assert_eq!(evicted, 1, "idle ownerless leech entry is reaped");
+        assert!(!reg.serves(&ih));
+    }
+
+    #[test]
+    fn reaper_spares_owned_entries_even_when_idle() {
         let reg = SeedRegistry::new();
         let leech = [1u8; 20];
         let bcast_ih = [2u8; 20];
         let bcast_cid = [3u8; 20];
-        // Leak the leases so only the reaper can reclaim them.
+        // Live leases (producers > 0). mem::forget so only the reaper could reclaim them.
         std::mem::forget(reg.lease_store(leech, || PieceStore::new(4, 4, 1024)).1);
         std::mem::forget(
             reg.lease_broadcast(bcast_ih, bcast_cid, vec![9], || PieceStore::new(4, 4, 1024))
                 .1,
         );
-
-        // A zero TTL makes every entry "idle now".
         let evicted = reg.reap(std::time::Duration::from_secs(0));
-        assert_eq!(evicted, 1, "exactly the leech entry is reaped");
-        assert!(!reg.serves(&leech), "idle leech entry evicted");
-        assert!(reg.serves(&bcast_ih), "broadcast infohash exempt");
-        assert!(reg.serves(&bcast_cid), "broadcast content_id exempt");
+        assert_eq!(evicted, 0, "owned entries are never reaped, even when idle");
+        assert!(reg.serves(&leech), "actively-owned leech entry survives");
+        assert!(
+            reg.serves(&bcast_ih) && reg.serves(&bcast_cid),
+            "broadcast survives"
+        );
     }
 
     #[test]
-    fn get_touches_last_active_so_a_served_entry_is_not_reaped() {
+    fn get_touches_last_active_so_an_ownerless_entry_is_not_reaped() {
         let reg = SeedRegistry::new();
         let ih = [8u8; 20];
-        std::mem::forget(reg.lease_store(ih, || PieceStore::new(4, 4, 1024)).1);
+        reg.get_or_create(ih, || PieceStore::new(4, 4, 1024)); // ownerless
         let _ = reg.get(&ih); // touch
         let evicted = reg.reap(std::time::Duration::from_secs(3600));
         assert_eq!(evicted, 0);
