@@ -12,7 +12,9 @@
 //! PKCS1-v1_5 over SHA1 of the piece payload, signature embedded as the piece's trailing
 //! bytes) using the broadcast's own `LiveSourceAuth` identity — not a placeholder.
 
+use crate::ace_provider::build_piece_store;
 use crate::broadcast_persist::{BroadcastPersist, PersistedBroadcast};
+use crate::config::CacheType;
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::store::PieceStore;
 use ace_wire::bencode::Bencode;
@@ -20,6 +22,7 @@ use ace_wire::infohash::{infohash_of_descriptor, infohash_of_transport, transpor
 use ace_wire::live_auth::LiveSourceAuth;
 use ace_wire::transport::{decode_transport, encode_transport};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -139,29 +142,49 @@ pub struct BroadcastRegistry {
     /// `None` disables persistence (unit tests / disk-less runs); `Some` reads and writes
     /// `<data_dir>/broadcasts/`.
     persist: Option<BroadcastPersist>,
+    /// Backend the originated/reloaded piece stores use (daemon-global, unlike the per-call
+    /// `store_bytes` budget). Defaults to `Memory`; production sets it from config.
+    cache_type: CacheType,
+    /// Root dir for disk-mode piece files (per-infohash subdir derived from this).
+    cache_dir: PathBuf,
 }
 
 impl BroadcastRegistry {
-    /// A disk-less registry: minted broadcasts live only in memory (used by tests).
+    /// A disk-less registry: minted broadcasts live only in memory (used by tests). Piece data is
+    /// always memory-backed here.
     pub fn new() -> Arc<Self> {
         Arc::new(BroadcastRegistry {
             by_name: Mutex::new(BTreeMap::new()),
             persist: None,
+            cache_type: CacheType::Memory,
+            cache_dir: PathBuf::new(),
         })
     }
 
     /// A registry that persists minted broadcasts under `<data_dir>/broadcasts/` and reloads
-    /// them across restarts.
-    pub fn with_persist(data_dir: &std::path::Path) -> Arc<Self> {
+    /// them across restarts. `cache_type` / `cache_dir` select where originated piece data lives
+    /// (mirroring the leech path's cache config).
+    pub fn with_persist(data_dir: &Path, cache_type: CacheType, cache_dir: PathBuf) -> Arc<Self> {
         Arc::new(BroadcastRegistry {
             by_name: Mutex::new(BTreeMap::new()),
             persist: Some(BroadcastPersist::new(data_dir)),
+            cache_type,
+            cache_dir,
         })
     }
 
     /// The broadcast already minted under `name`, if any.
     pub async fn get(&self, name: &str) -> Option<Broadcast> {
         self.by_name.lock().await.get(name).cloned()
+    }
+
+    /// Remove the on-disk piece cache for `infohash` (a no-op in memory mode). Best-effort; called
+    /// on broadcast teardown so a stopped broadcast does not leave its cache directory behind.
+    pub fn remove_cache_dir(&self, infohash: &[u8; 20]) {
+        if self.cache_type == CacheType::Disk {
+            let dir = self.cache_dir.join(crate::ace_provider::infohash_hex(infohash));
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// Mint, resume-from-memory, or reload-from-disk the broadcast for `name`, and register its
@@ -203,7 +226,14 @@ impl BroadcastRegistry {
         let content_id = transport_file_hash(&transport_bytes);
         seed_registry.register_metadata(content_id, transport_bytes.clone());
         let store = seed_registry.get_or_create(infohash, || {
-            PieceStore::new(PIECE_LENGTH, CHUNK_LENGTH, store_bytes)
+            build_piece_store(
+                PIECE_LENGTH,
+                CHUNK_LENGTH,
+                store_bytes,
+                self.cache_type,
+                &self.cache_dir,
+                &infohash,
+            )
         });
         // Persist the fresh identity (cursor at 0) before wiring the cursor's sink, so the
         // record exists immediately (matching the engine writing `.acelive`/`.sauth` at mint).
@@ -308,7 +338,14 @@ impl BroadcastRegistry {
         let chunk_length = decoded.chunk_length;
         seed_registry.register_metadata(content_id, rec.transport.clone());
         let store = seed_registry.get_or_create(infohash, || {
-            PieceStore::new(piece_length, chunk_length, store_bytes)
+            build_piece_store(
+                piece_length,
+                chunk_length,
+                store_bytes,
+                self.cache_type,
+                &self.cache_dir,
+                &infohash,
+            )
         });
         let resume_at = rec.next_piece.saturating_add(CURSOR_PERSIST_INTERVAL);
         let cursor = BroadcastCursor::new(
@@ -423,6 +460,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disk_mode_writes_piece_files_and_teardown_removes_them() {
+        let data_dir = tmp_dir();
+        let cache_dir = data_dir.join("cache");
+        let reg = BroadcastRegistry::with_persist(&data_dir, CacheType::Disk, cache_dir.clone());
+        let seed = SeedRegistry::new();
+        let (bc, _fresh) = reg
+            .start_or_resume("disk", "Disk", &[], &seed, 1 << 20)
+            .await;
+
+        // Feed a full piece into the (disk-backed) origination store.
+        {
+            let mut guard = bc.store.lock().await;
+            let chunks = guard.chunks_per_piece();
+            for c in 0..chunks {
+                guard.put_chunk(0, c, &vec![7u8; CHUNK_LENGTH as usize]);
+            }
+            assert!(guard.has_piece(0));
+            assert_eq!(
+                guard.chunk(0, 0).as_deref(),
+                Some(&vec![7u8; CHUNK_LENGTH as usize][..]),
+                "chunk reads back from disk"
+            );
+        }
+
+        let hex = crate::ace_provider::infohash_hex(&bc.infohash);
+        let piece_file = cache_dir.join(&hex).join("0.piece");
+        assert!(
+            piece_file.exists(),
+            "disk backend wrote a piece file at {}",
+            piece_file.display()
+        );
+
+        reg.remove_cache_dir(&bc.infohash);
+        assert!(
+            !cache_dir.join(&hex).exists(),
+            "teardown removed the per-infohash cache dir"
+        );
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[tokio::test]
     async fn store_is_registered_in_the_shared_seed_registry_under_the_infohash() {
         let (reg, seed) = registry();
         let (bc, _fresh) = reg
@@ -503,7 +581,7 @@ mod tests {
     async fn cursor_persists_on_the_interval_and_on_flush() {
         let dir = tmp_dir();
         let seed = SeedRegistry::new();
-        let reg = BroadcastRegistry::with_persist(&dir);
+        let reg = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (bc, _) = reg.start_or_resume("c", "C", &[], &seed, 1 << 20).await;
         let persist = BroadcastPersist::new(&dir);
 
@@ -534,7 +612,7 @@ mod tests {
     async fn identity_survives_a_restart() {
         let dir = tmp_dir();
         let seed1 = SeedRegistry::new();
-        let reg1 = BroadcastRegistry::with_persist(&dir);
+        let reg1 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (a, fresh1) = reg1
             .start_or_resume("news", "News", &["udp://t:1/announce".into()], &seed1, 1 << 20)
             .await;
@@ -542,7 +620,7 @@ mod tests {
 
         // Simulate a daemon restart: brand-new registry + seed registry, same data_dir.
         let seed2 = SeedRegistry::new();
-        let reg2 = BroadcastRegistry::with_persist(&dir);
+        let reg2 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (b, fresh2) = reg2
             .start_or_resume("news", "Ignored On Resume", &[], &seed2, 1 << 20)
             .await;
@@ -560,13 +638,13 @@ mod tests {
     async fn cursor_resumes_with_the_no_reuse_margin_after_restart() {
         let dir = tmp_dir();
         let seed1 = SeedRegistry::new();
-        let reg1 = BroadcastRegistry::with_persist(&dir);
+        let reg1 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (a, _) = reg1.start_or_resume("m", "M", &[], &seed1, 1 << 20).await;
         a.cursor.advance_to(500);
         a.cursor.flush();
 
         let seed2 = SeedRegistry::new();
-        let reg2 = BroadcastRegistry::with_persist(&dir);
+        let reg2 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (b, _) = reg2.start_or_resume("m", "M", &[], &seed2, 1 << 20).await;
         assert_eq!(
             b.cursor.start_piece(),
@@ -582,7 +660,7 @@ mod tests {
     async fn delete_then_put_re_mints_a_fresh_identity() {
         let dir = tmp_dir();
         let seed = SeedRegistry::new();
-        let reg = BroadcastRegistry::with_persist(&dir);
+        let reg = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (a, _) = reg.start_or_resume("x", "X", &[], &seed, 1 << 20).await;
 
         let removed = reg.delete("x").await;
@@ -599,7 +677,7 @@ mod tests {
     async fn removed_cursor_does_not_resurrect_the_file() {
         let dir = tmp_dir();
         let seed = SeedRegistry::new();
-        let reg = BroadcastRegistry::with_persist(&dir);
+        let reg = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (a, _) = reg.start_or_resume("y", "Y", &[], &seed, 1 << 20).await;
         reg.delete("y").await;
         // A stale in-flight ingest's late flush must not recreate the record.
@@ -616,7 +694,7 @@ mod tests {
         let dir = tmp_dir();
         let seed = SeedRegistry::new();
         // Mint one broadcast to get valid transport bytes...
-        let reg0 = BroadcastRegistry::with_persist(&dir);
+        let reg0 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (a, _) = reg0.start_or_resume("bad", "Bad", &[], &seed, 1 << 20).await;
         // ...then corrupt the record: keep the transport but swap in a different key.
         let other = LiveSourceAuth::generate();
@@ -633,7 +711,7 @@ mod tests {
             .unwrap();
 
         let seed2 = SeedRegistry::new();
-        let reg = BroadcastRegistry::with_persist(&dir);
+        let reg = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (b, fresh) = reg.start_or_resume("bad", "Bad", &[], &seed2, 1 << 20).await;
         assert!(fresh, "an invalid record is discarded and a fresh identity minted");
         assert_ne!(a.infohash, b.infohash);

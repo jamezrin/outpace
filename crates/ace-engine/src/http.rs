@@ -206,6 +206,7 @@ async fn broadcast_delete(State(s): State<AppState>, Path(name): Path<String>) -
     if let Some(bc) = bs.registry.delete(&name).await {
         bs.seed_registry.remove(&bc.infohash);
         bs.seed_registry.remove(&bc.content_id);
+        bs.registry.remove_cache_dir(&bc.infohash);
         crate::alog!("[broadcast] {name}: deleted");
     }
     StatusCode::NO_CONTENT.into_response()
@@ -1219,7 +1220,7 @@ mod tests {
         let chunks_per_piece = guard.chunks_per_piece();
         let mut piece_bytes = Vec::with_capacity(PIECE_LENGTH as usize);
         for c in 0..chunks_per_piece {
-            piece_bytes.extend_from_slice(guard.chunk(0, c).unwrap());
+            piece_bytes.extend_from_slice(&guard.chunk(0, c).unwrap());
         }
         drop(guard);
 

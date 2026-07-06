@@ -2,7 +2,7 @@
 
 use crate::ace_provider::AceProvider;
 use crate::broadcast::{Broadcast, BroadcastRegistry};
-use crate::config::{load_or_create_identity, Config};
+use crate::config::{load_or_create_identity, CacheType, Config};
 use crate::http::{router, AppState, BroadcastState};
 use crate::manager::StreamManager;
 use crate::provider::ProviderRegistry;
@@ -48,6 +48,16 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     }
     if let Ok(v) = std::env::var("OUTPACE_SEED_STORE_BYTES") {
         config.seed_store_bytes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_CACHE_TYPE") {
+        config.cache_type = match v.as_str() {
+            "memory" => CacheType::Memory,
+            "disk" => CacheType::Disk,
+            other => return Err(format!("invalid OUTPACE_CACHE_TYPE: {other}").into()),
+        };
+    }
+    if let Ok(v) = std::env::var("OUTPACE_CACHE_DIR") {
+        config.cache_dir = v.into();
     }
     if let Ok(v) = std::env::var("OUTPACE_PREFETCH_PIECES") {
         config.prefetch_pieces = v.parse()?;
@@ -130,6 +140,17 @@ pub async fn build_runtime(
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
 
+    // Fail fast on a misconfigured disk cache: prepare the cache root once at startup so a bad
+    // OUTPACE_CACHE_DIR surfaces here rather than silently degrading to memory per stream.
+    if config.cache_type == CacheType::Disk {
+        std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
+            format!(
+                "cannot create OUTPACE_CACHE_DIR {}: {e}",
+                config.cache_dir.display()
+            )
+        })?;
+    }
+
     // Register enabled providers. Only "ace" exists today; the registry is the path for more.
     let seed_registry = ace_swarm::listen::SeedRegistry::new();
     let mut registry = ProviderRegistry::new();
@@ -143,6 +164,7 @@ pub async fn build_runtime(
             .with_bootstrap_peers(bootstrap_peers)
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
+            .with_cache(config.cache_type, config.cache_dir.clone())
             .with_prefetch_pieces(config.prefetch_pieces)
             .with_seeding_enabled(config.enable_seeding)
             .with_inbound_announce_port(inbound_peer_port);
@@ -153,7 +175,11 @@ pub async fn build_runtime(
     let manager = StreamManager::with_buffer(registry, config.session_buffer);
     manager.spawn_reaper();
     let broadcasts = BroadcastState {
-        registry: BroadcastRegistry::with_persist(&config.data_dir),
+        registry: BroadcastRegistry::with_persist(
+            &config.data_dir,
+            config.cache_type,
+            config.cache_dir.clone(),
+        ),
         seed_registry: seed_registry.clone(),
         trackers: DEFAULT_BROADCAST_TRACKERS
             .iter()
@@ -372,6 +398,27 @@ mod tests {
         assert!(err.is_some(), "session_buffer=0 must be rejected");
     }
 
+    #[test]
+    fn parses_cache_type_and_dir() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_CACHE_TYPE", "disk");
+        std::env::set_var("OUTPACE_CACHE_DIR", "/tmp/outpace-cache-test");
+        let c = config_from_env().unwrap();
+        assert_eq!(c.cache_type, CacheType::Disk);
+        assert_eq!(c.cache_dir, std::path::PathBuf::from("/tmp/outpace-cache-test"));
+        std::env::remove_var("OUTPACE_CACHE_TYPE");
+        std::env::remove_var("OUTPACE_CACHE_DIR");
+    }
+
+    #[test]
+    fn rejects_invalid_cache_type() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_CACHE_TYPE", "nvme");
+        let err = config_from_env().err();
+        std::env::remove_var("OUTPACE_CACHE_TYPE");
+        assert!(err.is_some(), "unknown cache type must be rejected");
+    }
+
     #[tokio::test]
     async fn build_runtime_reloads_persisted_broadcasts_and_serves_them() {
         use crate::broadcast::BroadcastRegistry;
@@ -384,7 +431,11 @@ mod tests {
         // capturing its identity, then drop the registry to simulate a shutdown.
         let infohash = {
             let seed = ace_swarm::listen::SeedRegistry::new();
-            let reg = BroadcastRegistry::with_persist(&data_dir);
+            let reg = BroadcastRegistry::with_persist(
+                &data_dir,
+                CacheType::Memory,
+                std::path::PathBuf::new(),
+            );
             let (bc, fresh) = reg
                 .start_or_resume("news", "News", &[], &seed, 1 << 20)
                 .await;
