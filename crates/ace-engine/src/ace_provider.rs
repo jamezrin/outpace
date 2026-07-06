@@ -878,6 +878,20 @@ async fn follow_live(
     // peers. If we stall again having produced nothing since, those peers are genuinely
     // unproductive (e.g. a frozen source) and get excluded so we look elsewhere.
     let mut last_stall_emitted: Option<u64> = None;
+    // Acquire the leech producer lease once for the whole session. `store` is created here and
+    // reused across every reconnect (preserving buffered pieces, exactly like the old idempotent
+    // `get_or_create`); `_seed_lease` lives for the entire `follow_live` body and drops on return
+    // (including any early return), evicting the registry entry once no producer holds it.
+    let (store, _seed_lease) = seed.registry.lease_store(info.infohash, || {
+        build_piece_store(
+            info.piece_length,
+            info.chunk_length,
+            seed.store_bytes,
+            seed.cache_type,
+            &seed.cache_dir,
+            &info.infohash,
+        )
+    });
     loop {
         if tx.is_closed() {
             return;
@@ -943,6 +957,7 @@ async fn follow_live(
             &uploaded,
             &peers_served,
             &seed,
+            &store,
             &mut continuity,
             refill_candidates,
             known_refill_peers,
@@ -1318,6 +1333,7 @@ async fn follow_peer_pool(
     uploaded: &Arc<AtomicU64>,
     peers_served: &Arc<AtomicU32>,
     seed: &SeedConfig,
+    store: &Arc<tokio::sync::Mutex<PieceStore>>,
     continuity: &mut Option<Continuity>,
     refill_candidates: Vec<SocketAddrV4>,
     known_refill_peers: Vec<SocketAddrV4>,
@@ -1348,16 +1364,6 @@ async fn follow_peer_pool(
         }
     };
     let continuity = continuity.as_mut().expect("initialized just above");
-    let store = seed.registry.get_or_create(info.infohash, || {
-        build_piece_store(
-            info.piece_length,
-            info.chunk_length,
-            seed.store_bytes,
-            seed.cache_type,
-            &seed.cache_dir,
-            &info.infohash,
-        )
-    });
     let (event_tx, mut event_rx) = mpsc::channel(MAX_ACTIVE_UPSTREAMS * 32);
     let (refill_tx, mut refill_rx) = mpsc::channel(MAX_ACTIVE_UPSTREAMS);
     // A live-held clone of the refill sender so peers learned from `id=12` peer-exchange
@@ -2328,6 +2334,18 @@ mod tests {
     async fn network_is_ace() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
         assert_eq!(p.network(), "ace");
+    }
+
+    #[tokio::test]
+    async fn leech_lease_evicts_registry_entry_when_dropped() {
+        let reg = ace_swarm::listen::SeedRegistry::new();
+        let ih = [9u8; 20];
+        {
+            let (_store, _lease) =
+                reg.lease_store(ih, || ace_swarm::store::PieceStore::new(1 << 20, 1 << 14, 1 << 20));
+            assert!(reg.serves(&ih), "served while the leech loop holds its lease");
+        }
+        assert!(!reg.serves(&ih), "entry evicted after the leech loop drops its lease");
     }
 
     #[test]
