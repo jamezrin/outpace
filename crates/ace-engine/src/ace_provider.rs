@@ -398,8 +398,8 @@ impl StreamProvider for AceProvider {
         // does content_id→infohash internally — we do it ourselves, no Acestream API).
         let info = if let Some(content_id) = id.strip_prefix("cid:") {
             self.resolve_content_id(content_id).await?
-        } else if let Some(url) = id.strip_prefix("turl:") {
-            stream_info_from_transport_url(url)
+        } else if let Some(url) = crate::transport_url::decode_transport_url(id) {
+            stream_info_from_transport_url(&url)
                 .await
                 .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")))?
         } else if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -407,7 +407,7 @@ impl StreamProvider for AceProvider {
                 .map_err(|_| ProviderError::Backend("bad infohash".into()))?
         } else {
             return Err(ProviderError::Backend(
-                "id must be a 40-hex infohash, cid:<40hex>, or turl:<url>".into(),
+                "id must be a 40-hex infohash, cid:<40hex>, or a transport-url id".into(),
             ));
         };
 
@@ -2345,11 +2345,18 @@ mod tests {
         let reg = ace_swarm::listen::SeedRegistry::new();
         let ih = [9u8; 20];
         {
-            let (_store, _lease) =
-                reg.lease_store(ih, || ace_swarm::store::PieceStore::new(1 << 20, 1 << 14, 1 << 20));
-            assert!(reg.serves(&ih), "served while the leech loop holds its lease");
+            let (_store, _lease) = reg.lease_store(ih, || {
+                ace_swarm::store::PieceStore::new(1 << 20, 1 << 14, 1 << 20)
+            });
+            assert!(
+                reg.serves(&ih),
+                "served while the leech loop holds its lease"
+            );
         }
-        assert!(!reg.serves(&ih), "entry evicted after the leech loop drops its lease");
+        assert!(
+            !reg.serves(&ih),
+            "entry evicted after the leech loop drops its lease"
+        );
     }
 
     #[test]
@@ -2401,13 +2408,11 @@ mod tests {
     #[tokio::test]
     async fn open_rejects_transport_url_with_blocked_host() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
-        // Loopback is SSRF-blocked, so this fails closed via the turl: branch (proven by the
-        // "transport url" message, not the generic unrecognized-id fallthrough).
-        let err = p
-            .open("turl:http://127.0.0.1:1/x")
-            .await
-            .err()
-            .expect("blocked host must error");
+        // A valid transport-url id whose host is loopback is SSRF-blocked, so open() fails closed
+        // via the decode+fetch branch (proven by the "transport url" message, not the generic
+        // unrecognized-id fallthrough).
+        let id = crate::transport_url::encode_transport_url("http://127.0.0.1:1/x").unwrap();
+        let err = p.open(&id).await.err().expect("blocked host must error");
         match err {
             ProviderError::Backend(msg) => assert!(msg.contains("transport url"), "{msg}"),
             other => panic!("expected Backend error, got {other:?}"),
@@ -2415,13 +2420,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_rejects_transport_url_bad_scheme() {
+    async fn open_rejects_transport_url_id_with_bad_scheme() {
+        // Defense in depth: even a hand-crafted transport-url id encoding a non-http scheme is
+        // rejected at the fetch layer, not just at the input surface.
+        use base64ct::{Base64UrlUnpadded, Encoding};
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
-        let err = p
-            .open("turl:file:///etc/passwd")
-            .await
-            .err()
-            .expect("bad scheme must error");
+        let id = format!(
+            "turl-{}",
+            Base64UrlUnpadded::encode_string(b"file:///etc/passwd")
+        );
+        let err = p.open(&id).await.err().expect("bad scheme must error");
         match err {
             ProviderError::Backend(msg) => assert!(msg.contains("transport url"), "{msg}"),
             other => panic!("expected Backend error, got {other:?}"),

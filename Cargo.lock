@@ -12,6 +12,7 @@ dependencies = [
  "ace-wire",
  "async-trait",
  "axum",
+ "base64ct",
  "bytes",
  "clap",
  "dirs",
@@ -20,7 +21,6 @@ dependencies = [
  "rtmp-rs",
  "serde",
  "serde_json",
- "sha1",
  "tokio",
  "tower 0.4.13",
 ]

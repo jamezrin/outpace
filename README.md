@@ -53,12 +53,19 @@ exclusive selectors, applied in precedence order
 
 - `acestream://<content_id>` or `acestream:?content_id=<40-hex>`;
 - `acestream:?infohash=<40-hex>`;
-- `acestream:?url=<https://…>` - a transport-file URL. The descriptor is fetched
-  over http/https with SSRF protection (private, loopback, and link-local hosts
-  are blocked), a 1 MiB size cap, disabled redirects, and a request timeout;
-  unsafe, oversized, or non-transport responses fail closed;
+- a transport-file URL - either passed bare (`play https://host/x.acelive?a=1&b=2`,
+  which handles a URL carrying its own `&`-joined query) or as
+  `acestream:?url=<https://…>` (in the `acestream:?` form the URL's own query must
+  be percent-encoded, e.g. `%26` for `&`). The descriptor is fetched over http/https
+  with SSRF protection (private, loopback, and link-local hosts are blocked), a 1 MiB
+  size cap, disabled redirects, and a request timeout; unsafe, oversized, or
+  non-transport responses fail closed;
 - `magnet:?xt=urn:btih:<40-hex-or-32-base32>` - a BitTorrent v1 magnet, reduced to
   its infohash (v2 `urn:btmh:` magnets are rejected).
+
+On the `/ace/getstream` compatibility route a `url=` selector returns a
+self-contained playback id, so playback works after a daemon restart without any
+server-side session table.
 
 Start a named broadcast:
 

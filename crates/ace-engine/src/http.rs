@@ -14,7 +14,6 @@ use axum::{routing::get, routing::put, Json, Router};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
-use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast::error::RecvError;
@@ -368,16 +367,14 @@ fn ace_selected_stream(params: &HashMap<String, String>) -> Option<AceStreamSele
         });
     }
     if let Some(url) = ace_nonempty_param(params, "url") {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return None;
-        }
-        // session_key is what the provider opens; playback_id must be path-safe because it is
-        // interpolated into the /ace/r/{playback_id} route (a raw URL would break routing).
-        let token = format!("turl-{}", sha1_hex(url.as_bytes()));
+        // The id is a reversible, path-safe encoding of the URL, so it is both the route-safe
+        // playback_id and the session_key the provider decodes — no server-side alias table, so
+        // playback survives a restart or a direct `/ace/r/{id}` hit.
+        let token = crate::transport_url::encode_transport_url(url).ok()?;
         return Some(AceStreamSelection {
             public_id: token.clone(),
-            playback_id: token,
-            session_key: format!("turl:{url}"),
+            playback_id: token.clone(),
+            session_key: token,
             content_id: None,
         });
     }
@@ -391,12 +388,6 @@ fn ace_selected_stream(params: &HashMap<String, String>) -> Option<AceStreamSele
         });
     }
     None
-}
-
-fn sha1_hex(bytes: &[u8]) -> String {
-    let mut h = Sha1::new();
-    h.update(bytes);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn ace_nonempty_param<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
@@ -592,22 +583,28 @@ mod tests {
     #[test]
     fn getstream_selects_magnet_as_infohash() {
         let ih = "0123456789abcdef0123456789abcdef01234567";
-        let sel =
-            ace_selected_stream(&params(&[("magnet", &format!("magnet:?xt=urn:btih:{ih}"))]))
-                .unwrap();
+        let sel = ace_selected_stream(&params(&[("magnet", &format!("magnet:?xt=urn:btih:{ih}"))]))
+            .unwrap();
         assert_eq!(sel.session_key, ih);
         assert_eq!(sel.playback_id, ih);
     }
 
     #[test]
-    fn getstream_selects_transport_url_with_path_safe_playback_id() {
+    fn getstream_selects_transport_url_with_self_contained_playback_id() {
         let url = "https://example.com/a/b.acelive";
         let sel = ace_selected_stream(&params(&[("url", url)])).unwrap();
-        assert_eq!(sel.session_key, format!("turl:{url}"));
-        // playback_id is path-safe (no scheme separators) so it round-trips through /ace/r/{id}.
+        // playback_id == session_key: no server-side alias table, so playback survives a restart
+        // or a direct hit, and the id is path-safe (single segment, no '/'/':'/'?').
+        assert_eq!(sel.playback_id, sel.session_key);
         assert!(sel.playback_id.starts_with("turl-"));
         assert!(!sel.playback_id.contains('/'));
         assert!(!sel.playback_id.contains(':'));
+        assert!(!sel.playback_id.contains('?'));
+        // ...and it decodes back to the URL the provider will fetch.
+        assert_eq!(
+            crate::transport_url::decode_transport_url(&sel.session_key).as_deref(),
+            Some(url)
+        );
     }
 
     #[test]
@@ -636,7 +633,10 @@ mod tests {
             ("magnet", &format!("magnet:?xt=urn:btih:{ih}")),
         ]))
         .unwrap();
-        assert_eq!(sel.session_key, "turl:https://e/x.acelive");
+        assert_eq!(
+            crate::transport_url::decode_transport_url(&sel.session_key).as_deref(),
+            Some("https://e/x.acelive")
+        );
     }
 
     #[test]
@@ -1386,7 +1386,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(put.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(put.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(put.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ih_hex = json["infohash"].as_str().unwrap();
         let mut infohash = [0u8; 20];
@@ -1398,11 +1400,18 @@ mod tests {
         // Delete it -> 204, no longer served, GET 404s.
         let del = app
             .clone()
-            .oneshot(Request::delete("/broadcast/gone").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::delete("/broadcast/gone")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(del.status(), StatusCode::NO_CONTENT);
-        assert!(!seed_registry.serves(&infohash), "no longer served after delete");
+        assert!(
+            !seed_registry.serves(&infohash),
+            "no longer served after delete"
+        );
         let get = app
             .clone()
             .oneshot(Request::get("/broadcast/gone").body(Body::empty()).unwrap())
@@ -1412,7 +1421,11 @@ mod tests {
 
         // Deleting again is idempotent.
         let del2 = app
-            .oneshot(Request::delete("/broadcast/gone").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::delete("/broadcast/gone")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(del2.status(), StatusCode::NO_CONTENT);

@@ -485,6 +485,12 @@ fn is_safe_ip(ip: &IpAddr) -> bool {
 /// hostnames are resolved and the first safe address is kept (later pinned into the client so
 /// DNS rebinding cannot swap it).
 async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveError> {
+    // `Url::host_str` keeps the brackets on an IPv6 literal (`[::1]`); strip them so the literal
+    // parses and is validated, rather than falling through to a doomed DNS lookup.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     if let Ok(ip) = host.parse::<IpAddr>() {
         return if is_safe_ip(&ip) {
             Ok(SocketAddr::new(ip, port))
@@ -605,6 +611,22 @@ mod tests {
             resolve_safe_addr("127.0.0.1", 80).await,
             Err(ResolveError::Url("blocked address"))
         );
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_handles_bracketed_ipv6_literal() {
+        // `Url::host_str` returns IPv6 literals bracketed; they must be parsed+validated, not
+        // treated as an (always-failing) hostname. Bracketed loopback -> blocked (not dns failed).
+        assert_eq!(
+            resolve_safe_addr("[::1]", 80).await,
+            Err(ResolveError::Url("blocked address"))
+        );
+        // A bracketed public IPv6 literal resolves to a safe address.
+        let ok = resolve_safe_addr("[2606:2800:220:1:248:1893:25c8:1946]", 443)
+            .await
+            .unwrap();
+        assert_eq!(ok.port(), 443);
+        assert!(ok.is_ipv6());
     }
 
     // Minimal one-shot HTTP/1.1 server: serves `status`+`body` to the first connection.

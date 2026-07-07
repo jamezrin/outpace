@@ -5,7 +5,6 @@
 
 #[macro_use]
 pub mod logts;
-pub mod magnet;
 pub mod ace_provider;
 pub mod broadcast;
 pub mod broadcast_ingest;
@@ -14,6 +13,7 @@ pub mod cli;
 pub mod config;
 pub mod hls;
 pub mod http;
+pub mod magnet;
 pub mod manager;
 pub mod provider;
 pub mod routes;
@@ -22,3 +22,4 @@ pub mod rtmp_ts;
 pub mod runtime;
 pub mod session;
 pub mod testprovider;
+pub mod transport_url;
