@@ -83,7 +83,18 @@ pub struct GetPeersResponse {
 /// `r.token` (needed to `announce_peer` back to whichever node sent this response).
 pub fn parse_response(buf: &[u8]) -> Option<GetPeersResponse> {
     let v = Bencode::parse(buf).ok()?;
+    // A KRPC *response* is the message type `y == "r"` (BEP-5). On untrusted public UDP a
+    // hostile packet can smuggle an `r` dict under a query (`y == "q"`) or error
+    // (`y == "e"`) type, or omit `y` entirely; gate on the type before mining `r` for
+    // peers/nodes/tokens so those never come from a non-response.
+    if v.get(b"y").and_then(Bencode::as_bytes) != Some(b"r".as_slice()) {
+        return None;
+    }
+    // `r` must be a dict; a response whose `r` is any other shape is malformed, not empty.
     let r = v.get(b"r")?;
+    if !matches!(r, Bencode::Dict(_)) {
+        return None;
+    }
     let mut out = GetPeersResponse::default();
     if let Some(Bencode::List(vals)) = r.get(b"values") {
         for e in vals {
@@ -422,6 +433,7 @@ mod tests {
         r.insert(b"token".to_vec(), Bencode::Bytes(b"opaque-tok".to_vec()));
         let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
         top.insert(b"r".to_vec(), Bencode::Dict(r));
+        top.insert(b"y".to_vec(), Bencode::Bytes(b"r".to_vec()));
         let resp = parse_response(&Bencode::Dict(top).encode()).unwrap();
         assert_eq!(resp.token, Some(b"opaque-tok".to_vec()));
     }
@@ -432,6 +444,7 @@ mod tests {
         r.insert(b"id".to_vec(), Bencode::Bytes(vec![0; 20]));
         let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
         top.insert(b"r".to_vec(), Bencode::Dict(r));
+        top.insert(b"y".to_vec(), Bencode::Bytes(b"r".to_vec()));
         let resp = parse_response(&Bencode::Dict(top).encode()).unwrap();
         assert_eq!(resp.token, None);
     }
@@ -444,9 +457,161 @@ mod tests {
         r.insert(b"nodes".to_vec(), Bencode::Bytes(node));
         let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
         top.insert(b"r".to_vec(), Bencode::Dict(r));
+        top.insert(b"y".to_vec(), Bencode::Bytes(b"r".to_vec()));
         let resp = parse_response(&Bencode::Dict(top).encode()).unwrap();
         assert_eq!(resp.nodes.len(), 1);
         assert_eq!(resp.nodes[0].1, "1.2.3.4:6881".parse().unwrap());
+    }
+
+    // --- Malformed / hostile KRPC response hardening (#41) ---
+    //
+    // Public DHT UDP is untrusted, so `parse_response` must ignore anything that isn't a
+    // well-formed `get_peers` *response*, rather than mining peers/nodes/tokens out of it.
+
+    /// Build a raw top-level KRPC message: an optional `y` (message type), a `t`
+    /// transaction id, and the given `r` value — which need not be a dict, so malformed
+    /// shapes can be exercised.
+    fn krpc_message(y: Option<&[u8]>, r: Bencode) -> Vec<u8> {
+        let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        top.insert(b"t".to_vec(), Bencode::Bytes(b"aa".to_vec()));
+        if let Some(y) = y {
+            top.insert(b"y".to_vec(), Bencode::Bytes(y.to_vec()));
+        }
+        top.insert(b"r".to_vec(), r);
+        Bencode::Dict(top).encode()
+    }
+
+    /// Build an `r` response dict from optional `values`/`nodes`/`token` parts.
+    fn r_dict(values: Option<Bencode>, nodes: Option<Bencode>, token: Option<Bencode>) -> Bencode {
+        let mut r: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        r.insert(b"id".to_vec(), Bencode::Bytes(vec![7; 20]));
+        if let Some(v) = values {
+            r.insert(b"values".to_vec(), v);
+        }
+        if let Some(n) = nodes {
+            r.insert(b"nodes".to_vec(), n);
+        }
+        if let Some(t) = token {
+            r.insert(b"token".to_vec(), t);
+        }
+        Bencode::Dict(r)
+    }
+
+    /// A `values` list carrying exactly one valid compact peer (10.0.0.1:1111).
+    fn one_valid_peer_values() -> Bencode {
+        Bencode::List(vec![Bencode::Bytes(vec![10, 0, 0, 1, 0x04, 0x57])])
+    }
+
+    #[test]
+    fn ignores_message_whose_type_is_not_a_response() {
+        // y = "q" (a query), not "r". A hostile packet can still smuggle an `r` dict with
+        // peers and a token; gating on the message type keeps those from being trusted.
+        let r = r_dict(
+            Some(one_valid_peer_values()),
+            None,
+            Some(Bencode::Bytes(b"tok".to_vec())),
+        );
+        assert!(parse_response(&krpc_message(Some(b"q"), r)).is_none());
+    }
+
+    #[test]
+    fn ignores_response_with_missing_message_type() {
+        // BEP-5 requires `y`; a message that omits it is malformed and must be ignored.
+        let r = r_dict(Some(one_valid_peer_values()), None, None);
+        assert!(parse_response(&krpc_message(None, r)).is_none());
+    }
+
+    #[test]
+    fn ignores_error_message() {
+        // KRPC error: y="e", e=[code, msg], no `r`.
+        let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        top.insert(b"t".to_vec(), Bencode::Bytes(b"aa".to_vec()));
+        top.insert(b"y".to_vec(), Bencode::Bytes(b"e".to_vec()));
+        top.insert(
+            b"e".to_vec(),
+            Bencode::List(vec![Bencode::Int(201), Bencode::Bytes(b"err".to_vec())]),
+        );
+        assert!(parse_response(&Bencode::Dict(top).encode()).is_none());
+    }
+
+    #[test]
+    fn ignores_response_whose_r_is_not_a_dict() {
+        // y="r" but `r` is a byte string, not the expected dict — reject deterministically
+        // instead of silently treating it as an empty response.
+        let raw = krpc_message(Some(b"r"), Bencode::Bytes(b"not-a-dict".to_vec()));
+        assert!(parse_response(&raw).is_none());
+    }
+
+    #[test]
+    fn ignores_partial_trailing_compact_node_record() {
+        // One full 26-byte node followed by a truncated fragment: the fragment is dropped,
+        // the valid node survives.
+        let mut nodes = vec![9u8; 20];
+        nodes.extend_from_slice(&[1, 2, 3, 4, 0x1A, 0xE1]); // 1.2.3.4:6881
+        nodes.extend_from_slice(&[0xAB; 10]); // partial record
+        let r = r_dict(None, Some(Bencode::Bytes(nodes)), None);
+        let resp = parse_response(&krpc_message(Some(b"r"), r)).unwrap();
+        assert_eq!(resp.nodes.len(), 1);
+        assert_eq!(resp.nodes[0].1, "1.2.3.4:6881".parse().unwrap());
+    }
+
+    #[test]
+    fn skips_invalid_compact_peer_values() {
+        // Wrong-length entries, a port-0 entry, and a non-bytes entry are all skipped;
+        // only the one valid compact peer survives.
+        let vals = Bencode::List(vec![
+            Bencode::Bytes(vec![10, 0, 0, 5]),       // too short (4 bytes)
+            Bencode::Bytes(vec![10, 0, 0, 6, 0, 0]), // port 0
+            Bencode::Bytes(vec![10, 0, 0, 7, 0x04, 0x57, 0xFF]), // too long (7 bytes)
+            Bencode::Int(42),                        // not bytes at all
+            Bencode::Bytes(vec![10, 0, 0, 1, 0x04, 0x57]), // valid -> 10.0.0.1:1111
+        ]);
+        let r = r_dict(Some(vals), None, None);
+        let resp = parse_response(&krpc_message(Some(b"r"), r)).unwrap();
+        assert_eq!(resp.peers, vec!["10.0.0.1:1111".parse().unwrap()]);
+    }
+
+    #[test]
+    fn ignores_values_that_are_not_a_list() {
+        // `values` as a byte string (not a list) yields no peers.
+        let r = r_dict(
+            Some(Bencode::Bytes(vec![10, 0, 0, 1, 0x04, 0x57])),
+            None,
+            None,
+        );
+        let resp = parse_response(&krpc_message(Some(b"r"), r)).unwrap();
+        assert!(resp.peers.is_empty());
+    }
+
+    #[test]
+    fn ignores_nodes_that_are_not_bytes() {
+        // `nodes` as a list (not the compact byte string) yields no nodes.
+        let r = r_dict(None, Some(Bencode::List(vec![Bencode::Int(1)])), None);
+        let resp = parse_response(&krpc_message(Some(b"r"), r)).unwrap();
+        assert!(resp.nodes.is_empty());
+    }
+
+    #[test]
+    fn ignores_token_that_is_not_bytes() {
+        // `token` as an int (not bytes) is treated as absent, not coerced.
+        let r = r_dict(None, None, Some(Bencode::Int(42)));
+        let resp = parse_response(&krpc_message(Some(b"r"), r)).unwrap();
+        assert_eq!(resp.token, None);
+    }
+
+    #[test]
+    fn drops_payload_truncated_at_the_receive_buffer_boundary() {
+        // A datagram larger than the 2048-byte receive buffer arrives truncated; the
+        // remaining bencode is incomplete and must be rejected, not partially trusted.
+        let big_token = vec![0x5A; 4096];
+        let r = r_dict(
+            Some(one_valid_peer_values()),
+            None,
+            Some(Bencode::Bytes(big_token)),
+        );
+        let raw = krpc_message(Some(b"r"), r);
+        assert!(raw.len() > 2048, "fixture must exceed the receive buffer");
+        assert!(parse_response(&raw[..2048]).is_none());
     }
 
     #[test]
