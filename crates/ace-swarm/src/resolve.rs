@@ -503,6 +503,69 @@ async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveE
     Err(ResolveError::Url("blocked address"))
 }
 
+/// Upper bound on a fetched transport-file body (bytes). Matches the descriptor ceilings the
+/// catalog path and `MAX_METADATA_SIZE` already impose on the same `AceStreamTransport` dict.
+pub const MAX_TRANSPORT_FILE: u64 = 1_048_576;
+
+const TRANSPORT_URL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TRANSPORT_URL_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Fetch a transport file from `url`, connecting only to the pre-validated `addr` (pinned so DNS
+/// rebinding cannot redirect the connection), and decode it into a [`StreamInfo`]. Redirects are
+/// disabled (a redirect is an SSRF bypass), the body is size-capped, and a non-2xx status fails
+/// closed. This is the inner seam the public entry calls after the SSRF guard runs.
+async fn fetch_transport_from(
+    url: &str,
+    host: &str,
+    addr: SocketAddr,
+) -> Result<StreamInfo, ResolveError> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(TRANSPORT_URL_CONNECT_TIMEOUT)
+        .timeout(TRANSPORT_URL_TOTAL_TIMEOUT)
+        .resolve(host, addr)
+        .build()
+        .map_err(|_| ResolveError::Url("client build failed"))?;
+
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| ResolveError::Url("fetch failed"))?;
+    if !resp.status().is_success() {
+        return Err(ResolveError::Url("http status"));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|_| ResolveError::Url("fetch failed"))?
+    {
+        if body.len() as u64 + chunk.len() as u64 > MAX_TRANSPORT_FILE {
+            return Err(ResolveError::Url("transport too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    stream_info_from_transport(&body)
+}
+
+/// Resolve a transport-file `url=` input into a [`StreamInfo`]: require an http/https scheme, run
+/// the SSRF guard on the host, then fetch+decode via [`fetch_transport_from`]. Every failure path
+/// is fail-closed.
+pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, ResolveError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| ResolveError::Url("bad url"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ResolveError::Url("unsupported scheme"));
+    }
+    let host = parsed.host_str().ok_or(ResolveError::Url("no host"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or(ResolveError::Url("no port"))?;
+    let addr = resolve_safe_addr(host, port).await?;
+    fetch_transport_from(url, host, addr).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +605,90 @@ mod tests {
             resolve_safe_addr("127.0.0.1", 80).await,
             Err(ResolveError::Url("blocked address"))
         );
+    }
+
+    // Minimal one-shot HTTP/1.1 server: serves `status`+`body` to the first connection.
+    async fn serve_once(status: &'static str, body: Vec<u8>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // drain request headers
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fetch_decodes_a_valid_transport() {
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei100000e12:chunk_lengthi16384e4:name4:Test12:piece_lengthi1048576e6:pubkey3:abc8:trackersl18:udp://t.example:80ee",
+        );
+        let addr = serve_once("200 OK", tf).await;
+        let url = format!("http://127.0.0.1:{}/t.bin", addr.port());
+        let si = fetch_transport_from(&url, "127.0.0.1", addr).await.unwrap();
+        assert_eq!(si.piece_length, 1_048_576);
+        assert_eq!(si.infohash[0], 0x92);
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_oversized_body() {
+        let addr = serve_once("200 OK", vec![b'x'; (MAX_TRANSPORT_FILE + 1) as usize]).await;
+        let url = format!("http://127.0.0.1:{}/big.bin", addr.port());
+        assert_eq!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Url("transport too large"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_transport_body() {
+        let addr = serve_once("200 OK", b"not a transport".to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/x", addr.port());
+        assert!(matches!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_200_status() {
+        let addr = serve_once("404 Not Found", b"nope".to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/missing", addr.port());
+        assert_eq!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Url("http status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_url_rejects_unsupported_scheme() {
+        assert_eq!(
+            stream_info_from_transport_url("file:///etc/passwd").await,
+            Err(ResolveError::Url("unsupported scheme"))
+        );
+        assert_eq!(
+            stream_info_from_transport_url("ftp://example.com/x").await,
+            Err(ResolveError::Url("unsupported scheme"))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "network: fetches a real public transport-file URL"]
+    async fn live_transport_url_fetch() {
+        // Replace with a known public/free transport-file URL when validating live.
+        let url =
+            std::env::var("OUTPACE_TEST_TRANSPORT_URL").expect("set OUTPACE_TEST_TRANSPORT_URL");
+        let si = stream_info_from_transport_url(&url).await.unwrap();
+        assert_ne!(si.infohash, [0u8; 20]);
     }
 
     // Wrap raw bencode into a transport file under the global key/IV (mirrors transport.rs).
