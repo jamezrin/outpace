@@ -5,6 +5,7 @@
 
 #[macro_use]
 pub mod logts;
+pub mod magnet;
 pub mod ace_provider;
 pub mod broadcast;
 pub mod broadcast_ingest;
