@@ -22,6 +22,7 @@ use rand::Rng;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -75,6 +76,8 @@ pub enum ResolveError {
     Catalog(&'static str),
     /// A peer/network step failed during content-id resolution.
     Peer(&'static str),
+    /// A transport-file `url=` fetch failed a safety check or the network step.
+    Url(&'static str),
 }
 
 /// Build a [`StreamInfo`] from raw `AceStreamTransport` file bytes (the pure half of
@@ -443,10 +446,103 @@ fn decode_hex20(hex: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
+/// Whether an IP is safe to fetch a transport file from — a conservative denylist that fails
+/// closed on anything private, local, or otherwise not a normal public unicast address. Used by
+/// the transport-file `url=` fetch to block SSRF into internal services.
+fn is_safe_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                // Shared address space / CGNAT: 100.64.0.0/10.
+                || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000))
+        }
+        IpAddr::V6(v6) => {
+            // Re-check IPv4-mapped addresses against the v4 rules.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_safe_ip(&IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique local fc00::/7.
+                || (seg[0] & 0xfe00) == 0xfc00
+                // Link-local unicast fe80::/10.
+                || (seg[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Resolve `host` to a single safe [`SocketAddr`], or [`ResolveError::Url`] if it is unresolvable
+/// or every resolved address is blocked by [`is_safe_ip`]. IP literals are validated directly;
+/// hostnames are resolved and the first safe address is kept (later pinned into the client so
+/// DNS rebinding cannot swap it).
+async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveError> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_safe_ip(&ip) {
+            Ok(SocketAddr::new(ip, port))
+        } else {
+            Err(ResolveError::Url("blocked address"))
+        };
+    }
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| ResolveError::Url("dns failed"))?;
+    for addr in addrs {
+        if is_safe_ip(&addr.ip()) {
+            return Ok(addr);
+        }
+    }
+    Err(ResolveError::Url("blocked address"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+
+    #[test]
+    fn ssrf_guard_rejects_unsafe_ip_literals() {
+        use std::net::Ipv4Addr;
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.0.1",
+            "169.254.0.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            assert!(!is_safe_ip(&ip.parse().unwrap()), "{ip} must be unsafe");
+        }
+        for ip in ["::1", "fc00::1", "fe80::1", "::", "ff02::1"] {
+            assert!(!is_safe_ip(&ip.parse().unwrap()), "{ip} must be unsafe");
+        }
+        // IPv4-mapped loopback must also be rejected.
+        assert!(!is_safe_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+        // Public addresses are allowed.
+        assert!(is_safe_ip(&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+        assert!(is_safe_ip(&IpAddr::V6(
+            "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+        )));
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_loopback_host() {
+        assert_eq!(
+            resolve_safe_addr("127.0.0.1", 80).await,
+            Err(ResolveError::Url("blocked address"))
+        );
+    }
 
     // Wrap raw bencode into a transport file under the global key/IV (mirrors transport.rs).
     fn make_transport(plaintext: &[u8]) -> Vec<u8> {
