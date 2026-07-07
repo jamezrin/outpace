@@ -79,10 +79,11 @@ Install a prebuilt Unix binary:
 ```bash
 version=0.1.0
 target=x86_64-unknown-linux-musl
-curl -LO "https://github.com/jamezrin/outpace/releases/download/v${version}/outpace-${version}-${target}.tar.gz"
+artifact="outpace-${version}-${target}.tar.gz"
+curl -LO "https://github.com/jamezrin/outpace/releases/download/v${version}/${artifact}"
 curl -LO "https://github.com/jamezrin/outpace/releases/download/v${version}/SHA256SUMS"
-sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf "outpace-${version}-${target}.tar.gz"
+awk -v artifact="$artifact" '$2 == artifact { print }' SHA256SUMS | shasum -a 256 --check
+tar -xzf "$artifact"
 sudo install -m 0755 "outpace-${version}-${target}/outpace" /usr/local/bin/outpace
 ```
 
