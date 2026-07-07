@@ -24,6 +24,10 @@ LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
+    && groupadd --system outpace \
+    && useradd --system --gid outpace --home-dir /var/lib/outpace --shell /usr/sbin/nologin outpace \
+    && mkdir -p /var/lib/outpace \
+    && chown outpace:outpace /var/lib/outpace \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/outpace /usr/local/bin/outpace
@@ -36,5 +40,6 @@ ENV OUTPACE_BIND=0.0.0.0:6878 \
 EXPOSE 6878/tcp 1935/tcp 8621/tcp 8621/udp
 VOLUME ["/var/lib/outpace"]
 
+USER outpace
 ENTRYPOINT ["outpace"]
 CMD ["serve"]
