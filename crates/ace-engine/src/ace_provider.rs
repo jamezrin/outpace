@@ -16,8 +16,8 @@ use ace_swarm::discover::{
 };
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::{
-    hex20, resolve_via_catalog, resolve_via_peer, stream_info_from_infohash, ResolveCache,
-    ResolveError,
+    hex20, resolve_via_catalog, resolve_via_peer, stream_info_from_infohash,
+    stream_info_from_transport_url, ResolveCache, ResolveError,
 };
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
@@ -398,12 +398,16 @@ impl StreamProvider for AceProvider {
         // does content_id→infohash internally — we do it ourselves, no Acestream API).
         let info = if let Some(content_id) = id.strip_prefix("cid:") {
             self.resolve_content_id(content_id).await?
+        } else if let Some(url) = id.strip_prefix("turl:") {
+            stream_info_from_transport_url(url)
+                .await
+                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")))?
         } else if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
             stream_info_from_infohash(id, self.default_trackers.clone())
                 .map_err(|_| ProviderError::Backend("bad infohash".into()))?
         } else {
             return Err(ProviderError::Backend(
-                "id must be a 40-hex infohash or cid:<40hex> content-id".into(),
+                "id must be a 40-hex infohash, cid:<40hex>, or turl:<url>".into(),
             ));
         };
 
@@ -2392,6 +2396,36 @@ mod tests {
             p.open("cid:nothex").await,
             Err(ProviderError::Backend(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn open_rejects_transport_url_with_blocked_host() {
+        let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+        // Loopback is SSRF-blocked, so this fails closed via the turl: branch (proven by the
+        // "transport url" message, not the generic unrecognized-id fallthrough).
+        let err = p
+            .open("turl:http://127.0.0.1:1/x")
+            .await
+            .err()
+            .expect("blocked host must error");
+        match err {
+            ProviderError::Backend(msg) => assert!(msg.contains("transport url"), "{msg}"),
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_rejects_transport_url_bad_scheme() {
+        let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+        let err = p
+            .open("turl:file:///etc/passwd")
+            .await
+            .err()
+            .expect("bad scheme must error");
+        match err {
+            ProviderError::Backend(msg) => assert!(msg.contains("transport url"), "{msg}"),
+            other => panic!("expected Backend error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
