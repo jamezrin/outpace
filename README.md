@@ -59,6 +59,68 @@ The broadcast command prints:
 - an RTMP ingest URL at `rtmp://<host>:<rtmp-port>/live/<name>`;
 - an `acestream://<content_id>` link backed by BEP-9 `ut_metadata` serving.
 
+## Installation
+
+Release artifacts are created from `vX.Y.Z` git tags and published on GitHub
+Releases. Binary archives are named `outpace-<version>-<target>.<ext>`, where
+`<version>` is the tag without its leading `v`.
+
+Available targets:
+
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+
+Install a prebuilt Unix binary:
+
+```bash
+version=0.1.0
+target=x86_64-unknown-linux-musl
+curl -LO "https://github.com/jamezrin/outpace/releases/download/v${version}/outpace-${version}-${target}.tar.gz"
+curl -LO "https://github.com/jamezrin/outpace/releases/download/v${version}/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf "outpace-${version}-${target}.tar.gz"
+sudo install -m 0755 "outpace-${version}-${target}/outpace" /usr/local/bin/outpace
+```
+
+Windows releases use `.zip` archives with the same naming scheme.
+
+Run the published container image:
+
+```bash
+docker run --rm \
+  -p 6878:6878 \
+  -p 1935:1935 \
+  -p 8621:8621/tcp \
+  -p 8621:8621/udp \
+  -v outpace-data:/var/lib/outpace \
+  ghcr.io/jamezrin/outpace:0.1.0
+```
+
+The container defaults to `outpace serve`. It sets `OUTPACE_BIND=0.0.0.0:6878`,
+`OUTPACE_RTMP_BIND=0.0.0.0:1935`, and `OUTPACE_DATA_DIR=/var/lib/outpace`.
+
+## Cutting a Release
+
+The release version is driven by a git tag named `vX.Y.Z`. Before tagging, update
+the Cargo crate versions to match the release.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Pushing the tag runs `.github/workflows/release.yml`, which:
+
+- builds Linux, macOS, and Windows binaries for amd64 and arm64;
+- uploads `tar.gz` archives for Unix targets and `zip` archives for Windows;
+- generates one `SHA256SUMS` file for all archives;
+- creates a GitHub Release with generated release notes;
+- publishes `ghcr.io/jamezrin/outpace:<version>` and `ghcr.io/jamezrin/outpace:latest`.
+
 ## Runtime Surfaces
 
 Native API:
@@ -176,3 +238,7 @@ capture/interop work, not for runtime use by outpace.
 outpace targets public, unencrypted Acestream swarms. Premium/encrypted content,
 Android/player apps, and a full clone of the closed engine HTTP API are out of
 scope unless a specific issue narrows that work.
+
+## License
+
+outpace is licensed under `AGPL-3.0-or-later`. See `LICENSE`.

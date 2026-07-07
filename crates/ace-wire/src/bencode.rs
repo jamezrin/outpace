@@ -217,9 +217,7 @@ mod tests {
             }
         }
         buf.extend_from_slice(b"i0e");
-        for _ in 0..depth {
-            buf.push(b'e');
-        }
+        buf.resize(buf.len() + depth, b'e');
         buf
     }
 
