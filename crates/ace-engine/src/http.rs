@@ -14,6 +14,7 @@ use axum::{routing::get, routing::put, Json, Router};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
+use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast::error::RecvError;
@@ -356,14 +357,46 @@ fn ace_selected_stream(params: &HashMap<String, String>) -> Option<AceStreamSele
             content_id: Some(content_id.to_string()),
         });
     }
-    ace_nonempty_param(params, "infohash")
-        .or_else(|| ace_nonempty_param(params, "id"))
-        .map(|id| AceStreamSelection {
+    if let Some(id) =
+        ace_nonempty_param(params, "infohash").or_else(|| ace_nonempty_param(params, "id"))
+    {
+        return Some(AceStreamSelection {
             public_id: id.to_string(),
             playback_id: id.to_string(),
             session_key: id.to_string(),
             content_id: None,
-        })
+        });
+    }
+    if let Some(url) = ace_nonempty_param(params, "url") {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return None;
+        }
+        // session_key is what the provider opens; playback_id must be path-safe because it is
+        // interpolated into the /ace/r/{playback_id} route (a raw URL would break routing).
+        let token = format!("turl-{}", sha1_hex(url.as_bytes()));
+        return Some(AceStreamSelection {
+            public_id: token.clone(),
+            playback_id: token,
+            session_key: format!("turl:{url}"),
+            content_id: None,
+        });
+    }
+    if let Some(magnet) = ace_nonempty_param(params, "magnet") {
+        let hex = crate::magnet::parse_magnet_infohash(magnet).ok()?;
+        return Some(AceStreamSelection {
+            public_id: hex.clone(),
+            playback_id: hex.clone(),
+            session_key: hex,
+            content_id: None,
+        });
+    }
+    None
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    let mut h = Sha1::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn ace_nonempty_param<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
@@ -548,6 +581,69 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use bytes::Bytes;
     use tower::ServiceExt;
+
+    fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn getstream_selects_magnet_as_infohash() {
+        let ih = "0123456789abcdef0123456789abcdef01234567";
+        let sel =
+            ace_selected_stream(&params(&[("magnet", &format!("magnet:?xt=urn:btih:{ih}"))]))
+                .unwrap();
+        assert_eq!(sel.session_key, ih);
+        assert_eq!(sel.playback_id, ih);
+    }
+
+    #[test]
+    fn getstream_selects_transport_url_with_path_safe_playback_id() {
+        let url = "https://example.com/a/b.acelive";
+        let sel = ace_selected_stream(&params(&[("url", url)])).unwrap();
+        assert_eq!(sel.session_key, format!("turl:{url}"));
+        // playback_id is path-safe (no scheme separators) so it round-trips through /ace/r/{id}.
+        assert!(sel.playback_id.starts_with("turl-"));
+        assert!(!sel.playback_id.contains('/'));
+        assert!(!sel.playback_id.contains(':'));
+    }
+
+    #[test]
+    fn getstream_precedence_content_id_over_infohash_over_url_over_magnet() {
+        let ih = "0123456789abcdef0123456789abcdef01234567";
+        let cid = "89abcdef0123456789abcdef0123456789abcdef";
+        let sel = ace_selected_stream(&params(&[
+            ("content_id", cid),
+            ("infohash", ih),
+            ("url", "https://e/x"),
+            ("magnet", &format!("magnet:?xt=urn:btih:{ih}")),
+        ]))
+        .unwrap();
+        assert_eq!(sel.session_key, format!("cid:{cid}"));
+
+        let sel = ace_selected_stream(&params(&[
+            ("infohash", ih),
+            ("url", "https://e/x"),
+            ("magnet", &format!("magnet:?xt=urn:btih:{ih}")),
+        ]))
+        .unwrap();
+        assert_eq!(sel.session_key, ih);
+
+        let sel = ace_selected_stream(&params(&[
+            ("url", "https://e/x.acelive"),
+            ("magnet", &format!("magnet:?xt=urn:btih:{ih}")),
+        ]))
+        .unwrap();
+        assert_eq!(sel.session_key, "turl:https://e/x.acelive");
+    }
+
+    #[test]
+    fn getstream_rejects_bad_url_and_magnet() {
+        assert!(ace_selected_stream(&params(&[("url", "file:///etc/passwd")])).is_none());
+        assert!(ace_selected_stream(&params(&[("magnet", "magnet:?dn=noxt")])).is_none());
+    }
 
     fn state() -> AppState {
         let mut r = ProviderRegistry::new();
