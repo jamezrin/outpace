@@ -47,6 +47,19 @@ Play a known Acestream link to stdout:
 cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
 ```
 
+`play` (and the `/ace/getstream` compatibility route) accept four mutually
+exclusive selectors, applied in precedence order
+`content_id` > `infohash` > `url` > `magnet`:
+
+- `acestream://<content_id>` or `acestream:?content_id=<40-hex>`;
+- `acestream:?infohash=<40-hex>`;
+- `acestream:?url=<https://…>` - a transport-file URL. The descriptor is fetched
+  over http/https with SSRF protection (private, loopback, and link-local hosts
+  are blocked), a 1 MiB size cap, disabled redirects, and a request timeout;
+  unsafe, oversized, or non-transport responses fail closed;
+- `magnet:?xt=urn:btih:<40-hex-or-32-base32>` - a BitTorrent v1 magnet, reduced to
+  its infohash (v2 `urn:btmh:` magnets are rejected).
+
 Start a named broadcast:
 
 ```bash
@@ -142,6 +155,8 @@ OUTPACE_EXPERIMENTAL_ACE_COMPAT=1 cargo run -p ace-engine --bin outpace -- serve
 
 On that compatibility surface, `/ace/stat` fields live under `.response`, and
 `acestream://` ids should be passed as `content_id=`, not `infohash=`.
+`/ace/getstream` also accepts `url=` (transport-file URL) and `magnet=` selectors,
+with the same `content_id` > `infohash` > `url` > `magnet` precedence as the CLI.
 
 ## Configuration
 
