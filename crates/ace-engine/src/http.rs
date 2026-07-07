@@ -203,10 +203,9 @@ async fn broadcast_delete(State(s): State<AppState>, Path(name): Path<String>) -
     let Some(bs) = &s.broadcasts else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if let Some(bc) = bs.registry.delete(&name).await {
-        bs.seed_registry.remove(&bc.infohash);
-        bs.seed_registry.remove(&bc.content_id);
-        bs.registry.remove_cache_dir(&bc.infohash);
+    if bs.registry.delete(&name).await.is_some() {
+        // Registry-entry eviction (and disk-dir cleanup) now ride the broadcast's SeedLease drop
+        // inside `registry.delete` — no explicit seed_registry.remove / remove_cache_dir needed.
         crate::alog!("[broadcast] {name}: deleted");
     }
     StatusCode::NO_CONTENT.into_response()
@@ -1072,6 +1071,10 @@ mod tests {
     async fn broadcast_put_mints_and_serves_via_the_shared_seed_registry() {
         let st = broadcast_state();
         let seed_registry = st.broadcasts.as_ref().unwrap().seed_registry.clone();
+        // Hold the `BroadcastRegistry` Arc alive for the test's duration too: its `by_name` map
+        // now anchors each broadcast's `SeedLease` (Task 5), and `app.oneshot(..)` consumes (and
+        // drops) the whole router — including its `AppState` clone — after each request.
+        let _registry = st.broadcasts.as_ref().unwrap().registry.clone();
         let app = router(st);
 
         // A run of 188-byte packets each starting with the TS sync byte (0x47) — enough of

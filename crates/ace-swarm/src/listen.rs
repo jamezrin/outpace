@@ -2,14 +2,32 @@
 //! connections, verifies the requested infohash against the registry, and hands the socket to
 //! `SeederSession::serve`.
 use crate::seed::SeederSession;
+use crate::seed::ServeCoordinator;
 use crate::store::PieceStore;
 use ace_peer::session::PeerSession;
 use ace_wire::identity::Identity;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+
+/// Monotonic id stamped on each `SeedEntry` at creation so a `SeedLease` only ever mutates the
+/// exact entry it was issued against — not a later entry that happens to reuse the same key after
+/// a force-remove (the idle-TTL reaper). Guards against ABA lease-accounting corruption.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Per-infohash store, shared with whatever feeds pieces (a download loop, a broadcast source).
 type SharedStore = Arc<Mutex<PieceStore>>;
@@ -17,20 +35,39 @@ type SharedStore = Arc<Mutex<PieceStore>>;
 /// Per-infohash metadata blob, shared by inbound seed sessions serving BEP-9 metadata.
 type SharedMetadata = Arc<Vec<u8>>;
 
-#[derive(Clone, Default)]
+/// Who keeps a registry entry alive. `Leech` entries are refcounted by `SeedLease`s (the download
+/// loop) and are also eligible for the idle-TTL backstop reaper; `Broadcast` entries are
+/// operator-controlled (removed only when their lease drops on DELETE) and exempt from the reaper.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OwnerKind {
+    #[default]
+    Leech,
+    Broadcast,
+}
+
+#[derive(Default)]
 struct SeedEntry {
     store: Option<SharedStore>,
     metadata: Option<SharedMetadata>,
+    /// Number of live `SeedLease`s referencing this key; the entry is removed at zero.
+    producers: usize,
+    kind: OwnerKind,
+    /// Unique id stamped at creation (see `next_generation`). A `SeedLease` records the generation
+    /// it saw and only mutates the entry if it still matches — so a stale lease can't corrupt a
+    /// different entry that reused the key. `Default` gives 0, but entries are never created via
+    /// bare `or_default()`; always `or_insert_with(|| SeedEntry { generation: next_generation(), .. })`.
+    generation: u64,
+    /// Millis-since-epoch timestamp of the last activity (creation or `get`), used by the
+    /// idle-TTL reaper to decide whether a `Leech` entry has been abandoned.
+    last_active: u64,
+    /// Lazily-created multi-peer serve coordinator (S2). Shares the entry's lifetime.
+    coordinator: Option<Arc<ServeCoordinator>>,
 }
 
-/// Maps infohash -> the store and/or metadata we'd serve. Shared between whatever feeds pieces
-/// (a download loop, a broadcast source) and the inbound listener.
-///
-/// KNOWN GAP: entries are never evicted — every infohash ever followed by this process gets a
-/// permanent slot (bounded per-entry by each store's own `max_bytes`, but unbounded in entry
-/// count). A long-lived daemon that streams many distinct infohashes accumulates one store per
-/// infohash for its whole lifetime. No `unregister`/TTL exists yet; add one if this becomes a
-/// real memory concern (e.g. tied to `StreamSession` teardown).
+/// Maps infohash -> the store and/or metadata we'd serve. Entry lifetime is anchored by
+/// `SeedLease` (producer refcount): the leech download loop and each broadcast hold a lease and
+/// the entry is evicted when the last one drops. An idle-TTL reaper (added later) backstops leaked
+/// leases for `Leech` entries.
 #[derive(Clone, Default)]
 pub struct SeedRegistry {
     stores: Arc<StdMutex<HashMap<[u8; 20], SeedEntry>>>,
@@ -47,13 +84,26 @@ impl SeedRegistry {
             .lock()
             .unwrap()
             .entry(infohash)
-            .or_default()
+            .or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                last_active: now_millis(),
+                ..Default::default()
+            })
             .store = Some(store);
     }
 
     /// Register (or replace) the BEP-9 metadata for `key`.
     pub fn register_metadata(&self, key: [u8; 20], metadata: Vec<u8>) {
-        self.stores.lock().unwrap().entry(key).or_default().metadata = Some(Arc::new(metadata));
+        self.stores
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                last_active: now_millis(),
+                ..Default::default()
+            })
+            .metadata = Some(Arc::new(metadata));
     }
 
     /// The store for `infohash`, creating it via `make` (and registering it) if absent.
@@ -67,15 +117,102 @@ impl SeedRegistry {
             .lock()
             .unwrap()
             .entry(infohash)
-            .or_default()
+            .or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                last_active: now_millis(),
+                ..Default::default()
+            })
             .store
             .get_or_insert_with(|| Arc::new(Mutex::new(make())))
             .clone()
     }
 
-    /// The store for `infohash`, if we serve it.
+    /// Acquire a leech producer lease for `infohash`, creating the store via `make` if absent.
+    /// The returned `SeedLease` refcounts the entry; when the last lease for this infohash drops,
+    /// the entry (and its store) is evicted. Two concurrent leech sessions for one infohash share
+    /// a single store and the entry survives until both leases drop.
+    ///
+    /// The registry's `StdMutex` is held across `make`, so `make` must not drop a `SeedLease` for
+    /// this same registry (it would re-lock the non-reentrant mutex and deadlock).
+    pub fn lease_store(
+        &self,
+        infohash: [u8; 20],
+        make: impl FnOnce() -> PieceStore,
+    ) -> (SharedStore, SeedLease) {
+        let mut map = self.stores.lock().unwrap();
+        let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
+            generation: next_generation(),
+            last_active: now_millis(),
+            ..Default::default()
+        });
+        let store = entry
+            .store
+            .get_or_insert_with(|| Arc::new(Mutex::new(make())))
+            .clone();
+        entry.producers += 1;
+        let lease = SeedLease {
+            registry: Arc::downgrade(&self.stores),
+            keys: vec![(infohash, entry.generation)],
+        };
+        (store, lease)
+    }
+
+    /// Acquire a broadcast producer lease owning both the `infohash` (store) and `content_id`
+    /// (BEP-9 metadata) keys, creating the store via `make` if absent. Marks the entries
+    /// `Broadcast` (reaper-exempt). Dropping the returned lease evicts both keys.
+    ///
+    /// Overwrites any existing `content_id` metadata; content is content-addressed by `content_id`,
+    /// so the blob is deterministic for a given key and the overwrite is a no-op in practice.
+    ///
+    /// The registry's `StdMutex` is held across `make`, so `make` must not drop a `SeedLease` for
+    /// this same registry (it would re-lock the non-reentrant mutex and deadlock).
+    pub fn lease_broadcast(
+        &self,
+        infohash: [u8; 20],
+        content_id: [u8; 20],
+        metadata: Vec<u8>,
+        make: impl FnOnce() -> PieceStore,
+    ) -> (SharedStore, SeedLease) {
+        let mut map = self.stores.lock().unwrap();
+        let (store, ih_generation) = {
+            let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                last_active: now_millis(),
+                ..Default::default()
+            });
+            entry.producers += 1;
+            entry.kind = OwnerKind::Broadcast;
+            let store = entry
+                .store
+                .get_or_insert_with(|| Arc::new(Mutex::new(make())))
+                .clone();
+            (store, entry.generation)
+        };
+        let cid_generation = {
+            let meta_entry = map.entry(content_id).or_insert_with(|| SeedEntry {
+                generation: next_generation(),
+                last_active: now_millis(),
+                ..Default::default()
+            });
+            meta_entry.producers += 1;
+            meta_entry.kind = OwnerKind::Broadcast;
+            meta_entry.metadata = Some(Arc::new(metadata));
+            meta_entry.generation
+        };
+        let lease = SeedLease {
+            registry: Arc::downgrade(&self.stores),
+            keys: vec![(infohash, ih_generation), (content_id, cid_generation)],
+        };
+        (store, lease)
+    }
+
+    /// The store for `infohash`, if we serve it. Touches the entry's activity clock (used by the
+    /// idle-TTL reaper) so an actively-served stream is never reaped.
     pub fn get(&self, infohash: &[u8; 20]) -> Option<SharedStore> {
-        self.stores.lock().unwrap().get(infohash)?.store.clone()
+        let mut map = self.stores.lock().unwrap();
+        let entry = map.get_mut(infohash)?;
+        entry.last_active = now_millis();
+        entry.store.clone()
     }
 
     /// The BEP-9 metadata for `key`, if we serve it.
@@ -88,10 +225,89 @@ impl SeedRegistry {
         self.stores.lock().unwrap().contains_key(infohash)
     }
 
+    /// The serve coordinator for `infohash`, creating it (with `max_unchoked`) on first use.
+    /// Returns `None` if we don't serve this infohash (entry absent), so a racing eviction can't
+    /// resurrect a bare entry.
+    pub fn coordinator_for(
+        &self,
+        infohash: &[u8; 20],
+        max_unchoked: usize,
+    ) -> Option<Arc<ServeCoordinator>> {
+        let mut map = self.stores.lock().unwrap();
+        let entry = map.get_mut(infohash)?;
+        Some(
+            entry
+                .coordinator
+                .get_or_insert_with(|| ServeCoordinator::new(max_unchoked))
+                .clone(),
+        )
+    }
+
+    /// Advance every live coordinator's optimistic-unchoke rotation. Called by the listener's
+    /// periodic rechoke ticker.
+    pub fn rechoke_all(&self) {
+        let coords: Vec<_> = {
+            let map = self.stores.lock().unwrap();
+            map.values().filter_map(|e| e.coordinator.clone()).collect()
+        };
+        for c in coords {
+            c.rechoke();
+        }
+    }
+
     /// Stop serving `key` (an infohash or a metadata content_id): drops both the piece store
     /// and any registered metadata under it. Idempotent — removing an absent key is a no-op.
     pub fn remove(&self, key: &[u8; 20]) {
         self.stores.lock().unwrap().remove(key);
+    }
+
+    /// Force-evict idle **ownerless** `Leech` entries (`producers == 0`, i.e. created outside the
+    /// lease API and never tied to a live producer). Entries held by a live `SeedLease`
+    /// (`producers > 0`) and all `Broadcast` entries are NEVER reaped — normal teardown rides the
+    /// lease drop. This is a backstop against orphans, not a way to reclaim a live-but-slow producer
+    /// (a stuck task holding a lease is left alone; it can't be soundly told apart from a slow one).
+    /// Returns how many entries were removed.
+    pub fn reap(&self, ttl: std::time::Duration) -> usize {
+        let now = now_millis();
+        let ttl_ms = ttl.as_millis() as u64;
+        let mut map = self.stores.lock().unwrap();
+        let before = map.len();
+        map.retain(|_, e| {
+            e.kind == OwnerKind::Broadcast
+                || e.producers > 0
+                || now.saturating_sub(e.last_active) < ttl_ms
+        });
+        before - map.len()
+    }
+}
+
+/// RAII producer handle for one or more `SeedRegistry` keys. Dropping it decrements each key's
+/// producer count and evicts any entry that reaches zero. Not `Clone` — a clone would need to bump
+/// the count; acquire another lease via the registry instead. Each key is paired with the entry
+/// generation seen at issue, so a stale lease never touches a different entry that reused the key.
+pub struct SeedLease {
+    registry: std::sync::Weak<StdMutex<HashMap<[u8; 20], SeedEntry>>>,
+    keys: Vec<([u8; 20], u64)>,
+}
+
+impl Drop for SeedLease {
+    fn drop(&mut self) {
+        let Some(map) = self.registry.upgrade() else {
+            return;
+        };
+        let mut map = map.lock().unwrap();
+        for (key, generation) in &self.keys {
+            if let Some(entry) = map.get_mut(key) {
+                // Only decrement the exact entry this lease was issued against; a force-remove +
+                // recreate at the same key bumps the generation and makes this a no-op.
+                if entry.generation == *generation {
+                    entry.producers = entry.producers.saturating_sub(1);
+                    if entry.producers == 0 {
+                        map.remove(key);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -114,6 +330,7 @@ impl PeerListener {
         piece_header: [u8; 8],
         max_inbound: usize,
         identity: Arc<Identity>,
+        max_unchoked: usize,
     ) {
         let sem = Arc::new(tokio::sync::Semaphore::new(max_inbound.max(1)));
         loop {
@@ -153,6 +370,7 @@ impl PeerListener {
                     piece_header,
                     &identity,
                     peer_ip,
+                    max_unchoked,
                 )
                 .await
                 {
@@ -170,6 +388,7 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     piece_header: [u8; 8],
     identity: &Identity,
     peer_ip: [u8; 4],
+    max_unchoked: usize,
 ) -> ace_peer::Result<()> {
     let mut session = PeerSession::new(stream);
     let peer_hs = session
@@ -180,6 +399,7 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     if store.is_none() && metadata.is_none() {
         return Err(ace_peer::PeerError::InfohashMismatch);
     }
+    let coordinator = registry.coordinator_for(&peer_hs.infohash, max_unchoked);
     SeederSession::serve(
         &mut session,
         store,
@@ -187,6 +407,7 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
         piece_header,
         identity,
         peer_ip,
+        coordinator,
     )
     .await
 }
@@ -233,5 +454,127 @@ mod tests {
         // Removing an absent key is a no-op.
         reg.remove(&key);
         assert!(!reg.serves(&key));
+    }
+
+    #[test]
+    fn lease_evicts_entry_when_last_producer_drops() {
+        let reg = SeedRegistry::new();
+        let ih = [3u8; 20];
+        let (_store, lease) = reg.lease_store(ih, || PieceStore::new(4, 4, 1024));
+        assert!(reg.serves(&ih), "served while a producer holds the lease");
+        drop(lease);
+        assert!(
+            !reg.serves(&ih),
+            "entry evicted when the last producer drops"
+        );
+    }
+
+    #[test]
+    fn two_leases_refcount_the_same_entry() {
+        let reg = SeedRegistry::new();
+        let ih = [4u8; 20];
+        let (a, l1) = reg.lease_store(ih, || PieceStore::new(4, 4, 1024));
+        let (b, l2) = reg.lease_store(ih, || panic!("second lease must reuse the store"));
+        assert!(Arc::ptr_eq(&a, &b), "both leases share one store");
+        drop(l1);
+        assert!(
+            reg.serves(&ih),
+            "entry survives while the second producer holds it"
+        );
+        drop(l2);
+        assert!(
+            !reg.serves(&ih),
+            "entry evicted only when both producers drop"
+        );
+    }
+
+    #[test]
+    fn broadcast_lease_owns_both_infohash_and_content_id() {
+        let reg = SeedRegistry::new();
+        let ih = [5u8; 20];
+        let cid = [6u8; 20];
+        let (_store, lease) =
+            reg.lease_broadcast(ih, cid, vec![1, 2, 3], || PieceStore::new(4, 4, 1024));
+        assert!(reg.serves(&ih) && reg.serves(&cid));
+        assert_eq!(&*reg.metadata(&cid).unwrap(), &[1, 2, 3]);
+        drop(lease);
+        assert!(!reg.serves(&ih), "infohash entry evicted");
+        assert!(!reg.serves(&cid), "content_id entry evicted");
+    }
+
+    #[test]
+    fn stale_lease_drop_does_not_evict_a_reborn_entry_at_the_same_key() {
+        let reg = SeedRegistry::new();
+        let ih = [12u8; 20];
+        let (_s1, l1) = reg.lease_store(ih, || PieceStore::new(4, 4, 1024));
+        // Simulate the reaper force-removing the entry while the lease is still outstanding.
+        reg.remove(&ih);
+        assert!(!reg.serves(&ih));
+        // A new producer re-creates the entry (new generation).
+        let (_s2, _l2) = reg.lease_store(ih, || PieceStore::new(4, 4, 1024));
+        assert!(reg.serves(&ih));
+        // Dropping the STALE lease must NOT evict the reborn entry.
+        drop(l1);
+        assert!(
+            reg.serves(&ih),
+            "stale lease drop must not touch the reborn entry"
+        );
+    }
+
+    #[test]
+    fn reaper_evicts_idle_ownerless_leech_entry() {
+        let reg = SeedRegistry::new();
+        let ih = [1u8; 20];
+        // An ownerless entry (created outside the lease API — producers == 0).
+        reg.get_or_create(ih, || PieceStore::new(4, 4, 1024));
+        let evicted = reg.reap(std::time::Duration::from_secs(0));
+        assert_eq!(evicted, 1, "idle ownerless leech entry is reaped");
+        assert!(!reg.serves(&ih));
+    }
+
+    #[test]
+    fn reaper_spares_owned_entries_even_when_idle() {
+        let reg = SeedRegistry::new();
+        let leech = [1u8; 20];
+        let bcast_ih = [2u8; 20];
+        let bcast_cid = [3u8; 20];
+        // Live leases (producers > 0). mem::forget so only the reaper could reclaim them.
+        std::mem::forget(reg.lease_store(leech, || PieceStore::new(4, 4, 1024)).1);
+        std::mem::forget(
+            reg.lease_broadcast(bcast_ih, bcast_cid, vec![9], || PieceStore::new(4, 4, 1024))
+                .1,
+        );
+        let evicted = reg.reap(std::time::Duration::from_secs(0));
+        assert_eq!(evicted, 0, "owned entries are never reaped, even when idle");
+        assert!(reg.serves(&leech), "actively-owned leech entry survives");
+        assert!(
+            reg.serves(&bcast_ih) && reg.serves(&bcast_cid),
+            "broadcast survives"
+        );
+    }
+
+    #[test]
+    fn get_touches_last_active_so_an_ownerless_entry_is_not_reaped() {
+        let reg = SeedRegistry::new();
+        let ih = [8u8; 20];
+        reg.get_or_create(ih, || PieceStore::new(4, 4, 1024)); // ownerless
+        let _ = reg.get(&ih); // touch
+        let evicted = reg.reap(std::time::Duration::from_secs(3600));
+        assert_eq!(evicted, 0);
+        assert!(reg.serves(&ih));
+    }
+
+    #[test]
+    fn coordinator_for_is_stable_per_infohash() {
+        let reg = SeedRegistry::new();
+        let ih = [11u8; 20];
+        let (_s, _l) = reg.lease_store(ih, || PieceStore::new(4, 4, 1024));
+        let c1 = reg.coordinator_for(&ih, 4).unwrap();
+        let c2 = reg.coordinator_for(&ih, 4).unwrap();
+        assert!(Arc::ptr_eq(&c1, &c2), "one coordinator per served infohash");
+        assert!(
+            reg.coordinator_for(&[99u8; 20], 4).is_none(),
+            "no coordinator for an unserved infohash"
+        );
     }
 }

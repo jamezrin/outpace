@@ -92,25 +92,41 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_SEED_STORE_BYTES` - byte budget for retained piece data (sizes both cache backends).
 - `OUTPACE_CACHE_TYPE` - where the seed store keeps piece data: `memory` (default) or `disk`.
   `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
-- `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per infohash),
-  default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`.
+- `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per served stream; see
+  below), default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`.
 - `OUTPACE_PREFETCH_PIECES` - pieces behind the live edge to start at, default `8`.
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
-- `OUTPACE_MAX_UNCHOKED` - accepted config knob for future multi-peer S2 policy.
+- `OUTPACE_MAX_UNCHOKED` - max simultaneously-unchoked peers per served stream (default 8). Wired
+  into the inbound serve path via the per-infohash serve coordinator: each stream unchokes up to
+  this many interested peers plus one rotating optimistic slot (rotated on a ~10s rechoke tick).
+- `OUTPACE_SEED_TTL_SECS` - idle-TTL (seconds, default 300; 0 disables) after which an *ownerless*
+  seed-registry entry (one with no live producer lease) is force-evicted by the reaper. A backstop
+  only — normal teardown rides the lease drop, and entries held by a live producer or a broadcast
+  are never reaped.
 - `OUTPACE_MAX_INBOUND` - inbound peer connection limit.
 - `OUTPACE_ENABLE_SEEDING` - reciprocal upload gate over outbound leech connections
   (answering peers' chunk requests). Self-announce is gated on `OUTPACE_ENABLE_INBOUND`.
-- `OUTPACE_ENABLE_INBOUND` - inbound peer listener gate; on by default (matching
-  the Acestream engine's full P2P participation). Set `0` for a pure leecher.
+- `OUTPACE_ENABLE_INBOUND` (default: on) - inbound peer serving (S2) gate. On by default,
+  intentionally matching the Acestream engine's out-of-the-box behavior: a full P2P participant
+  that binds its peer port (`OUTPACE_PEER_LISTEN`), accepts inbound peers, seeds, and
+  self-announces to trackers + DHT. Only the HTTP API (`OUTPACE_BIND`) stays on localhost by
+  default; the exposed surface is the peer port, as with Acestream. Set
+  `OUTPACE_ENABLE_INBOUND=0` for a pure-leecher deployment (no inbound listener, no seeder
+  self-announce).
 - `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - enables legacy compatibility routes.
 - `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
 
 The disk cache is **ephemeral**: its directory is cleared when a store is created and
 never reloaded across restarts (live piece data goes stale), which also avoids serving
 evicted-stale pieces. Disk I/O is currently synchronous; a write failure logs and falls
-back to memory rather than crashing. A stopped broadcast's cache dir is removed on
-`DELETE /broadcast/{name}`.
+back to memory rather than crashing.
+
+In disk mode each served stream keeps its pieces under
+`<OUTPACE_CACHE_DIR>/<infohash_hex>-<generation>` (a process-unique suffix per store instance).
+The directory is removed automatically when the stream is torn down (leech consumer disconnects,
+broadcast `DELETE`, or process exit), and the whole cache root is wiped on startup, so no
+per-stream directories accumulate.
 
 ## Project Docs
 

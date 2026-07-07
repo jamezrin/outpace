@@ -75,6 +75,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_MAX_INBOUND") {
         config.max_inbound_peers = v.parse()?;
     }
+    if let Ok(v) = std::env::var("OUTPACE_SEED_TTL_SECS") {
+        config.seed_ttl_secs = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_ENABLE_SEEDING") {
         config.enable_seeding = matches!(v.as_str(), "1" | "true");
     }
@@ -140,9 +143,19 @@ pub async fn build_runtime(
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
 
-    // Fail fast on a misconfigured disk cache: prepare the cache root once at startup so a bad
-    // OUTPACE_CACHE_DIR surfaces here rather than silently degrading to memory per stream.
+    // Fail fast on a misconfigured disk cache, and start from a clean slate: wipe the cache root
+    // so per-infohash dirs orphaned by a hard crash (no `Drop` ran) don't survive a restart. The
+    // cache is ephemeral (piece data goes stale; broadcasts rebuild theirs from live ingest), so
+    // wiping is always safe. A bad OUTPACE_CACHE_DIR surfaces here rather than degrading per stream.
     if config.cache_type == CacheType::Disk {
+        if config.cache_dir.exists() {
+            std::fs::remove_dir_all(&config.cache_dir).map_err(|e| {
+                format!(
+                    "cannot clear OUTPACE_CACHE_DIR {}: {e}",
+                    config.cache_dir.display()
+                )
+            })?;
+        }
         std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
             format!(
                 "cannot create OUTPACE_CACHE_DIR {}: {e}",
@@ -174,6 +187,33 @@ pub async fn build_runtime(
 
     let manager = StreamManager::with_buffer(registry, config.session_buffer);
     manager.spawn_reaper();
+    if config.seed_ttl_secs > 0 {
+        let seed_registry_reap = seed_registry.clone();
+        let ttl = std::time::Duration::from_secs(config.seed_ttl_secs);
+        tokio::spawn(async move {
+            // Sweep at a fraction of the TTL so an idle entry is reclaimed within ~1.25x the TTL.
+            let interval = (ttl / 4).max(std::time::Duration::from_secs(5));
+            loop {
+                tokio::time::sleep(interval).await;
+                let n = seed_registry_reap.reap(ttl);
+                if n > 0 {
+                    crate::alog!("[seed] reaped {n} idle leech registry entr(y/ies)");
+                }
+            }
+        });
+    }
+    if config.enable_inbound {
+        let rechoke_registry = seed_registry.clone();
+        tokio::spawn(async move {
+            // BitTorrent's classic rechoke cadence is ~10s; rotate the optimistic-unchoke slot on
+            // that beat so newcomers periodically get a turn even on a saturated stream.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                ticker.tick().await;
+                rechoke_registry.rechoke_all();
+            }
+        });
+    }
     let broadcasts = BroadcastState {
         registry: BroadcastRegistry::with_persist(
             &config.data_dir,
@@ -196,7 +236,10 @@ pub async fn build_runtime(
         .reload_persisted(&broadcasts.seed_registry, broadcasts.store_bytes)
         .await;
     if !reloaded.is_empty() {
-        crate::alog!("[broadcast] reloaded {} persisted broadcast(s)", reloaded.len());
+        crate::alog!(
+            "[broadcast] reloaded {} persisted broadcast(s)",
+            reloaded.len()
+        );
     }
     for bc in &reloaded {
         broadcasts.spawn_announce(bc);
@@ -252,6 +295,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         let listener_peer_id = ace_wire::handshake::random_peer_id();
         let inbound_registry = seed_registry.clone();
         let max_inbound = config.max_inbound_peers;
+        let max_unchoked = config.max_unchoked;
         let listener_identity = identity.clone();
         tokio::spawn(async move {
             ace_swarm::listen::PeerListener::serve(
@@ -261,6 +305,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
                 [0u8; 8],
                 max_inbound,
                 listener_identity,
+                max_unchoked,
             )
             .await;
         });
@@ -405,7 +450,10 @@ mod tests {
         std::env::set_var("OUTPACE_CACHE_DIR", "/tmp/outpace-cache-test");
         let c = config_from_env().unwrap();
         assert_eq!(c.cache_type, CacheType::Disk);
-        assert_eq!(c.cache_dir, std::path::PathBuf::from("/tmp/outpace-cache-test"));
+        assert_eq!(
+            c.cache_dir,
+            std::path::PathBuf::from("/tmp/outpace-cache-test")
+        );
         std::env::remove_var("OUTPACE_CACHE_TYPE");
         std::env::remove_var("OUTPACE_CACHE_DIR");
     }
@@ -455,13 +503,40 @@ mod tests {
         let runtime = build_runtime(config, vec![]).await.unwrap();
 
         let reloaded = runtime.broadcasts.registry.get("news").await;
-        assert!(reloaded.is_some(), "persisted broadcast reloaded into the registry");
-        assert_eq!(reloaded.unwrap().infohash, infohash, "identity survives restart");
+        assert!(
+            reloaded.is_some(),
+            "persisted broadcast reloaded into the registry"
+        );
+        assert_eq!(
+            reloaded.unwrap().infohash,
+            infohash,
+            "identity survives restart"
+        );
         assert!(
             runtime.seed_registry.serves(&infohash),
             "reloaded broadcast is immediately servable"
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn build_runtime_wires_max_unchoked_without_error() {
+        let dir = std::env::temp_dir().join(format!("outpace-rt-mu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            cache_dir: dir.join("cache"),
+            max_unchoked: 2,
+            enable_inbound: true,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            peer_listen: "127.0.0.1:0".parse().unwrap(),
+            rtmp_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        };
+        let runtime = build_runtime(config, vec![]).await.unwrap();
+        assert_eq!(runtime.config.max_unchoked, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

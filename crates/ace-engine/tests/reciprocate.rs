@@ -36,6 +36,7 @@ async fn peer_downloads_a_chunk_from_us() {
             [0u8; 8],
             &identity,
             [127, 0, 0, 1],
+            None,
         )
         .await;
     });
