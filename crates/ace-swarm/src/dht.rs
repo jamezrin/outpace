@@ -7,7 +7,7 @@
 //! and harvests any `values` (peers) it's handed along the way.
 
 use ace_wire::bencode::Bencode;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -22,6 +22,11 @@ const BOOTSTRAP: &[&str] = &[
 /// Enough peers to start racing TCP connects. Waiting for a much larger DHT harvest delays
 /// first byte even though the engine only needs one good upstream.
 const DHT_PEER_TARGET: usize = 8;
+
+/// How long an inflight `(source, txid)` query stays eligible to be answered. Long enough to
+/// admit a genuine reply that lands a round or two late, short enough that a stale entry can't
+/// be matched by an unrelated packet arriving much later in the walk.
+const INFLIGHT_TTL: Duration = Duration::from_secs(3);
 
 /// Build a `get_peers` KRPC query for `infohash` from our `node_id`.
 pub fn build_get_peers(node_id: &[u8; 20], infohash: &[u8; 20], txid: &[u8]) -> Vec<u8> {
@@ -69,6 +74,9 @@ pub struct GetPeersResponse {
     pub peers: Vec<SocketAddrV4>,
     pub nodes: Vec<([u8; 20], SocketAddrV4)>,
     pub token: Option<Vec<u8>>,
+    /// The KRPC transaction id (`t`) this reply echoes, used to correlate it against the
+    /// outbound query it answers. Empty if the response omitted `t`.
+    pub txid: Vec<u8>,
 }
 
 /// Parse a KRPC response, extracting `r.values` (peers), `r.nodes` (compact nodes), and
@@ -99,6 +107,13 @@ pub fn parse_response(buf: &[u8]) -> Option<GetPeersResponse> {
         .get(b"token")
         .and_then(Bencode::as_bytes)
         .map(|b| b.to_vec());
+    // Transaction id lives at the top level (`t`), alongside `r`/`y` — capture it so the walk
+    // can correlate this reply against the query it answers.
+    out.txid = v
+        .get(b"t")
+        .and_then(Bencode::as_bytes)
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
     Some(out)
 }
 
@@ -183,11 +198,22 @@ async fn dht_walk_frontier(
     let node_id: [u8; 20] = rand::random();
 
     let mut queried: HashSet<SocketAddrV4> = HashSet::new();
+    // Inflight queries keyed by (destination, transaction id) → expiry deadline. Public DHT
+    // UDP is untrusted, so a reply is only trusted if it arrives from the exact node we asked
+    // and echoes the exact transaction id we generated for that query.
+    let mut inflight: HashMap<(SocketAddrV4, Vec<u8>), Instant> = HashMap::new();
+    // Monotonic per-walk counter → a distinct 2-byte transaction id for every outbound query.
+    let mut next_txid: u16 = 0;
     let deadline = Instant::now() + budget;
     let mut buf = [0u8; 2048];
     crate::swarm_log!("[dht] seeded {} bootstrap node(s)", frontier.len());
 
     'outer: while Instant::now() < deadline {
+        // Drop expired inflight entries so a stale (source, txid) can't be matched by a much
+        // later packet — an unanswered query is abandoned, not left open for the whole walk.
+        let now = Instant::now();
+        inflight.retain(|_, exp| *exp > now);
+
         // Send to up to 8 closest not-yet-queried nodes.
         let batch: Vec<SocketAddrV4> = frontier
             .values()
@@ -201,8 +227,12 @@ async fn dht_walk_frontier(
         }
         for addr in &batch {
             queried.insert(*addr);
-            let q = build_get_peers(&node_id, infohash, b"sc");
-            let _ = sock.send_to(&q, SocketAddr::V4(*addr)).await;
+            let txid = next_txid.to_be_bytes().to_vec();
+            next_txid = next_txid.wrapping_add(1);
+            let q = build_get_peers(&node_id, infohash, &txid);
+            if sock.send_to(&q, SocketAddr::V4(*addr)).await.is_ok() {
+                inflight.insert((*addr, txid), Instant::now() + INFLIGHT_TTL);
+            }
         }
 
         // Collect responses for a short window.
@@ -215,18 +245,26 @@ async fn dht_walk_frontier(
                     // is always from a v4 peer; skip (not break — keep collecting within the
                     // window) on the theoretical v6 case rather than treating it as a timeout.
                     let SocketAddr::V4(src) = src else { continue };
-                    if let Some(resp) = parse_response(&buf[..n]) {
-                        for (id, addr) in &resp.nodes {
-                            frontier.entry(distance(id, infohash)).or_insert(*addr);
-                        }
-                        // Cap frontier growth: keep the 64 closest.
-                        while frontier.len() > 64 {
-                            let last = *frontier.keys().next_back().unwrap();
-                            frontier.remove(&last);
-                        }
-                        if on_response(src, &resp) {
-                            break 'outer;
-                        }
+                    let Some(resp) = parse_response(&buf[..n]) else {
+                        continue;
+                    };
+                    // Correlate: only accept a reply whose (source, txid) matches an inflight
+                    // query. Removing the entry also means a duplicate/replayed packet for the
+                    // same query is not processed twice. Unmatched packets are dropped, not
+                    // treated as end-of-window, so a spoofed packet can't cut the walk short.
+                    if inflight.remove(&(src, resp.txid.clone())).is_none() {
+                        continue;
+                    }
+                    for (id, addr) in &resp.nodes {
+                        frontier.entry(distance(id, infohash)).or_insert(*addr);
+                    }
+                    // Cap frontier growth: keep the 64 closest.
+                    while frontier.len() > 64 {
+                        let last = *frontier.keys().next_back().unwrap();
+                        frontier.remove(&last);
+                    }
+                    if on_response(src, &resp) {
+                        break 'outer;
                     }
                 }
                 _ => break,
@@ -307,8 +345,9 @@ pub async fn dht_announce_peer(infohash: &[u8; 20], peer_port: u16, budget: Dura
 
     let node_id: [u8; 20] = rand::random();
     let mut announced = 0usize;
-    for (addr, token) in &tokens {
-        let q = build_announce_peer(&node_id, infohash, peer_port, token, b"sc");
+    for (i, (addr, token)) in tokens.iter().enumerate() {
+        let txid = (i as u16).to_be_bytes();
+        let q = build_announce_peer(&node_id, infohash, peer_port, token, &txid);
         if sock.send_to(&q, SocketAddr::V4(*addr)).await.is_ok() {
             announced += 1;
         }
@@ -416,6 +455,46 @@ mod tests {
         assert!(distance(&[0; 20], &[1; 20]) < distance(&[0xff; 20], &[0; 20]));
     }
 
+    /// Extract the KRPC transaction id (`t`) from a raw query/response buffer.
+    fn buf_txid(buf: &[u8]) -> Vec<u8> {
+        Bencode::parse(buf)
+            .unwrap()
+            .get(b"t")
+            .and_then(Bencode::as_bytes)
+            .expect("query must carry a transaction id")
+            .to_vec()
+    }
+
+    /// Build a `get_peers` `values` response echoing `txid` and carrying `peers`.
+    fn values_response(txid: &[u8], peers: &[SocketAddrV4]) -> Vec<u8> {
+        let vals: Vec<Bencode> = peers
+            .iter()
+            .map(|p| {
+                let mut b = Vec::new();
+                b.extend_from_slice(&p.ip().octets());
+                b.extend_from_slice(&p.port().to_be_bytes());
+                Bencode::Bytes(b)
+            })
+            .collect();
+        let mut r: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        r.insert(b"id".to_vec(), Bencode::Bytes(vec![7; 20]));
+        r.insert(b"values".to_vec(), Bencode::List(vals));
+        let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        top.insert(b"t".to_vec(), Bencode::Bytes(txid.to_vec()));
+        top.insert(b"y".to_vec(), Bencode::Bytes(b"r".to_vec()));
+        top.insert(b"r".to_vec(), Bencode::Dict(r));
+        Bencode::Dict(top).encode()
+    }
+
+    #[test]
+    fn parse_response_extracts_transaction_id() {
+        // The transaction id lives at the top level (`t`), not inside `r`; the walk needs it
+        // to correlate a reply against the query it answers.
+        let resp = values_response(b"Zx", &["10.0.0.9:9000".parse().unwrap()]);
+        let got = parse_response(&resp).unwrap();
+        assert_eq!(got.txid, b"Zx".to_vec());
+    }
+
     #[tokio::test]
     async fn dht_lookup_stops_once_peer_target_is_met() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -425,26 +504,17 @@ mod tests {
         };
         let handle = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
-            let (_n, peer) = server.recv_from(&mut buf).await.unwrap();
-            let mut peer1 = Vec::new();
-            peer1.extend_from_slice(&[10, 0, 0, 1]);
-            peer1.extend_from_slice(&1111u16.to_be_bytes());
-            let mut peer2 = Vec::new();
-            peer2.extend_from_slice(&[10, 0, 0, 2]);
-            peer2.extend_from_slice(&2222u16.to_be_bytes());
-
-            let mut r: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
-            r.insert(b"id".to_vec(), Bencode::Bytes(vec![7; 20]));
-            r.insert(
-                b"values".to_vec(),
-                Bencode::List(vec![Bencode::Bytes(peer1), Bencode::Bytes(peer2)]),
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            // A real node echoes the query's transaction id; the client now requires it.
+            let txid = buf_txid(&buf[..n]);
+            let resp = values_response(
+                &txid,
+                &[
+                    "10.0.0.1:1111".parse().unwrap(),
+                    "10.0.0.2:2222".parse().unwrap(),
+                ],
             );
-            let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
-            top.insert(b"r".to_vec(), Bencode::Dict(r));
-            server
-                .send_to(&Bencode::Dict(top).encode(), peer)
-                .await
-                .unwrap();
+            server.send_to(&resp, peer).await.unwrap();
         });
 
         let start = Instant::now();
@@ -460,6 +530,65 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "lookup should return as soon as enough peers are available"
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dht_ignores_response_with_wrong_transaction_id() {
+        // A valid-looking response from the queried node but echoing a transaction id we never
+        // sent must not contribute peers — it is unrelated (or forged) traffic.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = match server.local_addr().unwrap() {
+            SocketAddr::V4(v4) => v4,
+            _ => panic!("test server must be IPv4"),
+        };
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let real = buf_txid(&buf[..n]);
+            // Deliberately corrupt the echoed txid so it cannot match any inflight query.
+            let mut wrong = real.clone();
+            wrong.push(0xff);
+            let resp = values_response(&wrong, &["10.0.0.1:1111".parse().unwrap()]);
+            server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let peers =
+            dht_get_peers_from_seeds(&[9u8; 20], Duration::from_millis(1200), 2, vec![seed]).await;
+        assert!(
+            peers.is_empty(),
+            "response with a mismatched transaction id must be ignored, got {peers:?}"
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dht_ignores_response_from_wrong_source() {
+        // A response echoing the correct transaction id but arriving from an address we never
+        // queried must be ignored: an off-path attacker who guesses/observes the txid still
+        // cannot inject peers unless the source also matches the inflight query.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spoofer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = match server.local_addr().unwrap() {
+            SocketAddr::V4(v4) => v4,
+            _ => panic!("test server must be IPv4"),
+        };
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            // The queried node stays silent; the spoofer (different source) replies with the
+            // correct txid it observed from the query.
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let txid = buf_txid(&buf[..n]);
+            let resp = values_response(&txid, &["10.0.0.1:1111".parse().unwrap()]);
+            spoofer.send_to(&resp, peer).await.unwrap();
+        });
+
+        let peers =
+            dht_get_peers_from_seeds(&[9u8; 20], Duration::from_millis(1200), 2, vec![seed]).await;
+        assert!(
+            peers.is_empty(),
+            "response from an unqueried source must be ignored, got {peers:?}"
         );
         handle.await.unwrap();
     }
