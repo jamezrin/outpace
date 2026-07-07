@@ -128,6 +128,46 @@ pub fn parse_response(buf: &[u8]) -> Option<GetPeersResponse> {
     Some(out)
 }
 
+/// Did a rejected datagram carry a well-formed KRPC error (`y == "e"`), as opposed to being
+/// unparseable or the wrong shape? Diagnostics only — used to separate a node that answered
+/// with an error from genuinely malformed/hostile traffic.
+fn is_krpc_error(buf: &[u8]) -> bool {
+    match Bencode::parse(buf) {
+        Ok(v) => v.get(b"y").and_then(Bencode::as_bytes) == Some(b"e".as_slice()),
+        Err(_) => false,
+    }
+}
+
+/// Per-walk diagnostics for a single iterative lookup. A raw peer count hides the failure
+/// modes that matter when comparing the custom DHT against a candidate crate (#43): silence,
+/// malformed traffic, KRPC errors, uncorrelated packets, and frontier exhaustion. Logged once
+/// at the end of a walk and returned so tests can assert on it; not part of the public API.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DhtWalkMetrics {
+    /// Bootstrap/seed nodes placed in the initial frontier.
+    bootstrap_seeded: usize,
+    /// `get_peers` queries sent (one per not-yet-queried node).
+    nodes_queried: usize,
+    /// Datagrams accepted as correlated `get_peers` responses.
+    valid_responses: usize,
+    /// Peer records harvested from accepted responses (`r.values`).
+    peers_discovered: usize,
+    /// Compact node records harvested from accepted responses (`r.nodes`).
+    nodes_discovered: usize,
+    /// Datagrams that failed to parse as a well-formed `get_peers` response and were not
+    /// recognizable KRPC errors.
+    malformed_responses: usize,
+    /// Datagrams that were well-formed KRPC error messages (`y == "e"`).
+    krpc_errors: usize,
+    /// Datagrams that parsed as a response but matched no inflight `(source, txid)` query —
+    /// late, replayed, or spoofed traffic rejected by correlation (#40).
+    uncorrelated_responses: usize,
+    /// Query rounds whose response window elapsed without receiving any datagram at all.
+    timeouts: usize,
+    /// The walk ran out of new frontier nodes before exhausting its time budget.
+    frontier_exhausted: bool,
+}
+
 /// 6-byte compact endpoint: 4-byte IPv4 + 2-byte big-endian port.
 fn compact_peer(b: &[u8]) -> Option<SocketAddrV4> {
     if b.len() != 6 {
@@ -162,7 +202,7 @@ async fn dht_walk(
     budget: Duration,
     sock: &UdpSocket,
     on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
-) {
+) -> DhtWalkMetrics {
     // Frontier of candidate nodes keyed by XOR distance; seed with bootstrap routers.
     let mut frontier: BTreeMap<[u8; 20], SocketAddrV4> = BTreeMap::new();
     for (i, host) in BOOTSTRAP.iter().enumerate() {
@@ -179,7 +219,7 @@ async fn dht_walk(
             }
         }
     }
-    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await;
+    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await
 }
 
 #[cfg(test)]
@@ -189,14 +229,14 @@ async fn dht_walk_from_seeds(
     sock: &UdpSocket,
     seeds: Vec<SocketAddrV4>,
     on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
-) {
+) -> DhtWalkMetrics {
     let mut frontier: BTreeMap<[u8; 20], SocketAddrV4> = BTreeMap::new();
     for (i, seed) in seeds.into_iter().enumerate() {
         let mut key = [0xffu8; 20];
         key[19] = i as u8;
         frontier.insert(key, seed);
     }
-    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await;
+    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await
 }
 
 async fn dht_walk_frontier(
@@ -205,8 +245,12 @@ async fn dht_walk_frontier(
     sock: &UdpSocket,
     mut frontier: BTreeMap<[u8; 20], SocketAddrV4>,
     mut on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
-) {
+) -> DhtWalkMetrics {
     let node_id: [u8; 20] = rand::random();
+    let mut metrics = DhtWalkMetrics {
+        bootstrap_seeded: frontier.len(),
+        ..Default::default()
+    };
 
     let mut queried: HashSet<SocketAddrV4> = HashSet::new();
     // Inflight queries keyed by (destination, transaction id) → expiry deadline. Public DHT
@@ -233,6 +277,7 @@ async fn dht_walk_frontier(
             .copied()
             .collect();
         if batch.is_empty() {
+            metrics.frontier_exhausted = true;
             crate::swarm_log!("[dht] frontier exhausted: queried={}", queried.len());
             break;
         }
@@ -242,21 +287,32 @@ async fn dht_walk_frontier(
             next_txid = next_txid.wrapping_add(1);
             let q = build_get_peers(&node_id, infohash, &txid);
             if sock.send_to(&q, SocketAddr::V4(*addr)).await.is_ok() {
+                metrics.nodes_queried += 1;
                 inflight.insert((*addr, txid), Instant::now() + INFLIGHT_TTL);
             }
         }
 
-        // Collect responses for a short window.
+        // Collect responses for a short window. A round in which no datagram arrives at all is
+        // a timeout; datagrams that arrive but are rejected are counted by their failure mode.
+        let mut received_any = false;
         let window = Instant::now() + Duration::from_millis(1500);
         while Instant::now() < window {
             let remaining = window.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
                 Ok(Ok((n, src))) => {
+                    received_any = true;
                     // Bootstrap/frontier addresses are always v4 (see below), so a real reply
                     // is always from a v4 peer; skip (not break — keep collecting within the
                     // window) on the theoretical v6 case rather than treating it as a timeout.
                     let SocketAddr::V4(src) = src else { continue };
                     let Some(resp) = parse_response(&buf[..n]) else {
+                        // Rejected before correlation: either a node's KRPC error or genuinely
+                        // malformed/hostile traffic. Bucket the two apart for diagnostics.
+                        if is_krpc_error(&buf[..n]) {
+                            metrics.krpc_errors += 1;
+                        } else {
+                            metrics.malformed_responses += 1;
+                        }
                         continue;
                     };
                     // Correlate: only accept a reply whose (source, txid) matches an inflight
@@ -264,8 +320,12 @@ async fn dht_walk_frontier(
                     // same query is not processed twice. Unmatched packets are dropped, not
                     // treated as end-of-window, so a spoofed packet can't cut the walk short.
                     if inflight.remove(&(src, resp.txid.clone())).is_none() {
+                        metrics.uncorrelated_responses += 1;
                         continue;
                     }
+                    metrics.valid_responses += 1;
+                    metrics.peers_discovered += resp.peers.len();
+                    metrics.nodes_discovered += resp.nodes.len();
                     for (id, addr) in &resp.nodes {
                         frontier.entry(distance(id, infohash)).or_insert(*addr);
                     }
@@ -281,7 +341,26 @@ async fn dht_walk_frontier(
                 _ => break,
             }
         }
+        if !received_any {
+            metrics.timeouts += 1;
+        }
     }
+
+    crate::swarm_log!(
+        "[dht] walk done: seeded={} queried={} valid={} peers={} nodes={} malformed={} \
+         krpc_err={} uncorrelated={} timeouts={} frontier_exhausted={}",
+        metrics.bootstrap_seeded,
+        metrics.nodes_queried,
+        metrics.valid_responses,
+        metrics.peers_discovered,
+        metrics.nodes_discovered,
+        metrics.malformed_responses,
+        metrics.krpc_errors,
+        metrics.uncorrelated_responses,
+        metrics.timeouts,
+        metrics.frontier_exhausted,
+    );
+    metrics
 }
 
 /// Iterative `get_peers` toward `infohash`, bounded by `budget`. Returns discovered peers.
@@ -755,6 +834,214 @@ mod tests {
             peers.is_empty(),
             "response from an unqueried source must be ignored, got {peers:?}"
         );
+        handle.await.unwrap();
+    }
+
+    // --- Walk diagnostics / metrics (#43) ---
+    //
+    // A raw peer count hides useful failure modes (silence, malformed traffic, KRPC errors,
+    // uncorrelated packets, frontier exhaustion). `dht_walk_from_seeds` returns a
+    // `DhtWalkMetrics` so those modes are observable and deterministically testable offline.
+
+    /// Build a `get_peers` response echoing `txid` with the given compact peers and nodes.
+    fn response_with(
+        txid: &[u8],
+        peers: &[SocketAddrV4],
+        nodes: &[([u8; 20], SocketAddrV4)],
+    ) -> Vec<u8> {
+        let vals: Vec<Bencode> = peers
+            .iter()
+            .map(|p| {
+                let mut b = Vec::new();
+                b.extend_from_slice(&p.ip().octets());
+                b.extend_from_slice(&p.port().to_be_bytes());
+                Bencode::Bytes(b)
+            })
+            .collect();
+        let mut node_bytes = Vec::new();
+        for (id, addr) in nodes {
+            node_bytes.extend_from_slice(id);
+            node_bytes.extend_from_slice(&addr.ip().octets());
+            node_bytes.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        let mut r: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        r.insert(b"id".to_vec(), Bencode::Bytes(vec![7; 20]));
+        if !peers.is_empty() {
+            r.insert(b"values".to_vec(), Bencode::List(vals));
+        }
+        if !nodes.is_empty() {
+            r.insert(b"nodes".to_vec(), Bencode::Bytes(node_bytes));
+        }
+        let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        top.insert(b"t".to_vec(), Bencode::Bytes(txid.to_vec()));
+        top.insert(b"y".to_vec(), Bencode::Bytes(b"r".to_vec()));
+        top.insert(b"r".to_vec(), Bencode::Dict(r));
+        Bencode::Dict(top).encode()
+    }
+
+    /// Build a KRPC error message (`y == "e"`) echoing `txid`.
+    fn error_response(txid: &[u8]) -> Vec<u8> {
+        let mut top: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        top.insert(b"t".to_vec(), Bencode::Bytes(txid.to_vec()));
+        top.insert(b"y".to_vec(), Bencode::Bytes(b"e".to_vec()));
+        top.insert(
+            b"e".to_vec(),
+            Bencode::List(vec![Bencode::Int(201), Bencode::Bytes(b"err".to_vec())]),
+        );
+        Bencode::Dict(top).encode()
+    }
+
+    fn v4_addr(sock: &UdpSocket) -> SocketAddrV4 {
+        match sock.local_addr().unwrap() {
+            SocketAddr::V4(v4) => v4,
+            _ => panic!("test socket must be IPv4"),
+        }
+    }
+
+    #[tokio::test]
+    async fn walk_metrics_count_a_successful_response_path() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = v4_addr(&server);
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let txid = buf_txid(&buf[..n]);
+            let resp = response_with(
+                &txid,
+                &[
+                    "10.0.0.1:1111".parse().unwrap(),
+                    "10.0.0.2:2222".parse().unwrap(),
+                ],
+                &[([9u8; 20], "1.2.3.4:6881".parse().unwrap())],
+            );
+            server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut seen: BTreeSet<SocketAddrV4> = BTreeSet::new();
+        let metrics = dht_walk_from_seeds(
+            &[9u8; 20],
+            Duration::from_secs(5),
+            &client,
+            vec![seed],
+            |_src, resp| {
+                seen.extend(resp.peers.iter().copied());
+                seen.len() >= 2
+            },
+        )
+        .await;
+
+        assert_eq!(metrics.bootstrap_seeded, 1);
+        assert_eq!(metrics.nodes_queried, 1);
+        assert_eq!(metrics.valid_responses, 1);
+        assert_eq!(metrics.peers_discovered, 2);
+        assert_eq!(metrics.nodes_discovered, 1);
+        assert_eq!(metrics.malformed_responses, 0);
+        assert_eq!(metrics.krpc_errors, 0);
+        assert_eq!(metrics.uncorrelated_responses, 0);
+        assert_eq!(metrics.timeouts, 0);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn walk_metrics_count_ignored_malformed_and_error_traffic() {
+        // One seed replies with a well-formed KRPC error, another with non-bencode garbage;
+        // neither yields peers, and each is bucketed by its own failure mode.
+        let err_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let garbage_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let err_seed = v4_addr(&err_server);
+        let garbage_seed = v4_addr(&garbage_server);
+
+        let h1 = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = err_server.recv_from(&mut buf).await.unwrap();
+            let txid = buf_txid(&buf[..n]);
+            err_server
+                .send_to(&error_response(&txid), peer)
+                .await
+                .unwrap();
+        });
+        let h2 = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (_n, peer) = garbage_server.recv_from(&mut buf).await.unwrap();
+            garbage_server
+                .send_to(b"not-a-bencode-datagram", peer)
+                .await
+                .unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let metrics = dht_walk_from_seeds(
+            &[9u8; 20],
+            Duration::from_secs(5),
+            &client,
+            vec![err_seed, garbage_seed],
+            |_src, _resp| false,
+        )
+        .await;
+
+        assert_eq!(metrics.valid_responses, 0);
+        assert_eq!(metrics.peers_discovered, 0);
+        assert_eq!(metrics.krpc_errors, 1);
+        assert_eq!(metrics.malformed_responses, 1);
+        assert!(metrics.frontier_exhausted);
+        h1.await.unwrap();
+        h2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn walk_metrics_count_a_silent_round_as_a_timeout() {
+        // A seed that receives the query but never answers: the response window elapses in
+        // total silence, which is a timeout, and the walk then exhausts its frontier.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = v4_addr(&server);
+        // Keep `server` bound (so the port stays reachable, no ICMP unreachable) but silent.
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let metrics = dht_walk_from_seeds(
+            &[9u8; 20],
+            Duration::from_secs(5),
+            &client,
+            vec![seed],
+            |_src, _resp| false,
+        )
+        .await;
+
+        assert_eq!(metrics.valid_responses, 0);
+        assert_eq!(metrics.timeouts, 1);
+        assert!(metrics.frontier_exhausted);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn walk_metrics_count_an_uncorrelated_response() {
+        // Correct source, wrong transaction id: the datagram arrives (so it is not a timeout)
+        // but fails correlation, so it contributes no peers and is bucketed as uncorrelated.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = v4_addr(&server);
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let mut wrong = buf_txid(&buf[..n]);
+            wrong.push(0xff);
+            let resp = response_with(&wrong, &["10.0.0.1:1111".parse().unwrap()], &[]);
+            server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let metrics = dht_walk_from_seeds(
+            &[9u8; 20],
+            Duration::from_secs(5),
+            &client,
+            vec![seed],
+            |_src, _resp| false,
+        )
+        .await;
+
+        assert_eq!(metrics.valid_responses, 0);
+        assert_eq!(metrics.peers_discovered, 0);
+        assert_eq!(metrics.uncorrelated_responses, 1);
+        assert_eq!(metrics.timeouts, 0);
         handle.await.unwrap();
     }
 
