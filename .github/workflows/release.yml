@@ -3,7 +3,8 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
+      - "!v*.*.*-*"
 
 permissions:
   contents: read
@@ -14,9 +15,35 @@ env:
   IMAGE_NAME: ghcr.io/jamezrin/outpace
 
 jobs:
+  release-metadata:
+    name: Classify release tag
+    runs-on: ubuntu-24.04
+    outputs:
+      stable: ${{ steps.release.outputs.stable }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Derive release version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+
+          if [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping non-stable release tag: ${tag}"
+          fi
+
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: release-metadata
+    if: needs.release-metadata.outputs.stable == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -55,11 +82,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Derive release version
-        id: release
-        shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
       - name: Build release binary
         shell: bash
         run: |
@@ -69,7 +91,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ steps.release.outputs.version }}"
+          version="${{ needs.release-metadata.outputs.version }}"
           target="${{ matrix.target }}"
           binary="target/${target}/release/${BIN_NAME}"
 
@@ -92,14 +114,17 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: dist/${{ env.BIN_NAME }}-${{ steps.release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          path: dist/${{ env.BIN_NAME }}-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error
           compression-level: 0
 
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
-    needs: build-binaries
+    needs:
+      - release-metadata
+      - build-binaries
+    if: needs.release-metadata.outputs.stable == 'true'
     permissions:
       contents: write
 
@@ -131,6 +156,8 @@ jobs:
   publish-container:
     name: Publish GHCR image
     runs-on: ubuntu-24.04
+    needs: release-metadata
+    if: needs.release-metadata.outputs.stable == 'true'
     permissions:
       contents: read
       packages: write
@@ -155,7 +182,7 @@ jobs:
             org.opencontainers.image.licenses=AGPL-3.0-or-later
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.release-metadata.outputs.stable == 'true' }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
