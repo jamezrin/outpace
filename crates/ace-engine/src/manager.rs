@@ -1,6 +1,7 @@
 //! Registry of live sessions keyed by `(network, id)`. One shared session per key; lazy
 //! start via the provider; teardown after the last subscriber leaves + grace.
 
+use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
 use crate::provider::{ProviderError, ProviderRegistry};
 use crate::session::StreamSession;
@@ -19,6 +20,7 @@ pub struct StreamManager {
     /// Held only around start, never around the fast existing-session path.
     start_lock: Mutex<()>,
     buffer: usize,
+    hls: HlsConfig,
     grace: Duration,
 }
 
@@ -28,12 +30,21 @@ impl StreamManager {
     }
 
     pub fn with_buffer(registry: ProviderRegistry, buffer: usize) -> Arc<StreamManager> {
+        Self::with_config(registry, buffer, HlsConfig::default())
+    }
+
+    pub fn with_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+    ) -> Arc<StreamManager> {
         Arc::new(StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
             packagers: Mutex::new(HashMap::new()),
             start_lock: Mutex::new(()),
             buffer,
+            hls,
             grace: Duration::from_secs(30),
         })
     }
@@ -41,6 +52,11 @@ impl StreamManager {
     #[cfg(test)]
     pub(crate) fn buffer(&self) -> usize {
         self.buffer
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hls_config(&self) -> HlsConfig {
+        self.hls
     }
 
     /// Get the running session for `(network, id)` or start one via the provider. Returns
@@ -93,7 +109,7 @@ impl StreamManager {
         let mut map = self.packagers.lock().await;
         Ok(map
             .entry(key)
-            .or_insert_with(|| HlsPackager::start(&session))
+            .or_insert_with(|| HlsPackager::start(&session, self.hls))
             .clone())
     }
 
@@ -156,6 +172,20 @@ mod tests {
         let reg = ProviderRegistry::new();
         let mgr = StreamManager::with_buffer(reg, 4);
         assert_eq!(mgr.buffer(), 4);
+    }
+
+    #[test]
+    fn with_config_sets_buffer_and_hls_config() {
+        let reg = ProviderRegistry::new();
+        let hls = HlsConfig {
+            segment_packets: 64,
+            window_segments: 4,
+            segment_duration_ms: 1500,
+        };
+        let mgr = StreamManager::with_config(reg, 8, hls);
+
+        assert_eq!(mgr.buffer(), 8);
+        assert_eq!(mgr.hls_config(), hls);
     }
 
     #[tokio::test]

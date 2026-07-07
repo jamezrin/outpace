@@ -69,6 +69,36 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         }
         config.session_buffer = n;
     }
+    if let Ok(v) = std::env::var("OUTPACE_REQUEST_TIMEOUT_MS") {
+        config.live_recovery.request_timeout_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS") {
+        config.live_recovery.stale_upstream_timeout_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_REQUEST_CHECK_INTERVAL_MS") {
+        config.live_recovery.request_check_interval_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_ACTIVE_UPSTREAMS") {
+        config.live_recovery.max_active_upstreams = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_PARALLEL_CONNECT") {
+        config.live_recovery.max_parallel_connect = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_PIECE_ADVANCE") {
+        config.live_recovery.max_piece_advance = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_MAX_REASM_PIECES_AHEAD") {
+        config.live_recovery.max_reasm_pieces_ahead = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_SEGMENT_PACKETS") {
+        config.hls.segment_packets = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_WINDOW_SEGMENTS") {
+        config.hls.window_segments = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_SEGMENT_DURATION_MS") {
+        config.hls.segment_duration_ms = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
         config.max_unchoked = v.parse()?;
     }
@@ -87,6 +117,8 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_EXPERIMENTAL_ACE_COMPAT") {
         config.experimental_ace_compat = matches!(v.as_str(), "1" | "true");
     }
+    config.live_recovery.validate()?;
+    config.hls.validate()?;
     Ok(config)
 }
 
@@ -179,13 +211,14 @@ pub async fn build_runtime(
             .with_seed_store_bytes(config.seed_store_bytes)
             .with_cache(config.cache_type, config.cache_dir.clone())
             .with_prefetch_pieces(config.prefetch_pieces)
+            .with_live_recovery(config.live_recovery)
             .with_seeding_enabled(config.enable_seeding)
             .with_inbound_announce_port(inbound_peer_port);
         registry.register(Arc::new(provider));
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager = StreamManager::with_buffer(registry, config.session_buffer);
+    let manager = StreamManager::with_config(registry, config.session_buffer, config.hls);
     manager.spawn_reaper();
     if config.seed_ttl_secs > 0 {
         let seed_registry_reap = seed_registry.clone();
@@ -441,6 +474,82 @@ mod tests {
         let err = config_from_env().err();
         std::env::remove_var("OUTPACE_SESSION_BUFFER");
         assert!(err.is_some(), "session_buffer=0 must be rejected");
+    }
+
+    #[test]
+    fn default_config_has_live_recovery_and_hls_defaults() {
+        let c = Config::default();
+        assert_eq!(c.live_recovery.request_timeout_ms, 4000);
+        assert_eq!(c.live_recovery.stale_upstream_timeout_ms, 12000);
+        assert_eq!(c.live_recovery.request_check_interval_ms, 1000);
+        assert_eq!(c.live_recovery.max_active_upstreams, 4);
+        assert_eq!(c.live_recovery.max_parallel_connect, 12);
+        assert_eq!(c.live_recovery.max_piece_advance, 256);
+        assert_eq!(c.live_recovery.max_reasm_pieces_ahead, 512);
+        assert_eq!(c.hls.segment_packets, 256);
+        assert_eq!(c.hls.window_segments, 6);
+        assert_eq!(c.hls.segment_duration_ms, 1000);
+    }
+
+    #[test]
+    fn parses_live_recovery_and_hls_knobs() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "OUTPACE_REQUEST_TIMEOUT_MS",
+            "OUTPACE_STALE_UPSTREAM_TIMEOUT_MS",
+            "OUTPACE_REQUEST_CHECK_INTERVAL_MS",
+            "OUTPACE_MAX_ACTIVE_UPSTREAMS",
+            "OUTPACE_MAX_PARALLEL_CONNECT",
+            "OUTPACE_MAX_PIECE_ADVANCE",
+            "OUTPACE_MAX_REASM_PIECES_AHEAD",
+            "OUTPACE_HLS_SEGMENT_PACKETS",
+            "OUTPACE_HLS_WINDOW_SEGMENTS",
+            "OUTPACE_HLS_SEGMENT_DURATION_MS",
+        ];
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("OUTPACE_REQUEST_TIMEOUT_MS", "2500");
+        std::env::set_var("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS", "10000");
+        std::env::set_var("OUTPACE_REQUEST_CHECK_INTERVAL_MS", "500");
+        std::env::set_var("OUTPACE_MAX_ACTIVE_UPSTREAMS", "3");
+        std::env::set_var("OUTPACE_MAX_PARALLEL_CONNECT", "9");
+        std::env::set_var("OUTPACE_MAX_PIECE_ADVANCE", "128");
+        std::env::set_var("OUTPACE_MAX_REASM_PIECES_AHEAD", "256");
+        std::env::set_var("OUTPACE_HLS_SEGMENT_PACKETS", "64");
+        std::env::set_var("OUTPACE_HLS_WINDOW_SEGMENTS", "4");
+        std::env::set_var("OUTPACE_HLS_SEGMENT_DURATION_MS", "1500");
+
+        let c = config_from_env().unwrap();
+
+        assert_eq!(c.live_recovery.request_timeout_ms, 2500);
+        assert_eq!(c.live_recovery.stale_upstream_timeout_ms, 10000);
+        assert_eq!(c.live_recovery.request_check_interval_ms, 500);
+        assert_eq!(c.live_recovery.max_active_upstreams, 3);
+        assert_eq!(c.live_recovery.max_parallel_connect, 9);
+        assert_eq!(c.live_recovery.max_piece_advance, 128);
+        assert_eq!(c.live_recovery.max_reasm_pieces_ahead, 256);
+        assert_eq!(c.hls.segment_packets, 64);
+        assert_eq!(c.hls.window_segments, 4);
+        assert_eq!(c.hls.segment_duration_ms, 1500);
+
+        for key in keys {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_live_recovery_relationships() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_REQUEST_TIMEOUT_MS", "12000");
+        std::env::set_var("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS", "12000");
+        let err = config_from_env().unwrap_err().to_string();
+        std::env::remove_var("OUTPACE_REQUEST_TIMEOUT_MS");
+        std::env::remove_var("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS");
+        assert!(
+            err.contains("OUTPACE_REQUEST_TIMEOUT_MS must be < OUTPACE_STALE_UPSTREAM_TIMEOUT_MS"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

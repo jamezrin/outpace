@@ -526,7 +526,10 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
                     }
                     return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate)));
                 }
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(_)) => {
+                    reset_stream_keyframe_gate(&mut gate);
+                    continue;
+                }
                 Err(RecvError::Closed) => return None,
             }
         }
@@ -535,6 +538,10 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
         .header(header::CONTENT_TYPE, "video/mp2t")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
+    *gate = ace_media::mpegts::KeyframeGate::new();
 }
 
 #[cfg(test)]
@@ -681,6 +688,28 @@ mod tests {
             .find(|p| (((p[1] & 0x1F) as u16) << 8 | p[2] as u16) == VIDEO_PID)
             .expect("a video packet was served");
         assert_eq!(first_video, &FIXTURE[KEYFRAME2..KEYFRAME2 + 188]);
+    }
+
+    #[test]
+    fn stream_ts_resets_keyframe_gate_after_lag() {
+        let mut gate = ace_media::mpegts::KeyframeGate::new();
+        assert!(
+            !gate.push(FIXTURE).is_empty(),
+            "fixture should lock the gate on a keyframe"
+        );
+        let mid_gop_packet = &FIXTURE[4136..4136 + 188];
+        assert_eq!(
+            gate.push(mid_gop_packet).len(),
+            188,
+            "locked gate passes through mid-GOP packets"
+        );
+
+        reset_stream_keyframe_gate(&mut gate);
+
+        assert!(
+            gate.push(mid_gop_packet).is_empty(),
+            "after lag reset, mid-GOP packets are held until a keyframe"
+        );
     }
 
     #[tokio::test]
@@ -1290,7 +1319,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(put.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(put.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(put.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ih_hex = json["infohash"].as_str().unwrap();
         let mut infohash = [0u8; 20];
@@ -1302,11 +1333,18 @@ mod tests {
         // Delete it -> 204, no longer served, GET 404s.
         let del = app
             .clone()
-            .oneshot(Request::delete("/broadcast/gone").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::delete("/broadcast/gone")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(del.status(), StatusCode::NO_CONTENT);
-        assert!(!seed_registry.serves(&infohash), "no longer served after delete");
+        assert!(
+            !seed_registry.serves(&infohash),
+            "no longer served after delete"
+        );
         let get = app
             .clone()
             .oneshot(Request::get("/broadcast/gone").body(Body::empty()).unwrap())
@@ -1316,7 +1354,11 @@ mod tests {
 
         // Deleting again is idempotent.
         let del2 = app
-            .oneshot(Request::delete("/broadcast/gone").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::delete("/broadcast/gone")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(del2.status(), StatusCode::NO_CONTENT);
