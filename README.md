@@ -67,6 +67,20 @@ On the `/ace/getstream` compatibility route a `url=` selector returns a
 self-contained playback id, so playback works after a daemon restart without any
 server-side session table.
 
+### VOD (single-file)
+
+For a **VOD** transport (a descriptor carrying a `pieces` SHA1 list), add `--vod` to
+download and verify the file to stdout instead of following a live stream:
+
+```bash
+cargo run -p ace-engine --bin outpace -- play --vod acestream://<content-id> > movie.mp4
+```
+
+Each piece is SHA1-checked against the transport's `pieces` before any bytes are written.
+The daemon serves the same content over `GET /vod/<network>/<id>` with a `Content-Length`.
+Multi-file VOD is intentionally unsupported and fails with a clear error; VOD HLS and
+byte-range requests are tracked follow-ups.
+
 Start a named broadcast:
 
 ```bash
@@ -150,6 +164,7 @@ Native API:
 - `GET /streams`
 - `GET /streams/ace/<id>.ts`
 - HLS and playlist routes backed by the native stream session layer
+- `GET /vod/<network>/<id>` - single-file VOD, SHA1-verified, with `Content-Length`
 - `PUT /broadcast/<name>`
 - `GET /broadcast/<name>`
 
