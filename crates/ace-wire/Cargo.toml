@@ -13,7 +13,7 @@ rand = "0.8"
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
 rsa = "0.9"
-pkcs8 = { version = "0.10", features = ["pem"] }
+pkcs8 = { version = "0.11", features = ["pem"] }
 
 [dev-dependencies]
 hex = "0.4"
