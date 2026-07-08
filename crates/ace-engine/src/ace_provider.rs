@@ -18,7 +18,7 @@ use ace_swarm::discover::{
 };
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::{
-    catalog_transport_bytes, hex20, resolve_via_catalog, resolve_via_peer,
+    catalog_transport_bytes, hex20, infohash_hex, resolve_via_catalog, resolve_via_peer,
     stream_info_from_infohash, stream_info_from_transport_url, transport_bytes_from_url,
     transport_bytes_via_peer, vod_info_from_transport, ResolveCache, ResolveError,
 };
@@ -126,16 +126,6 @@ fn disk_store_subdir(infohash: &[u8; 20]) -> String {
     static GENERATION: AtomicU64 = AtomicU64::new(0);
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     format!("{}-{generation}", infohash_hex(infohash))
-}
-
-/// Lowercase hex of a 20-byte infohash; the readable prefix of the per-instance disk cache
-/// subdirectory name (`<infohash_hex>-<generation>`).
-pub(crate) fn infohash_hex(infohash: &[u8; 20]) -> String {
-    use std::fmt::Write;
-    infohash.iter().fold(String::with_capacity(40), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 /// Seeding configuration threaded through the download loop: the shared per-infohash
@@ -296,7 +286,7 @@ impl AceProvider {
 
         match resolve_via_catalog(content_id).await {
             Ok(info) => {
-                let ih: String = info.infohash.iter().map(|b| format!("{b:02x}")).collect();
+                let ih = infohash_hex(&info.infohash);
                 crate::alog!("[ace] resolved cid:{content_id} via catalog -> infohash {ih}");
                 self.resolve_cache.put(content_id, info.clone());
                 return Ok(info);
@@ -330,7 +320,7 @@ impl AceProvider {
             let mut session = session.with_timeout(RESOLVE_PEER_TIMEOUT);
             match resolve_via_peer(&mut session, key, &self.identity).await {
                 Ok(info) => {
-                    let ih: String = info.infohash.iter().map(|b| format!("{b:02x}")).collect();
+                    let ih = infohash_hex(&info.infohash);
                     crate::alog!("[ace] resolved cid:{content_id} via {addr} -> infohash {ih}");
                     self.resolve_cache.put(content_id, info.clone());
                     return Ok(info);

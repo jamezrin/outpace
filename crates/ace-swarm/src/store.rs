@@ -218,7 +218,12 @@ impl PieceStore {
         max_bytes: u64,
         dir: std::path::PathBuf,
     ) -> std::io::Result<Self> {
-        Self::with_backend(piece_length, chunk_length, max_bytes, BackendKind::Disk { dir })
+        Self::with_backend(
+            piece_length,
+            chunk_length,
+            max_bytes,
+            BackendKind::Disk { dir },
+        )
     }
 
     /// Chunks per piece (`piece_length / chunk_length`).
@@ -369,7 +374,11 @@ mod tests {
         s.put_chunk(3, 0, &[0; 4]); // cur = 8 > 4 -> must evict down to <= 4
         assert!(!s.has_piece(1), "zero-byte piece evicted, not skipped");
         assert_eq!(s.chunk(1, 0).as_deref(), None);
-        assert_eq!(s.chunk(2, 0).as_deref(), None, "real bytes above it also evicted");
+        assert_eq!(
+            s.chunk(2, 0).as_deref(),
+            None,
+            "real bytes above it also evicted"
+        );
         assert_eq!(s.window(), Some((3, 3)));
     }
 
@@ -492,6 +501,9 @@ mod tests {
         .unwrap();
         s.put_chunk(3, 0, &[1, 2, 3, 4]);
         assert_eq!(s.chunk(3, 0).as_deref(), Some(&[1, 2, 3, 4][..]));
-        assert!(!s.has_piece(3), "partial piece (1 of 2 chunks) not complete");
+        assert!(
+            !s.has_piece(3),
+            "partial piece (1 of 2 chunks) not complete"
+        );
     }
 }

@@ -286,7 +286,8 @@ mod tests {
     async fn resolve_rejects_overlong_urls() {
         let overlong = format!("udp://{}:80", "a".repeat(MAX_TRACKER_URL_LEN));
         let got =
-            resolve_trackers_with_policy(&[overlong, "udp://127.0.0.1:80".into()], local_ok()).await;
+            resolve_trackers_with_policy(&[overlong, "udp://127.0.0.1:80".into()], local_ok())
+                .await;
         assert_eq!(got, vec!["127.0.0.1:80".parse().unwrap()]);
     }
 

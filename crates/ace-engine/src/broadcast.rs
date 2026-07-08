@@ -234,11 +234,8 @@ impl BroadcastRegistry {
             .expect("broadcast descriptor has official infohash fields");
         let transport_bytes = encode_transport(&descriptor);
         let content_id = transport_file_hash(&transport_bytes);
-        let (store, lease) = seed_registry.lease_broadcast(
-            infohash,
-            content_id,
-            transport_bytes.clone(),
-            || {
+        let (store, lease) =
+            seed_registry.lease_broadcast(infohash, content_id, transport_bytes.clone(), || {
                 build_piece_store(
                     PIECE_LENGTH,
                     CHUNK_LENGTH,
@@ -247,8 +244,7 @@ impl BroadcastRegistry {
                     &self.cache_dir,
                     &infohash,
                 )
-            },
-        );
+            });
         // Persist the fresh identity (cursor at 0) before wiring the cursor's sink, so the
         // record exists immediately (matching the engine writing `.acelive`/`.sauth` at mint).
         let key_pem = auth.to_pkcs1_pem();
@@ -363,11 +359,8 @@ impl BroadcastRegistry {
         let content_id = transport_file_hash(&rec.transport);
         let piece_length = decoded.piece_length;
         let chunk_length = decoded.chunk_length;
-        let (store, lease) = seed_registry.lease_broadcast(
-            infohash,
-            content_id,
-            rec.transport.clone(),
-            || {
+        let (store, lease) =
+            seed_registry.lease_broadcast(infohash, content_id, rec.transport.clone(), || {
                 build_piece_store(
                     piece_length,
                     chunk_length,
@@ -376,8 +369,7 @@ impl BroadcastRegistry {
                     &self.cache_dir,
                     &infohash,
                 )
-            },
-        );
+            });
         let resume_at = rec.next_piece.saturating_add(CURSOR_PERSIST_INTERVAL);
         let cursor = BroadcastCursor::new(
             resume_at,
@@ -505,7 +497,10 @@ mod tests {
         assert!(seed.serves(&bc.infohash) && seed.serves(&bc.content_id));
 
         reg.delete("chan").await;
-        assert!(!seed.serves(&bc.infohash), "infohash entry evicted on delete");
+        assert!(
+            !seed.serves(&bc.infohash),
+            "infohash entry evicted on delete"
+        );
         assert!(
             !seed.serves(&bc.content_id),
             "content_id entry evicted on delete"
@@ -627,7 +622,13 @@ mod tests {
         let seed1 = SeedRegistry::new();
         let reg1 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let (a, fresh1) = reg1
-            .start_or_resume("news", "News", &["udp://t:1/announce".into()], &seed1, 1 << 20)
+            .start_or_resume(
+                "news",
+                "News",
+                &["udp://t:1/announce".into()],
+                &seed1,
+                1 << 20,
+            )
             .await;
         assert!(fresh1, "first ever PUT mints");
 
@@ -678,7 +679,10 @@ mod tests {
 
         let removed = reg.delete("x").await;
         assert!(removed.is_some());
-        assert!(BroadcastPersist::new(&dir).load("x").is_none(), "file purged");
+        assert!(
+            BroadcastPersist::new(&dir).load("x").is_none(),
+            "file purged"
+        );
 
         let (b, fresh) = reg.start_or_resume("x", "X", &[], &seed, 1 << 20).await;
         assert!(fresh, "after delete, next PUT mints fresh");
@@ -708,7 +712,9 @@ mod tests {
         let seed = SeedRegistry::new();
         // Mint one broadcast to get valid transport bytes...
         let reg0 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
-        let (a, _) = reg0.start_or_resume("bad", "Bad", &[], &seed, 1 << 20).await;
+        let (a, _) = reg0
+            .start_or_resume("bad", "Bad", &[], &seed, 1 << 20)
+            .await;
         // ...then corrupt the record: keep the transport but swap in a different key.
         let other = LiveSourceAuth::generate();
         let persist = BroadcastPersist::new(&dir);
@@ -725,8 +731,13 @@ mod tests {
 
         let seed2 = SeedRegistry::new();
         let reg = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
-        let (b, fresh) = reg.start_or_resume("bad", "Bad", &[], &seed2, 1 << 20).await;
-        assert!(fresh, "an invalid record is discarded and a fresh identity minted");
+        let (b, fresh) = reg
+            .start_or_resume("bad", "Bad", &[], &seed2, 1 << 20)
+            .await;
+        assert!(
+            fresh,
+            "an invalid record is discarded and a fresh identity minted"
+        );
         assert_ne!(a.infohash, b.infohash);
         let _ = std::fs::remove_dir_all(&dir);
     }

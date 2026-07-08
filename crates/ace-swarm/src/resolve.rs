@@ -21,7 +21,6 @@ use base64ct::{Base64, Encoding};
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -187,6 +186,11 @@ pub fn hex20(hex: &str) -> Result<[u8; 20], ResolveError> {
     decode_hex20(hex).ok_or(ResolveError::BadInfohash)
 }
 
+/// Encode a 20-byte infohash/content-id as canonical lowercase hex.
+pub fn infohash_hex(infohash: &[u8; 20]) -> String {
+    hex::encode(&infohash[..])
+}
+
 /// Resolve a content-id to a [`StreamInfo`] over an already-connected peer, by fetching the
 /// `AceStreamTransport` metadata via BEP-9 `ut_metadata` and decoding it.
 ///
@@ -198,7 +202,9 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     handshake_infohash: [u8; 20],
     identity: &Identity,
 ) -> Result<StreamInfo, ResolveError> {
-    stream_info_from_transport(&transport_bytes_via_peer(session, handshake_infohash, identity).await?)
+    stream_info_from_transport(
+        &transport_bytes_via_peer(session, handshake_infohash, identity).await?,
+    )
 }
 
 /// Fetch the raw `AceStreamTransport` metadata bytes over a peer via BEP-9 `ut_metadata`. The
@@ -317,7 +323,7 @@ fn catalog_signature(content_id: &str, request_random: u64) -> String {
     let signed = format!("_n=3.2.11#_p=linux#_r={request_random}#_v=3021100#pid={content_id}");
     hasher.update(signed.as_bytes());
     hasher.update(CATALOG_SIGNING_SECRET);
-    hex_lower(&hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn catalog_response_transport(body: &[u8]) -> Result<Vec<u8>, ResolveError> {
@@ -400,14 +406,6 @@ fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Result<&'a str, ResolveError>
 
 fn find_crlf(bytes: &[u8]) -> Option<usize> {
     bytes.windows(2).position(|w| w == b"\r\n")
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(out, "{b:02x}").expect("writing to string cannot fail");
-    }
-    out
 }
 
 /// Read messages until the peer's extended handshake arrives; extract its `ut_metadata` ext id
@@ -699,6 +697,18 @@ mod tests {
             vod_info_from_transport(&tf),
             Err(ResolveError::Transport(_))
         ));
+    }
+
+    #[test]
+    fn infohash_hex_is_lowercase_and_zero_padded() {
+        let infohash = [
+            0x00, 0x01, 0x0a, 0x0f, 0x10, 0xab, 0xcd, 0xef, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70,
+            0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0,
+        ];
+        let encoded = infohash_hex(&infohash);
+
+        assert_eq!(encoded, "00010a0f10abcdef2030405060708090a0b0c0d0");
+        assert_eq!(hex20(&encoded).unwrap(), infohash);
     }
 
     #[test]

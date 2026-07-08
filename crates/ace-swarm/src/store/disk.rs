@@ -118,7 +118,9 @@ impl DiskBackend {
             // yet the disk read failed. Log it — a silent `None` here looks like an ordinary miss
             // to the seeder but is really an unservable advertised piece.
             Err(e) => {
-                crate::swarm_log!("[cache] disk read failed for present piece {piece} chunk {chunk}: {e}");
+                crate::swarm_log!(
+                    "[cache] disk read failed for present piece {piece} chunk {chunk}: {e}"
+                );
                 None
             }
         }
@@ -171,7 +173,10 @@ impl Drop for DiskBackend {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                crate::swarm_log!("[cache] disk cleanup failed for {}: {e}", self.dir.display());
+                crate::swarm_log!(
+                    "[cache] disk cleanup failed for {}: {e}",
+                    self.dir.display()
+                );
             }
         }
     }
@@ -205,7 +210,10 @@ mod tests {
         {
             let _b_old = DiskBackend::new(dir_a.clone(), 4).unwrap();
         } // old drops here
-        assert!(dir_b.exists(), "the newer instance's dir survives the old one's Drop");
+        assert!(
+            dir_b.exists(),
+            "the newer instance's dir survives the old one's Drop"
+        );
         drop(b_new);
         let _ = std::fs::remove_dir_all(&tmp);
     }

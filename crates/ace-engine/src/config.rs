@@ -288,46 +288,38 @@ mod tests {
             max_active_upstreams: usize::MAX,
             ..LiveRecoveryConfig::default()
         };
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .contains("OUTPACE_MAX_ACTIVE_UPSTREAMS")
-        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("OUTPACE_MAX_ACTIVE_UPSTREAMS"));
 
         config = LiveRecoveryConfig {
             max_parallel_connect: usize::MAX,
             ..LiveRecoveryConfig::default()
         };
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .contains("OUTPACE_MAX_PARALLEL_CONNECT")
-        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("OUTPACE_MAX_PARALLEL_CONNECT"));
 
         config = LiveRecoveryConfig {
             max_piece_advance: u64::MAX,
             max_reasm_pieces_ahead: u64::MAX,
             ..LiveRecoveryConfig::default()
         };
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .contains("OUTPACE_MAX_PIECE_ADVANCE")
-        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("OUTPACE_MAX_PIECE_ADVANCE"));
 
         config = LiveRecoveryConfig {
             max_reasm_pieces_ahead: u64::MAX,
             ..LiveRecoveryConfig::default()
         };
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .contains("OUTPACE_MAX_REASM_PIECES_AHEAD")
-        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("OUTPACE_MAX_REASM_PIECES_AHEAD"));
     }
 
     #[test]

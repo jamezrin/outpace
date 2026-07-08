@@ -155,20 +155,18 @@ impl SeederSession {
                         }
                     }
                 }
-                PeerMessage::Interested => {
-                    match (&coordinator, peer_id) {
-                        (Some(c), Some(id)) => c.set_interested(id, true),
-                        _ => {
-                            if !unchoked {
-                                session.send(&PeerMessage::Unchoke).await?;
-                                unchoked = true;
-                                if debug {
-                                    crate::swarm_log!("[seed-session] -> Unchoke");
-                                }
+                PeerMessage::Interested => match (&coordinator, peer_id) {
+                    (Some(c), Some(id)) => c.set_interested(id, true),
+                    _ => {
+                        if !unchoked {
+                            session.send(&PeerMessage::Unchoke).await?;
+                            unchoked = true;
+                            if debug {
+                                crate::swarm_log!("[seed-session] -> Unchoke");
                             }
                         }
                     }
-                }
+                },
                 PeerMessage::NotInterested => {
                     if let (Some(c), Some(id)) = (&coordinator, peer_id) {
                         c.set_interested(id, false);
@@ -466,8 +464,14 @@ mod tests {
             coord.set_interested(*id, true);
         }
         let unchoked = rxs.iter().filter(|rx| *rx.borrow()).count();
-        assert!(unchoked <= 3, "max_unchoked(2) + 1 optimistic = 3, got {unchoked}");
-        assert!(unchoked >= 2, "should unchoke up to the cap when enough are interested");
+        assert!(
+            unchoked <= 3,
+            "max_unchoked(2) + 1 optimistic = 3, got {unchoked}"
+        );
+        assert!(
+            unchoked >= 2,
+            "should unchoke up to the cap when enough are interested"
+        );
     }
 
     #[test]
@@ -491,10 +495,16 @@ mod tests {
         coord.set_interested(b, true);
         coord.set_interested(c, true);
         assert!(*rx_a.borrow(), "first-come peer holds the guaranteed slot");
-        assert!(!*rx_c.borrow(), "third peer is choked (past max + optimistic)");
+        assert!(
+            !*rx_c.borrow(),
+            "third peer is choked (past max + optimistic)"
+        );
         // When `a` leaves, the guaranteed slot frees up and `c` must get unchoked.
         coord.leave(a);
-        assert!(*rx_c.borrow(), "a genuinely-choked peer becomes unchoked after another leaves");
+        assert!(
+            *rx_c.borrow(),
+            "a genuinely-choked peer becomes unchoked after another leaves"
+        );
     }
 
     #[test]
@@ -796,10 +806,7 @@ mod tests {
             .unwrap();
         assert!(matches!(msg, PeerMessage::Bitfield(_)));
 
-        client_session
-            .send(&PeerMessage::Interested)
-            .await
-            .unwrap();
+        client_session.send(&PeerMessage::Interested).await.unwrap();
         let msg = timeout(Duration::from_millis(500), client_session.read_message())
             .await
             .expect("timed out waiting for Unchoke")

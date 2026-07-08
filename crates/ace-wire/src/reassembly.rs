@@ -106,7 +106,9 @@ impl PieceReassembler {
             // Outside the accept window: reject before allocating a piece buffer. The caller
             // drops the block (and re-requests in-window pieces from the pool), so a peer
             // streaming far-future indices can't force unbounded reassembly allocation.
-            return Err(WireError::Invalid("piece index too far ahead of emit cursor"));
+            return Err(WireError::Invalid(
+                "piece index too far ahead of emit cursor",
+            ));
         }
         let end = begin
             .checked_add(block.len() as u64)
@@ -397,7 +399,10 @@ mod tests {
         // allocate a full piece_length buffer held until the intervening pieces arrive, so
         // out-of-window indices must be rejected, not buffered (issue #13).
         let mut r = PieceReassembler::new(4, 0).with_max_pieces_ahead(8);
-        assert!(r.add_block(7, 0, &[1, 2, 3, 4]).is_ok(), "within window [0,8)");
+        assert!(
+            r.add_block(7, 0, &[1, 2, 3, 4]).is_ok(),
+            "within window [0,8)"
+        );
         assert!(
             r.add_block(8, 0, &[1, 2, 3, 4]).is_err(),
             "at the window edge -> rejected"
@@ -414,7 +419,10 @@ mod tests {
         // the new cursor are accepted again — a legitimately-requested piece is never
         // permanently rejected just because playback started further back.
         let mut r = PieceReassembler::new(2, 0).with_max_pieces_ahead(4);
-        assert!(r.add_block(4, 0, &[9, 9]).is_err(), "outside [0,4) at first");
+        assert!(
+            r.add_block(4, 0, &[9, 9]).is_err(),
+            "outside [0,4) at first"
+        );
         r.add_block(0, 0, &[1, 1]).unwrap();
         r.add_block(1, 0, &[2, 2]).unwrap();
         assert_eq!(r.take_ready(), vec![1, 1, 2, 2]);
