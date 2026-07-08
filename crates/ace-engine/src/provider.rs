@@ -47,7 +47,7 @@ pub trait VodByteSource: Send {
 /// length once (to validate a `Range` header) before deciding which pieces to download, so seek
 /// requests fetch only the covering pieces rather than the whole file.
 #[async_trait]
-pub trait VodContent: Send {
+pub trait VodContent: Send + Sync {
     /// Total content length of the whole file in bytes.
     fn content_length(&self) -> u64;
     /// Open a verified byte source for the inclusive byte range `[start, end]`. The returned

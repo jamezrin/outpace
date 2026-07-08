@@ -3,7 +3,7 @@
 
 use crate::broadcast::BroadcastRegistry;
 use crate::manager::StreamManager;
-use crate::provider::VodByteSource;
+use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::StreamSession;
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::resolve_via_catalog;
@@ -107,19 +107,16 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// `GET /vod/{network}/{id}` — resolve `id` as a single-file VOD, then stream its verified
-/// bytes with a `Content-Length`. VOD is a one-shot download (not a shared live session), so
-/// this resolves the provider directly instead of going through the session manager.
+/// bytes with a `Content-Length`. The resolved VOD is cached by the manager and shared with the
+/// HLS routes, so a playback resolves the descriptor once and reuses downloaded pieces.
 async fn vod_stream(
     State(s): State<AppState>,
     Path((network, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(provider) = s.manager.provider(&network) else {
-        return (StatusCode::NOT_FOUND, "unknown network").into_response();
-    };
-    let vod = match provider.resolve_vod(&id).await {
+    let vod = match resolve_vod(&s, &network, &id).await {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+        Err(resp) => return resp,
     };
     let total = vod.content_length();
     if total == 0 {
@@ -260,6 +257,22 @@ fn vod_partial_response(
         .into_response()
 }
 
+/// Resolve `id` on `network` to a single-file VOD via the manager's shared cache, or the HTTP
+/// error response to return: `404` for an unknown network, `502` if resolution fails.
+async fn resolve_vod(
+    s: &AppState,
+    network: &str,
+    id: &str,
+) -> Result<Arc<dyn VodContent>, Response> {
+    match s.manager.resolve_vod(network, id).await {
+        Ok(v) => Ok(v),
+        Err(ProviderError::NotFound) => {
+            Err((StatusCode::NOT_FOUND, "unknown network").into_response())
+        }
+        Err(e) => Err((StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response()),
+    }
+}
+
 /// `GET /vod/{network}/{id}/manifest.m3u8` — a static VOD HLS media playlist for the resolved
 /// single-file VOD. The whole file's length is known, so the playlist lists every byte-range
 /// segment up front and ends with `#EXT-X-ENDLIST`; segments are fetched lazily via
@@ -268,12 +281,9 @@ async fn vod_manifest(
     State(s): State<AppState>,
     Path((network, id)): Path<(String, String)>,
 ) -> Response {
-    let Some(provider) = s.manager.provider(&network) else {
-        return (StatusCode::NOT_FOUND, "unknown network").into_response();
-    };
-    let vod = match provider.resolve_vod(&id).await {
+    let vod = match resolve_vod(&s, &network, &id).await {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+        Err(resp) => return resp,
     };
     let layout = crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config());
     (
@@ -293,12 +303,9 @@ async fn vod_hls_segment(
     let Some(index) = seg.strip_suffix(".ts").and_then(|n| n.parse::<u64>().ok()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(provider) = s.manager.provider(&network) else {
-        return (StatusCode::NOT_FOUND, "unknown network").into_response();
-    };
-    let vod = match provider.resolve_vod(&id).await {
+    let vod = match resolve_vod(&s, &network, &id).await {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+        Err(resp) => return resp,
     };
     let layout = crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config());
     let Some((start, end)) = layout.segment_range(index) else {

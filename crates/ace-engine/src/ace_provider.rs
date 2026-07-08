@@ -35,7 +35,7 @@ use ace_wire::message::PeerMessage;
 use ace_wire::reassembly::PieceReassembler;
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -354,6 +354,10 @@ impl AceProvider {
             info,
             bootstrap_peers: self.bootstrap_peers.clone(),
             peer_port: self.peer_port,
+            cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(
+                VOD_PIECE_CACHE_CAP,
+            ))),
+            peers: Arc::new(tokio::sync::Mutex::new(None)),
         }))
     }
 
@@ -393,7 +397,13 @@ impl AceProvider {
     /// [`Self::resolve_content_id`].
     async fn vod_transport_via_peers(&self, key: [u8; 20]) -> Result<Vec<u8>, ProviderError> {
         let all = if self.bootstrap_peers.is_empty() {
-            discover_peers(&self.default_trackers, &key, &random_peer_id(), self.peer_port).await
+            discover_peers(
+                &self.default_trackers,
+                &key,
+                &random_peer_id(),
+                self.peer_port,
+            )
+            .await
         } else {
             self.bootstrap_peers.clone()
         };
@@ -415,12 +425,105 @@ impl AceProvider {
     }
 }
 
+/// How many whole VOD pieces one resolved VOD keeps cached. Bounds memory to `cap * piece_length`
+/// regardless of file size, while being ample for HLS/seek reads whose consecutive byte ranges
+/// fall inside the same handful of (typically much larger) pieces.
+const VOD_PIECE_CACHE_CAP: usize = 16;
+
+/// A small bounded cache of whole, SHA-1-verified VOD pieces (piece index → bytes) for one
+/// resolved VOD, so overlapping/adjacent byte-range reads (HLS segments, seeks) don't re-download
+/// a piece already fetched. FIFO eviction keeps it bounded — a whole-file read streams through it
+/// holding at most `cap` pieces rather than the entire file.
+struct VodPieceCache {
+    cap: usize,
+    pieces: HashMap<u64, Bytes>,
+    order: VecDeque<u64>,
+}
+
+impl VodPieceCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            pieces: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, index: u64) -> Option<Bytes> {
+        self.pieces.get(&index).cloned()
+    }
+
+    fn insert(&mut self, index: u64, bytes: Bytes) {
+        if self.pieces.contains_key(&index) {
+            return; // already cached; keep its FIFO position
+        }
+        if self.pieces.len() >= self.cap {
+            if let Some(evict) = self.order.pop_front() {
+                self.pieces.remove(&evict);
+            }
+        }
+        self.pieces.insert(index, bytes);
+        self.order.push_back(index);
+    }
+}
+
+/// The leading run of `[first_piece, end_piece)` already present in `cache`. Returns those pieces'
+/// bytes plus `download_from`, the first index still needing download — so `open_range` serves the
+/// cached prefix from memory and only fetches `[download_from, end_piece)`. For the common
+/// sequential-read pattern (each segment covers a still-hot piece plus at most one new one), the
+/// shared piece is served from cache and never re-downloaded.
+fn cached_prefix(cache: &VodPieceCache, first_piece: u64, end_piece: u64) -> (Vec<Bytes>, u64) {
+    let mut prefix = Vec::new();
+    let mut p = first_piece;
+    while p < end_piece {
+        match cache.get(p) {
+            Some(bytes) => {
+                prefix.push(bytes);
+                p += 1;
+            }
+            None => break,
+        }
+    }
+    (prefix, p)
+}
+
 /// A resolved VOD ready to serve byte ranges. Holds the descriptor geometry plus the discovery
-/// inputs `open_range` needs, so each range opens its own download of just the covering pieces.
+/// inputs `open_range` needs, and a shared bounded piece cache + once-discovered peer list so the
+/// many range reads of one playback (HLS segments, seeks) resolve peers once and download each
+/// covering piece at most once.
 struct AceVodContent {
     info: VodInfo,
     bootstrap_peers: Vec<SocketAddrV4>,
     peer_port: u16,
+    /// Verified whole pieces retained across this VOD's range reads (bounded, FIFO).
+    cache: Arc<std::sync::Mutex<VodPieceCache>>,
+    /// Peers discovered once and reused by every range read (VOD swarms are stable, unlike the
+    /// live edge). `None` until the first read discovers them.
+    peers: Arc<tokio::sync::Mutex<Option<Vec<SocketAddrV4>>>>,
+}
+
+impl AceVodContent {
+    /// Peers for this VOD, discovered once and cached. Bootstrap peers (tests / explicit config)
+    /// are used directly. VOD swarms are standard BitTorrent, discovered like the live path.
+    async fn peers(&self) -> Vec<SocketAddrV4> {
+        let mut guard = self.peers.lock().await;
+        if let Some(peers) = guard.as_ref() {
+            return peers.clone();
+        }
+        let discovered = if self.bootstrap_peers.is_empty() {
+            discover_peers(
+                &self.info.trackers,
+                &self.info.infohash,
+                &random_peer_id(),
+                self.peer_port,
+            )
+            .await
+        } else {
+            self.bootstrap_peers.clone()
+        };
+        *guard = Some(discovered.clone());
+        discovered
+    }
 }
 
 #[async_trait]
@@ -447,38 +550,59 @@ impl VodContent for AceVodContent {
         let first_piece = start / piece_length;
         let end_piece = end / piece_length + 1;
 
-        // VOD swarms are standard BitTorrent; discover the same way live does.
-        let peers = if self.bootstrap_peers.is_empty() {
-            discover_peers(
-                &self.info.trackers,
-                &self.info.infohash,
-                &random_peer_id(),
-                self.peer_port,
-            )
-            .await
-        } else {
-            self.bootstrap_peers.clone()
+        // Serve any already-cached leading pieces from memory; only download the missing suffix.
+        let (prefix, download_from) = {
+            let cache = self.cache.lock().unwrap();
+            cached_prefix(&cache, first_piece, end_piece)
         };
-        crate::alog!(
-            "[ace] open_range [{start}, {end}]: pieces [{first_piece}, {end_piece}), {} peer(s)",
-            peers.len()
-        );
-        if peers.is_empty() {
-            return Err(ProviderError::Backend("no VOD peers discovered".into()));
-        }
 
         let (tx, rx) = mpsc::channel::<Bytes>(64);
-        let info = self.info.clone();
-        tokio::spawn(async move {
-            if let Err(e) = download_vod_pieces(info, peers, tx, first_piece, end_piece).await {
-                crate::alog!("[ace] vod range download ended: {e:?}");
+        if download_from < end_piece {
+            // VOD swarms are standard BitTorrent; discover the same way live does (once, cached).
+            let peers = self.peers().await;
+            crate::alog!(
+                "[ace] open_range [{start}, {end}]: pieces [{download_from}, {end_piece}) \
+                 (prefix {} cached), {} peer(s)",
+                prefix.len(),
+                peers.len()
+            );
+            if peers.is_empty() {
+                return Err(ProviderError::Backend("no VOD peers discovered".into()));
             }
-        });
+            let info = self.info.clone();
+            let cache = self.cache.clone();
+            // Download the missing suffix, teeing every whole verified piece into the cache as it
+            // streams so a later overlapping read finds it instead of re-downloading. The
+            // downloader runs detached: if the consumer drops (leaving the tee loop, dropping
+            // `drx`), `download_vod_pieces` sees `ConsumerGone` on its next send and stops.
+            let (dtx, mut drx) = mpsc::channel::<Bytes>(64);
+            tokio::spawn(async move {
+                if let Err(e) =
+                    download_vod_pieces(info, peers, dtx, download_from, end_piece).await
+                {
+                    crate::alog!("[ace] vod range download ended: {e:?}");
+                }
+            });
+            tokio::spawn(async move {
+                let mut idx = download_from;
+                while let Some(piece) = drx.recv().await {
+                    cache.lock().unwrap().insert(idx, piece.clone());
+                    idx += 1;
+                    if tx.send(piece).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // else: the whole range is cached — `tx` drops here, closing `rx`, so the source emits
+        // only the cached prefix.
+
         // The first covering piece begins at `first_piece * piece_length`; drop the bytes before
         // `start`, then emit exactly the range length.
         let skip = start - first_piece * piece_length;
         let emit_len = end - start + 1;
         Ok(Box::new(VodSource {
+            prefix: prefix.into(),
             rx,
             skip,
             remaining: emit_len,
@@ -487,10 +611,14 @@ impl VodContent for AceVodContent {
     }
 }
 
-/// Streams verified whole-piece bytes from a [`download_vod_pieces`] task, trimmed to a byte
-/// range: it drops `skip` leading bytes (the offset of `start` inside the first covering piece)
-/// and stops after `emit_len` bytes, so a caller only ever sees the requested `[start, end]`.
+/// Streams verified whole-piece bytes trimmed to a byte range: it drops `skip` leading bytes (the
+/// offset of `start` inside the first covering piece) and stops after `emit_len` bytes, so a caller
+/// only ever sees the requested `[start, end]`. Pieces come first from `prefix` (leading pieces
+/// already in the VOD's cache) and then from `rx` (the freshly downloaded suffix) — a single
+/// contiguous, in-order stream of the covering pieces.
 struct VodSource {
+    /// Cached leading covering pieces, emitted (and trimmed) before anything from `rx`.
+    prefix: VecDeque<Bytes>,
     rx: mpsc::Receiver<Bytes>,
     /// Bytes still to drop from the front before emitting (offset of `start` in the first piece).
     skip: u64,
@@ -507,7 +635,11 @@ impl VodByteSource for VodSource {
     }
     async fn next(&mut self) -> Option<Bytes> {
         while self.remaining > 0 {
-            let mut chunk = self.rx.recv().await?;
+            // Cached prefix pieces first, then the downloaded suffix.
+            let mut chunk = match self.prefix.pop_front() {
+                Some(chunk) => chunk,
+                None => self.rx.recv().await?,
+            };
             if self.skip > 0 {
                 if self.skip >= chunk.len() as u64 {
                     self.skip -= chunk.len() as u64;
@@ -2650,6 +2782,7 @@ mod tests {
         tx.send(Bytes::from_static(b"CCCC")).await.unwrap();
         drop(tx);
         let mut src = VodSource {
+            prefix: VecDeque::new(),
             rx,
             skip: 2,
             remaining: 5,
@@ -2661,6 +2794,237 @@ mod tests {
             got.extend_from_slice(&chunk);
         }
         assert_eq!(&got, b"AABBB");
+    }
+
+    #[tokio::test]
+    async fn vod_source_emits_cached_prefix_before_downloaded_suffix() {
+        // First covering piece "AAAA" is cached (prefix); the suffix "BBBB","CCCC" streams in.
+        // The range starts 2 bytes into the first piece and spans 5 bytes, so trimming must apply
+        // uniformly across the prefix/stream boundary: "AA" + "BBB".
+        let (tx, rx) = mpsc::channel::<Bytes>(4);
+        tx.send(Bytes::from_static(b"BBBB")).await.unwrap();
+        tx.send(Bytes::from_static(b"CCCC")).await.unwrap();
+        drop(tx);
+        let mut src = VodSource {
+            prefix: VecDeque::from(vec![Bytes::from_static(b"AAAA")]),
+            rx,
+            skip: 2,
+            remaining: 5,
+            emit_len: 5,
+        };
+        let mut got = Vec::new();
+        while let Some(chunk) = src.next().await {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(&got, b"AABBB");
+    }
+
+    #[test]
+    fn vod_piece_cache_retains_then_fifo_evicts_within_its_bound() {
+        let mut cache = VodPieceCache::new(2);
+        cache.insert(0, Bytes::from_static(b"zero"));
+        cache.insert(1, Bytes::from_static(b"one"));
+        assert_eq!(cache.get(0).as_deref(), Some(&b"zero"[..]));
+        assert_eq!(cache.get(1).as_deref(), Some(&b"one"[..]));
+        // A third insert evicts the oldest (piece 0), keeping the bound at 2.
+        cache.insert(2, Bytes::from_static(b"two"));
+        assert!(cache.get(0).is_none(), "oldest piece evicted at the bound");
+        assert_eq!(cache.get(1).as_deref(), Some(&b"one"[..]));
+        assert_eq!(cache.get(2).as_deref(), Some(&b"two"[..]));
+        // Re-inserting an existing index is a no-op (keeps its FIFO position, no double-count).
+        cache.insert(1, Bytes::from_static(b"CHANGED"));
+        assert_eq!(cache.get(1).as_deref(), Some(&b"one"[..]));
+    }
+
+    #[test]
+    fn cached_prefix_is_the_leading_run_present_in_the_cache() {
+        let mut cache = VodPieceCache::new(8);
+        cache.insert(2, Bytes::from_static(b"p2"));
+        cache.insert(3, Bytes::from_static(b"p3"));
+        // Covering [2, 6): pieces 2 and 3 are cached, 4 is the first missing.
+        let (prefix, download_from) = cached_prefix(&cache, 2, 6);
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(&prefix[0][..], b"p2");
+        assert_eq!(&prefix[1][..], b"p3");
+        assert_eq!(download_from, 4);
+        // A gap at the first piece means no cached prefix at all.
+        cache.insert(5, Bytes::from_static(b"p5"));
+        let (prefix, download_from) = cached_prefix(&cache, 4, 6);
+        assert!(prefix.is_empty());
+        assert_eq!(download_from, 4);
+    }
+
+    // Build `total_len` bytes plus a matching VodInfo (SHA-1 piece hashes over that content).
+    fn make_vod_content(
+        piece_length: u64,
+        chunk_length: u64,
+        total_len: u64,
+    ) -> (Vec<u8>, VodInfo) {
+        use sha1::{Digest, Sha1};
+        let content: Vec<u8> = (0..total_len).map(|i| (i % 251) as u8).collect();
+        let piece_count = total_len.div_ceil(piece_length);
+        let mut piece_hashes = Vec::new();
+        for p in 0..piece_count {
+            let start = (p * piece_length) as usize;
+            let end = ((p + 1) * piece_length).min(total_len) as usize;
+            let h: [u8; 20] = Sha1::digest(&content[start..end]).into();
+            piece_hashes.push(h);
+        }
+        let info = VodInfo {
+            infohash: [0x42; 20],
+            piece_length,
+            chunk_length,
+            trackers: vec![],
+            piece_hashes,
+            total_length: total_len,
+        };
+        (content, info)
+    }
+
+    // A minimal standard-BitTorrent VOD seeder that tallies how many block bytes it serves, so a
+    // test can assert a piece was fetched from the swarm at most once.
+    async fn spawn_counting_vod_seeder(
+        content: Vec<u8>,
+        info: VodInfo,
+        served: Arc<AtomicU64>,
+    ) -> SocketAddrV4 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = match listener.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let content = content.clone();
+                let info = info.clone();
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut hs = [0u8; ace_wire::handshake::HANDSHAKE_LEN];
+                    if sock.read_exact(&mut hs).await.is_err() {
+                        return;
+                    }
+                    let reply =
+                        ace_wire::handshake::Handshake::new(info.infohash, random_peer_id())
+                            .encode();
+                    if sock.write_all(&reply).await.is_err() {
+                        return;
+                    }
+                    let nbytes = (info.piece_count() as usize).div_ceil(8);
+                    let mut bits = vec![0u8; nbytes];
+                    for p in 0..info.piece_count() as usize {
+                        bits[p / 8] |= 0x80 >> (p % 8);
+                    }
+                    let _ = sock.write_all(&PeerMessage::Bitfield(bits).encode()).await;
+                    let _ = sock.write_all(&PeerMessage::Unchoke.encode()).await;
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        loop {
+                            match PeerMessage::decode(&buf) {
+                                Ok(Some((msg, used))) => {
+                                    buf.drain(..used);
+                                    if let PeerMessage::Request {
+                                        index,
+                                        begin,
+                                        length,
+                                    } = msg
+                                    {
+                                        let start = (index as u64 * info.piece_length
+                                            + begin as u64)
+                                            as usize;
+                                        let end = start + length as usize;
+                                        let block = content[start..end].to_vec();
+                                        served.fetch_add(block.len() as u64, Ordering::SeqCst);
+                                        let piece = PeerMessage::Piece {
+                                            index,
+                                            begin,
+                                            block,
+                                        }
+                                        .encode();
+                                        if sock.write_all(&piece).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => return,
+                            }
+                        }
+                        let n = match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    async fn read_all(mut src: Box<dyn VodByteSource>) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(chunk) = src.next().await {
+            out.extend_from_slice(&chunk);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn open_range_downloads_each_covering_piece_at_most_once() {
+        // 3 pieces of 16 bytes (one 16-byte block per piece). Two reads that both fall inside
+        // piece 0: the second must be served from the cache the first populated, not re-downloaded.
+        let (content, info) = make_vod_content(16, 16, 48);
+        assert_eq!(info.piece_count(), 3);
+        let served = Arc::new(AtomicU64::new(0));
+        let addr = spawn_counting_vod_seeder(content.clone(), info.clone(), served.clone()).await;
+        let vod = AceVodContent {
+            info,
+            bootstrap_peers: vec![addr],
+            peer_port: 0,
+            cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(8))),
+            peers: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let first = read_all(vod.open_range(0, 3).await.unwrap()).await;
+        assert_eq!(first, content[0..=3]);
+        let second = read_all(vod.open_range(8, 11).await.unwrap()).await;
+        assert_eq!(second, content[8..=11]);
+
+        // Piece 0 is 16 bytes; both reads cover it, but the swarm served it exactly once.
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            16,
+            "the covering piece is downloaded once, then reused from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_range_spanning_a_new_piece_downloads_only_the_missing_suffix() {
+        // Read piece 0 first (caches it), then read [0, 20] which spans pieces 0 and 1: piece 0 is
+        // served from cache, only piece 1 is fetched. The assembled bytes must still be correct.
+        let (content, info) = make_vod_content(16, 16, 48);
+        let served = Arc::new(AtomicU64::new(0));
+        let addr = spawn_counting_vod_seeder(content.clone(), info.clone(), served.clone()).await;
+        let vod = AceVodContent {
+            info,
+            bootstrap_peers: vec![addr],
+            peer_port: 0,
+            cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(8))),
+            peers: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let _ = read_all(vod.open_range(0, 15).await.unwrap()).await; // piece 0
+        let spanning = read_all(vod.open_range(0, 20).await.unwrap()).await;
+        assert_eq!(spanning, content[0..=20]);
+        // Piece 0 (16) downloaded once for the first read; piece 1 (16) for the spanning read.
+        assert_eq!(served.load(Ordering::SeqCst), 32);
     }
 
     #[tokio::test]

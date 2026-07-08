@@ -31,3 +31,6 @@ dirs = "6"
 rand = "0.8"
 rtmp-rs = "0.5"
 base64ct = { version = "1.8", features = ["alloc"] }
+
+[dev-dependencies]
+sha1 = "0.10"

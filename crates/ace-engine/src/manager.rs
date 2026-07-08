@@ -3,12 +3,15 @@
 
 use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
-use crate::provider::{ProviderError, ProviderRegistry, StreamProvider};
+use crate::provider::{ProviderError, ProviderRegistry, VodContent};
 use crate::session::StreamSession;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+/// A resolved VOD plus its last-access time (for idle expiry), keyed by `(network, id)`.
+type VodCacheEntry = (Arc<dyn VodContent>, Instant);
 
 pub struct StreamManager {
     registry: ProviderRegistry,
@@ -19,6 +22,15 @@ pub struct StreamManager {
     /// discovery + duplicate peer connections from our same node_id (which real peers drop).
     /// Held only around start, never around the fast existing-session path.
     start_lock: Mutex<()>,
+    /// Resolved single-file VODs, shared across a playback's many range reads (the HLS manifest
+    /// plus every segment). Each entry keeps its provider-resolved handle (and, for the ace
+    /// provider, its bounded piece cache + discovered peers) alive so segments resolve the
+    /// transport descriptor once and reuse downloaded pieces instead of re-fetching per request.
+    /// Entries expire after `grace` of no access. Value: (handle, last-access time).
+    vod_cache: Mutex<HashMap<(String, String), VodCacheEntry>>,
+    /// Serializes VOD *resolution* so concurrent first reads for the same id (a manifest fetch
+    /// racing an eager segment fetch) trigger exactly one `provider.resolve_vod()`.
+    vod_resolve_lock: Mutex<()>,
     buffer: usize,
     hls: HlsConfig,
     grace: Duration,
@@ -43,6 +55,8 @@ impl StreamManager {
             sessions: Mutex::new(HashMap::new()),
             packagers: Mutex::new(HashMap::new()),
             start_lock: Mutex::new(()),
+            vod_cache: Mutex::new(HashMap::new()),
+            vod_resolve_lock: Mutex::new(()),
             buffer,
             hls,
             grace: Duration::from_secs(30),
@@ -58,11 +72,44 @@ impl StreamManager {
         self.hls
     }
 
-    /// The registered provider for `network`, if any. VOD downloads are one-shot (not shared
-    /// live sessions), so the `/vod` route resolves the provider directly rather than going
-    /// through [`get_or_start`](Self::get_or_start).
-    pub fn provider(&self, network: &str) -> Option<Arc<dyn StreamProvider>> {
-        self.registry.get(network)
+    /// Resolve `id` to a single-file VOD, caching the resolved handle per `(network, id)` so a
+    /// whole playback — the HLS manifest plus every segment read — shares one resolution (and, for
+    /// the ace provider, one piece cache + one peer discovery) instead of re-resolving per request.
+    /// Returns `NotFound` for an unregistered network.
+    pub async fn resolve_vod(
+        &self,
+        network: &str,
+        id: &str,
+    ) -> Result<Arc<dyn VodContent>, ProviderError> {
+        let key = (network.to_string(), id.to_string());
+        if let Some(v) = self.cached_vod(&key).await {
+            return Ok(v);
+        }
+        // Serialize resolution and re-check: a concurrent request may have resolved this id while
+        // we waited, so we must not resolve (and discover) a second time.
+        let _resolving = self.vod_resolve_lock.lock().await;
+        if let Some(v) = self.cached_vod(&key).await {
+            return Ok(v);
+        }
+        let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
+        let vod: Arc<dyn VodContent> = Arc::from(provider.resolve_vod(id).await?);
+        self.vod_cache
+            .lock()
+            .await
+            .insert(key, (vod.clone(), Instant::now()));
+        Ok(vod)
+    }
+
+    /// A live (non-expired) cached VOD for `key`, refreshing its access time. Sweeps entries idle
+    /// longer than `grace` on the way, so the cache is bounded to VODs read within the last `grace`.
+    async fn cached_vod(&self, key: &(String, String)) -> Option<Arc<dyn VodContent>> {
+        let mut map = self.vod_cache.lock().await;
+        let now = Instant::now();
+        map.retain(|_, (_, at)| now.duration_since(*at) < self.grace);
+        map.get_mut(key).map(|(v, at)| {
+            *at = now;
+            v.clone()
+        })
     }
 
     /// Get the running session for `(network, id)` or start one via the provider. Returns
@@ -265,6 +312,68 @@ mod tests {
             ptrs.iter().all(|p| *p == ptrs[0]),
             "all callers share one session"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_vod_is_cached_per_key_and_shared() {
+        // A provider that counts how many times `resolve_vod` runs, so we can prove one playback's
+        // manifest + segment reads resolve the descriptor once and share one resolved VOD.
+        use crate::provider::{ProviderError, StreamProvider, TsSource, VodByteSource, VodContent};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingVodProvider(Arc<AtomicUsize>);
+        struct EmptyVod;
+        #[async_trait]
+        impl VodContent for EmptyVod {
+            fn content_length(&self) -> u64 {
+                0
+            }
+            async fn open_range(
+                &self,
+                _start: u64,
+                _end: u64,
+            ) -> Result<Box<dyn VodByteSource>, ProviderError> {
+                Err(ProviderError::NotFound)
+            }
+        }
+        #[async_trait]
+        impl StreamProvider for CountingVodProvider {
+            fn network(&self) -> &'static str {
+                "cvod"
+            }
+            async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+                Err(ProviderError::NotFound)
+            }
+            async fn resolve_vod(&self, _id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(EmptyVod))
+            }
+        }
+
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let mut r = ProviderRegistry::new();
+        r.register(Arc::new(CountingVodProvider(resolves.clone())));
+        let m = StreamManager::new(r);
+
+        let a = m.resolve_vod("cvod", "x").await.unwrap();
+        let b = m.resolve_vod("cvod", "x").await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "same key shares one resolved VOD");
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            1,
+            "resolved once for one id"
+        );
+
+        // A different id resolves independently.
+        let _c = m.resolve_vod("cvod", "y").await.unwrap();
+        assert_eq!(resolves.load(Ordering::SeqCst), 2);
+
+        // Unknown network is NotFound, not a cache entry.
+        assert!(matches!(
+            m.resolve_vod("nope", "x").await,
+            Err(ProviderError::NotFound)
+        ));
     }
 
     #[tokio::test]

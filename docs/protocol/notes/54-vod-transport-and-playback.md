@@ -40,6 +40,16 @@ a local mock BitTorrent seeder — no live swarm required.
     approach as the live packager (`hls.rs`), sized by the shared `HlsConfig`.
   - `outpace play --vod <target>` — verified VOD download to stdout.
 
+  VOD resolution is cached so a playback resolves once and reuses downloaded pieces (#75):
+  `StreamManager::resolve_vod` keeps one resolved `VodContent` per `(network, id)` (idle-expired
+  after the session grace), shared by the whole-file route, the manifest, and every segment.
+  `AceVodContent` in turn discovers peers once and holds a bounded FIFO piece cache
+  (`VOD_PIECE_CACHE_CAP` whole pieces), so `open_range` serves an already-cached leading run from
+  memory and only downloads the missing suffix — HLS's many small, overlapping segment ranges no
+  longer re-fetch the transport descriptor, re-discover peers, or re-download the (larger) pieces
+  they share. The cache is bounded, so whole-file streaming stays memory-safe. A durable,
+  reseed-friendly piece store (vs. this in-memory reuse cache) is tracked by #78/#37/#38.
+
 ## Scope and follow-ups
 
 Single-file only; multi-file is rejected with a clear error. Deliberately deferred:
