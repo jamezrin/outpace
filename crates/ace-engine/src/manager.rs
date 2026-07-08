@@ -54,7 +54,6 @@ impl StreamManager {
         self.buffer
     }
 
-    #[cfg(test)]
     pub(crate) fn hls_config(&self) -> HlsConfig {
         self.hls
     }

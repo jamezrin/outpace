@@ -30,16 +30,22 @@ a local mock BitTorrent seeder — no live swarm required.
 - `ace-engine`:
   - `provider::VodByteSource` trait; `StreamProvider::open_vod` (default: unsupported) overridden
     by `AceProvider`.
-  - `GET /vod/:network/:id` — streams verified bytes with a `Content-Length`.
+  - `GET /vod/:network/:id` — streams verified bytes with a `Content-Length` (HTTP byte-range/seek
+    added in #76).
+  - `GET /vod/:network/:id/manifest.m3u8` + `GET /vod/:network/:id/seg/:n.ts` — VOD HLS packaging
+    (#75). The manifest is a static `#EXT-X-PLAYLIST-TYPE:VOD` list ending in `#EXT-X-ENDLIST`;
+    each segment is served as the verified byte range `hls::VodHlsLayout` assigns to it (so it
+    reuses `VodContent::open_range` and its per-piece SHA-1 verification). Segmentation is
+    byte-based and aligned to whole 188-byte TS packets — the same MPEG-TS, non-keyframe-aware
+    approach as the live packager (`hls.rs`), sized by the shared `HlsConfig`.
   - `outpace play --vod <target>` — verified VOD download to stdout.
 
 ## Scope and follow-ups
 
 Single-file only; multi-file is rejected with a clear error. Deliberately deferred:
-VOD HLS packaging, HTTP byte-range/seek, multi-peer rarest-first VOD scheduling, reseeding
-downloaded VOD pieces via `SeedRegistry`, and live-swarm validation against a real public VOD
-transport (which would also confirm/adjust the synthesized `length`/`files` schema — see
-`transport-file.md`).
+multi-peer rarest-first VOD scheduling, reseeding downloaded VOD pieces via `SeedRegistry`, and
+live-swarm validation against a real public VOD transport (which would also confirm/adjust the
+synthesized `length`/`files` schema — see `transport-file.md`).
 
 ## Verification
 
