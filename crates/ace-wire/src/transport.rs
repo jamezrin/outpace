@@ -51,6 +51,26 @@ pub struct TransportDescriptor {
     pub raw: crate::bencode::Bencode,
 }
 
+impl TransportDescriptor {
+    /// Total content byte length for a single-file VOD (`length` key), if present.
+    ///
+    /// SYNTHESIZED SCHEMA: no public VOD fixture is available, so the single-file `length`
+    /// key is assumed from standard BitTorrent conventions. Reconcile against a real capture.
+    pub fn vod_total_length(&self) -> Option<u64> {
+        self.raw
+            .get(b"length")
+            .and_then(|v| v.as_int())
+            .filter(|&i| i > 0)
+            .map(|i| i as u64)
+    }
+
+    /// Whether this descriptor advertises a multi-file layout (`files` list). Multi-file VOD is
+    /// intentionally unsupported; callers reject it. SYNTHESIZED SCHEMA (see [`Self::vod_total_length`]).
+    pub fn is_multifile(&self) -> bool {
+        matches!(self.raw.get(b"files"), Some(Bencode::List(_)))
+    }
+}
+
 type Dec = cbc::Decryptor<aes::Aes128>;
 
 /// Read a required descriptor int that must be strictly positive.
@@ -250,6 +270,40 @@ mod tests {
             vec!["udp://t1.example:2710/announce".to_string()]
         );
         assert!(got.is_live, "no pieces key => live");
+    }
+
+    #[test]
+    fn single_file_vod_exposes_length_and_pieces() {
+        use crate::bencode::Bencode;
+        use std::collections::BTreeMap;
+        // 2 pieces worth of SHA-1 hashes (40 bytes) + a length key => single-file VOD.
+        let mut d = BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"movie".to_vec()));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(131072));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16384));
+        d.insert(b"length".to_vec(), Bencode::Int(200000));
+        d.insert(b"pieces".to_vec(), Bencode::Bytes(vec![0u8; 40]));
+        let tf = encode_transport(&Bencode::Dict(d));
+        let got = decode_transport(&tf).unwrap();
+        assert!(!got.is_live);
+        assert_eq!(got.pieces.len(), 2);
+        assert_eq!(got.vod_total_length(), Some(200000));
+        assert!(!got.is_multifile());
+    }
+
+    #[test]
+    fn files_key_marks_multifile() {
+        use crate::bencode::Bencode;
+        use std::collections::BTreeMap;
+        let mut d = BTreeMap::new();
+        d.insert(b"piece_length".to_vec(), Bencode::Int(131072));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16384));
+        d.insert(b"pieces".to_vec(), Bencode::Bytes(vec![0u8; 20]));
+        d.insert(b"files".to_vec(), Bencode::List(vec![]));
+        let tf = encode_transport(&Bencode::Dict(d));
+        let got = decode_transport(&tf).unwrap();
+        assert!(got.is_multifile());
+        assert_eq!(got.vod_total_length(), None);
     }
 
     #[test]
