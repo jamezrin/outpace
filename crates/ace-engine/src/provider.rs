@@ -31,12 +31,33 @@ pub trait TsSource: Send {
 
 /// A finite, ordered VOD byte stream with a known total length. Unlike [`TsSource`] (an
 /// unbounded live stream), a VOD source ends after exactly `content_length()` bytes.
+///
+/// A source may cover the whole file or an arbitrary byte range (see [`VodContent::open_range`]);
+/// in both cases `content_length()` is the number of bytes this source will emit.
 #[async_trait]
 pub trait VodByteSource: Send {
-    /// Total content length in bytes (for a `Content-Length` header).
+    /// Number of bytes this source will emit (the whole file, or a requested range's length).
     fn content_length(&self) -> u64;
     /// Next verified, ordered chunk, or None at end-of-content.
     async fn next(&mut self) -> Option<Bytes>;
+}
+
+/// A resolved single-file VOD: its total length is known, and verified byte ranges can be
+/// opened on demand. Splitting resolution from range-opening lets the HTTP layer read the total
+/// length once (to validate a `Range` header) before deciding which pieces to download, so seek
+/// requests fetch only the covering pieces rather than the whole file.
+#[async_trait]
+pub trait VodContent: Send {
+    /// Total content length of the whole file in bytes.
+    fn content_length(&self) -> u64;
+    /// Open a verified byte source for the inclusive byte range `[start, end]`. The returned
+    /// source emits exactly those bytes, each SHA-1-verified (per covering piece) before
+    /// emission. `start`/`end` must satisfy `start <= end < content_length()`.
+    async fn open_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Box<dyn VodByteSource>, ProviderError>;
 }
 
 /// Adapter for one network (e.g. "ace").
@@ -45,10 +66,11 @@ pub trait StreamProvider: Send + Sync {
     fn network(&self) -> &'static str;
     /// Open a live TS source for `id` (the provider resolves/discovers internally).
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError>;
-    /// Open a single-file VOD source for `id`. Defaults to unsupported; networks with a VOD
-    /// path override this. Kept separate from [`open`](Self::open) because VOD is finite,
-    /// length-known content, not an unbounded live stream.
-    async fn open_vod(&self, _id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
+    /// Resolve `id` to a single-file VOD, returning its geometry (total length) and a handle for
+    /// opening verified byte ranges. Defaults to unsupported; networks with a VOD path override
+    /// this. Kept separate from [`open`](Self::open) because VOD is finite, length-known content
+    /// (seekable), not an unbounded live stream.
+    async fn resolve_vod(&self, _id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
         Err(ProviderError::Backend(
             "this network does not support VOD".into(),
         ))

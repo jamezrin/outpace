@@ -210,8 +210,16 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if args.vod {
         eprintln!("outpace play: VOD download (verified) to stdout");
-        let mut source = provider
-            .open_vod(&target.provider_id)
+        let vod = provider
+            .resolve_vod(&target.provider_id)
+            .await
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let total = vod.content_length();
+        if total == 0 {
+            return Ok(());
+        }
+        let mut source = vod
+            .open_range(0, total - 1)
             .await
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         let mut stdout = tokio::io::stdout();

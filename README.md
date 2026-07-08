@@ -77,9 +77,11 @@ cargo run -p ace-engine --bin outpace -- play --vod acestream://<content-id> > m
 ```
 
 Each piece is SHA1-checked against the transport's `pieces` before any bytes are written.
-The daemon serves the same content over `GET /vod/<network>/<id>` with a `Content-Length`.
-Multi-file VOD is intentionally unsupported and fails with a clear error; VOD HLS and
-byte-range requests are tracked follow-ups.
+The daemon serves the same content over `GET /vod/<network>/<id>` with a `Content-Length`,
+advertises `Accept-Ranges: bytes`, and honors single `Range` requests (`206 Partial Content`)
+so players can seek — each served range is still SHA1-verified against the covering pieces.
+Multi-file VOD is intentionally unsupported and fails with a clear error; VOD HLS is a tracked
+follow-up.
 
 Start a named broadcast:
 
@@ -164,7 +166,7 @@ Native API:
 - `GET /streams`
 - `GET /streams/ace/<id>.ts`
 - HLS and playlist routes backed by the native stream session layer
-- `GET /vod/<network>/<id>` - single-file VOD, SHA1-verified, with `Content-Length`
+- `GET /vod/<network>/<id>` - single-file VOD, SHA1-verified, with `Content-Length` and seekable `Range` support (`206`)
 - `PUT /broadcast/<name>`
 - `GET /broadcast/<name>`
 

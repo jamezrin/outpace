@@ -110,30 +110,151 @@ pub fn router(state: AppState) -> Router {
 async fn vod_stream(
     State(s): State<AppState>,
     Path((network, id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(provider) = s.manager.provider(&network) else {
         return (StatusCode::NOT_FOUND, "unknown network").into_response();
     };
-    match provider.open_vod(&id).await {
-        Ok(source) => vod_response_from_source(source),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+    let vod = match provider.resolve_vod(&id).await {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+    };
+    let total = vod.content_length();
+    if total == 0 {
+        return empty_vod_response();
+    }
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    match parse_byte_range(range, total) {
+        // Whole file (no usable Range): 200 with Accept-Ranges so players know they *can* seek.
+        RangeOutcome::Full => match vod.open_range(0, total - 1).await {
+            Ok(source) => vod_response_from_source(source),
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+        },
+        RangeOutcome::Satisfiable(start, end) => match vod.open_range(start, end).await {
+            Ok(source) => vod_partial_response(source, start, end, total),
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+        },
+        // A well-formed range that can't be met: 416 with the resource's true length.
+        RangeOutcome::Unsatisfiable => axum::http::Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .body(Body::empty())
+            .expect("valid 416 response")
+            .into_response(),
     }
 }
 
-/// Build a streaming `200` response from a [`VodByteSource`], advertising its total length.
-fn vod_response_from_source(source: Box<dyn VodByteSource>) -> Response {
-    let total = source.content_length();
+/// How a `Range` request header resolves against a known content length.
+#[derive(Debug, PartialEq, Eq)]
+enum RangeOutcome {
+    /// No usable single-range spec — serve the whole file (`200`).
+    Full,
+    /// One satisfiable byte range `[start, end]` (inclusive) — serve `206`.
+    Satisfiable(u64, u64),
+    /// A well-formed range that lies outside the content — serve `416`.
+    Unsatisfiable,
+}
+
+/// Interpret a `Range` header against `total` (> 0) content bytes. Only single byte-ranges are
+/// honored; anything else (missing header, non-`bytes` unit, multi-range, or unparseable spec)
+/// is ignored and treated as [`RangeOutcome::Full`] — RFC 7233 §3.1 lets a server ignore a
+/// `Range` it doesn't act on. Only a syntactically valid but out-of-bounds range is
+/// [`RangeOutcome::Unsatisfiable`].
+fn parse_byte_range(header: Option<&str>, total: u64) -> RangeOutcome {
+    let Some(spec) = header.and_then(|h| h.strip_prefix("bytes=")) else {
+        return RangeOutcome::Full;
+    };
+    let spec = spec.trim();
+    // Single range only; a comma means multiple ranges, which we decline to honor (serve 200).
+    if spec.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let Some((first, last)) = spec.split_once('-') else {
+        return RangeOutcome::Full;
+    };
+    let (first, last) = (first.trim(), last.trim());
+    match (first.is_empty(), last.is_empty()) {
+        // `-N`: the last N bytes (clamped to the whole file).
+        (true, false) => match last.parse::<u64>() {
+            Ok(0) => RangeOutcome::Unsatisfiable,
+            Ok(n) => RangeOutcome::Satisfiable(total.saturating_sub(n), total - 1),
+            Err(_) => RangeOutcome::Full,
+        },
+        // `N-`: from byte N to the end.
+        (false, true) => match first.parse::<u64>() {
+            Ok(start) if start < total => RangeOutcome::Satisfiable(start, total - 1),
+            Ok(_) => RangeOutcome::Unsatisfiable,
+            Err(_) => RangeOutcome::Full,
+        },
+        // `N-M`: an explicit range (end clamped to the last byte).
+        (false, false) => match (first.parse::<u64>(), last.parse::<u64>()) {
+            (Ok(start), Ok(end)) if start <= end && start < total => {
+                RangeOutcome::Satisfiable(start, end.min(total - 1))
+            }
+            (Ok(_), Ok(_)) => RangeOutcome::Unsatisfiable,
+            _ => RangeOutcome::Full,
+        },
+        // A bare `-`: not a valid range, ignore it.
+        (true, true) => RangeOutcome::Full,
+    }
+}
+
+/// Build an empty `200` for a zero-length VOD (no range possible), advertising `Accept-Ranges`.
+fn empty_vod_response() -> Response {
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, 0)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::empty())
+        .expect("valid empty vod response")
+        .into_response()
+}
+
+/// Bridge a [`VodByteSource`] to an HTTP body stream.
+fn vod_body(source: Box<dyn VodByteSource>) -> Body {
     let stream = futures::stream::unfold(source, |mut src| async move {
         src.next()
             .await
             .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), src))
     });
+    Body::from_stream(stream)
+}
+
+/// Build a streaming `200` response for a whole-file [`VodByteSource`], advertising its length
+/// and that the resource is range-seekable.
+fn vod_response_from_source(source: Box<dyn VodByteSource>) -> Response {
+    let total = source.content_length();
     axum::http::Response::builder()
         .status(StatusCode::OK)
+        .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, total)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from_stream(stream))
+        .body(vod_body(source))
         .expect("valid vod response")
+        .into_response()
+}
+
+/// Build a streaming `206 Partial Content` response for the inclusive byte range `[start, end]`
+/// of a `total`-byte VOD.
+fn vod_partial_response(
+    source: Box<dyn VodByteSource>,
+    start: u64,
+    end: u64,
+    total: u64,
+) -> Response {
+    axum::http::Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, end - start + 1)
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
+        )
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(vod_body(source))
+        .expect("valid vod partial response")
         .into_response()
 }
 
@@ -607,7 +728,9 @@ fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
 mod tests {
     use super::*;
     use crate::broadcast::{CHUNK_LENGTH, PIECE_LENGTH};
-    use crate::provider::{ProviderError, ProviderRegistry, SourceStats, StreamProvider, TsSource};
+    use crate::provider::{
+        ProviderError, ProviderRegistry, SourceStats, StreamProvider, TsSource, VodContent,
+    };
     use crate::testprovider::TestProvider;
     use async_trait::async_trait;
     use axum::body::Body;
@@ -641,8 +764,197 @@ mod tests {
         let resp = vod_response_from_source(Box::new(src));
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()[header::CONTENT_LENGTH], "5");
+        assert_eq!(resp.headers()[header::ACCEPT_RANGES], "bytes");
         let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"abcde");
+    }
+
+    #[test]
+    fn parse_byte_range_covers_the_range_header_forms() {
+        use RangeOutcome::*;
+        // No / non-bytes / unparseable / multi-range specs are ignored -> serve the whole file.
+        assert!(matches!(parse_byte_range(None, 10), Full));
+        assert!(matches!(parse_byte_range(Some("items=0-1"), 10), Full));
+        assert!(matches!(parse_byte_range(Some("bytes=abc"), 10), Full));
+        assert!(matches!(parse_byte_range(Some("bytes=-"), 10), Full));
+        assert!(matches!(parse_byte_range(Some("bytes=0-1,3-4"), 10), Full));
+        // Explicit range, clamped to the last byte.
+        assert!(matches!(
+            parse_byte_range(Some("bytes=2-4"), 10),
+            Satisfiable(2, 4)
+        ));
+        assert!(matches!(
+            parse_byte_range(Some("bytes=8-100"), 10),
+            Satisfiable(8, 9)
+        ));
+        // Open-ended: from N to the end.
+        assert!(matches!(
+            parse_byte_range(Some("bytes=5-"), 10),
+            Satisfiable(5, 9)
+        ));
+        // Suffix: the last N bytes (and a suffix longer than the file clamps to the whole file).
+        assert!(matches!(
+            parse_byte_range(Some("bytes=-3"), 10),
+            Satisfiable(7, 9)
+        ));
+        assert!(matches!(
+            parse_byte_range(Some("bytes=-100"), 10),
+            Satisfiable(0, 9)
+        ));
+        // Out-of-bounds / inverted / zero-suffix are unsatisfiable -> 416.
+        assert!(matches!(
+            parse_byte_range(Some("bytes=100-200"), 10),
+            Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_byte_range(Some("bytes=5-3"), 10),
+            Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_byte_range(Some("bytes=-0"), 10),
+            Unsatisfiable
+        ));
+    }
+
+    // An in-memory VOD provider for exercising the HTTP `/vod` range contract without a swarm.
+    // (Real SHA-1 verification of served ranges is covered by the ace-swarm vod tests.)
+    struct MemVodProvider {
+        data: Vec<u8>,
+    }
+    struct MemVod {
+        data: Vec<u8>,
+    }
+    struct MemVodSource {
+        chunk: Option<Bytes>,
+        len: u64,
+    }
+    #[async_trait]
+    impl VodByteSource for MemVodSource {
+        fn content_length(&self) -> u64 {
+            self.len
+        }
+        async fn next(&mut self) -> Option<Bytes> {
+            self.chunk.take()
+        }
+    }
+    #[async_trait]
+    impl VodContent for MemVod {
+        fn content_length(&self) -> u64 {
+            self.data.len() as u64
+        }
+        async fn open_range(
+            &self,
+            start: u64,
+            end: u64,
+        ) -> Result<Box<dyn VodByteSource>, ProviderError> {
+            let slice = self.data[start as usize..=end as usize].to_vec();
+            let len = slice.len() as u64;
+            Ok(Box::new(MemVodSource {
+                chunk: Some(Bytes::from(slice)),
+                len,
+            }))
+        }
+    }
+    #[async_trait]
+    impl StreamProvider for MemVodProvider {
+        fn network(&self) -> &'static str {
+            "memvod"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Err(ProviderError::NotFound)
+        }
+        async fn resolve_vod(&self, _id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+            Ok(Box::new(MemVod {
+                data: self.data.clone(),
+            }))
+        }
+    }
+
+    fn memvod_router(data: Vec<u8>) -> Router {
+        let mut r = ProviderRegistry::new();
+        r.register(std::sync::Arc::new(MemVodProvider { data }));
+        router(AppState {
+            manager: StreamManager::new(r),
+            networks: vec!["memvod".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            experimental_ace_compat: false,
+            broadcasts: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn vod_without_range_serves_200_and_advertises_accept_ranges() {
+        let data: Vec<u8> = (0..20u8).collect();
+        let resp = memvod_router(data.clone())
+            .oneshot(Request::get("/vod/memvod/x").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "20");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[..]);
+    }
+
+    #[tokio::test]
+    async fn vod_range_serves_206_partial_content() {
+        let data: Vec<u8> = (0..20u8).collect();
+        let resp = memvod_router(data.clone())
+            .oneshot(
+                Request::get("/vod/memvod/x")
+                    .header(header::RANGE, "bytes=5-9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes 5-9/20");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "5");
+        assert_eq!(resp.headers()[header::ACCEPT_RANGES], "bytes");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[5..=9]);
+    }
+
+    #[tokio::test]
+    async fn vod_suffix_range_serves_the_last_bytes() {
+        let data: Vec<u8> = (0..20u8).collect();
+        let resp = memvod_router(data.clone())
+            .oneshot(
+                Request::get("/vod/memvod/x")
+                    .header(header::RANGE, "bytes=-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes 16-19/20");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[16..=19]);
+    }
+
+    #[tokio::test]
+    async fn vod_unsatisfiable_range_returns_416_with_content_range() {
+        let data: Vec<u8> = (0..20u8).collect();
+        let resp = memvod_router(data)
+            .oneshot(
+                Request::get("/vod/memvod/x")
+                    .header(header::RANGE, "bytes=50-60")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes */20");
     }
 
     fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {

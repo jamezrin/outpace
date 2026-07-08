@@ -8,7 +8,9 @@
 //! fallback (see [`ace_swarm::resolve`]); the infohash form works directly.
 
 use crate::config::{CacheType, LiveRecoveryConfig};
-use crate::provider::{ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource};
+use crate::provider::{
+    ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource, VodContent,
+};
 use ace_peer::session::{connect, PeerSession};
 use ace_swarm::dht::dht_announce_peer;
 use ace_swarm::discover::{
@@ -23,7 +25,7 @@ use ace_swarm::resolve::{
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
 use ace_swarm::types::{StreamInfo, VodInfo};
-use ace_swarm::vod::download_vod;
+use ace_swarm::vod::download_vod_pieces;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
@@ -342,39 +344,17 @@ impl AceProvider {
         ))
     }
 
-    /// Resolve `id` to a single-file VOD and start a verified download, returning a
-    /// [`VodByteSource`] that emits SHA-1-verified content bytes in order. Errors if the id
-    /// is live, multi-file, or carries no VOD descriptor (a bare infohash has no piece hashes).
-    async fn open_vod_inner(&self, id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
-        let vod = self.resolve_vod_info(id).await?;
-        // VOD swarms are standard BitTorrent; discover the same way live does.
-        let peers = if self.bootstrap_peers.is_empty() {
-            discover_peers(
-                &vod.trackers,
-                &vod.infohash,
-                &random_peer_id(),
-                self.peer_port,
-            )
-            .await
-        } else {
-            self.bootstrap_peers.clone()
-        };
-        crate::alog!(
-            "[ace] open_vod {id}: {} piece(s), {} peer(s)",
-            vod.piece_count(),
-            peers.len()
-        );
-        if peers.is_empty() {
-            return Err(ProviderError::Backend("no VOD peers discovered".into()));
-        }
-        let total = vod.total_length;
-        let (tx, rx) = mpsc::channel::<Bytes>(64);
-        tokio::spawn(async move {
-            if let Err(e) = download_vod(vod, peers, tx).await {
-                crate::alog!("[ace] vod download ended: {e:?}");
-            }
-        });
-        Ok(Box::new(VodSource { rx, total }))
+    /// Resolve `id` to a single-file VOD, returning a handle that knows its total length and can
+    /// open verified byte ranges. Errors if the id is live, multi-file, or carries no VOD
+    /// descriptor (a bare infohash has no piece hashes). Peer discovery and the actual download
+    /// are deferred to [`AceVodContent::open_range`], so a seek fetches only its covering pieces.
+    async fn resolve_vod_inner(&self, id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+        let info = self.resolve_vod_info(id).await?;
+        Ok(Box::new(AceVodContent {
+            info,
+            bootstrap_peers: self.bootstrap_peers.clone(),
+            peer_port: self.peer_port,
+        }))
     }
 
     /// Fetch the VOD transport descriptor for `id` and decode it into a [`VodInfo`]. Accepts a
@@ -435,18 +415,114 @@ impl AceProvider {
     }
 }
 
+/// A resolved VOD ready to serve byte ranges. Holds the descriptor geometry plus the discovery
+/// inputs `open_range` needs, so each range opens its own download of just the covering pieces.
+struct AceVodContent {
+    info: VodInfo,
+    bootstrap_peers: Vec<SocketAddrV4>,
+    peer_port: u16,
+}
+
+#[async_trait]
+impl VodContent for AceVodContent {
+    fn content_length(&self) -> u64 {
+        self.info.total_length
+    }
+
+    async fn open_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        let total = self.info.total_length;
+        if total == 0 || start > end || end >= total {
+            return Err(ProviderError::Backend(format!(
+                "vod range [{start}, {end}] out of bounds for {total}-byte content"
+            )));
+        }
+        let piece_length = self.info.piece_length;
+        // The contiguous pieces covering [start, end]. `download_vod_pieces` verifies each whole
+        // piece against its SHA-1 hash before emitting it, so trimming its output to the range
+        // never yields an unverified byte.
+        let first_piece = start / piece_length;
+        let end_piece = end / piece_length + 1;
+
+        // VOD swarms are standard BitTorrent; discover the same way live does.
+        let peers = if self.bootstrap_peers.is_empty() {
+            discover_peers(
+                &self.info.trackers,
+                &self.info.infohash,
+                &random_peer_id(),
+                self.peer_port,
+            )
+            .await
+        } else {
+            self.bootstrap_peers.clone()
+        };
+        crate::alog!(
+            "[ace] open_range [{start}, {end}]: pieces [{first_piece}, {end_piece}), {} peer(s)",
+            peers.len()
+        );
+        if peers.is_empty() {
+            return Err(ProviderError::Backend("no VOD peers discovered".into()));
+        }
+
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+        let info = self.info.clone();
+        tokio::spawn(async move {
+            if let Err(e) = download_vod_pieces(info, peers, tx, first_piece, end_piece).await {
+                crate::alog!("[ace] vod range download ended: {e:?}");
+            }
+        });
+        // The first covering piece begins at `first_piece * piece_length`; drop the bytes before
+        // `start`, then emit exactly the range length.
+        let skip = start - first_piece * piece_length;
+        let emit_len = end - start + 1;
+        Ok(Box::new(VodSource {
+            rx,
+            skip,
+            remaining: emit_len,
+            emit_len,
+        }))
+    }
+}
+
+/// Streams verified whole-piece bytes from a [`download_vod_pieces`] task, trimmed to a byte
+/// range: it drops `skip` leading bytes (the offset of `start` inside the first covering piece)
+/// and stops after `emit_len` bytes, so a caller only ever sees the requested `[start, end]`.
 struct VodSource {
     rx: mpsc::Receiver<Bytes>,
-    total: u64,
+    /// Bytes still to drop from the front before emitting (offset of `start` in the first piece).
+    skip: u64,
+    /// Bytes still to emit before end-of-range.
+    remaining: u64,
+    /// Total bytes this source will emit (the range length); constant after construction.
+    emit_len: u64,
 }
 
 #[async_trait]
 impl VodByteSource for VodSource {
     fn content_length(&self) -> u64 {
-        self.total
+        self.emit_len
     }
     async fn next(&mut self) -> Option<Bytes> {
-        self.rx.recv().await
+        while self.remaining > 0 {
+            let mut chunk = self.rx.recv().await?;
+            if self.skip > 0 {
+                if self.skip >= chunk.len() as u64 {
+                    self.skip -= chunk.len() as u64;
+                    continue;
+                }
+                chunk = chunk.slice(self.skip as usize..);
+                self.skip = 0;
+            }
+            if chunk.len() as u64 > self.remaining {
+                chunk = chunk.slice(..self.remaining as usize);
+            }
+            self.remaining -= chunk.len() as u64;
+            return Some(chunk);
+        }
+        None
     }
 }
 
@@ -481,8 +557,8 @@ impl StreamProvider for AceProvider {
         "ace"
     }
 
-    async fn open_vod(&self, id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
-        self.open_vod_inner(id).await
+    async fn resolve_vod(&self, id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+        self.resolve_vod_inner(id).await
     }
 
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
@@ -2551,15 +2627,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_vod_rejects_bare_infohash() {
+    async fn resolve_vod_rejects_bare_infohash() {
         // A bare infohash carries no transport descriptor, so it has no VOD piece hashes.
         // This resolves synchronously (no network) to a clear error.
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
         let err = p
-            .open_vod("00112233445566778899aabbccddeeff00112233")
+            .resolve_vod("00112233445566778899aabbccddeeff00112233")
             .await
             .err();
         assert!(err.is_some(), "a bare infohash is not a VOD target");
+    }
+
+    #[tokio::test]
+    async fn vod_source_trims_received_pieces_to_the_requested_byte_range() {
+        // Three whole "pieces" of 4 bytes arrive in order. The source is opened for a range that
+        // starts 2 bytes into the first covering piece and spans 5 bytes total, so it must drop
+        // the leading 2 bytes and stop after 5 emitted bytes — never leaking bytes outside the
+        // range even though the covering pieces carry more.
+        let (tx, rx) = mpsc::channel::<Bytes>(4);
+        tx.send(Bytes::from_static(b"AAAA")).await.unwrap();
+        tx.send(Bytes::from_static(b"BBBB")).await.unwrap();
+        tx.send(Bytes::from_static(b"CCCC")).await.unwrap();
+        drop(tx);
+        let mut src = VodSource {
+            rx,
+            skip: 2,
+            remaining: 5,
+            emit_len: 5,
+        };
+        assert_eq!(src.content_length(), 5);
+        let mut got = Vec::new();
+        while let Some(chunk) = src.next().await {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(&got, b"AABBB");
     }
 
     #[tokio::test]
