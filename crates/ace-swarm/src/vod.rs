@@ -44,15 +44,31 @@ pub async fn download_vod(
     peers: Vec<SocketAddrV4>,
     tx: mpsc::Sender<Bytes>,
 ) -> Result<(), VodError> {
-    let piece_count = info.piece_count();
-    let mut next_piece: u64 = 0;
+    let end_piece = info.piece_count();
+    download_vod_pieces(info, peers, tx, 0, end_piece).await
+}
+
+/// Download the contiguous piece range `[first_piece, end_piece)` of `info`, verifying every
+/// piece against its SHA-1 hash before sending its (whole, in-order) bytes to `tx`. This is the
+/// primitive behind byte-range/seek serving: the caller picks the pieces covering the requested
+/// byte range and trims the partial ends. Shares the same sequential single-peer strategy and
+/// stall budget as [`download_vod`], and likewise never emits unverified bytes.
+pub async fn download_vod_pieces(
+    info: VodInfo,
+    peers: Vec<SocketAddrV4>,
+    tx: mpsc::Sender<Bytes>,
+    first_piece: u64,
+    end_piece: u64,
+) -> Result<(), VodError> {
+    let end_piece = end_piece.min(info.piece_count());
+    let mut next_piece = first_piece;
     let mut peer_idx = 0usize;
     // Stall budget: consecutive attempts that made no progress. Reset whenever `next_piece`
     // advances, so a long download that keeps delivering pieces across reconnecting peers is
     // never failed for "using up attempts" — only a genuine stall (no piece advanced) is.
     let mut attempts = 0usize;
     let max_attempts = peers.len().max(1) * 3;
-    while next_piece < piece_count {
+    while next_piece < end_piece {
         if peers.is_empty() || attempts >= max_attempts {
             return Err(VodError::Unrecoverable(next_piece));
         }
@@ -72,7 +88,7 @@ pub async fn download_vod(
         {
             continue;
         }
-        match drain_from_peer(&mut session, &info, &mut next_piece, &tx).await {
+        match drain_from_peer(&mut session, &info, &mut next_piece, end_piece, &tx).await {
             Ok(()) => {}
             Err(VodError::ConsumerGone) => return Err(VodError::ConsumerGone),
             // Peer-local failure: keep the cursor and try another peer.
@@ -93,15 +109,15 @@ async fn drain_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut PeerSession<S>,
     info: &VodInfo,
     next_piece: &mut u64,
+    end_piece: u64,
     tx: &mpsc::Sender<Bytes>,
 ) -> Result<(), VodError> {
     session
         .send(&PeerMessage::Interested)
         .await
         .map_err(|_| VodError::Unrecoverable(*next_piece))?;
-    let piece_count = info.piece_count();
     let mut unchoked = false;
-    while *next_piece < piece_count {
+    while *next_piece < end_piece {
         let idx = *next_piece;
         let piece_len = info.piece_size(idx) as usize;
         let mut assembled = vec![0u8; piece_len];
@@ -310,6 +326,40 @@ mod seeder_tests {
         }
         handle.await.unwrap().unwrap();
         assert_eq!(got, content);
+    }
+
+    #[tokio::test]
+    async fn downloads_only_the_requested_piece_range() {
+        // 5 pieces of 32 KiB each (total 160000). Request pieces [1, 4): 1, 2, 3.
+        let (content, info) = make_content(32768, 16384, 160000);
+        assert_eq!(info.piece_count(), 5);
+        let addr = spawn_seeder(content.clone(), info.clone(), false).await;
+        let (tx, mut rx) = mpsc::channel::<Bytes>(64);
+        let handle =
+            tokio::spawn(async move { download_vod_pieces(info, vec![addr], tx, 1, 4).await });
+        let mut got = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            got.extend_from_slice(&chunk);
+        }
+        handle.await.unwrap().unwrap();
+        // Exactly the whole-piece bytes for pieces 1..=3, verified against their SHA-1 hashes.
+        assert_eq!(got, content[32768..4 * 32768]);
+    }
+
+    #[tokio::test]
+    async fn piece_range_download_rejects_a_tampered_covering_piece() {
+        // Tamper corrupts piece 0's first block; a range that includes piece 0 must still verify
+        // every covering piece it emits, so the download fails rather than leaking bad bytes.
+        let (content, info) = make_content(32768, 16384, 160000);
+        let addr = spawn_seeder(content, info.clone(), true).await;
+        let (tx, mut rx) = mpsc::channel::<Bytes>(64);
+        let handle =
+            tokio::spawn(async move { download_vod_pieces(info, vec![addr], tx, 0, 2).await });
+        while rx.recv().await.is_some() {}
+        assert!(
+            handle.await.unwrap().is_err(),
+            "a tampered covering piece must fail the ranged download"
+        );
     }
 
     // A seeder that serves at most `pieces_per_conn` distinct pieces per connection, then drops.
