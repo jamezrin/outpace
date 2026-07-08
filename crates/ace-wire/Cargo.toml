@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 sha1 = { version = "0.10", features = ["oid"] }
-sha2 = "0.10"
+sha2 = "0.11"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 aes = "0.9"
