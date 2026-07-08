@@ -4,6 +4,12 @@ use ace_wire::identity::Identity;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+pub const MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS: usize = 256;
+pub const MAX_LIVE_RECOVERY_PARALLEL_CONNECT: usize = 1024;
+pub const MAX_LIVE_RECOVERY_PIECE_ADVANCE: u64 = 16_384;
+pub const MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD: u64 = 65_536;
 
 /// Where the seed store (`PieceStore`) keeps piece data. Mirrors Acestream's
 /// `--live-cache-type`. The disk backend trades RAM for capacity; both honor the same
@@ -16,6 +22,140 @@ pub enum CacheType {
     Memory,
     /// Spill piece data to disk under `cache_dir`.
     Disk,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LiveRecoveryConfig {
+    pub request_timeout_ms: u64,
+    pub stale_upstream_timeout_ms: u64,
+    pub request_check_interval_ms: u64,
+    pub max_active_upstreams: usize,
+    pub max_parallel_connect: usize,
+    pub max_piece_advance: u64,
+    pub max_reasm_pieces_ahead: u64,
+}
+
+impl Default for LiveRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_ms: 4000,
+            stale_upstream_timeout_ms: 12000,
+            request_check_interval_ms: 1000,
+            max_active_upstreams: 4,
+            max_parallel_connect: 12,
+            max_piece_advance: 256,
+            max_reasm_pieces_ahead: 512,
+        }
+    }
+}
+
+impl LiveRecoveryConfig {
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_millis(self.request_timeout_ms)
+    }
+
+    pub fn stale_upstream_timeout(&self) -> Duration {
+        Duration::from_millis(self.stale_upstream_timeout_ms)
+    }
+
+    pub fn request_check_interval(&self) -> Duration {
+        Duration::from_millis(self.request_check_interval_ms)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.request_timeout_ms == 0 {
+            return Err("OUTPACE_REQUEST_TIMEOUT_MS must be >= 1".into());
+        }
+        if self.stale_upstream_timeout_ms == 0 {
+            return Err("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS must be >= 1".into());
+        }
+        if self.request_check_interval_ms == 0 {
+            return Err("OUTPACE_REQUEST_CHECK_INTERVAL_MS must be >= 1".into());
+        }
+        if self.request_timeout_ms >= self.stale_upstream_timeout_ms {
+            return Err(
+                "OUTPACE_REQUEST_TIMEOUT_MS must be < OUTPACE_STALE_UPSTREAM_TIMEOUT_MS".into(),
+            );
+        }
+        if self.request_check_interval_ms > self.request_timeout_ms {
+            return Err(
+                "OUTPACE_REQUEST_CHECK_INTERVAL_MS must be <= OUTPACE_REQUEST_TIMEOUT_MS".into(),
+            );
+        }
+        if self.max_active_upstreams == 0 {
+            return Err("OUTPACE_MAX_ACTIVE_UPSTREAMS must be >= 1".into());
+        }
+        if self.max_parallel_connect == 0 {
+            return Err("OUTPACE_MAX_PARALLEL_CONNECT must be >= 1".into());
+        }
+        if self.max_piece_advance == 0 {
+            return Err("OUTPACE_MAX_PIECE_ADVANCE must be >= 1".into());
+        }
+        if self.max_active_upstreams > MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS {
+            return Err(format!(
+                "OUTPACE_MAX_ACTIVE_UPSTREAMS must be <= {MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS}"
+            ));
+        }
+        if self.max_parallel_connect > MAX_LIVE_RECOVERY_PARALLEL_CONNECT {
+            return Err(format!(
+                "OUTPACE_MAX_PARALLEL_CONNECT must be <= {MAX_LIVE_RECOVERY_PARALLEL_CONNECT}"
+            ));
+        }
+        if self.max_piece_advance > MAX_LIVE_RECOVERY_PIECE_ADVANCE {
+            return Err(format!(
+                "OUTPACE_MAX_PIECE_ADVANCE must be <= {MAX_LIVE_RECOVERY_PIECE_ADVANCE}"
+            ));
+        }
+        if self.max_reasm_pieces_ahead > MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD {
+            return Err(format!(
+                "OUTPACE_MAX_REASM_PIECES_AHEAD must be <= {MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD}"
+            ));
+        }
+        if self.max_reasm_pieces_ahead < self.max_piece_advance {
+            return Err(
+                "OUTPACE_MAX_REASM_PIECES_AHEAD must be >= OUTPACE_MAX_PIECE_ADVANCE".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HlsConfig {
+    pub segment_packets: usize,
+    pub window_segments: usize,
+    pub segment_duration_ms: u64,
+}
+
+impl Default for HlsConfig {
+    fn default() -> Self {
+        Self {
+            segment_packets: 256,
+            window_segments: 6,
+            segment_duration_ms: 1000,
+        }
+    }
+}
+
+impl HlsConfig {
+    pub fn segment_duration_secs(&self) -> f32 {
+        self.segment_duration_ms as f32 / 1000.0
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.segment_packets == 0 {
+            return Err("OUTPACE_HLS_SEGMENT_PACKETS must be >= 1".into());
+        }
+        if self.window_segments == 0 {
+            return Err("OUTPACE_HLS_WINDOW_SEGMENTS must be >= 1".into());
+        }
+        if self.segment_duration_ms == 0 {
+            return Err("OUTPACE_HLS_SEGMENT_DURATION_MS must be >= 1".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +184,10 @@ pub struct Config {
     /// Depth of the per-session fan-out broadcast channel (messages buffered per client).
     /// Must be >= 1.
     pub session_buffer: usize,
+    /// Live lag-recovery policy and active upstream bounds.
+    pub live_recovery: LiveRecoveryConfig,
+    /// HLS byte-segment packaging policy.
+    pub hls: HlsConfig,
     /// Max simultaneously-unchoked peers per served stream (S2). Wired into the inbound serve
     /// path via the per-infohash `ServeCoordinator`: each stream unchokes up to this many
     /// interested peers plus one rotating optimistic slot (rotated by the daemon's rechoke ticker).
@@ -88,6 +232,8 @@ impl Default for Config {
             cache_dir,
             prefetch_pieces: 8,
             session_buffer: 256,
+            live_recovery: LiveRecoveryConfig::default(),
+            hls: HlsConfig::default(),
             max_unchoked: 8,
             max_inbound_peers: 64,
             seed_ttl_secs: 300,
@@ -135,6 +281,54 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_recovery_rejects_oversized_allocation_bounds() {
+        let mut config = LiveRecoveryConfig {
+            max_active_upstreams: usize::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("OUTPACE_MAX_ACTIVE_UPSTREAMS")
+        );
+
+        config = LiveRecoveryConfig {
+            max_parallel_connect: usize::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("OUTPACE_MAX_PARALLEL_CONNECT")
+        );
+
+        config = LiveRecoveryConfig {
+            max_piece_advance: u64::MAX,
+            max_reasm_pieces_ahead: u64::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("OUTPACE_MAX_PIECE_ADVANCE")
+        );
+
+        config = LiveRecoveryConfig {
+            max_reasm_pieces_ahead: u64::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("OUTPACE_MAX_REASM_PIECES_AHEAD")
+        );
+    }
 
     #[test]
     fn identity_is_stable_across_loads() {

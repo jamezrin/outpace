@@ -7,7 +7,7 @@
 //! resolution first uses the official signed catalog path, with BEP-9 `ut_metadata` as a
 //! fallback (see [`ace_swarm::resolve`]); the infohash form works directly.
 
-use crate::config::CacheType;
+use crate::config::{CacheType, LiveRecoveryConfig};
 use crate::provider::{ProviderError, SourceStats, StreamProvider, TsSource};
 use ace_peer::session::{connect, PeerSession};
 use ace_swarm::dht::dht_announce_peer;
@@ -43,25 +43,7 @@ use tokio::sync::mpsc;
 
 /// How many pieces behind the live edge to start, so we have buffer immediately.
 const PREFETCH_PIECES: u64 = 8;
-/// Upper bound on pieces requested in a single forward step. A live window is ~100 pieces
-/// and advances ~1 piece per update, so this is only a guard: a malformed/garbled window
-/// update can never trigger an unbounded request burst (it just gets re-advanced next
-/// update). See `docs/protocol/notes/22-live-edge-never-advances.md`.
-const MAX_PIECE_ADVANCE: u64 = 256;
-/// Reassembler accept window: how far ahead of the emit cursor an incoming piece index may be
-/// before it's rejected as unsolicited (#13). The scheduler assigns pieces contiguously from
-/// the cursor with at most `MAX_PIECE_ADVANCE` requests in flight, so 2x that leaves ample
-/// headroom over anything we legitimately request while bounding the reassembler's
-/// buffered-ahead pieces against a peer streaming far-future indices.
-const MAX_REASM_PIECES_AHEAD: u64 = 2 * MAX_PIECE_ADVANCE;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// How many peers to race connecting to at once (so dead peers don't serialize the time to
-/// first byte). A live swarm returns dozens; we only need one good upstream to follow.
-const MAX_PARALLEL_CONNECT: usize = 12;
-/// How many simultaneously connected upstreams to keep in the active live follower.
-/// Small on purpose: enough to avoid committing playback to one stale peer, but low enough
-/// not to look like an abusive client in public swarms.
-const MAX_ACTIVE_UPSTREAMS: usize = 4;
 /// Legacy single-peer helper handle. The production path now assigns real peer handles
 /// starting at 1, but the old helper is kept as a short-term bisect fallback.
 const SINGLE_PEER_ID: u64 = 0;
@@ -80,19 +62,6 @@ const SEEDER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(4 * 60);
 const DHT_ANNOUNCE_BUDGET: Duration = Duration::from_secs(15);
 /// Per-peer read ceiling while resolving a content-id (a silent peer shouldn't stall us).
 const RESOLVE_PEER_TIMEOUT: Duration = Duration::from_secs(6);
-/// A connected peer that keeps the TCP session alive but does not deliver pieces or live-edge
-/// advancement is a bad upstream for playback. Reconnect so another discovered peer gets a
-/// chance instead of freezing forever after the initial prefetch window.
-const STALE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(12);
-/// How long a single requested piece may stay outstanding before we re-request it (from a
-/// different peer when one is available — see `ActivePeers`/`Scheduler`). Well below
-/// `STALE_UPSTREAM_TIMEOUT` so a single dropped/evicted request self-heals in seconds instead
-/// of waiting for the whole-pool stale teardown. Also the grace before skipping a piece that
-/// has been evicted from every upstream window.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
-/// Upper bound on how long the pool loop sleeps between retransmit/skip sweeps, so a stall is
-/// noticed within ~1s even when no peer sends anything.
-const REQUEST_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// Background discovery can spend longer/deeper than startup discovery because it does not
 /// gate first byte. It should still finish before the stale-upstream timer fires, so a new
 /// peer can enter the pool before we reconnect.
@@ -175,6 +144,8 @@ struct SeedConfig {
     enabled: bool,
     /// Pieces behind the live edge the fresh follower starts at (playback cushion).
     prefetch_pieces: u64,
+    /// Live lag-recovery policy and active upstream bounds.
+    live_recovery: LiveRecoveryConfig,
     /// Backend the per-infohash seed store uses for piece data.
     cache_type: CacheType,
     /// Root dir for disk-mode piece files (per-infohash subdir derived from this).
@@ -199,6 +170,7 @@ pub struct AceProvider {
     seed_registry: SeedRegistry,
     seed_store_bytes: u64,
     prefetch_pieces: u64,
+    live_recovery: LiveRecoveryConfig,
     enable_seeding: bool,
     cache_type: CacheType,
     cache_dir: PathBuf,
@@ -220,6 +192,7 @@ impl AceProvider {
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
             prefetch_pieces: PREFETCH_PIECES,
+            live_recovery: LiveRecoveryConfig::default(),
             enable_seeding: true,
             cache_type: CacheType::Memory,
             cache_dir: PathBuf::new(),
@@ -287,6 +260,13 @@ impl AceProvider {
     /// immediate playback cushion against extra startup latency. Defaults to `PREFETCH_PIECES`.
     pub fn with_prefetch_pieces(mut self, pieces: u64) -> Self {
         self.prefetch_pieces = pieces;
+        self
+    }
+
+    /// Override the live lag-recovery and active upstream policy. Values are validated by
+    /// runtime config parsing before this builder is called.
+    pub fn with_live_recovery(mut self, live_recovery: LiveRecoveryConfig) -> Self {
+        self.live_recovery = live_recovery;
         self
     }
 
@@ -442,6 +422,7 @@ impl StreamProvider for AceProvider {
             store_bytes: self.seed_store_bytes,
             enabled: self.enable_seeding,
             prefetch_pieces: self.prefetch_pieces,
+            live_recovery: self.live_recovery,
             cache_type: self.cache_type,
             cache_dir: self.cache_dir.clone(),
         };
@@ -784,10 +765,11 @@ async fn connect_pool(
     peers: &[SocketAddrV4],
     infohash: [u8; 20],
     excluded: &HashSet<SocketAddrV4>,
+    live_recovery: LiveRecoveryConfig,
 ) -> Vec<ConnectedUpstream> {
     let candidates = candidates_for_reconnect(peers, excluded);
     let mut stats = PeerConnectStats::default();
-    for batch in candidates.chunks(MAX_PARALLEL_CONNECT) {
+    for batch in candidates.chunks(live_recovery.max_parallel_connect) {
         let mut set = tokio::task::JoinSet::new();
         for &addr in batch {
             set.spawn(connect_upstream(addr, infohash));
@@ -810,7 +792,7 @@ async fn connect_pool(
 
         let deadline = tokio::time::Instant::now() + UPSTREAM_SELECTION_GRACE;
         loop {
-            if connected.len() >= MAX_ACTIVE_UPSTREAMS {
+            if connected.len() >= live_recovery.max_active_upstreams {
                 break;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -838,7 +820,7 @@ async fn connect_pool(
                 a.addr.cmp(&b.addr)
             }
         });
-        connected.truncate(MAX_ACTIVE_UPSTREAMS);
+        connected.truncate(live_recovery.max_active_upstreams);
         if stats.has_observations() {
             crate::alog!("[ace] initial upstream selection: {}", stats.summary());
         }
@@ -896,7 +878,8 @@ async fn follow_live(
         if tx.is_closed() {
             return;
         }
-        let mut upstreams = connect_pool(&peers, info.infohash, &excluded).await;
+        let mut upstreams =
+            connect_pool(&peers, info.infohash, &excluded, seed.live_recovery).await;
         if upstreams.is_empty() {
             peer_count.store(0, Ordering::Relaxed);
             let known = peers.len();
@@ -997,7 +980,8 @@ async fn follow_live(
 enum FollowEnd {
     ConsumerGone,
     PeerLost(Vec<SocketAddrV4>),
-    /// The pool stopped producing contiguous output for `STALE_UPSTREAM_TIMEOUT`, but its
+    /// The pool stopped producing contiguous output past the configured stale-upstream timeout,
+    /// but its
     /// peers were still connected (reachable). Unlike `PeerLost`, these `stalled` peers are
     /// NOT excluded on their own: a stall is usually us falling behind the live edge (the
     /// piece we still need got evicted from the peers' windows) rather than a bad peer, and
@@ -1017,17 +1001,19 @@ enum FollowEnd {
 /// connections drop and reconnect routinely, so this was a guaranteed visible stutter on
 /// every hop, not an edge case. See `docs/protocol/notes/23-reconnect-continuity.md`.
 struct Continuity {
+    live_recovery: LiveRecoveryConfig,
     reasm: PieceReassembler,
     resync: ace_media::mpegts::TsResync,
+    output_gate: Option<ace_media::mpegts::KeyframeGate>,
     scheduler: Scheduler,
     active_peers: ActivePeers,
     received_chunks: BTreeMap<u64, HashSet<u16>>,
     /// When each still-outstanding piece was (re-)requested — drives per-piece retransmission
-    /// (`REQUEST_TIMEOUT`) independent of the whole-pool stale timer.
+    /// independent of the whole-pool stale timer.
     requested_at: HashMap<u64, Instant>,
-    /// When the playback cursor (`reasm.next_needed()`) last advanced. If it stays put past
-    /// `REQUEST_TIMEOUT` and no upstream window still covers it, the piece was evicted and we
-    /// skip forward rather than freeze.
+    /// When the playback cursor (`reasm.next_needed()`) last advanced. If it stays put past the
+    /// configured request timeout and no upstream window still covers it, the piece was evicted
+    /// and we skip forward rather than freeze.
     next_needed_since: Instant,
     head: u64,
     emitted: u64,
@@ -1046,6 +1032,7 @@ impl Continuity {
         min_piece: u64,
         max_piece: u64,
         prefetch: u64,
+        live_recovery: LiveRecoveryConfig,
     ) -> (Continuity, u64) {
         let start = prefetch_start(min_piece, max_piece, prefetch);
         // Strip the per-piece signature tail from the emitted media stream, and — when the
@@ -1055,12 +1042,14 @@ impl Continuity {
         let reasm = PieceReassembler::new(info.piece_length, start)
             .with_piece_trailer(info.sig_len as u64)
             .with_source_pubkey(info.source_pubkey.clone())
-            .with_max_pieces_ahead(MAX_REASM_PIECES_AHEAD);
+            .with_max_pieces_ahead(live_recovery.max_reasm_pieces_ahead);
         (
             Continuity {
+                live_recovery,
                 reasm,
                 resync: ace_media::mpegts::TsResync::new(),
-                scheduler: Scheduler::new(MAX_PIECE_ADVANCE as usize),
+                output_gate: None,
+                scheduler: Scheduler::new(live_recovery.max_piece_advance as usize),
                 active_peers: ActivePeers::new(),
                 received_chunks: BTreeMap::new(),
                 requested_at: HashMap::new(),
@@ -1094,6 +1083,7 @@ impl Continuity {
                 resume - 1
             );
             self.reasm.skip_to(resume);
+            self.arm_output_gate();
         }
         resume
     }
@@ -1120,25 +1110,25 @@ impl Continuity {
         }
     }
 
-    /// Pieces still outstanding past `REQUEST_TIMEOUT` — candidates to re-request. Also prunes
-    /// timer bookkeeping for pieces the cursor has already advanced past.
+    /// Pieces still outstanding past the configured request timeout — candidates to re-request.
+    /// Also prunes timer bookkeeping for pieces the cursor has already advanced past.
     fn timed_out_requests(&mut self, now: Instant) -> Vec<u64> {
         let next = self.reasm.next_needed();
         self.requested_at.retain(|&p, _| p >= next);
         self.requested_at
             .iter()
-            .filter(|(_, &at)| now.duration_since(at) >= REQUEST_TIMEOUT)
+            .filter(|(_, &at)| now.duration_since(at) >= self.live_recovery.request_timeout())
             .map(|(&p, _)| p)
             .collect()
     }
 
-    /// If the cursor has been stuck past `REQUEST_TIMEOUT` on a piece no unchoked upstream can
-    /// still serve (evicted from every window), skip forward to the lowest piece some peer
+    /// If the cursor has been stuck past the configured request timeout on a piece no unchoked
+    /// upstream can still serve (evicted from every window), skip forward to the lowest piece some peer
     /// does have. Returns the skip target if it skipped. This is the mid-session analogue of
     /// [`resume`](Self::resume)'s reconnect-gap skip — recovering without a full teardown.
     fn skip_evicted_gap(&mut self, now: Instant) -> Option<u64> {
         let next = self.reasm.next_needed();
-        if now.duration_since(self.next_needed_since) < REQUEST_TIMEOUT
+        if now.duration_since(self.next_needed_since) < self.live_recovery.request_timeout()
             || self.active_peers.any_unchoked_covers(next)
         {
             return None;
@@ -1148,11 +1138,29 @@ impl Continuity {
             return None;
         }
         self.reasm.skip_to(floor);
+        self.arm_output_gate();
         self.active_peers.prune_below(floor);
         self.requested_at.retain(|&p, _| p >= floor);
         self.received_chunks.retain(|&p, _| p >= floor);
         self.next_needed_since = now;
         Some(floor)
+    }
+
+    fn arm_output_gate(&mut self) {
+        self.output_gate = Some(ace_media::mpegts::KeyframeGate::new());
+        self.resync = ace_media::mpegts::TsResync::new();
+    }
+
+    fn filter_output_after_discontinuity(&mut self, aligned: Vec<u8>) -> Vec<u8> {
+        match &mut self.output_gate {
+            Some(gate) => gate.push(&aligned),
+            None => aligned,
+        }
+    }
+
+    #[cfg(test)]
+    fn output_gate_armed(&self) -> bool {
+        self.output_gate.is_some()
     }
 
     fn register_active_peer(&mut self, id: u64, addr: SocketAddrV4, window: LivePosition) {
@@ -1241,6 +1249,7 @@ async fn refill_upstream_pool(
     infohash: [u8; 20],
     discovery_port: u16,
     known_peers: Vec<SocketAddrV4>,
+    live_recovery: LiveRecoveryConfig,
     refills: mpsc::Sender<ConnectedUpstream>,
 ) {
     let mut known: HashSet<SocketAddrV4> = known_peers.into_iter().collect();
@@ -1260,7 +1269,7 @@ async fn refill_upstream_pool(
     });
     let mut discovery_handle = Some(discovery_handle);
     loop {
-        for batch in candidates.chunks(MAX_PARALLEL_CONNECT) {
+        for batch in candidates.chunks(live_recovery.max_parallel_connect) {
             let mut set = tokio::task::JoinSet::new();
             for &addr in batch {
                 set.spawn(connect_upstream(addr, infohash));
@@ -1279,7 +1288,7 @@ async fn refill_upstream_pool(
                             return;
                         }
                         sent += 1;
-                        if sent >= MAX_ACTIVE_UPSTREAMS {
+                        if sent >= live_recovery.max_active_upstreams {
                             break;
                         }
                     }
@@ -1287,11 +1296,11 @@ async fn refill_upstream_pool(
                     Err(_) => stats.record_task_failure(),
                 }
             }
-            if sent >= MAX_ACTIVE_UPSTREAMS {
+            if sent >= live_recovery.max_active_upstreams {
                 break;
             }
         }
-        if sent >= MAX_ACTIVE_UPSTREAMS {
+        if sent >= live_recovery.max_active_upstreams {
             break;
         }
         let Some(handle) = discovery_handle.take() else {
@@ -1322,6 +1331,19 @@ fn abort_refill(handle: &mut Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+fn recovery_channel_capacities(
+    live_recovery: LiveRecoveryConfig,
+) -> Result<(usize, usize), String> {
+    live_recovery.validate()?;
+    let event_capacity = live_recovery
+        .max_active_upstreams
+        .checked_mul(32)
+        .ok_or_else(|| {
+            "OUTPACE_MAX_ACTIVE_UPSTREAMS event channel capacity overflowed".to_string()
+        })?;
+    Ok((event_capacity, live_recovery.max_active_upstreams))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn follow_peer_pool(
     upstreams: Vec<ConnectedUpstream>,
@@ -1347,7 +1369,13 @@ async fn follow_peer_pool(
     let max_piece = primary.max_piece.max(0) as u64;
     let start = match continuity {
         None => {
-            let (c, start) = Continuity::fresh(info, min_piece, max_piece, seed.prefetch_pieces);
+            let (c, start) = Continuity::fresh(
+                info,
+                min_piece,
+                max_piece,
+                seed.prefetch_pieces,
+                seed.live_recovery,
+            );
             *continuity = Some(c);
             crate::alog!(
                 "[ace] {primary_addr}: window min={min_piece} max={max_piece} -> start={start} head={max_piece}"
@@ -1364,8 +1392,16 @@ async fn follow_peer_pool(
         }
     };
     let continuity = continuity.as_mut().expect("initialized just above");
-    let (event_tx, mut event_rx) = mpsc::channel(MAX_ACTIVE_UPSTREAMS * 32);
-    let (refill_tx, mut refill_rx) = mpsc::channel(MAX_ACTIVE_UPSTREAMS);
+    let live_recovery = continuity.live_recovery;
+    let (event_capacity, refill_capacity) = match recovery_channel_capacities(live_recovery) {
+        Ok(capacities) => capacities,
+        Err(err) => {
+            crate::alog!("[ace] invalid live recovery configuration: {err}");
+            return FollowEnd::ConsumerGone;
+        }
+    };
+    let (event_tx, mut event_rx) = mpsc::channel(event_capacity);
+    let (refill_tx, mut refill_rx) = mpsc::channel(refill_capacity);
     // A live-held clone of the refill sender so peers learned from `id=12` peer-exchange
     // gossip can be connected and fed into the same pool-add path (keeps `refill_rx` open
     // even after the background refill task finishes).
@@ -1384,6 +1420,7 @@ async fn follow_peer_pool(
             info.infohash,
             discovery_port,
             known_refill_peers,
+            live_recovery,
             refill_tx,
         )))
     };
@@ -1413,10 +1450,13 @@ async fn follow_peer_pool(
     let mut refill_closed = refill_handle.is_none();
     loop {
         let now = Instant::now();
-        let Some(stale_budget) = stale_upstream_budget(last_progress, now) else {
+        let Some(stale_budget) =
+            stale_upstream_budget(last_progress, now, live_recovery.stale_upstream_timeout())
+        else {
             let stalled = peers.values().map(|p| p.addr).collect::<Vec<_>>();
             crate::alog!(
-                "[ace] upstream pool stale — no live progress for {STALE_UPSTREAM_TIMEOUT:?}; reconnecting {} peer(s)",
+                "[ace] upstream pool stale — no live progress for {:?}; reconnecting {} peer(s)",
+                live_recovery.stale_upstream_timeout(),
                 stalled.len()
             );
             shutdown_peer_runtimes(&mut peers);
@@ -1427,8 +1467,8 @@ async fn follow_peer_pool(
             };
         };
         // Self-heal a single stuck piece well before the whole-pool stale timeout: re-request
-        // pieces outstanding past REQUEST_TIMEOUT (to a faster peer where possible) and skip a
-        // piece evicted from every upstream window.
+        // pieces outstanding past the request timeout (to a faster peer where possible) and
+        // skip a piece evicted from every upstream window.
         let newly_lost =
             retransmit_stalled_requests(&mut peers, continuity, chunks_per_piece, now).await;
         lost_addrs.extend(newly_lost);
@@ -1438,13 +1478,13 @@ async fn follow_peer_pool(
         }
         peer_count.store(peers.len() as u32, Ordering::Relaxed);
 
-        // Wake at least every REQUEST_CHECK_INTERVAL so the sweep above runs even while no peer
-        // sends anything.
-        let wait = stale_budget.min(REQUEST_CHECK_INTERVAL);
+        // Wake at least every configured request-check interval so the sweep above runs even
+        // while no peer sends anything.
+        let wait = stale_budget.min(live_recovery.request_check_interval());
         let event = match tokio::time::timeout(wait, async {
             tokio::select! {
                 event = event_rx.recv() => PoolWake::Peer(event),
-                upstream = refill_rx.recv(), if !refill_closed && peers.len() < MAX_ACTIVE_UPSTREAMS => {
+                upstream = refill_rx.recv(), if !refill_closed && peers.len() < live_recovery.max_active_upstreams => {
                     PoolWake::Refill(upstream)
                 }
             }
@@ -1592,6 +1632,7 @@ async fn follow_peer_pool(
                     let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
                         let aligned = continuity.resync.push(&ready);
+                        let aligned = continuity.filter_output_after_discontinuity(aligned);
                         if !aligned.is_empty() {
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
@@ -1688,11 +1729,17 @@ async fn follow_peer_pool(
                 // Peer-exchange gossip: connect to peers we don't already have and feed the
                 // successes into the same pool-add path as the background refill, so a stalled
                 // pool has fresh, swarm-sourced upstreams to fall back on (notes 41-43).
-                if peers.len() < MAX_ACTIVE_UPSTREAMS {
+                if peers.len() < live_recovery.max_active_upstreams {
                     let advertised = ace_wire::peer_exchange::parse_peer_exchange(payload);
                     let total = advertised.len();
-                    let spawned =
-                        harvest_peers(&advertised, &peers, &mut pex_tried, info.infohash, &pex_tx);
+                    let spawned = harvest_peers(
+                        &advertised,
+                        &peers,
+                        &mut pex_tried,
+                        info.infohash,
+                        live_recovery.max_parallel_connect,
+                        &pex_tx,
+                    );
                     if spawned > 0 {
                         crate::alog!(
                             "[ace] peer-exchange from {addr}: {spawned} new peer(s) to try (of {total} advertised)"
@@ -1706,10 +1753,16 @@ async fn follow_peer_pool(
             } => {
                 // Source-node descriptor (the stream origin, re-announced by every peer). The
                 // source never stalls, so try it once if we don't already have it.
-                if peers.len() < MAX_ACTIVE_UPSTREAMS {
+                if peers.len() < live_recovery.max_active_upstreams {
                     if let Some(source) = ace_wire::peer_exchange::parse_peer_announce(payload) {
-                        if harvest_peers(&[source], &peers, &mut pex_tried, info.infohash, &pex_tx)
-                            > 0
+                        if harvest_peers(
+                            &[source],
+                            &peers,
+                            &mut pex_tried,
+                            info.infohash,
+                            live_recovery.max_parallel_connect,
+                            &pex_tx,
+                        ) > 0
                         {
                             crate::alog!("[ace] source-node announce from {addr}: trying {source}");
                         }
@@ -1792,13 +1845,14 @@ async fn send_peer_command(
 
 /// Connect-race `advertised` peers we don't already have and feed the successes into the
 /// pool-add channel (`pex_tx`), skipping already-active peers and any addr tried before this
-/// session (`pex_tried`). Bounded to `MAX_PARALLEL_CONNECT` spawns per call. Returns how many
-/// connect attempts were spawned. Shared by peer-exchange (`id=12`) and source-node (`id=36`).
+/// session (`pex_tried`). Bounded to the configured parallel-connect cap per call. Returns how
+/// many connect attempts were spawned. Shared by peer-exchange (`id=12`) and source-node (`id=36`).
 fn harvest_peers(
     advertised: &[SocketAddrV4],
     peers: &BTreeMap<u64, PeerRuntime>,
     pex_tried: &mut HashSet<SocketAddrV4>,
     infohash: [u8; 20],
+    max_parallel_connect: usize,
     pex_tx: &mpsc::Sender<ConnectedUpstream>,
 ) -> usize {
     if pex_tried.len() > 1024 {
@@ -1807,7 +1861,7 @@ fn harvest_peers(
     let active: HashSet<SocketAddrV4> = peers.values().map(|p| p.addr).collect();
     let mut spawned = 0usize;
     for &cand in advertised {
-        if spawned >= MAX_PARALLEL_CONNECT {
+        if spawned >= max_parallel_connect {
             break;
         }
         if active.contains(&cand) || !pex_tried.insert(cand) {
@@ -1874,8 +1928,8 @@ async fn advance_pool_requests(
 }
 
 /// Periodic self-heal for the request pipeline (runs on each pool loop tick): re-requeue any
-/// piece outstanding past `REQUEST_TIMEOUT` and skip a piece evicted from every upstream
-/// window, then re-issue requests. A timed-out piece is only requeued in the *scheduler* (its
+/// piece outstanding past the configured request timeout and skip a piece evicted from every
+/// upstream window, then re-issue requests. A timed-out piece is only requeued in the *scheduler* (its
 /// original peer keeps the in-flight slot), so [`ActivePeers::assign`] steers the retry to a
 /// peer with more spare capacity — i.e. a different, faster one when available. Returns any
 /// peers dropped while re-issuing requests.
@@ -1894,9 +1948,11 @@ async fn retransmit_stalled_requests(
     }
     let timed_out = continuity.timed_out_requests(now);
     if !timed_out.is_empty() {
+        let request_timeout = continuity.live_recovery.request_timeout();
         crate::alog!(
-            "[ace] re-requesting {} piece(s) outstanding > {REQUEST_TIMEOUT:?} (from {})",
+            "[ace] re-requesting {} piece(s) outstanding > {:?} (from {})",
             timed_out.len(),
+            request_timeout,
             continuity.reasm.next_needed()
         );
         for piece in timed_out {
@@ -1954,7 +2010,13 @@ async fn follow_one_peer(
     let max_piece = window.max_piece.max(0) as u64;
     let start = match continuity {
         None => {
-            let (c, start) = Continuity::fresh(info, min_piece, max_piece, seed.prefetch_pieces);
+            let (c, start) = Continuity::fresh(
+                info,
+                min_piece,
+                max_piece,
+                seed.prefetch_pieces,
+                seed.live_recovery,
+            );
             *continuity = Some(c);
             crate::alog!("[ace] {addr}: window min={min_piece} max={max_piece} -> start={start} head={max_piece}");
             start
@@ -2016,15 +2078,25 @@ async fn follow_one_peer(
     let mut seen_ids: HashSet<u8> = HashSet::new();
 
     loop {
-        let Some(read_budget) = stale_upstream_budget(last_progress, Instant::now()) else {
-            crate::alog!("[ace] {addr}: stale upstream — no live progress for {STALE_UPSTREAM_TIMEOUT:?}; reconnecting");
+        let Some(read_budget) = stale_upstream_budget(
+            last_progress,
+            Instant::now(),
+            seed.live_recovery.stale_upstream_timeout(),
+        ) else {
+            crate::alog!(
+                "[ace] {addr}: stale upstream — no live progress for {:?}; reconnecting",
+                seed.live_recovery.stale_upstream_timeout()
+            );
             return FollowEnd::PeerLost(vec![addr]);
         };
         let msg = match tokio::time::timeout(read_budget, session.read_message()).await {
             Ok(Ok(m)) => m,
             Ok(Err(_)) => return FollowEnd::PeerLost(vec![addr]),
             Err(_) => {
-                crate::alog!("[ace] {addr}: stale upstream — no live progress for {STALE_UPSTREAM_TIMEOUT:?}; reconnecting");
+                crate::alog!(
+                    "[ace] {addr}: stale upstream — no live progress for {:?}; reconnecting",
+                    seed.live_recovery.stale_upstream_timeout()
+                );
                 return FollowEnd::PeerLost(vec![addr]);
             }
         };
@@ -2108,6 +2180,7 @@ async fn follow_one_peer(
                     let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
                         let aligned = continuity.resync.push(&ready);
+                        let aligned = continuity.filter_output_after_discontinuity(aligned);
                         if !aligned.is_empty() {
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
@@ -2232,12 +2305,16 @@ fn advance_head_from_window(payload: &[u8], head: u64) -> Option<u64> {
     (w.max_piece > head).then_some(w.max_piece)
 }
 
-fn stale_upstream_budget(last_progress: Instant, now: Instant) -> Option<Duration> {
+fn stale_upstream_budget(
+    last_progress: Instant,
+    now: Instant,
+    stale_upstream_timeout: Duration,
+) -> Option<Duration> {
     let elapsed = now.saturating_duration_since(last_progress);
-    if elapsed >= STALE_UPSTREAM_TIMEOUT {
+    if elapsed >= stale_upstream_timeout {
         None
     } else {
-        Some(STALE_UPSTREAM_TIMEOUT - elapsed)
+        Some(stale_upstream_timeout - elapsed)
     }
 }
 
@@ -2328,7 +2405,27 @@ async fn read_peer_window(session: &mut PeerSession<TcpStream>) -> Option<LivePo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LiveRecoveryConfig;
     use ace_swarm::scheduler::{ActivePeers, PeerAssignment};
+
+    fn default_live_recovery() -> LiveRecoveryConfig {
+        LiveRecoveryConfig::default()
+    }
+
+    #[test]
+    fn recovery_channel_capacities_are_checked() {
+        let policy = LiveRecoveryConfig {
+            max_active_upstreams: 2,
+            ..LiveRecoveryConfig::default()
+        };
+        assert_eq!(recovery_channel_capacities(policy).unwrap(), (64, 2));
+
+        let invalid = LiveRecoveryConfig {
+            max_active_upstreams: usize::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(recovery_channel_capacities(invalid).is_err());
+    }
 
     #[tokio::test]
     async fn network_is_ace() {
@@ -2341,11 +2438,18 @@ mod tests {
         let reg = ace_swarm::listen::SeedRegistry::new();
         let ih = [9u8; 20];
         {
-            let (_store, _lease) =
-                reg.lease_store(ih, || ace_swarm::store::PieceStore::new(1 << 20, 1 << 14, 1 << 20));
-            assert!(reg.serves(&ih), "served while the leech loop holds its lease");
+            let (_store, _lease) = reg.lease_store(ih, || {
+                ace_swarm::store::PieceStore::new(1 << 20, 1 << 14, 1 << 20)
+            });
+            assert!(
+                reg.serves(&ih),
+                "served while the leech loop holds its lease"
+            );
         }
-        assert!(!reg.serves(&ih), "entry evicted after the leech loop drops its lease");
+        assert!(
+            !reg.serves(&ih),
+            "entry evicted after the leech loop drops its lease"
+        );
     }
 
     #[test]
@@ -2460,7 +2564,7 @@ mod tests {
 
     #[test]
     fn first_request_after_unchoke_covers_the_prefetch_window() {
-        let mut scheduler = Scheduler::new(MAX_PIECE_ADVANCE as usize);
+        let mut scheduler = Scheduler::new(default_live_recovery().max_piece_advance as usize);
         let mut active = single_active_peer(100, 109);
         let pieces = schedule_piece_requests(&mut scheduler, &mut active, 100, 109);
         assert_eq!(pieces, (100..=109).collect::<Vec<_>>());
@@ -2470,7 +2574,7 @@ mod tests {
     fn caught_up_requests_nothing() {
         // The reassembler cursor is already past the head -> nothing new yet (the loop
         // keeps waiting for window updates to advance it).
-        let mut scheduler = Scheduler::new(MAX_PIECE_ADVANCE as usize);
+        let mut scheduler = Scheduler::new(default_live_recovery().max_piece_advance as usize);
         let mut active = single_active_peer(100, 109);
         assert!(schedule_piece_requests(&mut scheduler, &mut active, 110, 109).is_empty());
     }
@@ -2479,14 +2583,14 @@ mod tests {
     fn window_update_drives_a_forward_request() {
         // The head advanced by one piece -> request exactly that new piece. This is the
         // step the pre-fix loop never took (it only advanced on a `Have` that never came).
-        let mut one = Scheduler::new(MAX_PIECE_ADVANCE as usize);
+        let mut one = Scheduler::new(default_live_recovery().max_piece_advance as usize);
         let mut one_active = single_active_peer(100, 110);
         assert_eq!(
             schedule_piece_requests(&mut one, &mut one_active, 110, 110),
             vec![110]
         );
 
-        let mut many = Scheduler::new(MAX_PIECE_ADVANCE as usize);
+        let mut many = Scheduler::new(default_live_recovery().max_piece_advance as usize);
         let mut many_active = single_active_peer(100, 113);
         assert_eq!(
             schedule_piece_requests(&mut many, &mut many_active, 110, 113),
@@ -2498,26 +2602,62 @@ mod tests {
     fn forward_request_is_bounded_against_a_bogus_head() {
         // A garbled window update claiming a wildly-advanced head can't burst-request the
         // whole range; it's clamped, and subsequent updates catch up.
-        let mut scheduler = Scheduler::new(MAX_PIECE_ADVANCE as usize);
+        let mut scheduler = Scheduler::new(default_live_recovery().max_piece_advance as usize);
         let mut active = single_active_peer(0, 10_000_000);
         let pieces = schedule_piece_requests(&mut scheduler, &mut active, 101, 10_000_000);
         assert_eq!(pieces.first(), Some(&101));
-        assert_eq!(pieces.len() as u64, MAX_PIECE_ADVANCE);
+        assert_eq!(
+            pieces.len() as u64,
+            default_live_recovery().max_piece_advance
+        );
+    }
+
+    #[test]
+    fn continuity_uses_configured_live_recovery_bounds() {
+        let info =
+            stream_info_from_infohash("0123456789abcdef0123456789abcdef01234567", vec![]).unwrap();
+        let policy = LiveRecoveryConfig {
+            max_piece_advance: 7,
+            max_reasm_pieces_ahead: 9,
+            ..LiveRecoveryConfig::default()
+        };
+        let (mut c, start) = Continuity::fresh(&info, 10, 20, 2, policy);
+
+        assert_eq!(start, 18);
+        c.register_active_peer(
+            1,
+            "127.0.0.1:1".parse().unwrap(),
+            LivePosition {
+                min_piece: 10,
+                max_piece: 100,
+                position: -1,
+                distance_from_source: 1,
+            },
+        );
+        c.head = 100;
+        c.set_peer_unchoked(1, true);
+
+        let pieces = schedule_piece_assignments(
+            &mut c.scheduler,
+            &mut c.active_peers,
+            c.reasm.next_needed(),
+            c.head,
+        );
+
+        assert_eq!(pieces.len(), 7);
     }
 
     #[test]
     fn stale_upstream_budget_expires_after_no_forward_progress() {
         let now = std::time::Instant::now();
+        let timeout = default_live_recovery().stale_upstream_timeout();
         assert_eq!(
-            stale_upstream_budget(now, now + Duration::from_secs(3)),
-            Some(STALE_UPSTREAM_TIMEOUT - Duration::from_secs(3))
+            stale_upstream_budget(now, now + Duration::from_secs(3), timeout),
+            Some(timeout - Duration::from_secs(3))
         );
+        assert_eq!(stale_upstream_budget(now, now + timeout, timeout), None);
         assert_eq!(
-            stale_upstream_budget(now, now + STALE_UPSTREAM_TIMEOUT),
-            None
-        );
-        assert_eq!(
-            stale_upstream_budget(now, now + STALE_UPSTREAM_TIMEOUT + Duration::from_millis(1)),
+            stale_upstream_budget(now, now + timeout + Duration::from_millis(1), timeout),
             None
         );
     }
@@ -2558,12 +2698,19 @@ mod tests {
 
     #[test]
     fn timed_out_requests_returns_only_aged_pieces_and_prunes_passed_ones() {
-        let (mut c, _) = Continuity::fresh(&info(), 5, 15, PREFETCH_PIECES); // next_needed = 7
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            5,
+            15,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        ); // next_needed = 7
         let base = Instant::now();
         c.requested_at.insert(4, base); // below cursor -> pruned, not returned
         c.requested_at.insert(8, base); // aged
-        c.requested_at.insert(9, base + REQUEST_TIMEOUT); // fresh
-        let now = base + REQUEST_TIMEOUT;
+        let request_timeout = default_live_recovery().request_timeout();
+        c.requested_at.insert(9, base + request_timeout); // fresh
+        let now = base + request_timeout;
         let mut out = c.timed_out_requests(now);
         out.sort_unstable();
         assert_eq!(out, vec![8]);
@@ -2572,23 +2719,35 @@ mod tests {
 
     #[test]
     fn skip_evicted_gap_jumps_to_lowest_covered_when_cursor_is_stranded() {
-        let (mut c, _) = Continuity::fresh(&info(), 100, 110, PREFETCH_PIECES); // next_needed = 102
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            110,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        ); // next_needed = 102
         c.register_active_peer(1, test_addr(), win(105, 120)); // evicted 102..104
         c.set_peer_unchoked(1, true);
         // Not stuck long enough yet.
         assert_eq!(c.skip_evicted_gap(c.next_needed_since), None);
         // Stuck past the timeout with no peer covering 102 -> skip to 105.
-        let now = c.next_needed_since + REQUEST_TIMEOUT;
+        let now = c.next_needed_since + default_live_recovery().request_timeout();
         assert_eq!(c.skip_evicted_gap(now), Some(105));
         assert_eq!(c.reasm.next_needed(), 105);
     }
 
     #[test]
     fn skip_evicted_gap_does_not_skip_while_a_peer_still_covers_the_cursor() {
-        let (mut c, _) = Continuity::fresh(&info(), 100, 110, PREFETCH_PIECES); // next_needed = 102
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            110,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        ); // next_needed = 102
         c.register_active_peer(1, test_addr(), win(100, 120)); // still covers 102
         c.set_peer_unchoked(1, true);
-        let now = c.next_needed_since + REQUEST_TIMEOUT * 3;
+        let now = c.next_needed_since + default_live_recovery().request_timeout() * 3;
         assert_eq!(c.skip_evicted_gap(now), None);
         assert_eq!(c.reasm.next_needed(), 102);
     }
@@ -2685,7 +2844,13 @@ mod tests {
 
     #[test]
     fn fresh_starts_prefetch_pieces_behind_head_clamped_to_min() {
-        let (c, start) = Continuity::fresh(&info(), 100, 200, PREFETCH_PIECES);
+        let (c, start) = Continuity::fresh(
+            &info(),
+            100,
+            200,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
         assert_eq!(start, 200 - PREFETCH_PIECES);
         assert_eq!(c.head, 200);
         assert_eq!(c.scheduler.in_flight_count(), 0);
@@ -2696,7 +2861,13 @@ mod tests {
     fn fresh_clamps_start_to_min_piece_on_a_narrow_window() {
         // min_piece is closer to head than PREFETCH_PIECES allows -> clamp, don't request
         // an evicted piece.
-        let (_c, start) = Continuity::fresh(&info(), 198, 200, PREFETCH_PIECES);
+        let (_c, start) = Continuity::fresh(
+            &info(),
+            198,
+            200,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
         assert_eq!(start, 198);
     }
 
@@ -2704,7 +2875,13 @@ mod tests {
     fn resume_continues_seamlessly_when_the_new_window_still_covers_our_position() {
         // We'd already emitted through piece 150; the new peer's window still covers the
         // next needed piece, so resume exactly there.
-        let (mut c, start) = Continuity::fresh(&info(), 100, 149, PREFETCH_PIECES);
+        let (mut c, start) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
         for piece in start..=150 {
             c.reasm.add_block(piece, 0, &[1, 1]).unwrap();
             c.reasm.add_block(piece, 2, &[2, 2]).unwrap();
@@ -2726,7 +2903,13 @@ mod tests {
         // In-flight scheduler entries only mean "asked the previous peer", not "received".
         // If that peer dies before delivery, the next peer must be asked for the first
         // still-missing piece rather than skipping past the old request frontier.
-        let (mut c, start) = Continuity::fresh(&info(), 100, 149, PREFETCH_PIECES);
+        let (mut c, start) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
         c.active_peers = single_active_peer(100, 150);
         let assigned = c.active_peers.assign(&mut c.scheduler, start, 150);
         assert!(!assigned.is_empty());
@@ -2746,7 +2929,13 @@ mod tests {
 
     #[test]
     fn peer_window_must_cover_the_next_needed_piece_on_reconnect() {
-        let (c, start) = Continuity::fresh(&info(), 100, 149, PREFETCH_PIECES);
+        let (c, start) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
         let stale = LivePosition {
             min_piece: 100,
             max_piece: (start - 1) as i64,
@@ -2834,7 +3023,13 @@ mod tests {
     fn resume_skips_forward_over_an_unrecoverable_eviction_gap() {
         // We were disconnected long enough that the new peer's window no longer has the
         // piece we needed next (min_piece has advanced past it) — must skip, not stall.
-        let (mut c, _start) = Continuity::fresh(&info(), 100, 149, PREFETCH_PIECES);
+        let (mut c, _start) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
         let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
         let resume = c.resume(addr, 500, 600); // min_piece way ahead of 151
         assert_eq!(resume, 500);
@@ -2847,8 +3042,79 @@ mod tests {
     }
 
     #[test]
+    fn resume_gap_arms_output_keyframe_gate() {
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
+        assert!(!c.output_gate_armed());
+
+        c.resume("127.0.0.1:1".parse().unwrap(), 170, 200);
+
+        assert!(c.output_gate_armed());
+    }
+
+    #[test]
+    fn arming_output_gate_discards_buffered_pre_gap_ts_bytes() {
+        const TS_PACKET: usize = 188;
+
+        fn packet(fill: u8) -> Vec<u8> {
+            let mut bytes = vec![fill; TS_PACKET];
+            bytes[0] = 0x47;
+            bytes
+        }
+
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
+        assert!(
+            c.resync.push(&packet(0x11)).is_empty(),
+            "one packet is buffered until lookahead confirms sync"
+        );
+
+        c.arm_output_gate();
+        let post_gap = [packet(0x22), packet(0x33)].concat();
+        let aligned = c.resync.push(&post_gap);
+
+        assert_eq!(aligned.len(), TS_PACKET);
+        assert_eq!(aligned[1], 0x22);
+    }
+
+    #[test]
+    fn skip_evicted_gap_arms_output_keyframe_gate() {
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            110,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
+        c.register_active_peer(1, test_addr(), win(105, 120));
+        c.set_peer_unchoked(1, true);
+        assert!(!c.output_gate_armed());
+
+        let now = c.next_needed_since + default_live_recovery().request_timeout();
+        assert_eq!(c.skip_evicted_gap(now), Some(105));
+
+        assert!(c.output_gate_armed());
+    }
+
+    #[test]
     fn resume_head_never_regresses() {
-        let (mut c, _start) = Continuity::fresh(&info(), 100, 200, PREFETCH_PIECES);
+        let (mut c, _start) = Continuity::fresh(
+            &info(),
+            100,
+            200,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
         let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
         c.resume(addr, 100, 150); // a new peer with a "smaller" (staler) window
         assert_eq!(c.head, 200, "head must not go backward");
@@ -3003,7 +3269,7 @@ mod tests {
     fn background_discovery_options_leave_stale_timer_margin() {
         let opts = background_discovery_options();
         assert!(opts.peer_target > 8);
-        assert!(opts.dht_budget < STALE_UPSTREAM_TIMEOUT);
+        assert!(opts.dht_budget < default_live_recovery().stale_upstream_timeout());
     }
 
     #[test]

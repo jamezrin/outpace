@@ -3,6 +3,7 @@
 //! render a live media playlist. Segmentation is byte-based (not keyframe-aware) — fine for
 //! tolerant players; precise GOP segmentation is a documented follow-up.
 
+use crate::config::HlsConfig;
 use crate::session::StreamSession;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -28,22 +29,22 @@ struct HlsState {
 }
 
 impl HlsPackager {
-    fn new(seg_packets: usize, window: usize, seg_duration: f32) -> Arc<HlsPackager> {
+    fn new(config: HlsConfig) -> Arc<HlsPackager> {
         Arc::new(HlsPackager {
             state: Mutex::new(HlsState {
                 media_seq: 0,
                 segments: VecDeque::new(),
                 cur: Vec::new(),
             }),
-            seg_packets,
-            window,
-            seg_duration,
+            seg_packets: config.segment_packets.max(1),
+            window: config.window_segments,
+            seg_duration: config.segment_duration_secs(),
         })
     }
 
     /// Start packaging `session`'s TS into segments in the background (uncounted receiver).
-    pub fn start(session: &StreamSession) -> Arc<HlsPackager> {
-        let me = Self::new(256, 6, 1.0); // ~48 KiB segments, 6-segment window
+    pub fn start(session: &StreamSession, config: HlsConfig) -> Arc<HlsPackager> {
+        let me = Self::new(config);
         let pkg = me.clone();
         let mut rx = session.raw_receiver();
         tokio::spawn(async move {
@@ -107,9 +108,14 @@ impl HlsPackager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HlsConfig;
 
     fn pkg() -> Arc<HlsPackager> {
-        HlsPackager::new(2, 3, 1.0) // 2 packets/segment, window 3
+        HlsPackager::new(HlsConfig {
+            segment_packets: 2,
+            window_segments: 3,
+            segment_duration_ms: 1000,
+        }) // 2 packets/segment, window 3
     }
 
     fn packets(n: usize) -> Vec<u8> {
@@ -143,5 +149,34 @@ mod tests {
         assert!(p.playlist("test", "x").lines().all(|l| !l.contains("seg/")));
         p.feed(&packets(1));
         assert!(p.playlist("test", "x").contains("seg/0.ts"));
+    }
+
+    #[test]
+    fn configured_hls_settings_control_playlist_and_segments() {
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 1,
+            window_segments: 2,
+            segment_duration_ms: 2500,
+        });
+        p.feed(&packets(3));
+
+        let pl = p.playlist("test", "abc");
+
+        assert!(pl.contains("#EXT-X-TARGETDURATION:3"));
+        assert!(pl.contains("#EXTINF:2.500,"));
+        assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+        assert!(p.segment(0).is_none());
+        assert_eq!(p.segment(2).unwrap().len(), TS_PACKET);
+    }
+
+    #[test]
+    fn zero_segment_packets_is_normalized_at_construction() {
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 0,
+            window_segments: 2,
+            segment_duration_ms: 1000,
+        });
+
+        assert_eq!(p.seg_packets, 1);
     }
 }
