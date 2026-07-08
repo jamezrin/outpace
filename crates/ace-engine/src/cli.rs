@@ -1,5 +1,6 @@
 use std::net::SocketAddrV4;
 
+use ace_swarm::resolve::infohash_hex;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -134,8 +135,8 @@ async fn run_broadcast(args: BroadcastArgs) -> Result<(), Box<dyn std::error::Er
         &name,
     );
     let transport_host = public_host.unwrap_or_else(|| bind.ip().to_string());
-    let content_id = hex20(&bc.content_id);
-    let infohash = hex20(&bc.infohash);
+    let content_id = infohash_hex(&bc.content_id);
+    let infohash = infohash_hex(&bc.infohash);
 
     eprint!(
         "{}",
@@ -240,10 +241,6 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
         stdout.flush().await?;
     }
     Ok(())
-}
-
-fn hex20(bytes: &[u8; 20]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn content_id_target(id: &str) -> Result<PlaybackTarget, String> {

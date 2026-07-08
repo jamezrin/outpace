@@ -65,7 +65,9 @@ impl VodInfo {
     /// Byte length of piece `index` (the last piece is truncated to `total_length`).
     pub fn piece_size(&self, index: u64) -> u64 {
         let start = index * self.piece_length;
-        self.total_length.saturating_sub(start).min(self.piece_length)
+        self.total_length
+            .saturating_sub(start)
+            .min(self.piece_length)
     }
 }
 

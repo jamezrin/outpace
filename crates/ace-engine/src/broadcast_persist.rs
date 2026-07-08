@@ -58,7 +58,7 @@ impl BroadcastPersist {
     pub fn save(&self, name: &str, rec: &PersistedBroadcast) -> io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let on_disk = OnDisk {
-            transport_hex: hex_encode(&rec.transport),
+            transport_hex: hex::encode(&rec.transport),
             key_pkcs1_pem: rec.key_pkcs1_pem.clone(),
             next_piece: rec.next_piece,
         };
@@ -112,33 +112,15 @@ impl BroadcastPersist {
 
 fn load_record(path: &Path) -> io::Result<PersistedBroadcast> {
     let bytes = std::fs::read(path)?;
-    let on_disk: OnDisk =
-        serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let transport = hex_decode(&on_disk.transport_hex)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad transport_hex"))?;
+    let on_disk: OnDisk = serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let transport = hex::decode(&on_disk.transport_hex)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad transport_hex"))?;
     Ok(PersistedBroadcast {
         transport,
         key_pkcs1_pem: on_disk.key_pkcs1_pem,
         next_piece: on_disk.next_piece,
     })
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
 }
 
 #[cfg(unix)]
@@ -191,9 +173,9 @@ mod tests {
     #[test]
     fn hex_round_trips_arbitrary_bytes() {
         let bytes: Vec<u8> = (0..=255).collect();
-        assert_eq!(hex_decode(&hex_encode(&bytes)).unwrap(), bytes);
-        assert!(hex_decode("xyz").is_none());
-        assert!(hex_decode("abc").is_none()); // odd length
+        assert_eq!(hex::decode(hex::encode(&bytes)).unwrap(), bytes);
+        assert!(hex::decode("xyz").is_err());
+        assert!(hex::decode("abc").is_err()); // odd length
     }
 
     #[test]

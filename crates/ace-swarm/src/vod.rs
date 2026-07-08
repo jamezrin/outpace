@@ -142,7 +142,11 @@ async fn drain_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
                 PeerMessage::Choke => unchoked = false,
-                PeerMessage::Piece { index, begin, block } if index == idx as u32 => {
+                PeerMessage::Piece {
+                    index,
+                    begin,
+                    block,
+                } if index == idx as u32 => {
                     let start = begin as usize;
                     if start < piece_len {
                         let end = (start + block.len()).min(piece_len);
@@ -261,7 +265,8 @@ mod seeder_tests {
                         return;
                     }
                     let reply =
-                        Handshake::new(info.infohash, ace_wire::handshake::random_peer_id()).encode();
+                        Handshake::new(info.infohash, ace_wire::handshake::random_peer_id())
+                            .encode();
                     if sock.write_all(&reply).await.is_err() {
                         return;
                     }
@@ -281,7 +286,12 @@ mod seeder_tests {
                             match PeerMessage::decode(&buf) {
                                 Ok(Some((msg, used))) => {
                                     buf.drain(..used);
-                                    if let PeerMessage::Request { index, begin, length } = msg {
+                                    if let PeerMessage::Request {
+                                        index,
+                                        begin,
+                                        length,
+                                    } = msg
+                                    {
                                         let start = (index as u64 * info.piece_length
                                             + begin as u64)
                                             as usize;
@@ -290,8 +300,12 @@ mod seeder_tests {
                                         if tamper && index == 0 && begin == 0 {
                                             block[0] ^= 0xff;
                                         }
-                                        let piece =
-                                            PeerMessage::Piece { index, begin, block }.encode();
+                                        let piece = PeerMessage::Piece {
+                                            index,
+                                            begin,
+                                            block,
+                                        }
+                                        .encode();
                                         if sock.write_all(&piece).await.is_err() {
                                             return;
                                         }
@@ -364,7 +378,11 @@ mod seeder_tests {
 
     // A seeder that serves at most `pieces_per_conn` distinct pieces per connection, then drops.
     // Forces the client to reconnect and resume — exercising progress across many short peers.
-    async fn spawn_flaky_seeder(content: Vec<u8>, info: VodInfo, pieces_per_conn: usize) -> SocketAddrV4 {
+    async fn spawn_flaky_seeder(
+        content: Vec<u8>,
+        info: VodInfo,
+        pieces_per_conn: usize,
+    ) -> SocketAddrV4 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = match listener.local_addr().unwrap() {
             std::net::SocketAddr::V4(a) => a,
@@ -384,7 +402,8 @@ mod seeder_tests {
                         return;
                     }
                     let reply =
-                        Handshake::new(info.infohash, ace_wire::handshake::random_peer_id()).encode();
+                        Handshake::new(info.infohash, ace_wire::handshake::random_peer_id())
+                            .encode();
                     if sock.write_all(&reply).await.is_err() {
                         return;
                     }
@@ -395,7 +414,8 @@ mod seeder_tests {
                     }
                     let _ = sock.write_all(&PeerMessage::Bitfield(bits).encode()).await;
                     let _ = sock.write_all(&PeerMessage::Unchoke.encode()).await;
-                    let mut served: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    let mut served: std::collections::HashSet<u32> =
+                        std::collections::HashSet::new();
                     let mut buf: Vec<u8> = Vec::new();
                     let mut tmp = [0u8; 4096];
                     loop {
@@ -403,7 +423,12 @@ mod seeder_tests {
                             match PeerMessage::decode(&buf) {
                                 Ok(Some((msg, used))) => {
                                     buf.drain(..used);
-                                    if let PeerMessage::Request { index, begin, length } = msg {
+                                    if let PeerMessage::Request {
+                                        index,
+                                        begin,
+                                        length,
+                                    } = msg
+                                    {
                                         if !served.contains(&index) {
                                             if served.len() >= pieces_per_conn {
                                                 return; // drop: force a reconnect
@@ -415,8 +440,12 @@ mod seeder_tests {
                                             as usize;
                                         let end = start + length as usize;
                                         let block = content[start..end].to_vec();
-                                        let piece =
-                                            PeerMessage::Piece { index, begin, block }.encode();
+                                        let piece = PeerMessage::Piece {
+                                            index,
+                                            begin,
+                                            block,
+                                        }
+                                        .encode();
                                         if sock.write_all(&piece).await.is_err() {
                                             return;
                                         }

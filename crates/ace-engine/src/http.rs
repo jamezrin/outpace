@@ -6,7 +6,7 @@ use crate::manager::StreamManager;
 use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::StreamSession;
 use ace_swarm::listen::SeedRegistry;
-use ace_swarm::resolve::resolve_via_catalog;
+use ace_swarm::resolve::{infohash_hex, resolve_via_catalog};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -389,9 +389,9 @@ async fn broadcast_ingest(
             bs.store_bytes,
         )
         .await;
-    let infohash_hex = hex20_string(&bc.infohash);
-    let content_id_hex = hex20_string(&bc.content_id);
-    crate::alog!("[broadcast] {name}: ingesting as infohash {infohash_hex}");
+    let infohash = infohash_hex(&bc.infohash);
+    let content_id = infohash_hex(&bc.content_id);
+    crate::alog!("[broadcast] {name}: ingesting as infohash {infohash}");
 
     // Self-announce to tracker + DHT exactly once per freshly-minted name — resumed PUTs and
     // disk reloads must not spawn duplicate loops.
@@ -414,8 +414,8 @@ async fn broadcast_ingest(
 
     Json(json!({
         "name": name,
-        "content_id": content_id_hex,
-        "infohash": infohash_hex,
+        "content_id": content_id,
+        "infohash": infohash,
     }))
     .into_response()
 }
@@ -452,7 +452,7 @@ async fn ace_getstream(
     if s.resolve_content_ids_in_getstream {
         if let Some(content_id) = selection.content_id.as_deref() {
             match resolve_via_catalog(content_id).await {
-                Ok(info) => selection = selection.with_resolved_infohash(hex20_string(&info.infohash)),
+                Ok(info) => selection = selection.with_resolved_infohash(infohash_hex(&info.infohash)),
                 Err(e) => crate::alog!(
                     "[ace] getstream content_id catalog resolution failed, falling back to cid: {e:?}"
                 ),
@@ -635,10 +635,6 @@ fn ace_session_key(s: &AppState, id: &str) -> String {
         .get(id)
         .cloned()
         .unwrap_or_else(|| id.to_string())
-}
-
-fn hex20_string(bytes: &[u8; 20]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn ace_network(s: &AppState) -> Option<String> {

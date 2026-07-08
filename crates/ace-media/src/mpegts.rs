@@ -672,7 +672,10 @@ mod tests {
             good.extend(packet(k));
         }
         let out = r.push(&good);
-        assert!(is_aligned(&out), "must re-lock on the aligned run after junk");
+        assert!(
+            is_aligned(&out),
+            "must re-lock on the aligned run after junk"
+        );
         assert!(packet_count(&out) >= 3, "should emit the recovered packets");
     }
 }

@@ -3,6 +3,8 @@
 //! rejects everything else (notably v2 `urn:btmh:`), so magnet inputs reduce to the existing
 //! bare-infohash playback path.
 
+use ace_swarm::resolve::infohash_hex;
+
 /// Extract the v1 info-hash from a magnet URI or a raw `magnet=` value, as a lowercase 40-hex
 /// string. Returns a human-readable error for anything unsupported.
 pub(crate) fn parse_magnet_infohash(magnet: &str) -> Result<String, String> {
@@ -27,8 +29,8 @@ fn normalize_btih(hash: &str) -> Result<String, String> {
         return Ok(hash.to_ascii_lowercase());
     }
     if hash.len() == 32 {
-        if let Some(bytes) = base32_decode(hash) {
-            return Ok(bytes.iter().map(|b| format!("{b:02x}")).collect());
+        if let Some(infohash) = base32_decode(hash) {
+            return Ok(infohash_hex(&infohash));
         }
     }
     Err("unsupported btih info-hash encoding".into())
@@ -36,7 +38,7 @@ fn normalize_btih(hash: &str) -> Result<String, String> {
 
 /// Decode a 32-char RFC-4648 base32 string into 20 bytes (case-insensitive). `None` on any
 /// invalid character or length.
-fn base32_decode(s: &str) -> Option<Vec<u8>> {
+fn base32_decode(s: &str) -> Option<[u8; 20]> {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     if s.len() != 32 {
         return None;
@@ -55,7 +57,9 @@ fn base32_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     if out.len() == 20 {
-        Some(out)
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(&out);
+        Some(bytes)
     } else {
         None
     }
@@ -80,13 +84,11 @@ mod tests {
         // (indices 0..31 packed 5 bits each), so magnet base32 maps to the same infohash the
         // hex form of those bytes would.
         let m = "magnet:?xt=urn:btih:ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-        let expected: String = [
+        let expected = [
             0x00u8, 0x44, 0x32, 0x14, 0xc7, 0x42, 0x54, 0xb6, 0x35, 0xcf, 0x84, 0x65, 0x3a, 0x56,
             0xd7, 0xc6, 0x75, 0xbe, 0x77, 0xdf,
-        ]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+        ];
+        let expected = infohash_hex(&expected);
         assert_eq!(parse_magnet_infohash(m).unwrap(), expected);
     }
 
