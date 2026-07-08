@@ -29,12 +29,30 @@ pub trait TsSource: Send {
     fn stats(&self) -> SourceStats;
 }
 
+/// A finite, ordered VOD byte stream with a known total length. Unlike [`TsSource`] (an
+/// unbounded live stream), a VOD source ends after exactly `content_length()` bytes.
+#[async_trait]
+pub trait VodByteSource: Send {
+    /// Total content length in bytes (for a `Content-Length` header).
+    fn content_length(&self) -> u64;
+    /// Next verified, ordered chunk, or None at end-of-content.
+    async fn next(&mut self) -> Option<Bytes>;
+}
+
 /// Adapter for one network (e.g. "ace").
 #[async_trait]
 pub trait StreamProvider: Send + Sync {
     fn network(&self) -> &'static str;
     /// Open a live TS source for `id` (the provider resolves/discovers internally).
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError>;
+    /// Open a single-file VOD source for `id`. Defaults to unsupported; networks with a VOD
+    /// path override this. Kept separate from [`open`](Self::open) because VOD is finite,
+    /// length-known content, not an unbounded live stream.
+    async fn open_vod(&self, _id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        Err(ProviderError::Backend(
+            "this network does not support VOD".into(),
+        ))
+    }
 }
 
 #[derive(Debug)]

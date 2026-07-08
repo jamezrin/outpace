@@ -9,7 +9,7 @@
 //!     for the pure decode half. The ut_metadata exchange is the remaining live-gated step
 //!     (documented in the design spec).
 
-use crate::types::StreamInfo;
+use crate::types::{StreamInfo, VodInfo};
 use ace_peer::session::PeerSession;
 use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
@@ -104,6 +104,34 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
     })
 }
 
+/// Build a [`VodInfo`] from raw `AceStreamTransport` bytes (the pure half of VOD resolution).
+///
+/// Errors if the descriptor is live (no `pieces`), advertises a multi-file layout (`files`
+/// present — intentionally unsupported), fails geometry validation, or lacks a single-file
+/// `length`.
+pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
+    let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    if d.is_live {
+        return Err(ResolveError::Transport("not a VOD transport (no pieces)"));
+    }
+    if d.is_multifile() {
+        return Err(ResolveError::Transport("multi-file VOD is not supported"));
+    }
+    validate_geometry(d.piece_length, d.chunk_length)?;
+    let total_length = d
+        .vod_total_length()
+        .ok_or(ResolveError::Transport("VOD descriptor missing length"))?;
+    Ok(VodInfo {
+        infohash: infohash_of_descriptor(&d.raw)
+            .map_err(|_| ResolveError::Transport("infohash failed"))?,
+        piece_length: d.piece_length,
+        chunk_length: d.chunk_length,
+        trackers: d.trackers,
+        piece_hashes: d.pieces,
+        total_length,
+    })
+}
+
 /// Validate untrusted transport geometry before it becomes a [`StreamInfo`].
 ///
 /// `piece_length`/`chunk_length` come from a metadata-swarm peer's transport descriptor. The
@@ -170,6 +198,17 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     handshake_infohash: [u8; 20],
     identity: &Identity,
 ) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&transport_bytes_via_peer(session, handshake_infohash, identity).await?)
+}
+
+/// Fetch the raw `AceStreamTransport` metadata bytes over a peer via BEP-9 `ut_metadata`. The
+/// pure decode half is left to the caller ([`stream_info_from_transport`] for live,
+/// [`vod_info_from_transport`] for VOD).
+pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+    handshake_infohash: [u8; 20],
+    identity: &Identity,
+) -> Result<Vec<u8>, ResolveError> {
     session
         .perform_handshake(handshake_infohash, random_peer_id())
         .await
@@ -192,11 +231,10 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|_| ResolveError::Peer("send extended handshake failed"))?;
 
     let (peer_ut_id, metadata_size) = read_metadata_params(session).await?;
-    let blob = session
+    session
         .fetch_metadata(peer_ut_id, metadata_size)
         .await
-        .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))?;
-    stream_info_from_transport(&blob)
+        .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))
 }
 
 /// Resolve a content-id through the official signed transport catalog.
@@ -204,6 +242,13 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
 /// The catalog returns the encrypted `AceStreamTransport` bytes; checksum validation happens
 /// before the existing pure transport decoder computes the real live swarm infohash.
 pub async fn resolve_via_catalog(content_id: &str) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&catalog_transport_bytes(content_id).await?)
+}
+
+/// Fetch the raw (decrypted) `AceStreamTransport` bytes for `content_id` from the signed
+/// catalog, trying each catalog host in turn. The pure decode half is left to the caller
+/// ([`stream_info_from_transport`] for live, [`vod_info_from_transport`] for VOD).
+pub async fn catalog_transport_bytes(content_id: &str) -> Result<Vec<u8>, ResolveError> {
     hex20(content_id)?;
 
     let mut last = ResolveError::Catalog("catalog request failed");
@@ -214,7 +259,7 @@ pub async fn resolve_via_catalog(content_id: &str) -> Result<StreamInfo, Resolve
         )
         .await
         {
-            Ok(Ok(transport)) => return stream_info_from_transport(&transport),
+            Ok(Ok(transport)) => return Ok(transport),
             Ok(Err(e)) => last = e,
             Err(_) => last = ResolveError::Catalog("catalog timeout"),
         }
@@ -520,11 +565,23 @@ const TRANSPORT_URL_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// rebinding cannot redirect the connection), and decode it into a [`StreamInfo`]. Redirects are
 /// disabled (a redirect is an SSRF bypass), the body is size-capped, and a non-2xx status fails
 /// closed. This is the inner seam the public entry calls after the SSRF guard runs.
+/// Fetch + decode a transport URL into a [`StreamInfo`]. Retained as a test helper; the
+/// production path fetches bytes via [`fetch_transport_bytes_from`] and decodes for the
+/// specific stream kind (live vs VOD).
+#[cfg(test)]
 async fn fetch_transport_from(
     url: &str,
     host: &str,
     addr: SocketAddr,
 ) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&fetch_transport_bytes_from(url, host, addr).await?)
+}
+
+async fn fetch_transport_bytes_from(
+    url: &str,
+    host: &str,
+    addr: SocketAddr,
+) -> Result<Vec<u8>, ResolveError> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(TRANSPORT_URL_CONNECT_TIMEOUT)
@@ -553,13 +610,20 @@ async fn fetch_transport_from(
         }
         body.extend_from_slice(&chunk);
     }
-    stream_info_from_transport(&body)
+    Ok(body)
 }
 
 /// Resolve a transport-file `url=` input into a [`StreamInfo`]: require an http/https scheme, run
 /// the SSRF guard on the host, then fetch+decode via [`fetch_transport_from`]. Every failure path
 /// is fail-closed.
 pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&transport_bytes_from_url(url).await?)
+}
+
+/// Fetch raw `AceStreamTransport` bytes from an `http(s)` transport-file URL, applying the same
+/// SSRF guard and size cap as [`stream_info_from_transport_url`]. The pure decode half is left
+/// to the caller ([`vod_info_from_transport`] for VOD).
+pub async fn transport_bytes_from_url(url: &str) -> Result<Vec<u8>, ResolveError> {
     let parsed = reqwest::Url::parse(url).map_err(|_| ResolveError::Url("bad url"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(ResolveError::Url("unsupported scheme"));
@@ -569,13 +633,73 @@ pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, Res
         .port_or_known_default()
         .ok_or(ResolveError::Url("no port"))?;
     let addr = resolve_safe_addr(host, port).await?;
-    fetch_transport_from(url, host, addr).await
+    fetch_transport_bytes_from(url, host, addr).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+
+    fn vod_transport(pieces_bytes: usize, length: Option<i64>, multifile: bool) -> Vec<u8> {
+        use ace_wire::bencode::Bencode;
+        use std::collections::BTreeMap;
+        let mut d = BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"movie".to_vec()));
+        // Fields the infohash formula requires (name/authmethod/pubkey/piece_length/
+        // chunk_length/bitrate — see infohash_of_descriptor).
+        d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"None".to_vec()));
+        d.insert(b"pubkey".to_vec(), Bencode::Bytes(vec![]));
+        d.insert(b"bitrate".to_vec(), Bencode::Int(100000));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(131072));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16384));
+        if let Some(len) = length {
+            d.insert(b"length".to_vec(), Bencode::Int(len));
+        }
+        if pieces_bytes > 0 {
+            d.insert(b"pieces".to_vec(), Bencode::Bytes(vec![7u8; pieces_bytes]));
+        }
+        if multifile {
+            d.insert(b"files".to_vec(), Bencode::List(vec![]));
+        }
+        ace_wire::transport::encode_transport(&Bencode::Dict(d))
+    }
+
+    #[test]
+    fn vod_info_from_single_file_transport() {
+        let tf = vod_transport(60, Some(300000), false); // 3 pieces, single-file
+        let info = vod_info_from_transport(&tf).unwrap();
+        assert_eq!(info.piece_hashes.len(), 3);
+        assert_eq!(info.total_length, 300000);
+        assert_eq!(info.piece_size(2), 300000 - 2 * 131072);
+    }
+
+    #[test]
+    fn vod_info_rejects_live_transport() {
+        let tf = vod_transport(0, None, false); // no pieces => live
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn vod_info_rejects_multifile() {
+        let tf = vod_transport(20, Some(1000), true);
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn vod_info_rejects_missing_length() {
+        let tf = vod_transport(20, None, false);
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
 
     #[test]
     fn ssrf_guard_rejects_unsafe_ip_literals() {

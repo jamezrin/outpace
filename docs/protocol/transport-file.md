@@ -87,11 +87,24 @@ handshakes:
 - `OPEN:` confirm the exact content_id algorithm from the decoded `pubkey`.
   `get_content_id` (HTTP API) resolves it today, so it is not an MVP blocker.
 
-## OPEN — VOD piece-hash list
-Both available fixtures are **live** (no `pieces`). A **VOD** transport is expected
-to carry `pieces` = a concatenated list of 20-byte SHA1 piece hashes (standard BT
-piece integrity). The decoder already surfaces `pieces` when present; this just needs
-a VOD fixture to confirm the exact encoding.
+## VOD piece-hash list and file layout (implemented #47)
+Both captured fixtures are **live** (no `pieces`). A **VOD** transport carries `pieces`
+= a concatenated list of 20-byte SHA1 piece hashes (standard BitTorrent piece integrity).
+The decoder surfaces `pieces` and `is_live`, and outpace now downloads, verifies, and serves
+single-file VOD content over vanilla BitTorrent (`ace_swarm::vod::download_vod`,
+`GET /vod/:network/:id`, `outpace play --vod`). Each assembled piece is SHA1-checked against
+its `pieces` entry before any bytes are emitted.
+
+**SYNTHESIZED SCHEMA (still OPEN — reconcile against a real VOD capture).** No public VOD
+transport was available, so the file-layout keys are assumed from standard BitTorrent
+conventions and encoded that way in the synthetic test fixtures:
+- Single-file VOD: a `length` key = total content bytes (the final piece is truncated to it).
+- Multi-file VOD: a `files` list. Multi-file is detected (`TransportDescriptor::is_multifile`)
+  and **intentionally rejected** with a clear error; only single-file VOD is supported.
+
+If a real capture shows a different encoding (e.g. length carried inside a `files`/`info`
+sub-dict), only `vod_total_length()` / `is_multifile()` in `transport.rs` need to change; the
+download/verify/serve path is standard BitTorrent and is unaffected.
 
 ## Implementation note
 `ace-wire` can: (1) compute the official descriptor-derived swarm infohash and the

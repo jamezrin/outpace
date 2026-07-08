@@ -8,7 +8,7 @@
 //! fallback (see [`ace_swarm::resolve`]); the infohash form works directly.
 
 use crate::config::{CacheType, LiveRecoveryConfig};
-use crate::provider::{ProviderError, SourceStats, StreamProvider, TsSource};
+use crate::provider::{ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource};
 use ace_peer::session::{connect, PeerSession};
 use ace_swarm::dht::dht_announce_peer;
 use ace_swarm::discover::{
@@ -16,12 +16,14 @@ use ace_swarm::discover::{
 };
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::{
-    hex20, resolve_via_catalog, resolve_via_peer, stream_info_from_infohash,
-    stream_info_from_transport_url, ResolveCache, ResolveError,
+    catalog_transport_bytes, hex20, resolve_via_catalog, resolve_via_peer,
+    stream_info_from_infohash, stream_info_from_transport_url, transport_bytes_from_url,
+    transport_bytes_via_peer, vod_info_from_transport, ResolveCache, ResolveError,
 };
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
-use ace_swarm::types::StreamInfo;
+use ace_swarm::types::{StreamInfo, VodInfo};
+use ace_swarm::vod::download_vod;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
@@ -339,6 +341,113 @@ impl AceProvider {
             "content-id resolution: no metadata peer responded".into(),
         ))
     }
+
+    /// Resolve `id` to a single-file VOD and start a verified download, returning a
+    /// [`VodByteSource`] that emits SHA-1-verified content bytes in order. Errors if the id
+    /// is live, multi-file, or carries no VOD descriptor (a bare infohash has no piece hashes).
+    async fn open_vod_inner(&self, id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        let vod = self.resolve_vod_info(id).await?;
+        // VOD swarms are standard BitTorrent; discover the same way live does.
+        let peers = if self.bootstrap_peers.is_empty() {
+            discover_peers(
+                &vod.trackers,
+                &vod.infohash,
+                &random_peer_id(),
+                self.peer_port,
+            )
+            .await
+        } else {
+            self.bootstrap_peers.clone()
+        };
+        crate::alog!(
+            "[ace] open_vod {id}: {} piece(s), {} peer(s)",
+            vod.piece_count(),
+            peers.len()
+        );
+        if peers.is_empty() {
+            return Err(ProviderError::Backend("no VOD peers discovered".into()));
+        }
+        let total = vod.total_length;
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+        tokio::spawn(async move {
+            if let Err(e) = download_vod(vod, peers, tx).await {
+                crate::alog!("[ace] vod download ended: {e:?}");
+            }
+        });
+        Ok(Box::new(VodSource { rx, total }))
+    }
+
+    /// Fetch the VOD transport descriptor for `id` and decode it into a [`VodInfo`]. Accepts a
+    /// `cid:<40hex>` content-id (catalog, then metadata-swarm peer) or a transport-url id; a
+    /// bare infohash is rejected (it carries no descriptor / piece hashes).
+    async fn resolve_vod_info(&self, id: &str) -> Result<VodInfo, ProviderError> {
+        let bytes = if let Some(content_id) = id.strip_prefix("cid:") {
+            let key =
+                hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
+            match catalog_transport_bytes(content_id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    crate::alog!("[ace] vod resolve cid:{content_id}: catalog failed: {e:?}");
+                    self.vod_transport_via_peers(key).await?
+                }
+            }
+        } else if let Some(url) = crate::transport_url::decode_transport_url(id) {
+            transport_bytes_from_url(&url)
+                .await
+                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")))?
+        } else if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ProviderError::Backend(
+                "a bare infohash is not a VOD target (no descriptor with piece hashes)".into(),
+            ));
+        } else {
+            return Err(ProviderError::Backend(
+                "id must be cid:<40hex> or a transport-url id for VOD".into(),
+            ));
+        };
+        vod_info_from_transport(&bytes)
+            .map_err(|e| ProviderError::Backend(format!("vod descriptor: {e:?}")))
+    }
+
+    /// Fetch VOD transport bytes over a metadata-swarm peer (BEP-9 `ut_metadata`), trying each
+    /// discovered/bootstrap peer in turn — the VOD analogue of the peer fallback in
+    /// [`Self::resolve_content_id`].
+    async fn vod_transport_via_peers(&self, key: [u8; 20]) -> Result<Vec<u8>, ProviderError> {
+        let all = if self.bootstrap_peers.is_empty() {
+            discover_peers(&self.default_trackers, &key, &random_peer_id(), self.peer_port).await
+        } else {
+            self.bootstrap_peers.clone()
+        };
+        for addr in all {
+            let Ok(Ok(session)) =
+                tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
+            else {
+                continue;
+            };
+            let mut session = session.with_timeout(RESOLVE_PEER_TIMEOUT);
+            match transport_bytes_via_peer(&mut session, key, &self.identity).await {
+                Ok(b) => return Ok(b),
+                Err(e) => crate::alog!("[ace] vod resolve {addr}: {e:?}"),
+            }
+        }
+        Err(ProviderError::Backend(
+            "vod content-id resolution: no metadata peer responded".into(),
+        ))
+    }
+}
+
+struct VodSource {
+    rx: mpsc::Receiver<Bytes>,
+    total: u64,
+}
+
+#[async_trait]
+impl VodByteSource for VodSource {
+    fn content_length(&self) -> u64 {
+        self.total
+    }
+    async fn next(&mut self) -> Option<Bytes> {
+        self.rx.recv().await
+    }
 }
 
 struct AceSource {
@@ -370,6 +479,10 @@ impl TsSource for AceSource {
 impl StreamProvider for AceProvider {
     fn network(&self) -> &'static str {
         "ace"
+    }
+
+    async fn open_vod(&self, id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        self.open_vod_inner(id).await
     }
 
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
@@ -2435,6 +2548,18 @@ mod tests {
     async fn network_is_ace() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
         assert_eq!(p.network(), "ace");
+    }
+
+    #[tokio::test]
+    async fn open_vod_rejects_bare_infohash() {
+        // A bare infohash carries no transport descriptor, so it has no VOD piece hashes.
+        // This resolves synchronously (no network) to a clear error.
+        let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+        let err = p
+            .open_vod("00112233445566778899aabbccddeeff00112233")
+            .await
+            .err();
+        assert!(err.is_some(), "a bare infohash is not a VOD target");
     }
 
     #[tokio::test]

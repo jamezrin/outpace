@@ -3,7 +3,7 @@
 
 use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
-use crate::provider::{ProviderError, ProviderRegistry};
+use crate::provider::{ProviderError, ProviderRegistry, StreamProvider};
 use crate::session::StreamSession;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,6 +57,13 @@ impl StreamManager {
     #[cfg(test)]
     pub(crate) fn hls_config(&self) -> HlsConfig {
         self.hls
+    }
+
+    /// The registered provider for `network`, if any. VOD downloads are one-shot (not shared
+    /// live sessions), so the `/vod` route resolves the provider directly rather than going
+    /// through [`get_or_start`](Self::get_or_start).
+    pub fn provider(&self, network: &str) -> Option<Arc<dyn StreamProvider>> {
+        self.registry.get(network)
     }
 
     /// Get the running session for `(network, id)` or start one via the provider. Returns

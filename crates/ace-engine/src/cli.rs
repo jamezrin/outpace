@@ -53,6 +53,10 @@ pub struct PlayArgs {
     pub input: String,
     #[arg(long = "peer")]
     pub peers: Vec<SocketAddrV4>,
+    /// Treat the target as a single-file VOD: download it, verify each piece against the
+    /// transport's SHA-1 hashes, and write the verified bytes to stdout (instead of a live TS).
+    #[arg(long)]
+    pub vod: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +208,20 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("outpace play: {}", args.input);
     eprintln!("outpace play: provider id {}", target.provider_id);
 
+    if args.vod {
+        eprintln!("outpace play: VOD download (verified) to stdout");
+        let mut source = provider
+            .open_vod(&target.provider_id)
+            .await
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let mut stdout = tokio::io::stdout();
+        while let Some(chunk) = source.next().await {
+            stdout.write_all(&chunk).await?;
+            stdout.flush().await?;
+        }
+        return Ok(());
+    }
+
     let mut source = provider
         .open(&target.provider_id)
         .await
@@ -308,6 +326,29 @@ mod tests {
         let cli = Cli::parse_from(["outpace", "serve"]);
 
         assert!(matches!(cli.command, Command::Serve(_)));
+    }
+
+    #[test]
+    fn play_defaults_to_live_and_accepts_vod_flag() {
+        let live = Cli::parse_from([
+            "outpace",
+            "play",
+            "acestream://0123456789abcdef0123456789abcdef01234567",
+        ]);
+        match live.command {
+            Command::Play(args) => assert!(!args.vod, "play defaults to live"),
+            other => panic!("expected play command, got {other:?}"),
+        }
+        let vod = Cli::parse_from([
+            "outpace",
+            "play",
+            "--vod",
+            "acestream://0123456789abcdef0123456789abcdef01234567",
+        ]);
+        match vod.command {
+            Command::Play(args) => assert!(args.vod, "--vod selects the VOD path"),
+            other => panic!("expected play command, got {other:?}"),
+        }
     }
 
     #[test]
