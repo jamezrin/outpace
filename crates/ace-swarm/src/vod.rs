@@ -47,6 +47,9 @@ pub async fn download_vod(
     let piece_count = info.piece_count();
     let mut next_piece: u64 = 0;
     let mut peer_idx = 0usize;
+    // Stall budget: consecutive attempts that made no progress. Reset whenever `next_piece`
+    // advances, so a long download that keeps delivering pieces across reconnecting peers is
+    // never failed for "using up attempts" — only a genuine stall (no piece advanced) is.
     let mut attempts = 0usize;
     let max_attempts = peers.len().max(1) * 3;
     while next_piece < piece_count {
@@ -56,6 +59,7 @@ pub async fn download_vod(
         attempts += 1;
         let addr = peers[peer_idx % peers.len()];
         peer_idx += 1;
+        let progress_before = next_piece;
 
         let mut session = match connect(&addr.to_string()).await {
             Ok(s) => s,
@@ -73,6 +77,11 @@ pub async fn download_vod(
             Err(VodError::ConsumerGone) => return Err(VodError::ConsumerGone),
             // Peer-local failure: keep the cursor and try another peer.
             Err(VodError::Unrecoverable(_)) => {}
+        }
+        if next_piece > progress_before {
+            // This peer delivered at least one verified piece — that's forward progress, even if
+            // it then dropped mid-drain. Only consecutive no-progress attempts count as a stall.
+            attempts = 0;
         }
     }
     Ok(())
@@ -293,6 +302,99 @@ mod seeder_tests {
         // 3 pieces, last one partial: piece_length 32 KiB, chunk 16 KiB, total 80000.
         let (content, info) = make_content(32768, 16384, 80000);
         let addr = spawn_seeder(content.clone(), info.clone(), false).await;
+        let (tx, mut rx) = mpsc::channel::<Bytes>(64);
+        let handle = tokio::spawn(async move { download_vod(info, vec![addr], tx).await });
+        let mut got = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            got.extend_from_slice(&chunk);
+        }
+        handle.await.unwrap().unwrap();
+        assert_eq!(got, content);
+    }
+
+    // A seeder that serves at most `pieces_per_conn` distinct pieces per connection, then drops.
+    // Forces the client to reconnect and resume — exercising progress across many short peers.
+    async fn spawn_flaky_seeder(content: Vec<u8>, info: VodInfo, pieces_per_conn: usize) -> SocketAddrV4 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = match listener.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let content = content.clone();
+                let info = info.clone();
+                tokio::spawn(async move {
+                    let mut hs = [0u8; ace_wire::handshake::HANDSHAKE_LEN];
+                    if sock.read_exact(&mut hs).await.is_err() {
+                        return;
+                    }
+                    let reply =
+                        Handshake::new(info.infohash, ace_wire::handshake::random_peer_id()).encode();
+                    if sock.write_all(&reply).await.is_err() {
+                        return;
+                    }
+                    let nbytes = (info.piece_count() as usize).div_ceil(8);
+                    let mut bits = vec![0u8; nbytes];
+                    for p in 0..info.piece_count() as usize {
+                        bits[p / 8] |= 0x80 >> (p % 8);
+                    }
+                    let _ = sock.write_all(&PeerMessage::Bitfield(bits).encode()).await;
+                    let _ = sock.write_all(&PeerMessage::Unchoke.encode()).await;
+                    let mut served: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        loop {
+                            match PeerMessage::decode(&buf) {
+                                Ok(Some((msg, used))) => {
+                                    buf.drain(..used);
+                                    if let PeerMessage::Request { index, begin, length } = msg {
+                                        if !served.contains(&index) {
+                                            if served.len() >= pieces_per_conn {
+                                                return; // drop: force a reconnect
+                                            }
+                                            served.insert(index);
+                                        }
+                                        let start = (index as u64 * info.piece_length
+                                            + begin as u64)
+                                            as usize;
+                                        let end = start + length as usize;
+                                        let block = content[start..end].to_vec();
+                                        let piece =
+                                            PeerMessage::Piece { index, begin, block }.encode();
+                                        if sock.write_all(&piece).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => return,
+                            }
+                        }
+                        let n = match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn progress_across_flaky_peer_resets_stall_budget() {
+        // 5 pieces from a single peer that drops after each piece. With one peer the stall
+        // budget is only 3 attempts, so this only completes because progress resets it.
+        let (content, info) = make_content(16384, 16384, 5 * 16384 - 100);
+        assert_eq!(info.piece_count(), 5);
+        let addr = spawn_flaky_seeder(content.clone(), info.clone(), 1).await;
         let (tx, mut rx) = mpsc::channel::<Bytes>(64);
         let handle = tokio::spawn(async move { download_vod(info, vec![addr], tx).await });
         let mut got = Vec::new();
