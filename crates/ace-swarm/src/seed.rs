@@ -5,7 +5,7 @@ use ace_peer::Result;
 use ace_wire::bencode::Bencode;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::identity::Identity;
-use ace_wire::live_codec::{build_piece, live_bitfield};
+use ace_wire::live_codec::{build_piece, live_bitfield, reject_chunk_request};
 use ace_wire::message::PeerMessage;
 use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -174,31 +174,41 @@ impl SeederSession {
                 }
                 PeerMessage::Unknown { id: 6, payload } if payload.len() >= 10 && unchoked => {
                     // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
-                    if let Some(store) = &store {
-                        let piece =
-                            u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                        let chunk = u16::from_be_bytes([payload[8], payload[9]]);
-                        let (data, header) = {
-                            let guard = store.lock().await;
+                    let stream =
+                        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    let piece =
+                        u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    let chunk = u16::from_be_bytes([payload[8], payload[9]]);
+                    let found = if let Some(store) = &store {
+                        let guard = store.lock().await;
+                        guard.chunk(piece as u64, chunk).map(|data| {
                             (
-                                guard.chunk(piece as u64, chunk).map(|d| d.to_vec()),
+                                data.to_vec(),
                                 guard.piece_header(piece as u64).unwrap_or(piece_header),
                             )
-                        };
-                        if let Some(data) = data {
-                            let reply = build_piece(0, piece, chunk, header, &data);
-                            session.send(&reply).await?;
-                            if debug {
-                                crate::swarm_log!(
-                                    "[seed-session] -> Piece stream=0 piece={piece} chunk={chunk} bytes={}",
-                                    data.len()
-                                );
-                            }
-                        } else if debug {
-                            crate::swarm_log!("[seed-session] miss piece={piece} chunk={chunk}");
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((data, header)) = found {
+                        let reply = build_piece(stream, piece, chunk, header, &data);
+                        session.send(&reply).await?;
+                        if debug {
+                            crate::swarm_log!(
+                                "[seed-session] -> Piece stream={stream} piece={piece} chunk={chunk} bytes={}",
+                                data.len()
+                            );
+                        }
+                    } else {
+                        session
+                            .send(&reject_chunk_request(stream, piece, chunk))
+                            .await?;
+                        if debug {
+                            crate::swarm_log!(
+                                "[seed-session] -> Reject stream={stream} piece={piece} chunk={chunk}"
+                            );
                         }
                     }
-                    // Missing/evicted chunk: silently skip (a future task may send a reject).
                 }
                 _ => {}
             }
@@ -284,6 +294,15 @@ fn seed_message_summary(msg: &PeerMessage) -> String {
             let chunk = u16::from_be_bytes([payload[8], payload[9]]);
             format!(
                 "ACE Request stream={stream} piece={piece} chunk={chunk} bytes={}",
+                payload.len()
+            )
+        }
+        PeerMessage::Unknown { id: 16, payload } if payload.len() >= 10 => {
+            let stream = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let piece = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let chunk = u16::from_be_bytes([payload[8], payload[9]]);
+            format!(
+                "ACE Reject stream={stream} piece={piece} chunk={chunk} bytes={}",
                 payload.len()
             )
         }
@@ -964,6 +983,50 @@ mod tests {
             }
         );
         serve_task.abort(); // stop the loop if it hasn't already returned
+    }
+
+    #[tokio::test]
+    async fn rejects_a_requested_chunk_that_is_not_in_the_store() {
+        let store = Arc::new(Mutex::new(PieceStore::new(4, 4, 1024)));
+        store.lock().await.put_chunk(5, 0, &[9, 9, 9, 9]);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let peer = tokio::spawn(async move {
+            let mut p = PeerSession::new(client);
+            p.send(&PeerMessage::Interested).await.unwrap();
+            p.send(&chunk_request(6, 0)).await.unwrap();
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), p.read_message()).await {
+                    Ok(Ok(PeerMessage::Unknown { id: 16, payload })) => return payload,
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(err)) => panic!("peer read failed before reject: {err:?}"),
+                    Err(_) => panic!("timed out waiting for live reject"),
+                }
+            }
+        });
+
+        let mut us = PeerSession::new(server);
+        let identity = Identity::generate();
+        let serve_task = tokio::spawn(async move {
+            let _ = SeederSession::serve(
+                &mut us,
+                Some(store),
+                None,
+                [0u8; 8],
+                &identity,
+                [127, 0, 0, 1],
+                None,
+            )
+            .await;
+        });
+
+        let payload = peer.await.unwrap();
+        assert_eq!(
+            payload,
+            vec![0, 0, 0, 0, 0, 0, 0, 6, 0, 0],
+            "reject must echo the live request's stream/piece/chunk coordinates"
+        );
+        serve_task.abort();
     }
 
     #[tokio::test]
