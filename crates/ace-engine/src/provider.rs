@@ -29,6 +29,16 @@ pub trait TsSource: Send {
     fn stats(&self) -> SourceStats;
 }
 
+/// A finite, ordered VOD byte stream with a known total length. Unlike [`TsSource`] (an
+/// unbounded live stream), a VOD source ends after exactly `content_length()` bytes.
+#[async_trait]
+pub trait VodByteSource: Send {
+    /// Total content length in bytes (for a `Content-Length` header).
+    fn content_length(&self) -> u64;
+    /// Next verified, ordered chunk, or None at end-of-content.
+    async fn next(&mut self) -> Option<Bytes>;
+}
+
 /// Adapter for one network (e.g. "ace").
 #[async_trait]
 pub trait StreamProvider: Send + Sync {

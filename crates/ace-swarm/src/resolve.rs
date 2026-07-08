@@ -198,6 +198,17 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     handshake_infohash: [u8; 20],
     identity: &Identity,
 ) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&transport_bytes_via_peer(session, handshake_infohash, identity).await?)
+}
+
+/// Fetch the raw `AceStreamTransport` metadata bytes over a peer via BEP-9 `ut_metadata`. The
+/// pure decode half is left to the caller ([`stream_info_from_transport`] for live,
+/// [`vod_info_from_transport`] for VOD).
+pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+    handshake_infohash: [u8; 20],
+    identity: &Identity,
+) -> Result<Vec<u8>, ResolveError> {
     session
         .perform_handshake(handshake_infohash, random_peer_id())
         .await
@@ -220,11 +231,10 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|_| ResolveError::Peer("send extended handshake failed"))?;
 
     let (peer_ut_id, metadata_size) = read_metadata_params(session).await?;
-    let blob = session
+    session
         .fetch_metadata(peer_ut_id, metadata_size)
         .await
-        .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))?;
-    stream_info_from_transport(&blob)
+        .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))
 }
 
 /// Resolve a content-id through the official signed transport catalog.
@@ -232,6 +242,13 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
 /// The catalog returns the encrypted `AceStreamTransport` bytes; checksum validation happens
 /// before the existing pure transport decoder computes the real live swarm infohash.
 pub async fn resolve_via_catalog(content_id: &str) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&catalog_transport_bytes(content_id).await?)
+}
+
+/// Fetch the raw (decrypted) `AceStreamTransport` bytes for `content_id` from the signed
+/// catalog, trying each catalog host in turn. The pure decode half is left to the caller
+/// ([`stream_info_from_transport`] for live, [`vod_info_from_transport`] for VOD).
+pub async fn catalog_transport_bytes(content_id: &str) -> Result<Vec<u8>, ResolveError> {
     hex20(content_id)?;
 
     let mut last = ResolveError::Catalog("catalog request failed");
@@ -242,7 +259,7 @@ pub async fn resolve_via_catalog(content_id: &str) -> Result<StreamInfo, Resolve
         )
         .await
         {
-            Ok(Ok(transport)) => return stream_info_from_transport(&transport),
+            Ok(Ok(transport)) => return Ok(transport),
             Ok(Err(e)) => last = e,
             Err(_) => last = ResolveError::Catalog("catalog timeout"),
         }
@@ -548,11 +565,23 @@ const TRANSPORT_URL_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// rebinding cannot redirect the connection), and decode it into a [`StreamInfo`]. Redirects are
 /// disabled (a redirect is an SSRF bypass), the body is size-capped, and a non-2xx status fails
 /// closed. This is the inner seam the public entry calls after the SSRF guard runs.
+/// Fetch + decode a transport URL into a [`StreamInfo`]. Retained as a test helper; the
+/// production path fetches bytes via [`fetch_transport_bytes_from`] and decodes for the
+/// specific stream kind (live vs VOD).
+#[cfg(test)]
 async fn fetch_transport_from(
     url: &str,
     host: &str,
     addr: SocketAddr,
 ) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&fetch_transport_bytes_from(url, host, addr).await?)
+}
+
+async fn fetch_transport_bytes_from(
+    url: &str,
+    host: &str,
+    addr: SocketAddr,
+) -> Result<Vec<u8>, ResolveError> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(TRANSPORT_URL_CONNECT_TIMEOUT)
@@ -581,13 +610,20 @@ async fn fetch_transport_from(
         }
         body.extend_from_slice(&chunk);
     }
-    stream_info_from_transport(&body)
+    Ok(body)
 }
 
 /// Resolve a transport-file `url=` input into a [`StreamInfo`]: require an http/https scheme, run
 /// the SSRF guard on the host, then fetch+decode via [`fetch_transport_from`]. Every failure path
 /// is fail-closed.
 pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, ResolveError> {
+    stream_info_from_transport(&transport_bytes_from_url(url).await?)
+}
+
+/// Fetch raw `AceStreamTransport` bytes from an `http(s)` transport-file URL, applying the same
+/// SSRF guard and size cap as [`stream_info_from_transport_url`]. The pure decode half is left
+/// to the caller ([`vod_info_from_transport`] for VOD).
+pub async fn transport_bytes_from_url(url: &str) -> Result<Vec<u8>, ResolveError> {
     let parsed = reqwest::Url::parse(url).map_err(|_| ResolveError::Url("bad url"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(ResolveError::Url("unsupported scheme"));
@@ -597,7 +633,7 @@ pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, Res
         .port_or_known_default()
         .ok_or(ResolveError::Url("no port"))?;
     let addr = resolve_safe_addr(host, port).await?;
-    fetch_transport_from(url, host, addr).await
+    fetch_transport_bytes_from(url, host, addr).await
 }
 
 #[cfg(test)]
