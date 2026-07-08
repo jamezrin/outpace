@@ -67,7 +67,18 @@ impl PlaybackTarget {
             let id = rest.split(['?', '#']).next().unwrap_or("");
             return content_id_target(id);
         }
+        if input.starts_with("magnet:") {
+            return magnet_target(input);
+        }
+        // A bare transport-file URL is unambiguous — accept it directly so a URL carrying its own
+        // `&`-joined query string never has to be squeezed through the `acestream:?` form.
+        if input.starts_with("http://") || input.starts_with("https://") {
+            return url_target(input);
+        }
         if let Some(query) = input.strip_prefix("acestream:?") {
+            // `parse_query` percent-decodes values, so a `url=`/`magnet=` whose own query string
+            // is percent-encoded (`%26` for `&`) survives — matching the HTTP query contract. A
+            // URL with literal `&` should use the bare-`http(s)://` form above instead.
             let params = parse_query(query);
             if let Some(id) = params.get("content_id") {
                 return content_id_target(id);
@@ -75,9 +86,15 @@ impl PlaybackTarget {
             if let Some(id) = params.get("infohash") {
                 return infohash_target(id);
             }
-            return Err("acestream URL must contain content_id or infohash".into());
+            if let Some(url) = params.get("url") {
+                return url_target(url);
+            }
+            if let Some(magnet) = params.get("magnet") {
+                return magnet_target(magnet);
+            }
+            return Err("acestream URL must contain content_id, infohash, url, or magnet".into());
         }
-        Err("expected an acestream:// or acestream:? URL".into())
+        Err("expected an acestream://, acestream:?, magnet:, or http(s):// URL".into())
     }
 }
 
@@ -216,6 +233,17 @@ fn infohash_target(id: &str) -> Result<PlaybackTarget, String> {
     })
 }
 
+fn url_target(url: &str) -> Result<PlaybackTarget, String> {
+    Ok(PlaybackTarget {
+        provider_id: crate::transport_url::encode_transport_url(url)?,
+    })
+}
+
+fn magnet_target(magnet: &str) -> Result<PlaybackTarget, String> {
+    let hex = crate::magnet::parse_magnet_infohash(magnet)?;
+    infohash_target(&hex)
+}
+
 fn normalize_hex40(id: &str) -> Result<String, String> {
     if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(id.to_ascii_lowercase())
@@ -234,10 +262,33 @@ fn parse_query(query: &str) -> std::collections::BTreeMap<String, String> {
             if key.is_empty() {
                 None
             } else {
-                Some((key.to_string(), value.to_string()))
+                Some((key.to_string(), percent_decode(value)))
             }
         })
         .collect()
+}
+
+/// Percent-decode a query value (`%XX` -> byte, `+` left as-is). Invalid escapes are kept
+/// literally. Lets an `acestream:?url=`/`magnet=` value carry a percent-encoded query string
+/// (`%26` for `&`) so it is not split apart by the `&` param separator.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -329,6 +380,77 @@ mod tests {
             }
             other => panic!("expected play command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_bare_magnet_input() {
+        let t =
+            PlaybackTarget::parse("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567")
+                .unwrap();
+        assert_eq!(t.provider_id, "0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn parses_transport_url_input() {
+        let t = PlaybackTarget::parse("acestream:?url=https://example.com/x.acelive").unwrap();
+        assert_eq!(
+            crate::transport_url::decode_transport_url(&t.provider_id).as_deref(),
+            Some("https://example.com/x.acelive")
+        );
+    }
+
+    #[test]
+    fn parses_bare_transport_url_with_query_string() {
+        // A literal `&` in the URL's own query works via the bare form (no acestream:? wrapper).
+        let url = "https://cdn.example.com/t.acelive?token=abc&sig=xyz";
+        let t = PlaybackTarget::parse(url).unwrap();
+        assert_eq!(
+            crate::transport_url::decode_transport_url(&t.provider_id).as_deref(),
+            Some(url)
+        );
+    }
+
+    #[test]
+    fn acestream_url_percent_encoded_query_survives() {
+        // %3F=? %3D== %26=& — the url's own query is percent-encoded so the outer `&` separator
+        // does not truncate it.
+        let t = PlaybackTarget::parse("acestream:?url=https://h/x%3Fa%3D1%26b%3D2").unwrap();
+        assert_eq!(
+            crate::transport_url::decode_transport_url(&t.provider_id).as_deref(),
+            Some("https://h/x?a=1&b=2")
+        );
+    }
+
+    #[test]
+    fn selector_precedence_content_id_over_infohash_over_url_over_magnet() {
+        let ih = "0123456789abcdef0123456789abcdef01234567";
+        let cid = "89abcdef0123456789abcdef0123456789abcdef";
+        // content_id wins.
+        let t = PlaybackTarget::parse(&format!(
+            "acestream:?content_id={cid}&infohash={ih}&url=https://e/x&magnet=magnet:?xt=urn:btih:{ih}"
+        ))
+        .unwrap();
+        assert_eq!(t.provider_id, format!("cid:{cid}"));
+        // then infohash.
+        let t = PlaybackTarget::parse(&format!(
+            "acestream:?infohash={ih}&url=https://e/x&magnet=magnet:?xt=urn:btih:{ih}"
+        ))
+        .unwrap();
+        assert_eq!(t.provider_id, ih);
+        // then url.
+        let t = PlaybackTarget::parse(&format!(
+            "acestream:?url=https://e/x.acelive&magnet=magnet:?xt=urn:btih:{ih}"
+        ))
+        .unwrap();
+        assert_eq!(
+            crate::transport_url::decode_transport_url(&t.provider_id).as_deref(),
+            Some("https://e/x.acelive")
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_transport_url() {
+        assert!(PlaybackTarget::parse("acestream:?url=file:///etc/passwd").is_err());
     }
 
     #[test]

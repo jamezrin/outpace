@@ -22,6 +22,7 @@ use rand::Rng;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -75,6 +76,8 @@ pub enum ResolveError {
     Catalog(&'static str),
     /// A peer/network step failed during content-id resolution.
     Peer(&'static str),
+    /// A transport-file `url=` fetch failed a safety check or the network step.
+    Url(&'static str),
 }
 
 /// Build a [`StreamInfo`] from raw `AceStreamTransport` file bytes (the pure half of
@@ -443,10 +446,272 @@ fn decode_hex20(hex: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
+/// Whether an IP is safe to fetch a transport file from — a conservative denylist that fails
+/// closed on anything private, local, or otherwise not a normal public unicast address. Used by
+/// the transport-file `url=` fetch to block SSRF into internal services.
+fn is_safe_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                // Shared address space / CGNAT: 100.64.0.0/10.
+                || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000))
+        }
+        IpAddr::V6(v6) => {
+            // Re-check IPv4-mapped addresses against the v4 rules.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_safe_ip(&IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique local fc00::/7.
+                || (seg[0] & 0xfe00) == 0xfc00
+                // Link-local unicast fe80::/10.
+                || (seg[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Resolve `host` to a single safe [`SocketAddr`], or [`ResolveError::Url`] if it is unresolvable
+/// or every resolved address is blocked by [`is_safe_ip`]. IP literals are validated directly;
+/// hostnames are resolved and the first safe address is kept (later pinned into the client so
+/// DNS rebinding cannot swap it).
+async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveError> {
+    // `Url::host_str` keeps the brackets on an IPv6 literal (`[::1]`); strip them so the literal
+    // parses and is validated, rather than falling through to a doomed DNS lookup.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_safe_ip(&ip) {
+            Ok(SocketAddr::new(ip, port))
+        } else {
+            Err(ResolveError::Url("blocked address"))
+        };
+    }
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| ResolveError::Url("dns failed"))?;
+    for addr in addrs {
+        if is_safe_ip(&addr.ip()) {
+            return Ok(addr);
+        }
+    }
+    Err(ResolveError::Url("blocked address"))
+}
+
+/// Upper bound on a fetched transport-file body (bytes). Matches the descriptor ceilings the
+/// catalog path and `MAX_METADATA_SIZE` already impose on the same `AceStreamTransport` dict.
+pub const MAX_TRANSPORT_FILE: u64 = 1_048_576;
+
+const TRANSPORT_URL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TRANSPORT_URL_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Fetch a transport file from `url`, connecting only to the pre-validated `addr` (pinned so DNS
+/// rebinding cannot redirect the connection), and decode it into a [`StreamInfo`]. Redirects are
+/// disabled (a redirect is an SSRF bypass), the body is size-capped, and a non-2xx status fails
+/// closed. This is the inner seam the public entry calls after the SSRF guard runs.
+async fn fetch_transport_from(
+    url: &str,
+    host: &str,
+    addr: SocketAddr,
+) -> Result<StreamInfo, ResolveError> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(TRANSPORT_URL_CONNECT_TIMEOUT)
+        .timeout(TRANSPORT_URL_TOTAL_TIMEOUT)
+        .resolve(host, addr)
+        .build()
+        .map_err(|_| ResolveError::Url("client build failed"))?;
+
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| ResolveError::Url("fetch failed"))?;
+    if !resp.status().is_success() {
+        return Err(ResolveError::Url("http status"));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|_| ResolveError::Url("fetch failed"))?
+    {
+        if body.len() as u64 + chunk.len() as u64 > MAX_TRANSPORT_FILE {
+            return Err(ResolveError::Url("transport too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    stream_info_from_transport(&body)
+}
+
+/// Resolve a transport-file `url=` input into a [`StreamInfo`]: require an http/https scheme, run
+/// the SSRF guard on the host, then fetch+decode via [`fetch_transport_from`]. Every failure path
+/// is fail-closed.
+pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, ResolveError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| ResolveError::Url("bad url"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ResolveError::Url("unsupported scheme"));
+    }
+    let host = parsed.host_str().ok_or(ResolveError::Url("no host"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or(ResolveError::Url("no port"))?;
+    let addr = resolve_safe_addr(host, port).await?;
+    fetch_transport_from(url, host, addr).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+
+    #[test]
+    fn ssrf_guard_rejects_unsafe_ip_literals() {
+        use std::net::Ipv4Addr;
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.0.1",
+            "169.254.0.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            assert!(!is_safe_ip(&ip.parse().unwrap()), "{ip} must be unsafe");
+        }
+        for ip in ["::1", "fc00::1", "fe80::1", "::", "ff02::1"] {
+            assert!(!is_safe_ip(&ip.parse().unwrap()), "{ip} must be unsafe");
+        }
+        // IPv4-mapped loopback must also be rejected.
+        assert!(!is_safe_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+        // Public addresses are allowed.
+        assert!(is_safe_ip(&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+        assert!(is_safe_ip(&IpAddr::V6(
+            "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+        )));
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_loopback_host() {
+        assert_eq!(
+            resolve_safe_addr("127.0.0.1", 80).await,
+            Err(ResolveError::Url("blocked address"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_handles_bracketed_ipv6_literal() {
+        // `Url::host_str` returns IPv6 literals bracketed; they must be parsed+validated, not
+        // treated as an (always-failing) hostname. Bracketed loopback -> blocked (not dns failed).
+        assert_eq!(
+            resolve_safe_addr("[::1]", 80).await,
+            Err(ResolveError::Url("blocked address"))
+        );
+        // A bracketed public IPv6 literal resolves to a safe address.
+        let ok = resolve_safe_addr("[2606:2800:220:1:248:1893:25c8:1946]", 443)
+            .await
+            .unwrap();
+        assert_eq!(ok.port(), 443);
+        assert!(ok.is_ipv6());
+    }
+
+    // Minimal one-shot HTTP/1.1 server: serves `status`+`body` to the first connection.
+    async fn serve_once(status: &'static str, body: Vec<u8>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // drain request headers
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fetch_decodes_a_valid_transport() {
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei100000e12:chunk_lengthi16384e4:name4:Test12:piece_lengthi1048576e6:pubkey3:abc8:trackersl18:udp://t.example:80ee",
+        );
+        let addr = serve_once("200 OK", tf).await;
+        let url = format!("http://127.0.0.1:{}/t.bin", addr.port());
+        let si = fetch_transport_from(&url, "127.0.0.1", addr).await.unwrap();
+        assert_eq!(si.piece_length, 1_048_576);
+        assert_eq!(si.infohash[0], 0x92);
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_oversized_body() {
+        let addr = serve_once("200 OK", vec![b'x'; (MAX_TRANSPORT_FILE + 1) as usize]).await;
+        let url = format!("http://127.0.0.1:{}/big.bin", addr.port());
+        assert_eq!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Url("transport too large"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_transport_body() {
+        let addr = serve_once("200 OK", b"not a transport".to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/x", addr.port());
+        assert!(matches!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_200_status() {
+        let addr = serve_once("404 Not Found", b"nope".to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/missing", addr.port());
+        assert_eq!(
+            fetch_transport_from(&url, "127.0.0.1", addr).await,
+            Err(ResolveError::Url("http status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_url_rejects_unsupported_scheme() {
+        assert_eq!(
+            stream_info_from_transport_url("file:///etc/passwd").await,
+            Err(ResolveError::Url("unsupported scheme"))
+        );
+        assert_eq!(
+            stream_info_from_transport_url("ftp://example.com/x").await,
+            Err(ResolveError::Url("unsupported scheme"))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "network: fetches a real public transport-file URL"]
+    async fn live_transport_url_fetch() {
+        // Replace with a known public/free transport-file URL when validating live.
+        let url =
+            std::env::var("OUTPACE_TEST_TRANSPORT_URL").expect("set OUTPACE_TEST_TRANSPORT_URL");
+        let si = stream_info_from_transport_url(&url).await.unwrap();
+        assert_ne!(si.infohash, [0u8; 20]);
+    }
 
     // Wrap raw bencode into a transport file under the global key/IV (mirrors transport.rs).
     fn make_transport(plaintext: &[u8]) -> Vec<u8> {

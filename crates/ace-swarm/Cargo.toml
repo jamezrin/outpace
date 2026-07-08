@@ -14,6 +14,7 @@ bytes = "1"
 rand = "0.8"
 sha1 = "0.10"
 base64ct = { version = "1.8", features = ["alloc"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 ace-media = { path = "../ace-media" }

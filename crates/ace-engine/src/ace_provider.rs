@@ -16,8 +16,8 @@ use ace_swarm::discover::{
 };
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::{
-    hex20, resolve_via_catalog, resolve_via_peer, stream_info_from_infohash, ResolveCache,
-    ResolveError,
+    hex20, resolve_via_catalog, resolve_via_peer, stream_info_from_infohash,
+    stream_info_from_transport_url, ResolveCache, ResolveError,
 };
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
@@ -378,12 +378,16 @@ impl StreamProvider for AceProvider {
         // does content_id→infohash internally — we do it ourselves, no Acestream API).
         let info = if let Some(content_id) = id.strip_prefix("cid:") {
             self.resolve_content_id(content_id).await?
+        } else if let Some(url) = crate::transport_url::decode_transport_url(id) {
+            stream_info_from_transport_url(&url)
+                .await
+                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")))?
         } else if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
             stream_info_from_infohash(id, self.default_trackers.clone())
                 .map_err(|_| ProviderError::Backend("bad infohash".into()))?
         } else {
             return Err(ProviderError::Backend(
-                "id must be a 40-hex infohash or cid:<40hex> content-id".into(),
+                "id must be a 40-hex infohash, cid:<40hex>, or a transport-url id".into(),
             ));
         };
 
@@ -2496,6 +2500,37 @@ mod tests {
             p.open("cid:nothex").await,
             Err(ProviderError::Backend(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn open_rejects_transport_url_with_blocked_host() {
+        let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+        // A valid transport-url id whose host is loopback is SSRF-blocked, so open() fails closed
+        // via the decode+fetch branch (proven by the "transport url" message, not the generic
+        // unrecognized-id fallthrough).
+        let id = crate::transport_url::encode_transport_url("http://127.0.0.1:1/x").unwrap();
+        let err = p.open(&id).await.err().expect("blocked host must error");
+        match err {
+            ProviderError::Backend(msg) => assert!(msg.contains("transport url"), "{msg}"),
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_rejects_transport_url_id_with_bad_scheme() {
+        // Defense in depth: even a hand-crafted transport-url id encoding a non-http scheme is
+        // rejected at the fetch layer, not just at the input surface.
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+        let id = format!(
+            "turl-{}",
+            Base64UrlUnpadded::encode_string(b"file:///etc/passwd")
+        );
+        let err = p.open(&id).await.err().expect("bad scheme must error");
+        match err {
+            ProviderError::Backend(msg) => assert!(msg.contains("transport url"), "{msg}"),
+            other => panic!("expected Backend error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
