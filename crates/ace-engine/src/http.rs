@@ -3,7 +3,7 @@
 
 use crate::broadcast::BroadcastRegistry;
 use crate::manager::StreamManager;
-use crate::provider::VodByteSource;
+use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::StreamSession;
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::resolve_via_catalog;
@@ -88,6 +88,8 @@ pub fn router(state: AppState) -> Router {
         .route("/streams/:network/:id/status", get(stream_status))
         .route("/streams/:network/:id/seg/:seg", get(stream_segment))
         .route("/vod/:network/:id", get(vod_stream))
+        .route("/vod/:network/:id/manifest.m3u8", get(vod_manifest))
+        .route("/vod/:network/:id/seg/:seg", get(vod_hls_segment))
         .route(
             "/broadcast/:name",
             put(broadcast_ingest)
@@ -105,19 +107,16 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// `GET /vod/{network}/{id}` — resolve `id` as a single-file VOD, then stream its verified
-/// bytes with a `Content-Length`. VOD is a one-shot download (not a shared live session), so
-/// this resolves the provider directly instead of going through the session manager.
+/// bytes with a `Content-Length`. The resolved VOD is cached by the manager and shared with the
+/// HLS routes, so a playback resolves the descriptor once and reuses downloaded pieces.
 async fn vod_stream(
     State(s): State<AppState>,
     Path((network, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(provider) = s.manager.provider(&network) else {
-        return (StatusCode::NOT_FOUND, "unknown network").into_response();
-    };
-    let vod = match provider.resolve_vod(&id).await {
+    let vod = match resolve_vod(&s, &network, &id).await {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+        Err(resp) => return resp,
     };
     let total = vod.content_length();
     if total == 0 {
@@ -255,6 +254,78 @@ fn vod_partial_response(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(vod_body(source))
         .expect("valid vod partial response")
+        .into_response()
+}
+
+/// Resolve `id` on `network` to a single-file VOD via the manager's shared cache, or the HTTP
+/// error response to return: `404` for an unknown network, `502` if resolution fails.
+async fn resolve_vod(
+    s: &AppState,
+    network: &str,
+    id: &str,
+) -> Result<Arc<dyn VodContent>, Response> {
+    match s.manager.resolve_vod(network, id).await {
+        Ok(v) => Ok(v),
+        Err(ProviderError::NotFound) => {
+            Err((StatusCode::NOT_FOUND, "unknown network").into_response())
+        }
+        Err(e) => Err((StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response()),
+    }
+}
+
+/// `GET /vod/{network}/{id}/manifest.m3u8` — a static VOD HLS media playlist for the resolved
+/// single-file VOD. The whole file's length is known, so the playlist lists every byte-range
+/// segment up front and ends with `#EXT-X-ENDLIST`; segments are fetched lazily via
+/// [`vod_hls_segment`]. Segment geometry comes from the shared HLS config (same knobs as live).
+async fn vod_manifest(
+    State(s): State<AppState>,
+    Path((network, id)): Path<(String, String)>,
+) -> Response {
+    let vod = match resolve_vod(&s, &network, &id).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let layout = crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config());
+    (
+        [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+        layout.playlist(&network, &id),
+    )
+        .into_response()
+}
+
+/// `GET /vod/{network}/{id}/seg/{n}.ts` — HLS segment `n` of the resolved VOD, served as the
+/// verified byte range the [`VodHlsLayout`](crate::hls::VodHlsLayout) assigns to it. A segment
+/// index past the last segment (or a malformed name) 404s.
+async fn vod_hls_segment(
+    State(s): State<AppState>,
+    Path((network, id, seg)): Path<(String, String, String)>,
+) -> Response {
+    let Some(index) = seg.strip_suffix(".ts").and_then(|n| n.parse::<u64>().ok()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let vod = match resolve_vod(&s, &network, &id).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let layout = crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config());
+    let Some((start, end)) = layout.segment_range(index) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match vod.open_range(start, end).await {
+        Ok(source) => vod_hls_segment_response(source),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+    }
+}
+
+/// Build a streaming `200` response for one HLS VOD segment (MPEG-TS), advertising its length.
+fn vod_hls_segment_response(source: Box<dyn VodByteSource>) -> Response {
+    let len = source.content_length();
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp2t")
+        .header(header::CONTENT_LENGTH, len)
+        .body(vod_body(source))
+        .expect("valid vod segment response")
         .into_response()
 }
 
@@ -955,6 +1026,107 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes */20");
+    }
+
+    // A memvod router whose HLS segments are `seg_packets` TS packets (188 bytes each), so small
+    // fixtures still span several segments.
+    fn memvod_hls_router(data: Vec<u8>, seg_packets: usize) -> Router {
+        let mut r = ProviderRegistry::new();
+        r.register(std::sync::Arc::new(MemVodProvider { data }));
+        let hls = crate::config::HlsConfig {
+            segment_packets: seg_packets,
+            window_segments: 6,
+            segment_duration_ms: 2000,
+        };
+        router(AppState {
+            manager: StreamManager::with_config(r, 256, hls),
+            networks: vec!["memvod".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            experimental_ace_compat: false,
+            broadcasts: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn vod_manifest_serves_a_terminated_vod_playlist() {
+        // 450 bytes over 188-byte (1-packet) segments => 3 segments.
+        let resp = memvod_hls_router(vec![0u8; 450], 1)
+            .oneshot(
+                Request::get("/vod/memvod/x/manifest.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(text.contains("/vod/memvod/x/seg/0.ts"));
+        assert!(text.contains("/vod/memvod/x/seg/2.ts"));
+        assert!(!text.contains("/vod/memvod/x/seg/3.ts"));
+        assert!(text.trim_end().ends_with("#EXT-X-ENDLIST"));
+    }
+
+    #[tokio::test]
+    async fn vod_hls_segment_serves_its_verified_byte_range_as_ts() {
+        let data: Vec<u8> = (0..255u8).cycle().take(450).collect();
+        // Segment 1 covers bytes [188, 376).
+        let resp = memvod_hls_router(data.clone(), 1)
+            .oneshot(
+                Request::get("/vod/memvod/x/seg/1.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "video/mp2t");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "188");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[188..376]);
+    }
+
+    #[tokio::test]
+    async fn vod_hls_final_segment_is_clamped_to_the_last_byte() {
+        let data: Vec<u8> = (0..255u8).cycle().take(450).collect();
+        // 450 bytes => final segment 2 covers [376, 450): 74 bytes.
+        let resp = memvod_hls_router(data.clone(), 1)
+            .oneshot(
+                Request::get("/vod/memvod/x/seg/2.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "74");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[376..450]);
+    }
+
+    #[tokio::test]
+    async fn vod_hls_segment_past_the_end_404s() {
+        let resp = memvod_hls_router(vec![0u8; 450], 1)
+            .oneshot(
+                Request::get("/vod/memvod/x/seg/99.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
