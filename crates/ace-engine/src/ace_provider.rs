@@ -1922,11 +1922,21 @@ async fn follow_peer_pool(
                 // Peer-exchange gossip: connect to peers we don't already have and feed the
                 // successes into the same pool-add path as the background refill, so a stalled
                 // pool has fresh, swarm-sourced upstreams to fall back on (notes 41-43).
+                // Rank the advertised peers by their advertised live window first, so the
+                // limited `max_parallel_connect` attempts prefer peers that can already serve
+                // the piece we still need (#2) before peers whose window is unknown or behind.
                 if peers.len() < live_recovery.max_active_upstreams {
-                    let advertised = ace_wire::peer_exchange::parse_peer_exchange(payload);
+                    let advertised = ace_wire::peer_exchange::parse_peer_exchange_detailed(payload);
                     let total = advertised.len();
+                    let next_needed = continuity.reasm.next_needed();
+                    let covering = advertised
+                        .iter()
+                        .filter(|p| p.window.is_some_and(|w| w.covers(next_needed)))
+                        .count();
+                    let ranked =
+                        ace_wire::peer_exchange::rank_by_window_coverage(&advertised, next_needed);
                     let spawned = harvest_peers(
-                        &advertised,
+                        &ranked,
                         &peers,
                         &mut pex_tried,
                         info.infohash,
@@ -1935,7 +1945,7 @@ async fn follow_peer_pool(
                     );
                     if spawned > 0 {
                         crate::alog!(
-                            "[ace] peer-exchange from {addr}: {spawned} new peer(s) to try (of {total} advertised)"
+                            "[ace] peer-exchange from {addr}: {spawned} new peer(s) to try (of {total} advertised, {covering} covering piece {next_needed})"
                         );
                     }
                 }
