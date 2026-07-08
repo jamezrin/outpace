@@ -36,7 +36,7 @@ impl HlsPackager {
                 segments: VecDeque::new(),
                 cur: Vec::new(),
             }),
-            seg_packets: config.segment_packets,
+            seg_packets: config.segment_packets.max(1),
             window: config.window_segments,
             seg_duration: config.segment_duration_secs(),
         })
@@ -167,5 +167,16 @@ mod tests {
         assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:1"));
         assert!(p.segment(0).is_none());
         assert_eq!(p.segment(2).unwrap().len(), TS_PACKET);
+    }
+
+    #[test]
+    fn zero_segment_packets_is_normalized_at_construction() {
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 0,
+            window_segments: 2,
+            segment_duration_ms: 1000,
+        });
+
+        assert_eq!(p.seg_packets, 1);
     }
 }

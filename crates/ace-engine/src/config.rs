@@ -6,6 +6,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub const MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS: usize = 256;
+pub const MAX_LIVE_RECOVERY_PARALLEL_CONNECT: usize = 1024;
+pub const MAX_LIVE_RECOVERY_PIECE_ADVANCE: u64 = 16_384;
+pub const MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD: u64 = 65_536;
+
 /// Where the seed store (`PieceStore`) keeps piece data. Mirrors Acestream's
 /// `--live-cache-type`. The disk backend trades RAM for capacity; both honor the same
 /// `seed_store_bytes` budget.
@@ -86,6 +91,26 @@ impl LiveRecoveryConfig {
         }
         if self.max_piece_advance == 0 {
             return Err("OUTPACE_MAX_PIECE_ADVANCE must be >= 1".into());
+        }
+        if self.max_active_upstreams > MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS {
+            return Err(format!(
+                "OUTPACE_MAX_ACTIVE_UPSTREAMS must be <= {MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS}"
+            ));
+        }
+        if self.max_parallel_connect > MAX_LIVE_RECOVERY_PARALLEL_CONNECT {
+            return Err(format!(
+                "OUTPACE_MAX_PARALLEL_CONNECT must be <= {MAX_LIVE_RECOVERY_PARALLEL_CONNECT}"
+            ));
+        }
+        if self.max_piece_advance > MAX_LIVE_RECOVERY_PIECE_ADVANCE {
+            return Err(format!(
+                "OUTPACE_MAX_PIECE_ADVANCE must be <= {MAX_LIVE_RECOVERY_PIECE_ADVANCE}"
+            ));
+        }
+        if self.max_reasm_pieces_ahead > MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD {
+            return Err(format!(
+                "OUTPACE_MAX_REASM_PIECES_AHEAD must be <= {MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD}"
+            ));
         }
         if self.max_reasm_pieces_ahead < self.max_piece_advance {
             return Err(
@@ -256,6 +281,54 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_recovery_rejects_oversized_allocation_bounds() {
+        let mut config = LiveRecoveryConfig {
+            max_active_upstreams: usize::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("OUTPACE_MAX_ACTIVE_UPSTREAMS")
+        );
+
+        config = LiveRecoveryConfig {
+            max_parallel_connect: usize::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("OUTPACE_MAX_PARALLEL_CONNECT")
+        );
+
+        config = LiveRecoveryConfig {
+            max_piece_advance: u64::MAX,
+            max_reasm_pieces_ahead: u64::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("OUTPACE_MAX_PIECE_ADVANCE")
+        );
+
+        config = LiveRecoveryConfig {
+            max_reasm_pieces_ahead: u64::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("OUTPACE_MAX_REASM_PIECES_AHEAD")
+        );
+    }
 
     #[test]
     fn identity_is_stable_across_loads() {

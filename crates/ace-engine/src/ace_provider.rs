@@ -1148,6 +1148,7 @@ impl Continuity {
 
     fn arm_output_gate(&mut self) {
         self.output_gate = Some(ace_media::mpegts::KeyframeGate::new());
+        self.resync = ace_media::mpegts::TsResync::new();
     }
 
     fn filter_output_after_discontinuity(&mut self, aligned: Vec<u8>) -> Vec<u8> {
@@ -1330,6 +1331,19 @@ fn abort_refill(handle: &mut Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+fn recovery_channel_capacities(
+    live_recovery: LiveRecoveryConfig,
+) -> Result<(usize, usize), String> {
+    live_recovery.validate()?;
+    let event_capacity = live_recovery
+        .max_active_upstreams
+        .checked_mul(32)
+        .ok_or_else(|| {
+            "OUTPACE_MAX_ACTIVE_UPSTREAMS event channel capacity overflowed".to_string()
+        })?;
+    Ok((event_capacity, live_recovery.max_active_upstreams))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn follow_peer_pool(
     upstreams: Vec<ConnectedUpstream>,
@@ -1379,8 +1393,15 @@ async fn follow_peer_pool(
     };
     let continuity = continuity.as_mut().expect("initialized just above");
     let live_recovery = continuity.live_recovery;
-    let (event_tx, mut event_rx) = mpsc::channel(live_recovery.max_active_upstreams * 32);
-    let (refill_tx, mut refill_rx) = mpsc::channel(live_recovery.max_active_upstreams);
+    let (event_capacity, refill_capacity) = match recovery_channel_capacities(live_recovery) {
+        Ok(capacities) => capacities,
+        Err(err) => {
+            crate::alog!("[ace] invalid live recovery configuration: {err}");
+            return FollowEnd::ConsumerGone;
+        }
+    };
+    let (event_tx, mut event_rx) = mpsc::channel(event_capacity);
+    let (refill_tx, mut refill_rx) = mpsc::channel(refill_capacity);
     // A live-held clone of the refill sender so peers learned from `id=12` peer-exchange
     // gossip can be connected and fed into the same pool-add path (keeps `refill_rx` open
     // even after the background refill task finishes).
@@ -2391,6 +2412,21 @@ mod tests {
         LiveRecoveryConfig::default()
     }
 
+    #[test]
+    fn recovery_channel_capacities_are_checked() {
+        let policy = LiveRecoveryConfig {
+            max_active_upstreams: 2,
+            ..LiveRecoveryConfig::default()
+        };
+        assert_eq!(recovery_channel_capacities(policy).unwrap(), (64, 2));
+
+        let invalid = LiveRecoveryConfig {
+            max_active_upstreams: usize::MAX,
+            ..LiveRecoveryConfig::default()
+        };
+        assert!(recovery_channel_capacities(invalid).is_err());
+    }
+
     #[tokio::test]
     async fn network_is_ace() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
@@ -3019,6 +3055,36 @@ mod tests {
         c.resume("127.0.0.1:1".parse().unwrap(), 170, 200);
 
         assert!(c.output_gate_armed());
+    }
+
+    #[test]
+    fn arming_output_gate_discards_buffered_pre_gap_ts_bytes() {
+        const TS_PACKET: usize = 188;
+
+        fn packet(fill: u8) -> Vec<u8> {
+            let mut bytes = vec![fill; TS_PACKET];
+            bytes[0] = 0x47;
+            bytes
+        }
+
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
+        assert!(
+            c.resync.push(&packet(0x11)).is_empty(),
+            "one packet is buffered until lookahead confirms sync"
+        );
+
+        c.arm_output_gate();
+        let post_gap = [packet(0x22), packet(0x33)].concat();
+        let aligned = c.resync.push(&post_gap);
+
+        assert_eq!(aligned.len(), TS_PACKET);
+        assert_eq!(aligned[1], 0x22);
     }
 
     #[test]

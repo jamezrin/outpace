@@ -166,11 +166,13 @@ Environment variables parsed by the daemon include:
   default `12000`.
 - `OUTPACE_REQUEST_CHECK_INTERVAL_MS` - request timeout sweep interval, default `1000`; must be
   lower than or equal to `OUTPACE_REQUEST_TIMEOUT_MS`.
-- `OUTPACE_MAX_ACTIVE_UPSTREAMS` - active upstream peer cap for one live follower, default `4`.
-- `OUTPACE_MAX_PARALLEL_CONNECT` - peer connect race batch size, default `12`.
-- `OUTPACE_MAX_PIECE_ADVANCE` - max pieces scheduled in one forward step, default `256`.
+- `OUTPACE_MAX_ACTIVE_UPSTREAMS` - active upstream peer cap for one live follower, default `4`;
+  max `256`.
+- `OUTPACE_MAX_PARALLEL_CONNECT` - peer connect race batch size, default `12`; max `1024`.
+- `OUTPACE_MAX_PIECE_ADVANCE` - max pieces scheduled in one forward step, default `256`;
+  max `16384`.
 - `OUTPACE_MAX_REASM_PIECES_AHEAD` - max pieces accepted ahead of the emit cursor, default `512`;
-  must be at least `OUTPACE_MAX_PIECE_ADVANCE`.
+  must be at least `OUTPACE_MAX_PIECE_ADVANCE`, max `65536`.
 - `OUTPACE_HLS_SEGMENT_PACKETS` - MPEG-TS packets per HLS segment, default `256`.
 - `OUTPACE_HLS_WINDOW_SEGMENTS` - retained HLS live window size, default `6`.
 - `OUTPACE_HLS_SEGMENT_DURATION_MS` - advertised HLS segment duration, default `1000`.
