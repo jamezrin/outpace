@@ -9,7 +9,7 @@
 //!     for the pure decode half. The ut_metadata exchange is the remaining live-gated step
 //!     (documented in the design spec).
 
-use crate::types::StreamInfo;
+use crate::types::{StreamInfo, VodInfo};
 use ace_peer::session::PeerSession;
 use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
@@ -101,6 +101,34 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
         } else {
             Vec::new()
         },
+    })
+}
+
+/// Build a [`VodInfo`] from raw `AceStreamTransport` bytes (the pure half of VOD resolution).
+///
+/// Errors if the descriptor is live (no `pieces`), advertises a multi-file layout (`files`
+/// present — intentionally unsupported), fails geometry validation, or lacks a single-file
+/// `length`.
+pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
+    let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    if d.is_live {
+        return Err(ResolveError::Transport("not a VOD transport (no pieces)"));
+    }
+    if d.is_multifile() {
+        return Err(ResolveError::Transport("multi-file VOD is not supported"));
+    }
+    validate_geometry(d.piece_length, d.chunk_length)?;
+    let total_length = d
+        .vod_total_length()
+        .ok_or(ResolveError::Transport("VOD descriptor missing length"))?;
+    Ok(VodInfo {
+        infohash: infohash_of_descriptor(&d.raw)
+            .map_err(|_| ResolveError::Transport("infohash failed"))?,
+        piece_length: d.piece_length,
+        chunk_length: d.chunk_length,
+        trackers: d.trackers,
+        piece_hashes: d.pieces,
+        total_length,
     })
 }
 
@@ -576,6 +604,66 @@ pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, Res
 mod tests {
     use super::*;
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+
+    fn vod_transport(pieces_bytes: usize, length: Option<i64>, multifile: bool) -> Vec<u8> {
+        use ace_wire::bencode::Bencode;
+        use std::collections::BTreeMap;
+        let mut d = BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"movie".to_vec()));
+        // Fields the infohash formula requires (name/authmethod/pubkey/piece_length/
+        // chunk_length/bitrate — see infohash_of_descriptor).
+        d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"None".to_vec()));
+        d.insert(b"pubkey".to_vec(), Bencode::Bytes(vec![]));
+        d.insert(b"bitrate".to_vec(), Bencode::Int(100000));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(131072));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16384));
+        if let Some(len) = length {
+            d.insert(b"length".to_vec(), Bencode::Int(len));
+        }
+        if pieces_bytes > 0 {
+            d.insert(b"pieces".to_vec(), Bencode::Bytes(vec![7u8; pieces_bytes]));
+        }
+        if multifile {
+            d.insert(b"files".to_vec(), Bencode::List(vec![]));
+        }
+        ace_wire::transport::encode_transport(&Bencode::Dict(d))
+    }
+
+    #[test]
+    fn vod_info_from_single_file_transport() {
+        let tf = vod_transport(60, Some(300000), false); // 3 pieces, single-file
+        let info = vod_info_from_transport(&tf).unwrap();
+        assert_eq!(info.piece_hashes.len(), 3);
+        assert_eq!(info.total_length, 300000);
+        assert_eq!(info.piece_size(2), 300000 - 2 * 131072);
+    }
+
+    #[test]
+    fn vod_info_rejects_live_transport() {
+        let tf = vod_transport(0, None, false); // no pieces => live
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn vod_info_rejects_multifile() {
+        let tf = vod_transport(20, Some(1000), true);
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn vod_info_rejects_missing_length() {
+        let tf = vod_transport(20, None, false);
+        assert!(matches!(
+            vod_info_from_transport(&tf),
+            Err(ResolveError::Transport(_))
+        ));
+    }
 
     #[test]
     fn ssrf_guard_rejects_unsafe_ip_literals() {
