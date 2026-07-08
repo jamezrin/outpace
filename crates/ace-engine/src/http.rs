@@ -3,6 +3,7 @@
 
 use crate::broadcast::BroadcastRegistry;
 use crate::manager::StreamManager;
+use crate::provider::VodByteSource;
 use crate::session::StreamSession;
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::resolve_via_catalog;
@@ -86,6 +87,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/streams/:network/:id/status", get(stream_status))
         .route("/streams/:network/:id/seg/:seg", get(stream_segment))
+        .route("/vod/:network/:id", get(vod_stream))
         .route(
             "/broadcast/:name",
             put(broadcast_ingest)
@@ -100,6 +102,39 @@ pub fn router(state: AppState) -> Router {
             .route("/ace/cmd/:id/:token", get(ace_command));
     }
     router.with_state(state)
+}
+
+/// `GET /vod/{network}/{id}` — resolve `id` as a single-file VOD, then stream its verified
+/// bytes with a `Content-Length`. VOD is a one-shot download (not a shared live session), so
+/// this resolves the provider directly instead of going through the session manager.
+async fn vod_stream(
+    State(s): State<AppState>,
+    Path((network, id)): Path<(String, String)>,
+) -> Response {
+    let Some(provider) = s.manager.provider(&network) else {
+        return (StatusCode::NOT_FOUND, "unknown network").into_response();
+    };
+    match provider.open_vod(&id).await {
+        Ok(source) => vod_response_from_source(source),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+    }
+}
+
+/// Build a streaming `200` response from a [`VodByteSource`], advertising its total length.
+fn vod_response_from_source(source: Box<dyn VodByteSource>) -> Response {
+    let total = source.content_length();
+    let stream = futures::stream::unfold(source, |mut src| async move {
+        src.next()
+            .await
+            .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), src))
+    });
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_LENGTH, total)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from_stream(stream))
+        .expect("valid vod response")
+        .into_response()
 }
 
 /// `GET /broadcast/{name}` — the minted broadcast's raw transport-file bytes (the
@@ -579,6 +614,36 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use bytes::Bytes;
     use tower::ServiceExt;
+
+    struct FakeVod {
+        chunks: std::collections::VecDeque<Bytes>,
+        total: u64,
+    }
+
+    #[async_trait]
+    impl VodByteSource for FakeVod {
+        fn content_length(&self) -> u64 {
+            self.total
+        }
+        async fn next(&mut self) -> Option<Bytes> {
+            self.chunks.pop_front()
+        }
+    }
+
+    #[tokio::test]
+    async fn vod_response_streams_body_with_content_length() {
+        let src = FakeVod {
+            chunks: [Bytes::from_static(b"abc"), Bytes::from_static(b"de")]
+                .into_iter()
+                .collect(),
+            total: 5,
+        };
+        let resp = vod_response_from_source(Box::new(src));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "5");
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"abcde");
+    }
 
     fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs

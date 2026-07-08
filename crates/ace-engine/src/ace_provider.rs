@@ -345,7 +345,7 @@ impl AceProvider {
     /// Resolve `id` to a single-file VOD and start a verified download, returning a
     /// [`VodByteSource`] that emits SHA-1-verified content bytes in order. Errors if the id
     /// is live, multi-file, or carries no VOD descriptor (a bare infohash has no piece hashes).
-    pub async fn open_vod(&self, id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
+    async fn open_vod_inner(&self, id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
         let vod = self.resolve_vod_info(id).await?;
         // VOD swarms are standard BitTorrent; discover the same way live does.
         let peers = if self.bootstrap_peers.is_empty() {
@@ -479,6 +479,10 @@ impl TsSource for AceSource {
 impl StreamProvider for AceProvider {
     fn network(&self) -> &'static str {
         "ace"
+    }
+
+    async fn open_vod(&self, id: &str) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        self.open_vod_inner(id).await
     }
 
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
