@@ -142,15 +142,22 @@ The container defaults to `outpace serve`. It sets `OUTPACE_BIND=0.0.0.0:6878`,
 
 ## Cutting a Release
 
-The release version is driven by a git tag named `vX.Y.Z`. Before tagging, update
-the Cargo crate versions to match the release.
+The release version is the Cargo package version: the workspace crates inherit a
+single `version` from `[workspace.package]` in the root `Cargo.toml`, and that is
+the version `outpace --version` reports. The git tag is only a validated trigger.
+
+First bump the shared version, then tag it with a leading `v`:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+# edit [workspace.package] version in Cargo.toml, e.g. to 0.2.0, then:
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-Pushing the tag runs `.github/workflows/release.yml`, which:
+Pushing the tag runs `.github/workflows/release.yml`. It reads the version from
+`cargo metadata` and fails the release before building anything if the tag does
+not match `v<cargo_version>`, so artifact names and Docker tags always agree with
+the Cargo version. The workflow:
 
 - builds Linux, macOS, and Windows binaries for amd64 and arm64;
 - uploads `tar.gz` archives for Unix targets and `zip` archives for Windows;

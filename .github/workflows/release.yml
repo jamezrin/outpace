@@ -16,34 +16,45 @@ env:
 
 jobs:
   release-metadata:
-    name: Classify release tag
+    name: Validate release tag against Cargo metadata
     runs-on: ubuntu-24.04
     outputs:
-      stable: ${{ steps.release.outputs.stable }}
       version: ${{ steps.release.outputs.version }}
 
     steps:
-      - name: Derive release version
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read Cargo version and validate release tag
         id: release
         shell: bash
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
 
-          if [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            echo "stable=true" >> "$GITHUB_OUTPUT"
-            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "stable=false" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping non-stable release tag: ${tag}"
+          cargo_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "ace-engine") | .version')"
+
+          if [[ -z "$cargo_version" || "$cargo_version" == "null" ]]; then
+            echo "::error::Could not read the ace-engine version from cargo metadata."
+            exit 1
           fi
+
+          tag="$GITHUB_REF_NAME"
+          expected="v${cargo_version}"
+          if [[ "$tag" != "$expected" ]]; then
+            echo "::error::Release tag ${tag} does not match the Cargo version (expected ${expected}). Update the [workspace.package] version in Cargo.toml or retag."
+            exit 1
+          fi
+
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+          echo "Release version (from Cargo metadata): ${cargo_version}"
 
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     needs: release-metadata
-    if: needs.release-metadata.outputs.stable == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -126,7 +137,6 @@ jobs:
     needs:
       - release-metadata
       - build-binaries
-    if: needs.release-metadata.outputs.stable == 'true'
     permissions:
       contents: write
 
@@ -161,7 +171,6 @@ jobs:
     name: Publish GHCR image
     runs-on: ubuntu-24.04
     needs: release-metadata
-    if: needs.release-metadata.outputs.stable == 'true'
     permissions:
       contents: read
       packages: write
@@ -187,8 +196,8 @@ jobs:
           labels: |
             org.opencontainers.image.licenses=AGPL-3.0-or-later
           tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ needs.release-metadata.outputs.stable == 'true' }}
+            type=raw,value=${{ needs.release-metadata.outputs.version }}
+            type=raw,value=latest
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
