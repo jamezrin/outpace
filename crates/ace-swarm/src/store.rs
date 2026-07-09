@@ -243,6 +243,15 @@ impl PieceStore {
     /// placeholder so old call sites remain compatible while relay/source paths preserve real
     /// headers.
     pub fn put_chunk_with_header(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) {
+        // Chunk indices arrive straight off the wire (id=7). Drop any index outside the piece's
+        // geometry so a stray value can't sit in the chunk map — inflating its length so
+        // `has_piece` never counts the piece complete (it would then never be reseeded) and
+        // wasting byte budget that should hold real reseed data (issue #91). A valid chunk index
+        // is always < chunks_per_piece, even for a short final piece (which has fewer chunks).
+        // Compared as u64 to avoid the u16 truncation in `chunks_per_piece`.
+        if (chunk as u64) >= self.piece_length / self.chunk_length {
+            return;
+        }
         let stored = self.backend.put(piece, chunk, header, data);
         self.cur_bytes -= stored.removed;
         self.cur_bytes += stored.added;
@@ -310,6 +319,29 @@ mod tests {
         s.put_chunk(5, 1, &[5, 6, 7, 8]);
         assert!(s.has_piece(5));
         assert_eq!(s.have_pieces(), vec![5]);
+    }
+
+    #[test]
+    fn ignores_a_chunk_index_outside_the_piece_geometry() {
+        // Chunk indices come straight off the wire (id=7). A stray out-of-range index must not
+        // enter the piece's chunk map: otherwise it inflates the map length so `has_piece`
+        // never counts the piece complete (it would never be reseeded) and it wastes byte
+        // budget that should hold real reseed data (issue #91).
+        let mut s = store(1024);
+        assert_eq!(s.chunks_per_piece(), 2); // valid chunk indices are 0 and 1
+        s.put_chunk(5, 0, &[1, 2, 3, 4]);
+        s.put_chunk(5, 99, &[9, 9, 9, 9]); // bogus index from a hostile/buggy peer
+        s.put_chunk(5, 1, &[5, 6, 7, 8]);
+        assert!(
+            s.has_piece(5),
+            "a stray chunk index must not block the piece from completing"
+        );
+        assert_eq!(s.have_pieces(), vec![5]);
+        assert_eq!(
+            s.chunk(5, 99),
+            None,
+            "the out-of-range chunk must never be stored"
+        );
     }
 
     #[test]
