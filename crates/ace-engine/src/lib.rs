@@ -20,6 +20,7 @@ pub mod routes;
 pub mod rtmp;
 pub mod rtmp_ts;
 pub mod runtime;
+pub mod server_api;
 pub mod session;
 pub mod testprovider;
 pub mod transport_url;

@@ -182,6 +182,14 @@ On that compatibility surface, `/ace/stat` fields live under `.response`, and
 `/ace/getstream` also accepts `url=` (transport-file URL) and `magnet=` selectors,
 with the same `content_id` > `infohash` > `url` > `magnet` precedence as the CLI.
 
+`/server/api` serves a targeted subset of the engine's JSON control API, dispatched
+on `?method=` and wrapped in a `{ "result", "error" }` envelope (note the `result`
+key, distinct from `/ace/*`'s `response`): `get_version`, `get_status`,
+`get_network_connection_status`, `analyze_content`, `get_content_id`, and
+`get_media_files`. The supported routes/methods, intentionally rejected surface, and
+deferred work are documented in
+[`docs/protocol/compat-matrix.md`](docs/protocol/compat-matrix.md).
+
 ## Configuration
 
 Environment variables parsed by the daemon include:
