@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(
     name = "outpace",
+    version,
     about = "Broadcast and play Acestream-compatible live streams"
 )]
 pub struct Cli {

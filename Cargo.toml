@@ -3,5 +3,6 @@ members = ["crates/ace-wire", "crates/ace-tracker", "crates/ace-peer", "crates/a
 resolver = "2"
 
 [workspace.package]
+version = "0.1.0"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/jamezrin/outpace"
