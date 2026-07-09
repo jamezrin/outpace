@@ -6,7 +6,7 @@ use crate::manager::StreamManager;
 use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::StreamSession;
 use ace_swarm::listen::SeedRegistry;
-use ace_swarm::resolve::{infohash_hex, resolve_via_catalog};
+use ace_swarm::resolve::{infohash_hex, resolve_via_catalog, stream_info_from_transport_url};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -101,7 +101,8 @@ pub fn router(state: AppState) -> Router {
             .route("/ace/getstream", get(ace_getstream))
             .route("/ace/r/:id/:token", get(ace_playback))
             .route("/ace/stat/:id/:token", get(ace_stat))
-            .route("/ace/cmd/:id/:token", get(ace_command));
+            .route("/ace/cmd/:id/:token", get(ace_command))
+            .route("/server/api", get(server_api));
     }
     router.with_state(state)
 }
@@ -556,6 +557,89 @@ async fn ace_command(
         return Json(json!({ "response": "ok", "error": null }));
     }
     Json(json!({ "response": null, "error": "missing method" }))
+}
+
+/// `GET /server/api` — the official-engine JSON control API (compatibility subset). Dispatches on
+/// `?method=` and always answers HTTP 200 with a `{ "result", "error" }` envelope (note 10). Only
+/// the methods in [`crate::server_api::Method`] are served; see `docs/protocol/compat-matrix.md`.
+async fn server_api(
+    State(s): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    use crate::server_api as api;
+
+    let method = params.get("method").map(String::as_str).unwrap_or("");
+    let body = match api::parse_method(method) {
+        api::Method::GetVersion => api::ok(api::version_result()),
+        api::Method::GetStatus => api::ok(api::status_result(s.manager.list().await.len())),
+        api::Method::GetNetworkConnectionStatus => api::ok(api::network_status_result(&s.networks)),
+        // `get_content_id` only echoes an id the caller already gave; it can't derive one from a
+        // bare infohash/url, so it never resolves.
+        api::Method::GetContentId => match api::selector(&params) {
+            api::Selector::ContentId(cid) => api::ok(api::content_id_result(&cid)),
+            api::Selector::Missing => api::err("missing content_id"),
+            _ => api::err("content_id unavailable for this selector"),
+        },
+        method @ (api::Method::AnalyzeContent | api::Method::GetMediaFiles) => {
+            match resolve_server_api_selector(&s, api::selector(&params)).await {
+                Ok(content) => match method {
+                    api::Method::AnalyzeContent => api::ok(api::analyze_result(&content)),
+                    api::Method::GetMediaFiles => api::ok(api::media_files_result(&content)),
+                    _ => unreachable!("outer match restricts these two variants"),
+                },
+                Err(e) => api::err(e),
+            }
+        }
+        api::Method::Unknown(name) => api::err(format!("unknown method: {name}")),
+    };
+    Json(body)
+}
+
+/// Resolve a `/server/api` content [`crate::server_api::Selector`] to its infohash. Direct
+/// infohashes and magnets resolve offline; `content_id`/`url` need a catalog/transport fetch,
+/// which is gated by the same `resolve_content_ids_in_getstream` switch tests use to stay offline
+/// (production enables it). A best-effort failure is reported in-band, never as an HTTP error.
+async fn resolve_server_api_selector(
+    s: &AppState,
+    sel: crate::server_api::Selector,
+) -> Result<crate::server_api::ResolvedContent, String> {
+    use crate::server_api::{ResolvedContent, Selector};
+
+    if let Some(resolved) = crate::server_api::resolve_offline(&sel) {
+        return resolved;
+    }
+    match sel {
+        Selector::ContentId(cid) => {
+            if !s.resolve_content_ids_in_getstream {
+                return Err("content-id catalog resolution is disabled".to_string());
+            }
+            match resolve_via_catalog(&cid).await {
+                Ok(info) => Ok(ResolvedContent {
+                    infohash: infohash_hex(&info.infohash),
+                    content_id: Some(cid),
+                    is_live: true,
+                }),
+                Err(e) => Err(format!("content-id resolution failed: {e:?}")),
+            }
+        }
+        Selector::Url(url) => {
+            if !s.resolve_content_ids_in_getstream {
+                return Err("transport-url resolution is disabled".to_string());
+            }
+            match stream_info_from_transport_url(&url).await {
+                Ok(info) => Ok(ResolvedContent {
+                    infohash: infohash_hex(&info.infohash),
+                    content_id: None,
+                    is_live: true,
+                }),
+                Err(e) => Err(format!("transport-url resolution failed: {e:?}")),
+            }
+        }
+        Selector::Missing => Err("missing content_id/infohash/url/magnet".to_string()),
+        Selector::Infohash(_) | Selector::Magnet(_) => {
+            unreachable!("infohash/magnet selectors resolve offline")
+        }
+    }
 }
 
 struct AceStreamSelection {
@@ -2003,5 +2087,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(del2.status(), StatusCode::NO_CONTENT);
+    }
+
+    async fn server_api_json(state: AppState, query: &str) -> (StatusCode, serde_json::Value) {
+        let resp = router(state)
+            .oneshot(
+                Request::get(format!("/server/api?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn server_api_get_version_returns_the_result_envelope() {
+        let (status, json) = server_api_json(ace_compat_state(0), "method=get_version").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["result"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn server_api_analyze_content_echoes_a_direct_infohash_lowercased() {
+        let upper = "50E93529D3EB46A50506B14464185A15292D6E47";
+        let (status, json) = server_api_json(
+            ace_compat_state(0),
+            &format!("method=analyze_content&infohash={upper}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["result"]["infohash"], upper.to_lowercase());
+        assert_eq!(json["result"]["is_live"], 1);
+    }
+
+    #[tokio::test]
+    async fn server_api_get_content_id_echoes_the_supplied_content_id() {
+        let (_, json) = server_api_json(
+            ace_compat_state(0),
+            "method=get_content_id&content_id=abc123",
+        )
+        .await;
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["result"]["content_id"], "abc123");
+    }
+
+    #[tokio::test]
+    async fn server_api_get_content_id_errors_when_it_cannot_be_derived() {
+        let (status, json) = server_api_json(
+            ace_compat_state(0),
+            "method=get_content_id&infohash=50e93529d3eb46a50506b14464185a15292d6e47",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["result"], serde_json::Value::Null);
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn server_api_get_media_files_lists_the_infohash_file() {
+        let ih = "aa".repeat(20);
+        let (_, json) = server_api_json(
+            ace_compat_state(0),
+            &format!("method=get_media_files&infohash={ih}"),
+        )
+        .await;
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["result"]["files"][0]["infohash"], ih);
+    }
+
+    #[tokio::test]
+    async fn server_api_get_network_connection_status_reports_connected() {
+        let (_, json) =
+            server_api_json(ace_compat_state(0), "method=get_network_connection_status").await;
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["result"]["connected"], true);
+    }
+
+    #[tokio::test]
+    async fn server_api_unknown_method_returns_error_with_http_200() {
+        let (status, json) =
+            server_api_json(ace_compat_state(0), "method=get_available_channels").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["result"], serde_json::Value::Null);
+        assert!(json["error"].as_str().unwrap().contains("unknown method"));
+    }
+
+    #[tokio::test]
+    async fn server_api_analyze_content_without_a_selector_errors() {
+        let (_, json) = server_api_json(ace_compat_state(0), "method=analyze_content").await;
+        assert_eq!(json["result"], serde_json::Value::Null);
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn server_api_content_id_resolution_errors_when_catalog_lookup_is_disabled() {
+        // ace_compat_state keeps resolve_content_ids_in_getstream = false, so a content_id that
+        // needs a live catalog lookup returns a structured error instead of touching the network.
+        let (status, json) = server_api_json(
+            ace_compat_state(0),
+            "method=analyze_content&content_id=2123456789abcdef0123456789abcdef01234567",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["result"], serde_json::Value::Null);
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn server_api_is_gated_by_experimental_ace_compat() {
+        // fixture_state leaves the compat surface off, so /server/api is not routed at all.
+        let (status, _) = server_api_json(fixture_state(0), "method=get_version").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
