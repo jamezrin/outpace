@@ -5,7 +5,7 @@ use ace_peer::Result;
 use ace_wire::bencode::Bencode;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::identity::Identity;
-use ace_wire::live_codec::{build_piece, live_bitfield, reject_chunk_request};
+use ace_wire::live_codec::{build_piece, live_bitfield, live_have, reject_chunk_request};
 use ace_wire::message::PeerMessage;
 use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,12 @@ use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::sync::Mutex;
+
+/// How often a serve loop re-checks the shared store for newly completed pieces to advertise as
+/// id=4 live-HAVEs. Live pieces complete on the order of ~1 s apart, so a sub-second poll keeps a
+/// connected consumer's request frontier advancing without meaningful latency; each check is a
+/// cheap locked `have_pieces()` read.
+const LIVE_EDGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub struct SeederSession;
 
@@ -95,10 +101,23 @@ impl SeederSession {
         });
         let mut unchoked = false;
         let mut advertised_bitfields = false;
+        // Highest piece already advertised to this peer (via the initial `mi`/live bitfield or a
+        // subsequent id=4 HAVE). Set from the same snapshot the bitfield is built from, then
+        // advanced one HAVE per newly completed piece (issue #94).
+        let mut advertised_max: Option<u64> = None;
+        // Poll the shared store for pieces that complete after connect: the serve loop is otherwise
+        // purely reactive to inbound frames, so without this a growing broadcast/reseed store would
+        // never be advertised past the connect-time window.
+        let mut live_edge_poll = tokio::time::interval(LIVE_EDGE_POLL_INTERVAL);
+        live_edge_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let msg = if let Some((_, rx)) = coord_rx.as_mut() {
                 tokio::select! {
                     m = session.read_message() => m?,
+                    _ = live_edge_poll.tick() => {
+                        advance_live_edge(session, &store, advertised_bitfields, &mut advertised_max, debug).await?;
+                        continue;
+                    }
                     changed = rx.changed() => {
                         // Sender dropped (entry/coordinator gone) → end the session cleanly.
                         if changed.is_err() {
@@ -121,7 +140,13 @@ impl SeederSession {
                     }
                 }
             } else {
-                session.read_message().await?
+                tokio::select! {
+                    m = session.read_message() => m?,
+                    _ = live_edge_poll.tick() => {
+                        advance_live_edge(session, &store, advertised_bitfields, &mut advertised_max, debug).await?;
+                        continue;
+                    }
+                }
             };
             if debug {
                 crate::swarm_log!("[seed-session] <- {}", seed_message_summary(&msg));
@@ -129,7 +154,9 @@ impl SeederSession {
             match msg {
                 PeerMessage::Extended { ext_id: 0, .. } if !advertised_bitfields => {
                     if let Some(store) = &store {
-                        advertise_live_bitfields(session, store, debug).await?;
+                        // Seed the live edge from the very snapshot the bitfield advertises, so a
+                        // piece that completes between here and the first poll still gets a HAVE.
+                        advertised_max = advertise_live_bitfields(session, store, debug).await?;
                     }
                     advertised_bitfields = true;
                 }
@@ -216,11 +243,15 @@ impl SeederSession {
     }
 }
 
+/// Advertise every complete piece held right now with Acestream's live bitfield (id=5). Returns the
+/// highest piece advertised (the connect-time live edge), or `None` if the store is empty — the
+/// caller seeds `advertised_max` with it so subsequent id=4 HAVEs pick up exactly where the bitfield
+/// left off.
 async fn advertise_live_bitfields<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut PeerSession<S>,
     store: &Arc<Mutex<PieceStore>>,
     debug: bool,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     let pieces = store.lock().await.have_pieces();
     if debug && !pieces.is_empty() {
         crate::swarm_log!(
@@ -228,6 +259,7 @@ async fn advertise_live_bitfields<S: AsyncRead + AsyncWrite + Unpin>(
             pieces.len()
         );
     }
+    let max = pieces.last().copied();
     let mut ranges = pieces.into_iter().peekable();
     while let Some(first) = ranges.next() {
         let mut last = first;
@@ -236,6 +268,36 @@ async fn advertise_live_bitfields<S: AsyncRead + AsyncWrite + Unpin>(
         }
         let count = (last - first + 1).min(u32::MAX as u64) as u32;
         session.send(&live_bitfield(first as u32, count)).await?;
+    }
+    Ok(max)
+}
+
+/// Advertise pieces that completed after connect as Acestream id=4 live-HAVEs
+/// (`[u32 stream=0][u32 piece]`) — the advancing-head signal a connected consumer needs to keep
+/// requesting past the window it saw at connect (issue #94; the serving-side mirror of note 22). One
+/// HAVE is sent per newly completed piece, in order, and never re-sent: `advertised_max` tracks the
+/// highest piece already advertised (via the initial `mi`/bitfield or a prior HAVE). No-op until the
+/// peer has been bootstrapped with the live bitfield (`advertised`) or when serving without a store.
+async fn advance_live_edge<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+    store: &Option<Arc<Mutex<PieceStore>>>,
+    advertised: bool,
+    advertised_max: &mut Option<u64>,
+    debug: bool,
+) -> Result<()> {
+    let Some(store) = store else { return Ok(()) };
+    if !advertised {
+        return Ok(());
+    }
+    let pieces = store.lock().await.have_pieces();
+    for piece in pieces {
+        if advertised_max.is_none_or(|max| piece > max) {
+            session.send(&live_have(piece as u32)).await?;
+            *advertised_max = Some(piece);
+            if debug {
+                crate::swarm_log!("[seed-session] -> live HAVE piece={piece}");
+            }
+        }
     }
     Ok(())
 }
@@ -1070,6 +1132,99 @@ mod tests {
         let got = peer.await.unwrap();
 
         assert_eq!(got.piece_header, header);
+        serve_task.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_advertises_the_advancing_live_edge_via_id4_have() {
+        // Read the next id=4 live-HAVE, skipping any other frame the seeder may emit.
+        async fn next_live_have(peer: &mut PeerSession<tokio::io::DuplexStream>) -> u32 {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(2), peer.read_message()).await {
+                    Ok(Ok(PeerMessage::Unknown { id: 4, payload })) => {
+                        assert_eq!(payload.len(), 8, "id=4 live-HAVE is 8 bytes");
+                        assert_eq!(
+                            &payload[0..4],
+                            &[0, 0, 0, 0],
+                            "id=4 live-HAVE carries stream index 0"
+                        );
+                        return u32::from_be_bytes([
+                            payload[4], payload[5], payload[6], payload[7],
+                        ]);
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(err)) => panic!("peer read failed before id=4: {err:?}"),
+                    Err(_) => panic!("timed out waiting for an id=4 live-HAVE"),
+                }
+            }
+        }
+
+        // Store starts with a connect-time window of complete pieces 20..=25 (2 chunks each).
+        let store = Arc::new(Mutex::new(PieceStore::new(8, 4, 1 << 20)));
+        for piece in 20..=25u64 {
+            store.lock().await.put_chunk(piece, 0, &[piece as u8; 4]);
+            store.lock().await.put_chunk(piece, 1, &[piece as u8; 4]);
+        }
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let identity = Identity::generate();
+        let mut us = PeerSession::new(server);
+        let serve_store = store.clone();
+        let serve_task = tokio::spawn(async move {
+            let _ = SeederSession::serve(
+                &mut us,
+                Some(serve_store),
+                None,
+                [0u8; 8],
+                &identity,
+                [127, 0, 0, 1],
+                None,
+            )
+            .await;
+        });
+
+        let mut peer = PeerSession::new(client);
+        // Signed extended handshake, then bootstrap the live bitfield with our own handshake.
+        assert!(matches!(
+            peer.read_message().await.unwrap(),
+            PeerMessage::Extended { ext_id: 0, .. }
+        ));
+        peer.send(&PeerMessage::Extended {
+            ext_id: 0,
+            payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            peer.read_message().await.unwrap(),
+            PeerMessage::Bitfield(_)
+        ));
+
+        // A piece completing after connect must be advertised as an id=4 live-HAVE — one per new
+        // piece, in order, and never for a piece already covered by the connect-time bitfield.
+        store.lock().await.put_chunk(26, 0, &[26u8; 4]);
+        store.lock().await.put_chunk(26, 1, &[26u8; 4]);
+        assert_eq!(
+            next_live_have(&mut peer).await,
+            26,
+            "the first HAVE advances past the connect-time window (25), it does not re-advertise it"
+        );
+
+        store.lock().await.put_chunk(27, 0, &[27u8; 4]);
+        store.lock().await.put_chunk(27, 1, &[27u8; 4]);
+        assert_eq!(next_live_have(&mut peer).await, 27);
+
+        // A partial piece (only one of two chunks) is not complete, so it must not be advertised;
+        // the next complete piece (29) is the next HAVE, proving 26/27 were not re-sent either.
+        store.lock().await.put_chunk(28, 0, &[28u8; 4]);
+        store.lock().await.put_chunk(29, 0, &[29u8; 4]);
+        store.lock().await.put_chunk(29, 1, &[29u8; 4]);
+        assert_eq!(
+            next_live_have(&mut peer).await,
+            29,
+            "an incomplete piece (28) is skipped and completed pieces are never re-advertised"
+        );
+
         serve_task.abort();
     }
 }
