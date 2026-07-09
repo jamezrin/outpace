@@ -6,10 +6,16 @@
 //! stream the media layer (MPEG-TS) consumes. Pure logic; pairs with [`crate::live`].
 
 use crate::{Result, WireError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 struct Partial {
     buf: Vec<u8>,
+    /// Offsets (`begin`) of the blocks already written, so a block delivered more than once
+    /// is counted toward completion only once. Blocks are chunk-aligned and non-overlapping
+    /// (`begin = chunk * chunk_length`), so a repeated `begin` is a genuine duplicate.
+    filled_offsets: BTreeSet<u64>,
+    /// Distinct bytes written so far, derived from `filled_offsets`; the piece is complete
+    /// when this reaches `piece_length`.
     filled: u64,
 }
 
@@ -118,10 +124,17 @@ impl PieceReassembler {
         }
         let p = self.partial.entry(index).or_insert_with(|| Partial {
             buf: vec![0u8; self.piece_length as usize],
+            filled_offsets: BTreeSet::new(),
             filled: 0,
         });
         p.buf[begin as usize..end as usize].copy_from_slice(block);
-        p.filled += block.len() as u64;
+        // Count each distinct block once. A duplicate delivery (same `begin`) — which the
+        // retransmit path produces by re-requesting a whole piece from a second peer without
+        // cancelling the first — must not inflate `filled` and prematurely complete the piece
+        // with a still-zero gap where a genuinely-missing chunk belongs (issue #90).
+        if p.filled_offsets.insert(begin) {
+            p.filled += block.len() as u64;
+        }
         if p.filled >= self.piece_length {
             let done = self.partial.remove(&index).unwrap();
             if let Some(pubkey) = &self.verify_pubkey {
@@ -229,6 +242,44 @@ mod tests {
     fn rejects_block_past_piece_length() {
         let mut r = PieceReassembler::new(4, 0);
         assert!(r.add_block(0, 2, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn duplicate_chunk_does_not_prematurely_complete_a_piece() {
+        // The note-48 retransmit path re-requests a whole piece from a second peer without
+        // cancelling the first, so a chunk can be delivered twice. Completion must key off the
+        // set of distinct filled regions, not a running byte total — otherwise a duplicate
+        // of an already-received chunk over-counts and completes the piece while a real chunk
+        // region is still zero, emitting a corrupt piece (issue #90).
+        let mut r = PieceReassembler::new(8, 0); // four 2-byte chunks at offsets 0,2,4,6
+        r.add_block(0, 0, &[0x11, 0x11]).unwrap(); // chunk 0
+        r.add_block(0, 2, &[0x22, 0x22]).unwrap(); // chunk 1
+        r.add_block(0, 4, &[0x33, 0x33]).unwrap(); // chunk 2
+        r.add_block(0, 0, &[0x11, 0x11]).unwrap(); // DUPLICATE chunk 0
+        assert_eq!(
+            r.take_ready(),
+            Vec::<u8>::new(),
+            "chunk 3 (offset 6..8) never arrived; the piece must not emit yet"
+        );
+        // The genuinely-missing chunk finally arrives → now the piece completes intact.
+        r.add_block(0, 6, &[0x44, 0x44]).unwrap();
+        assert_eq!(
+            r.take_ready(),
+            vec![0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44]
+        );
+    }
+
+    #[test]
+    fn a_fully_covered_piece_completes_even_with_duplicate_deliveries() {
+        // Every distinct chunk is present (some delivered more than once); the piece emits
+        // exactly once, with the correct bytes.
+        let mut r = PieceReassembler::new(6, 0); // three 2-byte chunks
+        r.add_block(0, 0, &[1, 1]).unwrap();
+        r.add_block(0, 2, &[2, 2]).unwrap();
+        r.add_block(0, 2, &[2, 2]).unwrap(); // duplicate
+        r.add_block(0, 4, &[3, 3]).unwrap();
+        r.add_block(0, 0, &[1, 1]).unwrap(); // duplicate after completion
+        assert_eq!(r.take_ready(), vec![1, 1, 2, 2, 3, 3]);
     }
 
     #[test]
