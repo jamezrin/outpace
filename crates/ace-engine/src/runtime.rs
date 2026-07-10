@@ -114,6 +114,15 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_ENABLE_INBOUND") {
         config.enable_inbound = matches!(v.as_str(), "1" | "true");
     }
+    if let Ok(v) = std::env::var("OUTPACE_ENABLE_PORT_MAPPING") {
+        config.enable_port_mapping = matches!(v.as_str(), "1" | "true");
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PORT_MAP_BACKEND") {
+        config.port_map_backend = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PORT_MAP_EXTERNAL_PORT") {
+        config.port_map_external_port = Some(v.parse()?);
+    }
     if let Ok(v) = std::env::var("OUTPACE_EXPERIMENTAL_ACE_COMPAT") {
         config.experimental_ace_compat = matches!(v.as_str(), "1" | "true");
     }
@@ -315,6 +324,11 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         broadcasts: Some(broadcasts),
     };
 
+    // Held for the process lifetime so the gateway port-mapping renewal task keeps running and
+    // the mapping is torn down on shutdown (handle drop). `None` unless port mapping is enabled
+    // and succeeds. The `_` prefix marks it as a lifetime guard rather than a read value.
+    let mut _port_map_handle: Option<ace_swarm::portmap::PortMapHandle> = None;
+
     // Inbound seeding (S2): ON by default, matching the Acestream engine's out-of-the-box
     // behavior as a full P2P participant (bind the peer port, accept inbound peers, seed,
     // self-announce). Piece headers are preserved/generated and official-consumer piece
@@ -342,6 +356,43 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
             )
             .await;
         });
+
+        // NAT reachability (issue #20): map the peer port on the home gateway so peers behind
+        // NAT can dial us. Gated behind the new `enable_port_mapping` (default off) in addition
+        // to `enable_inbound`; best-effort and non-fatal — a failure logs and the daemon
+        // continues. The resolved external endpoint is logged here and held for the announce
+        // path (#21) to consume; kept alive for the process lifetime so its renewal task runs
+        // and the mapping is deleted on shutdown (handle drop).
+        if config.enable_port_mapping {
+            let pm_cfg = ace_swarm::portmap::PortMapConfig {
+                backend: config.port_map_backend,
+                internal_port: config.peer_listen.port(),
+                external_port: config.port_map_external_port,
+                lease_seconds: ace_swarm::portmap::DEFAULT_LEASE_SECONDS,
+            };
+            eprintln!(
+                "outpace: port mapping ENABLED (backend={}, internal port {})",
+                config.port_map_backend,
+                config.peer_listen.port()
+            );
+            if let Some(handle) = ace_swarm::portmap::spawn_port_mapping(pm_cfg).await {
+                let ep = handle.endpoint();
+                eprintln!(
+                    "outpace: external endpoint {}:{} via {} (lease {}s)",
+                    ep.external_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    ep.external_port,
+                    ep.backend,
+                    ep.lease_duration.as_secs()
+                );
+                _port_map_handle = Some(handle);
+            } else {
+                eprintln!(
+                    "outpace: port mapping unavailable; continuing with a NAT-bound listener"
+                );
+            }
+        }
     }
 
     tokio::spawn(async move {
@@ -465,6 +516,44 @@ mod tests {
         assert_eq!(c.session_buffer, 512);
         std::env::remove_var("OUTPACE_PREFETCH_PIECES");
         std::env::remove_var("OUTPACE_SESSION_BUFFER");
+    }
+
+    #[test]
+    fn port_mapping_env_overrides_parse_and_default_off() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Default: no env set -> port mapping is off, backend auto, no external override.
+        std::env::remove_var("OUTPACE_ENABLE_PORT_MAPPING");
+        std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
+        std::env::remove_var("OUTPACE_PORT_MAP_EXTERNAL_PORT");
+        let c = config_from_env().unwrap();
+        assert!(!c.enable_port_mapping);
+        assert_eq!(c.port_map_backend, ace_swarm::portmap::PortMapBackend::Auto);
+        assert_eq!(c.port_map_external_port, None);
+
+        // Overrides applied.
+        std::env::set_var("OUTPACE_ENABLE_PORT_MAPPING", "1");
+        std::env::set_var("OUTPACE_PORT_MAP_BACKEND", "natpmp");
+        std::env::set_var("OUTPACE_PORT_MAP_EXTERNAL_PORT", "9000");
+        let c = config_from_env().unwrap();
+        assert!(c.enable_port_mapping);
+        assert_eq!(
+            c.port_map_backend,
+            ace_swarm::portmap::PortMapBackend::Natpmp
+        );
+        assert_eq!(c.port_map_external_port, Some(9000));
+
+        std::env::remove_var("OUTPACE_ENABLE_PORT_MAPPING");
+        std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
+        std::env::remove_var("OUTPACE_PORT_MAP_EXTERNAL_PORT");
+    }
+
+    #[test]
+    fn invalid_port_map_backend_env_is_rejected() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_PORT_MAP_BACKEND", "bogus");
+        let err = config_from_env().err();
+        std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
+        assert!(err.is_some(), "invalid backend must be rejected");
     }
 
     #[test]

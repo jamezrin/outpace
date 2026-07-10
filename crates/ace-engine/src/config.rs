@@ -209,6 +209,19 @@ pub struct Config {
     /// localhost by default; the exposed listener is the peer port (`peer_listen`), as with
     /// Acestream. Set `OUTPACE_ENABLE_INBOUND=0` for a pure-leecher deployment.
     pub enable_inbound: bool,
+    /// Map the inbound peer port on the home gateway (UPnP-IGD / NAT-PMP) so peers behind NAT
+    /// can dial us, mirroring the reference engine's `acestream.upnp __forward`. Best-effort and
+    /// non-fatal — a mapping failure logs a warning and the daemon continues. Only takes effect
+    /// when `enable_inbound` is also on (no point mapping a closed listener). Defaults **off** so
+    /// merging this has zero effect on default operation; enable with
+    /// `OUTPACE_ENABLE_PORT_MAPPING=1`. See issue #20.
+    pub enable_port_mapping: bool,
+    /// Which gateway backend to use for port mapping: `auto` (UPnP then NAT-PMP), `upnp`,
+    /// `natpmp`, or `none`. `OUTPACE_PORT_MAP_BACKEND`.
+    pub port_map_backend: ace_swarm::portmap::PortMapBackend,
+    /// External port to request on the gateway. When unset, request the same port as
+    /// `peer_listen`. `OUTPACE_PORT_MAP_EXTERNAL_PORT`.
+    pub port_map_external_port: Option<u16>,
     /// Expose Acestream-engine-compatible HTTP routes (`/ace/*`, `/server/api`). This is an
     /// experimental legacy adapter; outpace's native `/streams` and `/broadcast` API is the
     /// supported surface.
@@ -239,6 +252,9 @@ impl Default for Config {
             seed_ttl_secs: 300,
             enable_seeding: true,
             enable_inbound: true,
+            enable_port_mapping: false,
+            port_map_backend: ace_swarm::portmap::PortMapBackend::Auto,
+            port_map_external_port: None,
             experimental_ace_compat: false,
         }
     }
@@ -363,6 +379,16 @@ mod tests {
             !c.experimental_ace_compat,
             "Acestream HTTP compatibility must be opt-in"
         );
+        assert!(
+            !c.enable_port_mapping,
+            "port mapping must default OFF so merging has zero effect on default operation"
+        );
+        assert_eq!(
+            c.port_map_backend,
+            ace_swarm::portmap::PortMapBackend::Auto,
+            "default backend is auto (only consulted when port mapping is enabled)"
+        );
+        assert_eq!(c.port_map_external_port, None);
     }
 
     #[test]
