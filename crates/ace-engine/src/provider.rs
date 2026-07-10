@@ -26,6 +26,11 @@ pub struct SourceStats {
 pub trait TsSource: Send {
     /// Next contiguous MPEG-TS chunk, or None at end-of-stream.
     async fn next(&mut self) -> Option<Bytes>;
+    /// Report a known gap immediately before the most recently returned chunk. Sources that
+    /// recover by skipping unavailable media override this; ordinary sources stay contiguous.
+    fn take_discontinuity(&mut self) -> bool {
+        false
+    }
     fn stats(&self) -> SourceStats;
 }
 

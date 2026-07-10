@@ -4,7 +4,7 @@
 //! tolerant players; precise GOP segmentation is a documented follow-up.
 
 use crate::config::HlsConfig;
-use crate::session::StreamSession;
+use crate::session::{StreamEvent, StreamSession};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -24,8 +24,14 @@ pub struct HlsPackager {
 struct HlsState {
     /// Sequence number of the first retained segment.
     media_seq: u64,
-    segments: VecDeque<Bytes>,
+    segments: VecDeque<HlsSegment>,
     cur: Vec<u8>,
+    discontinuity_pending: bool,
+}
+
+struct HlsSegment {
+    bytes: Bytes,
+    discontinuity: bool,
 }
 
 impl HlsPackager {
@@ -35,6 +41,7 @@ impl HlsPackager {
                 media_seq: 0,
                 segments: VecDeque::new(),
                 cur: Vec::new(),
+                discontinuity_pending: false,
             }),
             seg_packets: config.segment_packets.max(1),
             window: config.window_segments,
@@ -51,13 +58,22 @@ impl HlsPackager {
             use tokio::sync::broadcast::error::RecvError;
             loop {
                 match rx.recv().await {
-                    Ok(chunk) => pkg.feed(&chunk),
-                    Err(RecvError::Lagged(_)) => continue,
+                    Ok(StreamEvent::Data(chunk)) => pkg.feed(&chunk),
+                    Ok(StreamEvent::Discontinuity) | Err(RecvError::Lagged(_)) => {
+                        pkg.discontinuity()
+                    }
                     Err(RecvError::Closed) => break,
                 }
             }
         });
         me
+    }
+
+    /// Drop media accumulated before a known gap and mark the first complete segment after it.
+    fn discontinuity(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.cur.clear();
+        st.discontinuity_pending = true;
     }
 
     /// Append contiguous TS bytes, emitting segments as they fill.
@@ -68,7 +84,11 @@ impl HlsPackager {
         while st.cur.len() >= seg_bytes {
             let rest = st.cur.split_off(seg_bytes);
             let seg = std::mem::replace(&mut st.cur, rest);
-            st.segments.push_back(Bytes::from(seg));
+            let discontinuity = std::mem::take(&mut st.discontinuity_pending);
+            st.segments.push_back(HlsSegment {
+                bytes: Bytes::from(seg),
+                discontinuity,
+            });
             while st.segments.len() > self.window {
                 st.segments.pop_front();
                 st.media_seq += 1;
@@ -85,11 +105,14 @@ impl HlsPackager {
             self.seg_duration.ceil() as u64
         ));
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", st.media_seq));
-        for i in 0..st.segments.len() as u64 {
+        for (i, segment) in st.segments.iter().enumerate() {
+            if segment.discontinuity {
+                out.push_str("#EXT-X-DISCONTINUITY\n");
+            }
             out.push_str(&format!("#EXTINF:{:.3},\n", self.seg_duration));
             out.push_str(&format!(
                 "/streams/{network}/{id}/seg/{}.ts\n",
-                st.media_seq + i
+                st.media_seq + i as u64
             ));
         }
         out
@@ -101,7 +124,9 @@ impl HlsPackager {
         if seq < st.media_seq {
             return None;
         }
-        st.segments.get((seq - st.media_seq) as usize).cloned()
+        st.segments
+            .get((seq - st.media_seq) as usize)
+            .map(|segment| segment.bytes.clone())
     }
 }
 
@@ -215,6 +240,62 @@ mod tests {
         assert!(p.playlist("test", "x").lines().all(|l| !l.contains("seg/")));
         p.feed(&packets(1));
         assert!(p.playlist("test", "x").contains("seg/0.ts"));
+    }
+
+    #[test]
+    fn receiver_lag_discards_partial_media_and_marks_only_first_post_gap_segment() {
+        let p = pkg();
+        let pre_gap = vec![0x11; TS_PACKET];
+        p.feed(&pre_gap);
+        p.discontinuity();
+        let post_gap = vec![0x22; 4 * TS_PACKET];
+        p.feed(&post_gap);
+
+        assert_eq!(p.segment(0).unwrap().as_ref(), &post_gap[..2 * TS_PACKET]);
+        assert_eq!(p.segment(1).unwrap().as_ref(), &post_gap[2 * TS_PACKET..]);
+        let playlist = p.playlist("test", "gap");
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 1);
+        assert!(
+            playlist.contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.000,\n/streams/test/gap/seg/0.ts")
+        );
+    }
+
+    #[test]
+    fn discontinuity_metadata_slides_with_its_segment() {
+        let p = pkg();
+        p.feed(&packets(2));
+        p.discontinuity();
+        p.feed(&packets(6));
+        let retained = p.playlist("test", "slide");
+        assert!(retained.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+        assert_eq!(retained.matches("#EXT-X-DISCONTINUITY").count(), 1);
+
+        p.feed(&packets(6));
+        let evicted = p.playlist("test", "slide");
+        assert!(evicted.contains("#EXT-X-MEDIA-SEQUENCE:4"));
+        assert_eq!(evicted.matches("#EXT-X-DISCONTINUITY").count(), 0);
+    }
+
+    #[test]
+    fn repeated_gaps_keep_distinct_markers_and_monotonic_sequences() {
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 1,
+            window_segments: 5,
+            segment_duration_ms: 1000,
+        });
+        p.feed(&packets(1));
+        p.discontinuity();
+        p.feed(&packets(1));
+        p.discontinuity();
+        p.feed(&packets(1));
+
+        let playlist = p.playlist("test", "repeat");
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 2);
+        assert!(playlist.contains("seg/0.ts"));
+        assert!(playlist.contains("seg/1.ts"));
+        assert!(playlist.contains("seg/2.ts"));
+        assert_eq!(p.segment(0).unwrap().len(), TS_PACKET);
+        assert_eq!(p.segment(2).unwrap().len(), TS_PACKET);
     }
 
     #[test]

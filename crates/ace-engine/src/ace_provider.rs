@@ -676,8 +676,14 @@ impl VodByteSource for VodSource {
     }
 }
 
+struct LiveOutput {
+    bytes: Bytes,
+    discontinuity: bool,
+}
+
 struct AceSource {
-    rx: mpsc::Receiver<Bytes>,
+    rx: mpsc::Receiver<LiveOutput>,
+    discontinuity: bool,
     peers: Arc<AtomicU32>,
     downloaded: Arc<AtomicU64>,
     uploaded: Arc<AtomicU64>,
@@ -687,7 +693,12 @@ struct AceSource {
 #[async_trait]
 impl TsSource for AceSource {
     async fn next(&mut self) -> Option<Bytes> {
-        self.rx.recv().await
+        let output = self.rx.recv().await?;
+        self.discontinuity = output.discontinuity;
+        Some(output.bytes)
+    }
+    fn take_discontinuity(&mut self) -> bool {
+        std::mem::take(&mut self.discontinuity)
     }
     fn stats(&self) -> SourceStats {
         SourceStats {
@@ -750,7 +761,7 @@ impl StreamProvider for AceProvider {
             ));
         }
 
-        let (tx, rx) = mpsc::channel::<Bytes>(256);
+        let (tx, rx) = mpsc::channel::<LiveOutput>(256);
         let peer_count = Arc::new(AtomicU32::new(0));
         let downloaded = Arc::new(AtomicU64::new(0));
         let uploaded = Arc::new(AtomicU64::new(0));
@@ -784,6 +795,7 @@ impl StreamProvider for AceProvider {
         });
         Ok(Box::new(AceSource {
             rx,
+            discontinuity: false,
             peers: peer_count,
             downloaded: stats_downloaded,
             uploaded: stats_uploaded,
@@ -1222,7 +1234,7 @@ async fn follow_live(
     info: StreamInfo,
     mut peers: Vec<SocketAddrV4>,
     identity: Arc<Identity>,
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<LiveOutput>,
     peer_count: Arc<AtomicU32>,
     downloaded: Arc<AtomicU64>,
     uploaded: Arc<AtomicU64>,
@@ -1389,6 +1401,7 @@ struct Continuity {
     reasm: PieceReassembler,
     resync: ace_media::mpegts::TsResync,
     output_gate: Option<ace_media::mpegts::KeyframeGate>,
+    discontinuity_pending: bool,
     scheduler: Scheduler,
     active_peers: ActivePeers,
     received_chunks: BTreeMap<u64, HashSet<u16>>,
@@ -1433,6 +1446,7 @@ impl Continuity {
                 reasm,
                 resync: ace_media::mpegts::TsResync::new(),
                 output_gate: None,
+                discontinuity_pending: false,
                 scheduler: Scheduler::new(live_recovery.max_piece_advance as usize),
                 active_peers: ActivePeers::new(),
                 received_chunks: BTreeMap::new(),
@@ -1533,6 +1547,7 @@ impl Continuity {
     fn arm_output_gate(&mut self) {
         self.output_gate = Some(ace_media::mpegts::KeyframeGate::new());
         self.resync = ace_media::mpegts::TsResync::new();
+        self.discontinuity_pending = true;
     }
 
     fn filter_output_after_discontinuity(&mut self, aligned: Vec<u8>) -> Vec<u8> {
@@ -1540,6 +1555,10 @@ impl Continuity {
             Some(gate) => gate.push(&aligned),
             None => aligned,
         }
+    }
+
+    fn take_discontinuity(&mut self) -> bool {
+        std::mem::take(&mut self.discontinuity_pending)
     }
 
     #[cfg(test)]
@@ -1742,7 +1761,7 @@ async fn follow_peer_pool(
     info: &StreamInfo,
     identity: &Identity,
     chunks_per_piece: u16,
-    tx: &mpsc::Sender<Bytes>,
+    tx: &mpsc::Sender<LiveOutput>,
     downloaded: &Arc<AtomicU64>,
     uploaded: &Arc<AtomicU64>,
     peers_served: &Arc<AtomicU32>,
@@ -2036,6 +2055,7 @@ async fn follow_peer_pool(
                         let aligned = continuity.resync.push(&ready);
                         let aligned = continuity.filter_output_after_discontinuity(aligned);
                         if !aligned.is_empty() {
+                            let discontinuity = continuity.take_discontinuity();
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
                                 crate::alog!(
@@ -2047,7 +2067,14 @@ async fn follow_peer_pool(
                                 continuity.next_log = continuity.emitted + (4 << 20);
                             }
                             let len = aligned.len() as u64;
-                            if tx.send(Bytes::from(aligned)).await.is_err() {
+                            if tx
+                                .send(LiveOutput {
+                                    bytes: Bytes::from(aligned),
+                                    discontinuity,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 shutdown_peer_runtimes(&mut peers);
                                 abort_refill(&mut refill_handle);
                                 return FollowEnd::ConsumerGone;
@@ -2845,6 +2872,43 @@ mod tests {
             ..LiveRecoveryConfig::default()
         };
         assert!(recovery_channel_capacities(invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_live_outputs_keep_each_discontinuity_with_its_chunk() {
+        let (tx, rx) = mpsc::channel(8);
+        for (bytes, discontinuity) in [
+            (b"pre".as_slice(), false),
+            (b"post-one".as_slice(), true),
+            (b"between".as_slice(), false),
+            (b"post-two".as_slice(), true),
+        ] {
+            tx.send(LiveOutput {
+                bytes: Bytes::copy_from_slice(bytes),
+                discontinuity,
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let mut source = AceSource {
+            rx,
+            discontinuity: false,
+            peers: Arc::new(AtomicU32::new(0)),
+            downloaded: Arc::new(AtomicU64::new(0)),
+            uploaded: Arc::new(AtomicU64::new(0)),
+            peers_served: Arc::new(AtomicU32::new(0)),
+        };
+
+        for (expected, gap) in [
+            (b"pre".as_slice(), false),
+            (b"post-one".as_slice(), true),
+            (b"between".as_slice(), false),
+            (b"post-two".as_slice(), true),
+        ] {
+            assert_eq!(source.next().await.unwrap().as_ref(), expected);
+            assert_eq!(source.take_discontinuity(), gap);
+        }
     }
 
     #[tokio::test]

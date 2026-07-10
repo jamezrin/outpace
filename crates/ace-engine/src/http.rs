@@ -4,6 +4,7 @@
 use crate::broadcast::BroadcastRegistry;
 use crate::manager::StreamManager;
 use crate::provider::{ProviderError, VodByteSource, VodContent};
+use crate::session::StreamEvent;
 use crate::session::StreamSession;
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::{infohash_hex, resolve_via_catalog, stream_info_from_transport_url};
@@ -959,12 +960,16 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
     let stream = futures::stream::unfold((sub, gate), |(mut sub, mut gate)| async move {
         loop {
             match sub.rx.recv().await {
-                Ok(chunk) => {
+                Ok(StreamEvent::Data(chunk)) => {
                     let out = gate.push(&chunk);
                     if out.is_empty() {
                         continue; // still waiting for the first keyframe
                     }
                     return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate)));
+                }
+                Ok(StreamEvent::Discontinuity) => {
+                    reset_stream_keyframe_gate(&mut gate);
+                    continue;
                 }
                 Err(RecvError::Lagged(_)) => {
                     reset_stream_keyframe_gate(&mut gate);
@@ -1000,10 +1005,13 @@ fn ace_stream_session_response(
                         if changed.is_err() || *cancel.borrow() { return None; }
                     }
                     received = sub.rx.recv() => match received {
-                        Ok(chunk) => {
+                        Ok(StreamEvent::Data(chunk)) => {
                             let out = gate.push(&chunk);
                             if out.is_empty() { continue; }
                             return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate, cancel, expires_at)));
+                        }
+                        Ok(StreamEvent::Discontinuity) => {
+                            reset_stream_keyframe_gate(&mut gate);
                         }
                         Err(RecvError::Lagged(_)) => { reset_stream_keyframe_gate(&mut gate); }
                         Err(RecvError::Closed) => return None,
