@@ -158,7 +158,7 @@ pub struct AceProvider {
     /// DHT self-announce. `None` when inbound seeding is disabled — we run no listener, so we
     /// must not invite peers to dial us (mirrors `BroadcastState::inbound_peer_port`). `Some`
     /// is the local `peer_port` today, or the mapped external port once #20 lands.
-    announce_peer_port: Option<u16>,
+    announce_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
     resolve_cache: ResolveCache,
@@ -185,7 +185,7 @@ impl AceProvider {
         AceProvider {
             identity,
             peer_port,
-            announce_peer_port: None,
+            announce_peer_port: tokio::sync::watch::channel(None).1,
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_peers: Vec::new(),
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
@@ -216,6 +216,17 @@ impl AceProvider {
     /// broadcast paths advertise the identical endpoint (the mapped external port once #20
     /// lands). `None` disables the self-announce entirely.
     pub fn with_inbound_announce_port(mut self, port: Option<u16>) -> Self {
+        self.announce_peer_port = tokio::sync::watch::channel(port).1;
+        self
+    }
+
+    /// Supply the daemon-wide, dynamically resolved inbound port. It starts at the local
+    /// listener port, switches to the gateway-assigned external port after mapping succeeds,
+    /// and falls back to the listener port if the mapping task disappears.
+    pub fn with_inbound_announce_port_receiver(
+        mut self,
+        port: tokio::sync::watch::Receiver<Option<u16>>,
+    ) -> Self {
         self.announce_peer_port = port;
         self
     }
@@ -223,8 +234,9 @@ impl AceProvider {
     /// Port to advertise on the periodic seeder self-announce, or `None` to not announce at
     /// all. This is always the peer endpoint (`peer_port`/external), **never** the HTTP API
     /// port, and is `None` without an inbound listener to back it.
+    #[cfg(test)]
     fn seeder_announce_port(&self) -> Option<u16> {
-        self.announce_peer_port
+        *self.announce_peer_port.borrow()
     }
 
     /// Trackers used for a bare infohash (which carries none); transport files supply their
@@ -758,7 +770,7 @@ impl StreamProvider for AceProvider {
             cache_dir: self.cache_dir.clone(),
         };
         let announce_info = info.clone();
-        let announce_port = self.seeder_announce_port();
+        let announce_port = self.announce_peer_port.clone();
         let discovery_port = self.peer_port;
         let reachability = self.reachability.clone();
         tokio::spawn(async move {
@@ -787,11 +799,35 @@ impl StreamProvider for AceProvider {
 /// advertisable endpoint (`enable_inbound` off, or a one-shot CLI leech): we must not invite
 /// peers to dial a port nobody is serving on. The advertised `port` is always the peer
 /// endpoint, never the HTTP API port (issue #21).
-async fn announce_seeder_periodically(info: StreamInfo, port: Option<u16>) {
-    let Some(port) = port else {
-        return std::future::pending().await;
-    };
-    announce_infohash_periodically(info.trackers, info.infohash, port).await
+async fn announce_seeder_periodically(
+    info: StreamInfo,
+    port: tokio::sync::watch::Receiver<Option<u16>>,
+) {
+    announce_infohash_periodically_dynamic(info.trackers, info.infohash, port).await
+}
+
+/// Dynamic form used by daemon announce paths. Port changes interrupt the normal interval so
+/// the newly mapped (or fallback) endpoint is advertised promptly.
+pub async fn announce_infohash_periodically_dynamic(
+    trackers: Vec<String>,
+    infohash: [u8; 20],
+    mut port_rx: tokio::sync::watch::Receiver<Option<u16>>,
+) {
+    let peer_id = random_peer_id();
+    loop {
+        let port = *port_rx.borrow_and_update();
+        if let Some(port) = port {
+            announce_infohash_once(&trackers, &infohash, &peer_id, port).await;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(SEEDER_ANNOUNCE_INTERVAL) => {},
+            changed = port_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// The tracker+DHT self-announce loop, decoupled from `StreamInfo` so both the leech path
@@ -800,21 +836,30 @@ async fn announce_seeder_periodically(info: StreamInfo, port: Option<u16>) {
 pub async fn announce_infohash_periodically(trackers: Vec<String>, infohash: [u8; 20], port: u16) {
     let peer_id = random_peer_id();
     loop {
-        let peers = announce_seeder(&trackers, &infohash, &peer_id, port).await;
-        // DHT self-announce too, not just tracker: real Acestream swarms are largely
-        // DHT-populated (README.md), so tracker-only self-announce under-serves
-        // discoverability. `dht_announce_peer` is a separate primitive (not folded into
-        // `announce_seeder` itself) because it's a multi-second live network call that
-        // would otherwise turn `announce_seeder`'s fast offline unit test into a slow,
-        // network-dependent one.
-        let dht_announced = dht_announce_peer(&infohash, port, DHT_ANNOUNCE_BUDGET).await;
-        crate::alog!(
-            "[ace] seeder self-announce for {}: {} tracker peer(s) seen, DHT announce_peer sent to {dht_announced} node(s)",
-            hex_preview(&infohash),
-            peers.len(),
-        );
+        announce_infohash_once(&trackers, &infohash, &peer_id, port).await;
         tokio::time::sleep(SEEDER_ANNOUNCE_INTERVAL).await;
     }
+}
+
+async fn announce_infohash_once(
+    trackers: &[String],
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+) {
+    let peers = announce_seeder(trackers, infohash, peer_id, port).await;
+    // DHT self-announce too, not just tracker: real Acestream swarms are largely
+    // DHT-populated (README.md), so tracker-only self-announce under-serves
+    // discoverability. `dht_announce_peer` is a separate primitive (not folded into
+    // `announce_seeder` itself) because it's a multi-second live network call that
+    // would otherwise turn `announce_seeder`'s fast offline unit test into a slow,
+    // network-dependent one.
+    let dht_announced = dht_announce_peer(infohash, port, DHT_ANNOUNCE_BUDGET).await;
+    crate::alog!(
+            "[ace] seeder self-announce for {}: {} tracker peer(s) seen, DHT announce_peer sent to {dht_announced} node(s)",
+            hex_preview(infohash),
+            peers.len(),
+        );
 }
 
 /// Which peers to try connecting to next: everyone except those already known bad this
@@ -3477,7 +3522,7 @@ mod tests {
         // a tracker announce, which would otherwise invite peers to dial a port nobody serves.
         let res = tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            announce_seeder_periodically(info(), None),
+            announce_seeder_periodically(info(), tokio::sync::watch::channel(None).1),
         )
         .await;
         assert!(res.is_err(), "must never resolve without an inbound port");

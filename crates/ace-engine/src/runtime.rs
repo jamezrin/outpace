@@ -37,6 +37,7 @@ pub struct EngineRuntime {
     /// serving is enabled — with inbound off we can't be dialed, so harvesting/counting is
     /// entirely absent and the status logger never runs.
     pub reachability: Option<Arc<ace_swarm::reachability::ReachabilityMonitor>>,
+    announce_port_tx: tokio::sync::watch::Sender<Option<u16>>,
     identity: Arc<ace_wire::identity::Identity>,
 }
 
@@ -227,6 +228,7 @@ pub async fn build_runtime(
     // the leech/seeder self-announce and `broadcasts.inbound_peer_port` are threaded from this
     // one value so tracker + DHT + PEX advertise one identical endpoint.
     let inbound_peer_port = config.enable_inbound.then_some(config.peer_listen.port());
+    let (announce_port_tx, announce_port_rx) = tokio::sync::watch::channel(inbound_peer_port);
     if config.networks.iter().any(|n| n == "ace") {
         let provider = AceProvider::new(identity.clone(), config.peer_listen.port())
             .with_bootstrap_peers(bootstrap_peers)
@@ -236,7 +238,7 @@ pub async fn build_runtime(
             .with_prefetch_pieces(config.prefetch_pieces)
             .with_live_recovery(config.live_recovery)
             .with_seeding_enabled(config.enable_seeding)
-            .with_inbound_announce_port(inbound_peer_port)
+            .with_inbound_announce_port_receiver(announce_port_rx.clone())
             .with_reachability(reachability.clone());
         registry.register(Arc::new(provider));
     }
@@ -283,7 +285,7 @@ pub async fn build_runtime(
             .map(|s| s.to_string())
             .collect(),
         store_bytes: config.seed_store_bytes,
-        inbound_peer_port,
+        inbound_peer_port: announce_port_rx,
     };
 
     // Reload any broadcasts persisted by a previous run so their identity/infohash survives
@@ -309,6 +311,7 @@ pub async fn build_runtime(
         seed_registry,
         broadcasts,
         reachability,
+        announce_port_tx,
         identity,
     })
 }
@@ -321,6 +324,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         seed_registry,
         broadcasts,
         reachability,
+        announce_port_tx,
         identity,
     } = runtime;
 
@@ -398,6 +402,14 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
                 config.peer_listen.port()
             );
             _port_map_handle = ace_swarm::portmap::spawn_port_mapping(pm_cfg);
+            if let Some(handle) = &_port_map_handle {
+                let mapped_rx = handle.endpoint_receiver();
+                tokio::spawn(propagate_mapped_announce_port(
+                    mapped_rx,
+                    announce_port_tx,
+                    config.peer_listen.port(),
+                ));
+            }
         }
 
         // Public-reachability status (issue #22): turn note 24's open "nothing proven to dial us
@@ -447,18 +459,38 @@ pub async fn mint_broadcast(runtime: &EngineRuntime, name: &str) -> Broadcast {
 }
 
 pub fn announce_broadcast(runtime: &EngineRuntime, bc: &Broadcast) {
-    if let Some(port) = runtime.broadcasts.inbound_peer_port {
+    if runtime.broadcasts.inbound_peer_port.borrow().is_some() {
         let trackers = runtime.broadcasts.trackers.clone();
-        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+        tokio::spawn(crate::ace_provider::announce_infohash_periodically_dynamic(
             trackers.clone(),
             bc.infohash,
-            port,
+            runtime.broadcasts.inbound_peer_port.clone(),
         ));
-        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+        tokio::spawn(crate::ace_provider::announce_infohash_periodically_dynamic(
             trackers,
             bc.content_id,
-            port,
+            runtime.broadcasts.inbound_peer_port.clone(),
         ));
+    }
+}
+
+async fn propagate_mapped_announce_port(
+    mut mapped_rx: tokio::sync::watch::Receiver<Option<ace_swarm::portmap::MappedEndpoint>>,
+    announce_tx: tokio::sync::watch::Sender<Option<u16>>,
+    local_port: u16,
+) {
+    loop {
+        let port = mapped_rx
+            .borrow_and_update()
+            .as_ref()
+            .map_or(local_port, |endpoint| endpoint.external_port);
+        announce_tx.send_replace(Some(port));
+        if mapped_rx.changed().await.is_err() {
+            announce_tx.send_replace(Some(local_port));
+            // Keep the sender alive so existing announce loops continue their normal periodic
+            // fallback announces after the mapping task has ended.
+            return std::future::pending().await;
+        }
     }
 }
 
@@ -591,6 +623,47 @@ mod tests {
         std::env::remove_var("OUTPACE_ENABLE_PORT_MAPPING");
         std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
         std::env::remove_var("OUTPACE_PORT_MAP_EXTERNAL_PORT");
+    }
+
+    #[tokio::test]
+    async fn mapped_port_replaces_local_port_and_loss_falls_back() {
+        use ace_swarm::portmap::MappedEndpoint;
+        use std::time::Duration;
+
+        const LOCAL: u16 = 8621;
+        const EXTERNAL: u16 = 49152;
+        let (mapped_tx, mapped_rx) = tokio::sync::watch::channel(None);
+        let (announce_tx, mut announce_rx) = tokio::sync::watch::channel(Some(LOCAL));
+        assert_eq!(*announce_rx.borrow(), Some(LOCAL));
+        tokio::spawn(propagate_mapped_announce_port(
+            mapped_rx,
+            announce_tx,
+            LOCAL,
+        ));
+
+        mapped_tx
+            .send(Some(MappedEndpoint {
+                external_ip: None,
+                external_port: EXTERNAL,
+                lease_duration: Duration::from_secs(3600),
+                backend: "test",
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *announce_rx.borrow_and_update() != Some(EXTERNAL) {
+                announce_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*announce_rx.borrow_and_update(), Some(EXTERNAL));
+
+        drop(mapped_tx);
+        tokio::time::timeout(Duration::from_secs(1), announce_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*announce_rx.borrow(), Some(LOCAL));
     }
 
     #[test]

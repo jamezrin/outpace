@@ -49,7 +49,7 @@ pub struct BroadcastState {
     /// Inbound peer-listener port to advertise via tracker/DHT self-announce for a freshly
     /// minted broadcast — `None` when inbound serving is disabled, since announcing a port
     /// nobody's listening on would just misdirect real peers.
-    pub inbound_peer_port: Option<u16>,
+    pub inbound_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
 }
 
 impl BroadcastState {
@@ -58,19 +58,19 @@ impl BroadcastState {
     /// on would misdirect real peers. Shared by fresh mint (`PUT`/RTMP) and startup reload, so
     /// each runs exactly once per broadcast.
     pub fn spawn_announce(&self, bc: &crate::broadcast::Broadcast) {
-        let Some(port) = self.inbound_peer_port else {
+        if self.inbound_peer_port.borrow().is_none() {
             return;
-        };
+        }
         let trackers = self.trackers.clone();
-        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+        tokio::spawn(crate::ace_provider::announce_infohash_periodically_dynamic(
             trackers.clone(),
             bc.infohash,
-            port,
+            self.inbound_peer_port.clone(),
         ));
-        tokio::spawn(crate::ace_provider::announce_infohash_periodically(
+        tokio::spawn(crate::ace_provider::announce_infohash_periodically_dynamic(
             trackers,
             bc.content_id,
-            port,
+            self.inbound_peer_port.clone(),
         ));
     }
 }
@@ -1766,7 +1766,7 @@ mod tests {
             store_bytes: 4 << 20,
             // No inbound listener in tests -> self-announce is a no-op (see the field doc);
             // keeps these tests offline/instant instead of hitting the network.
-            inbound_peer_port: None,
+            inbound_peer_port: tokio::sync::watch::channel(None).1,
         });
         st
     }
