@@ -360,9 +360,12 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         // NAT reachability (issue #20): map the peer port on the home gateway so peers behind
         // NAT can dial us. Gated behind the new `enable_port_mapping` (default off) in addition
         // to `enable_inbound`; best-effort and non-fatal — a failure logs and the daemon
-        // continues. The resolved external endpoint is logged here and held for the announce
-        // path (#21) to consume; kept alive for the process lifetime so its renewal task runs
-        // and the mapping is deleted on shutdown (handle drop).
+        // continues. `spawn_port_mapping` returns immediately and does ALL gateway discovery in
+        // a background task, so startup never blocks on slow SSDP / NAT-PMP retries. The task
+        // logs and publishes the resolved endpoint (for the announce path, #21, via
+        // `PortMapHandle::endpoint_receiver`) once established. The handle is held for the
+        // process lifetime so its renewal task runs and the mapping is deleted on shutdown
+        // (handle drop).
         if config.enable_port_mapping {
             let pm_cfg = ace_swarm::portmap::PortMapConfig {
                 backend: config.port_map_backend,
@@ -371,27 +374,11 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
                 lease_seconds: ace_swarm::portmap::DEFAULT_LEASE_SECONDS,
             };
             eprintln!(
-                "outpace: port mapping ENABLED (backend={}, internal port {})",
+                "outpace: port mapping ENABLED (backend={}, internal port {}); resolving gateway in background",
                 config.port_map_backend,
                 config.peer_listen.port()
             );
-            if let Some(handle) = ace_swarm::portmap::spawn_port_mapping(pm_cfg).await {
-                let ep = handle.endpoint();
-                eprintln!(
-                    "outpace: external endpoint {}:{} via {} (lease {}s)",
-                    ep.external_ip
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "?".to_string()),
-                    ep.external_port,
-                    ep.backend,
-                    ep.lease_duration.as_secs()
-                );
-                _port_map_handle = Some(handle);
-            } else {
-                eprintln!(
-                    "outpace: port mapping unavailable; continuing with a NAT-bound listener"
-                );
-            }
+            _port_map_handle = ace_swarm::portmap::spawn_port_mapping(pm_cfg);
         }
     }
 

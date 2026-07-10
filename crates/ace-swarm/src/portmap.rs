@@ -33,7 +33,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 /// Which gateway backend(s) to use.
@@ -167,24 +167,53 @@ impl fmt::Display for PortMapError {
 
 impl std::error::Error for PortMapError {}
 
-/// A live mapping plus its background renewal task.
+/// A handle to a backgrounded port-mapping task.
 ///
-/// Dropping the handle signals the renewal task to delete the mapping on a best-effort
-/// basis; prefer [`PortMapHandle::shutdown`] for a graceful, awaited teardown.
+/// The gateway discovery + mapping runs entirely in the spawned task, so obtaining a handle
+/// never blocks daemon startup on slow SSDP / NAT-PMP retries. The resolved endpoint is
+/// delivered asynchronously via a [`watch`] channel once (and if) established; read it with
+/// [`PortMapHandle::endpoint`] or await it with [`PortMapHandle::wait_for_endpoint`].
+///
+/// Dropping the handle signals the task to delete the mapping on a best-effort basis; prefer
+/// [`PortMapHandle::shutdown`] for a graceful, awaited teardown.
 pub struct PortMapHandle {
-    endpoint: MappedEndpoint,
+    /// `None` until the background task establishes a mapping (and after the task ends the
+    /// sender is dropped, so `changed()` returns `Err`).
+    endpoint_rx: watch::Receiver<Option<MappedEndpoint>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
 
 impl PortMapHandle {
-    /// The resolved external endpoint. Hand this to the announce path (#21).
-    pub fn endpoint(&self) -> &MappedEndpoint {
-        &self.endpoint
+    /// The resolved external endpoint if the background task has established one yet, else
+    /// `None`. Non-blocking snapshot. Hand this to the announce path (#21).
+    pub fn endpoint(&self) -> Option<MappedEndpoint> {
+        self.endpoint_rx.borrow().clone()
     }
 
-    /// Gracefully tear down: signal the renewal task to delete the gateway mapping and wait
-    /// for it to finish.
+    /// A [`watch`] receiver for the resolved endpoint (`None` until established). The announce
+    /// path (#21) can clone this and await changes without holding the handle.
+    pub fn endpoint_receiver(&self) -> watch::Receiver<Option<MappedEndpoint>> {
+        self.endpoint_rx.clone()
+    }
+
+    /// Await the endpoint being established. Returns `Some` once the mapping succeeds, or
+    /// `None` if the background task ends first (all backends failed, or shutdown raced
+    /// discovery).
+    pub async fn wait_for_endpoint(&self) -> Option<MappedEndpoint> {
+        let mut rx = self.endpoint_rx.clone();
+        loop {
+            if let Some(ep) = rx.borrow_and_update().clone() {
+                return Some(ep);
+            }
+            if rx.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+
+    /// Gracefully tear down: signal the background task to delete the gateway mapping (if it
+    /// established one, or to abandon in-flight discovery) and wait for it to finish.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -218,7 +247,7 @@ trait MapAttempt: Send + Sync {
 /// Try each candidate backend in order; the first success wins. Every failure is logged and
 /// swallowed. Returns `None` if none succeed (or there are no candidates) — the daemon
 /// continues unmapped.
-async fn establish(cfg: &PortMapConfig, attempts: &[&dyn MapAttempt]) -> Option<ActiveMapping> {
+async fn establish(cfg: &PortMapConfig, attempts: &[Box<dyn MapAttempt>]) -> Option<ActiveMapping> {
     for attempt in attempts {
         match attempt.attempt(cfg).await {
             Ok(active) => return Some(active),
@@ -234,29 +263,68 @@ async fn establish(cfg: &PortMapConfig, attempts: &[&dyn MapAttempt]) -> Option<
     None
 }
 
-/// Attempt to map the inbound peer port on the gateway and, on success, spawn a renewal task.
+/// Spawn a background task that maps the inbound peer port on the gateway, then renews the
+/// lease until shutdown.
 ///
-/// Best-effort: returns `None` (after logging a warning) on any failure or when the backend is
-/// [`PortMapBackend::None`]. Never panics. The caller must have already checked its gating
-/// (`enable_inbound` && `enable_port_mapping`).
-pub async fn spawn_port_mapping(cfg: PortMapConfig) -> Option<PortMapHandle> {
+/// Returns immediately with a [`PortMapHandle`] — **all** gateway discovery and mapping happens
+/// in the spawned task, so daemon startup never blocks on slow SSDP / NAT-PMP retries. Returns
+/// `None` only when the backend is [`PortMapBackend::None`] (nothing to do). Best-effort and
+/// non-fatal: mapping failures are logged and the daemon continues NAT-bound; never panics. The
+/// caller must have already checked its gating (`enable_inbound` && `enable_port_mapping`).
+///
+/// Must be called from within a Tokio runtime.
+pub fn spawn_port_mapping(cfg: PortMapConfig) -> Option<PortMapHandle> {
     let candidates = cfg.backend.candidates();
     if candidates.is_empty() {
         return None;
     }
 
-    // Build the concrete attempts for the selected backends.
-    let upnp = UpnpMapper;
-    let natpmp = NatPmpMapper;
-    let attempts: Vec<&dyn MapAttempt> = candidates
+    // Build the concrete attempts for the selected backends (owned, so they can move into the
+    // background task).
+    let attempts: Vec<Box<dyn MapAttempt>> = candidates
         .iter()
         .map(|b| match b {
-            Backend::Upnp => &upnp as &dyn MapAttempt,
-            Backend::NatPmp => &natpmp as &dyn MapAttempt,
+            Backend::Upnp => Box::new(UpnpMapper) as Box<dyn MapAttempt>,
+            Backend::NatPmp => Box::new(NatPmpMapper) as Box<dyn MapAttempt>,
         })
         .collect();
 
-    let active = establish(&cfg, &attempts).await?;
+    Some(spawn_with_attempts(cfg, attempts))
+}
+
+/// Spawn the background discovery + renewal task over a set of (possibly injected) attempts.
+/// Shared by the public entry point and unit tests.
+fn spawn_with_attempts(cfg: PortMapConfig, attempts: Vec<Box<dyn MapAttempt>>) -> PortMapHandle {
+    let (endpoint_tx, endpoint_rx) = watch::channel(None);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(run_port_mapping(cfg, attempts, endpoint_tx, shutdown_rx));
+    PortMapHandle {
+        endpoint_rx,
+        shutdown_tx: Some(shutdown_tx),
+        task: Some(task),
+    }
+}
+
+/// The background task body: discover + map (cancellable by shutdown), publish the endpoint,
+/// then renew until shutdown. Never panics.
+async fn run_port_mapping(
+    cfg: PortMapConfig,
+    attempts: Vec<Box<dyn MapAttempt>>,
+    endpoint_tx: watch::Sender<Option<MappedEndpoint>>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    // Discovery/mapping can take tens of seconds against an unresponsive gateway; abandon it
+    // cleanly if the daemon shuts down first (nothing is mapped yet, so nothing to remove).
+    let active = tokio::select! {
+        biased;
+        _ = &mut shutdown_rx => return,
+        active = establish(&cfg, &attempts) => active,
+    };
+    let Some(active) = active else {
+        swarm_log!("[portmap] no backend could map the inbound port; continuing NAT-bound");
+        return;
+    };
+
     let endpoint = active.endpoint();
     swarm_log!(
         "[portmap] mapped external {}:{} -> local :{} via {} (lease {}s)",
@@ -269,16 +337,10 @@ pub async fn spawn_port_mapping(cfg: PortMapConfig) -> Option<PortMapHandle> {
         endpoint.backend,
         endpoint.lease_duration.as_secs(),
     );
+    // Publish for the announce path (#21). Ignored if all receivers were already dropped.
+    let _ = endpoint_tx.send(Some(endpoint.clone()));
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let task_endpoint = endpoint.clone();
-    let task = tokio::spawn(renewal_loop(active, cfg, task_endpoint, shutdown_rx));
-
-    Some(PortMapHandle {
-        endpoint,
-        shutdown_tx: Some(shutdown_tx),
-        task: Some(task),
-    })
+    renewal_loop(active, cfg, endpoint, shutdown_rx).await;
 }
 
 /// Refresh the mapping before its lease expires; delete it on shutdown signal.
@@ -326,6 +388,10 @@ async fn renewal_loop(
 enum ActiveMapping {
     Upnp(Box<UpnpActive>),
     NatPmp(Box<crab_nat::PortMapping>),
+    /// A no-op mapping used by unit tests to exercise the full background flow (publish +
+    /// renew + remove) without a real gateway.
+    #[cfg(test)]
+    Fake(MappedEndpoint),
 }
 
 impl ActiveMapping {
@@ -343,6 +409,8 @@ impl ActiveMapping {
                 lease_duration: Duration::from_secs(u64::from(m.lifetime())),
                 backend: "natpmp",
             },
+            #[cfg(test)]
+            ActiveMapping::Fake(ep) => ep.clone(),
         }
     }
 
@@ -353,6 +421,8 @@ impl ActiveMapping {
                 .renew()
                 .await
                 .map_err(|e| PortMapError::NatPmp(e.to_string())),
+            #[cfg(test)]
+            ActiveMapping::Fake(_) => Ok(()),
         }
     }
 
@@ -363,6 +433,8 @@ impl ActiveMapping {
                 .try_drop()
                 .await
                 .map_err(|(e, _)| PortMapError::NatPmp(e.to_string())),
+            #[cfg(test)]
+            ActiveMapping::Fake(_) => Ok(()),
         }
     }
 }
@@ -543,6 +615,7 @@ fn default_route() -> Option<(IpAddr, Ipv4Addr)> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn backend_parses_all_variants() {
@@ -669,9 +742,19 @@ mod tests {
         }
     }
 
-    /// A backend whose gateway call always fails — used to prove the non-fatal path.
+    fn test_endpoint(port: u16) -> MappedEndpoint {
+        MappedEndpoint {
+            external_ip: None,
+            external_port: port,
+            lease_duration: Duration::from_secs(DEFAULT_LEASE_SECONDS as u64),
+            backend: "fake",
+        }
+    }
+
+    /// A backend whose gateway call always fails — used to prove the non-fatal path. The call
+    /// counter is shared via `Arc` so the test can inspect it after the attempt is boxed.
     struct AlwaysFails {
-        calls: AtomicUsize,
+        calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -685,40 +768,58 @@ mod tests {
         }
     }
 
+    /// A backend that succeeds after an optional delay, returning a fake (no-op) mapping.
+    struct DelayedOk {
+        delay: Duration,
+        endpoint: MappedEndpoint,
+    }
+
+    #[async_trait::async_trait]
+    impl MapAttempt for DelayedOk {
+        fn name(&self) -> &'static str {
+            "delayed-ok"
+        }
+        async fn attempt(&self, _cfg: &PortMapConfig) -> Result<ActiveMapping, PortMapError> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(ActiveMapping::Fake(self.endpoint.clone()))
+        }
+    }
+
     #[tokio::test]
     async fn establish_returns_none_on_injected_failure_without_panicking() {
         let cfg = test_cfg();
-        let a = AlwaysFails {
-            calls: AtomicUsize::new(0),
-        };
-        let attempts: Vec<&dyn MapAttempt> = vec![&a];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts: Vec<Box<dyn MapAttempt>> = vec![Box::new(AlwaysFails {
+            calls: calls.clone(),
+        })];
         // Must not panic; must return None; must have actually invoked the gateway call.
         let result = establish(&cfg, &attempts).await;
         assert!(result.is_none());
-        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn establish_tries_all_candidates_in_order() {
         let cfg = test_cfg();
-        let a = AlwaysFails {
-            calls: AtomicUsize::new(0),
-        };
-        let b = AlwaysFails {
-            calls: AtomicUsize::new(0),
-        };
-        let attempts: Vec<&dyn MapAttempt> = vec![&a, &b];
+        let a = Arc::new(AtomicUsize::new(0));
+        let b = Arc::new(AtomicUsize::new(0));
+        let attempts: Vec<Box<dyn MapAttempt>> = vec![
+            Box::new(AlwaysFails { calls: a.clone() }),
+            Box::new(AlwaysFails { calls: b.clone() }),
+        ];
         let result = establish(&cfg, &attempts).await;
         assert!(result.is_none());
         // Both candidates attempted once because the first failed.
-        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(a.load(Ordering::SeqCst), 1);
+        assert_eq!(b.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn establish_with_no_candidates_returns_none() {
         let cfg = test_cfg();
-        let attempts: Vec<&dyn MapAttempt> = vec![];
+        let attempts: Vec<Box<dyn MapAttempt>> = vec![];
         assert!(establish(&cfg, &attempts).await.is_none());
     }
 
@@ -728,6 +829,64 @@ mod tests {
             backend: PortMapBackend::None,
             ..test_cfg()
         };
-        assert!(spawn_port_mapping(cfg).await.is_none());
+        assert!(spawn_port_mapping(cfg).is_none());
+    }
+
+    // Proves startup does not block on gateway discovery: `spawn_with_attempts` returns while
+    // the (delayed) attempt is still in flight, so the endpoint is not yet available, and it is
+    // then delivered asynchronously via the watch channel.
+    #[tokio::test]
+    async fn spawn_returns_before_discovery_completes_then_delivers_via_channel() {
+        let cfg = test_cfg();
+        let attempts: Vec<Box<dyn MapAttempt>> = vec![Box::new(DelayedOk {
+            delay: Duration::from_millis(300),
+            endpoint: test_endpoint(8621),
+        })];
+        let handle = spawn_with_attempts(cfg, attempts);
+        // Returned immediately: the 300ms attempt cannot have completed synchronously.
+        assert!(
+            handle.endpoint().is_none(),
+            "spawn must not await gateway discovery"
+        );
+        // Endpoint is delivered once the background task finishes discovery.
+        let delivered = tokio::time::timeout(Duration::from_secs(2), handle.wait_for_endpoint())
+            .await
+            .expect("endpoint should be delivered promptly after discovery");
+        assert_eq!(delivered.map(|e| e.external_port), Some(8621));
+        // A snapshot read now also sees it.
+        assert_eq!(handle.endpoint().map(|e| e.external_port), Some(8621));
+        handle.shutdown().await;
+    }
+
+    // Shutting down while discovery is still in flight must not panic and must leave no endpoint.
+    #[tokio::test]
+    async fn shutdown_before_discovery_completes_does_not_panic() {
+        let cfg = test_cfg();
+        let attempts: Vec<Box<dyn MapAttempt>> = vec![Box::new(DelayedOk {
+            delay: Duration::from_secs(30),
+            endpoint: test_endpoint(8621),
+        })];
+        let handle = spawn_with_attempts(cfg, attempts);
+        assert!(handle.endpoint().is_none());
+        // Should return quickly (the task abandons the 30s discovery on the shutdown signal)
+        // and no endpoint is ever produced.
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("shutdown must not wait for in-flight discovery");
+    }
+
+    // When every backend fails, the background task ends without an endpoint and the handle's
+    // channel reports `None` rather than hanging.
+    #[tokio::test]
+    async fn all_backends_failing_yields_no_endpoint() {
+        let cfg = test_cfg();
+        let attempts: Vec<Box<dyn MapAttempt>> = vec![Box::new(AlwaysFails {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })];
+        let handle = spawn_with_attempts(cfg, attempts);
+        let delivered = tokio::time::timeout(Duration::from_secs(2), handle.wait_for_endpoint())
+            .await
+            .expect("wait_for_endpoint must resolve when the task ends");
+        assert!(delivered.is_none());
     }
 }
