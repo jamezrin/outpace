@@ -149,10 +149,6 @@ struct SeedConfig {
 
 pub struct AceProvider {
     identity: Arc<Identity>,
-    /// The local peer-listener port (`config.peer_listen.port()`) — our designated AceStream
-    /// peer endpoint, never the HTTP API port. It is the discovery-announce fallback when no
-    /// dynamically resolved mapped endpoint is available.
-    peer_port: u16,
     /// External inbound endpoint to advertise as a dial-able seeder on the periodic tracker +
     /// DHT self-announce. `None` when inbound seeding is disabled — we run no listener, so we
     /// must not invite peers to dial us (mirrors `BroadcastState::inbound_peer_port`). `Some`
@@ -181,10 +177,9 @@ impl AceProvider {
     /// Self-announcing as a dial-able seeder is opt-in via
     /// [`with_inbound_announce_port`](Self::with_inbound_announce_port); by default we do not
     /// advertise an inbound endpoint (a pure leecher / one-shot CLI play has no listener).
-    pub fn new(identity: Arc<Identity>, peer_port: u16) -> Self {
+    pub fn new(identity: Arc<Identity>, _peer_port: u16) -> Self {
         AceProvider {
             identity,
-            peer_port,
             announce_peer_port: tokio::sync::watch::channel(None).1,
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_peers: Vec::new(),
@@ -240,7 +235,7 @@ impl AceProvider {
     }
 
     fn discovery_announce_port(&self) -> u16 {
-        self.announce_peer_port.borrow().unwrap_or(self.peer_port)
+        self.announce_peer_port.borrow().unwrap_or(0)
     }
 
     /// Trackers used for a bare infohash (which carries none); transport files supply their
@@ -375,7 +370,6 @@ impl AceProvider {
         Ok(Box::new(AceVodContent {
             info,
             bootstrap_peers: self.bootstrap_peers.clone(),
-            peer_port: self.peer_port,
             announce_peer_port: self.announce_peer_port.clone(),
             cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(
                 VOD_PIECE_CACHE_CAP,
@@ -517,7 +511,6 @@ fn cached_prefix(cache: &VodPieceCache, first_piece: u64, end_piece: u64) -> (Ve
 struct AceVodContent {
     info: VodInfo,
     bootstrap_peers: Vec<SocketAddrV4>,
-    peer_port: u16,
     announce_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
     /// Verified whole pieces retained across this VOD's range reads (bounded, FIFO).
     cache: Arc<std::sync::Mutex<VodPieceCache>>,
@@ -535,7 +528,7 @@ impl AceVodContent {
             return peers.clone();
         }
         let discovered = if self.bootstrap_peers.is_empty() {
-            let announce_port = self.announce_peer_port.borrow().unwrap_or(self.peer_port);
+            let announce_port = self.announce_peer_port.borrow().unwrap_or(0);
             discover_peers(
                 &self.info.trackers,
                 &self.info.infohash,
@@ -778,11 +771,7 @@ impl StreamProvider for AceProvider {
         };
         let announce_info = info.clone();
         let announce_port = self.announce_peer_port.clone();
-        let discovery_port = if self.announce_peer_port.borrow().is_some() {
-            self.announce_peer_port.clone()
-        } else {
-            tokio::sync::watch::channel(Some(self.peer_port)).1
-        };
+        let discovery_port = self.announce_peer_port.clone();
         let reachability = self.reachability.clone();
         tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
@@ -3093,7 +3082,6 @@ mod tests {
         let vod = AceVodContent {
             info,
             bootstrap_peers: vec![addr],
-            peer_port: 0,
             announce_peer_port: tokio::sync::watch::channel(None).1,
             cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(8))),
             peers: Arc::new(tokio::sync::Mutex::new(None)),
@@ -3122,7 +3110,6 @@ mod tests {
         let vod = AceVodContent {
             info,
             bootstrap_peers: vec![addr],
-            peer_port: 0,
             announce_peer_port: tokio::sync::watch::channel(None).1,
             cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(8))),
             peers: Arc::new(tokio::sync::Mutex::new(None)),
@@ -3565,10 +3552,11 @@ mod tests {
         // no dial-able endpoint at all — matching the broadcast path's `inbound_peer_port`.
         let leech_only = AceProvider::new(Arc::new(Identity::generate()), PEER_PORT);
         assert_eq!(leech_only.seeder_announce_port(), None);
+        assert_eq!(leech_only.discovery_announce_port(), 0);
     }
 
     #[tokio::test]
-    async fn mapped_port_is_encoded_in_the_tracker_discovery_announce() {
+    async fn resolved_or_disabled_port_is_encoded_in_the_tracker_discovery_announce() {
         use tokio::net::UdpSocket;
         const LOCAL_PORT: u16 = 8621;
         const MAPPED_PORT: u16 = 48621;
@@ -3577,46 +3565,57 @@ mod tests {
             .with_inbound_announce_port_receiver(port_rx);
         assert_eq!(provider.discovery_announce_port(), MAPPED_PORT);
 
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = match server.local_addr().unwrap() {
-            std::net::SocketAddr::V4(addr) => addr,
-            _ => unreachable!(),
-        };
-        let capture = tokio::spawn(async move {
-            let mut buf = [0_u8; 2048];
-            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
-            let txid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
-            let mut response = Vec::new();
-            response.extend_from_slice(&0_u32.to_be_bytes());
-            response.extend_from_slice(&txid.to_be_bytes());
-            response.extend_from_slice(&42_u64.to_be_bytes());
-            server.send_to(&response, peer).await.unwrap();
-            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
-            assert_eq!(len, 98);
-            let announced_port = u16::from_be_bytes(buf[96..98].try_into().unwrap());
-            let txid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
-            let mut response = Vec::new();
-            response.extend_from_slice(&1_u32.to_be_bytes());
-            response.extend_from_slice(&txid.to_be_bytes());
-            response.extend_from_slice(&1800_u32.to_be_bytes());
-            response.extend_from_slice(&0_u32.to_be_bytes());
-            response.extend_from_slice(&0_u32.to_be_bytes());
-            server.send_to(&response, peer).await.unwrap();
-            announced_port
-        });
-        ace_tracker::client::announce(
-            addr,
-            &[1_u8; 20],
-            &[2_u8; 20],
-            provider.discovery_announce_port(),
-            50,
-            ace_tracker::codec::TransferState::default(),
-            ace_tracker::codec::AnnounceEvent::Started,
-        )
-        .await
-        .unwrap();
-        assert_eq!(capture.await.unwrap(), MAPPED_PORT);
+        async fn capture_wire_port(port: u16) -> u16 {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = match server.local_addr().unwrap() {
+                std::net::SocketAddr::V4(addr) => addr,
+                _ => unreachable!(),
+            };
+            let capture = tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let (_, peer) = server.recv_from(&mut buf).await.unwrap();
+                let txid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+                let mut response = Vec::new();
+                response.extend_from_slice(&0_u32.to_be_bytes());
+                response.extend_from_slice(&txid.to_be_bytes());
+                response.extend_from_slice(&42_u64.to_be_bytes());
+                server.send_to(&response, peer).await.unwrap();
+                let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+                assert_eq!(len, 98);
+                let announced_port = u16::from_be_bytes(buf[96..98].try_into().unwrap());
+                let txid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+                let mut response = Vec::new();
+                response.extend_from_slice(&1_u32.to_be_bytes());
+                response.extend_from_slice(&txid.to_be_bytes());
+                response.extend_from_slice(&1800_u32.to_be_bytes());
+                response.extend_from_slice(&0_u32.to_be_bytes());
+                response.extend_from_slice(&0_u32.to_be_bytes());
+                server.send_to(&response, peer).await.unwrap();
+                announced_port
+            });
+            ace_tracker::client::announce(
+                addr,
+                &[1_u8; 20],
+                &[2_u8; 20],
+                port,
+                50,
+                ace_tracker::codec::TransferState::default(),
+                ace_tracker::codec::AnnounceEvent::Started,
+            )
+            .await
+            .unwrap();
+            capture.await.unwrap()
+        }
+        assert_eq!(
+            capture_wire_port(provider.discovery_announce_port()).await,
+            MAPPED_PORT
+        );
         assert_ne!(MAPPED_PORT, LOCAL_PORT);
+        let inbound_disabled = AceProvider::new(Arc::new(Identity::generate()), LOCAL_PORT);
+        assert_eq!(
+            capture_wire_port(inbound_disabled.discovery_announce_port()).await,
+            0
+        );
     }
 
     #[test]
