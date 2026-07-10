@@ -6,7 +6,6 @@ use crate::config::{load_or_create_identity, CacheType, Config};
 use crate::http::{router, AppState, BroadcastState};
 use crate::manager::StreamManager;
 use crate::provider::ProviderRegistry;
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
@@ -336,7 +335,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         manager,
         networks: networks.clone(),
         resolve_content_ids_in_getstream: true,
-        ace_session_aliases: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: config.experimental_ace_compat,
         broadcasts: Some(broadcasts),
     };
