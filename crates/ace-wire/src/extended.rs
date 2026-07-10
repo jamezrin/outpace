@@ -213,6 +213,26 @@ impl ExtendedHandshake {
     pub fn metadata_size(&self) -> Option<i64> {
         self.raw.get(b"metadata_size").and_then(Bencode::as_int)
     }
+
+    /// The public IP the peer sees us as, from the BEP-10 `yourip` field (a compact address:
+    /// 4 bytes = IPv4, 16 bytes = IPv6). `None` when absent or malformed. On an OUTBOUND
+    /// connection this is the swarm echoing back our observed public address — the free signal
+    /// used to answer "are we publicly reachable?" (issue #22).
+    pub fn yourip(&self) -> Option<std::net::IpAddr> {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let bytes = self.raw.get(b"yourip").and_then(Bencode::as_bytes)?;
+        match bytes.len() {
+            4 => {
+                let o: [u8; 4] = bytes.try_into().ok()?;
+                Some(IpAddr::V4(Ipv4Addr::from(o)))
+            }
+            16 => {
+                let o: [u8; 16] = bytes.try_into().ok()?;
+                Some(IpAddr::V6(Ipv6Addr::from(o)))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +271,49 @@ mod tests {
         let parsed = ExtendedHandshake::parse(&payload).unwrap();
         assert_eq!(parsed.metadata_size(), Some(420));
         assert_eq!(parsed.ut_metadata_id(), Some(2));
+    }
+
+    #[test]
+    fn parses_ipv4_yourip_echoed_by_a_peer() {
+        use crate::identity::Identity;
+        use std::net::{IpAddr, Ipv4Addr};
+        // A peer echoes the IPv4 it sees us as via the `yourip` field (issue #22). Only the
+        // full signed handshake carries `yourip`, so exercise that encoder.
+        let payload = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: None,
+            node: NodeFields::default(),
+            peer_ip: Some([203, 0, 113, 7]),
+            metadata_size: None,
+        }
+        .sign_and_encode(&Identity::generate());
+        let parsed = ExtendedHandshake::parse(&payload).unwrap();
+        assert_eq!(
+            parsed.yourip(),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
+        );
+    }
+
+    #[test]
+    fn absent_or_malformed_yourip_is_none() {
+        // Absent: a handshake that never carried `yourip`.
+        let payload = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: None,
+            node: NodeFields::default(),
+            peer_ip: None,
+            metadata_size: None,
+        }
+        .encode_payload();
+        assert_eq!(ExtendedHandshake::parse(&payload).unwrap().yourip(), None);
+
+        // Malformed: a `yourip` of the wrong byte length is ignored, not misread.
+        let mut dict = BTreeMap::new();
+        dict.insert(b"yourip".to_vec(), Bencode::Bytes(vec![1, 2, 3]));
+        let raw = Bencode::Dict(dict).encode();
+        assert_eq!(ExtendedHandshake::parse(&raw).unwrap().yourip(), None);
     }
 
     #[test]

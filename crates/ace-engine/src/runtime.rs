@@ -17,6 +17,10 @@ use std::sync::Arc;
 /// anything is locally following it — a pure origin needs to be discoverable too.
 const DEFAULT_BROADCAST_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announce"];
 
+/// How often the daemon logs its public-reachability status (issue #22). Slow-changing signal,
+/// so a couple of minutes keeps the noise low (cf. the 4-min seeder self-announce cadence).
+const REACHABILITY_STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BroadcastIngestUrls {
     pub raw: String,
@@ -29,6 +33,10 @@ pub struct EngineRuntime {
     pub manager: Arc<StreamManager>,
     pub seed_registry: ace_swarm::listen::SeedRegistry,
     pub broadcasts: BroadcastState,
+    /// Daemon-wide public-reachability observability (issue #22). `Some` only when inbound
+    /// serving is enabled — with inbound off we can't be dialed, so harvesting/counting is
+    /// entirely absent and the status logger never runs.
+    pub reachability: Option<Arc<ace_swarm::reachability::ReachabilityMonitor>>,
     identity: Arc<ace_wire::identity::Identity>,
 }
 
@@ -207,6 +215,12 @@ pub async fn build_runtime(
 
     // Register enabled providers. Only "ace" exists today; the registry is the path for more.
     let seed_registry = ace_swarm::listen::SeedRegistry::new();
+    // Public-reachability monitor (issue #22): only created when inbound serving is on. With
+    // inbound off we can never be dialed, so nothing harvests `yourip` or counts inbound peers
+    // and the whole feature is inert — no behavior change (issue #22 task 5).
+    let reachability = config
+        .enable_inbound
+        .then(|| Arc::new(ace_swarm::reachability::ReachabilityMonitor::new()));
     let mut registry = ProviderRegistry::new();
     // The single resolved external inbound endpoint. Advertise the *peer* port, never the HTTP
     // API port (issue #21); `None` when inbound serving is off (no listener to back it). Both
@@ -222,7 +236,8 @@ pub async fn build_runtime(
             .with_prefetch_pieces(config.prefetch_pieces)
             .with_live_recovery(config.live_recovery)
             .with_seeding_enabled(config.enable_seeding)
-            .with_inbound_announce_port(inbound_peer_port);
+            .with_inbound_announce_port(inbound_peer_port)
+            .with_reachability(reachability.clone());
         registry.register(Arc::new(provider));
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
@@ -293,6 +308,7 @@ pub async fn build_runtime(
         manager,
         seed_registry,
         broadcasts,
+        reachability,
         identity,
     })
 }
@@ -304,6 +320,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         manager,
         seed_registry,
         broadcasts,
+        reachability,
         identity,
     } = runtime;
 
@@ -344,6 +361,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         let max_inbound = config.max_inbound_peers;
         let max_unchoked = config.max_unchoked;
         let listener_identity = identity.clone();
+        let listener_reachability = reachability.clone();
         tokio::spawn(async move {
             ace_swarm::listen::PeerListener::serve(
                 peer_listener,
@@ -353,6 +371,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
                 max_inbound,
                 listener_identity,
                 max_unchoked,
+                listener_reachability,
             )
             .await;
         });
@@ -379,6 +398,16 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
                 config.peer_listen.port()
             );
             _port_map_handle = ace_swarm::portmap::spawn_port_mapping(pm_cfg);
+        }
+
+        // Public-reachability status (issue #22): turn note 24's open "nothing proven to dial us
+        // back" question into an observable answer. We hold a monitor only when inbound serving
+        // is on, so this runs exactly when there is a listener that could actually be reached.
+        // The port-mapping endpoint receiver (when mapping is enabled) feeds the `yourip` vs
+        // mapped-external-IP cross-check that flags double-NAT / CGNAT.
+        if let Some(monitor) = reachability.clone() {
+            let endpoint_rx = _port_map_handle.as_ref().map(|h| h.endpoint_receiver());
+            tokio::spawn(reachability_status_loop(monitor, endpoint_rx));
         }
     }
 
@@ -430,6 +459,36 @@ pub fn announce_broadcast(runtime: &EngineRuntime, bc: &Broadcast) {
             bc.content_id,
             port,
         ));
+    }
+}
+
+/// Periodically log the daemon's public-reachability status (issue #22): whether an unsolicited
+/// inbound peer has confirmed us reachable, the public IP peers echo via `yourip`, and — when a
+/// gateway mapping (#20) is present — a `yourip` vs mapped-external-IP cross-check that warns on
+/// a mismatch (the double-NAT / CGNAT signature). `endpoint_rx` is `None` when port mapping is
+/// disabled, in which case the cross-check is simply skipped.
+async fn reachability_status_loop(
+    monitor: Arc<ace_swarm::reachability::ReachabilityMonitor>,
+    endpoint_rx: Option<tokio::sync::watch::Receiver<Option<ace_swarm::portmap::MappedEndpoint>>>,
+) {
+    use ace_swarm::reachability::CrossCheck;
+    let mut ticker = tokio::time::interval(REACHABILITY_STATUS_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let mapped = endpoint_rx.as_ref().and_then(|rx| rx.borrow().clone());
+        let mapped_ip = mapped.as_ref().and_then(|e| e.external_ip);
+        // The status line's "external" endpoint is the gateway-mapped one (only when the backend
+        // reported an external IP); the observed `yourip` is always reported separately.
+        let external = mapped
+            .as_ref()
+            .and_then(|e| e.external_ip.map(|ip| (ip, e.external_port)));
+        crate::alog!("[reachability] {}", monitor.status_line(external));
+        if let CrossCheck::Mismatch { observed, mapped } = monitor.cross_check(mapped_ip) {
+            crate::alog!(
+                "[reachability] WARNING: observed public IP {observed} (from peer yourip) differs from the mapped external IP {mapped} — likely double-NAT / CGNAT (the gateway mapped a private upstream address); inbound dials to {mapped} may never reach us"
+            );
+        }
     }
 }
 
@@ -722,6 +781,36 @@ mod tests {
         };
         let runtime = build_runtime(config, vec![]).await.unwrap();
         assert_eq!(runtime.config.max_unchoked, 2);
+        assert!(
+            runtime.reachability.is_some(),
+            "a reachability monitor exists when inbound serving is on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reachability_monitor_is_absent_when_inbound_is_disabled() {
+        // Issue #22 task 5: with inbound serving off we can never be dialed, so the whole
+        // reachability feature must be inert — no monitor is created, nothing harvests `yourip`
+        // or counts inbound peers, and the status logger never runs.
+        let dir = std::env::temp_dir().join(format!("outpace-rt-reach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            cache_dir: dir.join("cache"),
+            networks: vec![],
+            enable_inbound: false,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            peer_listen: "127.0.0.1:0".parse().unwrap(),
+            rtmp_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        };
+        let runtime = build_runtime(config, vec![]).await.unwrap();
+        assert!(
+            runtime.reachability.is_none(),
+            "no reachability monitor when inbound serving is disabled"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
