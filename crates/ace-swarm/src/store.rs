@@ -243,6 +243,12 @@ impl PieceStore {
     /// placeholder so old call sites remain compatible while relay/source paths preserve real
     /// headers.
     pub fn put_chunk_with_header(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) {
+        // A zero budget is the explicit no-retention policy used when disk-mode construction
+        // fails. Do not even touch backend metadata: empty payloads add zero accounted bytes and
+        // would otherwise accumulate piece/chunk/header entries without triggering eviction.
+        if self.max_bytes == 0 {
+            return;
+        }
         // Chunk indices arrive straight off the wire (id=7). Drop any index outside the piece's
         // geometry so a stray value can't sit in the chunk map — inflating its length so
         // `has_piece` never counts the piece complete (it would then never be reseeded) and
@@ -382,6 +388,22 @@ mod tests {
         s.put_chunk(1, 0, &[0; 4]);
         assert_eq!(s.chunk(1, 0).as_deref(), None); // evicted immediately, no panic
         assert_eq!(s.window(), None);
+    }
+
+    #[test]
+    fn zero_budget_retains_no_payload_or_metadata_even_for_empty_chunks() {
+        let mut store = PieceStore::new(8, 4, 0);
+        for piece in 0..10_000 {
+            store.put_chunk_with_header(piece, 0, [0x55; 8], &[]);
+            store.put_chunk_with_header(piece, 1, [0xaa; 8], &[1, 2, 3, 4]);
+        }
+
+        assert!(store.chunk(0, 0).is_none());
+        assert!(store.chunk(9_999, 1).is_none());
+        assert!(store.piece_header(0).is_none());
+        assert!(store.piece_header(9_999).is_none());
+        assert!(store.have_pieces().is_empty());
+        assert_eq!(store.window(), None);
     }
 
     #[test]
