@@ -252,8 +252,14 @@ Environment variables parsed by the daemon include:
 
 The disk cache is **ephemeral**: its directory is cleared when a store is created and
 never reloaded across restarts (live piece data goes stale), which also avoids serving
-evicted-stale pieces. Disk I/O is currently synchronous; a write failure logs and falls
-back to memory rather than crashing.
+evicted-stale pieces. Disk I/O is currently synchronous.
+
+Disk mode never silently converts `OUTPACE_SEED_STORE_BYTES` into an equal per-stream RAM
+allocation. An invalid/unwritable cache root fails daemon startup. If a new per-stream directory
+cannot be created later (for example after a permission change), outpace logs an escalating
+`disk store creation failure #N` error and keeps playback running with **zero piece retention** for
+that stream: no memory cache fallback is allocated, and reciprocal/inbound seeding has no retained
+pieces to serve. This favors the operator's RAM bound over transient seeding capacity.
 
 In disk mode each served stream keeps its pieces under
 `<OUTPACE_CACHE_DIR>/<infohash_hex>-<generation>` (a process-unique suffix per store instance).
