@@ -21,19 +21,6 @@ pub fn chunk_request(piece: u32, chunk: u16) -> PeerMessage {
     PeerMessage::Unknown { id: 6, payload }
 }
 
-/// Build Acestream's live request rejection for `(stream, piece, chunk)`.
-///
-/// BEP-6 `reject_request` uses message id 16. Acestream live requests use a custom
-/// 10-byte stream/piece/chunk payload rather than the standard 12-byte BitTorrent
-/// piece/begin/length tuple, so this stays a raw peer message.
-pub fn reject_chunk_request(stream: u32, piece: u32, chunk: u16) -> PeerMessage {
-    let mut payload = Vec::with_capacity(10);
-    payload.extend_from_slice(&stream.to_be_bytes());
-    payload.extend_from_slice(&piece.to_be_bytes());
-    payload.extend_from_slice(&chunk.to_be_bytes());
-    PeerMessage::Unknown { id: 16, payload }
-}
-
 /// Build Acestream's custom live availability signal (id=4):
 /// payload `[stream u32=0][piece u32]`. This is distinct from standard BT `Have`, whose
 /// payload is only `[piece u32]`.
@@ -134,27 +121,6 @@ mod tests {
             }
             _ => panic!(),
         }
-    }
-
-    #[test]
-    fn reject_request_has_acestream_10_byte_payload_on_bep6_id() {
-        let m = reject_chunk_request(0, 0x005067f8, 3);
-        match &m {
-            PeerMessage::Unknown { id, payload } => {
-                assert_eq!(*id, 16);
-                assert_eq!(
-                    payload.as_slice(),
-                    &[0, 0, 0, 0, 0x00, 0x50, 0x67, 0xf8, 0x00, 0x03]
-                );
-            }
-            _ => panic!(),
-        }
-
-        let encoded = m.encode();
-        assert_eq!(
-            PeerMessage::decode(&encoded).unwrap(),
-            Some((m, encoded.len()))
-        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use ace_peer::Result;
 use ace_wire::bencode::Bencode;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::identity::Identity;
-use ace_wire::live_codec::{build_piece, live_bitfield, live_have, reject_chunk_request};
+use ace_wire::live_codec::{build_piece, live_bitfield, live_have};
 use ace_wire::message::PeerMessage;
 use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,8 +28,10 @@ impl SeederSession {
     /// advertising the store's current live window (`mi`) — **required** before a real leech
     /// client (including our own `AceProvider`, which waits for this as the peer's first
     /// message) will proceed at all — then advertise held pieces with Acestream's live
-    /// bitfield, then answer each Acestream chunk-request (id=6
-    /// `[stream u32][piece u32][chunk u16]`) with a `Piece` built from the store. Unchoking is
+    /// bitfield, then answer each available Acestream chunk-request (id=6
+    /// `[stream u32][piece u32][chunk u16]`) with a `Piece` built from the store. Requests for
+    /// unavailable chunks are left unanswered, matching the legacy engine's retry behavior.
+    /// Unchoking is
     /// gated by `coordinator` when `Some` — the peer is unchoked/choked as the coordinator's
     /// `max_unchoked` policy flips its watch, so a choked peer's chunk-requests are dropped
     /// (`Unknown { id: 6, .. }` requires `unchoked`). When `coordinator` is `None`, falls back to
@@ -226,15 +228,6 @@ impl SeederSession {
                                 data.len()
                             );
                         }
-                    } else {
-                        session
-                            .send(&reject_chunk_request(stream, piece, chunk))
-                            .await?;
-                        if debug {
-                            crate::swarm_log!(
-                                "[seed-session] -> Reject stream={stream} piece={piece} chunk={chunk}"
-                            );
-                        }
                     }
                 }
                 _ => {}
@@ -356,15 +349,6 @@ fn seed_message_summary(msg: &PeerMessage) -> String {
             let chunk = u16::from_be_bytes([payload[8], payload[9]]);
             format!(
                 "ACE Request stream={stream} piece={piece} chunk={chunk} bytes={}",
-                payload.len()
-            )
-        }
-        PeerMessage::Unknown { id: 16, payload } if payload.len() >= 10 => {
-            let stream = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            let piece = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            let chunk = u16::from_be_bytes([payload[8], payload[9]]);
-            format!(
-                "ACE Reject stream={stream} piece={piece} chunk={chunk} bytes={}",
                 payload.len()
             )
         }
@@ -1048,7 +1032,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_a_requested_chunk_that_is_not_in_the_store() {
+    async fn ignores_a_missing_chunk_request_and_keeps_serving() {
         let store = Arc::new(Mutex::new(PieceStore::new(4, 4, 1024)));
         store.lock().await.put_chunk(5, 0, &[9, 9, 9, 9]);
 
@@ -1057,12 +1041,30 @@ mod tests {
             let mut p = PeerSession::new(client);
             p.send(&PeerMessage::Interested).await.unwrap();
             p.send(&chunk_request(6, 0)).await.unwrap();
+            let quiet_until = tokio::time::Instant::now() + Duration::from_millis(100);
+            loop {
+                match tokio::time::timeout_at(quiet_until, p.read_message()).await {
+                    Ok(Ok(PeerMessage::Unknown { id: 16, .. })) => {
+                        panic!("missing live chunks must not emit the incompatible id=16 message")
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(err)) => panic!("peer connection closed after missing request: {err:?}"),
+                    Err(_) => break,
+                }
+            }
+
+            p.send(&chunk_request(5, 0)).await.unwrap();
             loop {
                 match tokio::time::timeout(Duration::from_millis(500), p.read_message()).await {
-                    Ok(Ok(PeerMessage::Unknown { id: 16, payload })) => return payload,
+                    Ok(Ok(message @ PeerMessage::Piece { .. })) => {
+                        return LiveChunk::from_message(&message).unwrap();
+                    }
+                    Ok(Ok(PeerMessage::Unknown { id: 16, .. })) => {
+                        panic!("missing live chunks must not emit the incompatible id=16 message")
+                    }
                     Ok(Ok(_)) => continue,
-                    Ok(Err(err)) => panic!("peer read failed before reject: {err:?}"),
-                    Err(_) => panic!("timed out waiting for live reject"),
+                    Ok(Err(err)) => panic!("peer read failed before available chunk: {err:?}"),
+                    Err(_) => panic!("timed out waiting for available chunk"),
                 }
             }
         });
@@ -1082,11 +1084,16 @@ mod tests {
             .await;
         });
 
-        let payload = peer.await.unwrap();
+        let chunk = peer.await.unwrap();
         assert_eq!(
-            payload,
-            vec![0, 0, 0, 0, 0, 0, 0, 6, 0, 0],
-            "reject must echo the live request's stream/piece/chunk coordinates"
+            chunk,
+            LiveChunk {
+                piece: 5,
+                piece_header: [0; 8],
+                chunk: 0,
+                data: vec![9, 9, 9, 9],
+            },
+            "the session must remain usable after an unavailable chunk request"
         );
         serve_task.abort();
     }
