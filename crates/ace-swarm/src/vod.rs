@@ -25,6 +25,8 @@ pub const VOD_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const VOD_UNCHOKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum time between newly covered blocks while assembling a VOD piece.
 pub const VOD_BLOCK_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum time allowed for an outbound VOD protocol write.
+pub const VOD_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 struct VodTimeouts {
@@ -32,6 +34,7 @@ struct VodTimeouts {
     handshake: Duration,
     unchoke: Duration,
     block_progress: Duration,
+    write: Duration,
 }
 
 const DEFAULT_VOD_TIMEOUTS: VodTimeouts = VodTimeouts {
@@ -39,6 +42,7 @@ const DEFAULT_VOD_TIMEOUTS: VodTimeouts = VodTimeouts {
     handshake: VOD_HANDSHAKE_TIMEOUT,
     unchoke: VOD_UNCHOKE_TIMEOUT,
     block_progress: VOD_BLOCK_PROGRESS_TIMEOUT,
+    write: VOD_WRITE_TIMEOUT,
 };
 
 /// True iff `bytes` hashes (SHA-1) to `expected` — standard BitTorrent piece integrity.
@@ -226,30 +230,33 @@ async fn drain_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
     tx: &mpsc::Sender<Bytes>,
     timeouts: VodTimeouts,
 ) -> Result<(), VodError> {
-    session
-        .send(&PeerMessage::Interested)
-        .await
-        .map_err(|_| VodError::Unrecoverable(*next_piece))?;
+    send_vod_message(
+        session,
+        &PeerMessage::Interested,
+        tx,
+        timeouts.write,
+        *next_piece,
+    )
+    .await?;
     let mut unchoked = false;
     while *next_piece < end_piece {
         let idx = *next_piece;
         let piece_len = info.piece_size(idx) as usize;
         let mut assembled = PieceBuffer::new(piece_len);
         if unchoked {
-            request_piece_blocks(session, info, idx, piece_len)
-                .await
-                .map_err(|_| VodError::Unrecoverable(idx))?;
+            request_piece_blocks(session, info, idx, piece_len, tx, timeouts.write).await?;
         }
-        let mut phase_deadline = tokio::time::Instant::now()
+        let mut progress_deadline = tokio::time::Instant::now()
             + if unchoked {
                 timeouts.block_progress
             } else {
                 timeouts.unchoke
             };
+        let mut requested_this_piece = unchoked;
         loop {
             let msg = tokio::select! {
                 _ = tx.closed() => return Err(VodError::ConsumerGone),
-                result = tokio::time::timeout_at(phase_deadline, session.read_message()) => {
+                result = tokio::time::timeout_at(progress_deadline, session.read_message()) => {
                     match result {
                         Ok(Ok(message)) => message,
                         Ok(Err(_)) | Err(_) => return Err(VodError::Unrecoverable(idx)),
@@ -260,15 +267,19 @@ async fn drain_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
                 PeerMessage::Unchoke => {
                     if !unchoked {
                         unchoked = true;
-                        request_piece_blocks(session, info, idx, piece_len)
-                            .await
-                            .map_err(|_| VodError::Unrecoverable(idx))?;
-                        phase_deadline = tokio::time::Instant::now() + timeouts.block_progress;
+                        if !requested_this_piece {
+                            request_piece_blocks(session, info, idx, piece_len, tx, timeouts.write)
+                                .await?;
+                            requested_this_piece = true;
+                            // The first unchoke changes the wait from "permission" to "data".
+                            // Later choke/unchoke chatter cannot extend this deadline.
+                            progress_deadline =
+                                tokio::time::Instant::now() + timeouts.block_progress;
+                        }
                     }
                 }
                 PeerMessage::Choke => {
                     unchoked = false;
-                    phase_deadline = tokio::time::Instant::now() + timeouts.unchoke;
                 }
                 PeerMessage::Piece {
                     index,
@@ -282,7 +293,7 @@ async fn drain_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
                         break;
                     }
                     if made_progress {
-                        phase_deadline = tokio::time::Instant::now() + timeouts.block_progress;
+                        progress_deadline = tokio::time::Instant::now() + timeouts.block_progress;
                     }
                 }
                 // Ignore Have / Bitfield / unrelated-piece / other messages; keep reading.
@@ -307,21 +318,46 @@ async fn request_piece_blocks<S: AsyncRead + AsyncWrite + Unpin>(
     info: &VodInfo,
     idx: u64,
     piece_len: usize,
-) -> ace_peer::Result<()> {
+    tx: &mpsc::Sender<Bytes>,
+    write_timeout: Duration,
+) -> Result<(), VodError> {
     let block = info.chunk_length as usize;
     let mut begin = 0usize;
     while begin < piece_len {
         let length = block.min(piece_len - begin);
-        session
-            .send(&PeerMessage::Request {
+        send_vod_message(
+            session,
+            &PeerMessage::Request {
                 index: idx as u32,
                 begin: begin as u32,
                 length: length as u32,
-            })
-            .await?;
+            },
+            tx,
+            write_timeout,
+            idx,
+        )
+        .await?;
         begin += length;
     }
     Ok(())
+}
+
+async fn send_vod_message<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+    message: &PeerMessage,
+    tx: &mpsc::Sender<Bytes>,
+    timeout: Duration,
+    piece: u64,
+) -> Result<(), VodError> {
+    tokio::select! {
+        _ = tx.closed() => Err(VodError::ConsumerGone),
+        result = tokio::time::timeout(timeout, session.send(message)) => {
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) | Err(_) => Err(VodError::Unrecoverable(piece)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -591,7 +627,41 @@ mod seeder_tests {
             handshake: Duration::from_millis(100),
             unchoke: Duration::from_millis(100),
             block_progress: Duration::from_millis(100),
+            write: Duration::from_millis(100),
         }
+    }
+
+    async fn spawn_chattering_peer(infohash: [u8; 20]) -> SocketAddrV4 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = match listener.local_addr().unwrap() {
+            std::net::SocketAddr::V4(addr) => addr,
+            _ => unreachable!(),
+        };
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut hs = [0u8; ace_wire::handshake::HANDSHAKE_LEN];
+                    if sock.read_exact(&mut hs).await.is_err() {
+                        return;
+                    }
+                    let reply =
+                        Handshake::new(infohash, ace_wire::handshake::random_peer_id()).encode();
+                    if sock.write_all(&reply).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        for message in [PeerMessage::Unchoke, PeerMessage::Choke] {
+                            if sock.write_all(&message.encode()).await.is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }
+                });
+            }
+        });
+        addr
     }
 
     #[tokio::test]
@@ -605,6 +675,20 @@ mod seeder_tests {
         )
         .await
         .expect("silent peer must not hang");
+        assert!(matches!(result, Err(VodError::Unrecoverable(0))));
+    }
+
+    #[tokio::test]
+    async fn choke_unchoke_chatter_does_not_extend_the_data_deadline() {
+        let (_, info) = make_content(16, 8, 16);
+        let chatter = spawn_chattering_peer(info.infohash).await;
+        let (tx, _rx) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            download_vod_pieces_with_timeouts(info, vec![chatter], tx, 0, 1, fast_timeouts()),
+        )
+        .await
+        .expect("state chatter without bytes must not hang");
         assert!(matches!(result, Err(VodError::Unrecoverable(0))));
     }
 
@@ -689,6 +773,24 @@ mod seeder_tests {
         let result = tokio::time::timeout(Duration::from_millis(100), handle)
             .await
             .expect("consumer cancellation must be prompt")
+            .unwrap();
+        assert!(matches!(result, Err(VodError::ConsumerGone)));
+    }
+
+    #[tokio::test]
+    async fn dropping_consumer_cancels_backpressured_request_writes() {
+        let (_server, client) = tokio::io::duplex(1);
+        let mut session = PeerSession::new(client);
+        let (_, info) = make_content(32, 8, 32);
+        let (tx, rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            request_piece_blocks(&mut session, &info, 0, 32, &tx, Duration::from_secs(10)).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(rx);
+        let result = tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("consumer cancellation must interrupt a blocked request write")
             .unwrap();
         assert!(matches!(result, Err(VodError::ConsumerGone)));
     }
