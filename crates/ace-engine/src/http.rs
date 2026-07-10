@@ -1457,6 +1457,10 @@ mod tests {
     struct FixtureSource {
         pos: usize,
     }
+    struct PacedFixtureProvider;
+    struct PacedFixtureSource {
+        pos: usize,
+    }
     #[async_trait]
     impl TsSource for FixtureSource {
         async fn next(&mut self) -> Option<Bytes> {
@@ -1487,6 +1491,31 @@ mod tests {
         }
         async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
             Ok(Box::new(FixtureSource { pos: self.skip }))
+        }
+    }
+    #[async_trait]
+    impl TsSource for PacedFixtureSource {
+        async fn next(&mut self) -> Option<Bytes> {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            if self.pos >= FIXTURE.len() {
+                self.pos = 0;
+            }
+            let end = (self.pos + 188 * 8).min(FIXTURE.len());
+            let chunk = Bytes::copy_from_slice(&FIXTURE[self.pos..end]);
+            self.pos = end;
+            Some(chunk)
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+    #[async_trait]
+    impl StreamProvider for PacedFixtureProvider {
+        fn network(&self) -> &'static str {
+            "fix"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(PacedFixtureSource { pos: 0 }))
         }
     }
 
@@ -1944,6 +1973,115 @@ mod tests {
             "compatibility stop must not force-stop the shared source"
         );
         assert!(manager.get("fix", content_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ace_stop_isolates_two_compat_clients_and_preserves_native_consumer() {
+        use futures::StreamExt;
+        let id = "shared";
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(PacedFixtureProvider));
+        let manager = StreamManager::new(registry);
+        let app = router(AppState {
+            manager: manager.clone(),
+            networks: vec!["fix".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: Arc::new(AceSessionStore::default()),
+            experimental_ace_compat: true,
+            broadcasts: None,
+        });
+
+        async fn mint(app: &Router, id: &str) -> serde_json::Value {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/ace/getstream?infohash={id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+        let a = mint(&app, id).await;
+        let b = mint(&app, id).await;
+        let a_path = a["response"]["playback_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        let b_path = b["response"]["playback_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        let stop_a = a["response"]["command_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+
+        let mut body_a = app
+            .clone()
+            .oneshot(Request::get(a_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        let mut body_b = app
+            .clone()
+            .oneshot(Request::get(b_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        let mut native = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/fix/{id}.ts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        assert!(body_a.next().await.transpose().unwrap().is_some());
+        assert!(body_b.next().await.transpose().unwrap().is_some());
+        assert!(native.next().await.transpose().unwrap().is_some());
+        assert_eq!(manager.get("fix", id).await.unwrap().subscriber_count(), 3);
+
+        let stopped = app
+            .clone()
+            .oneshot(
+                Request::get(format!("{stop_a}?method=stop"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        assert!(body_a.next().await.is_none(), "stopped client A must close");
+        assert_eq!(manager.get("fix", id).await.unwrap().subscriber_count(), 2);
+        assert!(
+            body_b.next().await.transpose().unwrap().is_some(),
+            "client B must keep receiving"
+        );
+        assert!(
+            native.next().await.transpose().unwrap().is_some(),
+            "native consumer must keep receiving"
+        );
+
+        drop(body_b);
+        drop(native);
+        assert_eq!(
+            manager.get("fix", id).await.unwrap().subscriber_count(),
+            0,
+            "the final consumers disappearing must leave the source eligible for idle cleanup"
+        );
     }
 
     #[tokio::test]
