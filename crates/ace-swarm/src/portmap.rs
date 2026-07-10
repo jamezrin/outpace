@@ -340,7 +340,7 @@ async fn run_port_mapping(
     // Publish for the announce path (#21). Ignored if all receivers were already dropped.
     let _ = endpoint_tx.send(Some(endpoint.clone()));
 
-    renewal_loop(active, cfg, endpoint, shutdown_rx).await;
+    renewal_loop(active, cfg, endpoint, endpoint_tx, shutdown_rx).await;
 }
 
 /// Refresh the mapping before its lease expires; delete it on shutdown signal.
@@ -348,13 +348,20 @@ async fn renewal_loop(
     mut active: ActiveMapping,
     cfg: PortMapConfig,
     endpoint: MappedEndpoint,
+    endpoint_tx: watch::Sender<Option<MappedEndpoint>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
+    let lease = if endpoint.lease_duration.is_zero() {
+        Duration::from_secs(30)
+    } else {
+        endpoint.lease_duration
+    };
+    let mut expires_at = tokio::time::Instant::now() + lease;
     loop {
         // Renew at ~half the lease so a single missed refresh does not drop the mapping.
-        let lease = endpoint.lease_duration.max(Duration::from_secs(30));
         let refresh_in = lease / 2;
         tokio::select! {
+            biased;
             _ = &mut shutdown_rx => {
                 match active.remove(&cfg).await {
                     Ok(()) => swarm_log!(
@@ -368,12 +375,17 @@ async fn renewal_loop(
                 }
                 return;
             }
+            _ = tokio::time::sleep_until(expires_at) => {
+                swarm_log!("[portmap] mapping lease for external port {} expired; withdrawing endpoint", endpoint.external_port);
+                let _ = endpoint_tx.send(None);
+                return;
+            }
             _ = tokio::time::sleep(refresh_in) => {
                 match active.renew(&cfg).await {
-                    Ok(()) => swarm_log!(
-                        "[portmap] renewed mapping for external port {}",
-                        endpoint.external_port
-                    ),
+                    Ok(()) => {
+                        expires_at = tokio::time::Instant::now() + lease;
+                        swarm_log!("[portmap] renewed mapping for external port {}", endpoint.external_port);
+                    }
                     Err(e) => swarm_log!(
                         "[portmap] failed to renew mapping for external port {}: {e} (continuing)",
                         endpoint.external_port
@@ -392,6 +404,8 @@ enum ActiveMapping {
     /// renew + remove) without a real gateway.
     #[cfg(test)]
     Fake(MappedEndpoint),
+    #[cfg(test)]
+    FakeRenewFailure(MappedEndpoint),
 }
 
 impl ActiveMapping {
@@ -411,6 +425,8 @@ impl ActiveMapping {
             },
             #[cfg(test)]
             ActiveMapping::Fake(ep) => ep.clone(),
+            #[cfg(test)]
+            ActiveMapping::FakeRenewFailure(ep) => ep.clone(),
         }
     }
 
@@ -423,6 +439,10 @@ impl ActiveMapping {
                 .map_err(|e| PortMapError::NatPmp(e.to_string())),
             #[cfg(test)]
             ActiveMapping::Fake(_) => Ok(()),
+            #[cfg(test)]
+            ActiveMapping::FakeRenewFailure(_) => {
+                Err(PortMapError::Upnp("injected renewal failure".into()))
+            }
         }
     }
 
@@ -434,7 +454,7 @@ impl ActiveMapping {
                 .await
                 .map_err(|(e, _)| PortMapError::NatPmp(e.to_string())),
             #[cfg(test)]
-            ActiveMapping::Fake(_) => Ok(()),
+            ActiveMapping::Fake(_) | ActiveMapping::FakeRenewFailure(_) => Ok(()),
         }
     }
 }
@@ -774,6 +794,20 @@ mod tests {
         endpoint: MappedEndpoint,
     }
 
+    struct RenewalFails {
+        endpoint: MappedEndpoint,
+    }
+
+    #[async_trait::async_trait]
+    impl MapAttempt for RenewalFails {
+        fn name(&self) -> &'static str {
+            "renewal-fails"
+        }
+        async fn attempt(&self, _cfg: &PortMapConfig) -> Result<ActiveMapping, PortMapError> {
+            Ok(ActiveMapping::FakeRenewFailure(self.endpoint.clone()))
+        }
+    }
+
     #[async_trait::async_trait]
     impl MapAttempt for DelayedOk {
         fn name(&self) -> &'static str {
@@ -888,5 +922,32 @@ mod tests {
             .await
             .expect("wait_for_endpoint must resolve when the task ends");
         assert!(delivered.is_none());
+    }
+
+    #[tokio::test]
+    async fn renewal_failure_withdraws_endpoint_when_the_granted_lease_expires() {
+        let endpoint = MappedEndpoint {
+            lease_duration: Duration::from_millis(80),
+            ..test_endpoint(48621)
+        };
+        let handle = spawn_with_attempts(test_cfg(), vec![Box::new(RenewalFails { endpoint })]);
+        let mut endpoint_rx = handle.endpoint_receiver();
+        endpoint_rx.changed().await.unwrap();
+        assert_eq!(
+            endpoint_rx.borrow().as_ref().map(|e| e.external_port),
+            Some(48621)
+        );
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                endpoint_rx.changed().await.unwrap();
+                if endpoint_rx.borrow().is_none() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("expired mapping must be withdrawn");
+        assert!(handle.endpoint().is_none());
+        handle.shutdown().await;
     }
 }

@@ -9,6 +9,7 @@ dependencies = [
  "ace-media",
  "ace-peer",
  "ace-swarm",
+ "ace-tracker",
  "ace-wire",
  "async-trait",
  "axum",

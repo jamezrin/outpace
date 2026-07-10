@@ -143,7 +143,7 @@ mod tests {
             seed_registry: ace_swarm::listen::SeedRegistry::new(),
             trackers: vec![],
             store_bytes: 4 << 20,
-            inbound_peer_port: None,
+            inbound_peer_port: tokio::sync::watch::channel(None).1,
         }
     }
 

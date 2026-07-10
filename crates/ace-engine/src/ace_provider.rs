@@ -149,16 +149,11 @@ struct SeedConfig {
 
 pub struct AceProvider {
     identity: Arc<Identity>,
-    /// The local peer-listener port (`config.peer_listen.port()`) — our designated AceStream
-    /// peer endpoint, never the HTTP API port. This is what we send on tracker/DHT
-    /// **discovery** announces (finding peers to leech from also registers us as a peer). The
-    /// seeder self-announce advertises `announce_peer_port` instead, not this field.
-    peer_port: u16,
     /// External inbound endpoint to advertise as a dial-able seeder on the periodic tracker +
     /// DHT self-announce. `None` when inbound seeding is disabled — we run no listener, so we
     /// must not invite peers to dial us (mirrors `BroadcastState::inbound_peer_port`). `Some`
     /// is the local `peer_port` today, or the mapped external port once #20 lands.
-    announce_peer_port: Option<u16>,
+    announce_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
     resolve_cache: ResolveCache,
@@ -177,15 +172,15 @@ pub struct AceProvider {
 }
 
 impl AceProvider {
-    /// `peer_port` is the local AceStream peer-listener port (`config.peer_listen.port()`),
-    /// used for discovery announces. Self-announcing as a dial-able seeder is opt-in via
+    /// `peer_port` is the local AceStream peer-listener port (`config.peer_listen.port()`).
+    /// Discovery and self-announces use the dynamic inbound endpoint when configured.
+    /// Self-announcing as a dial-able seeder is opt-in via
     /// [`with_inbound_announce_port`](Self::with_inbound_announce_port); by default we do not
     /// advertise an inbound endpoint (a pure leecher / one-shot CLI play has no listener).
-    pub fn new(identity: Arc<Identity>, peer_port: u16) -> Self {
+    pub fn new(identity: Arc<Identity>, _peer_port: u16) -> Self {
         AceProvider {
             identity,
-            peer_port,
-            announce_peer_port: None,
+            announce_peer_port: tokio::sync::watch::channel(None).1,
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_peers: Vec::new(),
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
@@ -216,6 +211,17 @@ impl AceProvider {
     /// broadcast paths advertise the identical endpoint (the mapped external port once #20
     /// lands). `None` disables the self-announce entirely.
     pub fn with_inbound_announce_port(mut self, port: Option<u16>) -> Self {
+        self.announce_peer_port = tokio::sync::watch::channel(port).1;
+        self
+    }
+
+    /// Supply the daemon-wide, dynamically resolved inbound port. It starts at the local
+    /// listener port, switches to the gateway-assigned external port after mapping succeeds,
+    /// and falls back to the listener port if the mapping task disappears.
+    pub fn with_inbound_announce_port_receiver(
+        mut self,
+        port: tokio::sync::watch::Receiver<Option<u16>>,
+    ) -> Self {
         self.announce_peer_port = port;
         self
     }
@@ -223,8 +229,13 @@ impl AceProvider {
     /// Port to advertise on the periodic seeder self-announce, or `None` to not announce at
     /// all. This is always the peer endpoint (`peer_port`/external), **never** the HTTP API
     /// port, and is `None` without an inbound listener to back it.
+    #[cfg(test)]
     fn seeder_announce_port(&self) -> Option<u16> {
-        self.announce_peer_port
+        *self.announce_peer_port.borrow()
+    }
+
+    fn discovery_announce_port(&self) -> u16 {
+        self.announce_peer_port.borrow().unwrap_or(0)
     }
 
     /// Trackers used for a bare infohash (which carries none); transport files supply their
@@ -315,7 +326,7 @@ impl AceProvider {
                 &self.default_trackers,
                 &key,
                 &random_peer_id(),
-                self.peer_port,
+                self.discovery_announce_port(),
             )
             .await
         } else {
@@ -359,7 +370,7 @@ impl AceProvider {
         Ok(Box::new(AceVodContent {
             info,
             bootstrap_peers: self.bootstrap_peers.clone(),
-            peer_port: self.peer_port,
+            announce_peer_port: self.announce_peer_port.clone(),
             cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(
                 VOD_PIECE_CACHE_CAP,
             ))),
@@ -407,7 +418,7 @@ impl AceProvider {
                 &self.default_trackers,
                 &key,
                 &random_peer_id(),
-                self.peer_port,
+                self.discovery_announce_port(),
             )
             .await
         } else {
@@ -500,7 +511,7 @@ fn cached_prefix(cache: &VodPieceCache, first_piece: u64, end_piece: u64) -> (Ve
 struct AceVodContent {
     info: VodInfo,
     bootstrap_peers: Vec<SocketAddrV4>,
-    peer_port: u16,
+    announce_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
     /// Verified whole pieces retained across this VOD's range reads (bounded, FIFO).
     cache: Arc<std::sync::Mutex<VodPieceCache>>,
     /// Peers discovered once and reused by every range read (VOD swarms are stable, unlike the
@@ -517,11 +528,12 @@ impl AceVodContent {
             return peers.clone();
         }
         let discovered = if self.bootstrap_peers.is_empty() {
+            let announce_port = self.announce_peer_port.borrow().unwrap_or(0);
             discover_peers(
                 &self.info.trackers,
                 &self.info.infohash,
                 &random_peer_id(),
-                self.peer_port,
+                announce_port,
             )
             .await
         } else {
@@ -725,7 +737,7 @@ impl StreamProvider for AceProvider {
                 &info.trackers,
                 &info.infohash,
                 &random_peer_id(),
-                self.peer_port,
+                self.discovery_announce_port(),
             )
             .await
         } else {
@@ -758,8 +770,8 @@ impl StreamProvider for AceProvider {
             cache_dir: self.cache_dir.clone(),
         };
         let announce_info = info.clone();
-        let announce_port = self.seeder_announce_port();
-        let discovery_port = self.peer_port;
+        let announce_port = self.announce_peer_port.clone();
+        let discovery_port = self.announce_peer_port.clone();
         let reachability = self.reachability.clone();
         tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
@@ -787,11 +799,35 @@ impl StreamProvider for AceProvider {
 /// advertisable endpoint (`enable_inbound` off, or a one-shot CLI leech): we must not invite
 /// peers to dial a port nobody is serving on. The advertised `port` is always the peer
 /// endpoint, never the HTTP API port (issue #21).
-async fn announce_seeder_periodically(info: StreamInfo, port: Option<u16>) {
-    let Some(port) = port else {
-        return std::future::pending().await;
-    };
-    announce_infohash_periodically(info.trackers, info.infohash, port).await
+async fn announce_seeder_periodically(
+    info: StreamInfo,
+    port: tokio::sync::watch::Receiver<Option<u16>>,
+) {
+    announce_infohash_periodically_dynamic(info.trackers, info.infohash, port).await
+}
+
+/// Dynamic form used by daemon announce paths. Port changes interrupt the normal interval so
+/// the newly mapped (or fallback) endpoint is advertised promptly.
+pub async fn announce_infohash_periodically_dynamic(
+    trackers: Vec<String>,
+    infohash: [u8; 20],
+    mut port_rx: tokio::sync::watch::Receiver<Option<u16>>,
+) {
+    let peer_id = random_peer_id();
+    loop {
+        let port = *port_rx.borrow_and_update();
+        if let Some(port) = port {
+            announce_infohash_once(&trackers, &infohash, &peer_id, port).await;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(SEEDER_ANNOUNCE_INTERVAL) => {},
+            changed = port_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// The tracker+DHT self-announce loop, decoupled from `StreamInfo` so both the leech path
@@ -800,21 +836,30 @@ async fn announce_seeder_periodically(info: StreamInfo, port: Option<u16>) {
 pub async fn announce_infohash_periodically(trackers: Vec<String>, infohash: [u8; 20], port: u16) {
     let peer_id = random_peer_id();
     loop {
-        let peers = announce_seeder(&trackers, &infohash, &peer_id, port).await;
-        // DHT self-announce too, not just tracker: real Acestream swarms are largely
-        // DHT-populated (README.md), so tracker-only self-announce under-serves
-        // discoverability. `dht_announce_peer` is a separate primitive (not folded into
-        // `announce_seeder` itself) because it's a multi-second live network call that
-        // would otherwise turn `announce_seeder`'s fast offline unit test into a slow,
-        // network-dependent one.
-        let dht_announced = dht_announce_peer(&infohash, port, DHT_ANNOUNCE_BUDGET).await;
-        crate::alog!(
-            "[ace] seeder self-announce for {}: {} tracker peer(s) seen, DHT announce_peer sent to {dht_announced} node(s)",
-            hex_preview(&infohash),
-            peers.len(),
-        );
+        announce_infohash_once(&trackers, &infohash, &peer_id, port).await;
         tokio::time::sleep(SEEDER_ANNOUNCE_INTERVAL).await;
     }
+}
+
+async fn announce_infohash_once(
+    trackers: &[String],
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+) {
+    let peers = announce_seeder(trackers, infohash, peer_id, port).await;
+    // DHT self-announce too, not just tracker: real Acestream swarms are largely
+    // DHT-populated (README.md), so tracker-only self-announce under-serves
+    // discoverability. `dht_announce_peer` is a separate primitive (not folded into
+    // `announce_seeder` itself) because it's a multi-second live network call that
+    // would otherwise turn `announce_seeder`'s fast offline unit test into a slow,
+    // network-dependent one.
+    let dht_announced = dht_announce_peer(infohash, port, DHT_ANNOUNCE_BUDGET).await;
+    crate::alog!(
+            "[ace] seeder self-announce for {}: {} tracker peer(s) seen, DHT announce_peer sent to {dht_announced} node(s)",
+            hex_preview(infohash),
+            peers.len(),
+        );
 }
 
 /// Which peers to try connecting to next: everyone except those already known bad this
@@ -1183,7 +1228,7 @@ async fn follow_live(
     uploaded: Arc<AtomicU64>,
     peers_served: Arc<AtomicU32>,
     seed: SeedConfig,
-    discovery_port: u16,
+    discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
     reachability: Option<Arc<ReachabilityMonitor>>,
 ) {
     let chunks_per_piece = info.chunks_per_piece();
@@ -1220,11 +1265,12 @@ async fn follow_live(
         if upstreams.is_empty() {
             peer_count.store(0, Ordering::Relaxed);
             let known = peers.len();
+            let announce_port = discovery_port.borrow().unwrap_or(0);
             let discovered = discover_peers(
                 &info.trackers,
                 &info.infohash,
                 &random_peer_id(),
-                discovery_port,
+                announce_port,
             )
             .await;
             let found = discovered.len();
@@ -1281,7 +1327,7 @@ async fn follow_live(
             &mut continuity,
             refill_candidates,
             known_refill_peers,
-            discovery_port,
+            discovery_port.clone(),
             &peer_count,
             reachability.as_ref(),
         )
@@ -1592,7 +1638,7 @@ async fn refill_upstream_pool(
     initial_candidates: Vec<SocketAddrV4>,
     trackers: Vec<String>,
     infohash: [u8; 20],
-    discovery_port: u16,
+    discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
     known_peers: Vec<SocketAddrV4>,
     live_recovery: LiveRecoveryConfig,
     refills: mpsc::Sender<ConnectedUpstream>,
@@ -1603,11 +1649,12 @@ async fn refill_upstream_pool(
     let mut sent = 0usize;
     let mut candidates = initial_candidates;
     let discovery_handle = tokio::spawn(async move {
+        let announce_port = discovery_port.borrow().unwrap_or(0);
         discover_peers_with_options(
             &trackers,
             &infohash,
             &random_peer_id(),
-            discovery_port,
+            announce_port,
             background_discovery_options(),
         )
         .await
@@ -1704,7 +1751,7 @@ async fn follow_peer_pool(
     continuity: &mut Option<Continuity>,
     refill_candidates: Vec<SocketAddrV4>,
     known_refill_peers: Vec<SocketAddrV4>,
-    discovery_port: u16,
+    discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
     peer_count: &Arc<AtomicU32>,
     reachability: Option<&Arc<ReachabilityMonitor>>,
 ) -> FollowEnd {
@@ -1764,7 +1811,7 @@ async fn follow_peer_pool(
             refill_candidates,
             info.trackers.clone(),
             info.infohash,
-            discovery_port,
+            discovery_port.clone(),
             known_refill_peers,
             live_recovery,
             refill_tx,
@@ -3035,7 +3082,7 @@ mod tests {
         let vod = AceVodContent {
             info,
             bootstrap_peers: vec![addr],
-            peer_port: 0,
+            announce_peer_port: tokio::sync::watch::channel(None).1,
             cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(8))),
             peers: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -3063,7 +3110,7 @@ mod tests {
         let vod = AceVodContent {
             info,
             bootstrap_peers: vec![addr],
-            peer_port: 0,
+            announce_peer_port: tokio::sync::watch::channel(None).1,
             cache: Arc::new(std::sync::Mutex::new(VodPieceCache::new(8))),
             peers: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -3477,7 +3524,7 @@ mod tests {
         // a tracker announce, which would otherwise invite peers to dial a port nobody serves.
         let res = tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            announce_seeder_periodically(info(), None),
+            announce_seeder_periodically(info(), tokio::sync::watch::channel(None).1),
         )
         .await;
         assert!(res.is_err(), "must never resolve without an inbound port");
@@ -3498,13 +3545,77 @@ mod tests {
             Some(HTTP_PORT),
             "must never advertise the HTTP API port"
         );
-        // Discovery announces (which also register us as a peer) likewise use the peer port.
-        assert_eq!(p.peer_port, PEER_PORT);
+        // Discovery announces (which also register us as a peer) use the same resolved port.
+        assert_eq!(p.discovery_announce_port(), PEER_PORT);
 
         // Without an inbound listener (the default, and `enable_inbound = false`), we advertise
         // no dial-able endpoint at all — matching the broadcast path's `inbound_peer_port`.
         let leech_only = AceProvider::new(Arc::new(Identity::generate()), PEER_PORT);
         assert_eq!(leech_only.seeder_announce_port(), None);
+        assert_eq!(leech_only.discovery_announce_port(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_or_disabled_port_is_encoded_in_the_tracker_discovery_announce() {
+        use tokio::net::UdpSocket;
+        const LOCAL_PORT: u16 = 8621;
+        const MAPPED_PORT: u16 = 48621;
+        let (_port_tx, port_rx) = tokio::sync::watch::channel(Some(MAPPED_PORT));
+        let provider = AceProvider::new(Arc::new(Identity::generate()), LOCAL_PORT)
+            .with_inbound_announce_port_receiver(port_rx);
+        assert_eq!(provider.discovery_announce_port(), MAPPED_PORT);
+
+        async fn capture_wire_port(port: u16) -> u16 {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = match server.local_addr().unwrap() {
+                std::net::SocketAddr::V4(addr) => addr,
+                _ => unreachable!(),
+            };
+            let capture = tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let (_, peer) = server.recv_from(&mut buf).await.unwrap();
+                let txid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+                let mut response = Vec::new();
+                response.extend_from_slice(&0_u32.to_be_bytes());
+                response.extend_from_slice(&txid.to_be_bytes());
+                response.extend_from_slice(&42_u64.to_be_bytes());
+                server.send_to(&response, peer).await.unwrap();
+                let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+                assert_eq!(len, 98);
+                let announced_port = u16::from_be_bytes(buf[96..98].try_into().unwrap());
+                let txid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+                let mut response = Vec::new();
+                response.extend_from_slice(&1_u32.to_be_bytes());
+                response.extend_from_slice(&txid.to_be_bytes());
+                response.extend_from_slice(&1800_u32.to_be_bytes());
+                response.extend_from_slice(&0_u32.to_be_bytes());
+                response.extend_from_slice(&0_u32.to_be_bytes());
+                server.send_to(&response, peer).await.unwrap();
+                announced_port
+            });
+            ace_tracker::client::announce(
+                addr,
+                &[1_u8; 20],
+                &[2_u8; 20],
+                port,
+                50,
+                ace_tracker::codec::TransferState::default(),
+                ace_tracker::codec::AnnounceEvent::Started,
+            )
+            .await
+            .unwrap();
+            capture.await.unwrap()
+        }
+        assert_eq!(
+            capture_wire_port(provider.discovery_announce_port()).await,
+            MAPPED_PORT
+        );
+        assert_ne!(MAPPED_PORT, LOCAL_PORT);
+        let inbound_disabled = AceProvider::new(Arc::new(Identity::generate()), LOCAL_PORT);
+        assert_eq!(
+            capture_wire_port(inbound_disabled.discovery_announce_port()).await,
+            0
+        );
     }
 
     #[test]

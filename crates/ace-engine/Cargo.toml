@@ -35,3 +35,4 @@ hex = "0.4"
 
 [dev-dependencies]
 sha1 = "0.10"
+ace-tracker = { path = "../ace-tracker" }
