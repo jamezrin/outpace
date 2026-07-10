@@ -676,9 +676,14 @@ impl VodByteSource for VodSource {
     }
 }
 
+struct LiveOutput {
+    bytes: Bytes,
+    discontinuity: bool,
+}
+
 struct AceSource {
-    rx: mpsc::Receiver<Bytes>,
-    discontinuity: Arc<std::sync::atomic::AtomicBool>,
+    rx: mpsc::Receiver<LiveOutput>,
+    discontinuity: bool,
     peers: Arc<AtomicU32>,
     downloaded: Arc<AtomicU64>,
     uploaded: Arc<AtomicU64>,
@@ -688,10 +693,12 @@ struct AceSource {
 #[async_trait]
 impl TsSource for AceSource {
     async fn next(&mut self) -> Option<Bytes> {
-        self.rx.recv().await
+        let output = self.rx.recv().await?;
+        self.discontinuity = output.discontinuity;
+        Some(output.bytes)
     }
     fn take_discontinuity(&mut self) -> bool {
-        self.discontinuity.swap(false, Ordering::AcqRel)
+        std::mem::take(&mut self.discontinuity)
     }
     fn stats(&self) -> SourceStats {
         SourceStats {
@@ -754,7 +761,7 @@ impl StreamProvider for AceProvider {
             ));
         }
 
-        let (tx, rx) = mpsc::channel::<Bytes>(256);
+        let (tx, rx) = mpsc::channel::<LiveOutput>(256);
         let peer_count = Arc::new(AtomicU32::new(0));
         let downloaded = Arc::new(AtomicU64::new(0));
         let uploaded = Arc::new(AtomicU64::new(0));
@@ -777,20 +784,18 @@ impl StreamProvider for AceProvider {
         let announce_port = self.announce_peer_port.clone();
         let discovery_port = self.announce_peer_port.clone();
         let reachability = self.reachability.clone();
-        let discontinuity = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let follow_discontinuity = discontinuity.clone();
         tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
             // whichever ends first (normally `follow_live`, when the consumer drops) tears
             // down the other — no separate lifecycle to manage.
             tokio::select! {
-                _ = follow_live(info, peers, identity, tx, stats_peers, downloaded, uploaded, peers_served, seed, discovery_port, reachability, follow_discontinuity) => {},
+                _ = follow_live(info, peers, identity, tx, stats_peers, downloaded, uploaded, peers_served, seed, discovery_port, reachability) => {},
                 _ = announce_seeder_periodically(announce_info, announce_port) => {},
             }
         });
         Ok(Box::new(AceSource {
             rx,
-            discontinuity,
+            discontinuity: false,
             peers: peer_count,
             downloaded: stats_downloaded,
             uploaded: stats_uploaded,
@@ -1229,7 +1234,7 @@ async fn follow_live(
     info: StreamInfo,
     mut peers: Vec<SocketAddrV4>,
     identity: Arc<Identity>,
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<LiveOutput>,
     peer_count: Arc<AtomicU32>,
     downloaded: Arc<AtomicU64>,
     uploaded: Arc<AtomicU64>,
@@ -1237,7 +1242,6 @@ async fn follow_live(
     seed: SeedConfig,
     discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
     reachability: Option<Arc<ReachabilityMonitor>>,
-    discontinuity: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let chunks_per_piece = info.chunks_per_piece();
     // Every peer lost so far this session (cumulative, not just the most recent) — see
@@ -1338,7 +1342,6 @@ async fn follow_live(
             discovery_port.clone(),
             &peer_count,
             reachability.as_ref(),
-            &discontinuity,
         )
         .await
         {
@@ -1758,7 +1761,7 @@ async fn follow_peer_pool(
     info: &StreamInfo,
     identity: &Identity,
     chunks_per_piece: u16,
-    tx: &mpsc::Sender<Bytes>,
+    tx: &mpsc::Sender<LiveOutput>,
     downloaded: &Arc<AtomicU64>,
     uploaded: &Arc<AtomicU64>,
     peers_served: &Arc<AtomicU32>,
@@ -1770,7 +1773,6 @@ async fn follow_peer_pool(
     discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
     peer_count: &Arc<AtomicU32>,
     reachability: Option<&Arc<ReachabilityMonitor>>,
-    source_discontinuity: &Arc<std::sync::atomic::AtomicBool>,
 ) -> FollowEnd {
     debug_assert!(!upstreams.is_empty());
     let primary = upstreams[0].window;
@@ -2053,9 +2055,7 @@ async fn follow_peer_pool(
                         let aligned = continuity.resync.push(&ready);
                         let aligned = continuity.filter_output_after_discontinuity(aligned);
                         if !aligned.is_empty() {
-                            if continuity.take_discontinuity() {
-                                source_discontinuity.store(true, Ordering::Release);
-                            }
+                            let discontinuity = continuity.take_discontinuity();
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
                                 crate::alog!(
@@ -2067,7 +2067,14 @@ async fn follow_peer_pool(
                                 continuity.next_log = continuity.emitted + (4 << 20);
                             }
                             let len = aligned.len() as u64;
-                            if tx.send(Bytes::from(aligned)).await.is_err() {
+                            if tx
+                                .send(LiveOutput {
+                                    bytes: Bytes::from(aligned),
+                                    discontinuity,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 shutdown_peer_runtimes(&mut peers);
                                 abort_refill(&mut refill_handle);
                                 return FollowEnd::ConsumerGone;
@@ -2865,6 +2872,43 @@ mod tests {
             ..LiveRecoveryConfig::default()
         };
         assert!(recovery_channel_capacities(invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_live_outputs_keep_each_discontinuity_with_its_chunk() {
+        let (tx, rx) = mpsc::channel(8);
+        for (bytes, discontinuity) in [
+            (b"pre".as_slice(), false),
+            (b"post-one".as_slice(), true),
+            (b"between".as_slice(), false),
+            (b"post-two".as_slice(), true),
+        ] {
+            tx.send(LiveOutput {
+                bytes: Bytes::copy_from_slice(bytes),
+                discontinuity,
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let mut source = AceSource {
+            rx,
+            discontinuity: false,
+            peers: Arc::new(AtomicU32::new(0)),
+            downloaded: Arc::new(AtomicU64::new(0)),
+            uploaded: Arc::new(AtomicU64::new(0)),
+            peers_served: Arc::new(AtomicU32::new(0)),
+        };
+
+        for (expected, gap) in [
+            (b"pre".as_slice(), false),
+            (b"post-one".as_slice(), true),
+            (b"between".as_slice(), false),
+            (b"post-two".as_slice(), true),
+        ] {
+            assert_eq!(source.next().await.unwrap().as_ref(), expected);
+            assert_eq!(source.take_discontinuity(), gap);
+        }
     }
 
     #[tokio::test]
