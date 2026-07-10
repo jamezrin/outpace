@@ -117,14 +117,20 @@ impl AceSessionStore {
         &self,
         playback_id: &str,
         token: &str,
-    ) -> Option<(String, tokio::sync::watch::Receiver<bool>)> {
+    ) -> Option<(String, Instant, tokio::sync::watch::Receiver<bool>)> {
         let now = Instant::now();
         let mut leases = self.leases.lock().unwrap();
         leases.retain(|_, lease| lease.expires_at > now);
         leases
             .get(token)
             .filter(|lease| lease.playback_id == playback_id)
-            .map(|lease| (lease.session_key.clone(), lease.cancel.subscribe()))
+            .map(|lease| {
+                (
+                    lease.session_key.clone(),
+                    lease.expires_at,
+                    lease.cancel.subscribe(),
+                )
+            })
     }
 }
 
@@ -598,11 +604,11 @@ async fn ace_playback(
     let Some(network) = ace_network(&s) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((session_key, cancel)) = s.ace_sessions.playback(&id, &token) else {
+    let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&id, &token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     match s.manager.get_or_start(&network, &session_key).await {
-        Ok(session) => ace_stream_session_response(session, cancel),
+        Ok(session) => ace_stream_session_response(session, expires_at, cancel),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -657,6 +663,9 @@ async fn ace_command(
     Path((id, token)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    if s.ace_sessions.validate(&id, &token).is_none() {
+        return Json(json!({ "response": null, "error": "invalid or expired playback session" }));
+    }
     if params.get("method").is_some_and(|m| m == "stop") {
         if !s.ace_sessions.revoke(&id, &token) {
             return Json(
@@ -973,15 +982,20 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
 
 fn ace_stream_session_response(
     session: Arc<StreamSession>,
+    expires_at: Instant,
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Response {
     let sub = session.subscribe();
     let gate = ace_media::mpegts::KeyframeGate::new();
     let stream = futures::stream::unfold(
-        (sub, gate, cancel),
-        |(mut sub, mut gate, mut cancel)| async move {
+        (sub, gate, cancel, expires_at),
+        |(mut sub, mut gate, mut cancel, expires_at)| async move {
             loop {
                 tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
+                        return None;
+                    }
                     changed = cancel.changed() => {
                         if changed.is_err() || *cancel.borrow() { return None; }
                     }
@@ -989,7 +1003,7 @@ fn ace_stream_session_response(
                         Ok(chunk) => {
                             let out = gate.push(&chunk);
                             if out.is_empty() { continue; }
-                            return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate, cancel)));
+                            return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate, cancel, expires_at)));
                         }
                         Err(RecvError::Lagged(_)) => { reset_stream_keyframe_gate(&mut gate); }
                         Err(RecvError::Closed) => return None,
@@ -1624,8 +1638,8 @@ mod tests {
         store.insert_at("client-a".into(), "same-id".into(), "same-key".into(), now);
         store.insert_at("client-b".into(), "same-id".into(), "same-key".into(), now);
 
-        let (_, mut client_a) = store.playback("same-id", "client-a").unwrap();
-        let (_, client_b) = store.playback("same-id", "client-b").unwrap();
+        let (_, _, mut client_a) = store.playback("same-id", "client-a").unwrap();
+        let (_, _, client_b) = store.playback("same-id", "client-b").unwrap();
         assert!(store.revoke("same-id", "client-a"));
         client_a.changed().await.unwrap();
         assert!(*client_a.borrow());
@@ -1770,6 +1784,8 @@ mod tests {
         for path in [
             format!("/ace/stat/cid:{content_id}/invalid"),
             format!("/ace/cmd/cid:{content_id}/invalid?method=stop"),
+            format!("/ace/cmd/cid:{content_id}/invalid?method=pause"),
+            format!("/ace/cmd/cid:{content_id}/invalid"),
         ] {
             let response = app
                 .clone()
@@ -1783,6 +1799,61 @@ mod tests {
             assert_eq!(value["response"], serde_json::Value::Null);
             assert_eq!(value["error"], "invalid or expired playback session");
         }
+    }
+
+    #[tokio::test]
+    async fn active_ace_playback_ends_at_its_lease_deadline() {
+        use futures::StreamExt;
+        let content_id = "2123456789abcdef0123456789abcdef01234567";
+        let mut state = ace_compat_state(0);
+        let manager = state.manager.clone();
+        state.ace_sessions = Arc::new(AceSessionStore::new(Duration::from_millis(30), 4));
+        let app = router(state);
+        let minted = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/getstream?content_id={content_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(minted.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let minted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let path = minted["response"]["playback_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap()
+            .to_owned();
+        let playback = app
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut body = playback.into_body().into_data_stream();
+        assert_eq!(
+            manager
+                .get("fix", &format!("cid:{content_id}"))
+                .await
+                .unwrap()
+                .subscriber_count(),
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            body.next().await.is_none(),
+            "an active body must terminate when its lease expires"
+        );
+        assert_eq!(
+            manager
+                .get("fix", &format!("cid:{content_id}"))
+                .await
+                .unwrap()
+                .subscriber_count(),
+            0
+        );
     }
 
     #[tokio::test]
