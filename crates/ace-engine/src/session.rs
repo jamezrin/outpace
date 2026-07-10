@@ -7,9 +7,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamEvent {
+    Data(Bytes),
+    Discontinuity,
+}
+
 /// A live session: pulls from one `TsSource` and broadcasts TS chunks to subscribers.
 pub struct StreamSession {
-    tx: broadcast::Sender<Bytes>,
+    tx: broadcast::Sender<StreamEvent>,
     subscribers: Arc<AtomicU64>,
     stats: Arc<Mutex<SourceStats>>,
     /// The background pull task; aborted when the session is dropped (last `Arc` gone, e.g.
@@ -26,7 +32,7 @@ impl Drop for StreamSession {
 
 /// A subscription that decrements the live subscriber count on drop.
 pub struct Subscription {
-    pub rx: broadcast::Receiver<Bytes>,
+    pub rx: broadcast::Receiver<StreamEvent>,
     count: Arc<AtomicU64>,
 }
 
@@ -48,8 +54,11 @@ impl StreamSession {
         let pump = tokio::spawn(async move {
             while let Some(chunk) = source.next().await {
                 *pump_stats.lock().await = source.stats();
+                if source.take_discontinuity() {
+                    let _ = pump_tx.send(StreamEvent::Discontinuity);
+                }
                 // Err just means no live receivers right now; keep pulling (live).
-                let _ = pump_tx.send(chunk);
+                let _ = pump_tx.send(StreamEvent::Data(chunk));
             }
         });
         Arc::new(StreamSession {
@@ -74,7 +83,7 @@ impl StreamSession {
 
     /// A receiver that does NOT count as a client (used by internal consumers like the HLS
     /// packager, which must not pin the session open against idle teardown).
-    pub fn raw_receiver(&self) -> broadcast::Receiver<Bytes> {
+    pub fn raw_receiver(&self) -> broadcast::Receiver<StreamEvent> {
         self.tx.subscribe()
     }
 
@@ -100,6 +109,9 @@ mod tests {
         let ca = a.rx.recv().await.unwrap();
         let cb = b.rx.recv().await.unwrap();
         assert_eq!(ca, cb);
+        let StreamEvent::Data(ca) = ca else {
+            panic!("expected data")
+        };
         assert_eq!(ca[0], 0x47);
         drop(a);
         assert_eq!(session.subscriber_count(), 1);
@@ -144,6 +156,54 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "pump must be aborted and source dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_discontinuity_precedes_first_post_gap_chunk() {
+        use async_trait::async_trait;
+
+        struct GapSource {
+            step: u8,
+            gap: bool,
+        }
+        #[async_trait]
+        impl TsSource for GapSource {
+            async fn next(&mut self) -> Option<Bytes> {
+                self.step += 1;
+                match self.step {
+                    1 => Some(Bytes::from_static(b"before")),
+                    2 => {
+                        self.gap = true;
+                        Some(Bytes::from_static(b"after"))
+                    }
+                    _ => None,
+                }
+            }
+            fn take_discontinuity(&mut self) -> bool {
+                std::mem::take(&mut self.gap)
+            }
+            fn stats(&self) -> SourceStats {
+                SourceStats::default()
+            }
+        }
+
+        let session = StreamSession::start(
+            Box::new(GapSource {
+                step: 0,
+                gap: false,
+            }),
+            8,
+        );
+        let mut sub = session.subscribe();
+        assert_eq!(
+            sub.rx.recv().await.unwrap(),
+            StreamEvent::Data(Bytes::from_static(b"before"))
+        );
+        assert_eq!(sub.rx.recv().await.unwrap(), StreamEvent::Discontinuity);
+        assert_eq!(
+            sub.rx.recv().await.unwrap(),
+            StreamEvent::Data(Bytes::from_static(b"after"))
         );
     }
 }
