@@ -20,10 +20,10 @@ Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 
 | Route | Status | Notes |
 | --- | --- | --- |
-| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > `url` > `magnet`. Returns playback/stat/command URLs. |
-| `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a started session. |
-| `GET /ace/stat/<id>/<token>` | Supported | Session stats under `.response`. |
-| `GET /ace/cmd/<id>/<token>?method=stop` | Supported | Only `stop` is honored; other methods return an error envelope. |
+| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > `url` > `magnet`. Returns playback/stat/command URLs with a new unpredictable, client-specific token. Tokens expire after six hours and state is capped at 4096 live leases. |
+| `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a valid lease. Missing, invalid, expired, stopped, or wrong-content tokens return HTTP 404. |
+| `GET /ace/stat/<id>/<token>` | Supported | Session stats under `.response`. Invalid/expired tokens return HTTP 200 with `response: null` and `error: "invalid or expired playback session"`. |
+| `GET /ace/cmd/<id>/<token>?method=stop` | Supported | `stop` revokes only this compatibility client's lease; other clients and native consumers keep the shared source alive. Invalid/expired tokens use the same error envelope as `stat`; other methods return an error envelope. |
 | `GET /ace/manifest.m3u8` | Deferred | Parsed by `routes.rs` but not served. Native `/vod/<net>/<id>/manifest.m3u8` HLS is the supported manifest surface. |
 | `GET /ace/c/<session>/<seq>.ts` | Deferred | HLS segment counterpart to `manifest.m3u8`; deferred with it. |
 

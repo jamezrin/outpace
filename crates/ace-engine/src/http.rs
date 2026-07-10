@@ -17,7 +17,116 @@ use futures::StreamExt;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
+
+const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const ACE_TOKEN_CAPACITY: usize = 4096;
+
+#[derive(Clone)]
+struct AceLease {
+    playback_id: String,
+    session_key: String,
+    expires_at: Instant,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+/// Bounded playback leases minted by `/ace/getstream`. A token is both authorization and the
+/// compatibility client's ownership handle; revoking one never force-stops the shared source.
+pub struct AceSessionStore {
+    leases: Mutex<HashMap<String, AceLease>>,
+    ttl: Duration,
+    capacity: usize,
+}
+
+impl Default for AceSessionStore {
+    fn default() -> Self {
+        Self::new(ACE_TOKEN_TTL, ACE_TOKEN_CAPACITY)
+    }
+}
+
+impl AceSessionStore {
+    fn new(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            leases: Mutex::new(HashMap::new()),
+            ttl,
+            capacity,
+        }
+    }
+
+    fn mint(&self, playback_id: String, session_key: String) -> String {
+        use rand::RngCore;
+        let mut bytes = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        self.insert_at(token.clone(), playback_id, session_key, Instant::now());
+        token
+    }
+
+    fn insert_at(&self, token: String, playback_id: String, session_key: String, now: Instant) {
+        let mut leases = self.leases.lock().unwrap();
+        leases.retain(|_, lease| lease.expires_at > now);
+        if leases.len() >= self.capacity {
+            if let Some(oldest) = leases
+                .iter()
+                .min_by_key(|(_, lease)| lease.expires_at)
+                .map(|(t, _)| t.clone())
+            {
+                leases.remove(&oldest);
+            }
+        }
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        leases.insert(
+            token,
+            AceLease {
+                playback_id,
+                session_key,
+                expires_at: now + self.ttl,
+                cancel,
+            },
+        );
+    }
+
+    fn validate(&self, playback_id: &str, token: &str) -> Option<String> {
+        self.validate_at(playback_id, token, Instant::now())
+    }
+
+    fn validate_at(&self, playback_id: &str, token: &str, now: Instant) -> Option<String> {
+        let mut leases = self.leases.lock().unwrap();
+        leases.retain(|_, lease| lease.expires_at > now);
+        leases
+            .get(token)
+            .filter(|lease| lease.playback_id == playback_id)
+            .map(|lease| lease.session_key.clone())
+    }
+
+    fn revoke(&self, playback_id: &str, token: &str) -> bool {
+        let mut leases = self.leases.lock().unwrap();
+        let matches = leases.get(token).is_some_and(|lease| {
+            lease.playback_id == playback_id && lease.expires_at > Instant::now()
+        });
+        if matches {
+            if let Some(lease) = leases.remove(token) {
+                let _ = lease.cancel.send(true);
+            }
+        }
+        matches
+    }
+
+    fn playback(
+        &self,
+        playback_id: &str,
+        token: &str,
+    ) -> Option<(String, tokio::sync::watch::Receiver<bool>)> {
+        let now = Instant::now();
+        let mut leases = self.leases.lock().unwrap();
+        leases.retain(|_, lease| lease.expires_at > now);
+        leases
+            .get(token)
+            .filter(|lease| lease.playback_id == playback_id)
+            .map(|lease| (lease.session_key.clone(), lease.cancel.subscribe()))
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,7 +138,7 @@ pub struct AppState {
     /// Official `/ace/getstream?content_id=` returns URLs keyed by the resolved infohash.
     /// Internally, keep using `cid:<content_id>` so playback gets the catalog-derived
     /// transport geometry/trackers instead of degrading to bare-infohash defaults.
-    pub ace_session_aliases: Arc<Mutex<HashMap<String, String>>>,
+    pub ace_sessions: Arc<AceSessionStore>,
     /// Experimental legacy Acestream HTTP compatibility surface. Native `/streams` and
     /// `/broadcast` routes remain available regardless of this flag.
     pub experimental_ace_compat: bool,
@@ -461,16 +570,11 @@ async fn ace_getstream(
         }
     }
 
-    let token = "outpace";
+    let token = s
+        .ace_sessions
+        .mint(selection.playback_id.clone(), selection.session_key.clone());
     let base = request_base(&headers);
     let playback_id = selection.playback_id;
-    let session_key = selection.session_key;
-    if playback_id != session_key {
-        s.ace_session_aliases
-            .lock()
-            .unwrap()
-            .insert(playback_id.clone(), session_key);
-    }
     let public_id = selection.public_id;
     Json(json!({
         "response": {
@@ -489,14 +593,16 @@ async fn ace_getstream(
 
 async fn ace_playback(
     State(s): State<AppState>,
-    Path((id, _token)): Path<(String, String)>,
+    Path((id, token)): Path<(String, String)>,
 ) -> Response {
     let Some(network) = ace_network(&s) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let session_key = ace_session_key(&s, &id);
+    let Some((session_key, cancel)) = s.ace_sessions.playback(&id, &token) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     match s.manager.get_or_start(&network, &session_key).await {
-        Ok(session) => stream_session_response(session),
+        Ok(session) => ace_stream_session_response(session, cancel),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -508,8 +614,10 @@ async fn ace_stat(
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }));
     };
+    let Some(session_key) = s.ace_sessions.validate(&id, &token) else {
+        return Json(json!({ "response": null, "error": "invalid or expired playback session" }));
+    };
     let public_id = ace_public_id(&id);
-    let session_key = ace_session_key(&s, &id);
     let Some(session) = s.manager.get(&network, &session_key).await else {
         return Json(json!({
             "response": {
@@ -546,13 +654,14 @@ async fn ace_stat(
 
 async fn ace_command(
     State(s): State<AppState>,
-    Path((id, _token)): Path<(String, String)>,
+    Path((id, token)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
     if params.get("method").is_some_and(|m| m == "stop") {
-        if let Some(network) = ace_network(&s) {
-            let session_key = ace_session_key(&s, &id);
-            s.manager.stop(&network, &session_key).await;
+        if !s.ace_sessions.revoke(&id, &token) {
+            return Json(
+                json!({ "response": null, "error": "invalid or expired playback session" }),
+            );
         }
         return Json(json!({ "response": "ok", "error": null }));
     }
@@ -712,15 +821,6 @@ fn ace_public_id(id: &str) -> &str {
     id.strip_prefix("cid:").unwrap_or(id)
 }
 
-fn ace_session_key(s: &AppState, id: &str) -> String {
-    s.ace_session_aliases
-        .lock()
-        .unwrap()
-        .get(id)
-        .cloned()
-        .unwrap_or_else(|| id.to_string())
-}
-
 fn ace_network(s: &AppState) -> Option<String> {
     if s.networks.iter().any(|n| n == "ace") {
         Some("ace".to_string())
@@ -869,6 +969,40 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
         .header(header::CONTENT_TYPE, "video/mp2t")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+fn ace_stream_session_response(
+    session: Arc<StreamSession>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Response {
+    let sub = session.subscribe();
+    let gate = ace_media::mpegts::KeyframeGate::new();
+    let stream = futures::stream::unfold(
+        (sub, gate, cancel),
+        |(mut sub, mut gate, mut cancel)| async move {
+            loop {
+                tokio::select! {
+                    changed = cancel.changed() => {
+                        if changed.is_err() || *cancel.borrow() { return None; }
+                    }
+                    received = sub.rx.recv() => match received {
+                        Ok(chunk) => {
+                            let out = gate.push(&chunk);
+                            if out.is_empty() { continue; }
+                            return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate, cancel)));
+                        }
+                        Err(RecvError::Lagged(_)) => { reset_stream_keyframe_gate(&mut gate); }
+                        Err(RecvError::Closed) => return None,
+                    }
+                }
+            }
+        },
+    );
+    (
+        [(header::CONTENT_TYPE, "video/mp2t")],
+        Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
@@ -1028,7 +1162,7 @@ mod tests {
             manager: StreamManager::new(r),
             networks: vec!["memvod".into()],
             resolve_content_ids_in_getstream: false,
-            ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            ace_sessions: Arc::new(AceSessionStore::default()),
             experimental_ace_compat: false,
             broadcasts: None,
         })
@@ -1122,7 +1256,7 @@ mod tests {
             manager: StreamManager::with_config(r, 256, hls),
             networks: vec!["memvod".into()],
             resolve_content_ids_in_getstream: false,
-            ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            ace_sessions: Arc::new(AceSessionStore::default()),
             experimental_ace_compat: false,
             broadcasts: None,
         })
@@ -1288,7 +1422,7 @@ mod tests {
             manager: StreamManager::new(r),
             networks: vec!["test".into()],
             resolve_content_ids_in_getstream: false,
-            ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            ace_sessions: Arc::new(AceSessionStore::default()),
             experimental_ace_compat: false,
             broadcasts: None,
         }
@@ -1349,7 +1483,7 @@ mod tests {
             manager: StreamManager::new(r),
             networks: vec!["fix".into()],
             resolve_content_ids_in_getstream: false,
-            ace_session_aliases: Arc::new(Mutex::new(HashMap::new())),
+            ace_sessions: Arc::new(AceSessionStore::default()),
             experimental_ace_compat: false,
             broadcasts: None,
         }
@@ -1446,6 +1580,63 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn ace_session_store_expires_and_bounds_leases_deterministically() {
+        let now = Instant::now();
+        let store = AceSessionStore::new(Duration::from_secs(10), 2);
+        store.insert_at("a".into(), "id-a".into(), "key-a".into(), now);
+        store.insert_at(
+            "b".into(),
+            "id-b".into(),
+            "key-b".into(),
+            now + Duration::from_secs(1),
+        );
+        store.insert_at(
+            "c".into(),
+            "id-c".into(),
+            "key-c".into(),
+            now + Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            store.validate_at("id-a", "a", now + Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            store.validate_at("id-b", "b", now + Duration::from_secs(2)),
+            Some("key-b".into())
+        );
+        assert_eq!(
+            store.validate_at("wrong-id", "b", now + Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            store.validate_at("id-b", "b", now + Duration::from_secs(12)),
+            None
+        );
+        assert_eq!(store.leases.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ace_session_store_revokes_only_matching_client_lease() {
+        let now = Instant::now();
+        let store = AceSessionStore::new(Duration::from_secs(60), 4);
+        store.insert_at("client-a".into(), "same-id".into(), "same-key".into(), now);
+        store.insert_at("client-b".into(), "same-id".into(), "same-key".into(), now);
+
+        let (_, mut client_a) = store.playback("same-id", "client-a").unwrap();
+        let (_, client_b) = store.playback("same-id", "client-b").unwrap();
+        assert!(store.revoke("same-id", "client-a"));
+        client_a.changed().await.unwrap();
+        assert!(*client_a.borrow());
+        assert!(client_b.has_changed().is_ok_and(|changed| !changed));
+        assert_eq!(store.validate("same-id", "client-a"), None);
+        assert_eq!(
+            store.validate("same-id", "client-b"),
+            Some("same-key".into())
+        );
+    }
+
     #[tokio::test]
     async fn networks_lists_registered() {
         let resp = router(state())
@@ -1516,11 +1707,7 @@ mod tests {
         let playback_path = playback_url
             .strip_prefix("http://localhost:6900")
             .expect("playback URL should point back at this daemon");
-        assert_eq!(
-            playback_path,
-            format!("/ace/r/cid:{content_id}/outpace"),
-            "content_id playback must enter the provider through the cid: resolver path"
-        );
+        assert!(playback_path.starts_with(&format!("/ace/r/cid:{content_id}/")));
         // Keep `app` alive while reading, as in the clean `/streams` tests: the test
         // manager owns the live session.
         let media = app
@@ -1541,14 +1728,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ace_getstream_mints_distinct_enforced_tokens() {
+        let content_id = "2123456789abcdef0123456789abcdef01234567";
+        let app = router(ace_compat_state(0));
+        let mut tokens = Vec::new();
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/ace/getstream?content_id={content_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            tokens.push(
+                value["response"]["playback_session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_ne!(tokens[0], tokens[1]);
+        assert_eq!(tokens[0].len(), 64);
+        assert!(!tokens[0].contains(content_id));
+
+        let playback = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/r/cid:{content_id}/invalid"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(playback.status(), StatusCode::NOT_FOUND);
+        for path in [
+            format!("/ace/stat/cid:{content_id}/invalid"),
+            format!("/ace/cmd/cid:{content_id}/invalid?method=stop"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["response"], serde_json::Value::Null);
+            assert_eq!(value["error"], "invalid or expired playback session");
+        }
+    }
+
+    #[tokio::test]
     async fn ace_stat_and_stop_track_content_id_session() {
         use futures::StreamExt;
         let content_id = "2123456789abcdef0123456789abcdef01234567";
         let state = ace_compat_state(0);
         let manager = state.manager.clone();
         let app = router(state);
-
-        let stat_path = format!("/ace/stat/cid:{content_id}/outpace");
+        let minted = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/getstream?content_id={content_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(minted.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let minted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = minted["response"]["playback_session_id"].as_str().unwrap();
+        let stat_path = format!("/ace/stat/cid:{content_id}/{token}");
         let idle = app
             .clone()
             .oneshot(Request::get(&stat_path).body(Body::empty()).unwrap())
@@ -1566,7 +1824,7 @@ mod tests {
         let media = app
             .clone()
             .oneshot(
-                Request::get(format!("/ace/r/cid:{content_id}/outpace"))
+                Request::get(format!("/ace/r/cid:{content_id}/{token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1594,7 +1852,7 @@ mod tests {
 
         let stop = app
             .oneshot(
-                Request::get(format!("/ace/cmd/cid:{content_id}/outpace?method=stop"))
+                Request::get(format!("/ace/cmd/cid:{content_id}/{token}?method=stop"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1607,10 +1865,13 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], serde_json::Value::Null);
         assert_eq!(json["response"], "ok");
-        assert!(manager
-            .get("fix", &format!("cid:{content_id}"))
-            .await
-            .is_none());
+        assert!(
+            manager
+                .get("fix", &format!("cid:{content_id}"))
+                .await
+                .is_some(),
+            "compatibility stop must not force-stop the shared source"
+        );
         assert!(manager.get("fix", content_id).await.is_none());
     }
 
