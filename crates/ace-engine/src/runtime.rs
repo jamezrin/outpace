@@ -134,6 +134,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_EXPERIMENTAL_ACE_COMPAT") {
         config.experimental_ace_compat = matches!(v.as_str(), "1" | "true");
     }
+    if let Ok(v) = std::env::var("OUTPACE_DHT_ROUTING_CACHE") {
+        config.dht_routing_cache = matches!(v.as_str(), "1" | "true");
+    }
     config.live_recovery.validate()?;
     config.hls.validate()?;
     Ok(config)
@@ -622,6 +625,20 @@ mod tests {
         std::env::remove_var("OUTPACE_ENABLE_PORT_MAPPING");
         std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
         std::env::remove_var("OUTPACE_PORT_MAP_EXTERNAL_PORT");
+    }
+
+    #[test]
+    fn dht_routing_cache_env_overrides_and_defaults_off() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Default: evaluate-first routing cache (#42) is off.
+        std::env::remove_var("OUTPACE_DHT_ROUTING_CACHE");
+        assert!(!config_from_env().unwrap().dht_routing_cache);
+
+        // Opt in explicitly.
+        std::env::set_var("OUTPACE_DHT_ROUTING_CACHE", "1");
+        assert!(config_from_env().unwrap().dht_routing_cache);
+
+        std::env::remove_var("OUTPACE_DHT_ROUTING_CACHE");
     }
 
     #[tokio::test]

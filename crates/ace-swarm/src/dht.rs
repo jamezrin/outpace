@@ -6,9 +6,11 @@
 //! bootstraps off the well-known routers, walks closer to the target collecting `nodes`,
 //! and harvests any `values` (peers) it's handed along the way.
 
+use crate::dht_cache::RoutingNodeCache;
 use ace_wire::bencode::Bencode;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
@@ -27,6 +29,39 @@ const DHT_PEER_TARGET: usize = 8;
 /// admit a genuine reply that lands a round or two late, short enough that a stale entry can't
 /// be matched by an unrelated packet arriving much later in the walk.
 const INFLIGHT_TTL: Duration = Duration::from_secs(3);
+
+/// Max cached routing nodes injected into a single walk's initial frontier (#42). Small: the
+/// cache is a warm-start hint, not a replacement for the walk's own iterative discovery.
+const MAX_CACHE_SEEDS: usize = 16;
+/// Frontier-key byte reserved so cached seeds sort strictly *after* the bootstrap routers
+/// (whose keys use small trailing indices) and after every real discovered node (whose keys
+/// are XOR distances, almost always numerically smaller). This guarantees cached seeds are
+/// tried alongside bootstrap but are the first to be dropped under the frontier size cap —
+/// they can never displace the public bootstrap fallback.
+const CACHE_SEED_KEY_BASE: u8 = 100;
+
+/// Is the DEFAULT-OFF routing-node cache (#42) enabled for this daemon session? Read once from
+/// `OUTPACE_DHT_ROUTING_CACHE` (`1`/`true`). With it off — the default — `dht_walk` seeds and
+/// harvests exactly as before: no cache reads, no cache writes, identical frontier. This gate
+/// lives here (rather than threaded through `dht_get_peers`' many callers) because the cache is
+/// an intrinsically process-session-scoped resource; `ace_engine::Config::dht_routing_cache`
+/// mirrors the same env for config-surface parity.
+fn routing_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("OUTPACE_DHT_ROUTING_CACHE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// The daemon-session routing-node cache. In-memory only (disk persistence is a separate
+/// follow-up), created lazily on first enabled use.
+fn session_cache() -> &'static Mutex<RoutingNodeCache> {
+    static CACHE: OnceLock<Mutex<RoutingNodeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(RoutingNodeCache::new()))
+}
 
 /// Build a `get_peers` KRPC query for `infohash` from our `node_id`.
 pub fn build_get_peers(node_id: &[u8; 20], infohash: &[u8; 20], txid: &[u8]) -> Vec<u8> {
@@ -77,6 +112,10 @@ pub struct GetPeersResponse {
     /// The KRPC transaction id (`t`) this reply echoes, used to correlate it against the
     /// outbound query it answers. Empty if the response omitted `t`.
     pub txid: Vec<u8>,
+    /// The responding node's own DHT id (`r.id`), if present and well-formed. This identifies
+    /// the node as a routing peer (distinct from any `peers`/`values` it hands us) and is the
+    /// "has a node id" half of routing-cache eligibility (#42).
+    pub responder_id: Option<[u8; 20]>,
 }
 
 /// Parse a KRPC response, extracting `r.values` (peers), `r.nodes` (compact nodes), and
@@ -118,6 +157,12 @@ pub fn parse_response(buf: &[u8]) -> Option<GetPeersResponse> {
         .get(b"token")
         .and_then(Bencode::as_bytes)
         .map(|b| b.to_vec());
+    // The responding node's own id (`r.id`) — a 20-byte compact node id. Anything else-shaped
+    // is treated as absent, not coerced.
+    out.responder_id = r
+        .get(b"id")
+        .and_then(Bencode::as_bytes)
+        .and_then(|b| <[u8; 20]>::try_from(b).ok());
     // Transaction id lives at the top level (`t`), alongside `r`/`y` — capture it so the walk
     // can correlate this reply against the query it answers.
     out.txid = v
@@ -146,6 +191,9 @@ fn is_krpc_error(buf: &[u8]) -> bool {
 struct DhtWalkMetrics {
     /// Bootstrap/seed nodes placed in the initial frontier.
     bootstrap_seeded: usize,
+    /// Cached routing nodes (#42) added to the initial frontier alongside bootstrap. Always 0
+    /// when the routing cache is disabled (the default).
+    cache_seeded: usize,
     /// `get_peers` queries sent (one per not-yet-queried node).
     nodes_queried: usize,
     /// Datagrams accepted as correlated `get_peers` responses.
@@ -166,6 +214,10 @@ struct DhtWalkMetrics {
     timeouts: usize,
     /// The walk ran out of new frontier nodes before exhausting its time budget.
     frontier_exhausted: bool,
+    /// Time from walk start to the first correlated response that carried at least one peer
+    /// (`r.values`). `None` if no peer was returned during the walk. The primary signal for
+    /// comparing cold vs warm (cached) startup (#42).
+    time_to_first_peer: Option<Duration>,
 }
 
 /// 6-byte compact endpoint: 4-byte IPv4 + 2-byte big-endian port.
@@ -192,11 +244,71 @@ fn distance(id: &[u8; 20], target: &[u8; 20]) -> [u8; 20] {
     d
 }
 
+/// What a walk harvested for the routing-node cache (#42), separate from `DhtWalkMetrics` so
+/// the metrics path stays unchanged. Purely observational: collected on every walk, but only
+/// *acted on* (written back to the cache) when the cache is enabled.
+#[derive(Debug, Default)]
+struct WalkHarvest {
+    /// Responders that returned a correlated valid `get_peers` response carrying their own node
+    /// id from a cache-eligible (public, under the default policy) source address. These are
+    /// the only routing-cache candidates — never `peers`/`values` records.
+    eligible: Vec<([u8; 20], SocketAddrV4)>,
+    /// Every address a query was actually sent to, so a cached seed that was queried but never
+    /// answered can be marked as a failure.
+    queried: HashSet<SocketAddrV4>,
+}
+
+/// Add cached routing nodes to `frontier` alongside whatever bootstrap/seed nodes it already
+/// holds, returning how many were inserted. Cached seeds get keys that sort strictly after the
+/// bootstrap routers and after every real discovered node (see `CACHE_SEED_KEY_BASE`), so they
+/// are queried concurrently in the early rounds yet are the first evicted under the frontier
+/// cap — they never displace the public bootstrap fallback. Non-blocking: this only mutates an
+/// in-memory map.
+fn seed_cached_into_frontier(
+    frontier: &mut BTreeMap<[u8; 20], SocketAddrV4>,
+    cached: &[SocketAddrV4],
+) -> usize {
+    let mut seeded = 0;
+    for (j, addr) in cached.iter().take(MAX_CACHE_SEEDS).enumerate() {
+        let mut key = [0xffu8; 20];
+        key[19] = CACHE_SEED_KEY_BASE.wrapping_add(j as u8);
+        if frontier.insert(key, *addr).is_none() {
+            seeded += 1;
+        }
+    }
+    seeded
+}
+
+/// Fold a walk's harvest back into `cache`: record eligible responders as successes, and any
+/// cached seed that was queried but did not answer as a failure, then prune stale/failed nodes.
+fn apply_harvest(
+    cache: &mut RoutingNodeCache,
+    harvest: &WalkHarvest,
+    cached_seeds: &[SocketAddrV4],
+) {
+    let now = Instant::now();
+    let succeeded: HashSet<SocketAddrV4> = harvest.eligible.iter().map(|(_, a)| *a).collect();
+    for (id, addr) in &harvest.eligible {
+        cache.record_success(*id, *addr, now);
+    }
+    for addr in cached_seeds {
+        if harvest.queried.contains(addr) && !succeeded.contains(addr) {
+            cache.record_failure(*addr, now);
+        }
+    }
+    cache.prune_stale(now);
+}
+
 /// Iterative `get_peers` walk toward `infohash`, shared by `dht_get_peers` (harvest peers)
 /// and `dht_announce_peer` (harvest tokens to announce back with). Seeds the frontier from
 /// bootstrap routers, sends batched queries to the closest not-yet-queried nodes, and calls
 /// `on_response` for each reply — which returns `true` to stop the walk early (e.g. "enough
 /// peers" or "enough tokens"). Bounded by `budget` regardless.
+///
+/// When the routing cache (#42) is enabled it *also* seeds the frontier with recently-successful
+/// cached nodes (alongside — never instead of — the bootstrap routers) and harvests fresh
+/// eligible responders back into the cache. With the cache disabled (the default) this is
+/// byte-for-byte the original bootstrap-only walk: no cache reads, no cache writes.
 async fn dht_walk(
     infohash: &[u8; 20],
     budget: Duration,
@@ -219,7 +331,29 @@ async fn dht_walk(
             }
         }
     }
-    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await
+
+    // Default-off routing cache: only read/seed when explicitly enabled. `cached` is captured
+    // so failed seeds can be penalized after the walk.
+    let cache_enabled = routing_cache_enabled();
+    let cached: Vec<SocketAddrV4> = if cache_enabled {
+        session_cache()
+            .lock()
+            .map(|c| c.seeds(Instant::now(), MAX_CACHE_SEEDS))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let cache_seeded = seed_cached_into_frontier(&mut frontier, &cached);
+
+    let (metrics, harvest) =
+        dht_walk_frontier(infohash, budget, sock, frontier, cache_seeded, on_response).await;
+
+    if cache_enabled {
+        if let Ok(mut c) = session_cache().lock() {
+            apply_harvest(&mut c, &harvest, &cached);
+        }
+    }
+    metrics
 }
 
 #[cfg(test)]
@@ -236,7 +370,36 @@ async fn dht_walk_from_seeds(
         key[19] = i as u8;
         frontier.insert(key, seed);
     }
-    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await
+    dht_walk_frontier(infohash, budget, sock, frontier, 0, on_response)
+        .await
+        .0
+}
+
+/// Offline test harness for the routing cache: seeds a frontier from explicit `bootstrap`
+/// seeds plus the given `cache`'s nodes, runs the walk, and folds the harvest back — exercising
+/// the exact `seed_cached_into_frontier` / `apply_harvest` paths production uses, without the
+/// global session cache or any DNS/bootstrap network I/O.
+#[cfg(test)]
+async fn dht_walk_from_seeds_cached(
+    infohash: &[u8; 20],
+    budget: Duration,
+    sock: &UdpSocket,
+    bootstrap: Vec<SocketAddrV4>,
+    cache: &Mutex<RoutingNodeCache>,
+    on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
+) -> DhtWalkMetrics {
+    let mut frontier: BTreeMap<[u8; 20], SocketAddrV4> = BTreeMap::new();
+    for (i, seed) in bootstrap.into_iter().enumerate() {
+        let mut key = [0xffu8; 20];
+        key[19] = i as u8;
+        frontier.insert(key, seed);
+    }
+    let cached = cache.lock().unwrap().seeds(Instant::now(), MAX_CACHE_SEEDS);
+    let cache_seeded = seed_cached_into_frontier(&mut frontier, &cached);
+    let (metrics, harvest) =
+        dht_walk_frontier(infohash, budget, sock, frontier, cache_seeded, on_response).await;
+    apply_harvest(&mut cache.lock().unwrap(), &harvest, &cached);
+    metrics
 }
 
 async fn dht_walk_frontier(
@@ -244,13 +407,18 @@ async fn dht_walk_frontier(
     budget: Duration,
     sock: &UdpSocket,
     mut frontier: BTreeMap<[u8; 20], SocketAddrV4>,
+    cache_seeded: usize,
     mut on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
-) -> DhtWalkMetrics {
+) -> (DhtWalkMetrics, WalkHarvest) {
     let node_id: [u8; 20] = rand::random();
+    let walk_start = Instant::now();
     let mut metrics = DhtWalkMetrics {
-        bootstrap_seeded: frontier.len(),
+        // The frontier holds bootstrap + cached seeds; report them separately.
+        bootstrap_seeded: frontier.len().saturating_sub(cache_seeded),
+        cache_seeded,
         ..Default::default()
     };
+    let mut harvest = WalkHarvest::default();
 
     let mut queried: HashSet<SocketAddrV4> = HashSet::new();
     // Inflight queries keyed by (destination, transaction id) → expiry deadline. Public DHT
@@ -326,6 +494,18 @@ async fn dht_walk_frontier(
                     metrics.valid_responses += 1;
                     metrics.peers_discovered += resp.peers.len();
                     metrics.nodes_discovered += resp.nodes.len();
+                    // Time-to-first-peer: the first correlated reply that actually carried a
+                    // peer (#42 — the headline cold-vs-warm startup signal).
+                    if !resp.peers.is_empty() && metrics.time_to_first_peer.is_none() {
+                        metrics.time_to_first_peer = Some(walk_start.elapsed());
+                    }
+                    // Routing-cache harvest candidate: a correlated valid responder that gave
+                    // its own node id. NEVER a `values` peer — those live in `resp.peers` and
+                    // are not routing nodes. The public-address eligibility gate is enforced by
+                    // the cache's `record_success` (single source of truth for that policy).
+                    if let Some(id) = resp.responder_id {
+                        harvest.eligible.push((id, src));
+                    }
                     for (id, addr) in &resp.nodes {
                         frontier.entry(distance(id, infohash)).or_insert(*addr);
                     }
@@ -347,9 +527,10 @@ async fn dht_walk_frontier(
     }
 
     crate::swarm_log!(
-        "[dht] walk done: seeded={} queried={} valid={} peers={} nodes={} malformed={} \
-         krpc_err={} uncorrelated={} timeouts={} frontier_exhausted={}",
+        "[dht] walk done: seeded={} cache_seeded={} queried={} valid={} peers={} nodes={} \
+         malformed={} krpc_err={} uncorrelated={} timeouts={} frontier_exhausted={} ttfp_ms={}",
         metrics.bootstrap_seeded,
+        metrics.cache_seeded,
         metrics.nodes_queried,
         metrics.valid_responses,
         metrics.peers_discovered,
@@ -359,8 +540,13 @@ async fn dht_walk_frontier(
         metrics.uncorrelated_responses,
         metrics.timeouts,
         metrics.frontier_exhausted,
+        metrics
+            .time_to_first_peer
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|| "-".to_string()),
     );
-    metrics
+    harvest.queried = queried;
+    (metrics, harvest)
 }
 
 /// Iterative `get_peers` toward `infohash`, bounded by `budget`. Returns discovered peers.
@@ -1043,6 +1229,203 @@ mod tests {
         assert_eq!(metrics.uncorrelated_responses, 1);
         assert_eq!(metrics.timeouts, 0);
         handle.await.unwrap();
+    }
+
+    // --- Routing-node cache prototype (#42), default-OFF ---
+    //
+    // These exercise the walk-level seed/harvest paths (`seed_cached_into_frontier` +
+    // `apply_harvest`) against an explicit `RoutingNodeCache` via `dht_walk_from_seeds_cached`,
+    // entirely offline. The cache uses `for_test(true)` (allow_non_global) so loopback fake
+    // sockets are eligible; the public-address policy itself is proven in `dht_cache`'s tests.
+
+    /// A one-shot server that answers a single `get_peers` with `peers` (echoing the txid) and
+    /// includes its own responder id (`r.id`), making it a harvest-eligible routing node.
+    async fn spawn_responder(
+        peers: Vec<SocketAddrV4>,
+    ) -> (SocketAddrV4, tokio::task::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = v4_addr(&server);
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            if let Ok((n, peer)) = server.recv_from(&mut buf).await {
+                let txid = buf_txid(&buf[..n]);
+                let resp = response_with(&txid, &peers, &[]);
+                let _ = server.send_to(&resp, peer).await;
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn cached_and_bootstrap_seeds_are_queried_concurrently() {
+        // A cached node and a bootstrap seed both answer; both must be queried in the same early
+        // round (concurrently, under one budget), and the cache seed is reported separately.
+        let (boot, hb) = spawn_responder(vec!["10.0.0.1:1111".parse().unwrap()]).await;
+        let (cached_node, hc) = spawn_responder(vec!["10.0.0.2:2222".parse().unwrap()]).await;
+
+        let cache = Mutex::new(RoutingNodeCache::for_test(true));
+        cache
+            .lock()
+            .unwrap()
+            .record_success([5u8; 20], cached_node, Instant::now());
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut seen: BTreeSet<SocketAddrV4> = BTreeSet::new();
+        let start = Instant::now();
+        let metrics = dht_walk_from_seeds_cached(
+            &[9u8; 20],
+            Duration::from_secs(5),
+            &client,
+            vec![boot],
+            &cache,
+            |_src, resp| {
+                seen.extend(resp.peers.iter().copied());
+                seen.len() >= 2
+            },
+        )
+        .await;
+
+        assert_eq!(metrics.bootstrap_seeded, 1);
+        assert_eq!(
+            metrics.cache_seeded, 1,
+            "cached node seeded alongside bootstrap"
+        );
+        assert_eq!(metrics.nodes_queried, 2, "both queried in the same round");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "concurrent seeding: both answers collected in one window, not serialized"
+        );
+        assert!(metrics.time_to_first_peer.is_some());
+        hb.await.unwrap();
+        hc.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_cached_node_adds_no_fixed_timeout_and_is_penalized() {
+        // A dead cached node is seeded next to a live bootstrap seed. The walk must not wait on
+        // the dead node (no per-node preflight/timeout): it returns as soon as the live seed
+        // meets the target, and the dead node earns a failure.
+        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = v4_addr(&dead);
+        drop(dead); // nothing will ever answer from this address
+
+        let (boot, hb) = spawn_responder(vec!["10.0.0.1:1111".parse().unwrap()]).await;
+
+        let cache = Mutex::new(RoutingNodeCache::for_test(true));
+        cache
+            .lock()
+            .unwrap()
+            .record_success([5u8; 20], dead_addr, Instant::now());
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut seen: BTreeSet<SocketAddrV4> = BTreeSet::new();
+        let start = Instant::now();
+        let metrics = dht_walk_from_seeds_cached(
+            &[9u8; 20],
+            Duration::from_secs(5),
+            &client,
+            vec![boot],
+            &cache,
+            |_src, resp| {
+                seen.extend(resp.peers.iter().copied());
+                !seen.is_empty()
+            },
+        )
+        .await;
+
+        assert_eq!(metrics.cache_seeded, 1);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a stale/dead cached seed must not add a fixed timeout to the walk"
+        );
+        assert!(seen.contains(&"10.0.0.1:1111".parse().unwrap()));
+        hb.await.unwrap();
+        // The dead seed was queried but never answered → one failure recorded (or evicted).
+        let penalized = cache
+            .lock()
+            .unwrap()
+            .failures_of(dead_addr)
+            .map(|f| f >= 1)
+            .unwrap_or(true);
+        assert!(
+            penalized,
+            "queried-but-silent cached seed must be penalized"
+        );
+    }
+
+    #[tokio::test]
+    async fn harvest_records_responder_never_the_values_peer() {
+        // The responder (loopback fake socket) answers with a `values` peer 203.0.113.7:7777.
+        // After the walk the RESPONDER is cached as a routing node; the values peer is not.
+        let peer: SocketAddrV4 = "203.0.113.7:7777".parse().unwrap();
+        let (responder, h) = spawn_responder(vec![peer]).await;
+
+        let cache = Mutex::new(RoutingNodeCache::for_test(true));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let metrics = dht_walk_from_seeds_cached(
+            &[9u8; 20],
+            Duration::from_secs(5),
+            &client,
+            vec![responder],
+            &cache,
+            |_src, resp| !resp.peers.is_empty(),
+        )
+        .await;
+
+        assert_eq!(metrics.valid_responses, 1);
+        h.await.unwrap();
+        let c = cache.lock().unwrap();
+        assert!(c.contains(responder), "responder cached as a routing node");
+        assert!(
+            !c.contains(peer),
+            "a `values` peer must never be cached as a routing node"
+        );
+        assert_eq!(c.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn default_off_frontier_and_metrics_are_identical_to_bootstrap_only() {
+        // With an EMPTY cache (the effective default-off state), the cached walk must seed and
+        // measure identically to the plain bootstrap-only walk: same silent seed → same
+        // timeout/exhaustion metrics, cache_seeded == 0, and the two metric structs are equal.
+        let silent_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed_a = v4_addr(&silent_a);
+        let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let plain = dht_walk_from_seeds(
+            &[9u8; 20],
+            Duration::from_secs(2),
+            &client_a,
+            vec![seed_a],
+            |_s, _r| false,
+        )
+        .await;
+
+        let silent_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed_b = v4_addr(&silent_b);
+        let empty_cache = Mutex::new(RoutingNodeCache::for_test(true));
+        let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cached = dht_walk_from_seeds_cached(
+            &[9u8; 20],
+            Duration::from_secs(2),
+            &client_b,
+            vec![seed_b],
+            &empty_cache,
+            |_s, _r| false,
+        )
+        .await;
+
+        assert_eq!(cached.cache_seeded, 0, "empty cache seeds nothing");
+        assert_eq!(
+            plain, cached,
+            "with no cached nodes the walk is identical to the bootstrap-only path"
+        );
+        assert_eq!(
+            empty_cache.lock().unwrap().len(),
+            0,
+            "nothing harvested from silence"
+        );
+        drop(silent_a);
+        drop(silent_b);
     }
 
     // Live DHT lookup against a real infohash:

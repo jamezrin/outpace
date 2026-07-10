@@ -226,6 +226,16 @@ pub struct Config {
     /// experimental legacy adapter; outpace's native `/streams` and `/broadcast` API is the
     /// supported surface.
     pub experimental_ace_compat: bool,
+    /// Evaluate-first DHT routing-node cache (#42): warm a new `get_peers` walk's frontier with
+    /// recently-successful routing nodes from earlier walks, alongside — never instead of — the
+    /// public bootstrap routers. Defaults **off**; an unproven startup optimization must not
+    /// regress the cold path. Enable with `OUTPACE_DHT_ROUTING_CACHE=1`.
+    ///
+    /// The cache itself is a daemon-session resource inside `ace_swarm::dht`, gated there by the
+    /// same `OUTPACE_DHT_ROUTING_CACHE` env var (threading a flag through `dht_get_peers`' many
+    /// callers would be far more invasive than the session-scoped gate). This config field
+    /// mirrors that env for config-surface parity and observability; both read the same var.
+    pub dht_routing_cache: bool,
 }
 
 impl Default for Config {
@@ -256,6 +266,7 @@ impl Default for Config {
             port_map_backend: ace_swarm::portmap::PortMapBackend::Auto,
             port_map_external_port: None,
             experimental_ace_compat: false,
+            dht_routing_cache: false,
         }
     }
 }

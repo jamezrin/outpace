@@ -13,6 +13,7 @@
 #[macro_use]
 pub mod logts;
 pub mod dht;
+mod dht_cache;
 pub mod discover;
 pub mod driver;
 pub mod listen;
