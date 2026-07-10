@@ -1,6 +1,7 @@
 //! Inbound seeding: a registry of infohashes we serve, and a `PeerListener` that accepts
 //! connections, verifies the requested infohash against the registry, and hands the socket to
 //! `SeederSession::serve`.
+use crate::reachability::ReachabilityMonitor;
 use crate::seed::SeederSession;
 use crate::seed::ServeCoordinator;
 use crate::store::PieceStore;
@@ -323,6 +324,9 @@ impl PeerListener {
     /// (`SeederSession::serve`) — without it a real leech client (including our own
     /// `AceProvider`) never proceeds past waiting for it.
     #[allow(clippy::too_many_arguments)]
+    /// `reachability`, when present, counts each accepted inbound connection — the strongest
+    /// signal that we are publicly reachable (issue #22). It is inert (never passed) when
+    /// inbound serving is disabled, since then no listener runs at all.
     pub async fn serve(
         listener: TcpListener,
         registry: SeedRegistry,
@@ -331,6 +335,7 @@ impl PeerListener {
         max_inbound: usize,
         identity: Arc<Identity>,
         max_unchoked: usize,
+        reachability: Option<Arc<ReachabilityMonitor>>,
     ) {
         let sem = Arc::new(tokio::sync::Semaphore::new(max_inbound.max(1)));
         loop {
@@ -345,6 +350,12 @@ impl PeerListener {
                     continue;
                 }
             };
+            // Every accepted connection is an unsolicited inbound dial — the strongest proof we
+            // are publicly reachable (issue #22). Count it before the concurrency gate so even a
+            // connection dropped at capacity still registers as "someone reached us".
+            if let Some(monitor) = &reachability {
+                monitor.note_inbound_peer();
+            }
             // Bounded concurrency: try_acquire_owned (non-blocking) rather than
             // acquire_owned().await. At capacity we want to drop the new connection
             // immediately and keep accepting, not stall the accept loop queuing up

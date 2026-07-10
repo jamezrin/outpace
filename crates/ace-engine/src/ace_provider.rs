@@ -17,6 +17,7 @@ use ace_swarm::discover::{
     announce_seeder, discover_peers, discover_peers_with_options, DiscoveryOptions,
 };
 use ace_swarm::listen::SeedRegistry;
+use ace_swarm::reachability::ReachabilityMonitor;
 use ace_swarm::resolve::{
     catalog_transport_bytes, hex20, infohash_hex, resolve_via_catalog, resolve_via_peer,
     stream_info_from_infohash, stream_info_from_transport_url, transport_bytes_from_url,
@@ -36,7 +37,7 @@ use ace_wire::reassembly::PieceReassembler;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::net::SocketAddrV4;
+use std::net::{IpAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -168,6 +169,11 @@ pub struct AceProvider {
     enable_seeding: bool,
     cache_type: CacheType,
     cache_dir: PathBuf,
+    /// Records the public IP peers echo back in `yourip` on our outbound handshakes (issue #22).
+    /// `None` unless inbound serving is enabled — with inbound off we can't be dialed anyway, so
+    /// harvesting is inert (never wired). Shared with the inbound listener and the daemon's
+    /// periodic reachability status logger.
+    reachability: Option<Arc<ReachabilityMonitor>>,
 }
 
 impl AceProvider {
@@ -190,7 +196,17 @@ impl AceProvider {
             enable_seeding: true,
             cache_type: CacheType::Memory,
             cache_dir: PathBuf::new(),
+            reachability: None,
         }
+    }
+
+    /// Share a [`ReachabilityMonitor`] so `yourip` values peers echo on our outbound handshakes
+    /// are harvested into the daemon-wide public-reachability view (issue #22). Pass `None`
+    /// (the default) to disable harvesting entirely — the engine only supplies a monitor when
+    /// inbound serving is on.
+    pub fn with_reachability(mut self, reachability: Option<Arc<ReachabilityMonitor>>) -> Self {
+        self.reachability = reachability;
+        self
     }
 
     /// Set the external inbound endpoint advertised by the periodic seeder self-announce so
@@ -744,12 +760,13 @@ impl StreamProvider for AceProvider {
         let announce_info = info.clone();
         let announce_port = self.seeder_announce_port();
         let discovery_port = self.peer_port;
+        let reachability = self.reachability.clone();
         tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
             // whichever ends first (normally `follow_live`, when the consumer drops) tears
             // down the other — no separate lifecycle to manage.
             tokio::select! {
-                _ = follow_live(info, peers, identity, tx, stats_peers, downloaded, uploaded, peers_served, seed, discovery_port) => {},
+                _ = follow_live(info, peers, identity, tx, stats_peers, downloaded, uploaded, peers_served, seed, discovery_port, reachability) => {},
                 _ = announce_seeder_periodically(announce_info, announce_port) => {},
             }
         });
@@ -856,6 +873,9 @@ struct ConnectedUpstream {
     session: PeerSession<TcpStream>,
     addr: SocketAddrV4,
     window: LivePosition,
+    /// The public IP this peer echoed to us in `yourip`, if any — harvested for reachability
+    /// observability (issue #22) when this upstream is activated.
+    yourip: Option<IpAddr>,
 }
 
 enum PeerConnectAttempt {
@@ -1027,7 +1047,7 @@ async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnect
             stage: PeerConnectStage::Handshake,
         });
     }
-    let Some(window) = read_peer_window(&mut session).await else {
+    let Some((window, yourip)) = read_peer_window(&mut session).await else {
         return PeerConnectAttempt::Failed(PeerConnectFailure {
             addr,
             stage: PeerConnectStage::Window,
@@ -1037,6 +1057,7 @@ async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnect
         session,
         addr,
         window,
+        yourip,
     })
 }
 
@@ -1163,6 +1184,7 @@ async fn follow_live(
     peers_served: Arc<AtomicU32>,
     seed: SeedConfig,
     discovery_port: u16,
+    reachability: Option<Arc<ReachabilityMonitor>>,
 ) {
     let chunks_per_piece = info.chunks_per_piece();
     // Every peer lost so far this session (cumulative, not just the most recent) — see
@@ -1261,6 +1283,7 @@ async fn follow_live(
             known_refill_peers,
             discovery_port,
             &peer_count,
+            reachability.as_ref(),
         )
         .await
         {
@@ -1503,7 +1526,14 @@ async fn activate_upstream_peer(
     identity: &Identity,
     continuity: &mut Continuity,
     event_tx: &mpsc::Sender<PeerEvent>,
+    reachability: Option<&Arc<ReachabilityMonitor>>,
 ) -> Result<PeerRuntime, SocketAddrV4> {
+    // Harvest the public IP this peer echoed to us in `yourip` (issue #22). This is the single
+    // funnel every activated outbound upstream passes through, so recording here captures the
+    // observation once per live peer. Inert when no monitor is supplied (inbound serving off).
+    if let (Some(monitor), Some(ip)) = (reachability, upstream.yourip) {
+        monitor.observe_yourip(ip);
+    }
     let peer_min = upstream.window.min_piece.max(0) as u64;
     let peer_max = upstream.window.max_piece.max(0) as u64;
     continuity.register_active_peer(peer_id, upstream.addr, upstream.window);
@@ -1676,6 +1706,7 @@ async fn follow_peer_pool(
     known_refill_peers: Vec<SocketAddrV4>,
     discovery_port: u16,
     peer_count: &Arc<AtomicU32>,
+    reachability: Option<&Arc<ReachabilityMonitor>>,
 ) -> FollowEnd {
     debug_assert!(!upstreams.is_empty());
     let primary = upstreams[0].window;
@@ -1746,8 +1777,16 @@ async fn follow_peer_pool(
     for upstream in upstreams {
         let peer_id = next_peer_id;
         next_peer_id += 1;
-        match activate_upstream_peer(peer_id, upstream, start, identity, continuity, &event_tx)
-            .await
+        match activate_upstream_peer(
+            peer_id,
+            upstream,
+            start,
+            identity,
+            continuity,
+            &event_tx,
+            reachability,
+        )
+        .await
         {
             Ok(runtime) => {
                 peers.insert(peer_id, runtime);
@@ -1840,6 +1879,7 @@ async fn follow_peer_pool(
                     identity,
                     continuity,
                     &event_tx,
+                    reachability,
                 )
                 .await
                 {
@@ -2708,20 +2748,28 @@ fn hex_preview(bytes: &[u8]) -> String {
     bytes.iter().take(24).map(|b| format!("{b:02x}")).collect()
 }
 
-/// Read messages until the peer's extended handshake arrives; return its live `mi` window.
-async fn read_peer_window(session: &mut PeerSession<TcpStream>) -> Option<LivePosition> {
+/// Read messages until the peer's extended handshake arrives; return its live `mi` window and
+/// the `yourip` public address it echoed to us (issue #22 — the swarm telling us how it sees us
+/// on this outbound connection; `None` when the peer sent no usable `yourip`).
+async fn read_peer_window(
+    session: &mut PeerSession<TcpStream>,
+) -> Option<(LivePosition, Option<IpAddr>)> {
     for _ in 0..32 {
         let msg = session.read_message().await.ok()?;
         if let PeerMessage::Extended { ext_id: 0, payload } = msg {
             let eh = ExtendedHandshake::parse(&payload).ok()?;
+            let yourip = eh.yourip();
             let mi = eh.raw.get(b"mi")?;
             let get = |k: &[u8]| mi.get(k).and_then(|v| v.as_int()).unwrap_or(-1);
-            return Some(LivePosition {
-                min_piece: get(b"min_piece"),
-                max_piece: get(b"max_piece"),
-                position: get(b"position"),
-                distance_from_source: get(b"distance_from_source"),
-            });
+            return Some((
+                LivePosition {
+                    min_piece: get(b"min_piece"),
+                    max_piece: get(b"max_piece"),
+                    position: get(b"position"),
+                    distance_from_source: get(b"distance_from_source"),
+                },
+                yourip,
+            ));
         }
     }
     None
