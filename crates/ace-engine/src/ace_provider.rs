@@ -84,12 +84,19 @@ const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 /// Bytes of recently-downloaded data retained per active peer connection for reseeding.
 const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Disk mode promises not to turn the configured on-disk budget into an equal per-stream RAM
+/// allocation. If a per-stream directory becomes unavailable after startup, keep playback alive
+/// with a zero-retention store: writes are immediately evicted and no piece payload accumulates.
+const DISK_FAILURE_MEMORY_BYTES: u64 = 0;
+static DISK_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
 /// Build a [`PieceStore`] for `infohash` honoring the configured cache backend. In disk mode the
 /// store lives under `<cache_dir>/<infohash_hex>-<generation>`, where `generation` is a
 /// process-unique counter so each store instance owns a private directory — a stale store instance
 /// can never clobber a re-created same-infohash store's data. If the directory cannot be prepared
-/// (an unexpected mid-run I/O error — the common misconfiguration is caught at startup) we log and
-/// fall back to a memory store so a live stream keeps serving rather than dying.
+/// (an unexpected mid-run I/O error — the common misconfiguration is caught at startup), playback
+/// continues with a zero-retention memory store. This deliberately disables cache/seeding for that
+/// stream rather than silently allocating the configured disk budget in RAM.
 pub(crate) fn build_piece_store(
     piece_length: u64,
     chunk_length: u64,
@@ -109,11 +116,12 @@ pub(crate) fn build_piece_store(
                 BackendKind::Disk { dir: dir.clone() },
             )
             .unwrap_or_else(|e| {
+                let failures = DISK_STORE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
                 crate::alog!(
-                    "[cache] disk cache unavailable at {}: {e}; falling back to memory",
-                    dir.display()
+                    "[cache] ERROR: disk store creation failure #{failures} at {}: {e}; continuing with ZERO piece retention (no RAM cache fallback)",
+                    dir.display(),
                 );
-                PieceStore::new(piece_length, chunk_length, max_bytes)
+                PieceStore::new(piece_length, chunk_length, DISK_FAILURE_MEMORY_BYTES)
             })
         }
     }
@@ -3228,6 +3236,33 @@ mod tests {
             "dir names keep the readable infohash prefix: {dirs:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn disk_construction_failure_keeps_playback_store_at_zero_retention() {
+        let invalid_root = std::env::temp_dir().join(format!(
+            "outpace-cache-failure-{}-{}",
+            std::process::id(),
+            DISK_STORE_FAILURES.load(Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&invalid_root);
+        std::fs::write(&invalid_root, b"file blocks child directory creation").unwrap();
+        let mut store = build_piece_store(
+            8,
+            4,
+            128 * 1024 * 1024,
+            CacheType::Disk,
+            &invalid_root,
+            &[0x38; 20],
+        );
+
+        store.put_chunk(0, 0, &[1, 2, 3, 4]);
+        assert!(
+            store.chunk(0, 0).is_none(),
+            "disk failure policy must not retain the configured disk budget in RAM"
+        );
+        assert!(store.have_pieces().is_empty());
+        std::fs::remove_file(invalid_root).unwrap();
     }
 
     #[tokio::test]
