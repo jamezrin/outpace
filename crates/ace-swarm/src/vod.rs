@@ -22,6 +22,54 @@ pub fn verify_piece(expected: &[u8; 20], bytes: &[u8]) -> bool {
     digest.as_slice() == expected
 }
 
+/// Piece-local assembly state whose memory is bounded by the validated piece geometry.
+///
+/// `covered` is a bitset (`Vec<bool>`) with one bit per output byte. This accepts standard
+/// block-aligned responses while also handling partial overlaps without double-counting them.
+/// Peer-provided offsets and lengths are validated before either buffer is indexed.
+struct PieceBuffer {
+    bytes: Vec<u8>,
+    covered: Vec<bool>,
+    covered_len: usize,
+}
+
+impl PieceBuffer {
+    fn new(piece_len: usize) -> Self {
+        Self {
+            bytes: vec![0; piece_len],
+            covered: vec![false; piece_len],
+            covered_len: 0,
+        }
+    }
+
+    /// Add one received block. Empty, overflowing, or out-of-range blocks are peer errors;
+    /// valid duplicate/overlapping bytes are idempotent and only new coverage advances
+    /// completion.
+    fn add_block(&mut self, begin: u32, block: &[u8]) -> Result<(), ()> {
+        if block.is_empty() {
+            return Err(());
+        }
+        let start = begin as usize;
+        let end = start.checked_add(block.len()).ok_or(())?;
+        if start >= self.bytes.len() || end > self.bytes.len() {
+            return Err(());
+        }
+
+        self.bytes[start..end].copy_from_slice(block);
+        for covered in &mut self.covered[start..end] {
+            if !*covered {
+                *covered = true;
+                self.covered_len += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.covered_len == self.bytes.len()
+    }
+}
+
 /// Error from a VOD download.
 #[derive(Debug)]
 pub enum VodError {
@@ -120,8 +168,7 @@ async fn drain_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
     while *next_piece < end_piece {
         let idx = *next_piece;
         let piece_len = info.piece_size(idx) as usize;
-        let mut assembled = vec![0u8; piece_len];
-        let mut have = 0usize;
+        let mut assembled = PieceBuffer::new(piece_len);
         if unchoked {
             request_piece_blocks(session, info, idx, piece_len)
                 .await
@@ -147,13 +194,10 @@ async fn drain_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
                     begin,
                     block,
                 } if index == idx as u32 => {
-                    let start = begin as usize;
-                    if start < piece_len {
-                        let end = (start + block.len()).min(piece_len);
-                        assembled[start..end].copy_from_slice(&block[..end - start]);
-                        have += end - start;
-                    }
-                    if have >= piece_len {
+                    assembled
+                        .add_block(begin, &block)
+                        .map_err(|_| VodError::Unrecoverable(idx))?;
+                    if assembled.is_complete() {
                         break;
                     }
                 }
@@ -161,11 +205,11 @@ async fn drain_from_peer<S: AsyncRead + AsyncWrite + Unpin>(
                 _ => {}
             }
         }
-        if !verify_piece(&info.piece_hashes[idx as usize], &assembled) {
+        if !verify_piece(&info.piece_hashes[idx as usize], &assembled.bytes) {
             // This peer served a piece that failed its hash; abandon it (keep the cursor).
             return Err(VodError::Unrecoverable(idx));
         }
-        tx.send(Bytes::from(assembled))
+        tx.send(Bytes::from(assembled.bytes))
             .await
             .map_err(|_| VodError::ConsumerGone)?;
         *next_piece += 1;
@@ -208,6 +252,51 @@ mod tests {
         let mut bad = data.to_vec();
         bad[0] ^= 0xff;
         assert!(!verify_piece(&hash, &bad));
+    }
+
+    #[test]
+    fn duplicate_block_does_not_advance_unique_coverage() {
+        let mut piece = PieceBuffer::new(6);
+        piece.add_block(0, &[1, 2, 3]).unwrap();
+        piece.add_block(0, &[1, 2, 3]).unwrap();
+        assert_eq!(piece.covered_len, 3);
+        assert!(!piece.is_complete());
+
+        piece.add_block(3, &[4, 5, 6]).unwrap();
+        assert!(piece.is_complete());
+        assert_eq!(piece.bytes, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn partial_overlap_counts_only_new_bytes() {
+        let mut piece = PieceBuffer::new(6);
+        piece.add_block(0, &[1, 2, 3, 4]).unwrap();
+        piece.add_block(2, &[3, 4, 5, 6]).unwrap();
+        assert_eq!(piece.covered_len, 6);
+        assert!(piece.is_complete());
+        assert_eq!(piece.bytes, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn out_of_order_unique_blocks_complete() {
+        let mut piece = PieceBuffer::new(6);
+        piece.add_block(4, &[5, 6]).unwrap();
+        piece.add_block(0, &[1, 2]).unwrap();
+        assert!(!piece.is_complete());
+        piece.add_block(2, &[3, 4]).unwrap();
+        assert!(piece.is_complete());
+        assert_eq!(piece.bytes, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn malformed_blocks_are_rejected_without_resizing() {
+        let mut piece = PieceBuffer::new(4);
+        assert!(piece.add_block(0, &[]).is_err());
+        assert!(piece.add_block(4, &[1]).is_err());
+        assert!(piece.add_block(3, &[1, 2]).is_err());
+        assert!(piece.add_block(u32::MAX, &[1]).is_err());
+        assert_eq!(piece.bytes.len(), 4);
+        assert_eq!(piece.covered_len, 0);
     }
 }
 
