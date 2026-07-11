@@ -207,6 +207,39 @@ impl PieceStore {
         handle.get(piece, chunk).await
     }
 
+    /// Read a standard BitTorrent byte block from a piece stored as request-sized chunks.
+    /// Returns `None` unless every byte in the requested range is retained.
+    pub async fn shared_block(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        begin: u32,
+        length: u32,
+    ) -> Option<Vec<u8>> {
+        if length == 0 {
+            return None;
+        }
+        let (chunk_length, piece_length) = {
+            let guard = store.lock().await;
+            (guard.chunk_length, guard.piece_length)
+        };
+        let end = u64::from(begin).checked_add(u64::from(length))?;
+        // Bound hostile request geometry before looping or allocating. BEP 3 blocks are normally
+        // 16 KiB; permit larger compatible requests up to one piece, but never beyond it.
+        if end > piece_length || u64::from(length) > piece_length {
+            return None;
+        }
+        let first = u64::from(begin) / chunk_length;
+        let last = end.div_ceil(chunk_length);
+        let mut piece_bytes = Vec::new();
+        for chunk in first..last {
+            let (data, _) = Self::shared_chunk(store, piece, u16::try_from(chunk).ok()?).await?;
+            piece_bytes.extend_from_slice(&data);
+        }
+        let offset = (u64::from(begin) % chunk_length) as usize;
+        let requested_end = offset.checked_add(length as usize)?;
+        Some(piece_bytes.get(offset..requested_end)?.to_vec())
+    }
+
     /// Write a chunk to a shared store without running disk I/O on a Tokio worker thread.
     pub async fn shared_put_chunk_with_header(
         store: &Arc<Mutex<Self>>,
