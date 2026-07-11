@@ -580,7 +580,7 @@ impl VodContent for AceVodContent {
             // downloader runs detached: if the consumer drops (leaving the tee loop, dropping
             // `drx`), `download_vod_pieces` sees `ConsumerGone` on its next send and stops.
             let (dtx, mut drx) = mpsc::channel::<Bytes>(64);
-            tokio::spawn(async move {
+            let downloader = tokio::spawn(async move {
                 if let Err(e) =
                     download_vod_pieces(info, peers, dtx, download_from, end_piece).await
                 {
@@ -588,8 +588,18 @@ impl VodContent for AceVodContent {
                 }
             });
             tokio::spawn(async move {
+                // Keep the range transaction serialized until the downloader has observed
+                // cancellation and exited, not merely until the HTTP consumer drops its source.
+                let _range_guard = range_guard;
                 let mut idx = download_from;
-                while let Some(piece) = drx.recv().await {
+                loop {
+                    let piece = tokio::select! {
+                        _ = tx.closed() => break,
+                        piece = drx.recv() => match piece {
+                            Some(piece) => piece,
+                            None => break,
+                        },
+                    };
                     // The downloader emits only whole pieces after SHA-1 verification. Populate
                     // the shared store only here, never from partial/unverified peer blocks.
                     for (chunk, data) in piece.chunks(chunk_length as usize).enumerate() {
@@ -607,7 +617,11 @@ impl VodContent for AceVodContent {
                         break;
                     }
                 }
+                drop(drx);
+                let _ = downloader.await;
             });
+        } else {
+            drop(range_guard);
         }
         // else: the whole range is cached — `tx` drops here, closing `rx`, so the source emits
         // only the cached prefix.
@@ -622,7 +636,6 @@ impl VodContent for AceVodContent {
             skip,
             remaining: emit_len,
             emit_len,
-            _range_guard: range_guard,
         }))
     }
 }
@@ -642,7 +655,6 @@ struct VodSource {
     remaining: u64,
     /// Total bytes this source will emit (the range length); constant after construction.
     emit_len: u64,
-    _range_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[async_trait]
@@ -2935,7 +2947,6 @@ mod tests {
             skip: 2,
             remaining: 5,
             emit_len: 5,
-            _range_guard: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
         };
         assert_eq!(src.content_length(), 5);
         let mut got = Vec::new();
@@ -2960,7 +2971,6 @@ mod tests {
             skip: 2,
             remaining: 5,
             emit_len: 5,
-            _range_guard: Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
         };
         let mut got = Vec::new();
         while let Some(chunk) = src.next().await {
@@ -3210,6 +3220,43 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_range_finishes_background_transaction_before_overlap_downloads() {
+        let (content, info) = make_vod_content(16, 16, 32);
+        let served = Arc::new(AtomicU64::new(0));
+        let upstream =
+            spawn_counting_vod_seeder(content.clone(), info.clone(), served.clone()).await;
+        let registry = SeedRegistry::new();
+        let store = registry.lease_store(info.infohash, || PieceStore::new(16, 16, 128));
+        let range_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let vod = AceVodContent {
+            info,
+            bootstrap_peers: vec![upstream],
+            announce_peer_port: tokio::sync::watch::channel(None).1,
+            store,
+            peers: Arc::new(tokio::sync::Mutex::new(None)),
+            range_lock: range_lock.clone(),
+        };
+
+        let cancelled = vod.open_range(0, 15).await.unwrap();
+        drop(cancelled);
+        // The supervisor owns the lock until its downloader observes cancellation and exits.
+        let guard = tokio::time::timeout(Duration::from_secs(1), range_lock.clone().lock_owned())
+            .await
+            .expect("cancelled background transaction shuts down");
+        drop(guard);
+
+        assert_eq!(
+            read_all(vod.open_range(0, 15).await.unwrap()).await,
+            content[..16]
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            16,
+            "cancelled overlap cannot race a duplicate piece download/write"
+        );
     }
 
     #[tokio::test]
