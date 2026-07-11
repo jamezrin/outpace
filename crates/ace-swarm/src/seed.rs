@@ -233,6 +233,26 @@ impl SeederSession {
                         }
                     }
                 }
+                PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                } if unchoked => {
+                    let found = if let Some(store) = &store {
+                        PieceStore::shared_block(store, index as u64, begin, length).await
+                    } else {
+                        None
+                    };
+                    if let Some(block) = found {
+                        session
+                            .send(&PeerMessage::Piece {
+                                index,
+                                begin,
+                                block,
+                            })
+                            .await?;
+                    }
+                }
                 _ => {}
             }
         }

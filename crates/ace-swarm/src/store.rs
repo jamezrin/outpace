@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Maximum request block accepted from a standard BitTorrent peer (BEP 3 convention).
+pub const MAX_BT_REQUEST_LEN: u32 = 16 * 1024;
+
 mod disk;
 use disk::DiskBackend;
 
@@ -207,6 +210,39 @@ impl PieceStore {
         handle.get(piece, chunk).await
     }
 
+    /// Read a standard BitTorrent byte block from a piece stored as request-sized chunks.
+    /// Returns `None` unless every byte in the requested range is retained.
+    pub async fn shared_block(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        begin: u32,
+        length: u32,
+    ) -> Option<Vec<u8>> {
+        if length == 0 || length > MAX_BT_REQUEST_LEN {
+            return None;
+        }
+        let (chunk_length, piece_length) = {
+            let guard = store.lock().await;
+            (guard.chunk_length, guard.piece_length)
+        };
+        let end = u64::from(begin).checked_add(u64::from(length))?;
+        // Bound hostile request geometry before looping or allocating. BEP 3 blocks are normally
+        // 16 KiB; permit larger compatible requests up to one piece, but never beyond it.
+        if end > piece_length {
+            return None;
+        }
+        let first = u64::from(begin) / chunk_length;
+        let last = end.div_ceil(chunk_length);
+        let mut piece_bytes = Vec::new();
+        for chunk in first..last {
+            let (data, _) = Self::shared_chunk(store, piece, u16::try_from(chunk).ok()?).await?;
+            piece_bytes.extend_from_slice(&data);
+        }
+        let offset = (u64::from(begin) % chunk_length) as usize;
+        let requested_end = offset.checked_add(length as usize)?;
+        Some(piece_bytes.get(offset..requested_end)?.to_vec())
+    }
+
     /// Write a chunk to a shared store without running disk I/O on a Tokio worker thread.
     pub async fn shared_put_chunk_with_header(
         store: &Arc<Mutex<Self>>,
@@ -358,6 +394,34 @@ mod tests {
     // 4-byte chunks, 2 chunks/piece, tiny budget for eviction tests.
     fn store(max_bytes: u64) -> PieceStore {
         PieceStore::new(8, 4, max_bytes)
+    }
+
+    #[tokio::test]
+    async fn standard_block_validates_request_geometry_and_short_final_piece() {
+        let store = Arc::new(Mutex::new(PieceStore::new(32_768, 16_384, 65_536)));
+        PieceStore::shared_put_chunk_with_header(&store, 0, 0, [0; 8], &vec![1; 16_384]).await;
+        PieceStore::shared_put_chunk_with_header(&store, 0, 1, [0; 8], &vec![2; 16_384]).await;
+        PieceStore::shared_put_chunk_with_header(&store, 1, 0, [0; 8], &[3; 100]).await;
+
+        assert_eq!(
+            PieceStore::shared_block(&store, 0, 16_380, 8)
+                .await
+                .unwrap(),
+            [vec![1; 4], vec![2; 4]].concat()
+        );
+        assert!(PieceStore::shared_block(&store, 0, 0, 0).await.is_none());
+        assert!(
+            PieceStore::shared_block(&store, 0, 0, MAX_BT_REQUEST_LEN + 1)
+                .await
+                .is_none()
+        );
+        assert!(PieceStore::shared_block(&store, 0, u32::MAX, 1)
+            .await
+            .is_none());
+        assert!(
+            PieceStore::shared_block(&store, 1, 96, 8).await.is_none(),
+            "request crossing the retained short final piece is rejected"
+        );
     }
 
     #[test]
