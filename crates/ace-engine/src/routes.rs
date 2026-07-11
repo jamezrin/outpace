@@ -7,7 +7,8 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
     /// `GET /ace/getstream` — start/attach a playback session. Carries the content
-    /// selector from the query (`content_id=` for acestream ids, else `infohash=`/`id=`).
+    /// selector from the query (`content_id=` or legacy alias `id=` for Acestream content
+    /// ids; `infohash=` for an explicit swarm key).
     GetStream { selector: ContentSelector },
     /// `GET /ace/manifest.m3u8` — HLS media playlist for a session.
     Manifest { selector: ContentSelector },
