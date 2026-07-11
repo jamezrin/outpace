@@ -190,7 +190,7 @@ impl PieceStore {
         piece: u64,
         chunk: u16,
     ) -> Option<(Vec<u8>, [u8; 8])> {
-        let plan = {
+        let handle = {
             let guard = store.lock().await;
             match &guard.backend {
                 Backend::Memory(_) => {
@@ -201,34 +201,10 @@ impl PieceStore {
                         )
                     });
                 }
-                Backend::Disk(disk) => {
-                    let entry = disk.index.get(&piece)?;
-                    let len = *entry.present.get(&chunk)? as usize;
-                    (
-                        Arc::clone(&disk.operation),
-                        Arc::clone(&disk.io),
-                        disk.chunk_length,
-                        len,
-                        entry.header,
-                    )
-                }
+                Backend::Disk(disk) => disk.handle(),
             }
         };
-        let (operation, io, chunk_length, len, header) = plan;
-        let _operation = operation.lock().await;
-        match tokio::task::spawn_blocking(move || io.read(piece, chunk, chunk_length, len)).await {
-            Ok(Ok(data)) => Some((data, header)),
-            Ok(Err(e)) => {
-                crate::swarm_log!(
-                    "[cache] disk read failed for present piece {piece} chunk {chunk}: {e}"
-                );
-                None
-            }
-            Err(e) => {
-                crate::swarm_log!("[cache] disk read task failed: {e}");
-                None
-            }
-        }
+        handle.get(piece, chunk).await
     }
 
     /// Write a chunk to a shared store without running disk I/O on a Tokio worker thread.
@@ -239,7 +215,7 @@ impl PieceStore {
         header: [u8; 8],
         data: &[u8],
     ) {
-        let plan = {
+        let (handle, max_bytes) = {
             let mut guard = store.lock().await;
             if guard.max_bytes == 0 || (chunk as u64) >= guard.piece_length / guard.chunk_length {
                 return;
@@ -249,65 +225,12 @@ impl PieceStore {
                     guard.put_chunk_with_header(piece, chunk, header, data);
                     return;
                 }
-                Backend::Disk(disk) => (
-                    Arc::clone(&disk.operation),
-                    Arc::clone(&disk.io),
-                    disk.chunk_length,
-                ),
+                Backend::Disk(disk) => (disk.handle(), guard.max_bytes),
             }
         };
-        let (operation, io, chunk_length) = plan;
-        let _operation = operation.lock().await;
-        let owned = data.to_vec();
-        let write_io = Arc::clone(&io);
-        let write =
-            tokio::task::spawn_blocking(move || write_io.write(piece, chunk, chunk_length, &owned))
-                .await;
-        match write {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                crate::swarm_log!("[cache] disk write failed for piece {piece} chunk {chunk}: {e}");
-                return;
-            }
-            Err(e) => {
-                crate::swarm_log!("[cache] disk write task failed: {e}");
-                return;
-            }
-        }
-        let evicted = {
-            let mut guard = store.lock().await;
-            let stored = match &mut guard.backend {
-                Backend::Disk(disk) => disk.commit_put(piece, chunk, header, data.len()),
-                Backend::Memory(_) => return,
-            };
-            guard.cur_bytes = guard.cur_bytes - stored.removed + stored.added;
-            let mut evicted = Vec::new();
-            while guard.cur_bytes > guard.max_bytes {
-                let Backend::Disk(disk) = &mut guard.backend else {
-                    break;
-                };
-                let Some((piece, freed)) = disk.evict_lowest_metadata() else {
-                    break;
-                };
-                guard.cur_bytes -= freed;
-                evicted.push(piece);
-            }
-            evicted
-        };
-        if !evicted.is_empty() {
-            let _ = tokio::task::spawn_blocking(move || {
-                for piece in evicted {
-                    if let Err(e) = io.remove(piece) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            crate::swarm_log!(
-                                "[cache] disk evict failed to remove piece {piece} file: {e}"
-                            );
-                        }
-                    }
-                }
-            })
+        handle
+            .put(piece, chunk, header, data.to_vec(), max_bytes)
             .await;
-        }
     }
 
     /// # Panics
@@ -689,5 +612,38 @@ mod tests {
             !s.has_piece(3),
             "partial piece (1 of 2 chunks) not complete"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_disk_put_still_commits_index_and_budget_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            PieceStore::new_disk(4, 4, 4, dir.path().join("cache")).unwrap(),
+        ));
+        PieceStore::shared_put_chunk_with_header(&store, 1, 0, [1; 8], b"1111").await;
+        let task = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                PieceStore::shared_put_chunk_with_header(&store, 2, 0, [2; 8], b"2222").await;
+            }
+        });
+        tokio::task::yield_now().await; // command has been submitted; cancellation drops its reply
+        task.abort();
+        for _ in 0..100 {
+            if store.lock().await.has_piece(2) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let guard = store.lock().await;
+        assert!(
+            guard.has_piece(2),
+            "actor commits after the caller is cancelled"
+        );
+        assert!(
+            !guard.has_piece(1),
+            "the same actor transaction enforces the budget"
+        );
+        assert_eq!(guard.chunk(2, 0).unwrap().as_ref(), b"2222");
     }
 }
