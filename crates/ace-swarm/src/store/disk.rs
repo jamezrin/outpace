@@ -9,13 +9,14 @@
 //! The cache is **ephemeral**: the directory is wiped on creation and never reloaded across
 //! restarts, since live piece data goes stale — this also sidesteps serving evicted-stale data.
 //!
-//! I/O is synchronous. Chunk writes are ~16 KiB and reads ≤1 MiB, hitting page cache almost
-//! immediately on the live path; if profiling ever shows reactor stalls under disk mode, move
-//! these ops to `spawn_blocking` — the backend boundary keeps that localized.
+//! I/O is synchronous at this compatibility boundary; async serve/download callers use
+//! `PieceStore::shared_chunk` and `shared_put_chunk_with_header` to dispatch it to Tokio's blocking
+//! pool. Each indexed piece owns one open handle and uses positioned reads/writes, avoiding both
+//! per-chunk opens and a shared seek cursor.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::File;
 use std::path::PathBuf;
 
 use crate::store::Stored;
@@ -25,6 +26,9 @@ use crate::store::Stored;
 #[derive(Debug)]
 struct PieceIndex {
     header: [u8; 8],
+    /// Kept open for the lifetime of the cached piece. Positioned I/O makes the handle safe to
+    /// reuse for every chunk without a shared seek cursor.
+    file: File,
     /// present chunk index -> stored byte length.
     present: BTreeMap<u16, u32>,
 }
@@ -58,17 +62,32 @@ impl DiskBackend {
 
     pub(super) fn put(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) -> Stored {
         let off = chunk as u64 * self.chunk_length;
-        let write_res = std::fs::OpenOptions::new()
-            .create(true)
-            // Never truncate: chunks share the piece file at fixed offsets, so an existing file
-            // must keep the chunks already written to it.
-            .truncate(false)
-            .write(true)
-            .open(self.piece_path(piece))
-            .and_then(|mut f| {
-                f.seek(SeekFrom::Start(off))?;
-                f.write_all(data)
-            });
+        let new_file = if self.index.contains_key(&piece) {
+            None
+        } else {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(self.piece_path(piece))
+            {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    crate::swarm_log!(
+                        "[cache] disk open failed for piece {piece} chunk {chunk}: {e}"
+                    );
+                    return Stored::default();
+                }
+            }
+        };
+        let file = self
+            .index
+            .get(&piece)
+            .map(|entry| &entry.file)
+            .or(new_file.as_ref())
+            .expect("existing or newly opened piece file");
+        let write_res = write_all_at(file, data, off);
         if let Err(e) = write_res {
             // Best-effort, non-fatal: drop the chunk and leave accounting untouched. The index is
             // not updated, so the chunk simply reads back as absent.
@@ -84,6 +103,7 @@ impl DiskBackend {
         }
         let entry = self.index.entry(piece).or_insert_with(|| PieceIndex {
             header,
+            file: new_file.expect("new piece has its newly opened file"),
             present: BTreeMap::new(),
         });
         // Header-upgrade rule, mirroring the memory backend: a nonzero header replaces an earlier
@@ -106,10 +126,12 @@ impl DiskBackend {
         let len = *self.index.get(&piece)?.present.get(&chunk)? as usize;
         let off = chunk as u64 * self.chunk_length;
         let read = || -> std::io::Result<Vec<u8>> {
-            let mut f = std::fs::File::open(self.piece_path(piece))?;
-            f.seek(SeekFrom::Start(off))?;
             let mut buf = vec![0u8; len];
-            f.read_exact(&mut buf)?;
+            read_exact_at(
+                &self.index.get(&piece).expect("checked above").file,
+                &mut buf,
+                off,
+            )?;
             Ok(buf)
         };
         match read() {
@@ -164,6 +186,54 @@ impl DiskBackend {
     }
 }
 
+#[cfg(unix)]
+fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !data.is_empty() {
+        let written = file.write_at(data, offset)?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        data = &data[written..];
+        offset += written as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut data: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !data.is_empty() {
+        let read = file.read_at(data, offset)?;
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        data = &mut data[read..];
+        offset += read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(data, offset).and_then(|n| {
+        (n == data.len())
+            .then_some(())
+            .ok_or_else(|| std::io::ErrorKind::WriteZero.into())
+    })
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, data: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(data, offset).and_then(|n| {
+        (n == data.len())
+            .then_some(())
+            .ok_or_else(|| std::io::ErrorKind::UnexpectedEof.into())
+    })
+}
+
 impl Drop for DiskBackend {
     /// Remove this store's private directory. Because the owning `PieceStore` is `Arc`-shared,
     /// this runs only when the last holder (registry entry, in-flight seed peers, ingest) releases
@@ -185,6 +255,21 @@ impl Drop for DiskBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn chunks_reuse_one_open_piece_handle() {
+        use std::os::fd::AsRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut backend = DiskBackend::new(tmp.path().join("cache"), 4).unwrap();
+        backend.put(7, 0, [0; 8], b"aaaa");
+        let fd = backend.index.get(&7).unwrap().file.as_raw_fd();
+        backend.put(7, 1, [0; 8], b"bbbb");
+        assert_eq!(backend.index.get(&7).unwrap().file.as_raw_fd(), fd);
+        assert_eq!(backend.get(7, 0).unwrap().as_ref(), b"aaaa");
+        assert_eq!(backend.index.get(&7).unwrap().file.as_raw_fd(), fd);
+    }
 
     #[test]
     fn dropping_backend_removes_its_directory() {

@@ -9,6 +9,8 @@
 //! [`chunk`](PieceStore::chunk) / the `put_chunk*` writers.
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod disk;
 use disk::DiskBackend;
@@ -180,6 +182,70 @@ impl MemoryBackend {
 }
 
 impl PieceStore {
+    /// Read a chunk from a shared store without running disk I/O on a Tokio worker thread.
+    /// Memory stores take the ordinary async lock and preserve their zero-copy internal path;
+    /// disk stores perform the synchronous compatibility operation on the blocking pool.
+    pub async fn shared_chunk(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<(Vec<u8>, [u8; 8])> {
+        let is_disk = matches!(store.lock().await.backend, Backend::Disk(_));
+        if !is_disk {
+            let guard = store.lock().await;
+            return guard.chunk(piece, chunk).map(|data| {
+                (
+                    data.into_owned(),
+                    guard.piece_header(piece).unwrap_or([0; 8]),
+                )
+            });
+        }
+        let store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || {
+            let guard = store.blocking_lock();
+            guard.chunk(piece, chunk).map(|data| {
+                (
+                    data.into_owned(),
+                    guard.piece_header(piece).unwrap_or([0; 8]),
+                )
+            })
+        })
+        .await
+        .unwrap_or_else(|e| {
+            crate::swarm_log!("[cache] disk read task failed: {e}");
+            None
+        })
+    }
+
+    /// Write a chunk to a shared store without running disk I/O on a Tokio worker thread.
+    pub async fn shared_put_chunk_with_header(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+        header: [u8; 8],
+        data: &[u8],
+    ) {
+        let is_disk = matches!(store.lock().await.backend, Backend::Disk(_));
+        if !is_disk {
+            store
+                .lock()
+                .await
+                .put_chunk_with_header(piece, chunk, header, data);
+            return;
+        }
+        let store = Arc::clone(store);
+        let data = data.to_vec();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            store
+                .blocking_lock()
+                .put_chunk_with_header(piece, chunk, header, &data);
+        })
+        .await
+        {
+            crate::swarm_log!("[cache] disk write task failed: {e}");
+        }
+    }
+
     /// # Panics
     /// `chunk_length` must be > 0 (otherwise [`chunks_per_piece`](Self::chunks_per_piece) divides
     /// by zero), and `piece_length` should be a multiple of `chunk_length`. Domain inputs are

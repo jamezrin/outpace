@@ -108,12 +108,17 @@ impl SeedRegistry {
     }
 
     /// The store for `infohash`, creating it via `make` (and registering it) if absent.
-    /// Atomic: the whole get-or-insert happens under one lock acquisition.
+    /// Store construction deliberately happens outside the registry mutex: disk-backed stores
+    /// may wipe and create directories, which must not stall inbound handshake lookup.
     pub fn get_or_create(
         &self,
         infohash: [u8; 20],
         make: impl FnOnce() -> PieceStore,
     ) -> SharedStore {
+        if let Some(store) = self.get(&infohash) {
+            return store;
+        }
+        let candidate = Arc::new(Mutex::new(make()));
         self.stores
             .lock()
             .unwrap()
@@ -124,7 +129,7 @@ impl SeedRegistry {
                 ..Default::default()
             })
             .store
-            .get_or_insert_with(|| Arc::new(Mutex::new(make())))
+            .get_or_insert(candidate)
             .clone()
     }
 
@@ -133,13 +138,17 @@ impl SeedRegistry {
     /// the entry (and its store) is evicted. Two concurrent leech sessions for one infohash share
     /// a single store and the entry survives until both leases drop.
     ///
-    /// The registry's `StdMutex` is held across `make`, so `make` must not drop a `SeedLease` for
-    /// this same registry (it would re-lock the non-reentrant mutex and deadlock).
+    /// Store construction happens before the mutation lock is acquired.
     pub fn lease_store(
         &self,
         infohash: [u8; 20],
         make: impl FnOnce() -> PieceStore,
     ) -> (SharedStore, SeedLease) {
+        let candidate = if self.get(&infohash).is_none() {
+            Some(Arc::new(Mutex::new(make())))
+        } else {
+            None
+        };
         let mut map = self.stores.lock().unwrap();
         let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
             generation: next_generation(),
@@ -148,7 +157,7 @@ impl SeedRegistry {
         });
         let store = entry
             .store
-            .get_or_insert_with(|| Arc::new(Mutex::new(make())))
+            .get_or_insert_with(|| candidate.expect("store was absent before construction"))
             .clone();
         entry.producers += 1;
         let lease = SeedLease {
@@ -165,8 +174,7 @@ impl SeedRegistry {
     /// Overwrites any existing `content_id` metadata; content is content-addressed by `content_id`,
     /// so the blob is deterministic for a given key and the overwrite is a no-op in practice.
     ///
-    /// The registry's `StdMutex` is held across `make`, so `make` must not drop a `SeedLease` for
-    /// this same registry (it would re-lock the non-reentrant mutex and deadlock).
+    /// Store construction happens before the mutation lock is acquired.
     pub fn lease_broadcast(
         &self,
         infohash: [u8; 20],
@@ -174,6 +182,11 @@ impl SeedRegistry {
         metadata: Vec<u8>,
         make: impl FnOnce() -> PieceStore,
     ) -> (SharedStore, SeedLease) {
+        let candidate = if self.get(&infohash).is_none() {
+            Some(Arc::new(Mutex::new(make())))
+        } else {
+            None
+        };
         let mut map = self.stores.lock().unwrap();
         let (store, ih_generation) = {
             let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
@@ -185,7 +198,7 @@ impl SeedRegistry {
             entry.kind = OwnerKind::Broadcast;
             let store = entry
                 .store
-                .get_or_insert_with(|| Arc::new(Mutex::new(make())))
+                .get_or_insert_with(|| candidate.expect("store was absent before construction"))
                 .clone();
             (store, entry.generation)
         };
@@ -259,7 +272,8 @@ impl SeedRegistry {
     /// Stop serving `key` (an infohash or a metadata content_id): drops both the piece store
     /// and any registered metadata under it. Idempotent — removing an absent key is a no-op.
     pub fn remove(&self, key: &[u8; 20]) {
-        self.stores.lock().unwrap().remove(key);
+        let removed = self.stores.lock().unwrap().remove(key);
+        drop(removed);
     }
 
     /// Force-evict idle **ownerless** `Leech` entries (`producers == 0`, i.e. created outside the
@@ -271,14 +285,23 @@ impl SeedRegistry {
     pub fn reap(&self, ttl: std::time::Duration) -> usize {
         let now = now_millis();
         let ttl_ms = ttl.as_millis() as u64;
-        let mut map = self.stores.lock().unwrap();
-        let before = map.len();
-        map.retain(|_, e| {
-            e.kind == OwnerKind::Broadcast
-                || e.producers > 0
-                || now.saturating_sub(e.last_active) < ttl_ms
-        });
-        before - map.len()
+        let (removed, count) = {
+            let mut map = self.stores.lock().unwrap();
+            let keys: Vec<_> = map
+                .iter()
+                .filter(|(_, e)| {
+                    e.kind != OwnerKind::Broadcast
+                        && e.producers == 0
+                        && now.saturating_sub(e.last_active) >= ttl_ms
+                })
+                .map(|(&key, _)| key)
+                .collect();
+            let removed: Vec<_> = keys.iter().filter_map(|key| map.remove(key)).collect();
+            let count = removed.len();
+            (removed, count)
+        };
+        drop(removed);
+        count
     }
 }
 
@@ -296,19 +319,26 @@ impl Drop for SeedLease {
         let Some(map) = self.registry.upgrade() else {
             return;
         };
-        let mut map = map.lock().unwrap();
-        for (key, generation) in &self.keys {
-            if let Some(entry) = map.get_mut(key) {
-                // Only decrement the exact entry this lease was issued against; a force-remove +
-                // recreate at the same key bumps the generation and makes this a no-op.
-                if entry.generation == *generation {
-                    entry.producers = entry.producers.saturating_sub(1);
-                    if entry.producers == 0 {
-                        map.remove(key);
+        let removed = {
+            let mut map = map.lock().unwrap();
+            let mut removed = Vec::new();
+            for (key, generation) in &self.keys {
+                if let Some(entry) = map.get_mut(key) {
+                    // Only decrement the exact entry this lease was issued against; a force-remove +
+                    // recreate at the same key bumps the generation and makes this a no-op.
+                    if entry.generation == *generation {
+                        entry.producers = entry.producers.saturating_sub(1);
+                        if entry.producers == 0 {
+                            if let Some(entry) = map.remove(key) {
+                                removed.push(entry);
+                            }
+                        }
                     }
                 }
             }
-        }
+            removed
+        };
+        drop(removed);
     }
 }
 
