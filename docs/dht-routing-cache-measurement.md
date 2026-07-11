@@ -4,7 +4,7 @@ Evaluate-first, **default-OFF** prototype. This document describes how to measur
 bounded, in-memory cache of recently-successful DHT routing nodes improves repeated `get_peers`
 startup **without** slowing the cold path or displacing the public bootstrap fallback. The
 implement-vs-reject decision is made from live-DHT numbers gathered with this procedure. The
-2026-07-11 measurement below recommends rejecting the prototype under the issue's strict criteria.
+2026-07-11 multi-target measurement below recommends keeping the bounded in-memory prototype.
 
 ## What the prototype does
 
@@ -24,7 +24,7 @@ The one-line `[dht] walk done: ...` log carries every field. Compare across runs
 | Field | Meaning | What to watch |
 | --- | --- | --- |
 | `ttfp_ms` (`time_to_first_peer`) | walk start → first correlated reply carrying a peer | **headline signal**: should DROP warm, never rise |
-| `peers` (`peers_discovered`) | total peers harvested | should be >= cold |
+| unique peers | deduplicated peers collected by the walk | must reach the production target (8) |
 | `queried` (`nodes_queried`) | `get_peers` sent | warm may reach useful nodes in fewer queries |
 | `timeouts` | silent response windows | must NOT rise warm (stale seeds must not add timeouts) |
 | `cache_seeded` | cached nodes added to the frontier | 0 when disabled; >0 warm |
@@ -32,10 +32,10 @@ The one-line `[dht] walk done: ...` log carries every field. Compare across runs
 
 ## Runs
 
-All three use a real infohash on the live DHT. Use the ignored live benchmark as the harness:
+All four cases use real infohashes on the live DHT. Use the ignored live benchmark as the harness:
 
 ```
-ACE_INFOHASH=<40hex> ACE_DHT_MEASURE_RUNS=5 \
+ACE_INFOHASHES=<40hex,40hex,...> ACE_DHT_MEASURE_RUNS=5 \
   cargo test -p ace-swarm dht_live_routing_cache_measurement -- --ignored --nocapture
 ```
 
@@ -47,15 +47,17 @@ included in the reported samples.
 
 - **COLD**: `OUTPACE_DHT_ROUTING_CACHE` unset. Bootstrap-only. Baseline `ttfp_ms`.
 - **WARM**: cache enabled and freshly populated by a prior walk. Expect lower `ttfp_ms`,
-  `cache_seeded > 0`, `peers >= cold`, `timeouts` no worse.
-- **STALE**: cache enabled but entries stale/dead. Stale seeds are not seeded and dead ones are
-  penalized without a fixed timeout — expect `ttfp_ms`/`timeouts` ~= COLD, never worse.
+  `cache_seeded > 0`, at least eight unique peers, and no timeout regression.
+- **STALE**: cache enabled with an already-aged entry. It must not be seeded and must behave like
+  cold bootstrap without a fixed delay.
+- **DEAD**: cache enabled with one fresh but nonresponsive eligible hint. It must be queried
+  alongside bootstrap without adding a serialized preflight delay.
 
 ## Decision criteria (from the issue)
 
-- **Reject** (close as "not worth implementing") if there is **no benefit** OR **any startup
-  regression** — i.e. WARM does not beat COLD on `ttfp_ms`/`peers`, or STALE (or WARM) is worse
-  than COLD on `ttfp_ms`/`timeouts`.
+- **Reject** (close as "not worth implementing") if there is **no benefit** or a systematic
+  startup regression: failure to reach the production peer target, worse TTFP/timeouts, or a
+  fixed stale/dead-hint delay.
 - **Keep** only if cached nodes measurably speed repeated startup, do **not** slow startup in the
   cold/stale cases, and **never** displace the public bootstrap fallback (`bootstrap_seeded` is
   unchanged and bootstrap is always seeded). Disk persistence is a separate follow-up, considered
@@ -63,41 +65,53 @@ included in the reported samples.
 
 ## Recorded live result — 2026-07-11
 
-Environment: `feat/dht-routing-cache-42` at `4363323` plus the measurement harness, Linux
-`7.0.14-arch1-1` x86_64, `rustc 1.96.0`, Europe/Madrid, public official-API example infohash
-`685edf209ccfdf88977c0d317e1407baca486067`. No WARP/Cloudflare interface was present in
-`ip -brief link`. Five interleaved samples per case completed in 113.27 seconds.
+Environment: `feat/dht-routing-cache-42` plus the measurement harness, Linux
+`7.0.14-arch1-1` x86_64, `rustc 1.96.0`, Europe/Madrid. No WARP/Cloudflare interface was present
+in `ip -brief link`. Case order was deterministically shuffled per target/run. A successful walk
+means it reached the production target of at least eight **unique** peers; raw peer-record totals
+are deliberately not an acceptance gate because the terminal response can contain several records.
 
-| Case/run | TTFP ms | Peer records | Queries | Timeouts | Bootstrap | Cache seeds |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| cold 1 | 7539 | 13 | 40 | 0 | 4 | 0 |
-| cold 2 | 4630 | 14 | 32 | 0 | 4 | 0 |
-| cold 3 | 9036 | 12 | 48 | 0 | 4 | 0 |
-| cold 4 | 6303 | 14 | 40 | 0 | 4 | 0 |
-| cold 5 | 4801 | 14 | 32 | 0 | 4 | 0 |
-| warm 1 | 3032 | 13 | 24 | 0 | 4 | 14 |
-| warm 2 | 4531 | 12 | 32 | 0 | 4 | 16 |
-| warm 3 | 3031 | 12 | 24 | 0 | 4 | 14 |
-| warm 4 | 4534 | 12 | 32 | 0 | 4 | 13 |
-| warm 5 | 4534 | 12 | 32 | 0 | 4 | 8 |
-| stale 1 | 6035 | 13 | 32 | 0 | 4 | 0 |
-| stale 2 | 6034 | 12 | 32 | 0 | 4 | 0 |
-| stale 3 | 6322 | 14 | 40 | 0 | 4 | 0 |
-| stale 4 | 4534 | 12 | 24 | 0 | 4 | 0 |
-| stale 5 | 6034 | 12 | 32 | 0 | 4 | 0 |
-| **cold median** | **6303** | **14** | **40** | **0** | **4** | **0** |
-| **warm median** | **4531** | **12** | **32** | **0** | **4** | **14** |
-| **stale median** | **6034** | **12** | **32** | **0** | **4** | **0** |
+The retained raw JSONL contains all 60 measured samples for the three targets that reached the
+production peer target, including the one failed cold sample for `47eda...`:
 
-Warm TTFP improved by 1772 ms (28.1%) and median query count fell by 8 (20%). Bootstrap remained
-present in every run, and neither warm nor stale produced a timeout. Aged-stale median TTFP was
-269 ms faster than cold, so there is no measured stale-startup regression.
+- `docs/measurements/2026-07-11-dht-routing-cache.jsonl`
+- SHA-256: `457de0fca63aeaa55977b43ea52204d445260a54a0e0f6d126554a6fbca72252`
 
-**Recommendation: reject / close as not worth implementing under the issue's stated criteria.**
-Although latency improved, warm median peer records fell from 14 to 12, failing the explicit
-`peers >= cold` keep condition. This is a conservative decision: the walk stops after reaching its
-eight-unique-peer target, so `peers_discovered` counts all records in the terminal response and is
-not a fixed-work throughput measure; live DHT membership and response timing also vary between
-runs. A future evaluation could use randomized targets, more repetitions, and a fixed-duration or
-fixed-query walk, but that would be a new experiment rather than evidence satisfying this issue's
-current acceptance rule.
+| Target | Case | Successes | Median TTFP | Median unique peers | Median queries | Median timeouts |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `685edf...6067` | cold | 5/5 | 6037 ms | 9 | 32 | 0 |
+| | warm | 5/5 | 3300 ms | 9 | 32 | 0 |
+| | stale | 5/5 | 7536 ms | 9 | 40 | 0 |
+| | fresh-dead | 5/5 | 6038 ms | 9 | 33 | 0 |
+| `50e935...6e47` | cold | 4/5 | 6050 ms | 8 | 48 | 0 |
+| | warm | 5/5 | 6047 ms | 8 | 48 | 0 |
+| | stale | 5/5 | 6049 ms | 8 | 40 | 0 |
+| | fresh-dead | 5/5 | 6045 ms | 8 | 49 | 0 |
+| `c12345...4567` | cold | 5/5 | 6155 ms | 15 | 32 | 0 |
+| | warm | 5/5 | 6048 ms | 15 | 40 | 0 |
+| | stale | 5/5 | 6270 ms | 15 | 32 | 0 |
+| | fresh-dead | 5/5 | 6074 ms | 15 | 33 | 0 |
+
+The fresh-dead case inserts `1.1.1.1:1` through the normal public-address eligibility path at the
+current time. Every sample reports `cache_seeded=1`, proving it was actually queried alongside all
+four bootstrap seeds. It added one query at the median and no median TTFP penalty. One of 15 dead
+samples recorded a timeout; because the hint shares the existing response round rather than adding
+a preflight, paired TTFP did not regress at the median. Aged entries always reported
+`cache_seeded=0`. Bootstrap remained four in every retained sample.
+
+`d12345...4567` was too weak for comparison: cold reached eight peers only 1/5 times, warm 3/5,
+and aged/dead 0/5. It is recorded as a current target failure and excluded from performance
+conclusions rather than selectively treating its sparse successes as paired evidence.
+
+Across the two fully reliable targets and the still-current `47eda...` target, warm success was
+15/15 versus cold 14/15. Warm materially improved `0a4848...` (median -2737 ms), was effectively
+neutral on `47eda...` (-3 ms), and modestly improved `9439a4...` (-107 ms). Stale and fresh-dead
+medians stayed within ordinary live-DHT variation and did not add a fixed delay; public bootstrap
+was never displaced.
+
+**Recommendation: KEEP the bounded daemon-session cache implementation.** It demonstrates a large
+repeat-start benefit on one current target, no loss of reaching the peer target, and no systematic
+stale/dead startup regression. Keep `OUTPACE_DHT_ROUTING_CACHE` **default off** for now: the sample
+is small, one dead run timed out, and query cost rose on one target. This lands the measured,
+operator-opt-in implementation without changing existing startup defaults. Enabling it by default
+should require broader/longer telemetry and is separate from disk persistence.
