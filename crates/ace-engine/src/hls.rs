@@ -30,6 +30,9 @@ struct HlsState {
     scanned_packets: usize,
     segment_start_pcr: Option<u64>,
     last_pcr: Option<u64>,
+    pcr_pid: Option<u16>,
+    packets_since_pcr: usize,
+    max_segment_duration: f32,
     discontinuity_pending: bool,
 }
 
@@ -49,6 +52,9 @@ impl HlsPackager {
                 scanned_packets: 0,
                 segment_start_pcr: None,
                 last_pcr: None,
+                pcr_pid: None,
+                packets_since_pcr: 0,
+                max_segment_duration: config.segment_duration_secs(),
                 discontinuity_pending: false,
             }),
             seg_packets: config.segment_packets.max(1),
@@ -84,6 +90,8 @@ impl HlsPackager {
         st.scanned_packets = 0;
         st.segment_start_pcr = None;
         st.last_pcr = None;
+        st.pcr_pid = None;
+        st.packets_since_pcr = 0;
         st.discontinuity_pending = true;
     }
 
@@ -93,7 +101,27 @@ impl HlsPackager {
         st.cur.extend_from_slice(data);
         while st.scanned_packets < st.cur.len() / TS_PACKET {
             let packet_offset = st.scanned_packets * TS_PACKET;
-            let timing = ts_timing(&st.cur[packet_offset..packet_offset + TS_PACKET]);
+            let mut timing = ts_timing(&st.cur[packet_offset..packet_offset + TS_PACKET]);
+
+            // A transport stream may carry several programs, each with its own PCR clock. Until
+            // PAT/PMT metadata is available here, lock each uninterrupted run to the first PCR
+            // PID instead of combining unrelated clocks. Random-access flags remain useful on a
+            // separate video PID.
+            if let Some(pcr) = timing.pcr {
+                match st.pcr_pid {
+                    Some(pid) if pid != timing.pid => {
+                        timing.pcr = None;
+                        st.packets_since_pcr = st.packets_since_pcr.saturating_add(1);
+                    }
+                    None => st.pcr_pid = Some(timing.pid),
+                    _ => {}
+                }
+                if timing.pcr == Some(pcr) {
+                    st.packets_since_pcr = 0;
+                }
+            } else {
+                st.packets_since_pcr = st.packets_since_pcr.saturating_add(1);
+            }
 
             if timing.discontinuity || pcr_went_backwards(st.last_pcr, timing.pcr) {
                 if packet_offset > 0 {
@@ -104,6 +132,8 @@ impl HlsPackager {
                 st.scanned_packets = 1;
                 st.segment_start_pcr = timing.pcr;
                 st.last_pcr = timing.pcr;
+                st.pcr_pid = timing.pcr.map(|_| timing.pid);
+                st.packets_since_pcr = 0;
                 st.discontinuity_pending = true;
                 continue;
             }
@@ -133,10 +163,14 @@ impl HlsPackager {
                 continue;
             }
             st.scanned_packets += 1;
-            if st.segment_start_pcr.is_none() && st.scanned_packets >= self.seg_packets {
+            let no_usable_clock =
+                st.segment_start_pcr.is_none() || st.packets_since_pcr >= self.seg_packets;
+            if no_usable_clock && st.scanned_packets >= self.seg_packets {
                 self.emit(&mut st, self.seg_packets * TS_PACKET, self.seg_duration);
                 st.segment_start_pcr = None;
                 st.last_pcr = None;
+                st.pcr_pid = None;
+                st.packets_since_pcr = 0;
             }
         }
     }
@@ -150,6 +184,7 @@ impl HlsPackager {
             duration,
             discontinuity,
         });
+        st.max_segment_duration = st.max_segment_duration.max(duration);
         st.scanned_packets = 0;
         while st.segments.len() > self.window {
             st.segments.pop_front();
@@ -163,11 +198,7 @@ impl HlsPackager {
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
         out.push_str(&format!(
             "#EXT-X-TARGETDURATION:{}\n",
-            st.segments
-                .iter()
-                .map(|segment| segment.duration)
-                .fold(self.seg_duration, f32::max)
-                .ceil() as u64
+            st.max_segment_duration.ceil() as u64
         ));
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", st.media_seq));
         for (i, segment) in st.segments.iter().enumerate() {
@@ -197,6 +228,7 @@ impl HlsPackager {
 
 #[derive(Default)]
 struct TsTiming {
+    pid: u16,
     pcr: Option<u64>,
     random_access: bool,
     discontinuity: bool,
@@ -206,6 +238,7 @@ fn ts_timing(packet: &[u8]) -> TsTiming {
     if packet.len() != TS_PACKET || packet[0] != 0x47 || packet[3] & 0x20 == 0 {
         return TsTiming::default();
     }
+    let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
     let adaptation_len = packet[4] as usize;
     if adaptation_len == 0 || adaptation_len > 183 {
         return TsTiming::default();
@@ -223,6 +256,7 @@ fn ts_timing(packet: &[u8]) -> TsTiming {
         None
     };
     TsTiming {
+        pid,
         pcr,
         random_access: flags & 0x40 != 0,
         discontinuity: flags & 0x80 != 0,
@@ -332,7 +366,8 @@ mod tests {
     fn timed_packet(pcr: u64, random_access: bool, discontinuity: bool, marker: u8) -> Vec<u8> {
         let mut packet = vec![0xff; TS_PACKET];
         packet[0] = 0x47;
-        packet[1] = marker & 0x1f;
+        packet[1] = 0;
+        packet[2] = 1;
         packet[3] = 0x20;
         packet[4] = 7;
         packet[5] =
@@ -343,6 +378,7 @@ mod tests {
         packet[9] = (pcr >> 1) as u8;
         packet[10] = ((pcr & 1) << 7) as u8 | 0x7e;
         packet[11] = 0;
+        packet[12] = marker;
         packet
     }
 
@@ -363,6 +399,12 @@ mod tests {
         packet
     }
 
+    fn with_pid(mut packet: Vec<u8>, pid: u16) -> Vec<u8> {
+        packet[1] = (packet[1] & 0xe0) | ((pid >> 8) as u8 & 0x1f);
+        packet[2] = pid as u8;
+        packet
+    }
+
     #[test]
     fn pcr_duration_cuts_before_random_access_packet_and_drives_extinf() {
         let p = timed_pkg(1000);
@@ -377,7 +419,7 @@ mod tests {
         }
 
         assert_eq!(p.segment(0).unwrap().len(), 2 * TS_PACKET);
-        assert_eq!(p.segment(1).unwrap()[1] & 0x1f, 3);
+        assert_eq!(p.segment(1).unwrap()[12], 3);
         let playlist = p.playlist("test", "timed");
         assert_eq!(playlist.matches("#EXTINF:1.200,").count(), 2);
         assert!(playlist.contains("#EXT-X-TARGETDURATION:2"));
@@ -423,9 +465,59 @@ mod tests {
         p.feed(&timed_packet(900_000, true, true, 3));
         p.feed(&timed_packet(1_008_000, true, false, 4));
 
-        assert_eq!(p.segment(0).unwrap()[1] & 0x1f, 3);
+        assert_eq!(p.segment(0).unwrap()[12], 3);
         let playlist = p.playlist("test", "disc");
         assert!(playlist.contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.200,"));
+    }
+
+    #[test]
+    fn packet_fallback_resumes_when_pcr_disappears() {
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 3,
+            window_segments: 6,
+            segment_duration_ms: 1000,
+        });
+        p.feed(&timed_packet(0, false, false, 1));
+        p.feed(&packets(6));
+
+        assert_eq!(p.segment(0).unwrap().len(), 3 * TS_PACKET);
+        assert_eq!(p.segment(1).unwrap().len(), 3 * TS_PACKET);
+    }
+
+    #[test]
+    fn unrelated_pcr_pid_does_not_corrupt_the_selected_clock() {
+        let p = timed_pkg(1000);
+        p.feed(&with_pid(timed_packet(0, false, false, 1), 100));
+        // A numerically unrelated clock on another program must not look like a backwards jump.
+        p.feed(&with_pid(
+            timed_packet(PCR_MODULUS - 1, false, false, 2),
+            200,
+        ));
+        p.feed(&with_pid(timed_packet(108_000, true, false, 3), 100));
+        p.feed(&with_pid(timed_packet(216_000, true, false, 4), 100));
+
+        let playlist = p.playlist("test", "multiprogram");
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 0);
+        assert_eq!(playlist.matches("#EXTINF:1.200,").count(), 2);
+    }
+
+    #[test]
+    fn target_duration_never_decreases_as_segments_slide() {
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 100,
+            window_segments: 1,
+            segment_duration_ms: 1000,
+        });
+        p.feed(&timed_packet(0, false, false, 1));
+        p.feed(&timed_packet(180_000, true, false, 2));
+        assert!(p
+            .playlist("test", "target")
+            .contains("#EXT-X-TARGETDURATION:2"));
+
+        p.feed(&timed_packet(270_000, true, false, 3));
+        assert!(p
+            .playlist("test", "target")
+            .contains("#EXT-X-TARGETDURATION:2"));
     }
 
     #[test]
