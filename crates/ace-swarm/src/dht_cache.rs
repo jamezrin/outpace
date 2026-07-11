@@ -231,6 +231,11 @@ impl RoutingNodeCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn clear(&mut self) {
+        self.nodes.clear();
+    }
+
+    #[cfg(test)]
     pub(crate) fn count_in_24(&self, addr: SocketAddrV4) -> usize {
         self.nodes
             .iter()

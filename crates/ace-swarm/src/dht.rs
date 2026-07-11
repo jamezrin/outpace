@@ -7,6 +7,8 @@
 //! and harvests any `values` (peers) it's handed along the way.
 
 use crate::dht_cache::RoutingNodeCache;
+#[cfg(test)]
+use crate::dht_cache::DEFAULT_STALE_AFTER;
 use ace_wire::bencode::Bencode;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -1476,6 +1478,171 @@ mod tests {
             println!("  {p}");
         }
         assert!(!peers.is_empty(), "DHT returned no peers");
+    }
+
+    #[derive(Clone, Copy)]
+    enum LiveMeasurementCase {
+        Cold,
+        Warm,
+        Stale,
+    }
+
+    impl LiveMeasurementCase {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Cold => "cold",
+                Self::Warm => "warm",
+                Self::Stale => "stale",
+            }
+        }
+    }
+
+    async fn measured_live_walk(infohash: &[u8; 20]) -> DhtWalkMetrics {
+        let sock = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let mut peers = BTreeSet::new();
+        dht_walk(
+            infohash,
+            Duration::from_secs(20),
+            &sock,
+            |_src, response| {
+                peers.extend(response.peers.iter().copied());
+                peers.len() >= DHT_PEER_TARGET
+            },
+        )
+        .await
+    }
+
+    fn print_live_sample(case: LiveMeasurementCase, run: usize, metrics: &DhtWalkMetrics) {
+        println!(
+            "DHT_MEASURE {{\"case\":\"{}\",\"run\":{},\"ttfp_ms\":{},\"peers\":{},\"queries\":{},\"timeouts\":{},\"bootstrap_seeded\":{},\"cache_seeded\":{}}}",
+            case.name(),
+            run,
+            metrics
+                .time_to_first_peer
+                .map(|value| value.as_millis().to_string())
+                .unwrap_or_else(|| "null".to_owned()),
+            metrics.peers_discovered,
+            metrics.nodes_queried,
+            metrics.timeouts,
+            metrics.bootstrap_seeded,
+            metrics.cache_seeded,
+        );
+    }
+
+    fn median(mut values: Vec<u128>) -> u128 {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
+    fn summarize_live_case(case: LiveMeasurementCase, samples: &[DhtWalkMetrics]) {
+        println!(
+            "DHT_MEASURE_SUMMARY {{\"case\":\"{}\",\"runs\":{},\"median_ttfp_ms\":{},\"median_peers\":{},\"median_queries\":{},\"median_timeouts\":{}}}",
+            case.name(),
+            samples.len(),
+            median(
+                samples
+                    .iter()
+                    .map(|m| m.time_to_first_peer.unwrap().as_millis())
+                    .collect(),
+            ),
+            median(samples.iter().map(|m| m.peers_discovered as u128).collect()),
+            median(samples.iter().map(|m| m.nodes_queried as u128).collect()),
+            median(samples.iter().map(|m| m.timeouts as u128).collect()),
+        );
+    }
+
+    /// Repeated live-DHT benchmark for #42. Each iteration runs an uncached baseline, populates
+    /// an empty session cache and measures the immediately following warm lookup, then injects
+    /// an already-aged entry and measures the real bootstrap walk with that stale cache. Cases
+    /// are interleaved to reduce time-of-day/network drift.
+    #[tokio::test]
+    #[ignore]
+    async fn dht_live_routing_cache_measurement() {
+        let hex = std::env::var("ACE_INFOHASH").expect("set ACE_INFOHASH=40hex");
+        assert_eq!(hex.len(), 40, "ACE_INFOHASH must contain 40 hex digits");
+        let mut infohash = [0u8; 20];
+        for i in 0..20 {
+            infohash[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let runs = std::env::var("ACE_DHT_MEASURE_RUNS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5);
+        assert!(runs > 0);
+
+        let mut cold = Vec::with_capacity(runs);
+        let mut warm = Vec::with_capacity(runs);
+        let mut stale = Vec::with_capacity(runs);
+        for run in 1..=runs {
+            session_cache().lock().unwrap().clear();
+            configure_routing_cache(false);
+            let sample = measured_live_walk(&infohash).await;
+            print_live_sample(LiveMeasurementCase::Cold, run, &sample);
+            assert!(sample.time_to_first_peer.is_some());
+            cold.push(sample);
+
+            session_cache().lock().unwrap().clear();
+            configure_routing_cache(true);
+            let population = measured_live_walk(&infohash).await;
+            assert!(population.time_to_first_peer.is_some());
+            let sample = measured_live_walk(&infohash).await;
+            print_live_sample(LiveMeasurementCase::Warm, run, &sample);
+            assert!(sample.time_to_first_peer.is_some());
+            warm.push(sample);
+
+            {
+                let mut cache = session_cache().lock().unwrap();
+                cache.clear();
+                cache.record_success(
+                    [42; 20],
+                    "1.1.1.1:1".parse().unwrap(),
+                    Instant::now() - DEFAULT_STALE_AFTER - Duration::from_secs(1),
+                );
+            }
+            let sample = measured_live_walk(&infohash).await;
+            print_live_sample(LiveMeasurementCase::Stale, run, &sample);
+            assert!(sample.time_to_first_peer.is_some());
+            assert_eq!(sample.cache_seeded, 0, "aged entry must not be seeded");
+            stale.push(sample);
+        }
+        configure_routing_cache(false);
+        session_cache().lock().unwrap().clear();
+
+        summarize_live_case(LiveMeasurementCase::Cold, &cold);
+        summarize_live_case(LiveMeasurementCase::Warm, &warm);
+        summarize_live_case(LiveMeasurementCase::Stale, &stale);
+        let cold_ttfp = median(
+            cold.iter()
+                .map(|m| m.time_to_first_peer.unwrap().as_millis())
+                .collect(),
+        );
+        let warm_ttfp = median(
+            warm.iter()
+                .map(|m| m.time_to_first_peer.unwrap().as_millis())
+                .collect(),
+        );
+        let stale_ttfp = median(
+            stale
+                .iter()
+                .map(|m| m.time_to_first_peer.unwrap().as_millis())
+                .collect(),
+        );
+        let cold_peers = median(cold.iter().map(|m| m.peers_discovered as u128).collect());
+        let warm_peers = median(warm.iter().map(|m| m.peers_discovered as u128).collect());
+        let no_timeout_regression =
+            warm.iter().all(|m| m.timeouts == 0) && stale.iter().all(|m| m.timeouts == 0);
+        let keep = warm_ttfp < cold_ttfp
+            && stale_ttfp <= cold_ttfp
+            && warm_peers >= cold_peers
+            && no_timeout_regression;
+        println!(
+            "DHT_MEASURE_DECISION {{\"keep\":{},\"warm_ttfp_improved\":{},\"stale_ttfp_regressed\":{},\"warm_peers_ge_cold\":{},\"timeout_regression\":{}}}",
+            keep,
+            warm_ttfp < cold_ttfp,
+            stale_ttfp > cold_ttfp,
+            warm_peers >= cold_peers,
+            !no_timeout_regression,
+        );
     }
 
     // Live DHT self-announce against a real infohash — confirms we can get tokens from real
