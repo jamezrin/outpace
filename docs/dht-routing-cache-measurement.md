@@ -67,4 +67,3 @@ with `ttfp_ms` and `timeouts` no worse than COLD.
   cold/stale cases, and **never** displace the public bootstrap fallback (`bootstrap_seeded` is
   unchanged and bootstrap is always seeded). Disk persistence is a separate follow-up, considered
   only if in-memory caching proves useful.
-```

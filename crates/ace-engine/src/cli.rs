@@ -193,6 +193,7 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let target = PlaybackTarget::parse(&args.input)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let config = crate::runtime::config_from_env()?;
+    ace_swarm::dht::configure_routing_cache(config.dht_routing_cache);
     let mut peers = crate::runtime::bootstrap_peers_from_env();
     peers.extend(args.peers);
 

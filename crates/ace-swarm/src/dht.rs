@@ -10,6 +10,7 @@ use crate::dht_cache::RoutingNodeCache;
 use ace_wire::bencode::Bencode;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -40,20 +41,11 @@ const MAX_CACHE_SEEDS: usize = 16;
 /// they can never displace the public bootstrap fallback.
 const CACHE_SEED_KEY_BASE: u8 = 100;
 
-/// Is the DEFAULT-OFF routing-node cache (#42) enabled for this daemon session? Read once from
-/// `OUTPACE_DHT_ROUTING_CACHE` (`1`/`true`). With it off — the default — `dht_walk` seeds and
-/// harvests exactly as before: no cache reads, no cache writes, identical frontier. This gate
-/// lives here (rather than threaded through `dht_get_peers`' many callers) because the cache is
-/// an intrinsically process-session-scoped resource; `ace_engine::Config::dht_routing_cache`
-/// mirrors the same env for config-surface parity.
-fn routing_cache_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("OUTPACE_DHT_ROUTING_CACHE").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
+static ROUTING_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Configure the daemon-session routing cache explicitly. The default is off.
+pub fn configure_routing_cache(enabled: bool) {
+    ROUTING_CACHE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 /// The daemon-session routing-node cache. In-memory only (disk persistence is a separate
@@ -334,7 +326,7 @@ async fn dht_walk(
 
     // Default-off routing cache: only read/seed when explicitly enabled. `cached` is captured
     // so failed seeds can be penalized after the walk.
-    let cache_enabled = routing_cache_enabled();
+    let cache_enabled = ROUTING_CACHE_ENABLED.load(Ordering::Relaxed);
     let cached: Vec<SocketAddrV4> = if cache_enabled {
         session_cache()
             .lock()
@@ -634,6 +626,14 @@ pub async fn dht_announce_peer(infohash: &[u8; 20], peer_port: u16, budget: Dura
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_cache_configuration_is_explicit_and_reconfigurable() {
+        configure_routing_cache(true);
+        assert!(ROUTING_CACHE_ENABLED.load(Ordering::Relaxed));
+        configure_routing_cache(false);
+        assert!(!ROUTING_CACHE_ENABLED.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn get_peers_query_roundtrips() {
@@ -1351,6 +1351,38 @@ mod tests {
             penalized,
             "queried-but-silent cached seed must be penalized"
         );
+    }
+
+    #[tokio::test]
+    async fn aged_stale_cached_node_is_not_seeded_and_is_pruned_by_walk() {
+        let stale_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stale_addr = v4_addr(&stale_socket);
+        let (boot, hb) = spawn_responder(vec!["10.0.0.1:1111".parse().unwrap()]).await;
+
+        let mut stale_cache =
+            RoutingNodeCache::with_params(64, 8, 8, Duration::from_secs(1), 2, true);
+        stale_cache.record_success(
+            [5u8; 20],
+            stale_addr,
+            Instant::now() - Duration::from_secs(2),
+        );
+        let cache = Mutex::new(stale_cache);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let metrics = dht_walk_from_seeds_cached(
+            &[9u8; 20],
+            Duration::from_secs(5),
+            &client,
+            vec![boot],
+            &cache,
+            |_src, resp| !resp.peers.is_empty(),
+        )
+        .await;
+
+        assert_eq!(metrics.bootstrap_seeded, 1);
+        assert_eq!(metrics.cache_seeded, 0, "aged node must not enter frontier");
+        assert_eq!(metrics.nodes_queried, 1, "only bootstrap is queried");
+        assert!(!cache.lock().unwrap().contains(stale_addr));
+        hb.await.unwrap();
     }
 
     #[tokio::test]

@@ -262,14 +262,20 @@ fn slash16(a: SocketAddrV4) -> [u8; 2] {
 /// loopback, private (RFC1918), link-local (incl. 169.254.0.0/16), CGNAT (100.64.0.0/10),
 /// multicast, broadcast, unspecified, and documentation ranges.
 pub(crate) fn is_public_v4(ip: &Ipv4Addr) -> bool {
-    !(ip.is_private()
+    let o = ip.octets();
+    !(o[0] == 0
+        || ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
         || ip.is_multicast()
         || ip.is_broadcast()
         || ip.is_unspecified()
         || ip.is_documentation()
-        || is_cgnat(ip))
+        || is_cgnat(ip)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0 && !matches!(o[3], 9 | 10))
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        || o[0] >= 240)
 }
 
 /// RFC6598 carrier-grade NAT shared address space: 100.64.0.0/10.
@@ -300,6 +306,13 @@ mod tests {
         assert!(!c.record_success([1u8; 20], pub_addr(169, 254, 1, 1, 1000), now));
         assert!(!c.record_success([1u8; 20], pub_addr(100, 64, 0, 1, 1000), now)); // CGNAT
         assert!(!c.record_success([1u8; 20], pub_addr(0, 0, 0, 0, 1000), now));
+        assert!(!c.record_success([1u8; 20], pub_addr(0, 1, 2, 3, 1000), now));
+        assert!(!c.record_success([1u8; 20], pub_addr(192, 0, 0, 8, 1000), now));
+        assert!(!c.record_success([1u8; 20], pub_addr(192, 88, 99, 1, 1000), now));
+        assert!(!c.record_success([1u8; 20], pub_addr(198, 18, 0, 1, 1000), now));
+        assert!(!c.record_success([1u8; 20], pub_addr(198, 19, 255, 254, 1000), now));
+        assert!(!c.record_success([1u8; 20], pub_addr(240, 0, 0, 1, 1000), now));
+        assert!(!c.record_success([1u8; 20], pub_addr(255, 255, 255, 254, 1000), now));
         assert_eq!(c.len(), 1, "only the one public node should be cached");
     }
 
@@ -415,6 +428,9 @@ mod tests {
         // Globally-routable.
         assert!(is_public_v4(&Ipv4Addr::new(87, 221, 96, 148)));
         assert!(is_public_v4(&Ipv4Addr::new(1, 1, 1, 1)));
+        // The two globally reachable anycast exceptions inside 192.0.0.0/24.
+        assert!(is_public_v4(&Ipv4Addr::new(192, 0, 0, 9)));
+        assert!(is_public_v4(&Ipv4Addr::new(192, 0, 0, 10)));
         // 100.63.0.1 sits just below the CGNAT block (100.64.0.0/10) and is routable.
         assert!(is_public_v4(&Ipv4Addr::new(100, 63, 0, 1)));
         // Reserved / non-routable ranges.

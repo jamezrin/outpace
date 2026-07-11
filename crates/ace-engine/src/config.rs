@@ -231,10 +231,8 @@ pub struct Config {
     /// public bootstrap routers. Defaults **off**; an unproven startup optimization must not
     /// regress the cold path. Enable with `OUTPACE_DHT_ROUTING_CACHE=1`.
     ///
-    /// The cache itself is a daemon-session resource inside `ace_swarm::dht`, gated there by the
-    /// same `OUTPACE_DHT_ROUTING_CACHE` env var (threading a flag through `dht_get_peers`' many
-    /// callers would be far more invasive than the session-scoped gate). This config field
-    /// mirrors that env for config-surface parity and observability; both read the same var.
+    /// Engine startup applies this value explicitly to discovery and self-announce walks,
+    /// avoiding lazy environment reads and test-order coupling.
     pub dht_routing_cache: bool,
 }
 

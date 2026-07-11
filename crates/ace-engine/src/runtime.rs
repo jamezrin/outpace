@@ -193,6 +193,7 @@ pub async fn build_runtime(
     config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    ace_swarm::dht::configure_routing_cache(config.dht_routing_cache);
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
 
     // Fail fast on a misconfigured disk cache, and start from a clean slate: wipe the cache root
