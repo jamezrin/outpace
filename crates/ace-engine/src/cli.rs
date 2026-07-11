@@ -7,7 +7,8 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "outpace",
     version,
-    about = "Broadcast and play Acestream-compatible live streams"
+    about = "Stream and broadcast public Acestream content",
+    long_about = "Stream and broadcast public Acestream content.\n\nThe native CLI and /streams API are the supported interface. Legacy /ace/* compatibility is experimental and disabled by default."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -35,8 +36,11 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the HTTP API, RTMP ingest listener, and enabled peer services.
     Serve(ServeArgs),
+    /// Create or resume a named broadcast and run its ingest server.
     Broadcast(BroadcastArgs),
+    /// Write a live MPEG-TS stream (or verified VOD with --vod) to stdout.
     Play(PlayArgs),
 }
 
@@ -45,14 +49,28 @@ pub struct ServeArgs {}
 
 #[derive(Debug, Args)]
 pub struct BroadcastArgs {
+    /// Broadcast name (1-64 ASCII letters, digits, '.', '_' or '-').
+    #[arg(value_parser = parse_broadcast_name)]
     pub name: String,
+    /// Host advertised in printed ingest and transport URLs.
     #[arg(long = "public-host")]
     pub public_host: Option<String>,
 }
 
+fn parse_broadcast_name(value: &str) -> Result<String, String> {
+    crate::broadcast::valid_broadcast_name(value)
+        .then(|| value.to_string())
+        .ok_or_else(|| {
+            "broadcast name must be 1-64 ASCII letters, digits, '.', '_' or '-' and cannot be '.' or '..'"
+                .to_string()
+        })
+}
+
 #[derive(Debug, Args)]
 pub struct PlayArgs {
+    /// Acestream URL, magnet URI, or HTTP(S) transport-file URL.
     pub input: String,
+    /// Bootstrap peer to try in addition to configured discovery (repeatable).
     #[arg(long = "peer")]
     pub peers: Vec<SocketAddrV4>,
     /// Treat the target as a single-file VOD: download it, verify each piece against the
@@ -318,7 +336,38 @@ fn percent_decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{broadcast_output, Cli, Command, PlaybackTarget};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn help_identifies_native_surface_and_describes_each_command() {
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("native CLI and /streams API are the supported interface"));
+        assert!(help.contains("Run the HTTP API, RTMP ingest listener"));
+        assert!(help.contains("Create or resume a named broadcast"));
+        assert!(help.contains("Write a live MPEG-TS stream"));
+
+        let play = command
+            .find_subcommand_mut("play")
+            .expect("play subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(play.contains("Acestream URL, magnet URI, or HTTP(S) transport-file URL"));
+        assert!(play.contains("verified VOD"));
+    }
+
+    #[test]
+    fn broadcast_name_rejects_unsafe_persistence_names() {
+        for name in [".", "..", "../escape", "has/slash", "café"] {
+            assert!(
+                Cli::try_parse_from(["outpace", "broadcast", name]).is_err(),
+                "accepted unsafe broadcast name {name:?}"
+            );
+        }
+        let too_long = "a".repeat(65);
+        assert!(Cli::try_parse_from(["outpace", "broadcast", &too_long]).is_err());
+        assert!(Cli::try_parse_from(["outpace", "broadcast", "sports-1_test.ok"]).is_ok());
+    }
 
     #[test]
     fn no_args_defaults_to_serve() {

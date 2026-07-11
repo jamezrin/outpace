@@ -33,6 +33,19 @@ pub const PIECE_LENGTH: u64 = 65_536;
 pub const CHUNK_LENGTH: u64 = 16_384;
 pub const DEFAULT_BROADCAST_BITRATE: i64 = 8375;
 
+/// Whether an operator-facing broadcast name is safe as a registry key, URL path segment, and
+/// persistence filename. Keep this validation shared by every entry point and the persistence
+/// boundary: broadcast names ultimately become `<data_dir>/broadcasts/<name>.json`.
+pub fn valid_broadcast_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// How often (in pieces produced) the ingest cursor is flushed to disk during a live ingest.
 /// On a daemon restart we resume at `persisted_next_piece + CURSOR_PERSIST_INTERVAL`, which
 /// guarantees a piece number is never reused (reuse corrupts followers) at the cost of a
