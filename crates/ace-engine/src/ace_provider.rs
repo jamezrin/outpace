@@ -2042,12 +2042,14 @@ async fn follow_peer_pool(
             m @ PeerMessage::Piece { .. } => {
                 if let Some(lc) = LiveChunk::from_message(&m) {
                     let piece = lc.piece as u64;
-                    store.lock().await.put_chunk_with_header(
+                    PieceStore::shared_put_chunk_with_header(
+                        store,
                         piece,
                         lc.chunk,
                         lc.piece_header,
                         &lc.data,
-                    );
+                    )
+                    .await;
                     let begin = lc.chunk as u64 * info.chunk_length;
                     if let Err(e) = continuity.reasm.add_block(lc.piece as u64, begin, &lc.data) {
                         // A malformed block, or a completed piece whose live-source signature
@@ -2122,14 +2124,7 @@ async fn follow_peer_pool(
                 // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
                 let p = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 let c = u16::from_be_bytes([payload[8], payload[9]]);
-                let (data, header) = {
-                    let guard = store.lock().await;
-                    (
-                        guard.chunk(p as u64, c).map(|d| d.to_vec()),
-                        guard.piece_header(p as u64).unwrap_or([0u8; 8]),
-                    )
-                };
-                if let Some(data) = data {
+                if let Some((data, header)) = PieceStore::shared_chunk(store, p as u64, c).await {
                     let len = data.len();
                     if let Some(lost) = send_peer_command(
                         peer_id,
@@ -2608,12 +2603,14 @@ async fn follow_one_peer(
             m @ PeerMessage::Piece { .. } => {
                 if let Some(lc) = LiveChunk::from_message(&m) {
                     let piece = lc.piece as u64;
-                    store.lock().await.put_chunk_with_header(
+                    PieceStore::shared_put_chunk_with_header(
+                        &store,
                         piece,
                         lc.chunk,
                         lc.piece_header,
                         &lc.data,
-                    );
+                    )
+                    .await;
                     let begin = lc.chunk as u64 * info.chunk_length;
                     if let Err(e) = continuity.reasm.add_block(lc.piece as u64, begin, &lc.data) {
                         // A malformed block, or a completed piece whose live-source signature
@@ -2666,14 +2663,7 @@ async fn follow_one_peer(
                 // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
                 let p = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 let c = u16::from_be_bytes([payload[8], payload[9]]);
-                let (data, header) = {
-                    let guard = store.lock().await;
-                    (
-                        guard.chunk(p as u64, c).map(|d| d.to_vec()),
-                        guard.piece_header(p as u64).unwrap_or([0u8; 8]),
-                    )
-                };
-                if let Some(data) = data {
+                if let Some((data, header)) = PieceStore::shared_chunk(&store, p as u64, c).await {
                     if session
                         .send(&build_piece(0, p, c, header, &data))
                         .await

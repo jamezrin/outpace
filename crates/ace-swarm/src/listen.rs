@@ -9,7 +9,7 @@ use ace_peer::session::PeerSession;
 use ace_wire::identity::Identity;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -32,6 +32,8 @@ fn now_millis() -> u64 {
 
 /// Per-infohash store, shared with whatever feeds pieces (a download loop, a broadcast source).
 type SharedStore = Arc<Mutex<PieceStore>>;
+type StoreRendezvous = Arc<OnceLock<SharedStore>>;
+type CreatingStores = Arc<StdMutex<HashMap<[u8; 20], StoreRendezvous>>>;
 
 /// Per-infohash metadata blob, shared by inbound seed sessions serving BEP-9 metadata.
 type SharedMetadata = Arc<Vec<u8>>;
@@ -72,6 +74,10 @@ struct SeedEntry {
 #[derive(Clone, Default)]
 pub struct SeedRegistry {
     stores: Arc<StdMutex<HashMap<[u8; 20], SeedEntry>>>,
+    /// Per-key construction rendezvous. `OnceLock` runs the potentially blocking factory without
+    /// holding `stores`; racing callers wait for and reuse the exact published store instead of
+    /// constructing a disposable disk-backed candidate.
+    creating: CreatingStores,
 }
 
 impl SeedRegistry {
@@ -108,24 +114,39 @@ impl SeedRegistry {
     }
 
     /// The store for `infohash`, creating it via `make` (and registering it) if absent.
-    /// Atomic: the whole get-or-insert happens under one lock acquisition.
+    /// Store construction deliberately happens outside the registry mutex: disk-backed stores
+    /// may wipe and create directories, which must not stall inbound handshake lookup.
     pub fn get_or_create(
         &self,
         infohash: [u8; 20],
         make: impl FnOnce() -> PieceStore,
     ) -> SharedStore {
-        self.stores
-            .lock()
-            .unwrap()
-            .entry(infohash)
-            .or_insert_with(|| SeedEntry {
-                generation: next_generation(),
-                last_active: now_millis(),
-                ..Default::default()
-            })
-            .store
-            .get_or_insert_with(|| Arc::new(Mutex::new(make())))
-            .clone()
+        if let Some(store) = self.get(&infohash) {
+            return store;
+        }
+        let rendezvous = {
+            let mut creating = self.creating.lock().unwrap();
+            creating.entry(infohash).or_default().clone()
+        };
+        let candidate = rendezvous
+            .get_or_init(|| Arc::new(Mutex::new(make())))
+            .clone();
+        let store = {
+            let mut map = self.stores.lock().unwrap();
+            map.entry(infohash)
+                .or_insert_with(|| SeedEntry {
+                    generation: next_generation(),
+                    last_active: now_millis(),
+                    ..Default::default()
+                })
+                .store
+                .get_or_insert_with(|| candidate.clone())
+                .clone()
+        };
+        // Removing the rendezvous can drop its final store reference, so do it outside `stores`.
+        let finished = self.creating.lock().unwrap().remove(&infohash);
+        drop(finished);
+        store
     }
 
     /// Acquire a leech producer lease for `infohash`, creating the store via `make` if absent.
@@ -133,23 +154,20 @@ impl SeedRegistry {
     /// the entry (and its store) is evicted. Two concurrent leech sessions for one infohash share
     /// a single store and the entry survives until both leases drop.
     ///
-    /// The registry's `StdMutex` is held across `make`, so `make` must not drop a `SeedLease` for
-    /// this same registry (it would re-lock the non-reentrant mutex and deadlock).
+    /// Store construction happens before the mutation lock is acquired.
     pub fn lease_store(
         &self,
         infohash: [u8; 20],
         make: impl FnOnce() -> PieceStore,
     ) -> (SharedStore, SeedLease) {
+        let candidate = self.get_or_create(infohash, make);
         let mut map = self.stores.lock().unwrap();
         let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
             generation: next_generation(),
             last_active: now_millis(),
             ..Default::default()
         });
-        let store = entry
-            .store
-            .get_or_insert_with(|| Arc::new(Mutex::new(make())))
-            .clone();
+        let store = entry.store.get_or_insert_with(|| candidate.clone()).clone();
         entry.producers += 1;
         let lease = SeedLease {
             registry: Arc::downgrade(&self.stores),
@@ -165,8 +183,7 @@ impl SeedRegistry {
     /// Overwrites any existing `content_id` metadata; content is content-addressed by `content_id`,
     /// so the blob is deterministic for a given key and the overwrite is a no-op in practice.
     ///
-    /// The registry's `StdMutex` is held across `make`, so `make` must not drop a `SeedLease` for
-    /// this same registry (it would re-lock the non-reentrant mutex and deadlock).
+    /// Store construction happens before the mutation lock is acquired.
     pub fn lease_broadcast(
         &self,
         infohash: [u8; 20],
@@ -174,6 +191,7 @@ impl SeedRegistry {
         metadata: Vec<u8>,
         make: impl FnOnce() -> PieceStore,
     ) -> (SharedStore, SeedLease) {
+        let candidate = self.get_or_create(infohash, make);
         let mut map = self.stores.lock().unwrap();
         let (store, ih_generation) = {
             let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
@@ -183,10 +201,7 @@ impl SeedRegistry {
             });
             entry.producers += 1;
             entry.kind = OwnerKind::Broadcast;
-            let store = entry
-                .store
-                .get_or_insert_with(|| Arc::new(Mutex::new(make())))
-                .clone();
+            let store = entry.store.get_or_insert_with(|| candidate.clone()).clone();
             (store, entry.generation)
         };
         let cid_generation = {
@@ -259,7 +274,8 @@ impl SeedRegistry {
     /// Stop serving `key` (an infohash or a metadata content_id): drops both the piece store
     /// and any registered metadata under it. Idempotent — removing an absent key is a no-op.
     pub fn remove(&self, key: &[u8; 20]) {
-        self.stores.lock().unwrap().remove(key);
+        let removed = self.stores.lock().unwrap().remove(key);
+        drop(removed);
     }
 
     /// Force-evict idle **ownerless** `Leech` entries (`producers == 0`, i.e. created outside the
@@ -271,14 +287,23 @@ impl SeedRegistry {
     pub fn reap(&self, ttl: std::time::Duration) -> usize {
         let now = now_millis();
         let ttl_ms = ttl.as_millis() as u64;
-        let mut map = self.stores.lock().unwrap();
-        let before = map.len();
-        map.retain(|_, e| {
-            e.kind == OwnerKind::Broadcast
-                || e.producers > 0
-                || now.saturating_sub(e.last_active) < ttl_ms
-        });
-        before - map.len()
+        let (removed, count) = {
+            let mut map = self.stores.lock().unwrap();
+            let keys: Vec<_> = map
+                .iter()
+                .filter(|(_, e)| {
+                    e.kind != OwnerKind::Broadcast
+                        && e.producers == 0
+                        && now.saturating_sub(e.last_active) >= ttl_ms
+                })
+                .map(|(&key, _)| key)
+                .collect();
+            let removed: Vec<_> = keys.iter().filter_map(|key| map.remove(key)).collect();
+            let count = removed.len();
+            (removed, count)
+        };
+        drop(removed);
+        count
     }
 }
 
@@ -296,19 +321,26 @@ impl Drop for SeedLease {
         let Some(map) = self.registry.upgrade() else {
             return;
         };
-        let mut map = map.lock().unwrap();
-        for (key, generation) in &self.keys {
-            if let Some(entry) = map.get_mut(key) {
-                // Only decrement the exact entry this lease was issued against; a force-remove +
-                // recreate at the same key bumps the generation and makes this a no-op.
-                if entry.generation == *generation {
-                    entry.producers = entry.producers.saturating_sub(1);
-                    if entry.producers == 0 {
-                        map.remove(key);
+        let removed = {
+            let mut map = map.lock().unwrap();
+            let mut removed = Vec::new();
+            for (key, generation) in &self.keys {
+                if let Some(entry) = map.get_mut(key) {
+                    // Only decrement the exact entry this lease was issued against; a force-remove +
+                    // recreate at the same key bumps the generation and makes this a no-op.
+                    if entry.generation == *generation {
+                        entry.producers = entry.producers.saturating_sub(1);
+                        if entry.producers == 0 {
+                            if let Some(entry) = map.remove(key) {
+                                removed.push(entry);
+                            }
+                        }
                     }
                 }
             }
-        }
+            removed
+        };
+        drop(removed);
     }
 }
 
@@ -436,6 +468,45 @@ mod tests {
         assert!(
             Arc::ptr_eq(&a, &b),
             "second call must return the SAME store, not create a new one"
+        );
+    }
+
+    #[test]
+    fn concurrent_creators_publish_one_disk_store_and_preserve_its_data() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reg = SeedRegistry::new();
+        let ih = [2u8; 20];
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("same-infohash");
+        let starts = Arc::new(std::sync::Barrier::new(3));
+        let factories = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let reg = reg.clone();
+            let dir = dir.clone();
+            let starts = starts.clone();
+            let factories = factories.clone();
+            threads.push(std::thread::spawn(move || {
+                starts.wait();
+                reg.get_or_create(ih, || {
+                    factories.fetch_add(1, Ordering::SeqCst);
+                    let mut store = PieceStore::new_disk(4, 4, 1024, dir).unwrap();
+                    store.put_chunk(0, 0, b"data");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    store
+                })
+            }));
+        }
+        starts.wait();
+        let a = threads.remove(0).join().unwrap();
+        let b = threads.remove(0).join().unwrap();
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(
+            a.blocking_lock().chunk(0, 0).unwrap().as_ref(),
+            b"data",
+            "a racing caller must not wipe or drop the published disk store"
         );
     }
 

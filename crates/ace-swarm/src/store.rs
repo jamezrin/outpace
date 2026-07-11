@@ -9,6 +9,8 @@
 //! [`chunk`](PieceStore::chunk) / the `put_chunk*` writers.
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod disk;
 use disk::DiskBackend;
@@ -180,6 +182,57 @@ impl MemoryBackend {
 }
 
 impl PieceStore {
+    /// Read a chunk from a shared store without running disk I/O on a Tokio worker thread.
+    /// Memory stores take the ordinary async lock and preserve their zero-copy internal path;
+    /// disk stores perform the synchronous compatibility operation on the blocking pool.
+    pub async fn shared_chunk(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<(Vec<u8>, [u8; 8])> {
+        let handle = {
+            let guard = store.lock().await;
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    return guard.chunk(piece, chunk).map(|data| {
+                        (
+                            data.into_owned(),
+                            guard.piece_header(piece).unwrap_or([0; 8]),
+                        )
+                    });
+                }
+                Backend::Disk(disk) => disk.handle(),
+            }
+        };
+        handle.get(piece, chunk).await
+    }
+
+    /// Write a chunk to a shared store without running disk I/O on a Tokio worker thread.
+    pub async fn shared_put_chunk_with_header(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+        header: [u8; 8],
+        data: &[u8],
+    ) {
+        let (handle, max_bytes) = {
+            let mut guard = store.lock().await;
+            if guard.max_bytes == 0 || (chunk as u64) >= guard.piece_length / guard.chunk_length {
+                return;
+            }
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    guard.put_chunk_with_header(piece, chunk, header, data);
+                    return;
+                }
+                Backend::Disk(disk) => (disk.handle(), guard.max_bytes),
+            }
+        };
+        handle
+            .put(piece, chunk, header, data.to_vec(), max_bytes)
+            .await;
+    }
+
     /// # Panics
     /// `chunk_length` must be > 0 (otherwise [`chunks_per_piece`](Self::chunks_per_piece) divides
     /// by zero), and `piece_length` should be a multiple of `chunk_length`. Domain inputs are
@@ -559,5 +612,38 @@ mod tests {
             !s.has_piece(3),
             "partial piece (1 of 2 chunks) not complete"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_disk_put_still_commits_index_and_budget_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            PieceStore::new_disk(4, 4, 4, dir.path().join("cache")).unwrap(),
+        ));
+        PieceStore::shared_put_chunk_with_header(&store, 1, 0, [1; 8], b"1111").await;
+        let task = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                PieceStore::shared_put_chunk_with_header(&store, 2, 0, [2; 8], b"2222").await;
+            }
+        });
+        tokio::task::yield_now().await; // command has been submitted; cancellation drops its reply
+        task.abort();
+        for _ in 0..100 {
+            if store.lock().await.has_piece(2) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let guard = store.lock().await;
+        assert!(
+            guard.has_piece(2),
+            "actor commits after the caller is cancelled"
+        );
+        assert!(
+            !guard.has_piece(1),
+            "the same actor transaction enforces the budget"
+        );
+        assert_eq!(guard.chunk(2, 0).unwrap().as_ref(), b"2222");
     }
 }

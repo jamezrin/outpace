@@ -209,13 +209,16 @@ impl SeederSession {
                         u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                     let chunk = u16::from_be_bytes([payload[8], payload[9]]);
                     let found = if let Some(store) = &store {
-                        let guard = store.lock().await;
-                        guard.chunk(piece as u64, chunk).map(|data| {
-                            (
-                                data.to_vec(),
-                                guard.piece_header(piece as u64).unwrap_or(piece_header),
-                            )
-                        })
+                        PieceStore::shared_chunk(store, piece as u64, chunk)
+                            .await
+                            .map(|(data, header)| {
+                                let header = if header == [0; 8] {
+                                    piece_header
+                                } else {
+                                    header
+                                };
+                                (data, header)
+                            })
                     } else {
                         None
                     };

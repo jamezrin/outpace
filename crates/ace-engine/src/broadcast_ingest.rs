@@ -58,10 +58,14 @@ impl BroadcastIngest {
     async fn store_outputs(&mut self, outputs: Vec<ace_wire::chunker::OutChunk>) {
         for out in outputs {
             let header = header_for_piece(&mut self.current_header, out.piece);
-            self.store
-                .lock()
-                .await
-                .put_chunk_with_header(out.piece, out.chunk, header, &out.data);
+            PieceStore::shared_put_chunk_with_header(
+                &self.store,
+                out.piece,
+                out.chunk,
+                header,
+                &out.data,
+            )
+            .await;
             // Track the live edge for ingest-resume continuity (throttle-persisted).
             self.cursor.advance_to(out.piece + 1);
         }
