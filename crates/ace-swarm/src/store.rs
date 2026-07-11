@@ -190,31 +190,45 @@ impl PieceStore {
         piece: u64,
         chunk: u16,
     ) -> Option<(Vec<u8>, [u8; 8])> {
-        let is_disk = matches!(store.lock().await.backend, Backend::Disk(_));
-        if !is_disk {
+        let plan = {
             let guard = store.lock().await;
-            return guard.chunk(piece, chunk).map(|data| {
-                (
-                    data.into_owned(),
-                    guard.piece_header(piece).unwrap_or([0; 8]),
-                )
-            });
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    return guard.chunk(piece, chunk).map(|data| {
+                        (
+                            data.into_owned(),
+                            guard.piece_header(piece).unwrap_or([0; 8]),
+                        )
+                    });
+                }
+                Backend::Disk(disk) => {
+                    let entry = disk.index.get(&piece)?;
+                    let len = *entry.present.get(&chunk)? as usize;
+                    (
+                        Arc::clone(&disk.operation),
+                        Arc::clone(&disk.io),
+                        disk.chunk_length,
+                        len,
+                        entry.header,
+                    )
+                }
+            }
+        };
+        let (operation, io, chunk_length, len, header) = plan;
+        let _operation = operation.lock().await;
+        match tokio::task::spawn_blocking(move || io.read(piece, chunk, chunk_length, len)).await {
+            Ok(Ok(data)) => Some((data, header)),
+            Ok(Err(e)) => {
+                crate::swarm_log!(
+                    "[cache] disk read failed for present piece {piece} chunk {chunk}: {e}"
+                );
+                None
+            }
+            Err(e) => {
+                crate::swarm_log!("[cache] disk read task failed: {e}");
+                None
+            }
         }
-        let store = Arc::clone(store);
-        tokio::task::spawn_blocking(move || {
-            let guard = store.blocking_lock();
-            guard.chunk(piece, chunk).map(|data| {
-                (
-                    data.into_owned(),
-                    guard.piece_header(piece).unwrap_or([0; 8]),
-                )
-            })
-        })
-        .await
-        .unwrap_or_else(|e| {
-            crate::swarm_log!("[cache] disk read task failed: {e}");
-            None
-        })
     }
 
     /// Write a chunk to a shared store without running disk I/O on a Tokio worker thread.
@@ -225,24 +239,74 @@ impl PieceStore {
         header: [u8; 8],
         data: &[u8],
     ) {
-        let is_disk = matches!(store.lock().await.backend, Backend::Disk(_));
-        if !is_disk {
-            store
-                .lock()
-                .await
-                .put_chunk_with_header(piece, chunk, header, data);
-            return;
+        let plan = {
+            let mut guard = store.lock().await;
+            if guard.max_bytes == 0 || (chunk as u64) >= guard.piece_length / guard.chunk_length {
+                return;
+            }
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    guard.put_chunk_with_header(piece, chunk, header, data);
+                    return;
+                }
+                Backend::Disk(disk) => (
+                    Arc::clone(&disk.operation),
+                    Arc::clone(&disk.io),
+                    disk.chunk_length,
+                ),
+            }
+        };
+        let (operation, io, chunk_length) = plan;
+        let _operation = operation.lock().await;
+        let owned = data.to_vec();
+        let write_io = Arc::clone(&io);
+        let write =
+            tokio::task::spawn_blocking(move || write_io.write(piece, chunk, chunk_length, &owned))
+                .await;
+        match write {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                crate::swarm_log!("[cache] disk write failed for piece {piece} chunk {chunk}: {e}");
+                return;
+            }
+            Err(e) => {
+                crate::swarm_log!("[cache] disk write task failed: {e}");
+                return;
+            }
         }
-        let store = Arc::clone(store);
-        let data = data.to_vec();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            store
-                .blocking_lock()
-                .put_chunk_with_header(piece, chunk, header, &data);
-        })
-        .await
-        {
-            crate::swarm_log!("[cache] disk write task failed: {e}");
+        let evicted = {
+            let mut guard = store.lock().await;
+            let stored = match &mut guard.backend {
+                Backend::Disk(disk) => disk.commit_put(piece, chunk, header, data.len()),
+                Backend::Memory(_) => return,
+            };
+            guard.cur_bytes = guard.cur_bytes - stored.removed + stored.added;
+            let mut evicted = Vec::new();
+            while guard.cur_bytes > guard.max_bytes {
+                let Backend::Disk(disk) = &mut guard.backend else {
+                    break;
+                };
+                let Some((piece, freed)) = disk.evict_lowest_metadata() else {
+                    break;
+                };
+                guard.cur_bytes -= freed;
+                evicted.push(piece);
+            }
+            evicted
+        };
+        if !evicted.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for piece in evicted {
+                    if let Err(e) = io.remove(piece) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            crate::swarm_log!(
+                                "[cache] disk evict failed to remove piece {piece} file: {e}"
+                            );
+                        }
+                    }
+                }
+            })
+            .await;
         }
     }
 
