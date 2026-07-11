@@ -467,16 +467,6 @@ async fn broadcast_transport(State(s): State<AppState>, Path(name): Path<String>
 /// Whether `name` is safe to use as both a registry key and a persistence filename. Names
 /// come straight from the URL path, so this closes a path-traversal vector: allow only
 /// `[A-Za-z0-9._-]`, length 1..=64, and never `.`/`..`.
-fn valid_broadcast_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name != "."
-        && name != ".."
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
 /// `PUT /broadcast/{name}` (B1) — accepts a chunked MPEG-TS body and originates it as an
 /// Acestream-compatible live swarm. Responds immediately with the minted infohash (identical
 /// name -> identical, already-minted broadcast; see `BroadcastRegistry::start_or_resume`)
@@ -490,7 +480,7 @@ async fn broadcast_ingest(
     Path(name): Path<String>,
     body: Body,
 ) -> Response {
-    if !valid_broadcast_name(&name) {
+    if !crate::broadcast::valid_broadcast_name(&name) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Some(bs) = &s.broadcasts else {
@@ -541,7 +531,7 @@ async fn broadcast_ingest(
 /// record) and stop serving its infohash/content_id, so a subsequent `PUT` mints a fresh
 /// identity. Idempotent: `204 No Content` whether or not the name existed.
 async fn broadcast_delete(State(s): State<AppState>, Path(name): Path<String>) -> Response {
-    if !valid_broadcast_name(&name) {
+    if !crate::broadcast::valid_broadcast_name(&name) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Some(bs) = &s.broadcasts else {
@@ -2472,15 +2462,15 @@ mod tests {
 
     #[test]
     fn broadcast_name_validation_rejects_traversal_and_junk() {
-        assert!(valid_broadcast_name("news"));
-        assert!(valid_broadcast_name("sports-2.hd_1"));
-        assert!(!valid_broadcast_name(""));
-        assert!(!valid_broadcast_name("."));
-        assert!(!valid_broadcast_name(".."));
-        assert!(!valid_broadcast_name("../etc/passwd"));
-        assert!(!valid_broadcast_name("a/b"));
-        assert!(!valid_broadcast_name("has space"));
-        assert!(!valid_broadcast_name(&"x".repeat(65)));
+        assert!(crate::broadcast::valid_broadcast_name("news"));
+        assert!(crate::broadcast::valid_broadcast_name("sports-2.hd_1"));
+        assert!(!crate::broadcast::valid_broadcast_name(""));
+        assert!(!crate::broadcast::valid_broadcast_name("."));
+        assert!(!crate::broadcast::valid_broadcast_name(".."));
+        assert!(!crate::broadcast::valid_broadcast_name("../etc/passwd"));
+        assert!(!crate::broadcast::valid_broadcast_name("a/b"));
+        assert!(!crate::broadcast::valid_broadcast_name("has space"));
+        assert!(!crate::broadcast::valid_broadcast_name(&"x".repeat(65)));
     }
 
     #[tokio::test]

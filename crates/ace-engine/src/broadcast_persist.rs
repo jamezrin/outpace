@@ -56,6 +56,12 @@ impl BroadcastPersist {
     /// pass an already-validated `name` (see `http::valid_broadcast_name`) — this becomes a
     /// filename.
     pub fn save(&self, name: &str, rec: &PersistedBroadcast) -> io::Result<()> {
+        if !crate::broadcast::valid_broadcast_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid broadcast name",
+            ));
+        }
         std::fs::create_dir_all(&self.dir)?;
         let on_disk = OnDisk {
             transport_hex: hex::encode(&rec.transport),
@@ -97,11 +103,20 @@ impl BroadcastPersist {
 
     /// Load the single persisted record for `name`, or `None` if it is absent or unreadable.
     pub fn load(&self, name: &str) -> Option<PersistedBroadcast> {
+        if !crate::broadcast::valid_broadcast_name(name) {
+            return None;
+        }
         load_record(&self.path(name)).ok()
     }
 
     /// Remove the persisted record for `name`. A missing file is not an error (idempotent).
     pub fn delete(&self, name: &str) -> io::Result<()> {
+        if !crate::broadcast::valid_broadcast_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid broadcast name",
+            ));
+        }
         match std::fs::remove_file(self.path(name)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -167,6 +182,20 @@ mod tests {
         p.save("news", &sample()).unwrap();
         let loaded = p.load_all();
         assert_eq!(loaded, vec![("news".to_string(), sample())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_rejects_invalid_names_before_constructing_paths() {
+        let dir = tmp_dir();
+        let p = BroadcastPersist::new(&dir);
+        for name in [".", "..", "../../escape", "has/slash", "café"] {
+            let err = p.save(name, &sample()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name:?}");
+        }
+        assert!(p.save(&"a".repeat(65), &sample()).is_err());
+        assert!(!dir.join("escape.json").exists());
+        assert!(!dir.join("broadcasts").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

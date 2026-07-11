@@ -50,10 +50,20 @@ pub struct ServeArgs {}
 #[derive(Debug, Args)]
 pub struct BroadcastArgs {
     /// Broadcast name (1-64 ASCII letters, digits, '.', '_' or '-').
+    #[arg(value_parser = parse_broadcast_name)]
     pub name: String,
     /// Host advertised in printed ingest and transport URLs.
     #[arg(long = "public-host")]
     pub public_host: Option<String>,
+}
+
+fn parse_broadcast_name(value: &str) -> Result<String, String> {
+    crate::broadcast::valid_broadcast_name(value)
+        .then(|| value.to_string())
+        .ok_or_else(|| {
+            "broadcast name must be 1-64 ASCII letters, digits, '.', '_' or '-' and cannot be '.' or '..'"
+                .to_string()
+        })
 }
 
 #[derive(Debug, Args)]
@@ -344,6 +354,19 @@ mod tests {
             .to_string();
         assert!(play.contains("Acestream URL, magnet URI, or HTTP(S) transport-file URL"));
         assert!(play.contains("verified VOD"));
+    }
+
+    #[test]
+    fn broadcast_name_rejects_unsafe_persistence_names() {
+        for name in [".", "..", "../escape", "has/slash", "café"] {
+            assert!(
+                Cli::try_parse_from(["outpace", "broadcast", name]).is_err(),
+                "accepted unsafe broadcast name {name:?}"
+            );
+        }
+        let too_long = "a".repeat(65);
+        assert!(Cli::try_parse_from(["outpace", "broadcast", &too_long]).is_err());
+        assert!(Cli::try_parse_from(["outpace", "broadcast", "sports-1_test.ok"]).is_ok());
     }
 
     #[test]
