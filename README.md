@@ -47,8 +47,7 @@ Play a known Acestream link to stdout:
 cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
 ```
 
-`play` (and the `/ace/getstream` compatibility route) accept four mutually
-exclusive selectors, applied in precedence order
+`play` accepts four mutually exclusive selectors, applied in precedence order
 `content_id` > `infohash` > `url` > `magnet`:
 
 - `acestream://<content_id>` or `acestream:?content_id=<40-hex>`;
@@ -63,9 +62,10 @@ exclusive selectors, applied in precedence order
 - `magnet:?xt=urn:btih:<40-hex-or-32-base32>` - a BitTorrent v1 magnet, reduced to
   its infohash (v2 `urn:btmh:` magnets are rejected).
 
-On the `/ace/getstream` compatibility route a `url=` selector returns a
-self-contained playback id, so playback works after a daemon restart without any
-server-side session table.
+The `/ace/getstream` compatibility route accepts the same selectors plus legacy
+`id=<40-hex>`, which is an alias for `content_id` (not `infohash`). Its precedence is
+`content_id` > `infohash` > `id` > `url` > `magnet`. A `url=` selector uses a self-contained
+playback id, so playback works after a daemon restart without any server-side alias table.
 
 ### VOD (single-file)
 
@@ -178,10 +178,18 @@ experimental and disabled by default. Enable them only when needed:
 OUTPACE_EXPERIMENTAL_ACE_COMPAT=1 cargo run -p ace-engine --bin outpace -- serve
 ```
 
-On that compatibility surface, `/ace/stat` fields live under `.response`, and
-`acestream://` ids should be passed as `content_id=`, not `infohash=`.
-`/ace/getstream` also accepts `url=` (transport-file URL) and `magnet=` selectors,
-with the same `content_id` > `infohash` > `url` > `magnet` precedence as the CLI.
+On that compatibility surface, `/ace/stat` fields live under `.response`. A directly playable
+legacy URL streams MPEG-TS without a JSON handshake:
+
+```text
+http://127.0.0.1:6878/ace/getstream?id=<content-id>
+```
+
+Call `/ace/getstream?format=json&content_id=<content-id>` when the client needs the tokenized
+playback/stat/command URL envelope instead. `id=` and `content_id=` enter content-ID catalog
+resolution; only `infohash=` bypasses it as an explicit swarm key. All hash selectors must be
+40 hexadecimal characters. The route also accepts `url=` (transport-file URL) and `magnet=`;
+see the compatibility matrix for exact precedence and error behavior.
 
 `/server/api` serves a targeted subset of the engine's JSON control API, dispatched
 on `?method=` and wrapped in a `{ "result", "error" }` envelope (note the `result`

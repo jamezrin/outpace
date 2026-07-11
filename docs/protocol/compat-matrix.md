@@ -20,12 +20,19 @@ Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 
 | Route | Status | Notes |
 | --- | --- | --- |
-| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > `url` > `magnet`. Returns playback/stat/command URLs with a new unpredictable, client-specific token. Tokens expire after six hours and state is capped at 4096 live leases. |
+| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t`; `format=json` returns playback/stat/command URLs with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
 | `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a valid lease. Missing, invalid, expired, stopped, or wrong-content tokens return HTTP 404. |
 | `GET /ace/stat/<id>/<token>` | Supported | Session stats under `.response`. Invalid/expired tokens return HTTP 200 with `response: null` and `error: "invalid or expired playback session"`. |
 | `GET /ace/cmd/<id>/<token>?method=stop` | Supported | `stop` revokes only this compatibility client's lease; other clients and native consumers keep the shared source alive. Invalid/expired tokens use the same error envelope as `stat`; other methods return an error envelope. |
 | `GET /ace/manifest.m3u8` | Deferred | Parsed by `routes.rs` but not served. Native `/vod/<net>/<id>/manifest.m3u8` HLS is the supported manifest surface. |
 | `GET /ace/c/<session>/<seq>.ts` | Deferred | HLS segment counterpart to `manifest.m3u8`; deferred with it. |
+
+`content_id`, `infohash`, and `id` must be exactly 40 hexadecimal characters and are normalized
+to lowercase. A malformed higher-priority selector is rejected rather than silently falling
+through to another selector. Compatibility hints such as `use_api_events` and other unknown query
+parameters are safely ignored. Missing/malformed selectors and unsupported formats currently use
+HTTP 200 with `{ "response": null, "error": "..." }`; this is outpace's pinned compatibility
+behavior pending a broader official-engine error capture.
 
 ## `/server/api` control methods
 

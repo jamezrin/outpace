@@ -32,6 +32,19 @@ struct AceLease {
     cancel: tokio::sync::watch::Sender<bool>,
 }
 
+/// Owns a hidden direct-playback lease for exactly as long as its HTTP body exists.
+struct AceDirectLeaseGuard {
+    sessions: Arc<AceSessionStore>,
+    playback_id: String,
+    token: String,
+}
+
+impl Drop for AceDirectLeaseGuard {
+    fn drop(&mut self) {
+        self.sessions.remove_owned(&self.playback_id, &self.token);
+    }
+}
+
 /// Bounded playback leases minted by `/ace/getstream`. A token is both authorization and the
 /// compatibility client's ownership handle; revoking one never force-stops the shared source.
 pub struct AceSessionStore {
@@ -114,6 +127,22 @@ impl AceSessionStore {
         matches
     }
 
+    /// Remove a lease owned by an internal body guard even if its authorization deadline has
+    /// just passed. Unlike `revoke`, this is not an authorization check: the guard was created
+    /// with the exact id/token pair when the lease was minted and must always clean up its entry.
+    fn remove_owned(&self, playback_id: &str, token: &str) -> bool {
+        let mut leases = self.leases.lock().unwrap();
+        let matches = leases
+            .get(token)
+            .is_some_and(|lease| lease.playback_id == playback_id);
+        if matches {
+            if let Some(lease) = leases.remove(token) {
+                let _ = lease.cancel.send(true);
+            }
+        }
+        matches
+    }
+
     fn playback(
         &self,
         playback_id: &str,
@@ -132,6 +161,11 @@ impl AceSessionStore {
                     lease.cancel.subscribe(),
                 )
             })
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        self.leases.lock().unwrap().len()
     }
 }
 
@@ -549,13 +583,25 @@ async fn ace_getstream(
     State(s): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
-    let Some(mut selection) = ace_selected_stream(&params) else {
-        return Json(json!({ "response": null, "error": "missing content_id/infohash/id" }));
+) -> Response {
+    let mode = match params.get("format").map(String::as_str) {
+        None | Some("") => AceGetstreamMode::Direct,
+        Some("json") => AceGetstreamMode::Json,
+        Some(_) => {
+            return Json(json!({ "response": null, "error": "unsupported format" }))
+                .into_response();
+        }
     };
-    if ace_network(&s).is_none() {
-        return Json(json!({ "response": null, "error": "no ace network registered" }));
-    }
+    let mut selection = match ace_selected_stream(&params) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return Json(json!({ "response": null, "error": error })).into_response();
+        }
+    };
+    let Some(network) = ace_network(&s) else {
+        return Json(json!({ "response": null, "error": "no ace network registered" }))
+            .into_response();
+    };
     if s.resolve_content_ids_in_getstream {
         if let Some(content_id) = selection.content_id.as_deref() {
             match resolve_via_catalog(content_id).await {
@@ -573,19 +619,46 @@ async fn ace_getstream(
     let base = request_base(&headers);
     let playback_id = selection.playback_id;
     let public_id = selection.public_id;
-    Json(json!({
-        "response": {
-            "infohash": public_id,
-            "playback_url": format!("{base}/ace/r/{playback_id}/{token}"),
-            "stat_url": format!("{base}/ace/stat/{playback_id}/{token}"),
-            "command_url": format!("{base}/ace/cmd/{playback_id}/{token}"),
-            "playback_session_id": token,
-            "client_session_id": -1,
-            "is_live": 1,
-            "is_encrypted": 0
-        },
-        "error": null
-    }))
+    if mode == AceGetstreamMode::Json {
+        return Json(json!({
+            "response": {
+                "infohash": public_id,
+                "playback_url": format!("{base}/ace/r/{playback_id}/{token}"),
+                "stat_url": format!("{base}/ace/stat/{playback_id}/{token}"),
+                "command_url": format!("{base}/ace/cmd/{playback_id}/{token}"),
+                "playback_session_id": token,
+                "client_session_id": -1,
+                "is_live": 1,
+                "is_encrypted": 0
+            },
+            "error": null
+        }))
+        .into_response();
+    }
+
+    // A direct request owns an ordinary compatibility lease, just like a caller that follows
+    // the JSON playback URL. The body holds exactly one StreamManager subscription, so dropping
+    // it detaches this caller without stopping a shared source or another compatibility client.
+    let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&playback_id, &token)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match s.manager.get_or_start(&network, &session_key).await {
+        Ok(session) => ace_stream_session_response(
+            session,
+            expires_at,
+            cancel,
+            Some(AceDirectLeaseGuard {
+                sessions: s.ace_sessions.clone(),
+                playback_id,
+                token,
+            }),
+        ),
+        Err(_) => {
+            s.ace_sessions.revoke(&playback_id, &token);
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 async fn ace_playback(
@@ -599,7 +672,7 @@ async fn ace_playback(
         return StatusCode::NOT_FOUND.into_response();
     };
     match s.manager.get_or_start(&network, &session_key).await {
-        Ok(session) => ace_stream_session_response(session, expires_at, cancel),
+        Ok(session) => ace_stream_session_response(session, expires_at, cancel, None),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -751,11 +824,18 @@ async fn resolve_server_api_selector(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct AceStreamSelection {
     public_id: String,
     playback_id: String,
     session_key: String,
     content_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AceGetstreamMode {
+    Direct,
+    Json,
 }
 
 impl AceStreamSelection {
@@ -767,31 +847,44 @@ impl AceStreamSelection {
     }
 }
 
-fn ace_selected_stream(params: &HashMap<String, String>) -> Option<AceStreamSelection> {
+fn ace_selected_stream(
+    params: &HashMap<String, String>,
+) -> Result<AceStreamSelection, &'static str> {
     if let Some(content_id) = ace_nonempty_param(params, "content_id") {
-        return Some(AceStreamSelection {
-            public_id: content_id.to_string(),
+        let content_id = ace_normalized_hex_id(content_id).ok_or("invalid content_id")?;
+        return Ok(AceStreamSelection {
+            public_id: content_id.clone(),
             playback_id: format!("cid:{content_id}"),
             session_key: format!("cid:{content_id}"),
-            content_id: Some(content_id.to_string()),
+            content_id: Some(content_id),
         });
     }
-    if let Some(id) =
-        ace_nonempty_param(params, "infohash").or_else(|| ace_nonempty_param(params, "id"))
-    {
-        return Some(AceStreamSelection {
-            public_id: id.to_string(),
-            playback_id: id.to_string(),
-            session_key: id.to_string(),
+    if let Some(infohash) = ace_nonempty_param(params, "infohash") {
+        let infohash = ace_normalized_hex_id(infohash).ok_or("invalid infohash")?;
+        return Ok(AceStreamSelection {
+            public_id: infohash.clone(),
+            playback_id: infohash.clone(),
+            session_key: infohash,
             content_id: None,
+        });
+    }
+    // The legacy `id=` spelling denotes an AceStream content id, not a swarm infohash.
+    if let Some(content_id) = ace_nonempty_param(params, "id") {
+        let content_id = ace_normalized_hex_id(content_id).ok_or("invalid id")?;
+        return Ok(AceStreamSelection {
+            public_id: content_id.clone(),
+            playback_id: format!("cid:{content_id}"),
+            session_key: format!("cid:{content_id}"),
+            content_id: Some(content_id),
         });
     }
     if let Some(url) = ace_nonempty_param(params, "url") {
         // The id is a reversible, path-safe encoding of the URL, so it is both the route-safe
         // playback_id and the session_key the provider decodes — no server-side alias table, so
         // playback survives a restart or a direct `/ace/r/{id}` hit.
-        let token = crate::transport_url::encode_transport_url(url).ok()?;
-        return Some(AceStreamSelection {
+        let token =
+            crate::transport_url::encode_transport_url(url).map_err(|_| "invalid transport url")?;
+        return Ok(AceStreamSelection {
             public_id: token.clone(),
             playback_id: token.clone(),
             session_key: token,
@@ -799,15 +892,19 @@ fn ace_selected_stream(params: &HashMap<String, String>) -> Option<AceStreamSele
         });
     }
     if let Some(magnet) = ace_nonempty_param(params, "magnet") {
-        let hex = crate::magnet::parse_magnet_infohash(magnet).ok()?;
-        return Some(AceStreamSelection {
+        let hex = crate::magnet::parse_magnet_infohash(magnet).map_err(|_| "invalid magnet")?;
+        return Ok(AceStreamSelection {
             public_id: hex.clone(),
             playback_id: hex.clone(),
             session_key: hex,
             content_id: None,
         });
     }
-    None
+    Err("missing content_id/infohash/id/url/magnet")
+}
+
+fn ace_normalized_hex_id(id: &str) -> Option<String> {
+    (id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_ascii_lowercase())
 }
 
 fn ace_nonempty_param<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
@@ -979,12 +1076,13 @@ fn ace_stream_session_response(
     session: Arc<StreamSession>,
     expires_at: Instant,
     cancel: tokio::sync::watch::Receiver<bool>,
+    direct_lease: Option<AceDirectLeaseGuard>,
 ) -> Response {
     let sub = session.subscribe();
     let gate = ace_media::mpegts::KeyframeGate::new();
     let stream = futures::stream::unfold(
-        (sub, gate, cancel, expires_at),
-        |(mut sub, mut gate, mut cancel, expires_at)| async move {
+        (sub, gate, cancel, expires_at, direct_lease),
+        |(mut sub, mut gate, mut cancel, expires_at, direct_lease)| async move {
             loop {
                 tokio::select! {
                     biased;
@@ -998,7 +1096,7 @@ fn ace_stream_session_response(
                         Ok(StreamEvent::Data(chunk)) => {
                             let out = gate.push(&chunk);
                             if out.is_empty() { continue; }
-                            return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate, cancel, expires_at)));
+                            return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate, cancel, expires_at, direct_lease)));
                         }
                         Ok(StreamEvent::Discontinuity) => {
                             reset_stream_keyframe_gate(&mut gate);
@@ -1396,6 +1494,7 @@ mod tests {
         let sel = ace_selected_stream(&params(&[
             ("content_id", cid),
             ("infohash", ih),
+            ("id", "fedcba9876543210fedcba9876543210fedcba98"),
             ("url", "https://e/x"),
             ("magnet", &format!("magnet:?xt=urn:btih:{ih}")),
         ]))
@@ -1404,6 +1503,7 @@ mod tests {
 
         let sel = ace_selected_stream(&params(&[
             ("infohash", ih),
+            ("id", "fedcba9876543210fedcba9876543210fedcba98"),
             ("url", "https://e/x"),
             ("magnet", &format!("magnet:?xt=urn:btih:{ih}")),
         ]))
@@ -1422,9 +1522,49 @@ mod tests {
     }
 
     #[test]
+    fn getstream_legacy_id_uses_content_id_resolver_key() {
+        let id = "89ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        let sel = ace_selected_stream(&params(&[("id", id)])).unwrap();
+        let normalized = id.to_ascii_lowercase();
+        assert_eq!(sel.public_id, normalized);
+        assert_eq!(sel.playback_id, format!("cid:{normalized}"));
+        assert_eq!(sel.session_key, format!("cid:{normalized}"));
+        assert_eq!(sel.content_id.as_deref(), Some(normalized.as_str()));
+    }
+
+    #[test]
+    fn getstream_infohash_remains_a_direct_swarm_key() {
+        let infohash = "89ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        let sel = ace_selected_stream(&params(&[("infohash", infohash)])).unwrap();
+        let normalized = infohash.to_ascii_lowercase();
+        assert_eq!(sel.playback_id, normalized);
+        assert_eq!(sel.session_key, normalized);
+        assert!(sel.content_id.is_none());
+    }
+
+    #[test]
     fn getstream_rejects_bad_url_and_magnet() {
-        assert!(ace_selected_stream(&params(&[("url", "file:///etc/passwd")])).is_none());
-        assert!(ace_selected_stream(&params(&[("magnet", "magnet:?dn=noxt")])).is_none());
+        assert!(ace_selected_stream(&params(&[("url", "file:///etc/passwd")])).is_err());
+        assert!(ace_selected_stream(&params(&[("magnet", "magnet:?dn=noxt")])).is_err());
+    }
+
+    #[test]
+    fn getstream_rejects_malformed_hash_selectors_without_falling_through() {
+        assert_eq!(
+            ace_selected_stream(&params(&[("id", "short")])),
+            Err("invalid id")
+        );
+        assert_eq!(
+            ace_selected_stream(&params(&[("infohash", "not-hex")])),
+            Err("invalid infohash")
+        );
+        assert_eq!(
+            ace_selected_stream(&params(&[
+                ("content_id", "bad"),
+                ("infohash", "0123456789abcdef0123456789abcdef01234567",),
+            ])),
+            Err("invalid content_id")
+        );
     }
 
     fn state() -> AppState {
@@ -1678,6 +1818,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_lease_guard_removes_its_entry_after_authorization_expiry() {
+        let now = Instant::now();
+        let sessions = Arc::new(AceSessionStore::new(Duration::from_secs(1), 4));
+        sessions.insert_at(
+            "expired-token".into(),
+            "same-id".into(),
+            "same-key".into(),
+            now - Duration::from_secs(2),
+        );
+        let guard = AceDirectLeaseGuard {
+            sessions: sessions.clone(),
+            playback_id: "same-id".into(),
+            token: "expired-token".into(),
+        };
+
+        assert!(
+            !sessions.revoke("same-id", "expired-token"),
+            "normal revoke must retain its unexpired-authorization requirement"
+        );
+        assert_eq!(sessions.active_count(), 1);
+        drop(guard);
+        assert_eq!(
+            sessions.active_count(),
+            0,
+            "the owner guard must remove its entry even after authorization expires"
+        );
+    }
+
     #[tokio::test]
     async fn networks_lists_registered() {
         let resp = router(state())
@@ -1769,6 +1938,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ace_getstream_without_format_directly_streams_legacy_id_as_mpegts() {
+        use futures::StreamExt;
+        let content_id = "2123456789abcdef0123456789abcdef01234567";
+        let state = ace_compat_state(0);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/getstream?id={content_id}&use_api_events=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp2t");
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap()[0], 0x47);
+        assert!(manager
+            .get("fix", &format!("cid:{content_id}"))
+            .await
+            .is_some());
+        assert!(manager.get("fix", content_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ace_direct_and_json_playback_share_source_and_disconnect_independently() {
+        use futures::StreamExt;
+        let infohash = "0123456789abcdef0123456789abcdef01234567";
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(PacedFixtureProvider));
+        let manager = StreamManager::new(registry);
+        let ace_sessions = Arc::new(AceSessionStore::default());
+        let app = router(AppState {
+            manager: manager.clone(),
+            networks: vec!["fix".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: ace_sessions.clone(),
+            experimental_ace_compat: true,
+            broadcasts: None,
+        });
+
+        let minted = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/getstream?format=json&infohash={infohash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let minted = axum::body::to_bytes(minted.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let minted: serde_json::Value = serde_json::from_slice(&minted).unwrap();
+        let playback_path = minted["response"]["playback_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        let mut json_body = app
+            .clone()
+            .oneshot(Request::get(playback_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        let mut direct_body = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/getstream?infohash={infohash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+
+        assert!(json_body.next().await.transpose().unwrap().is_some());
+        assert!(direct_body.next().await.transpose().unwrap().is_some());
+        assert_eq!(
+            manager
+                .get("fix", infohash)
+                .await
+                .unwrap()
+                .subscriber_count(),
+            2
+        );
+        assert_eq!(ace_sessions.active_count(), 2);
+        drop(direct_body);
+        assert_eq!(
+            manager
+                .get("fix", infohash)
+                .await
+                .unwrap()
+                .subscriber_count(),
+            1
+        );
+        assert_eq!(
+            ace_sessions.active_count(),
+            1,
+            "disconnecting direct playback must revoke its hidden lease only"
+        );
+        assert!(
+            json_body.next().await.transpose().unwrap().is_some(),
+            "dropping the direct caller must not interrupt the JSON playback caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn ace_getstream_errors_are_deterministic_and_do_not_start_sources() {
+        async fn get_json(app: &Router, path: &str) -> serde_json::Value {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let state = ace_compat_state(0);
+        let manager = state.manager.clone();
+        let app = router(state);
+        assert_eq!(
+            get_json(&app, "/ace/getstream").await["error"],
+            "missing content_id/infohash/id/url/magnet"
+        );
+        assert_eq!(
+            get_json(
+                &app,
+                "/ace/getstream?content_id=bad&infohash=0123456789abcdef0123456789abcdef01234567",
+            )
+            .await["error"],
+            "invalid content_id"
+        );
+        assert_eq!(
+            get_json(
+                &app,
+                "/ace/getstream?format=xml&infohash=0123456789abcdef0123456789abcdef01234567",
+            )
+            .await["error"],
+            "unsupported format"
+        );
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ace_direct_start_failure_revokes_its_hidden_lease() {
+        let sessions = Arc::new(AceSessionStore::default());
+        let app = router(AppState {
+            manager: StreamManager::new(ProviderRegistry::new()),
+            networks: vec!["fix".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: sessions.clone(),
+            experimental_ace_compat: true,
+            broadcasts: None,
+        });
+        let response = app
+            .oneshot(
+                Request::get("/ace/getstream?infohash=0123456789abcdef0123456789abcdef01234567")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(sessions.active_count(), 0);
+    }
+
+    #[tokio::test]
     async fn ace_getstream_mints_distinct_enforced_tokens() {
         let content_id = "2123456789abcdef0123456789abcdef01234567";
         let app = router(ace_compat_state(0));
@@ -1777,9 +2123,11 @@ mod tests {
             let response = app
                 .clone()
                 .oneshot(
-                    Request::get(format!("/ace/getstream?content_id={content_id}"))
-                        .body(Body::empty())
-                        .unwrap(),
+                    Request::get(format!(
+                        "/ace/getstream?format=json&content_id={content_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
                 )
                 .await
                 .unwrap();
@@ -1839,9 +2187,11 @@ mod tests {
         let minted = app
             .clone()
             .oneshot(
-                Request::get(format!("/ace/getstream?content_id={content_id}"))
-                    .body(Body::empty())
-                    .unwrap(),
+                Request::get(format!(
+                    "/ace/getstream?format=json&content_id={content_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -1893,9 +2243,11 @@ mod tests {
         let minted = app
             .clone()
             .oneshot(
-                Request::get(format!("/ace/getstream?content_id={content_id}"))
-                    .body(Body::empty())
-                    .unwrap(),
+                Request::get(format!(
+                    "/ace/getstream?format=json&content_id={content_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -1976,7 +2328,7 @@ mod tests {
     #[tokio::test]
     async fn ace_stop_isolates_two_compat_clients_and_preserves_native_consumer() {
         use futures::StreamExt;
-        let id = "shared";
+        let id = "0123456789abcdef0123456789abcdef01234567";
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(PacedFixtureProvider));
         let manager = StreamManager::new(registry);
@@ -1993,7 +2345,7 @@ mod tests {
             let response = app
                 .clone()
                 .oneshot(
-                    Request::get(format!("/ace/getstream?infohash={id}"))
+                    Request::get(format!("/ace/getstream?format=json&infohash={id}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
