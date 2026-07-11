@@ -167,15 +167,9 @@ the Cargo version. The workflow:
 
 ## Runtime Surfaces
 
-Native API:
-
-- `GET /healthz`
-- `GET /streams`
-- `GET /streams/ace/<id>.ts`
-- HLS and playlist routes backed by the native stream session layer
-- `GET /vod/<network>/<id>` - single-file VOD, SHA1-verified, with `Content-Length` and seekable `Range` support (`206`)
-- `PUT /broadcast/<name>`
-- `GET /broadcast/<name>`
+The supported integration contract is the native CLI and HTTP API. See the
+route table, response shapes, and VLC/Jellyfin/dispatcharr examples in
+[`docs/native-api.md`](docs/native-api.md).
 
 Legacy Acestream-compatible routes such as `/ace/*` and `/server/api` are
 experimental and disabled by default. Enable them only when needed:

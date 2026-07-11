@@ -2100,6 +2100,8 @@ mod tests {
             "/ace/stat/0123456789012345678901234567890123456789/outpace",
             "/ace/cmd/0123456789012345678901234567890123456789/outpace?method=stop",
             "/server/api?method=get_version",
+            "/ace/manifest.m3u8?infohash=0123456789012345678901234567890123456789",
+            "/ace/c/session/0.ts",
         ] {
             let resp = router(fixture_state(0))
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
