@@ -85,6 +85,7 @@ OUTPACE_EXPERIMENTAL_ACE_COMPAT=1 outpace serve
 
 The flag does not change native routes. Compatibility is deliberately not a full engine clone:
 account/premium, UI remote control, channel catalog, playlist/EPG, and encrypted-content features
-are unsupported. `/ace/manifest.m3u8` and `/ace/c/<session>/<seq>.ts` are deferred and return
-`404`; use native HLS. The exact supported methods and error envelopes are pinned in
+are unsupported. The live `/ace/manifest.m3u8`, tokenized `/ace/m/...m3u8`, and
+`/ace/c/<session>/<seq>.ts` adapter reuses the native live HLS packager; compatibility VOD remains
+deferred. The exact supported methods and error envelopes are pinned in
 [`protocol/compat-matrix.md`](protocol/compat-matrix.md).
