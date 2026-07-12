@@ -11,6 +11,18 @@ pub const MAX_LIVE_RECOVERY_PARALLEL_CONNECT: usize = 1024;
 pub const MAX_LIVE_RECOVERY_PIECE_ADVANCE: u64 = 16_384;
 pub const MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD: u64 = 65_536;
 
+/// Absolute ceiling for one configured in-memory retention pool. The address-space-relative
+/// limit below is stricter on 32-bit targets; this ceiling keeps a single pool bounded on 64-bit
+/// targets where `isize::MAX` is far larger than a practical allocation.
+const MAX_CONFIGURED_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Reserve three quarters of the largest representable object for the runtime, allocator,
+/// indexes, connection buffers, and other active sessions. This is a per-pool guard, not a claim
+/// that several pools can all grow to the returned limit simultaneously.
+pub(crate) fn safe_in_memory_pool_limit(max_object_bytes: u64) -> u64 {
+    (max_object_bytes / 4).min(MAX_CONFIGURED_MEMORY_BYTES)
+}
+
 /// Where the seed store (`PieceStore`) keeps piece data. Mirrors Acestream's
 /// `--live-cache-type`. The disk backend trades RAM for capacity; both honor the same
 /// `seed_store_bytes` budget.
@@ -145,6 +157,10 @@ impl HlsConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_for_object_limit(isize::MAX as u64)
+    }
+
+    pub(crate) fn validate_for_object_limit(&self, max_object_bytes: u64) -> Result<(), String> {
         if self.segment_packets == 0 {
             return Err("OUTPACE_HLS_SEGMENT_PACKETS must be >= 1".into());
         }
@@ -153,6 +169,34 @@ impl HlsConfig {
         }
         if self.segment_duration_ms == 0 {
             return Err("OUTPACE_HLS_SEGMENT_DURATION_MS must be >= 1".into());
+        }
+
+        let segment_bytes = u64::try_from(self.segment_packets)
+            .ok()
+            .and_then(|packets| packets.checked_mul(188))
+            .ok_or("OUTPACE_HLS_SEGMENT_PACKETS byte count overflows on this target")?;
+        if segment_bytes > max_object_bytes {
+            return Err(format!(
+                "OUTPACE_HLS_SEGMENT_PACKETS requires a {segment_bytes}-byte Vec, exceeding this target's {max_object_bytes}-byte object limit"
+            ));
+        }
+
+        // The live packager can retain `window_segments` completed segments plus its current
+        // segment. Bound their payload bytes as a unit; VecDeque/Bytes metadata and the rest of
+        // the daemon consume additional memory, which is why the pool limit is only one quarter
+        // of the target's maximum object size (and capped at 8 GiB on 64-bit).
+        let retained_segments = u64::try_from(self.window_segments)
+            .ok()
+            .and_then(|window| window.checked_add(1))
+            .ok_or("OUTPACE_HLS_WINDOW_SEGMENTS overflows on this target")?;
+        let retained_bytes = segment_bytes
+            .checked_mul(retained_segments)
+            .ok_or("configured HLS retained byte count overflows")?;
+        let safe_limit = safe_in_memory_pool_limit(max_object_bytes);
+        if retained_bytes > safe_limit {
+            return Err(format!(
+                "configured HLS window may retain {retained_bytes} bytes, exceeding this target's conservative {safe_limit}-byte in-memory pool limit"
+            ));
         }
         Ok(())
     }
@@ -336,6 +380,59 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("OUTPACE_MAX_REASM_PIECES_AHEAD"));
+    }
+
+    #[test]
+    fn simulated_32_bit_hls_bounds_segment_and_retained_window_bytes() {
+        let object_limit = i32::MAX as u64;
+        let mut config = HlsConfig {
+            segment_packets: 1_000_000,
+            window_segments: 1,
+            segment_duration_ms: 1000,
+        };
+        config.validate_for_object_limit(object_limit).unwrap();
+
+        config.window_segments = 2;
+        let err = config.validate_for_object_limit(object_limit).unwrap_err();
+        assert!(
+            err.contains("HLS window may retain"),
+            "unexpected error: {err}"
+        );
+
+        config.segment_packets = (usize::try_from(object_limit).unwrap() / 188) + 1;
+        config.window_segments = 1;
+        let err = config.validate_for_object_limit(object_limit).unwrap_err();
+        assert!(err.contains("byte Vec"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn simulated_32_bit_hls_accepts_largest_window_and_rejects_one_more_segment() {
+        let object_limit = i32::MAX as u64;
+        let safe_limit = safe_in_memory_pool_limit(object_limit);
+        let max_retained_segments = safe_limit / 188;
+        let mut config = HlsConfig {
+            segment_packets: 1,
+            window_segments: usize::try_from(max_retained_segments - 1).unwrap(),
+            segment_duration_ms: 1000,
+        };
+
+        config.validate_for_object_limit(object_limit).unwrap();
+        config.window_segments += 1;
+        let err = config.validate_for_object_limit(object_limit).unwrap_err();
+        assert!(
+            err.contains("HLS window may retain"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hls_rejects_checked_arithmetic_extremes() {
+        let config = HlsConfig {
+            segment_packets: 1,
+            window_segments: usize::MAX,
+            segment_duration_ms: 1000,
+        };
+        assert!(config.validate_for_object_limit(u64::MAX).is_err());
     }
 
     #[test]

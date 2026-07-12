@@ -2,7 +2,7 @@
 
 use crate::ace_provider::AceProvider;
 use crate::broadcast::{Broadcast, BroadcastRegistry};
-use crate::config::{load_or_create_identity, CacheType, Config};
+use crate::config::{load_or_create_identity, safe_in_memory_pool_limit, CacheType, Config};
 use crate::http::{router, AppState, BroadcastState};
 use crate::manager::StreamManager;
 use crate::provider::ProviderRegistry;
@@ -136,6 +136,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     }
     config.live_recovery.validate()?;
     config.hls.validate()?;
+    validate_cache_budget(&config)?;
     Ok(config)
 }
 
@@ -197,6 +198,27 @@ fn prepare_disk_cache_paths(config: &mut Config) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Reject an in-memory retention budget that leaves insufficient target-relative address space
+/// for allocator overhead, store indexes, runtime buffers, and other active sessions. Disk cache
+/// accounting remains `u64` and is not constrained by the process's maximum object size.
+fn validate_cache_budget(config: &Config) -> Result<(), String> {
+    validate_cache_budget_for_object_limit(config, isize::MAX as u64)
+}
+
+fn validate_cache_budget_for_object_limit(
+    config: &Config,
+    max_object_bytes: u64,
+) -> Result<(), String> {
+    let safe_limit = safe_in_memory_pool_limit(max_object_bytes);
+    if config.cache_type == CacheType::Memory && config.seed_store_bytes > safe_limit {
+        return Err(format!(
+            "OUTPACE_SEED_STORE_BYTES={} exceeds this target's conservative {}-byte memory-cache limit; reduce it or set OUTPACE_CACHE_TYPE=disk",
+            config.seed_store_bytes, safe_limit
+        ));
+    }
+    Ok(())
+}
+
 pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
     // OUTPACE_ACE_PEERS=ip:port,ip:port — bootstrap peers for the proven live path
     // until DHT / ut_metadata discovery is wired.
@@ -248,6 +270,10 @@ pub async fn build_runtime(
     mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    config.live_recovery.validate()?;
+    config.hls.validate()?;
+    validate_cache_budget(&config)?;
+
     // This must precede identity creation and, critically, the disk cache's remove_dir_all.
     // `build_runtime` is the single validation boundary for both env-derived Config and direct
     // library/test callers, and it runs before any destructive operation.
@@ -881,6 +907,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_hls_segment_byte_count_overflow() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OUTPACE_HLS_SEGMENT_PACKETS", usize::MAX.to_string());
+        let err = config_from_env().unwrap_err().to_string();
+        std::env::remove_var("OUTPACE_HLS_SEGMENT_PACKETS");
+        assert!(
+            err.contains("OUTPACE_HLS_SEGMENT_PACKETS")
+                && (err.contains("byte count overflows") || err.contains("object limit")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn parses_cache_type_and_dir() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("OUTPACE_CACHE_TYPE", "disk");
@@ -1031,6 +1070,29 @@ mod tests {
             "validated cache path and deleted path must have identical filesystem semantics"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn simulated_32_bit_memory_cache_enforces_conservative_boundary() {
+        let object_limit = i32::MAX as u64;
+        let safe_limit = safe_in_memory_pool_limit(object_limit);
+        let mut config = Config {
+            cache_type: CacheType::Memory,
+            seed_store_bytes: safe_limit,
+            ..Config::default()
+        };
+        validate_cache_budget_for_object_limit(&config, object_limit).unwrap();
+
+        config.seed_store_bytes = safe_limit + 1;
+        let err = validate_cache_budget_for_object_limit(&config, object_limit).unwrap_err();
+        assert!(
+            err.contains("OUTPACE_SEED_STORE_BYTES"),
+            "unexpected error: {err}"
+        );
+
+        config.cache_type = CacheType::Disk;
+        config.seed_store_bytes = u64::MAX;
+        validate_cache_budget_for_object_limit(&config, object_limit).unwrap();
     }
 
     #[tokio::test]

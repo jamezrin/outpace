@@ -105,6 +105,7 @@ Available targets:
 
 - `x86_64-unknown-linux-musl`
 - `aarch64-unknown-linux-musl`
+- `armv7-unknown-linux-musleabihf`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
@@ -138,6 +139,11 @@ docker run --rm \
 
 The container defaults to `outpace serve`. It sets `OUTPACE_BIND=0.0.0.0:6878`,
 `OUTPACE_RTMP_BIND=0.0.0.0:1935`, and `OUTPACE_DATA_DIR=/var/lib/outpace`.
+Inbound peer serving currently listens on TCP 8621; DHT and tracker UDP traffic use outbound
+sockets and does not require publishing UDP 8621.
+The image manifest includes `linux/amd64`, `linux/arm64`, and `linux/arm/v7`. See
+[`docs/linux-portability.md`](docs/linux-portability.md) for ARMv7 resource guidance and the
+manual aarch64 16 KiB-page qualification procedure.
 
 For a checked-in production Compose deployment, safe exposure defaults, leecher/disk/broadcast
 examples, DNS overrides, and upgrade guidance, see
@@ -162,7 +168,8 @@ Pushing the tag runs `.github/workflows/release.yml`. It reads the version from
 not match `v<cargo_version>`, so artifact names and Docker tags always agree with
 the Cargo version. The workflow:
 
-- builds Linux, macOS, and Windows binaries for amd64 and arm64;
+- builds Linux binaries for amd64, arm64, and ARMv7, plus macOS and Windows binaries for amd64
+  and arm64;
 - uploads `tar.gz` archives for Unix targets and `zip` archives for Windows;
 - generates one `SHA256SUMS` file for all archives;
 - creates a GitHub Release with generated release notes;
