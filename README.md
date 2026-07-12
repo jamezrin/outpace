@@ -132,13 +132,16 @@ docker run --rm \
   -p 6878:6878 \
   -p 1935:1935 \
   -p 8621:8621/tcp \
-  -p 8621:8621/udp \
   -v outpace-data:/var/lib/outpace \
   ghcr.io/jamezrin/outpace:0.1.0
 ```
 
 The container defaults to `outpace serve`. It sets `OUTPACE_BIND=0.0.0.0:6878`,
 `OUTPACE_RTMP_BIND=0.0.0.0:1935`, and `OUTPACE_DATA_DIR=/var/lib/outpace`.
+
+For a checked-in production Compose deployment, safe exposure defaults, leecher/disk/broadcast
+examples, DNS overrides, and upgrade guidance, see
+[`docs/deployment.md`](docs/deployment.md).
 
 ## Cutting a Release
 
@@ -249,8 +252,16 @@ Environment variables parsed by the daemon include:
   default; the exposed surface is the peer port, as with Acestream. Set
   `OUTPACE_ENABLE_INBOUND=0` for a pure-leecher deployment (no inbound listener, no seeder
   self-announce).
+- `OUTPACE_ENABLE_PORT_MAPPING` - best-effort UPnP/NAT-PMP mapping for the inbound TCP peer
+  listener, default off. Use only when the process owns the host/LAN-facing network address;
+  normal bridge-mode containers should use a manual router-to-Docker-host TCP forward.
+- `OUTPACE_PORT_MAP_BACKEND` - `auto`, `upnp`, `natpmp`, or `none`; default `auto`.
+- `OUTPACE_PORT_MAP_EXTERNAL_PORT` - optional external TCP port requested from the gateway.
 - `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - enables legacy compatibility routes.
 - `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
+
+Boolean gates accept exactly `1`, `true`, `0`, or `false`; other values are configuration errors
+rather than silently disabling a feature.
 
 The disk cache is **ephemeral**: its directory is cleared when a store is created and
 never reloaded across restarts (live piece data goes stale), which also avoids serving

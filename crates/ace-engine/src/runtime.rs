@@ -116,14 +116,14 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_SEED_TTL_SECS") {
         config.seed_ttl_secs = v.parse()?;
     }
-    if let Ok(v) = std::env::var("OUTPACE_ENABLE_SEEDING") {
-        config.enable_seeding = matches!(v.as_str(), "1" | "true");
+    if let Some(v) = bool_from_env("OUTPACE_ENABLE_SEEDING")? {
+        config.enable_seeding = v;
     }
-    if let Ok(v) = std::env::var("OUTPACE_ENABLE_INBOUND") {
-        config.enable_inbound = matches!(v.as_str(), "1" | "true");
+    if let Some(v) = bool_from_env("OUTPACE_ENABLE_INBOUND")? {
+        config.enable_inbound = v;
     }
-    if let Ok(v) = std::env::var("OUTPACE_ENABLE_PORT_MAPPING") {
-        config.enable_port_mapping = matches!(v.as_str(), "1" | "true");
+    if let Some(v) = bool_from_env("OUTPACE_ENABLE_PORT_MAPPING")? {
+        config.enable_port_mapping = v;
     }
     if let Ok(v) = std::env::var("OUTPACE_PORT_MAP_BACKEND") {
         config.port_map_backend = v.parse()?;
@@ -131,12 +131,70 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_PORT_MAP_EXTERNAL_PORT") {
         config.port_map_external_port = Some(v.parse()?);
     }
-    if let Ok(v) = std::env::var("OUTPACE_EXPERIMENTAL_ACE_COMPAT") {
-        config.experimental_ace_compat = matches!(v.as_str(), "1" | "true");
+    if let Some(v) = bool_from_env("OUTPACE_EXPERIMENTAL_ACE_COMPAT")? {
+        config.experimental_ace_compat = v;
     }
     config.live_recovery.validate()?;
     config.hls.validate()?;
     Ok(config)
+}
+
+fn bool_from_env(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    let value = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{name} must be valid UTF-8 and one of: 1, true, 0, false").into())
+        }
+    };
+    match value.as_str() {
+        "1" | "true" => Ok(Some(true)),
+        "0" | "false" => Ok(Some(false)),
+        _ => Err(format!("invalid {name}: {value:?}; expected one of: 1, true, 0, false").into()),
+    }
+}
+
+/// Create and resolve the disk/data roots before any persistent state is loaded or cache cleanup
+/// runs. Validation and later deletion must use this exact canonical cache path: lexically
+/// collapsing `..` first is unsafe because `symlink/..` is resolved by the filesystem relative to
+/// the symlink target, not its lexical parent.
+///
+/// A cache nested under the data directory is safe and remains the documented default. A cache
+/// equal to or containing the data directory is rejected because startup wipes the cache root.
+fn prepare_disk_cache_paths(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.cache_type != CacheType::Disk {
+        return Ok(());
+    }
+
+    // Directory creation is non-destructive and lets canonicalize apply the same symlink/`..`
+    // semantics that remove_dir_all will use. Do this before identity creation so a rejected
+    // relationship cannot overwrite or delete persistent state.
+    std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
+        format!(
+            "cannot create OUTPACE_CACHE_DIR {}: {e}",
+            config.cache_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+        format!(
+            "cannot create OUTPACE_DATA_DIR {}: {e}",
+            config.data_dir.display()
+        )
+    })?;
+
+    let cache_dir = config.cache_dir.canonicalize()?;
+    let data_dir = config.data_dir.canonicalize()?;
+    if data_dir.starts_with(&cache_dir) {
+        return Err(format!(
+            "OUTPACE_CACHE_DIR {} must not equal or contain OUTPACE_DATA_DIR {}; use a cache directory nested inside the data directory or a separate path",
+            config.cache_dir.display(),
+            config.data_dir.display()
+        )
+        .into());
+    }
+    config.cache_dir = cache_dir;
+    config.data_dir = data_dir;
+    Ok(())
 }
 
 pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
@@ -187,9 +245,13 @@ fn url_host_from_ip(ip: IpAddr) -> String {
 }
 
 pub async fn build_runtime(
-    config: Config,
+    mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    // This must precede identity creation and, critically, the disk cache's remove_dir_all.
+    // `build_runtime` is the single validation boundary for both env-derived Config and direct
+    // library/test callers, and it runs before any destructive operation.
+    prepare_disk_cache_paths(&mut config)?;
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
 
     // Fail fast on a misconfigured disk cache, and start from a clean slate: wipe the cache root
@@ -440,8 +502,35 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
     eprintln!("  MPEG-TS: http://{}/streams/ace/<id>.ts", config.bind);
     eprintln!("  HLS:     http://{}/streams/ace/<id>.m3u8", config.bind);
     eprintln!("  status:  http://{}/streams", config.bind);
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C signal handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    eprintln!("outpace: shutdown signal received; draining HTTP connections");
 }
 
 pub async fn mint_broadcast(runtime: &EngineRuntime, name: &str) -> Broadcast {
@@ -626,6 +715,36 @@ mod tests {
         std::env::remove_var("OUTPACE_PORT_MAP_EXTERNAL_PORT");
     }
 
+    #[test]
+    fn exposed_boolean_gates_use_one_strict_parser() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let names = [
+            "OUTPACE_ENABLE_SEEDING",
+            "OUTPACE_ENABLE_INBOUND",
+            "OUTPACE_ENABLE_PORT_MAPPING",
+            "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+        ];
+        for name in names {
+            std::env::remove_var(name);
+            for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                std::env::set_var(name, value);
+                assert_eq!(
+                    bool_from_env(name).unwrap(),
+                    Some(expected),
+                    "{name}={value}"
+                );
+            }
+            std::env::set_var(name, "ture");
+            let error = config_from_env().unwrap_err().to_string();
+            assert!(error.contains(name), "unexpected error: {error}");
+            assert!(
+                error.contains("expected one of"),
+                "unexpected error: {error}"
+            );
+            std::env::remove_var(name);
+        }
+    }
+
     #[tokio::test]
     async fn mapped_port_replaces_local_port_and_loss_falls_back() {
         use ace_swarm::portmap::MappedEndpoint;
@@ -783,6 +902,135 @@ mod tests {
         let err = config_from_env().err();
         std::env::remove_var("OUTPACE_CACHE_TYPE");
         assert!(err.is_some(), "unknown cache type must be rejected");
+    }
+
+    #[test]
+    fn disk_cache_may_be_nested_under_data_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "outpace-safe-cache-paths-{}",
+            rand::random::<u64>()
+        ));
+        let mut config = Config {
+            data_dir: root.clone(),
+            cache_type: CacheType::Disk,
+            cache_dir: root.join("state/../cache"),
+            ..Config::default()
+        };
+        prepare_disk_cache_paths(&mut config).unwrap();
+        assert!(config.cache_dir.starts_with(&config.data_dir));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_equal_to_data_dir_is_rejected_before_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "outpace-cache-equals-data-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("persistent-state");
+        std::fs::write(&marker, b"keep").unwrap();
+        let config = Config {
+            data_dir: root.clone(),
+            cache_type: CacheType::Disk,
+            cache_dir: root.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        let error = build_runtime(config, vec![])
+            .await
+            .err()
+            .expect("equal cache/data paths must fail")
+            .to_string();
+        assert!(
+            error.contains("must not equal or contain"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            marker.exists(),
+            "validation must run before destructive cache cleanup"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_ancestor_of_data_dir_is_rejected_before_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "outpace-cache-contains-data-{}",
+            rand::random::<u64>()
+        ));
+        let data_dir = root.join("persistent");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let marker = data_dir.join("identity-and-broadcast-state");
+        std::fs::write(&marker, b"keep").unwrap();
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            cache_dir: root.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        let error = build_runtime(config, vec![])
+            .await
+            .err()
+            .expect("a cache containing the data directory must fail")
+            .to_string();
+        assert!(
+            error.contains("must not equal or contain"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            marker.exists(),
+            "validation must run before destructive cache cleanup"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_sensitive_parent_path_cannot_bypass_cache_guard() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "outpace-cache-symlink-parent-{}",
+            rand::random::<u64>()
+        ));
+        let a = root.join("a");
+        let b = root.join("b");
+        let symlink_target = b.join("sub");
+        let data_dir = b.join("state");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&symlink_target).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        symlink(&symlink_target, a.join("link")).unwrap();
+        let marker = data_dir.join("MUST_SURVIVE");
+        std::fs::write(&marker, b"persistent state").unwrap();
+
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            // Filesystem resolution is `<target-of-link>/..` = `b`, not lexical `a`.
+            cache_dir: a.join("link/.."),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        let error = build_runtime(config, vec![])
+            .await
+            .err()
+            .expect("symlink-sensitive cache ancestor must fail")
+            .to_string();
+        assert!(
+            error.contains("must not equal or contain"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            marker.exists(),
+            "validated cache path and deleted path must have identical filesystem semantics"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

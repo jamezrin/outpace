@@ -23,7 +23,7 @@ LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && groupadd --system outpace \
     && useradd --system --gid outpace --home-dir /var/lib/outpace --shell /usr/sbin/nologin outpace \
     && mkdir -p /var/lib/outpace \
@@ -37,7 +37,7 @@ ENV OUTPACE_BIND=0.0.0.0:6878 \
     OUTPACE_RTMP_BIND=0.0.0.0:1935 \
     OUTPACE_DATA_DIR=/var/lib/outpace
 
-EXPOSE 6878/tcp 1935/tcp 8621/tcp 8621/udp
+EXPOSE 6878/tcp 1935/tcp 8621/tcp
 VOLUME ["/var/lib/outpace"]
 
 USER outpace
