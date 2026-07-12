@@ -194,6 +194,15 @@ impl HlsPackager {
 
     /// Render the live media playlist; segment URIs are absolute under the given prefix.
     pub fn playlist(&self, network: &str, id: &str) -> String {
+        self.playlist_with_segment_prefix(&format!("/streams/{network}/{id}/seg"))
+    }
+
+    /// Render the same retained live window with a caller-provided segment route.
+    ///
+    /// Compatibility adapters use this to expose the native packager's bytes and sequence
+    /// numbers under their own authenticated URL. It deliberately does not create or copy HLS
+    /// state: native and compatibility playlists are two views of this one sliding window.
+    pub fn playlist_with_segment_prefix(&self, segment_prefix: &str) -> String {
         let st = self.state.lock().unwrap();
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
         out.push_str(&format!(
@@ -207,7 +216,7 @@ impl HlsPackager {
             }
             out.push_str(&format!("#EXTINF:{:.3},\n", segment.duration));
             out.push_str(&format!(
-                "/streams/{network}/{id}/seg/{}.ts\n",
+                "{segment_prefix}/{}.ts\n",
                 st.media_seq + i as u64
             ));
         }
@@ -534,6 +543,33 @@ mod tests {
         assert!(p.segment(1).is_none());
         assert_eq!(p.segment(3).unwrap().len(), 2 * TS_PACKET);
         assert!(p.segment(99).is_none());
+    }
+
+    #[test]
+    fn alternate_playlist_prefix_reuses_native_sequence_and_discontinuity_state() {
+        let p = pkg();
+        p.feed(&packets(2));
+        p.discontinuity();
+        p.feed(&packets(2));
+
+        let native = p.playlist("test", "abc");
+        let compat = p.playlist_with_segment_prefix("/ace/c/client-token");
+
+        assert!(native.contains("/streams/test/abc/seg/0.ts"));
+        assert!(compat.contains("/ace/c/client-token/0.ts"));
+        assert!(compat.contains("/ace/c/client-token/1.ts"));
+        let native_metadata: Vec<_> = native
+            .lines()
+            .filter(|line| line.starts_with('#'))
+            .collect();
+        let compat_metadata: Vec<_> = compat
+            .lines()
+            .filter(|line| line.starts_with('#'))
+            .collect();
+        assert_eq!(
+            native_metadata, compat_metadata,
+            "changing the URI prefix must preserve every playlist metadata, sequence, duration, and discontinuity line"
+        );
     }
 
     #[test]

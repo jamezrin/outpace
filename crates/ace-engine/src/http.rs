@@ -4,8 +4,7 @@
 use crate::broadcast::BroadcastRegistry;
 use crate::manager::StreamManager;
 use crate::provider::{ProviderError, VodByteSource, VodContent};
-use crate::session::StreamEvent;
-use crate::session::StreamSession;
+use crate::session::{StreamEvent, StreamSession, Subscription};
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::{infohash_hex, resolve_via_catalog, stream_info_from_transport_url};
 use axum::body::Body;
@@ -17,6 +16,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
@@ -24,12 +24,16 @@ use tokio::sync::broadcast::error::RecvError;
 const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ACE_TOKEN_CAPACITY: usize = 4096;
 
-#[derive(Clone)]
 struct AceLease {
     playback_id: String,
     session_key: String,
     expires_at: Instant,
     cancel: tokio::sync::watch::Sender<bool>,
+    /// An HLS client has no long-lived response body to own its subscriber count. Keep one
+    /// receiver in the bounded lease instead, so the manager reaper sees the client until stop,
+    /// expiry, or capacity eviction. The receiver is never read; the packager uses its own raw
+    /// receiver and remains the sole segmenting pipeline.
+    _hls_pin: Option<Subscription>,
 }
 
 /// Owns a hidden direct-playback lease for exactly as long as its HTTP body exists.
@@ -51,6 +55,20 @@ pub struct AceSessionStore {
     leases: Mutex<HashMap<String, AceLease>>,
     ttl: Duration,
     capacity: usize,
+    /// A single weak-reference reaper handles every HLS deadline for this store. Mutations bump
+    /// the watch generation so capacity eviction, stop, and revoke cancel its current sleep and
+    /// make it recalculate the next live deadline.
+    hls_reaper_signal: tokio::sync::watch::Sender<u64>,
+    hls_reaper_started: AtomicBool,
+    hls_reaper_workers: Arc<AtomicUsize>,
+}
+
+struct HlsReaperGuard(Arc<AtomicUsize>);
+
+impl Drop for HlsReaperGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Default for AceSessionStore {
@@ -61,10 +79,14 @@ impl Default for AceSessionStore {
 
 impl AceSessionStore {
     fn new(ttl: Duration, capacity: usize) -> Self {
+        let (hls_reaper_signal, _) = tokio::sync::watch::channel(0);
         Self {
             leases: Mutex::new(HashMap::new()),
             ttl,
             capacity,
+            hls_reaper_signal,
+            hls_reaper_started: AtomicBool::new(false),
+            hls_reaper_workers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -77,16 +99,121 @@ impl AceSessionStore {
         token
     }
 
-    fn insert_at(&self, token: String, playback_id: String, session_key: String, now: Instant) {
+    fn mint_hls(
+        self: &Arc<Self>,
+        playback_id: String,
+        session_key: String,
+        pin: Subscription,
+    ) -> String {
+        use rand::RngCore;
+        let mut bytes = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        self.insert_hls_at(token.clone(), playback_id, session_key, Instant::now(), pin);
+        self.ensure_hls_reaper();
+        self.wake_hls_reaper();
+        token
+    }
+
+    fn ensure_hls_reaper(self: &Arc<Self>) {
+        if self
+            .hls_reaper_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let weak_store = Arc::downgrade(self);
+        let mut signal = self.hls_reaper_signal.subscribe();
+        let workers = self.hls_reaper_workers.clone();
+        workers.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let _guard = HlsReaperGuard(workers);
+            loop {
+                let Some(store) = weak_store.upgrade() else {
+                    break;
+                };
+                let deadline = store.next_hls_expiry();
+                drop(store);
+
+                match deadline {
+                    Some(deadline) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                                if let Some(store) = weak_store.upgrade() {
+                                    store.purge_expired(Instant::now());
+                                } else {
+                                    break;
+                                }
+                            }
+                            changed = signal.changed() => {
+                                if changed.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        if signal.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn next_hls_expiry(&self) -> Option<Instant> {
+        self.leases
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|lease| lease._hls_pin.is_some())
+            .map(|lease| lease.expires_at)
+            .min()
+    }
+
+    fn wake_hls_reaper(&self) {
+        self.hls_reaper_signal
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn purge_expired(&self, now: Instant) {
         let mut leases = self.leases.lock().unwrap();
-        leases.retain(|_, lease| lease.expires_at > now);
+        leases.retain(|_, lease| {
+            let keep = lease.expires_at > now;
+            if !keep {
+                let _ = lease.cancel.send(true);
+            }
+            keep
+        });
+    }
+
+    fn insert_at(&self, token: String, playback_id: String, session_key: String, now: Instant) {
+        self.insert_with_pin(token, playback_id, session_key, now, None);
+    }
+
+    fn insert_with_pin(
+        &self,
+        token: String,
+        playback_id: String,
+        session_key: String,
+        now: Instant,
+        hls_pin: Option<Subscription>,
+    ) {
+        let mut hls_schedule_changed = hls_pin.is_some();
+        self.purge_expired(now);
+        let mut leases = self.leases.lock().unwrap();
         if leases.len() >= self.capacity {
             if let Some(oldest) = leases
                 .iter()
                 .min_by_key(|(_, lease)| lease.expires_at)
                 .map(|(t, _)| t.clone())
             {
-                leases.remove(&oldest);
+                if let Some(lease) = leases.remove(&oldest) {
+                    hls_schedule_changed |= lease._hls_pin.is_some();
+                    let _ = lease.cancel.send(true);
+                }
             }
         }
         let (cancel, _) = tokio::sync::watch::channel(false);
@@ -97,18 +224,45 @@ impl AceSessionStore {
                 session_key,
                 expires_at: now + self.ttl,
                 cancel,
+                _hls_pin: hls_pin,
             },
         );
+        drop(leases);
+        if hls_schedule_changed {
+            self.wake_hls_reaper();
+        }
+    }
+
+    fn insert_hls_at(
+        &self,
+        token: String,
+        playback_id: String,
+        session_key: String,
+        now: Instant,
+        pin: Subscription,
+    ) {
+        self.insert_with_pin(token, playback_id, session_key, now, Some(pin));
     }
 
     fn validate(&self, playback_id: &str, token: &str) -> Option<String> {
         self.validate_at(playback_id, token, Instant::now())
     }
 
+    fn validate_token(&self, token: &str) -> Option<(String, String)> {
+        let now = Instant::now();
+        self.purge_expired(now);
+        self.leases
+            .lock()
+            .unwrap()
+            .get(token)
+            .map(|lease| (lease.playback_id.clone(), lease.session_key.clone()))
+    }
+
     fn validate_at(&self, playback_id: &str, token: &str, now: Instant) -> Option<String> {
-        let mut leases = self.leases.lock().unwrap();
-        leases.retain(|_, lease| lease.expires_at > now);
-        leases
+        self.purge_expired(now);
+        self.leases
+            .lock()
+            .unwrap()
             .get(token)
             .filter(|lease| lease.playback_id == playback_id)
             .map(|lease| lease.session_key.clone())
@@ -123,6 +277,10 @@ impl AceSessionStore {
             if let Some(lease) = leases.remove(token) {
                 let _ = lease.cancel.send(true);
             }
+        }
+        drop(leases);
+        if matches {
+            self.wake_hls_reaper();
         }
         matches
     }
@@ -140,6 +298,10 @@ impl AceSessionStore {
                 let _ = lease.cancel.send(true);
             }
         }
+        drop(leases);
+        if matches {
+            self.wake_hls_reaper();
+        }
         matches
     }
 
@@ -149,9 +311,10 @@ impl AceSessionStore {
         token: &str,
     ) -> Option<(String, Instant, tokio::sync::watch::Receiver<bool>)> {
         let now = Instant::now();
-        let mut leases = self.leases.lock().unwrap();
-        leases.retain(|_, lease| lease.expires_at > now);
-        leases
+        self.purge_expired(now);
+        self.leases
+            .lock()
+            .unwrap()
             .get(token)
             .filter(|lease| lease.playback_id == playback_id)
             .map(|lease| {
@@ -166,6 +329,11 @@ impl AceSessionStore {
     #[cfg(test)]
     fn active_count(&self) -> usize {
         self.leases.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    fn hls_reaper_workers(&self) -> Arc<AtomicUsize> {
+        self.hls_reaper_workers.clone()
     }
 }
 
@@ -250,6 +418,9 @@ pub fn router(state: AppState) -> Router {
         router = router
             .route("/ace/getstream", get(ace_getstream))
             .route("/ace/r/:id/:token", get(ace_playback))
+            .route("/ace/manifest.m3u8", get(ace_manifest))
+            .route("/ace/m/:id/:manifest", get(ace_hls_playback))
+            .route("/ace/c/:session/:segment", get(ace_hls_segment))
             .route("/ace/stat/:id/:token", get(ace_stat))
             .route("/ace/cmd/:id/:token", get(ace_command))
             .route("/server/api", get(server_api));
@@ -592,7 +763,7 @@ async fn ace_getstream(
                 .into_response();
         }
     };
-    let mut selection = match ace_selected_stream(&params) {
+    let selection = match resolve_ace_selection(&s, &params).await {
         Ok(selection) => selection,
         Err(error) => {
             return Json(json!({ "response": null, "error": error })).into_response();
@@ -602,17 +773,6 @@ async fn ace_getstream(
         return Json(json!({ "response": null, "error": "no ace network registered" }))
             .into_response();
     };
-    if s.resolve_content_ids_in_getstream {
-        if let Some(content_id) = selection.content_id.as_deref() {
-            match resolve_via_catalog(content_id).await {
-                Ok(info) => selection = selection.with_resolved_infohash(infohash_hex(&info.infohash)),
-                Err(e) => crate::alog!(
-                    "[ace] getstream content_id catalog resolution failed, falling back to cid: {e:?}"
-                ),
-            }
-        }
-    }
-
     let token = s
         .ace_sessions
         .mint(selection.playback_id.clone(), selection.session_key.clone());
@@ -658,6 +818,140 @@ async fn ace_getstream(
             s.ace_sessions.revoke(&playback_id, &token);
             StatusCode::NOT_FOUND.into_response()
         }
+    }
+}
+
+/// `GET /ace/manifest.m3u8` — start one native live HLS session. The default/`redirect`
+/// response points at a stable, token-authenticated playlist URL; `format=json` returns the
+/// official documented control-URL shape. Both paths use the same native `HlsPackager`.
+async fn ace_manifest(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let format = params
+        .get("format")
+        .map(String::as_str)
+        .unwrap_or("redirect");
+    if !matches!(format, "" | "redirect" | "json") {
+        return Json(json!({ "response": null, "error": "unsupported format" })).into_response();
+    }
+    let selection = match resolve_ace_selection(&s, &params).await {
+        Ok(selection) => selection,
+        Err(error) => {
+            return Json(json!({ "response": null, "error": error })).into_response();
+        }
+    };
+    let Some(network) = ace_network(&s) else {
+        return Json(json!({ "response": null, "error": "no ace network registered" }))
+            .into_response();
+    };
+
+    let _pkg = match s
+        .manager
+        .get_or_start_hls(&network, &selection.session_key)
+        .await
+    {
+        Ok(pkg) => pkg,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let Some(session) = s.manager.get(&network, &selection.session_key).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let token = s.ace_sessions.mint_hls(
+        selection.playback_id.clone(),
+        selection.session_key,
+        session.subscribe(),
+    );
+    let base = request_base(&headers);
+    let playback_url = format!("{base}/ace/m/{}/{}.m3u8", selection.playback_id, token);
+
+    if format == "json" {
+        return Json(json!({
+            "response": {
+                "playback_url": playback_url,
+                "stat_url": format!("{base}/ace/stat/{}/{token}", selection.playback_id),
+                "command_url": format!("{base}/ace/cmd/{}/{token}", selection.playback_id),
+                "infohash": selection.public_id,
+                "playback_session_id": token,
+                "is_live": 1,
+                "is_encrypted": 0,
+                "client_session_id": -1
+            },
+            "error": null
+        }))
+        .into_response();
+    }
+
+    // The documented engine default is a redirect. This also gives media players a stable URL
+    // to reload, avoiding a fresh lease on every HLS playlist refresh.
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, playback_url),
+            (header::CACHE_CONTROL, "no-store".into()),
+        ],
+    )
+        .into_response()
+}
+
+/// Tokenized HLS playlist returned by `/ace/manifest.m3u8` JSON/redirect modes.
+async fn ace_hls_playback(
+    State(s): State<AppState>,
+    Path((id, manifest)): Path<(String, String)>,
+) -> Response {
+    let Some(token) = manifest.strip_suffix(".m3u8") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(session_key) = s.ace_sessions.validate(&id, token) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(network) = ace_network(&s) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        pkg.playlist_with_segment_prefix(&format!("/ace/c/{token}")),
+    )
+        .into_response()
+}
+
+/// Authenticated view of a retained native live HLS segment. Probes never start work.
+async fn ace_hls_segment(
+    State(s): State<AppState>,
+    Path((token, segment)): Path<(String, String)>,
+) -> Response {
+    let Some(seq) = segment
+        .strip_suffix(".ts")
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some((_, session_key)) = s.ace_sessions.validate_token(&token) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(network) = ace_network(&s) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match pkg.segment(seq) {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "video/mp2t"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -845,6 +1139,26 @@ impl AceStreamSelection {
         self.content_id = None;
         self
     }
+}
+
+async fn resolve_ace_selection(
+    s: &AppState,
+    params: &HashMap<String, String>,
+) -> Result<AceStreamSelection, &'static str> {
+    let mut selection = ace_selected_stream(params)?;
+    if s.resolve_content_ids_in_getstream {
+        if let Some(content_id) = selection.content_id.as_deref() {
+            match resolve_via_catalog(content_id).await {
+                Ok(info) => {
+                    selection = selection.with_resolved_infohash(infohash_hex(&info.infohash));
+                }
+                Err(e) => crate::alog!(
+                    "[ace] content-id catalog resolution failed, falling back to cid: {e:?}"
+                ),
+            }
+        }
+    }
+    Ok(selection)
 }
 
 fn ace_selected_stream(
@@ -1676,6 +1990,89 @@ mod tests {
         st
     }
 
+    struct PacedPacketProvider;
+    struct PacedPacketSource {
+        marker: u8,
+    }
+    #[async_trait]
+    impl TsSource for PacedPacketSource {
+        async fn next(&mut self) -> Option<Bytes> {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let mut packet = vec![self.marker; 188];
+            packet[0] = 0x47;
+            self.marker = self.marker.wrapping_add(1);
+            Some(Bytes::from(packet))
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+    #[async_trait]
+    impl StreamProvider for PacedPacketProvider {
+        fn network(&self) -> &'static str {
+            "hlsfix"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(PacedPacketSource { marker: 1 }))
+        }
+    }
+
+    fn ace_hls_state(ttl: Duration, capacity: usize) -> AppState {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(PacedPacketProvider));
+        AppState {
+            manager: StreamManager::with_config(
+                registry,
+                32,
+                crate::config::HlsConfig {
+                    segment_packets: 2,
+                    window_segments: 3,
+                    segment_duration_ms: 1000,
+                },
+            ),
+            networks: vec!["hlsfix".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: Arc::new(AceSessionStore::new(ttl, capacity)),
+            experimental_ace_compat: true,
+            broadcasts: None,
+        }
+    }
+
+    async fn response_bytes(response: Response) -> Bytes {
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+    }
+
+    async fn response_text(response: Response) -> String {
+        let body = response_bytes(response).await;
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    async fn wait_for_hls_playlist(app: &Router, path: &str) -> String {
+        for _ in 0..50 {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let playlist = response_text(response).await;
+            if playlist.contains(".ts") {
+                return playlist;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("HLS packager did not produce a segment");
+    }
+
+    fn playlist_segment_path(playlist: &str) -> &str {
+        playlist
+            .lines()
+            .find(|line| line.ends_with(".ts"))
+            .expect("playlist segment")
+    }
+
     #[test]
     fn content_id_selection_uses_resolved_infohash_when_available() {
         let content_id = "2123456789abcdef0123456789abcdef01234567";
@@ -2435,6 +2832,476 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ace_manifest_redirects_to_stable_authenticated_native_hls_view() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::FOUND);
+        assert_eq!(start.headers()[header::CACHE_CONTROL], "no-store");
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap()
+            .to_owned();
+        assert!(playback.starts_with(&format!("/ace/m/{id}/")));
+
+        let playlist = wait_for_hls_playlist(&app, &playback).await;
+        let segment_path = playlist_segment_path(&playlist).to_owned();
+        assert!(segment_path.starts_with("/ace/c/"));
+        assert_eq!(segment_path.split('/').nth(3).unwrap().len(), 64);
+        assert_eq!(
+            manager.get("hlsfix", id).await.unwrap().subscriber_count(),
+            1,
+            "one HLS lease pins one native session subscriber"
+        );
+
+        let compat_segment = app
+            .clone()
+            .oneshot(Request::get(&segment_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(compat_segment.status(), StatusCode::OK);
+        assert_eq!(compat_segment.headers()[header::CONTENT_TYPE], "video/mp2t");
+        assert_eq!(compat_segment.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn ace_manifest_json_returns_documented_hls_control_urls() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let app = router(ace_hls_state(Duration::from_secs(60), 8));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/ace/manifest.m3u8?format=json&id={id}&use_api_events=1"
+                ))
+                .header(header::HOST, "localhost:6900")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["error"], serde_json::Value::Null);
+        assert_eq!(value["response"]["infohash"], id);
+        assert_eq!(value["response"]["is_live"], 1);
+        let token = value["response"]["playback_session_id"].as_str().unwrap();
+        assert_eq!(token.len(), 64);
+        let playback = value["response"]["playback_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://localhost:6900")
+            .unwrap();
+        assert!(playback.starts_with(&format!("/ace/m/cid:{id}/")));
+        assert!(playback.ends_with(".m3u8"));
+        assert_eq!(
+            value["response"]["stat_url"],
+            format!("http://localhost:6900/ace/stat/cid:{id}/{token}")
+        );
+        assert_eq!(
+            value["response"]["command_url"],
+            format!("http://localhost:6900/ace/cmd/cid:{id}/{token}")
+        );
+        assert!(wait_for_hls_playlist(&app, playback)
+            .await
+            .contains("/ace/c/"));
+    }
+
+    #[tokio::test]
+    async fn ace_and_native_hls_return_the_same_retained_segment_bytes() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        let playlist = wait_for_hls_playlist(&app, playback).await;
+        let compat_path = playlist_segment_path(&playlist);
+        let compat_packager = manager.get_hls("hlsfix", id).await.unwrap();
+        let native_manifest = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/hlsfix/{id}.m3u8"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(native_manifest.status(), StatusCode::OK);
+        assert!(Arc::ptr_eq(
+            &compat_packager,
+            &manager.get_hls("hlsfix", id).await.unwrap()
+        ));
+        let seq = compat_path
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .strip_suffix(".ts")
+            .unwrap();
+        let compat = app
+            .clone()
+            .oneshot(Request::get(compat_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let native = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/hlsfix/{id}/seg/{seq}.ts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compat.status(), StatusCode::OK);
+        assert_eq!(native.status(), StatusCode::OK);
+        assert_eq!(response_bytes(compat).await, response_bytes(native).await);
+        assert_eq!(manager.list().await.len(), 1);
+        assert!(manager.get_hls("hlsfix", id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn ace_manifest_rejects_unknown_format_without_starting_work() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let manager = state.manager.clone();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get(format!(
+                    "/ace/manifest.m3u8?format=mp4&infohash={id}&transcode_audio=1"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["response"], serde_json::Value::Null);
+        assert_eq!(value["error"], "unsupported format");
+        assert!(manager.list().await.is_empty());
+        assert!(manager.get_hls("hlsfix", id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ace_hls_stop_revokes_only_one_client_pin() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        async fn mint(app: &Router, id: &str) -> serde_json::Value {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/ace/manifest.m3u8?format=json&infohash={id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            serde_json::from_str(&response_text(response).await).unwrap()
+        }
+        let a = mint(&app, id).await;
+        let b = mint(&app, id).await;
+        assert_eq!(
+            manager.get("hlsfix", id).await.unwrap().subscriber_count(),
+            2
+        );
+
+        let stop_a = a["response"]["command_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        let stopped = app
+            .clone()
+            .oneshot(
+                Request::get(format!("{stop_a}?method=stop"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        assert_eq!(
+            manager.get("hlsfix", id).await.unwrap().subscriber_count(),
+            1
+        );
+
+        let a_playback = a["response"]["playback_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(Request::get(a_playback).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let b_playback = b["response"]["playback_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        assert!(wait_for_hls_playlist(&app, b_playback)
+            .await
+            .contains(".ts"));
+    }
+
+    #[tokio::test]
+    async fn ace_hls_churn_keeps_one_reaper_and_capacity_bounded_pins() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 4);
+        let manager = state.manager.clone();
+        let sessions = state.ace_sessions.clone();
+        let workers = sessions.hls_reaper_workers();
+        let app = router(state);
+        let mut tokens = Vec::new();
+
+        for _ in 0..100 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND);
+            let token = response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .strip_suffix(".m3u8")
+                .unwrap()
+                .to_owned();
+            tokens.push(token);
+        }
+
+        assert_eq!(workers.load(Ordering::SeqCst), 1);
+        assert_eq!(sessions.active_count(), 4);
+        assert_eq!(
+            manager.get("hlsfix", id).await.unwrap().subscriber_count(),
+            4
+        );
+        for token in tokens.iter().rev().take(4) {
+            assert!(sessions.revoke(id, token));
+        }
+        assert_eq!(sessions.active_count(), 0);
+        assert_eq!(
+            manager.get("hlsfix", id).await.unwrap().subscriber_count(),
+            0
+        );
+
+        drop(app);
+        drop(sessions);
+        for _ in 0..20 {
+            if workers.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            workers.load(Ordering::SeqCst),
+            0,
+            "the weak-reference store reaper must exit when its store is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn ace_hls_rejects_forged_future_evicted_and_expired_segments() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_millis(30), 1);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_playback = first.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap()
+            .to_owned();
+        let first_playlist = wait_for_hls_playlist(&app, &first_playback).await;
+        let first_segment = playlist_segment_path(&first_playlist).to_owned();
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::get("/ace/c/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/0.ts")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let token = first_segment.split('/').nth(3).unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::get(format!("/ace/c/{token}/18446744073709551615.ts"))
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // Capacity one: a second client evicts and drops the first client's pin.
+        let second = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::FOUND);
+        assert_eq!(
+            manager.get("hlsfix", id).await.unwrap().subscriber_count(),
+            1
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(Request::get(&first_segment).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let second_playback = second.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap()
+            .to_owned();
+        let second_playlist = wait_for_hls_playlist(&app, &second_playback).await;
+        let second_segment = playlist_segment_path(&second_playlist).to_owned();
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            app.clone()
+                .oneshot(Request::get(&second_playback).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(Request::get(&second_segment).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            manager.get("hlsfix", id).await.unwrap().subscriber_count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn ace_hls_returns_404_after_a_segment_leaves_the_native_window() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let app = router(ace_hls_state(Duration::from_secs(60), 8));
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        let first = wait_for_hls_playlist(&app, playback).await;
+        let old_segment = playlist_segment_path(&first).to_owned();
+        let old_seq = old_segment
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .strip_suffix(".ts")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+
+        for _ in 0..100 {
+            let playlist = wait_for_hls_playlist(&app, playback).await;
+            let media_seq = playlist
+                .lines()
+                .find_map(|line| line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            if media_seq > old_seq {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+
+        assert_eq!(
+            app.oneshot(Request::get(old_segment).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
     async fn ace_compat_routes_are_404_by_default() {
         for path in [
             "/ace/getstream?format=json&infohash=0123456789012345678901234567890123456789",
@@ -2443,6 +3310,7 @@ mod tests {
             "/ace/cmd/0123456789012345678901234567890123456789/outpace?method=stop",
             "/server/api?method=get_version",
             "/ace/manifest.m3u8?infohash=0123456789012345678901234567890123456789",
+            "/ace/m/0123456789012345678901234567890123456789/token.m3u8",
             "/ace/c/session/0.ts",
         ] {
             let resp = router(fixture_state(0))
