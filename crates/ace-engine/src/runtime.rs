@@ -149,6 +149,103 @@ pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
         .collect()
 }
 
+/// Resolve the tracker list minted into broadcast descriptors and used for broadcast
+/// self-announce. `OUTPACE_TRACKERS` — comma-separated `scheme://…` (typically
+/// `udp://host:port/announce`) URLs — FULLY REPLACES [`DEFAULT_BROADCAST_TRACKERS`] when set
+/// (non-empty after trimming); unset or blank leaves the public default in place so behavior is
+/// byte-identical to before.
+///
+/// Per-entry handling (see [`classify_tracker_entry`]):
+/// - No `scheme://` prefix: obviously unusable — a broadcast pointed only at such entries would
+///   be undiscoverable — so it is dropped with a warning rather than minted into a broken
+///   descriptor. Ditto entries longer than the announce path's
+///   [`ace_swarm::discover::MAX_TRACKER_URL_LEN`], which its resolver would skip anyway.
+/// - Well-formed but not lowercase `udp://` (e.g. `http://…`, `ws://…`, `UDP://…`): KEPT —
+///   other consumers of the minted descriptor may use it — but outpace's own self-announce
+///   resolver (`ace_swarm::discover::resolve_trackers`) only strips a literal lowercase
+///   `udp://` prefix, so outpace itself will never announce there; a warning says so.
+/// - The kept list is clamped to [`ace_swarm::discover::MAX_TRACKERS`] with a warning — the
+///   same cap the announce path applies.
+///
+/// If *every* override entry is dropped the result is empty (DHT-only discovery); we deliberately
+/// do NOT reinstate the public default in that case, since the operator explicitly opted out of
+/// it and silently re-announcing on a public tracker would defeat the point of the override.
+pub fn broadcast_trackers_from_env() -> Vec<String> {
+    use ace_swarm::discover::{MAX_TRACKERS, MAX_TRACKER_URL_LEN};
+    let raw = std::env::var("OUTPACE_TRACKERS").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return DEFAULT_BROADCAST_TRACKERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    }
+    let mut out = Vec::new();
+    for s in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match classify_tracker_entry(s) {
+            TrackerEntryClass::Udp => out.push(s.to_string()),
+            TrackerEntryClass::NonUdpScheme => {
+                crate::alog!(
+                    "[broadcast] WARNING: OUTPACE_TRACKERS entry {s:?} is not a lowercase udp:// URL; outpace only self-announces to udp:// trackers, so this entry is minted into broadcast descriptors for other clients only"
+                );
+                out.push(s.to_string());
+            }
+            TrackerEntryClass::TooLong => {
+                crate::alog!(
+                    "[broadcast] WARNING: ignoring over-long OUTPACE_TRACKERS entry ({} bytes > {MAX_TRACKER_URL_LEN} max); the announce path would skip it anyway",
+                    s.len()
+                );
+            }
+            TrackerEntryClass::Malformed => {
+                crate::alog!(
+                    "[broadcast] WARNING: ignoring malformed OUTPACE_TRACKERS entry {s:?} (no scheme:// prefix); it will not be minted into broadcast descriptors"
+                );
+            }
+        }
+    }
+    if out.len() > MAX_TRACKERS {
+        crate::alog!(
+            "[broadcast] WARNING: OUTPACE_TRACKERS has {} usable entries; keeping only the first {MAX_TRACKERS} (the announce path's cap)",
+            out.len()
+        );
+        out.truncate(MAX_TRACKERS);
+    }
+    out
+}
+
+/// How one `OUTPACE_TRACKERS` entry is treated. Pure classification (no logging) so the warn
+/// branches of [`broadcast_trackers_from_env`] are unit-testable without capturing stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackerEntryClass {
+    /// Lowercase `udp://…` — minted into descriptors AND self-announced by outpace.
+    Udp,
+    /// Well-formed `scheme://rest` but not lowercase `udp://` (e.g. `http://`, `ws://`,
+    /// `UDP://`). Kept in the minted descriptor for other clients, but never self-announced:
+    /// `ace_swarm::discover::resolve_trackers` only strips a literal lowercase `udp://` prefix.
+    NonUdpScheme,
+    /// Longer than [`ace_swarm::discover::MAX_TRACKER_URL_LEN`]; the announce path skips such
+    /// entries, so minting them would be dead weight — dropped.
+    TooLong,
+    /// No `scheme://` prefix — obviously unusable, dropped. This is only a minimal sanity
+    /// check, not a full URL validator.
+    Malformed,
+}
+
+fn classify_tracker_entry(s: &str) -> TrackerEntryClass {
+    if s.len() > ace_swarm::discover::MAX_TRACKER_URL_LEN {
+        return TrackerEntryClass::TooLong;
+    }
+    match s.split_once("://") {
+        Some((scheme, rest)) if !scheme.is_empty() && !rest.is_empty() => {
+            if scheme == "udp" {
+                TrackerEntryClass::Udp
+            } else {
+                TrackerEntryClass::NonUdpScheme
+            }
+        }
+        _ => TrackerEntryClass::Malformed,
+    }
+}
+
 pub fn broadcast_ingest_urls(
     http_bind: SocketAddr,
     rtmp_bind: SocketAddr,
@@ -279,10 +376,10 @@ pub async fn build_runtime(
             config.cache_dir.clone(),
         ),
         seed_registry: seed_registry.clone(),
-        trackers: DEFAULT_BROADCAST_TRACKERS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        // Single resolved tracker list — `OUTPACE_TRACKERS` overrides the public default here, so
+        // BOTH descriptor minting (`mint_broadcast`) and self-announce (`announce_broadcast`),
+        // which read `broadcasts.trackers`, stay in lockstep.
+        trackers: broadcast_trackers_from_env(),
         store_bytes: config.seed_store_bytes,
         inbound_peer_port: announce_port_rx,
     };
@@ -553,6 +650,159 @@ mod tests {
 
         let config = config.unwrap();
         assert_eq!(config.rtmp_bind, "127.0.0.1:19935".parse().unwrap());
+    }
+
+    #[test]
+    fn broadcast_trackers_env_override_parsing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OUTPACE_TRACKERS");
+
+        let default: Vec<String> = DEFAULT_BROADCAST_TRACKERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Unset -> untouched defaults.
+        std::env::remove_var("OUTPACE_TRACKERS");
+        assert_eq!(broadcast_trackers_from_env(), default);
+
+        // Blank / whitespace-only -> defaults (treated as unset).
+        std::env::set_var("OUTPACE_TRACKERS", "   ");
+        assert_eq!(broadcast_trackers_from_env(), default);
+
+        // Single URL fully replaces the default.
+        std::env::set_var("OUTPACE_TRACKERS", "udp://a.local:1/announce");
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec!["udp://a.local:1/announce".to_string()]
+        );
+
+        // Multiple, comma-separated, with surrounding whitespace and a trailing comma.
+        std::env::set_var(
+            "OUTPACE_TRACKERS",
+            " udp://a.local:1/announce , udp://b.local:2/announce ,",
+        );
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec![
+                "udp://a.local:1/announce".to_string(),
+                "udp://b.local:2/announce".to_string(),
+            ]
+        );
+
+        // Malformed entry (no scheme) is dropped; valid siblings survive.
+        std::env::set_var("OUTPACE_TRACKERS", "udp://a.local:1/announce,not-a-url");
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec!["udp://a.local:1/announce".to_string()]
+        );
+
+        // All entries malformed -> empty list; we deliberately do NOT fall back to the public
+        // default (the operator opted out of it), so the broadcast is DHT-only rather than
+        // silently re-announced on t1.torrentstream.org.
+        std::env::set_var("OUTPACE_TRACKERS", "nope,also-bad");
+        assert!(broadcast_trackers_from_env().is_empty());
+
+        // Non-udp and uppercase-UDP schemes are KEPT (minted for other descriptor consumers)
+        // even though outpace itself won't self-announce to them (warn-only path).
+        std::env::set_var(
+            "OUTPACE_TRACKERS",
+            "http://t.local/announce,UDP://h.local:1/announce,udp://a.local:1/announce",
+        );
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec![
+                "http://t.local/announce".to_string(),
+                "UDP://h.local:1/announce".to_string(),
+                "udp://a.local:1/announce".to_string(),
+            ]
+        );
+
+        // Over-long entries are dropped (announce path would skip them anyway).
+        let long = format!("udp://{}:1/announce", "h".repeat(300));
+        std::env::set_var(
+            "OUTPACE_TRACKERS",
+            format!("{long},udp://a.local:1/announce"),
+        );
+        assert_eq!(
+            broadcast_trackers_from_env(),
+            vec!["udp://a.local:1/announce".to_string()]
+        );
+
+        // The kept list is clamped to the announce path's MAX_TRACKERS cap.
+        let many: Vec<String> = (0..70).map(|i| format!("udp://t{i}.local:1/a")).collect();
+        std::env::set_var("OUTPACE_TRACKERS", many.join(","));
+        let clamped = broadcast_trackers_from_env();
+        assert_eq!(clamped.len(), ace_swarm::discover::MAX_TRACKERS);
+        assert_eq!(clamped[..], many[..ace_swarm::discover::MAX_TRACKERS]);
+
+        match old {
+            Some(v) => std::env::set_var("OUTPACE_TRACKERS", v),
+            None => std::env::remove_var("OUTPACE_TRACKERS"),
+        }
+    }
+
+    #[test]
+    fn tracker_entry_classification_matches_self_announce_reality() {
+        use TrackerEntryClass::*;
+        // Self-announced: only a literal lowercase udp:// scheme (what
+        // ace_swarm::discover::resolve_trackers strips).
+        assert_eq!(classify_tracker_entry("udp://t.local:1/announce"), Udp);
+        // Kept-but-warned: well-formed, but outpace never self-announces to these.
+        assert_eq!(
+            classify_tracker_entry("http://t.local/announce"),
+            NonUdpScheme
+        );
+        assert_eq!(
+            classify_tracker_entry("ws://t.local/announce"),
+            NonUdpScheme
+        );
+        assert_eq!(
+            classify_tracker_entry("UDP://t.local:1/announce"),
+            NonUdpScheme,
+            "resolve_trackers only matches lowercase udp://, so uppercase must be flagged"
+        );
+        // Dropped-and-warned.
+        assert_eq!(classify_tracker_entry("t.local:1"), Malformed);
+        assert_eq!(classify_tracker_entry("://rest"), Malformed);
+        assert_eq!(classify_tracker_entry("udp://"), Malformed);
+        let long = format!("udp://{}:1/a", "h".repeat(300));
+        assert_eq!(classify_tracker_entry(&long), TooLong);
+    }
+
+    #[tokio::test]
+    async fn minted_broadcast_descriptor_reflects_tracker_override() {
+        // Resolve the override under the env lock, then drop the guard before the async mint so a
+        // std mutex is never held across an await.
+        let trackers = {
+            let _g = ENV_LOCK.lock().unwrap();
+            let old = std::env::var_os("OUTPACE_TRACKERS");
+            std::env::set_var(
+                "OUTPACE_TRACKERS",
+                "udp://priv.local:1337/announce,udp://priv2.local:2/announce",
+            );
+            let t = broadcast_trackers_from_env();
+            match old {
+                Some(v) => std::env::set_var("OUTPACE_TRACKERS", v),
+                None => std::env::remove_var("OUTPACE_TRACKERS"),
+            }
+            t
+        };
+
+        let reg = crate::broadcast::BroadcastRegistry::new();
+        let seed = ace_swarm::listen::SeedRegistry::new();
+        let (bc, _fresh) = reg
+            .start_or_resume("t", "T", &trackers, &seed, 1 << 20)
+            .await;
+        let decoded = ace_wire::transport::decode_transport(&bc.transport_bytes).unwrap();
+        assert_eq!(
+            decoded.trackers,
+            vec![
+                "udp://priv.local:1337/announce".to_string(),
+                "udp://priv2.local:2/announce".to_string(),
+            ],
+            "minted descriptor must carry the OUTPACE_TRACKERS override, not the public default"
+        );
     }
 
     #[test]
