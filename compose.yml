@@ -1,0 +1,43 @@
+name: outpace
+
+services:
+  outpace:
+    image: ${OUTPACE_IMAGE:-ghcr.io/jamezrin/outpace:latest}
+    restart: unless-stopped
+    environment:
+      # Listeners bind inside the container; host exposure is controlled by ports below.
+      OUTPACE_BIND: 0.0.0.0:6878
+      OUTPACE_RTMP_BIND: 0.0.0.0:1935
+      OUTPACE_PEER_LISTEN: 0.0.0.0:8621
+      OUTPACE_DATA_DIR: /var/lib/outpace
+      OUTPACE_ENABLE_INBOUND: ${OUTPACE_ENABLE_INBOUND:-1}
+      OUTPACE_ENABLE_SEEDING: ${OUTPACE_ENABLE_SEEDING:-1}
+      OUTPACE_ENABLE_PORT_MAPPING: ${OUTPACE_ENABLE_PORT_MAPPING:-0}
+      OUTPACE_CACHE_TYPE: ${OUTPACE_CACHE_TYPE:-memory}
+      OUTPACE_CACHE_DIR: ${OUTPACE_CACHE_DIR:-/var/lib/outpace/cache}
+      OUTPACE_SEED_STORE_BYTES: ${OUTPACE_SEED_STORE_BYTES:-134217728}
+      OUTPACE_EXPERIMENTAL_ACE_COMPAT: ${OUTPACE_EXPERIMENTAL_ACE_COMPAT:-0}
+    ports:
+      # API and ingest stay host-local by default. Set the *_HOST variables deliberately
+      # if remote clients need them, and protect those listeners with a firewall/proxy.
+      - "${OUTPACE_HTTP_HOST:-127.0.0.1}:${OUTPACE_HTTP_PORT:-6878}:6878/tcp"
+      - "${OUTPACE_RTMP_HOST:-127.0.0.1}:${OUTPACE_RTMP_PORT:-1935}:1935/tcp"
+      # The peer listener and self-announcements both use TCP 8621. Keep this mapping fixed.
+      - "0.0.0.0:8621:8621/tcp"
+    volumes:
+      - outpace-data:/var/lib/outpace
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:6878/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  outpace-data:
