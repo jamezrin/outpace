@@ -14,8 +14,10 @@ const PCR_MODULUS: u64 = 1 << 33;
 
 pub struct HlsPackager {
     state: Mutex<HlsState>,
-    /// Packets per segment, used for streams which do not expose a usable PCR clock.
+    /// Hard packet ceiling for every segment. PCR/random-access timing may cut earlier, but never
+    /// later, so configuration-time retained-memory calculations match the runtime invariant.
     seg_packets: usize,
+    max_segment_bytes: usize,
     /// Number of segments retained in the sliding window.
     window: usize,
     /// Requested segment duration (seconds).
@@ -31,7 +33,6 @@ struct HlsState {
     segment_start_pcr: Option<u64>,
     last_pcr: Option<u64>,
     pcr_pid: Option<u16>,
-    packets_since_pcr: usize,
     max_segment_duration: f32,
     discontinuity_pending: bool,
 }
@@ -44,6 +45,10 @@ struct HlsSegment {
 
 impl HlsPackager {
     fn new(config: HlsConfig) -> Arc<HlsPackager> {
+        let seg_packets = config.segment_packets.max(1);
+        let max_segment_bytes = seg_packets
+            .checked_mul(TS_PACKET)
+            .expect("HLS config must be validated before packager construction");
         Arc::new(HlsPackager {
             state: Mutex::new(HlsState {
                 media_seq: 0,
@@ -53,12 +58,12 @@ impl HlsPackager {
                 segment_start_pcr: None,
                 last_pcr: None,
                 pcr_pid: None,
-                packets_since_pcr: 0,
                 max_segment_duration: config.segment_duration_secs(),
                 discontinuity_pending: false,
             }),
-            seg_packets: config.segment_packets.max(1),
-            window: config.window_segments,
+            seg_packets,
+            max_segment_bytes,
+            window: config.window_segments.max(1),
             seg_duration: config.segment_duration_secs(),
         })
     }
@@ -91,14 +96,26 @@ impl HlsPackager {
         st.segment_start_pcr = None;
         st.last_pcr = None;
         st.pcr_pid = None;
-        st.packets_since_pcr = 0;
         st.discontinuity_pending = true;
     }
 
     /// Append contiguous TS bytes, emitting PCR-timed, preferably random-access-aligned segments.
     fn feed(&self, data: &[u8]) {
         let mut st = self.state.lock().unwrap();
-        st.cur.extend_from_slice(data);
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            // Never duplicate more than one configured segment into `cur`, even when a source
+            // supplies a very large chunk in one call. `scan` always emits when the buffer reaches
+            // this ceiling, so there is room again before the next iteration.
+            let room = self.max_segment_bytes - st.cur.len();
+            let take = room.min(remaining.len());
+            st.cur.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            self.scan(&mut st);
+        }
+    }
+
+    fn scan(&self, st: &mut HlsState) {
         while st.scanned_packets < st.cur.len() / TS_PACKET {
             let packet_offset = st.scanned_packets * TS_PACKET;
             let mut timing = ts_timing(&st.cur[packet_offset..packet_offset + TS_PACKET]);
@@ -107,20 +124,12 @@ impl HlsPackager {
             // PAT/PMT metadata is available here, lock each uninterrupted run to the first PCR
             // PID instead of combining unrelated clocks. Random-access flags remain useful on a
             // separate video PID.
-            if let Some(pcr) = timing.pcr {
+            if timing.pcr.is_some() {
                 match st.pcr_pid {
-                    Some(pid) if pid != timing.pid => {
-                        timing.pcr = None;
-                        st.packets_since_pcr = st.packets_since_pcr.saturating_add(1);
-                    }
+                    Some(pid) if pid != timing.pid => timing.pcr = None,
                     None => st.pcr_pid = Some(timing.pid),
                     _ => {}
                 }
-                if timing.pcr == Some(pcr) {
-                    st.packets_since_pcr = 0;
-                }
-            } else {
-                st.packets_since_pcr = st.packets_since_pcr.saturating_add(1);
             }
 
             if timing.discontinuity || pcr_went_backwards(st.last_pcr, timing.pcr) {
@@ -133,7 +142,6 @@ impl HlsPackager {
                 st.segment_start_pcr = timing.pcr;
                 st.last_pcr = timing.pcr;
                 st.pcr_pid = timing.pcr.map(|_| timing.pid);
-                st.packets_since_pcr = 0;
                 st.discontinuity_pending = true;
                 continue;
             }
@@ -157,25 +165,32 @@ impl HlsPackager {
             if packet_offset > 0 && ((target_reached && timing.random_access) || pcr_fallback) {
                 let duration = elapsed.unwrap_or(self.seg_duration);
                 let boundary_pcr = st.last_pcr;
-                self.emit(&mut st, packet_offset, duration);
+                self.emit(st, packet_offset, duration);
                 st.segment_start_pcr = boundary_pcr;
                 st.last_pcr = boundary_pcr;
                 continue;
             }
             st.scanned_packets += 1;
-            let no_usable_clock =
-                st.segment_start_pcr.is_none() || st.packets_since_pcr >= self.seg_packets;
-            if no_usable_clock && st.scanned_packets >= self.seg_packets {
-                self.emit(&mut st, self.seg_packets * TS_PACKET, self.seg_duration);
+            if st.scanned_packets >= self.seg_packets {
+                // PCR mode is allowed to wait for a preferable boundary only up to the configured
+                // packet ceiling. This is also the fallback for streams with no usable clock.
+                let duration = elapsed.unwrap_or(self.seg_duration);
+                self.emit(st, self.seg_packets * TS_PACKET, duration);
                 st.segment_start_pcr = None;
                 st.last_pcr = None;
                 st.pcr_pid = None;
-                st.packets_since_pcr = 0;
             }
         }
     }
 
     fn emit(&self, st: &mut HlsState, end: usize, duration: f32) {
+        // Evict before splitting/pushing so emission never transiently retains `window + 1`
+        // completed segments in addition to the current segment. Configuration accounts for
+        // exactly `window` completed segments plus `cur`.
+        while st.segments.len() >= self.window {
+            st.segments.pop_front();
+            st.media_seq += 1;
+        }
         let rest = st.cur.split_off(end);
         let seg = std::mem::replace(&mut st.cur, rest);
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
@@ -186,10 +201,6 @@ impl HlsPackager {
         });
         st.max_segment_duration = st.max_segment_duration.max(duration);
         st.scanned_packets = 0;
-        while st.segments.len() > self.window {
-            st.segments.pop_front();
-            st.media_seq += 1;
-        }
     }
 
     /// Render the live media playlist; segment URIs are absolute under the given prefix.
@@ -432,6 +443,54 @@ mod tests {
         let playlist = p.playlist("test", "timed");
         assert_eq!(playlist.matches("#EXTINF:1.200,").count(), 2);
         assert!(playlist.contains("#EXT-X-TARGETDURATION:2"));
+    }
+
+    #[test]
+    fn pcr_mode_never_exceeds_the_hard_packet_ceiling() {
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 3,
+            window_segments: 4,
+            segment_duration_ms: 60_000,
+        });
+        let input: Vec<u8> = (0..7)
+            .flat_map(|i| timed_packet(i * 9_000, false, false, i as u8))
+            .collect();
+        p.feed(&input);
+
+        assert_eq!(p.segment(0).unwrap().len(), 3 * TS_PACKET);
+        assert_eq!(p.segment(1).unwrap().len(), 3 * TS_PACKET);
+        let st = p.state.lock().unwrap();
+        assert_eq!(st.cur.len(), TS_PACKET);
+        assert!(st
+            .segments
+            .iter()
+            .all(|segment| segment.bytes.len() <= p.max_segment_bytes));
+    }
+
+    #[test]
+    fn hard_ceiling_preserves_post_discontinuity_boundary() {
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 2,
+            window_segments: 4,
+            segment_duration_ms: 60_000,
+        });
+        p.feed(&timed_packet(0, false, false, 1));
+        p.discontinuity();
+        let post_gap: Vec<u8> = (0..3)
+            .flat_map(|i| timed_packet(i * 9_000, false, false, 10 + i as u8))
+            .collect();
+        p.feed(&post_gap);
+
+        let first = p.segment(0).unwrap();
+        assert_eq!(first.len(), 2 * TS_PACKET);
+        assert_eq!(first[12], 10);
+        assert_eq!(p.state.lock().unwrap().cur[12], 12);
+        assert_eq!(
+            p.playlist("test", "bounded-gap")
+                .matches("#EXT-X-DISCONTINUITY")
+                .count(),
+            1
+        );
     }
 
     #[test]

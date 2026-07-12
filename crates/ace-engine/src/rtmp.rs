@@ -215,6 +215,19 @@ mod tests {
 
     #[tokio::test]
     async fn rtmp_publish_reaches_broadcast_piece_store() {
+        let ffmpeg_available = Command::new("ffmpeg")
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success());
+        if !ffmpeg_available {
+            eprintln!("skipping RTMP loopback smoke: target-executable ffmpeg is unavailable");
+            return;
+        }
+
         let bs = state();
         let registry = bs.registry.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -259,7 +272,7 @@ mod tests {
             .stdin(Stdio::null())
             .status()
             .await
-            .expect("ffmpeg is installed for RTMP loopback test");
+            .expect("ffmpeg preflight succeeded for RTMP loopback test");
         assert!(status.success(), "ffmpeg RTMP publish failed: {status}");
 
         let bc = registry.get("loop").await.expect("broadcast was minted");

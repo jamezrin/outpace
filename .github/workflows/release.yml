@@ -65,6 +65,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04
             archive: tar.gz
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz
@@ -170,7 +173,12 @@ jobs:
   publish-container:
     name: Publish GHCR image
     runs-on: ubuntu-24.04
-    needs: release-metadata
+    # Do not update the versioned image or `latest` unless every release archive, including
+    # ARMv7 musl, built successfully. The PR portability workflow is intentionally not a tag-job
+    # dependency; the release build itself remains the final artifact gate.
+    needs:
+      - release-metadata
+      - build-binaries
     permissions:
       contents: read
       packages: write
@@ -209,7 +217,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
