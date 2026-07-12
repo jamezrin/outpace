@@ -33,11 +33,34 @@ impl Default for DiscoveryOptions {
 /// How the resolver treats a tracker list. Tracker URLs from a `cid:<40hex>` transport come
 /// from an untrusted metadata peer, so by default we refuse to turn them into DNS lookups and
 /// UDP announce traffic aimed at non-globally-routable hosts.
+///
+/// Set `OUTPACE_TRACKER_ALLOW_NON_GLOBAL=1` to opt into the permissive policy in production
+/// (see [`TrackerPolicy::from_env`]) for controlled/self-hosted deployments with a private
+/// tracker; any other value, including unset, keeps the default deny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TrackerPolicy {
     /// Allow private/loopback/link-local/multicast destinations. Off by default (`false`); opt
     /// in only for trusted/local deployments (or offline tests).
     pub allow_non_global: bool,
+}
+
+impl TrackerPolicy {
+    /// Build a policy from the environment: `OUTPACE_TRACKER_ALLOW_NON_GLOBAL=1` allows
+    /// non-globally-routable tracker destinations; anything else (including unset) denies.
+    pub fn from_env() -> Self {
+        Self::from_env_value(
+            std::env::var("OUTPACE_TRACKER_ALLOW_NON_GLOBAL")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// Pure parse of the `OUTPACE_TRACKER_ALLOW_NON_GLOBAL` value: only `Some("1")` allows.
+    fn from_env_value(value: Option<&str>) -> Self {
+        TrackerPolicy {
+            allow_non_global: value == Some("1"),
+        }
+    }
 }
 
 /// Maximum number of tracker URLs processed from one (untrusted) list.
@@ -153,7 +176,7 @@ async fn discover_tracker_peers(
         left,
         uploaded: 0,
     };
-    for tracker in resolve_trackers(trackers).await {
+    for tracker in resolve_trackers_with_policy(trackers, TrackerPolicy::from_env()).await {
         if let Ok(found) = announce(tracker, infohash, peer_id, port, 200, transfer, event).await {
             peers.extend(found);
         }
@@ -250,6 +273,95 @@ mod tests {
         // A bare host:port (no udp://) must be rejected even when non-global is allowed.
         let got = resolve_trackers_with_policy(&["127.0.0.1:80".into()], local_ok()).await;
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn tracker_policy_env_value_parses_to_deny_unless_exactly_one() {
+        // Pure parse, no env mutation: only the exact value "1" opts in.
+        assert!(!TrackerPolicy::from_env_value(None).allow_non_global);
+        assert!(!TrackerPolicy::from_env_value(Some("0")).allow_non_global);
+        assert!(!TrackerPolicy::from_env_value(Some("true")).allow_non_global);
+        assert!(!TrackerPolicy::from_env_value(Some("")).allow_non_global);
+        assert!(TrackerPolicy::from_env_value(Some("1")).allow_non_global);
+    }
+
+    /// Restores the prior `OUTPACE_TRACKER_ALLOW_NON_GLOBAL` value on drop (even on panic).
+    struct EnvGuard(Option<std::ffi::OsString>);
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            EnvGuard(std::env::var_os("OUTPACE_TRACKER_ALLOW_NON_GLOBAL"))
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("OUTPACE_TRACKER_ALLOW_NON_GLOBAL", value),
+                None => std::env::remove_var("OUTPACE_TRACKER_ALLOW_NON_GLOBAL"),
+            }
+        }
+    }
+
+    /// Guards the wiring in `discover_tracker_peers`: it must resolve with
+    /// `TrackerPolicy::from_env()`, not the default policy. Without the env opt-in a loopback
+    /// tracker must never be contacted; with `OUTPACE_TRACKER_ALLOW_NON_GLOBAL=1` the announce
+    /// must actually reach the socket. This is the only test that mutates the env var.
+    #[tokio::test]
+    async fn announce_seeder_contacts_loopback_tracker_only_with_env_opt_in() {
+        let _restore = EnvGuard::capture();
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tracker_url = format!("udp://{}/announce", server.local_addr().unwrap());
+
+        // Default deny: the resolve must filter loopback, so no packet reaches the socket.
+        std::env::remove_var("OUTPACE_TRACKER_ALLOW_NON_GLOBAL");
+        let peers = announce_seeder(
+            std::slice::from_ref(&tracker_url),
+            &[3u8; 20],
+            &[4u8; 20],
+            6881,
+        )
+        .await;
+        assert!(peers.is_empty());
+        let mut buf = [0u8; 2048];
+        assert!(
+            server.try_recv_from(&mut buf).is_err(),
+            "default deny must not send announce traffic to a loopback tracker"
+        );
+
+        // Fake BEP-15 tracker: one connect + one announce with 0 peers (layout per
+        // `ace_tracker::codec`); completing the exchange proves the announce reached it.
+        let served = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, 16, "connect request");
+            let txid = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&0u32.to_be_bytes()); // action = connect
+            resp.extend_from_slice(&txid.to_be_bytes());
+            resp.extend_from_slice(&42u64.to_be_bytes()); // connection id
+            server.send_to(&resp, peer).await.unwrap();
+
+            let (_n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let atxid = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            let mut ar = Vec::new();
+            ar.extend_from_slice(&1u32.to_be_bytes()); // action = announce
+            ar.extend_from_slice(&atxid.to_be_bytes());
+            ar.extend_from_slice(&1800u32.to_be_bytes()); // interval
+            ar.extend_from_slice(&0u32.to_be_bytes()); // leechers
+            ar.extend_from_slice(&0u32.to_be_bytes()); // seeders (0 peers follow)
+            server.send_to(&ar, peer).await.unwrap();
+        });
+
+        // Opt-in: the same call must now complete the connect+announce exchange.
+        std::env::set_var("OUTPACE_TRACKER_ALLOW_NON_GLOBAL", "1");
+        let peers = announce_seeder(&[tracker_url], &[3u8; 20], &[4u8; 20], 6881).await;
+        assert!(peers.is_empty(), "fake tracker returned zero peers");
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("tracker was never contacted despite OUTPACE_TRACKER_ALLOW_NON_GLOBAL=1")
+            .unwrap();
     }
 
     #[tokio::test]
