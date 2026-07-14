@@ -622,7 +622,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         "outpace: listening on http://{} networks={:?}",
         config.bind, networks
     );
-    eprintln!("  MPEG-TS: http://{}/streams/ace/<id>.ts", config.bind);
+    eprintln!("  MPEG-TS: http://{}/streams/ace/<id>", config.bind);
     eprintln!("  HLS:     http://{}/streams/ace/<id>.m3u8", config.bind);
     eprintln!("  status:  http://{}/streams", config.bind);
     axum::serve(listener, router(state))

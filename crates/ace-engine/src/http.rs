@@ -1326,7 +1326,8 @@ async fn stream_segment(
     }
 }
 
-/// `GET /streams/{network}/{id}.ts` (continuous MPEG-TS) or `.m3u8` (live HLS playlist).
+/// `GET /streams/{network}/{id}` or `{id}.ts` (continuous MPEG-TS), or `.m3u8` (live HLS
+/// playlist).
 async fn stream_file(
     State(s): State<AppState>,
     Path((network, file)): Path<(String, String)>,
@@ -1341,8 +1342,15 @@ async fn stream_file(
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         };
     }
-    let Some(id) = file.strip_suffix(".ts") else {
+    let id = if let Some(id) = file.strip_suffix(".ts") {
+        if id.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        id
+    } else if file.contains('.') {
         return StatusCode::NOT_FOUND.into_response();
+    } else {
+        &file
     };
     let session = match s.manager.get_or_start(&network, id).await {
         Ok(sess) => sess,
@@ -3335,16 +3343,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_ts_extension_returns_404() {
-        let resp = router(state())
+    async fn extensionless_stream_is_a_direct_mpegts_alias() {
+        let st = state();
+        let app = router(st.clone());
+
+        let extensionless = app
+            .clone()
             .oneshot(
-                Request::get("/streams/test/x.foo")
+                Request::get("/streams/test/channel")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(extensionless.status(), StatusCode::OK);
+        assert_eq!(extensionless.headers()[header::CONTENT_TYPE], "video/mp2t");
+        assert!(!extensionless.headers().contains_key(header::LOCATION));
+
+        let explicit = app
+            .oneshot(
+                Request::get("/streams/test/channel.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit.status(), StatusCode::OK);
+        assert_eq!(
+            st.manager.list().await,
+            vec![("test".to_string(), "channel".to_string(), 2,)]
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_dotted_suffixes_return_404_without_starting_sessions() {
+        for path in [
+            "/streams/test/x.mp4",
+            "/streams/test/x.foo",
+            "/streams/test/x.",
+        ] {
+            let st = state();
+            let resp = router(st.clone())
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            assert!(st.manager.list().await.is_empty(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_ts_id_returns_404_without_starting_a_session() {
+        let st = state();
+        let resp = router(st.clone())
+            .oneshot(
+                Request::get("/streams/test/.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(st.manager.list().await.is_empty());
     }
 
     #[tokio::test]

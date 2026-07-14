@@ -31,7 +31,8 @@ outpace broadcast sports --public-host stream.example
 | `GET /healthz` | `200 text/plain` (`ok`) | Process health probe; it does not prove swarm connectivity. |
 | `GET /networks` | `200 application/json`, `{"networks":["ace"]}` | Provider networks configured in this daemon. |
 | `GET /streams` | `200 application/json`, `{"streams":[...]}` | Active shared sessions. Entries have `network`, `id`, and direct-client count `clients`. |
-| `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Starts or joins a shared live session. Unknown networks or invalid ids return `404`. |
+| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. Dotted ids, unknown networks, and invalid ids return `404`. |
+| `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Explicit continuous MPEG-TS form; equivalent for dot-free ids and preserves dots within the provider id. |
 | `GET /streams/<network>/<id>.m3u8` | `200 application/vnd.apple.mpegurl` | Starts or joins live HLS packaging and returns a sliding playlist. |
 | `GET /streams/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Retained live HLS segment. Missing, expired, or not-yet-produced segments return `404`; a segment request alone never starts a stream. |
 | `GET /streams/<network>/<id>/status` | `200 application/json` | Active-session status; `404` before playback starts or after teardown. |
@@ -63,14 +64,20 @@ inflate it. `bitrate` is bits per second, `buffer_ms` is milliseconds, and `uplo
 
 ## Player and middleware integration
 
-Point VLC or a media-server channel directly at either native playback URL:
+Point VLC or a media-server channel at the extensionless native URL for direct MPEG-TS playback:
+
+```text
+http://127.0.0.1:6878/streams/ace/<id>
+```
+
+The explicit MPEG-TS and HLS forms remain available:
 
 ```text
 http://127.0.0.1:6878/streams/ace/<id>.ts
 http://127.0.0.1:6878/streams/ace/<id>.m3u8
 ```
 
-For dispatcharr-style playlist integration, generate entries using one of those URLs. No
+For dispatcharr-style playlist integration, generate entries using one of these URLs. No
 `/ace/getstream` handshake is required. Use `GET /streams` and per-stream `/status` for
 monitoring; do not poll a playback URL as a health check because that creates or joins a session.
 
