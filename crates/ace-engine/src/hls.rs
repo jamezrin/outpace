@@ -484,6 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn default_ceiling_allows_a_timed_keyframe_beyond_256_packets() {
+        let p = HlsPackager::new(HlsConfig::default());
+        let input: Vec<u8> = (0..=300)
+            .flat_map(|i| timed_packet(i * 360, i == 300, false, i as u8))
+            .collect();
+
+        p.feed(&input);
+
+        assert_eq!(p.segment(0).unwrap().len(), 300 * TS_PACKET);
+        assert!(p
+            .playlist("test", "default-ceiling")
+            .contains("#EXTINF:1.200,"));
+    }
+
+    #[test]
     fn pcr_mode_never_exceeds_the_hard_packet_ceiling() {
         let p = HlsPackager::new(HlsConfig {
             segment_packets: 3,

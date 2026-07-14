@@ -144,7 +144,7 @@ pub struct HlsConfig {
 impl Default for HlsConfig {
     fn default() -> Self {
         Self {
-            segment_packets: 256,
+            segment_packets: 16_384,
             window_segments: 6,
             segment_duration_ms: 1000,
         }
