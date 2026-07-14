@@ -917,7 +917,7 @@ async fn ace_hls_playback(
             (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        pkg.playlist_with_segment_prefix(&format!("/ace/c/{token}")),
+        pkg.compatibility_playlist_with_segment_prefix(&format!("/ace/c/{token}")),
     )
         .into_response()
 }
@@ -942,7 +942,7 @@ async fn ace_hls_segment(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match pkg.segment(seq) {
+    match pkg.compatibility_segment(seq) {
         Some(bytes) => (
             [
                 (header::CONTENT_TYPE, "video/mp2t"),
@@ -2875,6 +2875,51 @@ mod tests {
         assert_eq!(compat_segment.status(), StatusCode::OK);
         assert_eq!(compat_segment.headers()[header::CONTENT_TYPE], "video/mp2t");
         assert_eq!(compat_segment.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn ace_hls_playlist_and_segment_reads_do_not_refresh_native_activity() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap()
+            .to_owned();
+        let initial_playlist = wait_for_hls_playlist(&app, &playback).await;
+        let segment_path = playlist_segment_path(&initial_playlist).to_owned();
+        let pkg = manager.get_hls("hlsfix", id).await.unwrap();
+        let stale = Instant::now() - Duration::from_secs(60);
+
+        pkg.set_last_access_for_test(stale);
+        let playlist = app
+            .clone()
+            .oneshot(Request::get(&playback).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(playlist.status(), StatusCode::OK);
+        assert_eq!(pkg.last_access_for_test(), stale);
+
+        let segment = app
+            .clone()
+            .oneshot(Request::get(&segment_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(segment.status(), StatusCode::OK);
+        assert_eq!(pkg.last_access_for_test(), stale);
     }
 
     #[tokio::test]

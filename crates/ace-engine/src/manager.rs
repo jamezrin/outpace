@@ -217,7 +217,8 @@ impl StreamManager {
             .retain(|key, _| retained_sessions.contains(key));
     }
 
-    /// Spawn the idle-teardown watcher: drops sessions with 0 subscribers after `grace`.
+    /// Spawn the idle-teardown watcher: drops sessions with 0 subscribers after `grace`, while
+    /// recent native HLS activity retains a zero-subscriber session during that grace period.
     pub fn spawn_reaper(self: &Arc<Self>) {
         let me = self.clone();
         tokio::spawn(async move {
@@ -449,9 +450,11 @@ mod tests {
     async fn recent_hls_playlist_access_survives_idle_reap() {
         let m = StreamManager::new(registry());
         let pkg = m.get_or_start_hls("test", "active-hls").await.unwrap();
+        let before_access = Instant::now();
+        pkg.set_last_access_for_test(before_access - m.grace);
         let _playlist = pkg.playlist("test", "active-hls");
 
-        m.reap_idle_at(Instant::now() + m.grace / 2).await;
+        m.reap_idle_at(before_access + m.grace / 2).await;
 
         assert!(m.get("test", "active-hls").await.is_some());
         assert!(m.get_hls("test", "active-hls").await.is_some());

@@ -211,14 +211,20 @@ impl HlsPackager {
         self.playlist_with_segment_prefix(&format!("/streams/{network}/{id}/seg"))
     }
 
-    /// Render the same retained live window with a caller-provided segment route.
-    ///
-    /// Compatibility adapters use this to expose the native packager's bytes and sequence
-    /// numbers under their own authenticated URL. It deliberately does not create or copy HLS
-    /// state: native and compatibility playlists are two views of this one sliding window.
+    /// Render a native live playlist with a caller-provided segment route and refresh activity.
     pub fn playlist_with_segment_prefix(&self, segment_prefix: &str) -> String {
         let mut st = self.state.lock().unwrap();
         st.last_access = Instant::now();
+        Self::render_playlist(&st, segment_prefix)
+    }
+
+    /// Render the retained live window for a compatibility route without refreshing native HLS
+    /// activity. Compatibility lifetime is controlled by its explicit subscription pin.
+    pub fn compatibility_playlist_with_segment_prefix(&self, segment_prefix: &str) -> String {
+        Self::render_playlist(&self.state.lock().unwrap(), segment_prefix)
+    }
+
+    fn render_playlist(st: &HlsState, segment_prefix: &str) -> String {
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
         out.push_str(&format!(
             "#EXT-X-TARGETDURATION:{}\n",
@@ -241,21 +247,39 @@ impl HlsPackager {
     /// Fetch a retained segment by its absolute sequence number.
     pub fn segment(&self, seq: u64) -> Option<Bytes> {
         let mut st = self.state.lock().unwrap();
-        if seq < st.media_seq {
-            return None;
-        }
-        let bytes = st
-            .segments
-            .get((seq - st.media_seq) as usize)
-            .map(|segment| segment.bytes.clone());
+        let bytes = Self::retained_segment(&st, seq);
         if bytes.is_some() {
             st.last_access = Instant::now();
         }
         bytes
     }
 
+    /// Fetch a retained segment for a compatibility route without refreshing native HLS activity.
+    pub fn compatibility_segment(&self, seq: u64) -> Option<Bytes> {
+        Self::retained_segment(&self.state.lock().unwrap(), seq)
+    }
+
+    fn retained_segment(st: &HlsState, seq: u64) -> Option<Bytes> {
+        if seq < st.media_seq {
+            return None;
+        }
+        st.segments
+            .get((seq - st.media_seq) as usize)
+            .map(|segment| segment.bytes.clone())
+    }
+
     pub(crate) fn was_accessed_within(&self, now: Instant, grace: Duration) -> bool {
         now.saturating_duration_since(self.state.lock().unwrap().last_access) < grace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_access_for_test(&self, last_access: Instant) {
+        self.state.lock().unwrap().last_access = last_access;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_access_for_test(&self) -> Instant {
+        self.state.lock().unwrap().last_access
     }
 }
 
@@ -454,11 +478,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_segment_probe_does_not_refresh_activity() {
+    fn evicted_and_future_segment_probes_do_not_refresh_activity() {
         let p = pkg();
+        p.feed(&packets(10));
         let stale = Instant::now() - Duration::from_secs(60);
         p.state.lock().unwrap().last_access = stale;
 
+        assert!(p.segment(1).is_none());
+        assert_eq!(p.state.lock().unwrap().last_access, stale);
         assert!(p.segment(99).is_none());
         assert_eq!(p.state.lock().unwrap().last_access, stale);
     }
@@ -665,7 +692,7 @@ mod tests {
         p.feed(&packets(2));
 
         let native = p.playlist("test", "abc");
-        let compat = p.playlist_with_segment_prefix("/ace/c/client-token");
+        let compat = p.compatibility_playlist_with_segment_prefix("/ace/c/client-token");
 
         assert!(native.contains("/streams/test/abc/seg/0.ts"));
         assert!(compat.contains("/ace/c/client-token/0.ts"));
