@@ -4,7 +4,7 @@
 use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
 use crate::provider::{ProviderError, ProviderRegistry, VodContent};
-use crate::session::StreamSession;
+use crate::session::{StreamSession, Subscription};
 use ace_swarm::types::StreamMetadata;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -152,19 +152,43 @@ impl StreamManager {
             .cloned()
     }
 
-    /// Get (or lazily start) the HLS packager for `(network, id)`, starting the session too.
+    /// Get (or lazily start) a native HLS packager, recording native demand before it is returned.
     pub async fn get_or_start_hls(
         self: &Arc<Self>,
         network: &str,
         id: &str,
     ) -> Result<Arc<HlsPackager>, ProviderError> {
+        let (pkg, _session, _transition_pin) = self.get_or_start_pinned_hls(network, id).await?;
+        pkg.record_native_access();
+        Ok(pkg)
+    }
+
+    /// Get (or lazily start) a compatibility HLS packager without recording native activity.
+    /// The returned subscription pins the session across creation and must be transferred
+    /// directly to the compatibility lease owner.
+    pub async fn get_or_start_compatibility_hls(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+    ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
+        self.get_or_start_pinned_hls(network, id).await
+    }
+
+    async fn get_or_start_pinned_hls(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+    ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
         let session = self.get_or_start(network, id).await?;
+        // Keep the session visible to a concurrent reap while waiting to publish its packager.
+        let transition_pin = session.subscribe();
         let key = (network.to_string(), id.to_string());
         let mut map = self.packagers.lock().await;
-        Ok(map
+        let pkg = map
             .entry(key)
             .or_insert_with(|| HlsPackager::start(&session, self.hls))
-            .clone())
+            .clone();
+        Ok((pkg, session, transition_pin))
     }
 
     /// Peek at an already-running HLS packager without starting a session or packager.
@@ -471,12 +495,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hls_packager_without_native_access_does_not_survive_idle_reap() {
+    async fn native_hls_creation_survives_reap_before_playlist_rendering() {
         let m = StreamManager::new(registry());
-        m.get_or_start_hls("test", "compatibility-only-hls")
+        m.get_or_start_hls("test", "new-native-hls").await.unwrap();
+
+        m.reap_idle_at(Instant::now()).await;
+
+        assert!(m.get("test", "new-native-hls").await.is_some());
+        assert!(m.get_hls("test", "new-native-hls").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn compatibility_hls_is_retained_only_by_returned_pin() {
+        let m = StreamManager::new(registry());
+        let (_pkg, _session, pin) = m
+            .get_or_start_compatibility_hls("test", "compatibility-only-hls")
             .await
             .unwrap();
 
+        m.reap_idle_at(Instant::now()).await;
+        assert!(m.get("test", "compatibility-only-hls").await.is_some());
+        assert!(m.get_hls("test", "compatibility-only-hls").await.is_some());
+
+        drop(pin);
         m.reap_idle_at(Instant::now()).await;
 
         assert!(m.get("test", "compatibility-only-hls").await.is_none());

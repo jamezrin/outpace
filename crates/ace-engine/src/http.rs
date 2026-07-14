@@ -873,22 +873,17 @@ async fn ace_manifest(
             .into_response();
     };
 
-    let _pkg = match s
+    let (_pkg, session, pin) = match s
         .manager
-        .get_or_start_hls(&network, &selection.session_key)
+        .get_or_start_compatibility_hls(&network, &selection.session_key)
         .await
     {
-        Ok(pkg) => pkg,
+        Ok(started) => started,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    let Some(session) = s.manager.get(&network, &selection.session_key).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let token = s.ace_sessions.mint_hls(
-        selection.playback_id.clone(),
-        selection.session_key,
-        session.subscribe(),
-    );
+    let token = s
+        .ace_sessions
+        .mint_hls(selection.playback_id.clone(), selection.session_key, pin);
     let base = request_base(&headers);
     let playback_url = format!("{base}/ace/m/{}/{}.m3u8", selection.playback_id, token);
 

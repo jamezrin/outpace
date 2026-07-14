@@ -211,6 +211,11 @@ impl HlsPackager {
         self.playlist_with_segment_prefix(&format!("/streams/{network}/{id}/seg"))
     }
 
+    /// Record native HLS demand before a newly created packager is returned to its caller.
+    pub(crate) fn record_native_access(&self) {
+        self.state.lock().unwrap().last_access = Some(Instant::now());
+    }
+
     /// Render a native live playlist with a caller-provided segment route and refresh activity.
     pub fn playlist_with_segment_prefix(&self, segment_prefix: &str) -> String {
         let mut st = self.state.lock().unwrap();
