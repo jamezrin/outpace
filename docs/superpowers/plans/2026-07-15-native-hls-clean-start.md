@@ -41,7 +41,7 @@ fn video_access_point_state_uses_pmt_video_pid_and_caches_tables() {
     let pmt = pmt(PMT_PID, VIDEO_PID);
     assert!(!state.observe(&pat));
     assert!(!state.observe(&pmt));
-    assert!(!state.observe(&random_access_packet(0x101)));
+    assert!(!state.observe(&random_access_packet(0x102)));
     assert!(state.observe(&random_access_packet(VIDEO_PID)));
     assert_eq!(state.table_prefix().unwrap(), [pat, pmt].concat());
 }
