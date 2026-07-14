@@ -50,8 +50,9 @@ The manager's reaper will make one retention decision per session:
 
 The existing grace remains 30 seconds in production. Tests may construct a manager with a shorter
 grace or invoke one deterministic reap pass; production configuration does not gain a new knob.
-The session and packager maps will be locked in their established session-then-packager order so
-start, stop, and reap operations cannot introduce a lock-order inversion.
+The reaper will snapshot recent packager activity, release that map lock, update the session map,
+and then prune packagers in a separate lock scope. It will never hold both manager map locks at
+once, avoiding the inverse lock order currently used by explicit stop.
 
 A manifest request refreshes activity before returning its playlist. A valid retained segment
 request refreshes activity when it returns bytes. Invalid, future, or already-evicted segment
@@ -85,9 +86,9 @@ to document that the configured packet count is a hard memory ceiling.
 - Activity tracking uses a monotonic `Instant`; wall-clock changes cannot expire active playback.
 - Poisoned synchronous state follows the packager's existing mutex policy and is not given a
   separate recovery path.
-- A playlist refresh racing a reap pass has deterministic lock protection. Whichever operation
-  obtains the relevant manager locks first completes atomically; a request after removal starts a
-  new session through the existing lazy-start path.
+- The reaper evaluates the most recent completed access at its monotonic cutoff. A request that
+  arrives only after an already-idle session is removed starts a new session through the existing
+  lazy-start path.
 - Explicit stop continues to remove the session and packager immediately, regardless of recent
   activity.
 
