@@ -280,6 +280,7 @@ impl HlsPackager {
         if elapsed.is_some_and(|duration| duration >= self.seg_duration) && is_access_point {
             let duration = elapsed.unwrap_or(self.seg_duration);
             let boundary_pcr = st.last_pcr;
+            let boundary_pcr_pid = st.pcr_pid;
             self.emit(st, self.max_segment_bytes, duration);
             let prefix = st
                 .access
@@ -288,6 +289,7 @@ impl HlsPackager {
             self.seed_clean_run(st, &prefix, packet, timing);
             st.segment_start_pcr = boundary_pcr;
             st.last_pcr = boundary_pcr;
+            st.pcr_pid = boundary_pcr_pid;
             return;
         }
 
@@ -1102,6 +1104,30 @@ mod tests {
         let playlist = p.playlist("test", "multiprogram");
         assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 0);
         assert_eq!(playlist.matches("#EXTINF:1.200,").count(), 2);
+    }
+
+    #[test]
+    fn no_pcr_lookahead_boundary_keeps_the_selected_clock_pid() {
+        let p = clean_pkg(4);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&pcr_packet(VIDEO_PID, 0, true, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 108_000, false, false, 2));
+
+        // This access point completes the full run using elapsed time from VIDEO_PID, but it
+        // carries no PCR of its own. The next clean run must retain VIDEO_PID as its clock.
+        p.feed(&random_access_packet(3));
+        assert!(p.segment(0).is_some());
+
+        // A backwards-looking PCR from another program must remain filtered. The selected video
+        // clock can then advance to the next access point without a false discontinuity.
+        p.feed(&pcr_packet(AUDIO_PID, 0, false, false, 4));
+        p.feed(&pcr_packet(VIDEO_PID, 216_000, true, false, 5));
+
+        let playlist = p.playlist("test", "lookahead-clock");
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 0);
+        assert_eq!(playlist.matches("#EXTINF:1.200,").count(), 2);
+        assert!(p.segment(1).is_some());
     }
 
     #[test]
