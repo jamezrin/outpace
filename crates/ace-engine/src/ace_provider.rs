@@ -25,7 +25,7 @@ use ace_swarm::resolve::{
 };
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
-use ace_swarm::types::{StreamInfo, VodInfo};
+use ace_swarm::types::{StreamInfo, StreamMetadata, VodInfo};
 use ace_swarm::vod::download_vod_pieces;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
@@ -699,6 +699,7 @@ struct AceSource {
     downloaded: Arc<AtomicU64>,
     uploaded: Arc<AtomicU64>,
     peers_served: Arc<AtomicU32>,
+    metadata: StreamMetadata,
 }
 
 #[async_trait]
@@ -720,6 +721,9 @@ impl TsSource for AceSource {
             uploaded: self.uploaded.load(Ordering::Relaxed),
             peers_served: self.peers_served.load(Ordering::Relaxed),
         }
+    }
+    fn metadata(&self) -> StreamMetadata {
+        self.metadata.clone()
     }
 }
 
@@ -792,6 +796,7 @@ impl StreamProvider for AceProvider {
             cache_dir: self.cache_dir.clone(),
         };
         let announce_info = info.clone();
+        let metadata = info.metadata.clone();
         let announce_port = self.announce_peer_port.clone();
         let discovery_port = self.announce_peer_port.clone();
         let reachability = self.reachability.clone();
@@ -811,6 +816,7 @@ impl StreamProvider for AceProvider {
             downloaded: stats_downloaded,
             uploaded: stats_uploaded,
             peers_served: stats_peers_served,
+            metadata,
         }))
     }
 }
@@ -2899,6 +2905,7 @@ mod tests {
             downloaded: Arc::new(AtomicU64::new(0)),
             uploaded: Arc::new(AtomicU64::new(0)),
             peers_served: Arc::new(AtomicU32::new(0)),
+            metadata: StreamMetadata::default(),
         };
 
         for (expected, gap) in [
@@ -3677,6 +3684,7 @@ mod tests {
             piece_length: 4,
             chunk_length: 2,
             trackers: vec![],
+            metadata: Default::default(),
             sig_len: 0,
             source_pubkey: vec![],
         }

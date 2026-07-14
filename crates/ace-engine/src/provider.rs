@@ -2,6 +2,7 @@
 //! protocol. The `{network}` segment in the URL selects a `StreamProvider` via
 //! `ProviderRegistry`. The generic engine never names a network.
 
+use ace_swarm::types::StreamMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -32,6 +33,10 @@ pub trait TsSource: Send {
         false
     }
     fn stats(&self) -> SourceStats;
+    /// Descriptor metadata resolved alongside this exact source, if any.
+    fn metadata(&self) -> StreamMetadata {
+        StreamMetadata::default()
+    }
 }
 
 /// A finite, ordered VOD byte stream with a known total length. Unlike [`TsSource`] (an

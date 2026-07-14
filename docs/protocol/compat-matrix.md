@@ -20,12 +20,12 @@ Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 
 | Route | Status | Notes |
 | --- | --- | --- |
-| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t`; `format=json` returns playback/stat/command URLs with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
+| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t` and emits `Icy-Name` when the descriptor has a title; `format=json` returns playback/stat/command URLs and nested descriptor metadata with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
 | `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a valid lease. Missing, invalid, expired, stopped, or wrong-content tokens return HTTP 404. |
-| `GET /ace/manifest.m3u8` | Supported (live) | Uses the same selectors and catalog resolution as `getstream`. The default and `format=redirect` return `302` to a stable `/ace/m/...` playlist; `format=json` returns documented playback/stat/command fields. Each request owns one bounded HLS lease over the shared native packager. |
+| `GET /ace/manifest.m3u8` | Supported (live) | Uses the same selectors and catalog resolution as `getstream`. The default and `format=redirect` return `302` to a stable `/ace/m/...` playlist; `format=json` returns documented playback/stat/command fields plus nested descriptor metadata. Each request owns one bounded HLS lease over the shared native packager. |
 | `GET /ace/m/<id>/<token>.m3u8` | Supported (live) | Token-authenticated media playlist over the native live HLS window. Missing, forged, expired, stopped, or evicted leases return `404`; responses are `no-store`. |
 | `GET /ace/c/<session>/<seq>.ts` | Supported (live) | `session` is the unpredictable HLS lease token emitted in the playlist. Retained native bytes are returned as `video/mp2t`; forged tokens and evicted, future, or malformed sequence numbers return `404`. Segment probes never start a stream. |
-| `GET /ace/stat/<id>/<token>` | Supported | Session stats under `.response`. Invalid/expired tokens return HTTP 200 with `response: null` and `error: "invalid or expired playback session"`. |
+| `GET /ace/stat/<id>/<token>` | Supported | Session stats and nested descriptor metadata under `.response`. Invalid/expired tokens return HTTP 200 with `response: null` and `error: "invalid or expired playback session"`. |
 | `GET /ace/cmd/<id>/<token>?method=stop` | Supported | `stop` revokes only this compatibility client's lease; other clients and native consumers keep the shared source alive. Invalid/expired tokens use the same error envelope as `stat`; other methods return an error envelope. |
 
 `content_id`, `infohash`, and `id` must be exactly 40 hexadecimal characters and are normalized
@@ -40,6 +40,10 @@ parameters are accepted as inert compatibility hints: the adapter always exposes
 MPEG-TS HLS packager and never claims that remuxing or transcoding occurred. VOD compatibility is
 not claimed; native VOD remains available under `/vod`. See note 56 for the observed-versus-pinned
 contract and lifecycle details.
+
+The additive `metadata` object has stable `title`, `bitrate`, and `categories` fields. Unknown
+values are represented as `null`, `null`, and `[]`. HLS media playlists are unchanged; stream
+titles are exposed in the control JSON rather than encoded into a non-portable playlist tag.
 
 ## `/server/api` control methods
 

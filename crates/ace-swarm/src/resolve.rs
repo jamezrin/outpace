@@ -9,7 +9,7 @@
 //!     for the pure decode half. The ut_metadata exchange is the remaining live-gated step
 //!     (documented in the design spec).
 
-use crate::types::{StreamInfo, VodInfo};
+use crate::types::{StreamInfo, StreamMetadata, VodInfo};
 use ace_peer::session::PeerSession;
 use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
@@ -50,6 +50,7 @@ pub const MAX_METADATA_SIZE: usize = 1_048_576;
 /// ([`DEFAULT_PIECE_LENGTH`]). This ceiling leaves generous headroom for higher-bitrate
 /// sources while bounding the allocation a hostile transport can force at stream start.
 pub const MAX_PIECE_LENGTH: u64 = 8 * 1_048_576;
+const MAX_TITLE_BYTES: usize = 256;
 
 /// The ext id we assign to `ut_metadata` in our `m` dict (what the peer addresses replies to).
 const OUR_UT_METADATA_ID: i64 = 2;
@@ -79,6 +80,18 @@ pub enum ResolveError {
     Url(&'static str),
 }
 
+fn normalized_title(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut end = value.len().min(MAX_TITLE_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(value[..end].to_string())
+}
+
 /// Build a [`StreamInfo`] from raw `AceStreamTransport` file bytes (the pure half of
 /// content-id resolution): official swarm infohash + geometry + trackers from the descriptor.
 pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveError> {
@@ -88,12 +101,21 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
     // treat pieces as unsigned (don't strip, nothing to verify).
     let sig_len = ace_wire::live_auth::signature_len_from_pubkey_der(&d.pubkey);
+    let metadata = StreamMetadata {
+        title: normalized_title(&d.name),
+        bitrate: d
+            .bitrate
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0),
+        categories: d.categories,
+    };
     Ok(StreamInfo {
         infohash: infohash_of_descriptor(&d.raw)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
         piece_length: d.piece_length,
         chunk_length: d.chunk_length,
         trackers: d.trackers,
+        metadata,
         sig_len: sig_len.unwrap_or(0),
         source_pubkey: if sig_len.is_some() {
             d.pubkey
@@ -173,6 +195,7 @@ pub fn stream_info_from_infohash(
         piece_length: DEFAULT_PIECE_LENGTH,
         chunk_length: DEFAULT_CHUNK_LENGTH,
         trackers,
+        metadata: StreamMetadata::default(),
         // No transport => no pubkey to measure; assume the standard Acestream 768-bit
         // source key (96-byte signature tail). See DEFAULT_SIG_LEN. Without the actual pubkey
         // we can strip that tail but cannot *verify* it, so `source_pubkey` stays empty (#10).
@@ -951,6 +974,9 @@ mod tests {
         assert_eq!(si.chunk_length, 16_384);
         assert_eq!(si.chunks_per_piece(), 64);
         assert_eq!(si.trackers, vec!["udp://t.example:80".to_string()]);
+        assert_eq!(si.metadata.title.as_deref(), Some("Test"));
+        assert_eq!(si.metadata.bitrate, Some(100_000));
+        assert!(si.metadata.categories.is_empty());
         assert_eq!(
             si.infohash,
             [
@@ -958,6 +984,16 @@ mod tests {
                 0x6d, 0x42, 0xae, 0xa7, 0xf8, 0x8c,
             ]
         );
+    }
+
+    #[test]
+    fn transport_preserves_categories_in_stream_metadata() {
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei100000e10:categoriesl6:sports4:livee12:chunk_lengthi16384e4:name4:Test12:piece_lengthi1048576e6:pubkey3:abce",
+        );
+        let si = stream_info_from_transport(&tf).unwrap();
+
+        assert_eq!(si.metadata.categories, vec!["sports", "live"]);
     }
 
     #[test]
@@ -1014,6 +1050,7 @@ mod tests {
         assert_eq!(si.chunk_length, DEFAULT_CHUNK_LENGTH);
         assert_eq!(si.infohash[0], 0x01);
         assert_eq!(si.infohash[19], 0x67);
+        assert_eq!(si.metadata, crate::types::StreamMetadata::default());
     }
 
     #[test]
@@ -1109,6 +1146,7 @@ mod tests {
             piece_length: 1,
             chunk_length: 1,
             trackers: vec![],
+            metadata: StreamMetadata::default(),
             sig_len: 0,
             source_pubkey: vec![],
         };

@@ -30,9 +30,9 @@ outpace broadcast sports --public-host stream.example
 | --- | --- | --- |
 | `GET /healthz` | `200 text/plain` (`ok`) | Process health probe; it does not prove swarm connectivity. |
 | `GET /networks` | `200 application/json`, `{"networks":["ace"]}` | Provider networks configured in this daemon. |
-| `GET /streams` | `200 application/json`, `{"streams":[...]}` | Active shared sessions. Entries have `network`, `id`, and direct-client count `clients`. |
-| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. Dotted ids, unknown networks, and invalid ids return `404`. |
-| `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Explicit continuous MPEG-TS form; equivalent for dot-free ids and preserves dots within the provider id. |
+| `GET /streams` | `200 application/json`, `{"streams":[...]}` | Active shared sessions. Entries have `network`, `id`, direct-client count `clients`, and descriptor `metadata`. |
+| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. |
+| `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Explicit continuous MPEG-TS form; equivalent for dot-free ids, preserves dots within the provider id, and includes `Icy-Name` when the descriptor supplies a title. |
 | `GET /streams/<network>/<id>.m3u8` | `200 application/vnd.apple.mpegurl` | Starts or joins live HLS packaging and returns a sliding playlist. |
 | `GET /streams/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Retained live HLS segment. Missing, expired, or not-yet-produced segments return `404`; a segment request alone never starts a stream. |
 | `GET /streams/<network>/<id>/status` | `200 application/json` | Active-session status; `404` before playback starts or after teardown. |
@@ -55,12 +55,23 @@ An active stream status response has stable field names and numeric counters:
   "bitrate": 2450000,
   "buffer_ms": 6200,
   "uploaded": 1048576,
-  "peers_served": 2
+  "peers_served": 2,
+  "metadata": {
+    "title": "Example Sports",
+    "bitrate": 2450000,
+    "categories": ["sports"]
+  }
 }
 ```
 
 `clients` counts direct consumers of the shared byte stream; internal HLS packaging does not
-inflate it. `bitrate` is bits per second, `buffer_ms` is milliseconds, and `uploaded` is bytes.
+inflate it. The top-level `bitrate` is the measured session rate; `metadata.bitrate` is the
+descriptor's advertised rate. Rates are bits per second, `buffer_ms` is milliseconds, and
+`uploaded` is bytes. Metadata always has the stable `title`, `bitrate`, and `categories` fields;
+bare infohashes and descriptors without metadata return `null`, `null`, and `[]` respectively.
+The descriptor title is authoritative for both `metadata.title` and `Icy-Name`; outpace does not
+invent a title for a bare infohash.
+Live HLS media playlists are unchanged because they have no portable stream-title field.
 
 ## Player and middleware integration
 
@@ -96,3 +107,6 @@ are unsupported. The live `/ace/manifest.m3u8`, tokenized `/ace/m/...m3u8`, and
 `/ace/c/<session>/<seq>.ts` adapter reuses the native live HLS packager; compatibility VOD remains
 deferred. The exact supported methods and error envelopes are pinned in
 [`protocol/compat-matrix.md`](protocol/compat-matrix.md).
+
+Compatibility `getstream`, `manifest` JSON, and `stat` responses expose the same nested metadata
+object. Direct and tokenized MPEG-TS playback also emits `Icy-Name` when a title is known.
