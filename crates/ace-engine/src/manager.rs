@@ -3,7 +3,7 @@
 
 use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
-use crate::provider::{ProviderError, ProviderRegistry, VodContent};
+use crate::provider::{ProviderError, ProviderRegistry, TsSource, VodContent};
 use crate::session::{StreamSession, Subscription};
 use ace_swarm::types::StreamMetadata;
 use std::collections::{HashMap, HashSet};
@@ -13,14 +13,37 @@ use tokio::sync::Mutex;
 
 /// A resolved VOD plus its last-access time (for idle expiry), keyed by `(network, id)`.
 type VodCacheEntry = (Arc<dyn VodContent>, Instant);
+type StreamKey = (String, String);
+
+#[derive(Default)]
+struct HlsLifecycleState {
+    next_generation: u64,
+    pending: HashMap<StreamKey, HashSet<u64>>,
+    cancelled: HashSet<(StreamKey, u64)>,
+    start_locks: HashMap<StreamKey, Arc<Mutex<()>>>,
+}
+
+impl HlsLifecycleState {
+    fn finish(&mut self, key: &StreamKey, generation: u64) -> bool {
+        let cancelled = self.cancelled.remove(&(key.clone(), generation));
+        if let Some(generations) = self.pending.get_mut(key) {
+            generations.remove(&generation);
+            if generations.is_empty() {
+                self.pending.remove(key);
+                self.start_locks.remove(key);
+            }
+        }
+        cancelled
+    }
+}
 
 pub struct StreamManager {
     registry: ProviderRegistry,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
     packagers: Mutex<HashMap<(String, String), Arc<HlsPackager>>>,
-    /// Serializes complete HLS lifecycle transitions with reaping and explicit stop. Map locks
-    /// remain separately scoped inside this boundary and are never nested with one another.
-    hls_lifecycle: Mutex<()>,
+    /// Coordinates short HLS publication/reap/stop critical sections. Provider work runs outside
+    /// this lock; pending generations keep reap safe and let stop cancel only starts already begun.
+    hls_lifecycle: Mutex<HlsLifecycleState>,
     /// Serializes session *creation* so concurrent first requests for the same id (e.g. the
     /// two connections VLC opens) trigger exactly ONE `provider.open()` — not duplicate
     /// discovery + duplicate peer connections from our same node_id (which real peers drop).
@@ -58,7 +81,7 @@ impl StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
             packagers: Mutex::new(HashMap::new()),
-            hls_lifecycle: Mutex::new(()),
+            hls_lifecycle: Mutex::new(HlsLifecycleState::default()),
             start_lock: Mutex::new(()),
             vod_cache: Mutex::new(HashMap::new()),
             vod_resolve_lock: Mutex::new(()),
@@ -162,9 +185,8 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<HlsPackager>, ProviderError> {
-        let _lifecycle = self.hls_lifecycle.lock().await;
-        let (pkg, _session, _transition_pin) = self.get_or_start_pinned_hls(network, id).await?;
-        pkg.record_native_access();
+        let (pkg, _session, _transition_pin) =
+            self.get_or_start_pinned_hls(network, id, true).await?;
         Ok(pkg)
     }
 
@@ -176,24 +198,100 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
-        let _lifecycle = self.hls_lifecycle.lock().await;
-        self.get_or_start_pinned_hls(network, id).await
+        self.get_or_start_pinned_hls(network, id, false).await
     }
 
     async fn get_or_start_pinned_hls(
         self: &Arc<Self>,
         network: &str,
         id: &str,
+        native: bool,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
-        let session = self.get_or_start(network, id).await?;
-        // Keep the session visible to a concurrent reap while waiting to publish its packager.
-        let transition_pin = session.subscribe();
         let key = (network.to_string(), id.to_string());
-        let mut map = self.packagers.lock().await;
-        let pkg = map
-            .entry(key)
-            .or_insert_with(|| HlsPackager::start(&session, self.hls))
-            .clone();
+        let (generation, start_lock) = {
+            let mut lifecycle = self.hls_lifecycle.lock().await;
+            lifecycle.next_generation = lifecycle
+                .next_generation
+                .checked_add(1)
+                .expect("HLS transition generation overflow");
+            let generation = lifecycle.next_generation;
+            lifecycle
+                .pending
+                .entry(key.clone())
+                .or_default()
+                .insert(generation);
+            let start_lock = lifecycle
+                .start_locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone();
+            (generation, start_lock)
+        };
+
+        // Serialize only starts for this key. Unrelated provider opens, reap, and stop proceed.
+        let _starting = start_lock.lock().await;
+        let cancelled = {
+            let mut lifecycle = self.hls_lifecycle.lock().await;
+            if lifecycle.cancelled.contains(&(key.clone(), generation)) {
+                lifecycle.finish(&key, generation);
+                true
+            } else {
+                false
+            }
+        };
+        if cancelled {
+            return Err(ProviderError::NotFound);
+        }
+
+        let existing_session = self.sessions.lock().await.get(&key).cloned();
+        let mut source: Option<Box<dyn TsSource>> = if existing_session.is_none() {
+            let Some(provider) = self.registry.get(network) else {
+                self.hls_lifecycle.lock().await.finish(&key, generation);
+                return Err(ProviderError::NotFound);
+            };
+            match provider.open(id).await {
+                Ok(source) => Some(source),
+                Err(error) => {
+                    self.hls_lifecycle.lock().await.finish(&key, generation);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        // Finalization is atomic with reap/stop, but contains no provider or other long I/O.
+        let mut lifecycle = self.hls_lifecycle.lock().await;
+        if lifecycle.finish(&key, generation) {
+            return Err(ProviderError::NotFound);
+        }
+
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(&key) {
+                session.clone()
+            } else {
+                let session = StreamSession::start(
+                    source
+                        .take()
+                        .expect("an absent HLS session must have an opened source"),
+                    self.buffer,
+                );
+                sessions.insert(key.clone(), session.clone());
+                session
+            }
+        };
+        let transition_pin = session.subscribe();
+        let pkg = {
+            let mut packagers = self.packagers.lock().await;
+            packagers
+                .entry(key)
+                .or_insert_with(|| HlsPackager::start(&session, self.hls))
+                .clone()
+        };
+        if native {
+            pkg.record_native_access();
+        }
         Ok((pkg, session, transition_pin))
     }
 
@@ -210,8 +308,18 @@ impl StreamManager {
     /// down — the session's `Drop` aborts its background pull task. Returns `true` if a session
     /// for `(network, id)` existed. Connected clients see the stream end.
     pub async fn stop(&self, network: &str, id: &str) -> bool {
-        let _lifecycle = self.hls_lifecycle.lock().await;
         let key = (network.to_string(), id.to_string());
+        let mut lifecycle = self.hls_lifecycle.lock().await;
+        let pending = lifecycle
+            .pending
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        for generation in pending {
+            lifecycle.cancelled.insert((key.clone(), generation));
+        }
         self.packagers.lock().await.remove(&key);
         self.sessions.lock().await.remove(&key).is_some()
     }
@@ -234,7 +342,8 @@ impl StreamManager {
     }
 
     async fn reap_idle_at(&self, now: Instant) {
-        let _lifecycle = self.hls_lifecycle.lock().await;
+        let lifecycle = self.hls_lifecycle.lock().await;
+        let pending_hls: HashSet<_> = lifecycle.pending.keys().cloned().collect();
         let active_hls: HashSet<_> = {
             let packagers = self.packagers.lock().await;
             packagers
@@ -246,8 +355,11 @@ impl StreamManager {
 
         let retained_sessions: HashSet<_> = {
             let mut sessions = self.sessions.lock().await;
-            sessions
-                .retain(|key, session| session.subscriber_count() > 0 || active_hls.contains(key));
+            sessions.retain(|key, session| {
+                session.subscriber_count() > 0
+                    || active_hls.contains(key)
+                    || pending_hls.contains(key)
+            });
             sessions.keys().cloned().collect()
         };
 
@@ -302,7 +414,10 @@ mod tests {
             "blocking"
         }
 
-        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            if id == "fast" {
+                return Ok(Box::new(IdleSource));
+            }
             self.started.notify_one();
             self.release.notified().await;
             Ok(Box::new(IdleSource))
@@ -521,7 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_waits_for_hls_transition_then_removes_both_entries() {
+    async fn stop_cancels_pending_hls_without_waiting_for_provider() {
         let (m, started, release) = blocking_manager();
         let start = {
             let m = m.clone();
@@ -529,23 +644,42 @@ mod tests {
         };
         started.notified().await;
 
-        let mut stop = {
-            let m = m.clone();
-            tokio::spawn(async move { m.stop("blocking", "stopped").await })
-        };
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut stop)
+        let stopped =
+            tokio::time::timeout(Duration::from_millis(50), m.stop("blocking", "stopped"))
                 .await
-                .is_err(),
-            "stop must wait for the complete HLS transition"
-        );
+                .expect("stop must not wait for pending provider work");
+        assert!(!stopped);
 
         release.notify_one();
-        start.await.unwrap().unwrap();
-        assert!(stop.await.unwrap());
+        assert!(start.await.unwrap().is_err());
 
         assert!(m.get("blocking", "stopped").await.is_none());
         assert!(m.get_hls("blocking", "stopped").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_only_hls_generations_already_pending() {
+        let (m, started, release) = blocking_manager();
+        let old_start = {
+            let m = m.clone();
+            tokio::spawn(async move { m.get_or_start_hls("blocking", "generation").await })
+        };
+        started.notified().await;
+        assert!(!m.stop("blocking", "generation").await);
+
+        let new_start = {
+            let m = m.clone();
+            tokio::spawn(async move { m.get_or_start_hls("blocking", "generation").await })
+        };
+        release.notify_one();
+        assert!(old_start.await.unwrap().is_err());
+
+        started.notified().await;
+        release.notify_one();
+        new_start.await.unwrap().unwrap();
+
+        assert!(m.get("blocking", "generation").await.is_some());
+        assert!(m.get_hls("blocking", "generation").await.is_some());
     }
 
     #[tokio::test]
@@ -574,7 +708,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reap_waits_for_native_hls_transition_and_observes_activity() {
+    async fn unrelated_hls_start_does_not_wait_for_pending_provider() {
+        let (m, started, release) = blocking_manager();
+        let blocked = {
+            let m = m.clone();
+            tokio::spawn(async move { m.get_or_start_hls("blocking", "blocked").await })
+        };
+        started.notified().await;
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            m.get_or_start_hls("blocking", "fast"),
+        )
+        .await
+        .expect("an unrelated HLS start must not wait for pending provider work")
+        .unwrap();
+
+        release.notify_one();
+        blocked.await.unwrap().unwrap();
+        assert!(m.get_hls("blocking", "blocked").await.is_some());
+        assert!(m.get_hls("blocking", "fast").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reap_returns_while_native_hls_is_pending_then_observes_activity() {
         let (m, started, release) = blocking_manager();
         let start = {
             let m = m.clone();
@@ -582,20 +739,12 @@ mod tests {
         };
         started.notified().await;
 
-        let mut reap = {
-            let m = m.clone();
-            tokio::spawn(async move { m.reap_idle_at(Instant::now()).await })
-        };
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut reap)
-                .await
-                .is_err(),
-            "reap must wait for the complete native HLS transition"
-        );
+        tokio::time::timeout(Duration::from_millis(50), m.reap_idle_at(Instant::now()))
+            .await
+            .expect("reap must not wait for pending native provider work");
 
         release.notify_one();
         start.await.unwrap().unwrap();
-        reap.await.unwrap();
 
         assert!(m.get("blocking", "native").await.is_some());
         assert!(m.get_hls("blocking", "native").await.is_some());
@@ -621,7 +770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reap_waits_for_compatibility_hls_transition_and_observes_pin() {
+    async fn reap_returns_while_compatibility_hls_is_pending_then_observes_pin() {
         let (m, started, release) = blocking_manager();
         let start = {
             let m = m.clone();
@@ -632,20 +781,12 @@ mod tests {
         };
         started.notified().await;
 
-        let mut reap = {
-            let m = m.clone();
-            tokio::spawn(async move { m.reap_idle_at(Instant::now()).await })
-        };
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut reap)
-                .await
-                .is_err(),
-            "reap must wait for the complete compatibility HLS transition"
-        );
+        tokio::time::timeout(Duration::from_millis(50), m.reap_idle_at(Instant::now()))
+            .await
+            .expect("reap must not wait for pending compatibility provider work");
 
         release.notify_one();
         let (_pkg, _session, pin) = start.await.unwrap().unwrap();
-        reap.await.unwrap();
 
         assert!(m.get("blocking", "compatibility").await.is_some());
         assert!(m.get_hls("blocking", "compatibility").await.is_some());
