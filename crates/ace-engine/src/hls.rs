@@ -36,7 +36,7 @@ struct HlsState {
     pcr_pid: Option<u16>,
     max_segment_duration: f32,
     discontinuity_pending: bool,
-    last_access: Instant,
+    last_access: Option<Instant>,
 }
 
 struct HlsSegment {
@@ -62,7 +62,7 @@ impl HlsPackager {
                 pcr_pid: None,
                 max_segment_duration: config.segment_duration_secs(),
                 discontinuity_pending: false,
-                last_access: Instant::now(),
+                last_access: None,
             }),
             seg_packets,
             max_segment_bytes,
@@ -214,7 +214,7 @@ impl HlsPackager {
     /// Render a native live playlist with a caller-provided segment route and refresh activity.
     pub fn playlist_with_segment_prefix(&self, segment_prefix: &str) -> String {
         let mut st = self.state.lock().unwrap();
-        st.last_access = Instant::now();
+        st.last_access = Some(Instant::now());
         Self::render_playlist(&st, segment_prefix)
     }
 
@@ -249,7 +249,7 @@ impl HlsPackager {
         let mut st = self.state.lock().unwrap();
         let bytes = Self::retained_segment(&st, seq);
         if bytes.is_some() {
-            st.last_access = Instant::now();
+            st.last_access = Some(Instant::now());
         }
         bytes
     }
@@ -269,16 +269,20 @@ impl HlsPackager {
     }
 
     pub(crate) fn was_accessed_within(&self, now: Instant, grace: Duration) -> bool {
-        now.saturating_duration_since(self.state.lock().unwrap().last_access) < grace
+        self.state
+            .lock()
+            .unwrap()
+            .last_access
+            .is_some_and(|last_access| now.saturating_duration_since(last_access) < grace)
     }
 
     #[cfg(test)]
     pub(crate) fn set_last_access_for_test(&self, last_access: Instant) {
-        self.state.lock().unwrap().last_access = last_access;
+        self.state.lock().unwrap().last_access = Some(last_access);
     }
 
     #[cfg(test)]
-    pub(crate) fn last_access_for_test(&self) -> Instant {
+    pub(crate) fn last_access_for_test(&self) -> Option<Instant> {
         self.state.lock().unwrap().last_access
     }
 }
@@ -468,13 +472,23 @@ mod tests {
         p.feed(&packets(2));
         let stale = Instant::now() - Duration::from_secs(60);
 
-        p.state.lock().unwrap().last_access = stale;
+        p.state.lock().unwrap().last_access = Some(stale);
         let _playlist = p.playlist("test", "active");
-        assert!(p.state.lock().unwrap().last_access > stale);
+        assert!(p
+            .state
+            .lock()
+            .unwrap()
+            .last_access
+            .is_some_and(|at| at > stale));
 
-        p.state.lock().unwrap().last_access = stale;
+        p.state.lock().unwrap().last_access = Some(stale);
         assert!(p.segment(0).is_some());
-        assert!(p.state.lock().unwrap().last_access > stale);
+        assert!(p
+            .state
+            .lock()
+            .unwrap()
+            .last_access
+            .is_some_and(|at| at > stale));
     }
 
     #[test]
@@ -482,12 +496,12 @@ mod tests {
         let p = pkg();
         p.feed(&packets(10));
         let stale = Instant::now() - Duration::from_secs(60);
-        p.state.lock().unwrap().last_access = stale;
+        p.state.lock().unwrap().last_access = Some(stale);
 
         assert!(p.segment(1).is_none());
-        assert_eq!(p.state.lock().unwrap().last_access, stale);
+        assert_eq!(p.state.lock().unwrap().last_access, Some(stale));
         assert!(p.segment(99).is_none());
-        assert_eq!(p.state.lock().unwrap().last_access, stale);
+        assert_eq!(p.state.lock().unwrap().last_access, Some(stale));
     }
 
     #[test]

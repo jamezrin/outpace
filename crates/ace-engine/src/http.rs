@@ -3079,7 +3079,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(playlist.status(), StatusCode::OK);
-        assert_eq!(pkg.last_access_for_test(), stale);
+        assert_eq!(pkg.last_access_for_test(), Some(stale));
 
         let segment = app
             .clone()
@@ -3087,7 +3087,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(segment.status(), StatusCode::OK);
-        assert_eq!(pkg.last_access_for_test(), stale);
+        assert_eq!(pkg.last_access_for_test(), Some(stale));
     }
 
     #[tokio::test]

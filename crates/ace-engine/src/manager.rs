@@ -471,6 +471,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_packager_without_native_access_does_not_survive_idle_reap() {
+        let m = StreamManager::new(registry());
+        m.get_or_start_hls("test", "compatibility-only-hls")
+            .await
+            .unwrap();
+
+        m.reap_idle_at(Instant::now()).await;
+
+        assert!(m.get("test", "compatibility-only-hls").await.is_none());
+        assert!(m.get_hls("test", "compatibility-only-hls").await.is_none());
+    }
+
+    #[tokio::test]
     async fn inactive_hls_session_and_packager_are_reaped_together() {
         let m = StreamManager::new(registry());
         m.get_or_start_hls("test", "stale-hls").await.unwrap();
