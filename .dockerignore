@@ -7,4 +7,5 @@ re
 references
 target
 tests
-tools
+tools/*
+!tools/swarmtest

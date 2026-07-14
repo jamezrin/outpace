@@ -1,9 +1,21 @@
 name: ARMv7 portability
 
 on:
-  # Run on every PR: target behavior can change through toolchain, Cargo configuration,
-  # fixtures, build plumbing, or repository-level files outside `crates/`.
+  # Only run when something that can actually change the ARMv7 build or its runtime
+  # behavior moves: the shipped crates, test fixtures, workspace/toolchain config, the
+  # container image, or this workflow itself. Docs and dev-only tooling (`tools/**`,
+  # excluded from the emulated workspace run below) cannot affect it, so they are skipped
+  # to keep the slow QEMU jobs off unrelated PRs.
   pull_request:
+    paths:
+      - .github/workflows/armv7-portability.yml
+      - crates/**
+      - tests/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - Dockerfile
+      - .dockerignore
   workflow_dispatch:
 
 permissions:
@@ -40,7 +52,10 @@ jobs:
       - name: Run offline workspace suite
         env:
           RUST_TEST_THREADS: 1
-        run: cargo test --locked --workspace --all-targets --target "$TARGET"
+        # `swarmtest` is a dev-only, `publish = false` docker-orchestration harness that never
+        # runs on an ARMv7 device; excluding it keeps its heavy dependency tree (reqwest,
+        # tokio, flate2, tar) from being cross-compiled and its tests from running under QEMU.
+        run: cargo test --locked --workspace --exclude swarmtest --all-targets --target "$TARGET"
 
   container-smoke:
     name: ARMv7 container startup and health smoke
@@ -67,6 +82,10 @@ jobs:
           platforms: linux/arm/v7
           load: true
           tags: outpace:armv7-smoke
+          # Persist the emulated from-source build across runs; a full ARMv7 Rust compile
+          # under QEMU is the slowest step in this workflow.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Start daemon and check health
         shell: bash

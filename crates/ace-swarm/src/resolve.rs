@@ -527,6 +527,40 @@ fn is_safe_ip(ip: &IpAddr) -> bool {
 /// or every resolved address is blocked by [`is_safe_ip`]. IP literals are validated directly;
 /// hostnames are resolved and the first safe address is kept (later pinned into the client so
 /// DNS rebinding cannot swap it).
+/// Env opt-in to allow fetching transport files from non-global (private/LAN/loopback)
+/// hosts. Default off — the SSRF guard stays closed for normal use. Intended for
+/// controlled self-hosted or test swarms on a private network, and mirrors
+/// [`crate::discover::TrackerPolicy`]'s `OUTPACE_TRACKER_ALLOW_NON_GLOBAL`.
+fn allow_non_global_transport() -> bool {
+    std::env::var("OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Whether `ip` is a private/LAN/loopback address — the *only* extra targets the
+/// `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT` opt-in unblocks. This deliberately stays narrower
+/// than "not [`is_safe_ip`]": link-local (e.g. the `169.254.169.254` cloud metadata
+/// endpoint), unspecified, multicast, broadcast, and documentation ranges remain blocked
+/// even with the opt-in on, so enabling it for a LAN swarm cannot become an SSRF footgun.
+fn is_private_or_loopback(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                // Shared address space / CGNAT: 100.64.0.0/10.
+                || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_or_loopback(&IpAddr::V4(v4));
+            }
+            // Loopback ::1 or unique-local fc00::/7.
+            v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
 async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveError> {
     // `Url::host_str` keeps the brackets on an IPv6 literal (`[::1]`); strip them so the literal
     // parses and is validated, rather than falling through to a doomed DNS lookup.
@@ -534,8 +568,9 @@ async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveE
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
+    let allow_non_global = allow_non_global_transport();
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return if is_safe_ip(&ip) {
+        return if is_safe_ip(&ip) || (allow_non_global && is_private_or_loopback(&ip)) {
             Ok(SocketAddr::new(ip, port))
         } else {
             Err(ResolveError::Url("blocked address"))
@@ -545,7 +580,7 @@ async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveE
         .await
         .map_err(|_| ResolveError::Url("dns failed"))?;
     for addr in addrs {
-        if is_safe_ip(&addr.ip()) {
+        if is_safe_ip(&addr.ip()) || (allow_non_global && is_private_or_loopback(&addr.ip())) {
             return Ok(addr);
         }
     }
@@ -737,6 +772,51 @@ mod tests {
         assert!(is_safe_ip(&IpAddr::V6(
             "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
         )));
+    }
+
+    #[test]
+    fn non_global_transport_optin_stays_narrow() {
+        // The opt-in path ANDs `is_private_or_loopback`, so these extra targets must be
+        // unblocked by it (private/LAN/loopback + CGNAT)...
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.0.1",
+            "172.28.0.1", // the interop harness's bridge gateway
+            "100.64.0.1",
+        ] {
+            assert!(
+                is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must be reachable under the opt-in"
+            );
+        }
+        for ip in ["::1", "fc00::1", "::ffff:127.0.0.1"] {
+            assert!(
+                is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must be reachable under the opt-in"
+            );
+        }
+        // ...but link-local (incl. the cloud metadata endpoint), unspecified, broadcast,
+        // and multicast stay blocked even with the opt-in on.
+        for ip in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            assert!(
+                !is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must stay blocked even under the opt-in"
+            );
+        }
+        for ip in ["fe80::1", "::", "ff02::1"] {
+            assert!(
+                !is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must stay blocked even under the opt-in"
+            );
+        }
     }
 
     #[tokio::test]
