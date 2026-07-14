@@ -1379,11 +1379,22 @@ async fn stream_file(
 ) -> Response {
     if let Some(id) = file.strip_suffix(".m3u8") {
         return match s.manager.get_or_start_hls(&network, id).await {
-            Ok(pkg) => (
-                [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
-                pkg.playlist(&network, id),
-            )
-                .into_response(),
+            Ok(pkg) => {
+                let icy_name = s
+                    .manager
+                    .get(&network, id)
+                    .await
+                    .and_then(|session| icy_name_header(session.metadata()));
+                let mut response = (
+                    [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+                    pkg.playlist(&network, id),
+                )
+                    .into_response();
+                if let Some(value) = icy_name {
+                    response.headers_mut().insert("icy-name", value);
+                }
+                response
+            }
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         };
     }
@@ -3646,10 +3657,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m3u8_serves_hls_playlist() {
-        let resp = router(state())
+    async fn m3u8_serves_hls_playlist_with_stream_title() {
+        let resp = router(fixture_state(0))
             .oneshot(
-                Request::get("/streams/test/chan.m3u8")
+                Request::get("/streams/fix/chan.m3u8")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3660,6 +3671,7 @@ mod tests {
             resp.headers()[header::CONTENT_TYPE],
             "application/vnd.apple.mpegurl"
         );
+        assert_eq!(resp.headers()["icy-name"], "Synthetic Demo Channel");
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
