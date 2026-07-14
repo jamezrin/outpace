@@ -5,7 +5,7 @@ use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
 use crate::provider::{ProviderError, ProviderRegistry, VodContent};
 use crate::session::StreamSession;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -194,16 +194,36 @@ impl StreamManager {
             .collect()
     }
 
+    async fn reap_idle_at(&self, now: Instant) {
+        let active_hls: HashSet<_> = {
+            let packagers = self.packagers.lock().await;
+            packagers
+                .iter()
+                .filter(|(_, pkg)| pkg.was_accessed_within(now, self.grace))
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+
+        let retained_sessions: HashSet<_> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .retain(|key, session| session.subscriber_count() > 0 || active_hls.contains(key));
+            sessions.keys().cloned().collect()
+        };
+
+        self.packagers
+            .lock()
+            .await
+            .retain(|key, _| retained_sessions.contains(key));
+    }
+
     /// Spawn the idle-teardown watcher: drops sessions with 0 subscribers after `grace`.
     pub fn spawn_reaper(self: &Arc<Self>) {
         let me = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(me.grace).await;
-                let mut map = me.sessions.lock().await;
-                map.retain(|_, s| s.subscriber_count() > 0);
-                // Drop packagers whose session is gone (their background task ends on close).
-                me.packagers.lock().await.retain(|k, _| map.contains_key(k));
+                me.reap_idle_at(Instant::now()).await;
             }
         });
     }
@@ -423,5 +443,29 @@ mod tests {
             !m.stop("test", "a").await,
             "stopping a missing session is a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn recent_hls_playlist_access_survives_idle_reap() {
+        let m = StreamManager::new(registry());
+        let pkg = m.get_or_start_hls("test", "active-hls").await.unwrap();
+        let _playlist = pkg.playlist("test", "active-hls");
+
+        m.reap_idle_at(Instant::now() + m.grace / 2).await;
+
+        assert!(m.get("test", "active-hls").await.is_some());
+        assert!(m.get_hls("test", "active-hls").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn inactive_hls_session_and_packager_are_reaped_together() {
+        let m = StreamManager::new(registry());
+        m.get_or_start_hls("test", "stale-hls").await.unwrap();
+
+        m.reap_idle_at(Instant::now() + m.grace + Duration::from_secs(1))
+            .await;
+
+        assert!(m.get("test", "stale-hls").await.is_none());
+        assert!(m.get_hls("test", "stale-hls").await.is_none());
     }
 }
