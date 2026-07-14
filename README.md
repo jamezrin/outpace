@@ -266,6 +266,16 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_PORT_MAP_EXTERNAL_PORT` - optional external TCP port requested from the gateway.
 - `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - enables legacy compatibility routes.
 - `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
+- `OUTPACE_TRACKERS` - comma-separated `scheme://…` (typically `udp://host:port/announce`)
+  tracker URLs minted into `outpace broadcast` descriptors and used for broadcast self-announce.
+  When set (non-empty after trimming) it fully replaces the built-in public default
+  (`udp://t1.torrentstream.org:2710/announce`); unset leaves that default in place. Entries with
+  no `scheme://` prefix (or longer than 256 bytes) are dropped with a warning, and the list is
+  clamped to 64 entries. Note outpace only **self-announces** to lowercase `udp://` trackers;
+  entries with any other scheme are kept in the minted descriptor for other clients but warned
+  about, since outpace itself never announces there. Use this to point a broadcast at a
+  private/local tracker (announcing to a private-address tracker also requires the non-global
+  tracker allowance, tracked separately).
 
 Boolean gates accept exactly `1`, `true`, `0`, or `false`; other values are configuration errors
 rather than silently disabling a feature.
