@@ -1804,8 +1804,8 @@ mod tests {
 
     #[tokio::test]
     async fn vod_manifest_serves_a_terminated_vod_playlist() {
-        // 450 bytes over 188-byte (1-packet) segments => 3 segments.
-        let resp = memvod_hls_router(vec![0u8; 450], 1)
+        // 1500 bytes over 564-byte (3-packet) segments => 3 segments.
+        let resp = memvod_hls_router(vec![0u8; 1500], 3)
             .oneshot(
                 Request::get("/vod/memvod/x/manifest.m3u8")
                     .body(Body::empty())
@@ -1831,9 +1831,9 @@ mod tests {
 
     #[tokio::test]
     async fn vod_hls_segment_serves_its_verified_byte_range_as_ts() {
-        let data: Vec<u8> = (0..255u8).cycle().take(450).collect();
-        // Segment 1 covers bytes [188, 376).
-        let resp = memvod_hls_router(data.clone(), 1)
+        let data: Vec<u8> = (0..255u8).cycle().take(1500).collect();
+        // Segment 1 covers bytes [564, 1128).
+        let resp = memvod_hls_router(data.clone(), 3)
             .oneshot(
                 Request::get("/vod/memvod/x/seg/1.ts")
                     .body(Body::empty())
@@ -1843,18 +1843,18 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "video/mp2t");
-        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "188");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "564");
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        assert_eq!(&body[..], &data[188..376]);
+        assert_eq!(&body[..], &data[564..1128]);
     }
 
     #[tokio::test]
     async fn vod_hls_final_segment_is_clamped_to_the_last_byte() {
-        let data: Vec<u8> = (0..255u8).cycle().take(450).collect();
-        // 450 bytes => final segment 2 covers [376, 450): 74 bytes.
-        let resp = memvod_hls_router(data.clone(), 1)
+        let data: Vec<u8> = (0..255u8).cycle().take(1500).collect();
+        // 1500 bytes => final segment 2 covers [1128, 1500): 372 bytes.
+        let resp = memvod_hls_router(data.clone(), 3)
             .oneshot(
                 Request::get("/vod/memvod/x/seg/2.ts")
                     .body(Body::empty())
@@ -1863,16 +1863,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "74");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "372");
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        assert_eq!(&body[..], &data[376..450]);
+        assert_eq!(&body[..], &data[1128..1500]);
     }
 
     #[tokio::test]
     async fn vod_hls_segment_past_the_end_404s() {
-        let resp = memvod_hls_router(vec![0u8; 450], 1)
+        let resp = memvod_hls_router(vec![0u8; 1500], 3)
             .oneshot(
                 Request::get("/vod/memvod/x/seg/99.ts")
                     .body(Body::empty())
@@ -2121,15 +2121,83 @@ mod tests {
 
     struct PacedPacketProvider;
     struct PacedPacketSource {
-        marker: u8,
+        packet_index: u64,
     }
+
+    fn paced_psi(pid: u16, section: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0xff; 188];
+        packet[0] = 0x47;
+        packet[1] = 0x40 | ((pid >> 8) as u8 & 0x1f);
+        packet[2] = pid as u8;
+        packet[3] = 0x10;
+        packet[4] = 0;
+        packet[5..5 + section.len()].copy_from_slice(section);
+        packet
+    }
+
+    fn paced_pat(pmt_pid: u16) -> Vec<u8> {
+        let mut section = vec![0x00, 0xb0, 13, 0x00, 0x01, 0xc1, 0, 0];
+        section.extend_from_slice(&[
+            0x00,
+            0x01,
+            0xe0 | ((pmt_pid >> 8) as u8 & 0x1f),
+            pmt_pid as u8,
+        ]);
+        section.extend_from_slice(&[0; 4]);
+        paced_psi(0, &section)
+    }
+
+    fn paced_pmt(pmt_pid: u16, video_pid: u16) -> Vec<u8> {
+        let mut section = vec![0x02, 0xb0, 18, 0x00, 0x01, 0xc1, 0, 0];
+        section.extend_from_slice(&[
+            0xe0 | ((video_pid >> 8) as u8 & 0x1f),
+            video_pid as u8,
+            0xf0,
+            0,
+            0x1b,
+            0xe0 | ((video_pid >> 8) as u8 & 0x1f),
+            video_pid as u8,
+            0xf0,
+            0,
+        ]);
+        section.extend_from_slice(&[0; 4]);
+        paced_psi(pmt_pid, &section)
+    }
+
+    fn paced_video_access(video_pid: u16, pcr: u64, marker: u8) -> Vec<u8> {
+        let mut packet = vec![0xff; 188];
+        packet[0] = 0x47;
+        packet[1] = 0x40 | ((video_pid >> 8) as u8 & 0x1f);
+        packet[2] = video_pid as u8;
+        packet[3] = 0x30;
+        packet[4] = 7;
+        packet[5] = 0x50;
+        packet[6] = (pcr >> 25) as u8;
+        packet[7] = (pcr >> 17) as u8;
+        packet[8] = (pcr >> 9) as u8;
+        packet[9] = (pcr >> 1) as u8;
+        packet[10] = ((pcr & 1) << 7) as u8 | 0x7e;
+        packet[11] = 0;
+        packet[12] = marker;
+        packet
+    }
+
     #[async_trait]
     impl TsSource for PacedPacketSource {
         async fn next(&mut self) -> Option<Bytes> {
             tokio::time::sleep(Duration::from_millis(2)).await;
-            let mut packet = vec![self.marker; 188];
-            packet[0] = 0x47;
-            self.marker = self.marker.wrapping_add(1);
+            const PMT_PID: u16 = 0x0100;
+            const VIDEO_PID: u16 = 0x0101;
+            let packet = match self.packet_index {
+                0 => paced_pat(PMT_PID),
+                1 => paced_pmt(PMT_PID, VIDEO_PID),
+                index => paced_video_access(
+                    VIDEO_PID,
+                    (index - 2) * 108_000,
+                    index.wrapping_sub(2) as u8,
+                ),
+            };
+            self.packet_index += 1;
             Some(Bytes::from(packet))
         }
         fn stats(&self) -> SourceStats {
@@ -2145,7 +2213,7 @@ mod tests {
             "hlsfix"
         }
         async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
-            Ok(Box::new(PacedPacketSource { marker: 1 }))
+            Ok(Box::new(PacedPacketSource { packet_index: 0 }))
         }
     }
 
@@ -2157,7 +2225,7 @@ mod tests {
                 registry,
                 32,
                 crate::config::HlsConfig {
-                    segment_packets: 2,
+                    segment_packets: 3,
                     window_segments: 3,
                     segment_duration_ms: 1000,
                 },

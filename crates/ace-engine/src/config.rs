@@ -161,8 +161,8 @@ impl HlsConfig {
     }
 
     pub(crate) fn validate_for_object_limit(&self, max_object_bytes: u64) -> Result<(), String> {
-        if self.segment_packets == 0 {
-            return Err("OUTPACE_HLS_SEGMENT_PACKETS must be >= 1".into());
+        if self.segment_packets < 3 {
+            return Err("OUTPACE_HLS_SEGMENT_PACKETS must be >= 3".into());
         }
         if self.window_segments == 0 {
             return Err("OUTPACE_HLS_WINDOW_SEGMENTS must be >= 1".into());
@@ -406,12 +406,34 @@ mod tests {
     }
 
     #[test]
+    fn hls_segment_packets_requires_at_least_three() {
+        for segment_packets in [1, 2] {
+            let config = HlsConfig {
+                segment_packets,
+                ..HlsConfig::default()
+            };
+            assert_eq!(
+                config.validate().unwrap_err(),
+                "OUTPACE_HLS_SEGMENT_PACKETS must be >= 3"
+            );
+        }
+
+        HlsConfig {
+            segment_packets: 3,
+            ..HlsConfig::default()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
     fn simulated_32_bit_hls_accepts_largest_window_and_rejects_one_more_segment() {
         let object_limit = i32::MAX as u64;
         let safe_limit = safe_in_memory_pool_limit(object_limit);
-        let max_retained_segments = safe_limit / 188;
+        let segment_packets = 3;
+        let max_retained_segments = safe_limit / (segment_packets * 188);
         let mut config = HlsConfig {
-            segment_packets: 1,
+            segment_packets: usize::try_from(segment_packets).unwrap(),
             window_segments: usize::try_from(max_retained_segments - 1).unwrap(),
             segment_duration_ms: 1000,
         };
@@ -428,7 +450,7 @@ mod tests {
     #[test]
     fn hls_rejects_checked_arithmetic_extremes() {
         let config = HlsConfig {
-            segment_packets: 1,
+            segment_packets: 3,
             window_segments: usize::MAX,
             segment_duration_ms: 1000,
         };
