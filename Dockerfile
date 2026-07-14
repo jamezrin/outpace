@@ -14,6 +14,9 @@ RUN apt-get update \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# tools/ is copied so Cargo can resolve every workspace member's manifest; the
+# `-p ace-engine` build below still only compiles the engine, not the tools.
+COPY tools ./tools
 
 RUN cargo build --locked --release -p ace-engine --bin outpace
 

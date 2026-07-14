@@ -1,5 +1,14 @@
 //! Stream descriptors shared across resolution and download.
 
+/// Client-facing metadata resolved from an Acestream transport descriptor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamMetadata {
+    pub title: Option<String>,
+    /// Descriptor bitrate hint in bits per second.
+    pub bitrate: Option<u64>,
+    pub categories: Vec<String>,
+}
+
 /// What a stream needs to be downloaded, from the transport file (or known directly).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamInfo {
@@ -11,6 +20,8 @@ pub struct StreamInfo {
     pub chunk_length: u64,
     /// Tracker URLs from the transport file (UDP `udp://host:port` entries used).
     pub trackers: Vec<String>,
+    /// Human-readable descriptor metadata, empty for a bare infohash.
+    pub metadata: StreamMetadata,
     /// Per-piece live-source signature length in bytes (the RSA modulus's byte length). Each
     /// wire piece carries this many trailing signature bytes that are NOT media and must be
     /// stripped before the MPEG-TS layer (B0/note 27). `0` means unsigned pieces.
@@ -82,6 +93,7 @@ mod tests {
             piece_length: 1_048_576,
             chunk_length: 16_384,
             trackers: vec![],
+            metadata: StreamMetadata::default(),
             sig_len: DEFAULT_SIG_LEN,
             source_pubkey: vec![],
         };

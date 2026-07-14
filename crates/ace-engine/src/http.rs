@@ -7,9 +7,10 @@ use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::{StreamEvent, StreamSession, Subscription};
 use ace_swarm::listen::SeedRegistry;
 use ace_swarm::resolve::{infohash_hex, resolve_via_catalog, stream_info_from_transport_url};
+use ace_swarm::types::StreamMetadata;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::get, routing::put, Json, Router};
 use bytes::Bytes;
@@ -23,6 +24,29 @@ use tokio::sync::broadcast::error::RecvError;
 
 const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ACE_TOKEN_CAPACITY: usize = 4096;
+const MAX_ICY_NAME_BYTES: usize = 256;
+
+fn icy_name_header(metadata: &StreamMetadata) -> Option<HeaderValue> {
+    let title = metadata.title.as_deref()?.trim();
+    let sanitized: String = title.chars().filter(|ch| !ch.is_control()).collect();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        return None;
+    }
+    let mut end = sanitized.len().min(MAX_ICY_NAME_BYTES);
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    HeaderValue::from_bytes(&sanitized.as_bytes()[..end]).ok()
+}
+
+fn stream_metadata_json(metadata: &StreamMetadata) -> serde_json::Value {
+    json!({
+        "title": metadata.title,
+        "bitrate": metadata.bitrate,
+        "categories": metadata.categories,
+    })
+}
 
 struct AceLease {
     playback_id: String,
@@ -779,6 +803,7 @@ async fn ace_getstream(
     let base = request_base(&headers);
     let playback_id = selection.playback_id;
     let public_id = selection.public_id;
+    let metadata = selection.metadata;
     if mode == AceGetstreamMode::Json {
         return Json(json!({
             "response": {
@@ -789,7 +814,8 @@ async fn ace_getstream(
                 "playback_session_id": token,
                 "client_session_id": -1,
                 "is_live": 1,
-                "is_encrypted": 0
+                "is_encrypted": 0,
+                "metadata": stream_metadata_json(&metadata)
             },
             "error": null
         }))
@@ -876,7 +902,8 @@ async fn ace_manifest(
                 "playback_session_id": token,
                 "is_live": 1,
                 "is_encrypted": 0,
-                "client_session_id": -1
+                "client_session_id": -1,
+                "metadata": stream_metadata_json(session.metadata())
             },
             "error": null
         }))
@@ -993,7 +1020,8 @@ async fn ace_stat(
                 "is_live": 1,
                 "is_encrypted": 0,
                 "playback_session_id": token,
-                "client_session_id": -1
+                "client_session_id": -1,
+                "metadata": stream_metadata_json(&StreamMetadata::default())
             },
             "error": null
         }));
@@ -1010,7 +1038,8 @@ async fn ace_stat(
             "is_live": 1,
             "is_encrypted": 0,
             "playback_session_id": token,
-            "client_session_id": -1
+            "client_session_id": -1,
+            "metadata": stream_metadata_json(session.metadata())
         },
         "error": null
     }))
@@ -1124,6 +1153,7 @@ struct AceStreamSelection {
     playback_id: String,
     session_key: String,
     content_id: Option<String>,
+    metadata: StreamMetadata,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1133,10 +1163,11 @@ enum AceGetstreamMode {
 }
 
 impl AceStreamSelection {
-    fn with_resolved_infohash(mut self, infohash: String) -> Self {
+    fn with_resolved_stream(mut self, infohash: String, metadata: StreamMetadata) -> Self {
         self.public_id = infohash.clone();
         self.playback_id = infohash;
         self.content_id = None;
+        self.metadata = metadata;
         self
     }
 }
@@ -1150,7 +1181,8 @@ async fn resolve_ace_selection(
         if let Some(content_id) = selection.content_id.as_deref() {
             match resolve_via_catalog(content_id).await {
                 Ok(info) => {
-                    selection = selection.with_resolved_infohash(infohash_hex(&info.infohash));
+                    selection =
+                        selection.with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
                 }
                 Err(e) => crate::alog!(
                     "[ace] content-id catalog resolution failed, falling back to cid: {e:?}"
@@ -1171,6 +1203,7 @@ fn ace_selected_stream(
             playback_id: format!("cid:{content_id}"),
             session_key: format!("cid:{content_id}"),
             content_id: Some(content_id),
+            metadata: StreamMetadata::default(),
         });
     }
     if let Some(infohash) = ace_nonempty_param(params, "infohash") {
@@ -1180,6 +1213,7 @@ fn ace_selected_stream(
             playback_id: infohash.clone(),
             session_key: infohash,
             content_id: None,
+            metadata: StreamMetadata::default(),
         });
     }
     // The legacy `id=` spelling denotes an AceStream content id, not a swarm infohash.
@@ -1190,6 +1224,7 @@ fn ace_selected_stream(
             playback_id: format!("cid:{content_id}"),
             session_key: format!("cid:{content_id}"),
             content_id: Some(content_id),
+            metadata: StreamMetadata::default(),
         });
     }
     if let Some(url) = ace_nonempty_param(params, "url") {
@@ -1203,6 +1238,7 @@ fn ace_selected_stream(
             playback_id: token.clone(),
             session_key: token,
             content_id: None,
+            metadata: StreamMetadata::default(),
         });
     }
     if let Some(magnet) = ace_nonempty_param(params, "magnet") {
@@ -1212,6 +1248,7 @@ fn ace_selected_stream(
             playback_id: hex.clone(),
             session_key: hex,
             content_id: None,
+            metadata: StreamMetadata::default(),
         });
     }
     Err("missing content_id/infohash/id/url/magnet")
@@ -1260,7 +1297,14 @@ async fn list_streams(State(s): State<AppState>) -> Json<serde_json::Value> {
         .list()
         .await
         .into_iter()
-        .map(|(network, id, clients)| json!({ "network": network, "id": id, "clients": clients }))
+        .map(|(network, id, clients, metadata)| {
+            json!({
+                "network": network,
+                "id": id,
+                "clients": clients,
+                "metadata": stream_metadata_json(&metadata),
+            })
+        })
         .collect();
     Json(json!({ "streams": streams }))
 }
@@ -1300,6 +1344,7 @@ async fn stream_status(
                 "buffer_ms": stats.buffer_ms,
                 "uploaded": stats.uploaded,
                 "peers_served": stats.peers_served,
+                "metadata": stream_metadata_json(session.metadata()),
             }))
             .into_response()
         }
@@ -1326,7 +1371,8 @@ async fn stream_segment(
     }
 }
 
-/// `GET /streams/{network}/{id}.ts` (continuous MPEG-TS) or `.m3u8` (live HLS playlist).
+/// `GET /streams/{network}/{id}` or `{id}.ts` (continuous MPEG-TS), or `.m3u8` (live HLS
+/// playlist).
 async fn stream_file(
     State(s): State<AppState>,
     Path((network, file)): Path<(String, String)>,
@@ -1341,8 +1387,15 @@ async fn stream_file(
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         };
     }
-    let Some(id) = file.strip_suffix(".ts") else {
+    let id = if let Some(id) = file.strip_suffix(".ts") {
+        if id.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        id
+    } else if file.contains('.') {
         return StatusCode::NOT_FOUND.into_response();
+    } else {
+        &file
     };
     let session = match s.manager.get_or_start(&network, id).await {
         Ok(sess) => sess,
@@ -1352,6 +1405,7 @@ async fn stream_file(
 }
 
 fn stream_session_response(session: Arc<StreamSession>) -> Response {
+    let icy_name = icy_name_header(session.metadata());
     let sub = session.subscribe();
     // Per-client keyframe gate: a player joining mid-GOP is held until the first clean
     // keyframe (with PAT/PMT prepended) so it starts on a decodable picture, not garbage.
@@ -1380,10 +1434,11 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
             }
         }
     });
-    Response::builder()
-        .header(header::CONTENT_TYPE, "video/mp2t")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    let mut response = Response::builder().header(header::CONTENT_TYPE, "video/mp2t");
+    if let Some(value) = icy_name {
+        response = response.header("icy-name", value);
+    }
+    response.body(Body::from_stream(stream)).unwrap()
 }
 
 fn ace_stream_session_response(
@@ -1392,6 +1447,7 @@ fn ace_stream_session_response(
     cancel: tokio::sync::watch::Receiver<bool>,
     direct_lease: Option<AceDirectLeaseGuard>,
 ) -> Response {
+    let icy_name = icy_name_header(session.metadata());
     let sub = session.subscribe();
     let gate = ace_media::mpegts::KeyframeGate::new();
     let stream = futures::stream::unfold(
@@ -1422,11 +1478,11 @@ fn ace_stream_session_response(
             }
         },
     );
-    (
-        [(header::CONTENT_TYPE, "video/mp2t")],
-        Body::from_stream(stream),
-    )
-        .into_response()
+    let mut response = Response::builder().header(header::CONTENT_TYPE, "video/mp2t");
+    if let Some(value) = icy_name {
+        response = response.header("icy-name", value);
+    }
+    response.body(Body::from_stream(stream)).unwrap()
 }
 
 fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
@@ -1441,11 +1497,65 @@ mod tests {
         ProviderError, ProviderRegistry, SourceStats, StreamProvider, TsSource, VodContent,
     };
     use crate::testprovider::TestProvider;
+    use ace_swarm::types::StreamMetadata;
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use bytes::Bytes;
     use tower::ServiceExt;
+
+    #[test]
+    fn icy_name_header_sanitizes_and_bounds_titles() {
+        let metadata = StreamMetadata {
+            title: Some("  Synthetic Demo\r\n\0 Channel  ".to_string()),
+            bitrate: None,
+            categories: vec![],
+        };
+        assert_eq!(
+            icy_name_header(&metadata).unwrap().as_bytes(),
+            b"Synthetic Demo Channel"
+        );
+
+        let metadata = StreamMetadata {
+            title: Some("é".repeat(200)),
+            bitrate: None,
+            categories: vec![],
+        };
+        let value = icy_name_header(&metadata).unwrap();
+        assert!(value.as_bytes().len() <= 256);
+        assert!(std::str::from_utf8(value.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn icy_name_header_omits_empty_titles() {
+        assert!(icy_name_header(&StreamMetadata::default()).is_none());
+        assert!(icy_name_header(&StreamMetadata {
+            title: Some(" \r\n\t ".to_string()),
+            bitrate: None,
+            categories: vec![],
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn stream_metadata_json_has_stable_shape() {
+        assert_eq!(
+            stream_metadata_json(&StreamMetadata::default()),
+            json!({ "title": null, "bitrate": null, "categories": [] })
+        );
+        assert_eq!(
+            stream_metadata_json(&StreamMetadata {
+                title: Some("Synthetic Demo Channel".to_string()),
+                bitrate: Some(100_000),
+                categories: vec!["sports".to_string()],
+            }),
+            json!({
+                "title": "Synthetic Demo Channel",
+                "bitrate": 100_000,
+                "categories": ["sports"],
+            })
+        );
+    }
 
     struct FakeVod {
         chunks: std::collections::VecDeque<Bytes>,
@@ -1913,6 +2023,13 @@ mod tests {
     struct PacedFixtureSource {
         pos: usize,
     }
+    fn fixture_metadata() -> StreamMetadata {
+        StreamMetadata {
+            title: Some("Synthetic Demo Channel".to_string()),
+            bitrate: Some(100_000),
+            categories: vec!["sports".to_string()],
+        }
+    }
     #[async_trait]
     impl TsSource for FixtureSource {
         async fn next(&mut self) -> Option<Bytes> {
@@ -1934,6 +2051,9 @@ mod tests {
                 uploaded: 0,
                 peers_served: 0,
             }
+        }
+        fn metadata(&self) -> StreamMetadata {
+            fixture_metadata()
         }
     }
     #[async_trait]
@@ -1959,6 +2079,9 @@ mod tests {
         }
         fn stats(&self) -> SourceStats {
             SourceStats::default()
+        }
+        fn metadata(&self) -> StreamMetadata {
+            fixture_metadata()
         }
     }
     #[async_trait]
@@ -2005,6 +2128,9 @@ mod tests {
         }
         fn stats(&self) -> SourceStats {
             SourceStats::default()
+        }
+        fn metadata(&self) -> StreamMetadata {
+            fixture_metadata()
         }
     }
     #[async_trait]
@@ -2082,11 +2208,12 @@ mod tests {
 
         let selection = ace_selected_stream(&params)
             .unwrap()
-            .with_resolved_infohash(resolved.to_string());
+            .with_resolved_stream(resolved.to_string(), fixture_metadata());
 
         assert_eq!(selection.public_id, resolved);
         assert_eq!(selection.playback_id, resolved);
         assert_eq!(selection.session_key, format!("cid:{content_id}"));
+        assert_eq!(selection.metadata, fixture_metadata());
     }
 
     #[tokio::test]
@@ -2274,10 +2401,26 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "video/mp2t");
+        assert_eq!(resp.headers()["icy-name"], "Synthetic Demo Channel");
         // Live body is unbounded; read just the first TS chunk.
         let mut stream = resp.into_body().into_data_stream();
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first[0], 0x47);
+    }
+
+    #[tokio::test]
+    async fn stream_metadata_title_header_is_absent_without_metadata() {
+        let resp = router(state())
+            .oneshot(
+                Request::get("/streams/test/somechannel.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!resp.headers().contains_key("icy-name"));
     }
 
     #[tokio::test]
@@ -2309,6 +2452,10 @@ mod tests {
         assert_eq!(json["response"]["is_live"], 1);
         assert_eq!(json["response"]["is_encrypted"], 0);
         assert_eq!(json["response"]["infohash"], content_id);
+        assert_eq!(
+            json["response"]["metadata"],
+            json!({ "title": null, "bitrate": null, "categories": [] })
+        );
 
         let playback_url = json["response"]["playback_url"].as_str().unwrap();
         let playback_path = playback_url
@@ -2324,6 +2471,7 @@ mod tests {
             .unwrap();
         assert_eq!(media.status(), StatusCode::OK);
         assert_eq!(media.headers()[header::CONTENT_TYPE], "video/mp2t");
+        assert_eq!(media.headers()["icy-name"], "Synthetic Demo Channel");
         let mut stream = media.into_body().into_data_stream();
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first[0], 0x47);
@@ -2353,6 +2501,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp2t");
+        assert_eq!(response.headers()["icy-name"], "Synthetic Demo Channel");
         let mut body = response.into_body().into_data_stream();
         assert_eq!(body.next().await.unwrap().unwrap()[0], 0x47);
         assert!(manager
@@ -2667,6 +2816,10 @@ mod tests {
         assert_eq!(json["error"], serde_json::Value::Null);
         assert_eq!(json["response"]["status"], "idle");
         assert_eq!(json["response"]["infohash"], content_id);
+        assert_eq!(
+            json["response"]["metadata"],
+            json!({ "title": null, "bitrate": null, "categories": [] })
+        );
 
         let media = app
             .clone()
@@ -2695,6 +2848,10 @@ mod tests {
         assert_eq!(json["error"], serde_json::Value::Null);
         assert_eq!(json["response"]["status"], "dl");
         assert_eq!(json["response"]["peers"], 1);
+        assert_eq!(
+            json["response"]["metadata"],
+            stream_metadata_json(&fixture_metadata())
+        );
         assert!(json["response"]["downloaded"].as_u64().unwrap() > 0);
 
         let stop = app
@@ -2944,6 +3101,10 @@ mod tests {
         assert_eq!(value["error"], serde_json::Value::Null);
         assert_eq!(value["response"]["infohash"], id);
         assert_eq!(value["response"]["is_live"], 1);
+        assert_eq!(
+            value["response"]["metadata"],
+            stream_metadata_json(&fixture_metadata())
+        );
         let token = value["response"]["playback_session_id"].as_str().unwrap();
         assert_eq!(token.len(), 64);
         let playback = value["response"]["playback_url"]
@@ -3380,27 +3541,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_ts_extension_returns_404() {
-        let resp = router(state())
+    async fn extensionless_stream_is_a_direct_mpegts_alias() {
+        let st = state();
+        let app = router(st.clone());
+
+        let extensionless = app
+            .clone()
             .oneshot(
-                Request::get("/streams/test/x.foo")
+                Request::get("/streams/test/channel")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(extensionless.status(), StatusCode::OK);
+        assert_eq!(extensionless.headers()[header::CONTENT_TYPE], "video/mp2t");
+        assert!(!extensionless.headers().contains_key(header::LOCATION));
+
+        let explicit = app
+            .oneshot(
+                Request::get("/streams/test/channel.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit.status(), StatusCode::OK);
+        assert_eq!(
+            st.manager.list().await,
+            vec![(
+                "test".to_string(),
+                "channel".to_string(),
+                2,
+                StreamMetadata::default(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_dotted_suffixes_return_404_without_starting_sessions() {
+        for path in [
+            "/streams/test/x.mp4",
+            "/streams/test/x.foo",
+            "/streams/test/x.",
+        ] {
+            let st = state();
+            let resp = router(st.clone())
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            assert!(st.manager.list().await.is_empty(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_ts_id_returns_404_without_starting_a_session() {
+        let st = state();
+        let resp = router(st.clone())
+            .oneshot(
+                Request::get("/streams/test/.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(st.manager.list().await.is_empty());
     }
 
     #[tokio::test]
     async fn status_404_until_started_then_reports() {
-        let st = state();
+        let st = fixture_state(0);
         let app = router(st.clone());
         // Not started yet.
         let resp = app
             .clone()
             .oneshot(
-                Request::get("/streams/test/chan/status")
+                Request::get("/streams/fix/chan/status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3408,10 +3627,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         // Start it, then status reports it with clean keys.
-        st.manager.get_or_start("test", "chan").await.unwrap();
+        st.manager.get_or_start("fix", "chan").await.unwrap();
         let resp = app
             .oneshot(
-                Request::get("/streams/test/chan/status")
+                Request::get("/streams/fix/chan/status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3421,8 +3640,9 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        let txt = String::from_utf8_lossy(&body);
-        assert!(txt.contains("\"clients\"") && txt.contains("\"peers\""));
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["metadata"], stream_metadata_json(&fixture_metadata()));
+        assert_eq!(value["bitrate"], 0, "measured bitrate keeps its meaning");
     }
 
     #[tokio::test]
@@ -3477,8 +3697,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_streams_reports_active() {
-        let st = state();
-        st.manager.get_or_start("test", "abc").await.unwrap();
+        let st = fixture_state(0);
+        st.manager.get_or_start("fix", "abc").await.unwrap();
         let resp = router(st)
             .oneshot(Request::get("/streams").body(Body::empty()).unwrap())
             .await
@@ -3486,7 +3706,12 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("\"abc\""));
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["streams"][0]["id"], "abc");
+        assert_eq!(
+            value["streams"][0]["metadata"],
+            stream_metadata_json(&fixture_metadata())
+        );
     }
 
     fn broadcast_state() -> AppState {

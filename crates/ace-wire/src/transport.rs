@@ -39,6 +39,8 @@ pub struct TransportDescriptor {
     pub chunk_length: u64,
     /// Media bitrate hint, if present.
     pub bitrate: Option<i64>,
+    /// Bounded content categories advertised by the descriptor.
+    pub categories: Vec<String>,
     /// Tracker announce URLs (lossy UTF-8 of each `trackers` list element).
     pub trackers: Vec<String>,
     /// RSA DER public key of the broadcaster (124 bytes); empty if absent.
@@ -72,6 +74,37 @@ impl TransportDescriptor {
 }
 
 type Dec = cbc::Decryptor<aes::Aes128>;
+
+const MAX_CATEGORIES: usize = 32;
+const MAX_CATEGORY_BYTES: usize = 128;
+
+fn bounded_text(bytes: &[u8], max_bytes: usize) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(text[..end].to_string())
+}
+
+fn decode_categories(raw: &Bencode) -> Vec<String> {
+    match raw.get(b"categories") {
+        Some(Bencode::List(items)) => items
+            .iter()
+            .filter_map(Bencode::as_bytes)
+            .filter_map(|value| bounded_text(value, MAX_CATEGORY_BYTES))
+            .take(MAX_CATEGORIES)
+            .collect(),
+        Some(Bencode::Bytes(value)) => bounded_text(value, MAX_CATEGORY_BYTES)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 /// Read a required descriptor int that must be strictly positive.
 ///
@@ -134,6 +167,8 @@ pub fn decode_transport_with_key(
 
     let bitrate = raw.get(b"bitrate").and_then(|v| v.as_int());
 
+    let categories = decode_categories(&raw);
+
     let pubkey = raw
         .get(b"pubkey")
         .and_then(|v| v.as_bytes())
@@ -168,6 +203,7 @@ pub fn decode_transport_with_key(
         piece_length,
         chunk_length,
         bitrate,
+        categories,
         trackers,
         pubkey,
         pieces,
@@ -243,6 +279,15 @@ mod tests {
         d.insert(b"piece_length".to_vec(), Bencode::Int(1_048_576));
         d.insert(b"chunk_length".to_vec(), Bencode::Int(16_384));
         d.insert(
+            b"categories".to_vec(),
+            Bencode::List(vec![
+                Bencode::Bytes(b" sports ".to_vec()),
+                Bencode::Int(7),
+                Bencode::Bytes(Vec::new()),
+                Bencode::Bytes(b"live".to_vec()),
+            ]),
+        );
+        d.insert(
             b"trackers".to_vec(),
             Bencode::List(vec![Bencode::Bytes(
                 b"udp://t1.example:2710/announce".to_vec(),
@@ -265,11 +310,57 @@ mod tests {
         assert_eq!(got.name, "my broadcast");
         assert_eq!(got.piece_length, 1_048_576);
         assert_eq!(got.chunk_length, 16_384);
+        assert_eq!(got.categories, vec!["sports", "live"]);
         assert_eq!(
             got.trackers,
             vec!["udp://t1.example:2710/announce".to_string()]
         );
         assert!(got.is_live, "no pieces key => live");
+    }
+
+    #[test]
+    fn category_bytes_decode_as_one_bounded_value() {
+        let category = "é".repeat(100);
+        let plaintext = format!(
+            "d10:categories{}:{}12:chunk_lengthi16384e12:piece_lengthi131072ee",
+            category.len(),
+            category
+        );
+        let got = decode_transport(&make_transport(plaintext.as_bytes())).unwrap();
+
+        assert_eq!(got.categories.len(), 1);
+        assert!(got.categories[0].len() <= 128);
+        assert!(got.categories[0].is_char_boundary(got.categories[0].len()));
+    }
+
+    #[test]
+    fn category_list_preserves_order_and_stops_at_the_count_limit() {
+        use std::collections::BTreeMap;
+
+        let mut descriptor = BTreeMap::new();
+        descriptor.insert(b"piece_length".to_vec(), Bencode::Int(131_072));
+        descriptor.insert(b"chunk_length".to_vec(), Bencode::Int(16_384));
+        descriptor.insert(
+            b"categories".to_vec(),
+            Bencode::List(
+                (0..40)
+                    .map(|index| Bencode::Bytes(format!("category-{index}").into_bytes()))
+                    .collect(),
+            ),
+        );
+
+        let transport = encode_transport(&Bencode::Dict(descriptor));
+        let got = decode_transport(&transport).unwrap();
+
+        assert_eq!(got.categories.len(), MAX_CATEGORIES);
+        assert_eq!(
+            got.categories.first().map(String::as_str),
+            Some("category-0")
+        );
+        assert_eq!(
+            got.categories.last().map(String::as_str),
+            Some("category-31")
+        );
     }
 
     #[test]

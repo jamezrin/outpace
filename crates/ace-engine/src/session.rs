@@ -2,6 +2,7 @@
 //! Exactly one [`TsSource`] is pulled regardless of how many clients are attached.
 
 use crate::provider::{SourceStats, TsSource};
+use ace_swarm::types::StreamMetadata;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ pub struct StreamSession {
     tx: broadcast::Sender<StreamEvent>,
     subscribers: Arc<AtomicU64>,
     stats: Arc<Mutex<SourceStats>>,
+    metadata: StreamMetadata,
     /// The background pull task; aborted when the session is dropped (last `Arc` gone, e.g.
     /// the manager's idle reaper or an explicit force-stop) so a live download doesn't keep
     /// running headless.
@@ -49,6 +51,7 @@ impl StreamSession {
     pub fn start(mut source: Box<dyn TsSource>, buffer: usize) -> Arc<StreamSession> {
         let (tx, _rx) = broadcast::channel(buffer);
         let stats = Arc::new(Mutex::new(SourceStats::default()));
+        let metadata = source.metadata();
         let pump_tx = tx.clone();
         let pump_stats = stats.clone();
         let pump = tokio::spawn(async move {
@@ -65,6 +68,7 @@ impl StreamSession {
             tx,
             subscribers: Arc::new(AtomicU64::new(0)),
             stats,
+            metadata,
             pump,
         })
     }
@@ -90,6 +94,10 @@ impl StreamSession {
     pub async fn stats(&self) -> SourceStats {
         self.stats.lock().await.clone()
     }
+
+    pub fn metadata(&self) -> &StreamMetadata {
+        &self.metadata
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +105,41 @@ mod tests {
     use super::*;
     use crate::provider::StreamProvider;
     use crate::testprovider::TestProvider;
+    use ace_swarm::types::StreamMetadata;
+
+    #[tokio::test]
+    async fn session_captures_source_metadata_before_pumping() {
+        struct MetadataSource;
+        #[async_trait::async_trait]
+        impl TsSource for MetadataSource {
+            async fn next(&mut self) -> Option<Bytes> {
+                std::future::pending().await
+            }
+
+            fn stats(&self) -> SourceStats {
+                SourceStats::default()
+            }
+
+            fn metadata(&self) -> StreamMetadata {
+                StreamMetadata {
+                    title: Some("Synthetic Demo Channel".to_string()),
+                    bitrate: Some(100_000),
+                    categories: vec!["sports".to_string()],
+                }
+            }
+        }
+
+        let session = StreamSession::start(Box::new(MetadataSource), 8);
+
+        assert_eq!(
+            session.metadata(),
+            &StreamMetadata {
+                title: Some("Synthetic Demo Channel".to_string()),
+                bitrate: Some(100_000),
+                categories: vec!["sports".to_string()],
+            }
+        );
+    }
 
     #[tokio::test]
     async fn two_subscribers_share_one_source() {

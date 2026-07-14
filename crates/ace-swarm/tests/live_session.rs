@@ -26,6 +26,7 @@ async fn live_session_emits_contiguous_ts_from_one_peer() {
         piece_length: 8,
         chunk_length: 4,
         trackers: vec![],
+        metadata: Default::default(),
         sig_len: 0,
         source_pubkey: vec![],
     };
@@ -125,6 +126,7 @@ async fn live_session_verifies_signed_pieces_and_emits_only_media() {
         piece_length: piece_length as u64,
         chunk_length: chunk_length as u64,
         trackers: vec![],
+        metadata: Default::default(),
         sig_len,
         source_pubkey: auth.pubkey_der(),
     };

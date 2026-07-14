@@ -5,6 +5,7 @@ use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
 use crate::provider::{ProviderError, ProviderRegistry, VodContent};
 use crate::session::StreamSession;
+use ace_swarm::types::StreamMetadata;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -184,13 +185,20 @@ impl StreamManager {
         self.sessions.lock().await.remove(&key).is_some()
     }
 
-    /// Active sessions as `(network, id, subscriber_count)`.
-    pub async fn list(&self) -> Vec<(String, String, u64)> {
+    /// Active sessions as `(network, id, subscriber_count, metadata)`.
+    pub async fn list(&self) -> Vec<(String, String, u64, StreamMetadata)> {
         self.sessions
             .lock()
             .await
             .iter()
-            .map(|((n, i), s)| (n.clone(), i.clone(), s.subscriber_count()))
+            .map(|((n, i), s)| {
+                (
+                    n.clone(),
+                    i.clone(),
+                    s.subscriber_count(),
+                    s.metadata().clone(),
+                )
+            })
             .collect()
     }
 
@@ -425,7 +433,9 @@ mod tests {
         let m = StreamManager::new(registry());
         m.get_or_start("test", "a").await.unwrap();
         let list = m.list().await;
-        assert!(list.iter().any(|(n, i, _)| n == "test" && i == "a"));
+        assert!(list.iter().any(|(n, i, _, metadata)| {
+            n == "test" && i == "a" && metadata == &ace_swarm::types::StreamMetadata::default()
+        }));
     }
 
     #[tokio::test]

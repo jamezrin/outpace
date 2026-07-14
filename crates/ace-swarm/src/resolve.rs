@@ -9,7 +9,7 @@
 //!     for the pure decode half. The ut_metadata exchange is the remaining live-gated step
 //!     (documented in the design spec).
 
-use crate::types::{StreamInfo, VodInfo};
+use crate::types::{StreamInfo, StreamMetadata, VodInfo};
 use ace_peer::session::PeerSession;
 use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
@@ -50,6 +50,7 @@ pub const MAX_METADATA_SIZE: usize = 1_048_576;
 /// ([`DEFAULT_PIECE_LENGTH`]). This ceiling leaves generous headroom for higher-bitrate
 /// sources while bounding the allocation a hostile transport can force at stream start.
 pub const MAX_PIECE_LENGTH: u64 = 8 * 1_048_576;
+const MAX_TITLE_BYTES: usize = 256;
 
 /// The ext id we assign to `ut_metadata` in our `m` dict (what the peer addresses replies to).
 const OUR_UT_METADATA_ID: i64 = 2;
@@ -79,6 +80,18 @@ pub enum ResolveError {
     Url(&'static str),
 }
 
+fn normalized_title(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut end = value.len().min(MAX_TITLE_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(value[..end].to_string())
+}
+
 /// Build a [`StreamInfo`] from raw `AceStreamTransport` file bytes (the pure half of
 /// content-id resolution): official swarm infohash + geometry + trackers from the descriptor.
 pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveError> {
@@ -88,12 +101,21 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
     // treat pieces as unsigned (don't strip, nothing to verify).
     let sig_len = ace_wire::live_auth::signature_len_from_pubkey_der(&d.pubkey);
+    let metadata = StreamMetadata {
+        title: normalized_title(&d.name),
+        bitrate: d
+            .bitrate
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0),
+        categories: d.categories,
+    };
     Ok(StreamInfo {
         infohash: infohash_of_descriptor(&d.raw)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
         piece_length: d.piece_length,
         chunk_length: d.chunk_length,
         trackers: d.trackers,
+        metadata,
         sig_len: sig_len.unwrap_or(0),
         source_pubkey: if sig_len.is_some() {
             d.pubkey
@@ -173,6 +195,7 @@ pub fn stream_info_from_infohash(
         piece_length: DEFAULT_PIECE_LENGTH,
         chunk_length: DEFAULT_CHUNK_LENGTH,
         trackers,
+        metadata: StreamMetadata::default(),
         // No transport => no pubkey to measure; assume the standard Acestream 768-bit
         // source key (96-byte signature tail). See DEFAULT_SIG_LEN. Without the actual pubkey
         // we can strip that tail but cannot *verify* it, so `source_pubkey` stays empty (#10).
@@ -527,6 +550,40 @@ fn is_safe_ip(ip: &IpAddr) -> bool {
 /// or every resolved address is blocked by [`is_safe_ip`]. IP literals are validated directly;
 /// hostnames are resolved and the first safe address is kept (later pinned into the client so
 /// DNS rebinding cannot swap it).
+/// Env opt-in to allow fetching transport files from non-global (private/LAN/loopback)
+/// hosts. Default off — the SSRF guard stays closed for normal use. Intended for
+/// controlled self-hosted or test swarms on a private network, and mirrors
+/// [`crate::discover::TrackerPolicy`]'s `OUTPACE_TRACKER_ALLOW_NON_GLOBAL`.
+fn allow_non_global_transport() -> bool {
+    std::env::var("OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Whether `ip` is a private/LAN/loopback address — the *only* extra targets the
+/// `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT` opt-in unblocks. This deliberately stays narrower
+/// than "not [`is_safe_ip`]": link-local (e.g. the `169.254.169.254` cloud metadata
+/// endpoint), unspecified, multicast, broadcast, and documentation ranges remain blocked
+/// even with the opt-in on, so enabling it for a LAN swarm cannot become an SSRF footgun.
+fn is_private_or_loopback(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                // Shared address space / CGNAT: 100.64.0.0/10.
+                || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_or_loopback(&IpAddr::V4(v4));
+            }
+            // Loopback ::1 or unique-local fc00::/7.
+            v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
 async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveError> {
     // `Url::host_str` keeps the brackets on an IPv6 literal (`[::1]`); strip them so the literal
     // parses and is validated, rather than falling through to a doomed DNS lookup.
@@ -534,8 +591,9 @@ async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveE
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
+    let allow_non_global = allow_non_global_transport();
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return if is_safe_ip(&ip) {
+        return if is_safe_ip(&ip) || (allow_non_global && is_private_or_loopback(&ip)) {
             Ok(SocketAddr::new(ip, port))
         } else {
             Err(ResolveError::Url("blocked address"))
@@ -545,7 +603,7 @@ async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveE
         .await
         .map_err(|_| ResolveError::Url("dns failed"))?;
     for addr in addrs {
-        if is_safe_ip(&addr.ip()) {
+        if is_safe_ip(&addr.ip()) || (allow_non_global && is_private_or_loopback(&addr.ip())) {
             return Ok(addr);
         }
     }
@@ -739,6 +797,51 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn non_global_transport_optin_stays_narrow() {
+        // The opt-in path ANDs `is_private_or_loopback`, so these extra targets must be
+        // unblocked by it (private/LAN/loopback + CGNAT)...
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.0.1",
+            "172.28.0.1", // the interop harness's bridge gateway
+            "100.64.0.1",
+        ] {
+            assert!(
+                is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must be reachable under the opt-in"
+            );
+        }
+        for ip in ["::1", "fc00::1", "::ffff:127.0.0.1"] {
+            assert!(
+                is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must be reachable under the opt-in"
+            );
+        }
+        // ...but link-local (incl. the cloud metadata endpoint), unspecified, broadcast,
+        // and multicast stay blocked even with the opt-in on.
+        for ip in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            assert!(
+                !is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must stay blocked even under the opt-in"
+            );
+        }
+        for ip in ["fe80::1", "::", "ff02::1"] {
+            assert!(
+                !is_private_or_loopback(&ip.parse().unwrap()),
+                "{ip} must stay blocked even under the opt-in"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn ssrf_guard_rejects_loopback_host() {
         assert_eq!(
@@ -871,6 +974,9 @@ mod tests {
         assert_eq!(si.chunk_length, 16_384);
         assert_eq!(si.chunks_per_piece(), 64);
         assert_eq!(si.trackers, vec!["udp://t.example:80".to_string()]);
+        assert_eq!(si.metadata.title.as_deref(), Some("Test"));
+        assert_eq!(si.metadata.bitrate, Some(100_000));
+        assert!(si.metadata.categories.is_empty());
         assert_eq!(
             si.infohash,
             [
@@ -878,6 +984,16 @@ mod tests {
                 0x6d, 0x42, 0xae, 0xa7, 0xf8, 0x8c,
             ]
         );
+    }
+
+    #[test]
+    fn transport_preserves_categories_in_stream_metadata() {
+        let tf = make_transport(
+            b"d10:authmethod3:RSA7:bitratei100000e10:categoriesl6:sports4:livee12:chunk_lengthi16384e4:name4:Test12:piece_lengthi1048576e6:pubkey3:abce",
+        );
+        let si = stream_info_from_transport(&tf).unwrap();
+
+        assert_eq!(si.metadata.categories, vec!["sports", "live"]);
     }
 
     #[test]
@@ -934,6 +1050,7 @@ mod tests {
         assert_eq!(si.chunk_length, DEFAULT_CHUNK_LENGTH);
         assert_eq!(si.infohash[0], 0x01);
         assert_eq!(si.infohash[19], 0x67);
+        assert_eq!(si.metadata, crate::types::StreamMetadata::default());
     }
 
     #[test]
@@ -1029,6 +1146,7 @@ mod tests {
             piece_length: 1,
             chunk_length: 1,
             trackers: vec![],
+            metadata: StreamMetadata::default(),
             sig_len: 0,
             source_pubkey: vec![],
         };
