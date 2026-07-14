@@ -26,6 +26,8 @@ The `icy-name` response header is present in FFmpeg's parsed HLS metadata and is
   PAT/PMT, video-PID, and keyframe rules to diverge.
 - Preserve the existing HLS URLs, `icy-name` response metadata, segment duration target, memory
   ceiling, activity lease, compatibility token pins, and no-transcoding behavior.
+- Require `OUTPACE_HLS_SEGMENT_PACKETS >= 3`, the smallest ceiling that can contain PAT, PMT, and
+  one video access-point packet. The default remains 16,384.
 
 ## Non-goals
 
@@ -63,6 +65,10 @@ Transport discontinuities clear partial media and access-point/table state, then
 clean start before media is published again.
 
 This is packet-level HLS packaging only: encoded payloads are neither transcoded nor rewritten.
+
+An explicit packet ceiling of one or two is rejected during configuration validation. A ceiling
+of exactly three uses the next access-point packet as bounded lookahead so the preceding
+three-packet clean segment can complete without temporarily exceeding its configured limit.
 
 ### Playlist readiness
 

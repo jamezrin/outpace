@@ -15,6 +15,7 @@
 - Every successfully advertised live segment starts with cached PAT and PMT packets followed by a detected H.264 video access point.
 - A successful live playlist response contains at least one completed segment; timeout returns `503 Service Unavailable` with `Retry-After: 1`.
 - Provider/network work remains outside manager lifecycle/map locks, and the HLS readiness wait creates no subscriber.
+- `OUTPACE_HLS_SEGMENT_PACKETS` must be at least 3; the default remains 16,384.
 
 ---
 
@@ -130,6 +131,8 @@ git commit -m "refactor(ace-media): share video access-point state"
 
 **Files:**
 - Modify: `crates/ace-engine/src/hls.rs:1-330`
+- Modify: `crates/ace-engine/src/config.rs:140-180`
+- Test: impacted live/VOD HTTP fixtures in `crates/ace-engine/src/http.rs`
 
 **Interfaces:**
 - Consumes: `ace_media::mpegts::VideoAccessPointState`.
@@ -174,6 +177,10 @@ undecodable segment. On transport discontinuity, also reset `VideoAccessPointSta
 
 Ensure the two prefix packets count toward `max_segment_bytes` and no completed/current segment
 exceeds the configured ceiling.
+
+Validate a minimum of three packets. For an exact three-packet ceiling, treat the following access
+packet as bounded lookahead so PAT + PMT + the prior access packet can complete without exceeding
+the ceiling. Reject one and two explicitly; leave the 16,384 default unchanged.
 
 - [ ] **Step 4: Add failing readiness tests**
 
