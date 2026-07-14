@@ -948,7 +948,7 @@ async fn ace_hls_playback_with_timeout(
     let Some(token) = manifest.strip_suffix(".m3u8") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(session_key) = s.ace_sessions.validate(&id, token) else {
+    let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&id, token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(network) = ace_network(&s) else {
@@ -957,8 +957,22 @@ async fn ace_hls_playback_with_timeout(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if let Err(response) = await_hls_ready(&pkg, timeout).await {
-        return response;
+    let ready = tokio::select! {
+        ready = pkg.wait_ready(timeout) => ready,
+        _ = cancel.changed() => return StatusCode::NOT_FOUND.into_response(),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    if s.ace_sessions.validate(&id, token).as_deref() != Some(session_key.as_str()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !ready {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+        )
+            .into_response();
     }
     (
         [
@@ -2304,7 +2318,7 @@ mod tests {
         }
     }
 
-    fn stalled_hls_state() -> AppState {
+    fn stalled_hls_state_with(ttl: Duration, capacity: usize) -> AppState {
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(StalledProvider));
         AppState {
@@ -2319,10 +2333,54 @@ mod tests {
             ),
             networks: vec!["stalled".into()],
             resolve_content_ids_in_getstream: false,
-            ace_sessions: Arc::new(AceSessionStore::new(Duration::from_secs(60), 8)),
+            ace_sessions: Arc::new(AceSessionStore::new(ttl, capacity)),
             experimental_ace_compat: true,
             broadcasts: None,
         }
+    }
+
+    fn stalled_hls_state() -> AppState {
+        stalled_hls_state_with(Duration::from_secs(60), 8)
+    }
+
+    async fn mint_stalled_hls(app: &Router, id: &str) -> (String, String, String) {
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::FOUND);
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878/ace/m/")
+            .unwrap();
+        let (playback_id, manifest) = playback.split_once('/').unwrap();
+        let token = manifest.strip_suffix(".m3u8").unwrap();
+        (
+            playback_id.to_string(),
+            manifest.to_string(),
+            format!("/ace/cmd/{playback_id}/{token}?method=stop"),
+        )
+    }
+
+    fn spawn_stalled_hls_request(
+        state: AppState,
+        playback_id: String,
+        manifest: String,
+    ) -> tokio::task::JoinHandle<Response> {
+        tokio::spawn(async move {
+            ace_hls_playback_with_timeout(
+                State(state),
+                Path((playback_id, manifest)),
+                Duration::from_secs(5),
+            )
+            .await
+        })
     }
 
     async fn response_bytes(response: Response) -> Bytes {
@@ -3233,29 +3291,83 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef01234567";
         let state = stalled_hls_state();
         let app = router(state.clone());
-        let start = app
-            .oneshot(
-                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let playback = start.headers()[header::LOCATION]
-            .to_str()
-            .unwrap()
-            .strip_prefix("http://127.0.0.1:6878/ace/m/")
-            .unwrap();
-        let (playback_id, manifest) = playback.split_once('/').unwrap();
+        let (playback_id, manifest, _) = mint_stalled_hls(&app, id).await;
 
         let response = ace_hls_playback_with_timeout(
             State(state),
-            Path((playback_id.to_string(), manifest.to_string())),
+            Path((playback_id, manifest)),
             Duration::from_millis(1),
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[tokio::test]
+    async fn ace_hls_stop_cancels_a_stalled_playlist_wait_with_404() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = stalled_hls_state();
+        let app = router(state.clone());
+        let (playback_id, manifest, stop_path) = mint_stalled_hls(&app, id).await;
+        let request = spawn_stalled_hls_request(state, playback_id, manifest);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !request.is_finished(),
+            "playlist request must be waiting for readiness"
+        );
+
+        let stopped = app
+            .oneshot(Request::get(stop_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        let response = tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .expect("revocation must wake the playlist wait")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ace_hls_expiry_cancels_a_stalled_playlist_wait_with_404() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = stalled_hls_state_with(Duration::from_millis(40), 8);
+        let app = router(state.clone());
+        let (playback_id, manifest, _) = mint_stalled_hls(&app, id).await;
+        let request = spawn_stalled_hls_request(state, playback_id, manifest);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !request.is_finished(),
+            "playlist request must be waiting for readiness"
+        );
+
+        let response = tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .expect("expiry must wake the playlist wait")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ace_hls_capacity_eviction_cancels_a_stalled_playlist_wait_with_404() {
+        let first_id = "0123456789abcdef0123456789abcdef01234567";
+        let second_id = "1123456789abcdef0123456789abcdef01234567";
+        let state = stalled_hls_state_with(Duration::from_secs(60), 1);
+        let app = router(state.clone());
+        let (playback_id, manifest, _) = mint_stalled_hls(&app, first_id).await;
+        let request = spawn_stalled_hls_request(state, playback_id, manifest);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !request.is_finished(),
+            "playlist request must be waiting for readiness"
+        );
+
+        let _newer_lease = mint_stalled_hls(&app, second_id).await;
+        let response = tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .expect("capacity eviction must wake the playlist wait")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
