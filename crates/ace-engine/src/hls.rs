@@ -7,6 +7,7 @@ use crate::session::{StreamEvent, StreamSession};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const TS_PACKET: usize = 188;
 const PCR_HZ: u64 = 90_000;
@@ -35,6 +36,7 @@ struct HlsState {
     pcr_pid: Option<u16>,
     max_segment_duration: f32,
     discontinuity_pending: bool,
+    last_access: Instant,
 }
 
 struct HlsSegment {
@@ -60,6 +62,7 @@ impl HlsPackager {
                 pcr_pid: None,
                 max_segment_duration: config.segment_duration_secs(),
                 discontinuity_pending: false,
+                last_access: Instant::now(),
             }),
             seg_packets,
             max_segment_bytes,
@@ -214,7 +217,8 @@ impl HlsPackager {
     /// numbers under their own authenticated URL. It deliberately does not create or copy HLS
     /// state: native and compatibility playlists are two views of this one sliding window.
     pub fn playlist_with_segment_prefix(&self, segment_prefix: &str) -> String {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        st.last_access = Instant::now();
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
         out.push_str(&format!(
             "#EXT-X-TARGETDURATION:{}\n",
@@ -236,13 +240,22 @@ impl HlsPackager {
 
     /// Fetch a retained segment by its absolute sequence number.
     pub fn segment(&self, seq: u64) -> Option<Bytes> {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
         if seq < st.media_seq {
             return None;
         }
-        st.segments
+        let bytes = st
+            .segments
             .get((seq - st.media_seq) as usize)
-            .map(|segment| segment.bytes.clone())
+            .map(|segment| segment.bytes.clone());
+        if bytes.is_some() {
+            st.last_access = Instant::now();
+        }
+        bytes
+    }
+
+    pub(crate) fn was_accessed_within(&self, now: Instant, grace: Duration) -> bool {
+        now.saturating_duration_since(self.state.lock().unwrap().last_access) < grace
     }
 }
 
@@ -423,6 +436,31 @@ mod tests {
         packet[1] = (packet[1] & 0xe0) | ((pid >> 8) as u8 & 0x1f);
         packet[2] = pid as u8;
         packet
+    }
+
+    #[test]
+    fn playlist_and_valid_segment_reads_refresh_activity() {
+        let p = pkg();
+        p.feed(&packets(2));
+        let stale = Instant::now() - Duration::from_secs(60);
+
+        p.state.lock().unwrap().last_access = stale;
+        let _playlist = p.playlist("test", "active");
+        assert!(p.state.lock().unwrap().last_access > stale);
+
+        p.state.lock().unwrap().last_access = stale;
+        assert!(p.segment(0).is_some());
+        assert!(p.state.lock().unwrap().last_access > stale);
+    }
+
+    #[test]
+    fn invalid_segment_probe_does_not_refresh_activity() {
+        let p = pkg();
+        let stale = Instant::now() - Duration::from_secs(60);
+        p.state.lock().unwrap().last_access = stale;
+
+        assert!(p.segment(99).is_none());
+        assert_eq!(p.state.lock().unwrap().last_access, stale);
     }
 
     #[test]
