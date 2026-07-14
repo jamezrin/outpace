@@ -1,9 +1,10 @@
-//! Live HLS packaging over a session's TS broadcast. PCR is used as the media clock and cuts
-//! prefer packets carrying the random-access indicator (normally the start of a video GOP).
-//! Packet-count segmentation remains as a bounded fallback for streams without usable PCR.
+//! Live HLS packaging over a session's TS broadcast. PCR is used as the media clock and segments
+//! start only at PMT-declared video access points, prefixed with the latest PAT and PMT. Runs that
+//! cannot reach another clean boundary within the configured packet ceiling are discarded.
 
 use crate::config::HlsConfig;
 use crate::session::{StreamEvent, StreamSession};
+use ace_media::mpegts::VideoAccessPointState;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ const PCR_MODULUS: u64 = 1 << 33;
 
 pub struct HlsPackager {
     state: Mutex<HlsState>,
+    ready: tokio::sync::Notify,
     /// Hard packet ceiling for every segment. PCR/random-access timing may cut earlier, but never
     /// later, so configuration-time retained-memory calculations match the runtime invariant.
     seg_packets: usize,
@@ -37,6 +39,8 @@ struct HlsState {
     max_segment_duration: f32,
     discontinuity_pending: bool,
     last_access: Option<Instant>,
+    access: VideoAccessPointState,
+    awaiting_access_point: bool,
 }
 
 struct HlsSegment {
@@ -63,7 +67,10 @@ impl HlsPackager {
                 max_segment_duration: config.segment_duration_secs(),
                 discontinuity_pending: false,
                 last_access: None,
+                access: VideoAccessPointState::new(),
+                awaiting_access_point: true,
             }),
+            ready: tokio::sync::Notify::new(),
             seg_packets,
             max_segment_bytes,
             window: config.window_segments.max(1),
@@ -100,6 +107,8 @@ impl HlsPackager {
         st.last_pcr = None;
         st.pcr_pid = None;
         st.discontinuity_pending = true;
+        st.access.reset();
+        st.awaiting_access_point = true;
     }
 
     /// Append contiguous TS bytes, emitting PCR-timed, preferably random-access-aligned segments.
@@ -107,11 +116,13 @@ impl HlsPackager {
         let mut st = self.state.lock().unwrap();
         let mut remaining = data;
         while !remaining.is_empty() {
-            // Never duplicate more than one configured segment into `cur`, even when a source
-            // supplies a very large chunk in one call. `scan` always emits when the buffer reaches
-            // this ceiling, so there is room again before the next iteration.
             let room = self.max_segment_bytes - st.cur.len();
-            let take = room.min(remaining.len());
+            let packet_room = TS_PACKET - st.cur.len() % TS_PACKET;
+            let take = room.min(packet_room).min(remaining.len());
+            if take == 0 {
+                self.discard_incomplete_run(&mut st);
+                continue;
+            }
             st.cur.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
             self.scan(&mut st);
@@ -121,7 +132,44 @@ impl HlsPackager {
     fn scan(&self, st: &mut HlsState) {
         while st.scanned_packets < st.cur.len() / TS_PACKET {
             let packet_offset = st.scanned_packets * TS_PACKET;
-            let mut timing = ts_timing(&st.cur[packet_offset..packet_offset + TS_PACKET]);
+            let packet = st.cur[packet_offset..packet_offset + TS_PACKET].to_vec();
+            let mut timing = ts_timing(&packet);
+            let is_access_point = st.access.observe(&packet);
+
+            if timing.discontinuity {
+                st.access.reset();
+                st.cur.drain(..packet_offset + TS_PACKET);
+                st.scanned_packets = 0;
+                st.segment_start_pcr = None;
+                st.last_pcr = None;
+                st.pcr_pid = None;
+                st.discontinuity_pending = true;
+                st.awaiting_access_point = true;
+                continue;
+            }
+
+            if st.awaiting_access_point {
+                let Some(prefix) = is_access_point.then(|| st.access.table_prefix()).flatten()
+                else {
+                    st.cur.drain(..packet_offset + TS_PACKET);
+                    st.scanned_packets = 0;
+                    continue;
+                };
+                if prefix.len() + TS_PACKET > self.max_segment_bytes {
+                    st.cur.drain(..packet_offset + TS_PACKET);
+                    st.scanned_packets = 0;
+                    st.discontinuity_pending = true;
+                    continue;
+                }
+                let trailing = st.cur.split_off(packet_offset + TS_PACKET);
+                st.cur.clear();
+                st.cur.extend_from_slice(&prefix);
+                st.cur.extend_from_slice(&packet);
+                st.cur.extend_from_slice(&trailing);
+                st.scanned_packets = prefix.len() / TS_PACKET;
+                st.awaiting_access_point = false;
+                continue;
+            }
 
             // A transport stream may carry several programs, each with its own PCR clock. Until
             // PAT/PMT metadata is available here, lock each uninterrupted run to the first PCR
@@ -135,17 +183,15 @@ impl HlsPackager {
                 }
             }
 
-            if timing.discontinuity || pcr_went_backwards(st.last_pcr, timing.pcr) {
-                if packet_offset > 0 {
-                    st.cur.drain(..packet_offset);
-                }
-                // Keep the flagged packet as the first packet after the gap, but do not inspect
-                // its discontinuity flag again on the next loop iteration.
-                st.scanned_packets = 1;
-                st.segment_start_pcr = timing.pcr;
-                st.last_pcr = timing.pcr;
-                st.pcr_pid = timing.pcr.map(|_| timing.pid);
+            if pcr_went_backwards(st.last_pcr, timing.pcr) {
+                st.access.reset();
+                st.cur.drain(..packet_offset + TS_PACKET);
+                st.scanned_packets = 0;
+                st.segment_start_pcr = None;
+                st.last_pcr = None;
+                st.pcr_pid = None;
                 st.discontinuity_pending = true;
+                st.awaiting_access_point = true;
                 continue;
             }
 
@@ -161,32 +207,39 @@ impl HlsPackager {
                 _ => None,
             };
             let target_reached = elapsed.is_some_and(|d| d >= self.seg_duration);
-            // Waiting forever for a broken/missing random-access flag is worse than a less ideal
-            // boundary. At twice the target, cut at the next PCR-bearing packet.
-            let pcr_fallback =
-                timing.pcr.is_some() && elapsed.is_some_and(|d| d >= self.seg_duration * 2.0);
-            if packet_offset > 0 && ((target_reached && timing.random_access) || pcr_fallback) {
+            if packet_offset > 0 && target_reached && is_access_point {
                 let duration = elapsed.unwrap_or(self.seg_duration);
                 let boundary_pcr = st.last_pcr;
                 self.emit(st, packet_offset, duration);
+                let prefix = st
+                    .access
+                    .table_prefix()
+                    .expect("an observed video access point has PAT/PMT state");
+                st.cur.splice(0..0, prefix.iter().copied());
+                st.scanned_packets = prefix.len() / TS_PACKET;
                 st.segment_start_pcr = boundary_pcr;
                 st.last_pcr = boundary_pcr;
                 continue;
             }
             st.scanned_packets += 1;
             if st.scanned_packets >= self.seg_packets {
-                // PCR mode is allowed to wait for a preferable boundary only up to the configured
-                // packet ceiling. This is also the fallback for streams with no usable clock.
-                let duration = elapsed.unwrap_or(self.seg_duration);
-                self.emit(st, self.seg_packets * TS_PACKET, duration);
-                st.segment_start_pcr = None;
-                st.last_pcr = None;
-                st.pcr_pid = None;
+                self.discard_incomplete_run(st);
             }
         }
     }
 
+    fn discard_incomplete_run(&self, st: &mut HlsState) {
+        st.cur.clear();
+        st.scanned_packets = 0;
+        st.segment_start_pcr = None;
+        st.last_pcr = None;
+        st.pcr_pid = None;
+        st.discontinuity_pending = true;
+        st.awaiting_access_point = true;
+    }
+
     fn emit(&self, st: &mut HlsState, end: usize, duration: f32) {
+        let first_segment = st.segments.is_empty();
         // Evict before splitting/pushing so emission never transiently retains `window + 1`
         // completed segments in addition to the current segment. Configuration accounts for
         // exactly `window` completed segments plus `cur`.
@@ -202,8 +255,34 @@ impl HlsPackager {
             duration,
             discontinuity,
         });
+        if first_segment {
+            self.ready.notify_waiters();
+        }
         st.max_segment_duration = st.max_segment_duration.max(duration);
         st.scanned_packets = 0;
+    }
+
+    /// Whether at least one independently joinable live segment is available.
+    pub fn is_ready(&self) -> bool {
+        !self.state.lock().unwrap().segments.is_empty()
+    }
+
+    /// Wait up to `timeout` for the first independently joinable live segment.
+    pub async fn wait_ready(&self, timeout: Duration) -> bool {
+        if self.is_ready() {
+            return true;
+        }
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.ready.notified();
+                if self.is_ready() {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
     }
 
     /// Render the live media playlist; segment URIs are absolute under the given prefix.
@@ -296,7 +375,6 @@ impl HlsPackager {
 struct TsTiming {
     pid: u16,
     pcr: Option<u64>,
-    random_access: bool,
     discontinuity: bool,
 }
 
@@ -324,7 +402,6 @@ fn ts_timing(packet: &[u8]) -> TsTiming {
     TsTiming {
         pid,
         pcr,
-        random_access: flags & 0x40 != 0,
         discontinuity: flags & 0x80 != 0,
     }
 }
@@ -415,10 +492,10 @@ mod tests {
 
     fn pkg() -> Arc<HlsPackager> {
         HlsPackager::new(HlsConfig {
-            segment_packets: 2,
+            segment_packets: 6,
             window_segments: 3,
             segment_duration_ms: 1000,
-        }) // 2 packets/segment, window 3
+        })
     }
 
     fn packets(n: usize) -> Vec<u8> {
@@ -429,12 +506,85 @@ mod tests {
         v
     }
 
-    fn timed_packet(pcr: u64, random_access: bool, discontinuity: bool, marker: u8) -> Vec<u8> {
+    fn timed_pkg(duration_ms: u64) -> Arc<HlsPackager> {
+        HlsPackager::new(HlsConfig {
+            segment_packets: 100,
+            window_segments: 6,
+            segment_duration_ms: duration_ms,
+        })
+    }
+
+    fn random_access_packet(marker: u8) -> Vec<u8> {
+        let mut packet = packets(1);
+        packet[1] = 0x40 | ((VIDEO_PID >> 8) as u8 & 0x1f);
+        packet[2] = VIDEO_PID as u8;
+        packet[3] = 0x30;
+        packet[4] = 1;
+        packet[5] = 0x40;
+        packet[6] = marker;
+        packet
+    }
+
+    fn with_pid(mut packet: Vec<u8>, pid: u16) -> Vec<u8> {
+        packet[1] = (packet[1] & 0xe0) | ((pid >> 8) as u8 & 0x1f);
+        packet[2] = pid as u8;
+        packet
+    }
+
+    fn psi(pid: u16, section: &[u8]) -> Vec<u8> {
         let mut packet = vec![0xff; TS_PACKET];
         packet[0] = 0x47;
-        packet[1] = 0;
-        packet[2] = 1;
-        packet[3] = 0x20;
+        packet[1] = 0x40 | ((pid >> 8) as u8 & 0x1f);
+        packet[2] = pid as u8;
+        packet[3] = 0x10;
+        packet[4] = 0;
+        packet[5..5 + section.len()].copy_from_slice(section);
+        packet
+    }
+
+    fn pat(pmt_pid: u16) -> Vec<u8> {
+        let section_length = 5 + 4 + 4;
+        let mut section = vec![0x00, 0xb0, section_length as u8, 0x00, 0x01, 0xc1, 0, 0];
+        section.extend_from_slice(&[
+            0x00,
+            0x01,
+            0xe0 | ((pmt_pid >> 8) as u8 & 0x1f),
+            pmt_pid as u8,
+        ]);
+        section.extend_from_slice(&[0; 4]);
+        psi(0, &section)
+    }
+
+    fn pmt(pmt_pid: u16, video_pid: u16) -> Vec<u8> {
+        let section_length = 5 + 4 + 5 + 4;
+        let mut section = vec![0x02, 0xb0, section_length as u8, 0x00, 0x01, 0xc1, 0, 0];
+        section.extend_from_slice(&[
+            0xe0 | ((video_pid >> 8) as u8 & 0x1f),
+            video_pid as u8,
+            0xf0,
+            0,
+            0x1b,
+            0xe0 | ((video_pid >> 8) as u8 & 0x1f),
+            video_pid as u8,
+            0xf0,
+            0,
+        ]);
+        section.extend_from_slice(&[0; 4]);
+        psi(pmt_pid, &section)
+    }
+
+    fn pcr_packet(
+        pid: u16,
+        pcr: u64,
+        random_access: bool,
+        discontinuity: bool,
+        marker: u8,
+    ) -> Vec<u8> {
+        let mut packet = vec![0xff; TS_PACKET];
+        packet[0] = 0x47;
+        packet[1] = 0x40 | ((pid >> 8) as u8 & 0x1f);
+        packet[2] = pid as u8;
+        packet[3] = 0x30;
         packet[4] = 7;
         packet[5] =
             0x10 | if random_access { 0x40 } else { 0 } | if discontinuity { 0x80 } else { 0 };
@@ -448,33 +598,171 @@ mod tests {
         packet
     }
 
-    fn timed_pkg(duration_ms: u64) -> Arc<HlsPackager> {
+    fn video_access_packet(pid: u16, pcr: u64) -> Vec<u8> {
+        pcr_packet(pid, pcr, true, false, (pcr / 90_000) as u8)
+    }
+
+    fn clean_pkg(segment_packets: usize) -> Arc<HlsPackager> {
         HlsPackager::new(HlsConfig {
-            segment_packets: 100,
-            window_segments: 6,
-            segment_duration_ms: duration_ms,
+            segment_packets,
+            window_segments: 4,
+            segment_duration_ms: 1000,
         })
     }
 
-    fn random_access_packet(marker: u8) -> Vec<u8> {
-        let mut packet = packets(1);
-        packet[1] = marker & 0x1f;
-        packet[3] = 0x20;
-        packet[4] = 1;
-        packet[5] = 0x40;
-        packet
+    const PMT_PID: u16 = 0x0100;
+    const VIDEO_PID: u16 = 0x0101;
+    const AUDIO_PID: u16 = 0x0102;
+
+    fn feed_one_clean_segment(p: &HlsPackager) {
+        feed_clean_run(p, 0, 1);
     }
 
-    fn with_pid(mut packet: Vec<u8>, pid: u16) -> Vec<u8> {
-        packet[1] = (packet[1] & 0xe0) | ((pid >> 8) as u8 & 0x1f);
-        packet[2] = pid as u8;
-        packet
+    fn feed_clean_run(p: &HlsPackager, start_pcr: u64, segment_count: usize) {
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, start_pcr));
+        for i in 1..=segment_count {
+            p.feed(&video_access_packet(
+                VIDEO_PID,
+                start_pcr + i as u64 * 108_000,
+            ));
+        }
+    }
+
+    #[test]
+    fn clean_first_segment_discards_partial_gop_and_starts_with_tables_and_video_access() {
+        let p = clean_pkg(12);
+        let partial_gop_packet = with_pid(packets(1), VIDEO_PID);
+        let pat = pat(PMT_PID);
+        let pmt = pmt(PMT_PID, VIDEO_PID);
+        let first_access = video_access_packet(VIDEO_PID, 0);
+
+        p.feed(&partial_gop_packet);
+        p.feed(&pat);
+        p.feed(&pmt);
+        p.feed(&first_access);
+        p.feed(&pcr_packet(VIDEO_PID, 45_000, false, false, 7));
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+
+        let segment = p.segment(0).expect("first clean segment");
+        assert_eq!(&segment[..TS_PACKET], &pat);
+        assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], &pmt);
+        assert_eq!(&segment[TS_PACKET * 2..TS_PACKET * 3], &first_access);
+        assert!(!segment
+            .windows(TS_PACKET)
+            .any(|packet| packet == partial_gop_packet));
+    }
+
+    #[test]
+    fn clean_subsequent_segment_repeats_tables_and_ignores_non_video_random_access() {
+        let p = clean_pkg(12);
+        let pat = pat(PMT_PID);
+        let pmt = pmt(PMT_PID, VIDEO_PID);
+        let non_video_access = pcr_packet(AUDIO_PID, 108_000, true, false, 8);
+        let second_access = video_access_packet(VIDEO_PID, 216_000);
+
+        p.feed(&pat);
+        p.feed(&pmt);
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&pcr_packet(VIDEO_PID, 108_000, false, false, 7));
+        p.feed(&non_video_access);
+        p.feed(&second_access);
+        p.feed(&pcr_packet(VIDEO_PID, 270_000, false, false, 9));
+        p.feed(&video_access_packet(VIDEO_PID, 324_000));
+
+        let first = p.segment(0).expect("first clean segment");
+        assert!(first
+            .chunks_exact(TS_PACKET)
+            .any(|packet| packet == non_video_access));
+        let second = p.segment(1).expect("second clean segment");
+        assert_eq!(&second[..TS_PACKET], &pat);
+        assert_eq!(&second[TS_PACKET..TS_PACKET * 2], &pmt);
+        assert_eq!(&second[TS_PACKET * 2..TS_PACKET * 3], &second_access);
+    }
+
+    #[test]
+    fn clean_discontinuity_requires_fresh_tables_before_restarting() {
+        let p = clean_pkg(12);
+        let stale_access = video_access_packet(VIDEO_PID, 0);
+        let fresh_pat = pat(PMT_PID);
+        let fresh_pmt = pmt(PMT_PID, VIDEO_PID);
+        let fresh_access = video_access_packet(VIDEO_PID, 90_000);
+
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.discontinuity();
+        p.feed(&stale_access);
+        p.feed(&fresh_pat);
+        p.feed(&fresh_pmt);
+        p.feed(&fresh_access);
+        p.feed(&video_access_packet(VIDEO_PID, 198_000));
+
+        let segment = p.segment(0).expect("first post-gap clean segment");
+        assert_eq!(&segment[..TS_PACKET], &fresh_pat);
+        assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], &fresh_pmt);
+        assert_eq!(&segment[TS_PACKET * 2..TS_PACKET * 3], &fresh_access);
+        assert!(!segment
+            .chunks_exact(TS_PACKET)
+            .any(|packet| packet == stale_access));
+    }
+
+    #[test]
+    fn clean_hard_ceiling_discards_incomplete_run_and_restarts_at_next_access_point() {
+        let p = clean_pkg(5);
+        let pat = pat(PMT_PID);
+        let pmt = pmt(PMT_PID, VIDEO_PID);
+
+        p.feed(&pat);
+        p.feed(&pmt);
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&pcr_packet(VIDEO_PID, 9_000, false, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 18_000, false, false, 2));
+
+        assert!(p.segment(0).is_none());
+        assert!(p.state.lock().unwrap().cur.is_empty());
+
+        let restarted_access = video_access_packet(VIDEO_PID, 108_000);
+        p.feed(&restarted_access);
+        p.feed(&video_access_packet(VIDEO_PID, 216_000));
+
+        let segment = p.segment(0).expect("clean segment after ceiling reset");
+        assert_eq!(segment.len(), 3 * TS_PACKET);
+        assert_eq!(&segment[..TS_PACKET], &pat);
+        assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], &pmt);
+        assert_eq!(&segment[TS_PACKET * 2..], &restarted_access);
+        assert!(p
+            .playlist("test", "ceiling")
+            .contains("#EXT-X-DISCONTINUITY"));
+        let st = p.state.lock().unwrap();
+        assert!(st.cur.len() <= p.max_segment_bytes);
+        assert!(st
+            .segments
+            .iter()
+            .all(|segment| segment.bytes.len() <= p.max_segment_bytes));
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_first_completed_segment_and_then_stays_ready() {
+        let p = clean_pkg(6);
+        let stale = Instant::now() - Duration::from_secs(60);
+        p.state.lock().unwrap().last_access = Some(stale);
+
+        assert!(!p.is_ready());
+        assert!(!p.wait_ready(Duration::from_millis(1)).await);
+        assert_eq!(p.state.lock().unwrap().last_access, Some(stale));
+
+        feed_one_clean_segment(&p);
+        assert!(p.wait_ready(Duration::from_millis(50)).await);
+        assert!(p.is_ready());
+        assert_eq!(p.state.lock().unwrap().last_access, Some(stale));
     }
 
     #[test]
     fn playlist_and_valid_segment_reads_refresh_activity() {
         let p = pkg();
-        p.feed(&packets(2));
+        feed_one_clean_segment(&p);
         let stale = Instant::now() - Duration::from_secs(60);
 
         p.state.lock().unwrap().last_access = Some(stale);
@@ -499,7 +787,7 @@ mod tests {
     #[test]
     fn evicted_and_future_segment_probes_do_not_refresh_activity() {
         let p = pkg();
-        p.feed(&packets(10));
+        feed_clean_run(&p, 0, 5);
         let stale = Instant::now() - Duration::from_secs(60);
         p.state.lock().unwrap().last_access = Some(stale);
 
@@ -512,6 +800,8 @@ mod tests {
     #[test]
     fn pcr_duration_cuts_before_random_access_packet_and_drives_extinf() {
         let p = timed_pkg(1000);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
         for (pcr, key, marker) in [
             (0, true, 1),
             (45_000, false, 2),
@@ -519,11 +809,11 @@ mod tests {
             (153_000, false, 4),
             (216_000, true, 5),
         ] {
-            p.feed(&timed_packet(pcr, key, false, marker));
+            p.feed(&pcr_packet(VIDEO_PID, pcr, key, false, marker));
         }
 
-        assert_eq!(p.segment(0).unwrap().len(), 2 * TS_PACKET);
-        assert_eq!(p.segment(1).unwrap()[12], 3);
+        assert_eq!(p.segment(0).unwrap().len(), 4 * TS_PACKET);
+        assert_eq!(p.segment(1).unwrap()[2 * TS_PACKET + 12], 3);
         let playlist = p.playlist("test", "timed");
         assert_eq!(playlist.matches("#EXTINF:1.200,").count(), 2);
         assert!(playlist.contains("#EXT-X-TARGETDURATION:2"));
@@ -532,13 +822,15 @@ mod tests {
     #[test]
     fn default_ceiling_allows_a_timed_keyframe_beyond_256_packets() {
         let p = HlsPackager::new(HlsConfig::default());
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
         let input: Vec<u8> = (0..=300)
-            .flat_map(|i| timed_packet(i * 360, i == 300, false, i as u8))
+            .flat_map(|i| pcr_packet(VIDEO_PID, i * 360, matches!(i, 0 | 300), false, i as u8))
             .collect();
 
         p.feed(&input);
 
-        assert_eq!(p.segment(0).unwrap().len(), 300 * TS_PACKET);
+        assert_eq!(p.segment(0).unwrap().len(), 302 * TS_PACKET);
         assert!(p
             .playlist("test", "default-ceiling")
             .contains("#EXTINF:1.200,"));
@@ -547,19 +839,19 @@ mod tests {
     #[test]
     fn pcr_mode_never_exceeds_the_hard_packet_ceiling() {
         let p = HlsPackager::new(HlsConfig {
-            segment_packets: 3,
+            segment_packets: 5,
             window_segments: 4,
             segment_duration_ms: 60_000,
         });
-        let input: Vec<u8> = (0..7)
-            .flat_map(|i| timed_packet(i * 9_000, false, false, i as u8))
-            .collect();
-        p.feed(&input);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&pcr_packet(VIDEO_PID, 9_000, false, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 18_000, false, false, 2));
 
-        assert_eq!(p.segment(0).unwrap().len(), 3 * TS_PACKET);
-        assert_eq!(p.segment(1).unwrap().len(), 3 * TS_PACKET);
+        assert!(p.segment(0).is_none());
         let st = p.state.lock().unwrap();
-        assert_eq!(st.cur.len(), TS_PACKET);
+        assert!(st.cur.is_empty());
         assert!(st
             .segments
             .iter()
@@ -569,21 +861,20 @@ mod tests {
     #[test]
     fn hard_ceiling_preserves_post_discontinuity_boundary() {
         let p = HlsPackager::new(HlsConfig {
-            segment_packets: 2,
+            segment_packets: 6,
             window_segments: 4,
-            segment_duration_ms: 60_000,
+            segment_duration_ms: 1000,
         });
-        p.feed(&timed_packet(0, false, false, 1));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
         p.discontinuity();
-        let post_gap: Vec<u8> = (0..3)
-            .flat_map(|i| timed_packet(i * 9_000, false, false, 10 + i as u8))
-            .collect();
-        p.feed(&post_gap);
+        feed_clean_run(&p, 90_000, 1);
 
         let first = p.segment(0).unwrap();
-        assert_eq!(first.len(), 2 * TS_PACKET);
-        assert_eq!(first[12], 10);
-        assert_eq!(p.state.lock().unwrap().cur[12], 12);
+        assert_eq!(first.len(), 3 * TS_PACKET);
+        assert_eq!(&first[..TS_PACKET], &pat(PMT_PID));
+        assert_eq!(p.state.lock().unwrap().cur.len(), 3 * TS_PACKET);
         assert_eq!(
             p.playlist("test", "bounded-gap")
                 .matches("#EXT-X-DISCONTINUITY")
@@ -595,14 +886,16 @@ mod tests {
     #[test]
     fn random_access_packet_need_not_carry_the_pcr_it_is_aligned_against() {
         let p = timed_pkg(1000);
-        p.feed(&timed_packet(0, false, false, 1));
-        p.feed(&timed_packet(108_000, false, false, 2));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&pcr_packet(VIDEO_PID, 0, true, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 108_000, false, false, 2));
         p.feed(&random_access_packet(3));
-        p.feed(&timed_packet(216_000, false, false, 4));
+        p.feed(&pcr_packet(VIDEO_PID, 216_000, false, false, 4));
         p.feed(&random_access_packet(5));
 
-        assert_eq!(p.segment(0).unwrap().len(), 2 * TS_PACKET);
-        assert_eq!(p.segment(1).unwrap()[1] & 0x1f, 3);
+        assert_eq!(p.segment(0).unwrap().len(), 4 * TS_PACKET);
+        assert_eq!(p.segment(1).unwrap()[2 * TS_PACKET + 6], 3);
         assert_eq!(
             p.playlist("test", "split-pcr")
                 .matches("#EXTINF:1.200,")
@@ -615,9 +908,11 @@ mod tests {
     fn pcr_wrap_is_measured_as_forward_time() {
         let p = timed_pkg(1000);
         let start = PCR_MODULUS - 45_000;
-        p.feed(&timed_packet(start, true, false, 1));
-        p.feed(&timed_packet(63_000, true, false, 2));
-        p.feed(&timed_packet(171_000, true, false, 3));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&pcr_packet(VIDEO_PID, start, true, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 63_000, true, false, 2));
+        p.feed(&pcr_packet(VIDEO_PID, 171_000, true, false, 3));
 
         let playlist = p.playlist("test", "wrap");
         assert!(playlist.contains("#EXTINF:1.200,"));
@@ -627,41 +922,48 @@ mod tests {
     #[test]
     fn transport_discontinuity_discards_partial_segment_and_marks_next_one() {
         let p = timed_pkg(1000);
-        p.feed(&timed_packet(0, true, false, 1));
-        p.feed(&timed_packet(45_000, false, false, 2));
-        p.feed(&timed_packet(900_000, true, true, 3));
-        p.feed(&timed_packet(1_008_000, true, false, 4));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&pcr_packet(VIDEO_PID, 0, true, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 45_000, false, false, 2));
+        p.feed(&pcr_packet(VIDEO_PID, 900_000, true, true, 3));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&pcr_packet(VIDEO_PID, 900_000, true, false, 4));
+        p.feed(&pcr_packet(VIDEO_PID, 1_008_000, true, false, 5));
 
-        assert_eq!(p.segment(0).unwrap()[12], 3);
+        assert_eq!(p.segment(0).unwrap()[2 * TS_PACKET + 12], 4);
         let playlist = p.playlist("test", "disc");
         assert!(playlist.contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.200,"));
     }
 
     #[test]
-    fn packet_fallback_resumes_when_pcr_disappears() {
+    fn packet_ceiling_drops_a_run_when_pcr_disappears() {
         let p = HlsPackager::new(HlsConfig {
-            segment_packets: 3,
+            segment_packets: 5,
             window_segments: 6,
             segment_duration_ms: 1000,
         });
-        p.feed(&timed_packet(0, false, false, 1));
-        p.feed(&packets(6));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&pcr_packet(VIDEO_PID, 0, true, false, 1));
+        p.feed(&with_pid(packets(1), VIDEO_PID));
+        p.feed(&with_pid(packets(1), VIDEO_PID));
 
-        assert_eq!(p.segment(0).unwrap().len(), 3 * TS_PACKET);
-        assert_eq!(p.segment(1).unwrap().len(), 3 * TS_PACKET);
+        assert!(p.segment(0).is_none());
+        assert!(p.state.lock().unwrap().cur.is_empty());
     }
 
     #[test]
     fn unrelated_pcr_pid_does_not_corrupt_the_selected_clock() {
         let p = timed_pkg(1000);
-        p.feed(&with_pid(timed_packet(0, false, false, 1), 100));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, 100));
+        p.feed(&pcr_packet(100, 0, true, false, 1));
         // A numerically unrelated clock on another program must not look like a backwards jump.
-        p.feed(&with_pid(
-            timed_packet(PCR_MODULUS - 1, false, false, 2),
-            200,
-        ));
-        p.feed(&with_pid(timed_packet(108_000, true, false, 3), 100));
-        p.feed(&with_pid(timed_packet(216_000, true, false, 4), 100));
+        p.feed(&pcr_packet(200, PCR_MODULUS - 1, false, false, 2));
+        p.feed(&pcr_packet(100, 108_000, true, false, 3));
+        p.feed(&pcr_packet(100, 216_000, true, false, 4));
 
         let playlist = p.playlist("test", "multiprogram");
         assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 0);
@@ -675,13 +977,15 @@ mod tests {
             window_segments: 1,
             segment_duration_ms: 1000,
         });
-        p.feed(&timed_packet(0, false, false, 1));
-        p.feed(&timed_packet(180_000, true, false, 2));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&pcr_packet(VIDEO_PID, 0, true, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 180_000, true, false, 2));
         assert!(p
             .playlist("test", "target")
             .contains("#EXT-X-TARGETDURATION:2"));
 
-        p.feed(&timed_packet(270_000, true, false, 3));
+        p.feed(&pcr_packet(VIDEO_PID, 270_000, true, false, 3));
         assert!(p
             .playlist("test", "target")
             .contains("#EXT-X-TARGETDURATION:2"));
@@ -690,25 +994,24 @@ mod tests {
     #[test]
     fn fills_segments_and_slides_window() {
         let p = pkg();
-        // 10 packets -> 5 segments of 2; window keeps last 3 (seq 2,3,4).
-        p.feed(&packets(10));
+        feed_clean_run(&p, 0, 5);
         let pl = p.playlist("test", "abc");
         assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:2"));
         assert!(pl.contains("/streams/test/abc/seg/2.ts"));
         assert!(pl.contains("/streams/test/abc/seg/4.ts"));
         assert!(!pl.contains("seg/1.ts"));
-        // evicted + future segments are gone; retained ones are 2*188 bytes.
+        // Evicted + future segments are gone; retained ones are PAT + PMT + access point.
         assert!(p.segment(1).is_none());
-        assert_eq!(p.segment(3).unwrap().len(), 2 * TS_PACKET);
+        assert_eq!(p.segment(3).unwrap().len(), 3 * TS_PACKET);
         assert!(p.segment(99).is_none());
     }
 
     #[test]
     fn alternate_playlist_prefix_reuses_native_sequence_and_discontinuity_state() {
         let p = pkg();
-        p.feed(&packets(2));
+        feed_one_clean_segment(&p);
         p.discontinuity();
-        p.feed(&packets(2));
+        feed_clean_run(&p, 1_000_000, 1);
 
         let native = p.playlist("test", "abc");
         let compat = p.compatibility_playlist_with_segment_prefix("/ace/c/client-token");
@@ -733,9 +1036,16 @@ mod tests {
     #[test]
     fn partial_packets_buffer_until_full() {
         let p = pkg();
-        p.feed(&packets(1)); // not enough for a 2-packet segment
+        let stream = [
+            pat(PMT_PID),
+            pmt(PMT_PID, VIDEO_PID),
+            video_access_packet(VIDEO_PID, 0),
+            video_access_packet(VIDEO_PID, 108_000),
+        ]
+        .concat();
+        p.feed(&stream[..stream.len() - 1]);
         assert!(p.playlist("test", "x").lines().all(|l| !l.contains("seg/")));
-        p.feed(&packets(1));
+        p.feed(&stream[stream.len() - 1..]);
         assert!(p.playlist("test", "x").contains("seg/0.ts"));
     }
 
@@ -745,29 +1055,30 @@ mod tests {
         let pre_gap = vec![0x11; TS_PACKET];
         p.feed(&pre_gap);
         p.discontinuity();
-        let post_gap = vec![0x22; 4 * TS_PACKET];
-        p.feed(&post_gap);
+        feed_clean_run(&p, 0, 2);
 
-        assert_eq!(p.segment(0).unwrap().as_ref(), &post_gap[..2 * TS_PACKET]);
-        assert_eq!(p.segment(1).unwrap().as_ref(), &post_gap[2 * TS_PACKET..]);
+        assert_eq!(p.segment(0).unwrap().len(), 3 * TS_PACKET);
+        assert_eq!(p.segment(1).unwrap().len(), 3 * TS_PACKET);
         let playlist = p.playlist("test", "gap");
         assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 1);
         assert!(
-            playlist.contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.000,\n/streams/test/gap/seg/0.ts")
+            playlist.contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.200,\n/streams/test/gap/seg/0.ts")
         );
     }
 
     #[test]
     fn discontinuity_metadata_slides_with_its_segment() {
         let p = pkg();
-        p.feed(&packets(2));
+        feed_one_clean_segment(&p);
         p.discontinuity();
-        p.feed(&packets(6));
+        feed_clean_run(&p, 1_000_000, 3);
         let retained = p.playlist("test", "slide");
         assert!(retained.contains("#EXT-X-MEDIA-SEQUENCE:1"));
         assert_eq!(retained.matches("#EXT-X-DISCONTINUITY").count(), 1);
 
-        p.feed(&packets(6));
+        for i in 4..=6 {
+            p.feed(&video_access_packet(VIDEO_PID, 1_000_000 + i * 108_000));
+        }
         let evicted = p.playlist("test", "slide");
         assert!(evicted.contains("#EXT-X-MEDIA-SEQUENCE:4"));
         assert_eq!(evicted.matches("#EXT-X-DISCONTINUITY").count(), 0);
@@ -776,41 +1087,46 @@ mod tests {
     #[test]
     fn repeated_gaps_keep_distinct_markers_and_monotonic_sequences() {
         let p = HlsPackager::new(HlsConfig {
-            segment_packets: 1,
+            segment_packets: 6,
             window_segments: 5,
             segment_duration_ms: 1000,
         });
-        p.feed(&packets(1));
+        feed_clean_run(&p, 0, 1);
         p.discontinuity();
-        p.feed(&packets(1));
+        feed_clean_run(&p, 1_000_000, 1);
         p.discontinuity();
-        p.feed(&packets(1));
+        feed_clean_run(&p, 2_000_000, 1);
 
         let playlist = p.playlist("test", "repeat");
         assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 2);
         assert!(playlist.contains("seg/0.ts"));
         assert!(playlist.contains("seg/1.ts"));
         assert!(playlist.contains("seg/2.ts"));
-        assert_eq!(p.segment(0).unwrap().len(), TS_PACKET);
-        assert_eq!(p.segment(2).unwrap().len(), TS_PACKET);
+        assert_eq!(p.segment(0).unwrap().len(), 3 * TS_PACKET);
+        assert_eq!(p.segment(2).unwrap().len(), 3 * TS_PACKET);
     }
 
     #[test]
     fn configured_hls_settings_control_playlist_and_segments() {
         let p = HlsPackager::new(HlsConfig {
-            segment_packets: 1,
+            segment_packets: 6,
             window_segments: 2,
             segment_duration_ms: 2500,
         });
-        p.feed(&packets(3));
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        for i in 1..=3 {
+            p.feed(&video_access_packet(VIDEO_PID, i * 270_000));
+        }
 
         let pl = p.playlist("test", "abc");
 
         assert!(pl.contains("#EXT-X-TARGETDURATION:3"));
-        assert!(pl.contains("#EXTINF:2.500,"));
+        assert!(pl.contains("#EXTINF:3.000,"));
         assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:1"));
         assert!(p.segment(0).is_none());
-        assert_eq!(p.segment(2).unwrap().len(), TS_PACKET);
+        assert_eq!(p.segment(2).unwrap().len(), 3 * TS_PACKET);
     }
 
     fn vod_config() -> HlsConfig {
