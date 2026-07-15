@@ -1005,6 +1005,11 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_service_name_rejects_all_control_chars() {
+        assert_eq!(sanitize_service_name("\0\u{1}\u{2}"), None);
+    }
+
+    #[test]
     fn sanitize_service_name_byte_caps_on_char_boundary() {
         // Multibyte chars must never be split, and the result must fit build_sdt (one packet).
         let name = sanitize_service_name(&"é".repeat(200)).unwrap();
