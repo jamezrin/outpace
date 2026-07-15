@@ -2301,7 +2301,11 @@ mod tests {
                 registry,
                 32,
                 crate::config::HlsConfig {
-                    segment_packets: 3,
+                    // 4, not 3: PacedPacketSource's fixture metadata carries a title (Task 5,
+                    // #135), so the injected per-segment table prefix is [PAT][PMT][SDT] (3
+                    // packets) rather than [PAT][PMT] (2) -- one more packet of headroom is
+                    // needed to still fit a keyframe alongside it.
+                    segment_packets: 4,
                     window_segments: 3,
                     segment_duration_ms: 1000,
                 },
