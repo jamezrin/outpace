@@ -1090,7 +1090,7 @@ mod tests {
         assert_eq!(c.live_recovery.max_parallel_connect, 12);
         assert_eq!(c.live_recovery.max_piece_advance, 256);
         assert_eq!(c.live_recovery.max_reasm_pieces_ahead, 512);
-        assert_eq!(c.hls.segment_packets, 16_384);
+        assert_eq!(c.hls.segment_packets, 65_536);
         assert_eq!(c.hls.window_segments, 6);
         assert_eq!(c.hls.segment_duration_ms, 1000);
     }

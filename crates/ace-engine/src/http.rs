@@ -1431,20 +1431,16 @@ async fn stream_file_with_hls_timeout(
                 if let Err(response) = await_hls_ready(&pkg, timeout).await {
                     return response;
                 }
-                let icy_name = s
-                    .manager
-                    .get(&network, id)
-                    .await
-                    .and_then(|session| icy_name_header(session.metadata()));
-                let mut response = (
+                // Deliberately no `icy-*` header here: on an HLS manifest it makes VLC's HTTP
+                // access promote the URL to the `icyx://` (Icecast) scheme and treat the body as
+                // a raw audio stream, so the HLS demux never loads and playback busy-loops the
+                // playlist without fetching segments. The title still reaches clients via the
+                // JSON metadata endpoints; `icy-name` remains on the direct `.ts` responses.
+                (
                     [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
                     pkg.playlist(&network, id),
                 )
-                    .into_response();
-                if let Some(value) = icy_name {
-                    response.headers_mut().insert("icy-name", value);
-                }
-                response
+                    .into_response()
             }
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         };
@@ -3982,7 +3978,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m3u8_serves_hls_playlist_with_stream_title() {
+    async fn m3u8_playlist_omits_icy_headers() {
+        // An `icy-*` header on an HLS manifest makes VLC's HTTP access promote the URL to the
+        // `icyx://` (Icecast) scheme and treat the body as a raw audio stream: the HLS demux
+        // never loads, so VLC busy-loops the playlist and never fetches a segment. The manifest
+        // must therefore carry no `icy-*` header even when the stream has a title (the title is
+        // still exposed to clients via the JSON metadata endpoints). It stays on direct `.ts`.
         let resp = router(fixture_state(0))
             .oneshot(
                 Request::get("/streams/fix/chan.m3u8")
@@ -3996,7 +3997,13 @@ mod tests {
             resp.headers()[header::CONTENT_TYPE],
             "application/vnd.apple.mpegurl"
         );
-        assert_eq!(resp.headers()["icy-name"], "Synthetic Demo Channel");
+        assert!(
+            !resp
+                .headers()
+                .keys()
+                .any(|k| k.as_str().starts_with("icy-")),
+            "HLS manifest must not carry icy-* headers (breaks VLC HLS playback)"
+        );
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
