@@ -2,6 +2,7 @@
 //! compatibility `/ace/...` playback surface.
 
 use crate::broadcast::BroadcastRegistry;
+use crate::hls::HlsPackager;
 use crate::manager::StreamManager;
 use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::{StreamEvent, StreamSession, Subscription};
@@ -25,6 +26,7 @@ use tokio::sync::broadcast::error::RecvError;
 const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ACE_TOKEN_CAPACITY: usize = 4096;
 const MAX_ICY_NAME_BYTES: usize = 256;
+const HLS_PLAYLIST_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn icy_name_header(metadata: &StreamMetadata) -> Option<HeaderValue> {
     let title = metadata.title.as_deref()?.trim();
@@ -46,6 +48,18 @@ fn stream_metadata_json(metadata: &StreamMetadata) -> serde_json::Value {
         "bitrate": metadata.bitrate,
         "categories": metadata.categories,
     })
+}
+
+async fn await_hls_ready(pkg: &HlsPackager, timeout: Duration) -> Result<(), Response> {
+    if pkg.wait_ready(timeout).await {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+        )
+            .into_response())
+    }
 }
 
 struct AceLease {
@@ -873,22 +887,17 @@ async fn ace_manifest(
             .into_response();
     };
 
-    let _pkg = match s
+    let (_pkg, session, pin) = match s
         .manager
-        .get_or_start_hls(&network, &selection.session_key)
+        .get_or_start_compatibility_hls(&network, &selection.session_key)
         .await
     {
-        Ok(pkg) => pkg,
+        Ok(started) => started,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    let Some(session) = s.manager.get(&network, &selection.session_key).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let token = s.ace_sessions.mint_hls(
-        selection.playback_id.clone(),
-        selection.session_key,
-        session.subscribe(),
-    );
+    let token = s
+        .ace_sessions
+        .mint_hls(selection.playback_id.clone(), selection.session_key, pin);
     let base = request_base(&headers);
     let playback_url = format!("{base}/ace/m/{}/{}.m3u8", selection.playback_id, token);
 
@@ -927,10 +936,19 @@ async fn ace_hls_playback(
     State(s): State<AppState>,
     Path((id, manifest)): Path<(String, String)>,
 ) -> Response {
+    ace_hls_playback_with_timeout(State(s), Path((id, manifest)), HLS_PLAYLIST_STARTUP_TIMEOUT)
+        .await
+}
+
+async fn ace_hls_playback_with_timeout(
+    State(s): State<AppState>,
+    Path((id, manifest)): Path<(String, String)>,
+    timeout: Duration,
+) -> Response {
     let Some(token) = manifest.strip_suffix(".m3u8") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(session_key) = s.ace_sessions.validate(&id, token) else {
+    let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&id, token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(network) = ace_network(&s) else {
@@ -939,12 +957,29 @@ async fn ace_hls_playback(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let ready = tokio::select! {
+        ready = pkg.wait_ready(timeout) => ready,
+        _ = cancel.changed() => return StatusCode::NOT_FOUND.into_response(),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    if s.ace_sessions.validate(&id, token).as_deref() != Some(session_key.as_str()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !ready {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+        )
+            .into_response();
+    }
     (
         [
             (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        pkg.playlist_with_segment_prefix(&format!("/ace/c/{token}")),
+        pkg.compatibility_playlist_with_segment_prefix(&format!("/ace/c/{token}")),
     )
         .into_response()
 }
@@ -969,7 +1004,7 @@ async fn ace_hls_segment(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match pkg.segment(seq) {
+    match pkg.compatibility_segment(seq) {
         Some(bytes) => (
             [
                 (header::CONTENT_TYPE, "video/mp2t"),
@@ -1377,13 +1412,40 @@ async fn stream_file(
     State(s): State<AppState>,
     Path((network, file)): Path<(String, String)>,
 ) -> Response {
+    stream_file_with_hls_timeout(
+        State(s),
+        Path((network, file)),
+        HLS_PLAYLIST_STARTUP_TIMEOUT,
+    )
+    .await
+}
+
+async fn stream_file_with_hls_timeout(
+    State(s): State<AppState>,
+    Path((network, file)): Path<(String, String)>,
+    timeout: Duration,
+) -> Response {
     if let Some(id) = file.strip_suffix(".m3u8") {
         return match s.manager.get_or_start_hls(&network, id).await {
-            Ok(pkg) => (
-                [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
-                pkg.playlist(&network, id),
-            )
-                .into_response(),
+            Ok(pkg) => {
+                if let Err(response) = await_hls_ready(&pkg, timeout).await {
+                    return response;
+                }
+                let icy_name = s
+                    .manager
+                    .get(&network, id)
+                    .await
+                    .and_then(|session| icy_name_header(session.metadata()));
+                let mut response = (
+                    [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+                    pkg.playlist(&network, id),
+                )
+                    .into_response();
+                if let Some(value) = icy_name {
+                    response.headers_mut().insert("icy-name", value);
+                }
+                response
+            }
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         };
     }
@@ -1798,8 +1860,8 @@ mod tests {
 
     #[tokio::test]
     async fn vod_manifest_serves_a_terminated_vod_playlist() {
-        // 450 bytes over 188-byte (1-packet) segments => 3 segments.
-        let resp = memvod_hls_router(vec![0u8; 450], 1)
+        // 1500 bytes over 564-byte (3-packet) segments => 3 segments.
+        let resp = memvod_hls_router(vec![0u8; 1500], 3)
             .oneshot(
                 Request::get("/vod/memvod/x/manifest.m3u8")
                     .body(Body::empty())
@@ -1825,9 +1887,9 @@ mod tests {
 
     #[tokio::test]
     async fn vod_hls_segment_serves_its_verified_byte_range_as_ts() {
-        let data: Vec<u8> = (0..255u8).cycle().take(450).collect();
-        // Segment 1 covers bytes [188, 376).
-        let resp = memvod_hls_router(data.clone(), 1)
+        let data: Vec<u8> = (0..255u8).cycle().take(1500).collect();
+        // Segment 1 covers bytes [564, 1128).
+        let resp = memvod_hls_router(data.clone(), 3)
             .oneshot(
                 Request::get("/vod/memvod/x/seg/1.ts")
                     .body(Body::empty())
@@ -1837,18 +1899,18 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "video/mp2t");
-        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "188");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "564");
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        assert_eq!(&body[..], &data[188..376]);
+        assert_eq!(&body[..], &data[564..1128]);
     }
 
     #[tokio::test]
     async fn vod_hls_final_segment_is_clamped_to_the_last_byte() {
-        let data: Vec<u8> = (0..255u8).cycle().take(450).collect();
-        // 450 bytes => final segment 2 covers [376, 450): 74 bytes.
-        let resp = memvod_hls_router(data.clone(), 1)
+        let data: Vec<u8> = (0..255u8).cycle().take(1500).collect();
+        // 1500 bytes => final segment 2 covers [1128, 1500): 372 bytes.
+        let resp = memvod_hls_router(data.clone(), 3)
             .oneshot(
                 Request::get("/vod/memvod/x/seg/2.ts")
                     .body(Body::empty())
@@ -1857,16 +1919,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "74");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "372");
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        assert_eq!(&body[..], &data[376..450]);
+        assert_eq!(&body[..], &data[1128..1500]);
     }
 
     #[tokio::test]
     async fn vod_hls_segment_past_the_end_404s() {
-        let resp = memvod_hls_router(vec![0u8; 450], 1)
+        let resp = memvod_hls_router(vec![0u8; 1500], 3)
             .oneshot(
                 Request::get("/vod/memvod/x/seg/99.ts")
                     .body(Body::empty())
@@ -2115,15 +2177,107 @@ mod tests {
 
     struct PacedPacketProvider;
     struct PacedPacketSource {
-        marker: u8,
+        packet_index: u64,
     }
+    struct StalledProvider;
+    struct StalledSource;
+
+    #[async_trait]
+    impl TsSource for StalledSource {
+        async fn next(&mut self) -> Option<Bytes> {
+            std::future::pending().await
+        }
+
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+
+    #[async_trait]
+    impl StreamProvider for StalledProvider {
+        fn network(&self) -> &'static str {
+            "stalled"
+        }
+
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(StalledSource))
+        }
+    }
+
+    fn paced_psi(pid: u16, section: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0xff; 188];
+        packet[0] = 0x47;
+        packet[1] = 0x40 | ((pid >> 8) as u8 & 0x1f);
+        packet[2] = pid as u8;
+        packet[3] = 0x10;
+        packet[4] = 0;
+        packet[5..5 + section.len()].copy_from_slice(section);
+        packet
+    }
+
+    fn paced_pat(pmt_pid: u16) -> Vec<u8> {
+        let mut section = vec![0x00, 0xb0, 13, 0x00, 0x01, 0xc1, 0, 0];
+        section.extend_from_slice(&[
+            0x00,
+            0x01,
+            0xe0 | ((pmt_pid >> 8) as u8 & 0x1f),
+            pmt_pid as u8,
+        ]);
+        section.extend_from_slice(&[0; 4]);
+        paced_psi(0, &section)
+    }
+
+    fn paced_pmt(pmt_pid: u16, video_pid: u16) -> Vec<u8> {
+        let mut section = vec![0x02, 0xb0, 18, 0x00, 0x01, 0xc1, 0, 0];
+        section.extend_from_slice(&[
+            0xe0 | ((video_pid >> 8) as u8 & 0x1f),
+            video_pid as u8,
+            0xf0,
+            0,
+            0x1b,
+            0xe0 | ((video_pid >> 8) as u8 & 0x1f),
+            video_pid as u8,
+            0xf0,
+            0,
+        ]);
+        section.extend_from_slice(&[0; 4]);
+        paced_psi(pmt_pid, &section)
+    }
+
+    fn paced_video_access(video_pid: u16, pcr: u64, marker: u8) -> Vec<u8> {
+        let mut packet = vec![0xff; 188];
+        packet[0] = 0x47;
+        packet[1] = 0x40 | ((video_pid >> 8) as u8 & 0x1f);
+        packet[2] = video_pid as u8;
+        packet[3] = 0x30;
+        packet[4] = 7;
+        packet[5] = 0x50;
+        packet[6] = (pcr >> 25) as u8;
+        packet[7] = (pcr >> 17) as u8;
+        packet[8] = (pcr >> 9) as u8;
+        packet[9] = (pcr >> 1) as u8;
+        packet[10] = ((pcr & 1) << 7) as u8 | 0x7e;
+        packet[11] = 0;
+        packet[12] = marker;
+        packet
+    }
+
     #[async_trait]
     impl TsSource for PacedPacketSource {
         async fn next(&mut self) -> Option<Bytes> {
             tokio::time::sleep(Duration::from_millis(2)).await;
-            let mut packet = vec![self.marker; 188];
-            packet[0] = 0x47;
-            self.marker = self.marker.wrapping_add(1);
+            const PMT_PID: u16 = 0x0100;
+            const VIDEO_PID: u16 = 0x0101;
+            let packet = match self.packet_index {
+                0 => paced_pat(PMT_PID),
+                1 => paced_pmt(PMT_PID, VIDEO_PID),
+                index => paced_video_access(
+                    VIDEO_PID,
+                    (index - 2) * 108_000,
+                    index.wrapping_sub(2) as u8,
+                ),
+            };
+            self.packet_index += 1;
             Some(Bytes::from(packet))
         }
         fn stats(&self) -> SourceStats {
@@ -2139,7 +2293,7 @@ mod tests {
             "hlsfix"
         }
         async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
-            Ok(Box::new(PacedPacketSource { marker: 1 }))
+            Ok(Box::new(PacedPacketSource { packet_index: 0 }))
         }
     }
 
@@ -2151,7 +2305,7 @@ mod tests {
                 registry,
                 32,
                 crate::config::HlsConfig {
-                    segment_packets: 2,
+                    segment_packets: 3,
                     window_segments: 3,
                     segment_duration_ms: 1000,
                 },
@@ -2162,6 +2316,71 @@ mod tests {
             experimental_ace_compat: true,
             broadcasts: None,
         }
+    }
+
+    fn stalled_hls_state_with(ttl: Duration, capacity: usize) -> AppState {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(StalledProvider));
+        AppState {
+            manager: StreamManager::with_config(
+                registry,
+                32,
+                crate::config::HlsConfig {
+                    segment_packets: 3,
+                    window_segments: 3,
+                    segment_duration_ms: 1000,
+                },
+            ),
+            networks: vec!["stalled".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: Arc::new(AceSessionStore::new(ttl, capacity)),
+            experimental_ace_compat: true,
+            broadcasts: None,
+        }
+    }
+
+    fn stalled_hls_state() -> AppState {
+        stalled_hls_state_with(Duration::from_secs(60), 8)
+    }
+
+    async fn mint_stalled_hls(app: &Router, id: &str) -> (String, String, String) {
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::FOUND);
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878/ace/m/")
+            .unwrap();
+        let (playback_id, manifest) = playback.split_once('/').unwrap();
+        let token = manifest.strip_suffix(".m3u8").unwrap();
+        (
+            playback_id.to_string(),
+            manifest.to_string(),
+            format!("/ace/cmd/{playback_id}/{token}?method=stop"),
+        )
+    }
+
+    fn spawn_stalled_hls_request(
+        state: AppState,
+        playback_id: String,
+        manifest: String,
+    ) -> tokio::task::JoinHandle<Response> {
+        tokio::spawn(async move {
+            ace_hls_playback_with_timeout(
+                State(state),
+                Path((playback_id, manifest)),
+                Duration::from_secs(5),
+            )
+            .await
+        })
     }
 
     async fn response_bytes(response: Response) -> Bytes {
@@ -3035,6 +3254,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ace_hls_cold_playlist_200_contains_a_segment() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let app = router(ace_hls_state(Duration::from_secs(60), 8));
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+
+        let response = app
+            .oneshot(Request::get(playback).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = response_text(response).await;
+        assert!(body.lines().any(|line| !line.starts_with('#')));
+    }
+
+    #[tokio::test]
+    async fn ace_hls_stalled_playlist_returns_retryable_503() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = stalled_hls_state();
+        let app = router(state.clone());
+        let (playback_id, manifest, _) = mint_stalled_hls(&app, id).await;
+
+        let response = ace_hls_playback_with_timeout(
+            State(state),
+            Path((playback_id, manifest)),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[tokio::test]
+    async fn ace_hls_stop_cancels_a_stalled_playlist_wait_with_404() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = stalled_hls_state();
+        let app = router(state.clone());
+        let (playback_id, manifest, stop_path) = mint_stalled_hls(&app, id).await;
+        let request = spawn_stalled_hls_request(state, playback_id, manifest);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !request.is_finished(),
+            "playlist request must be waiting for readiness"
+        );
+
+        let stopped = app
+            .oneshot(Request::get(stop_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        let response = tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .expect("revocation must wake the playlist wait")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ace_hls_expiry_cancels_a_stalled_playlist_wait_with_404() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = stalled_hls_state_with(Duration::from_millis(40), 8);
+        let app = router(state.clone());
+        let (playback_id, manifest, _) = mint_stalled_hls(&app, id).await;
+        let request = spawn_stalled_hls_request(state, playback_id, manifest);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !request.is_finished(),
+            "playlist request must be waiting for readiness"
+        );
+
+        let response = tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .expect("expiry must wake the playlist wait")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ace_hls_capacity_eviction_cancels_a_stalled_playlist_wait_with_404() {
+        let first_id = "0123456789abcdef0123456789abcdef01234567";
+        let second_id = "1123456789abcdef0123456789abcdef01234567";
+        let state = stalled_hls_state_with(Duration::from_secs(60), 1);
+        let app = router(state.clone());
+        let (playback_id, manifest, _) = mint_stalled_hls(&app, first_id).await;
+        let request = spawn_stalled_hls_request(state, playback_id, manifest);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !request.is_finished(),
+            "playlist request must be waiting for readiness"
+        );
+
+        let _newer_lease = mint_stalled_hls(&app, second_id).await;
+        let response = tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .expect("capacity eviction must wake the playlist wait")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ace_hls_playlist_and_segment_reads_do_not_refresh_native_activity() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap()
+            .to_owned();
+        let initial_playlist = wait_for_hls_playlist(&app, &playback).await;
+        let segment_path = playlist_segment_path(&initial_playlist).to_owned();
+        let pkg = manager.get_hls("hlsfix", id).await.unwrap();
+        let stale = Instant::now() - Duration::from_secs(60);
+
+        pkg.set_last_access_for_test(stale);
+        let playlist = app
+            .clone()
+            .oneshot(Request::get(&playback).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(playlist.status(), StatusCode::OK);
+        assert_eq!(pkg.last_access_for_test(), Some(stale));
+
+        let segment = app
+            .clone()
+            .oneshot(Request::get(&segment_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(segment.status(), StatusCode::OK);
+        assert_eq!(pkg.last_access_for_test(), Some(stale));
+    }
+
+    #[tokio::test]
     async fn ace_manifest_json_returns_documented_hls_control_urls() {
         let id = "0123456789abcdef0123456789abcdef01234567";
         let app = router(ace_hls_state(Duration::from_secs(60), 8));
@@ -3601,10 +3982,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m3u8_serves_hls_playlist() {
-        let resp = router(state())
+    async fn m3u8_serves_hls_playlist_with_stream_title() {
+        let resp = router(fixture_state(0))
             .oneshot(
-                Request::get("/streams/test/chan.m3u8")
+                Request::get("/streams/fix/chan.m3u8")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3615,10 +3996,26 @@ mod tests {
             resp.headers()[header::CONTENT_TYPE],
             "application/vnd.apple.mpegurl"
         );
+        assert_eq!(resp.headers()["icy-name"], "Synthetic Demo Channel");
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).starts_with("#EXTM3U"));
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.starts_with("#EXTM3U"));
+        assert!(body.lines().any(|line| !line.starts_with('#')));
+    }
+
+    #[tokio::test]
+    async fn m3u8_stalled_playlist_returns_retryable_503() {
+        let response = stream_file_with_hls_timeout(
+            State(stalled_hls_state()),
+            Path(("stalled".to_string(), "chan.m3u8".to_string())),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
 
     #[tokio::test]

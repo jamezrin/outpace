@@ -114,6 +114,55 @@ impl TsResync {
     }
 }
 
+/// Tracks the MPEG-TS tables and video PID needed to identify a decodable access point.
+#[derive(Default)]
+pub struct VideoAccessPointState {
+    pmt_pid: Option<u16>,
+    video_pid: Option<u16>,
+    cached_pat: Option<Vec<u8>>,
+    cached_pmt: Option<Vec<u8>>,
+}
+
+impl VideoAccessPointState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn observe(&mut self, packet: &[u8]) -> bool {
+        if packet.len() != TS_PACKET_LEN || packet[0] != 0x47 {
+            return false;
+        }
+        let pid = ts_pid(packet);
+        if pid == 0 {
+            if let Some(pmt_pid) = parse_pat_pmt_pid(packet) {
+                self.cached_pat = Some(packet.to_vec());
+                if self.pmt_pid != Some(pmt_pid) {
+                    self.cached_pmt = None;
+                    self.video_pid = None;
+                }
+                self.pmt_pid = Some(pmt_pid);
+            }
+        } else if Some(pid) == self.pmt_pid {
+            if let Some(video_pid) = parse_pmt_video_pid(packet) {
+                self.cached_pmt = Some(packet.to_vec());
+                self.video_pid = Some(video_pid);
+            }
+        }
+        Some(pid) == self.video_pid && is_random_access_point(packet)
+    }
+
+    pub fn table_prefix(&self) -> Option<Vec<u8>> {
+        let mut prefix = Vec::with_capacity(TS_PACKET_LEN * 2);
+        prefix.extend_from_slice(self.cached_pat.as_ref()?);
+        prefix.extend_from_slice(self.cached_pmt.as_ref()?);
+        Some(prefix)
+    }
+}
+
 /// Per-client gate that drops a stream's opening packets until the first clean keyframe, so a
 /// player joining a live MPEG-TS mid-GOP starts on a decodable picture instead of garbage.
 ///
@@ -125,10 +174,7 @@ impl TsResync {
 pub struct KeyframeGate {
     buf: Vec<u8>,
     locked: bool,
-    pmt_pid: Option<u16>,
-    video_pid: Option<u16>,
-    cached_pat: Option<Vec<u8>>,
-    cached_pmt: Option<Vec<u8>>,
+    access: VideoAccessPointState,
     scanned: usize,
     max_scan_packets: usize,
 }
@@ -148,10 +194,7 @@ impl KeyframeGate {
         KeyframeGate {
             buf: Vec::new(),
             locked: false,
-            pmt_pid: None,
-            video_pid: None,
-            cached_pat: None,
-            cached_pmt: None,
+            access: VideoAccessPointState::new(),
             scanned: 0,
             max_scan_packets,
         }
@@ -170,25 +213,10 @@ impl KeyframeGate {
                 continue;
             }
             self.scanned += 1;
-            let pid = ts_pid(pkt);
-            if pid == 0 {
-                self.cached_pat = Some(pkt.to_vec());
-                if let Some(pp) = parse_pat_pmt_pid(pkt) {
-                    self.pmt_pid = Some(pp);
-                }
-            } else if Some(pid) == self.pmt_pid {
-                self.cached_pmt = Some(pkt.to_vec());
-                if let Some(vp) = parse_pmt_video_pid(pkt) {
-                    self.video_pid = Some(vp);
-                }
-            }
-            if Some(pid) == self.video_pid && is_random_access_point(pkt) {
+            if self.access.observe(pkt) {
                 // Lock on the keyframe: hand the player the tables, then the keyframe.
-                if let Some(p) = &self.cached_pat {
-                    out.extend_from_slice(p);
-                }
-                if let Some(p) = &self.cached_pmt {
-                    out.extend_from_slice(p);
+                if let Some(prefix) = self.access.table_prefix() {
+                    out.extend_from_slice(&prefix);
                 }
                 out.extend_from_slice(pkt);
                 self.locked = true;
@@ -407,6 +435,86 @@ mod tests {
     const PMT_PID: u16 = 0x0100;
     const VIDEO_PID: u16 = 0x0101;
     const AUDIO_PID: u16 = 0x0102;
+
+    fn random_access_packet(pid: u16) -> Vec<u8> {
+        ts(pid, true, true, &[])
+    }
+
+    #[test]
+    fn video_access_point_state_uses_pmt_video_pid_and_caches_tables() {
+        let mut state = VideoAccessPointState::new();
+        let pat = pat(PMT_PID);
+        let pmt = pmt(PMT_PID, VIDEO_PID);
+        assert!(!state.observe(&pat));
+        assert!(!state.observe(&pmt));
+        assert!(!state.observe(&random_access_packet(AUDIO_PID)));
+        assert!(state.observe(&random_access_packet(VIDEO_PID)));
+        assert_eq!(state.table_prefix().unwrap(), [pat, pmt].concat());
+    }
+
+    #[test]
+    fn video_access_point_state_reset_requires_fresh_tables() {
+        let mut state = VideoAccessPointState::new();
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+        state.reset();
+        assert!(!state.observe(&random_access_packet(VIDEO_PID)));
+        assert!(state.table_prefix().is_none());
+    }
+
+    #[test]
+    fn video_access_point_state_ignores_malformed_pat_without_corrupting_valid_state() {
+        let mut state = VideoAccessPointState::new();
+        let valid_pat = pat(PMT_PID);
+        let valid_pmt = pmt(PMT_PID, VIDEO_PID);
+        state.observe(&valid_pat);
+        state.observe(&valid_pmt);
+        let expected_prefix = [valid_pat, valid_pmt].concat();
+
+        let mut malformed_pat = pat(PMT_PID);
+        malformed_pat[5] = 0xff;
+        assert!(!state.observe(&malformed_pat));
+        assert_eq!(state.table_prefix().unwrap(), expected_prefix);
+        assert!(state.observe(&random_access_packet(VIDEO_PID)));
+    }
+
+    #[test]
+    fn video_access_point_state_ignores_malformed_pmt_without_corrupting_valid_state() {
+        let mut state = VideoAccessPointState::new();
+        let valid_pat = pat(PMT_PID);
+        let valid_pmt = pmt(PMT_PID, VIDEO_PID);
+        state.observe(&valid_pat);
+        state.observe(&valid_pmt);
+        let expected_prefix = [valid_pat, valid_pmt].concat();
+
+        let mut malformed_pmt = pmt(PMT_PID, VIDEO_PID);
+        malformed_pmt[5] = 0xff;
+        assert!(!state.observe(&malformed_pmt));
+        assert_eq!(state.table_prefix().unwrap(), expected_prefix);
+        assert!(state.observe(&random_access_packet(VIDEO_PID)));
+    }
+
+    #[test]
+    fn video_access_point_state_invalidates_dependent_state_when_pat_remaps_pmt() {
+        const NEW_PMT_PID: u16 = 0x0200;
+        const NEW_VIDEO_PID: u16 = 0x0201;
+
+        let mut state = VideoAccessPointState::new();
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+
+        assert!(!state.observe(&pat(NEW_PMT_PID)));
+        assert!(state.table_prefix().is_none());
+        assert!(!state.observe(&random_access_packet(VIDEO_PID)));
+
+        let new_pmt = pmt(NEW_PMT_PID, NEW_VIDEO_PID);
+        assert!(!state.observe(&new_pmt));
+        assert!(state.observe(&random_access_packet(NEW_VIDEO_PID)));
+        assert_eq!(
+            state.table_prefix().unwrap(),
+            [pat(NEW_PMT_PID), new_pmt].concat()
+        );
+    }
 
     #[test]
     fn gate_drops_mid_gop_prefix_and_prepends_tables() {

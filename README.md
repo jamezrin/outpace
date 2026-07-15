@@ -239,9 +239,10 @@ Environment variables parsed by the daemon include:
   max `16384`.
 - `OUTPACE_MAX_REASM_PIECES_AHEAD` - max pieces accepted ahead of the emit cursor, default `512`;
   must be at least `OUTPACE_MAX_PIECE_ADVANCE`, max `65536`.
-- `OUTPACE_HLS_SEGMENT_PACKETS` - MPEG-TS packets per HLS segment, default `256`.
+- `OUTPACE_HLS_SEGMENT_PACKETS` - hard MPEG-TS packet ceiling per HLS segment and packet-count
+  fallback for streams without usable PCR, default `16384` (about 3.1 MB).
 - `OUTPACE_HLS_WINDOW_SEGMENTS` - retained HLS live window size, default `6`.
-- `OUTPACE_HLS_SEGMENT_DURATION_MS` - advertised HLS segment duration, default `1000`.
+- `OUTPACE_HLS_SEGMENT_DURATION_MS` - requested PCR-timed HLS segment duration, default `1000`.
 - `OUTPACE_MAX_UNCHOKED` - max simultaneously-unchoked peers per served stream (default 8). Wired
   into the inbound serve path via the per-infohash serve coordinator: each stream unchokes up to
   this many interested peers plus one rotating optimistic slot (rotated on a ~10s rechoke tick).
