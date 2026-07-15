@@ -158,11 +158,6 @@ impl HlsPackager {
             let mut timing = ts_timing(&packet);
             let is_access_point = st.access.observe(&packet);
 
-            if st.filter_sdt && ts_pid(&packet) == SDT_PID {
-                st.cur.drain(packet_offset..packet_offset + TS_PACKET);
-                continue; // scanned_packets unchanged: the next packet slides into this offset
-            }
-
             if timing.discontinuity {
                 st.access.reset();
                 st.cur.drain(..packet_offset + TS_PACKET);
@@ -173,6 +168,14 @@ impl HlsPackager {
                 st.discontinuity_pending = true;
                 st.awaiting_access_point = true;
                 continue;
+            }
+
+            // Drop a titled stream's upstream SDT before it becomes segment content, but only
+            // after the discontinuity check above: `ts_timing` flags discontinuity PID-agnostically,
+            // so a discontinuity-marked SDT must take the reset path, not be silently filtered.
+            if st.filter_sdt && ts_pid(&packet) == SDT_PID {
+                st.cur.drain(packet_offset..packet_offset + TS_PACKET);
+                continue; // scanned_packets unchanged: the next packet slides into this offset
             }
 
             if st.awaiting_access_point {
@@ -258,10 +261,6 @@ impl HlsPackager {
         let mut timing = ts_timing(packet);
         let is_access_point = st.access.observe(packet);
 
-        if st.filter_sdt && ts_pid(packet) == SDT_PID {
-            return;
-        }
-
         if timing.discontinuity {
             st.access.reset();
             self.discard_incomplete_run(st);
@@ -279,6 +278,13 @@ impl HlsPackager {
         if pcr_went_backwards(st.last_pcr, timing.pcr) {
             st.access.reset();
             self.discard_incomplete_run(st);
+            return;
+        }
+
+        // Drop a titled stream's upstream SDT lookahead packet only after the discontinuity and
+        // PCR-regression safety checks above (both PID-agnostic), so a flagged SDT still forces a
+        // reset. `feed` already zeroed `lookahead_len`, so returning here refills cleanly.
+        if st.filter_sdt && ts_pid(packet) == SDT_PID {
             return;
         }
 
@@ -498,7 +504,7 @@ struct TsTiming {
 /// A packet's PID, independent of `ts_timing`'s adaptation-field gate. `ts_timing` returns a
 /// zeroed default (including `pid: 0`) for payload-only packets -- the common shape for PSI
 /// sections such as SDT -- so it cannot be used to identify the SDT PID for filtering.
-fn ts_pid(packet: &[u8; TS_PACKET]) -> u16 {
+fn ts_pid(packet: &[u8]) -> u16 {
     (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16
 }
 
@@ -506,7 +512,7 @@ fn ts_timing(packet: &[u8]) -> TsTiming {
     if packet.len() != TS_PACKET || packet[0] != 0x47 || packet[3] & 0x20 == 0 {
         return TsTiming::default();
     }
-    let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
+    let pid = ts_pid(packet);
     let adaptation_len = packet[4] as usize;
     if adaptation_len == 0 || adaptation_len > 183 {
         return TsTiming::default();
@@ -1459,6 +1465,45 @@ mod tests {
         // The injected SDT carries the title.
         assert_eq!(read_sdt_service_name(&seg).as_deref(), Some("HLS Title"));
         // Exactly one SDT-PID packet in the segment: ours. The upstream one was dropped.
+        let sdt_packets = seg
+            .chunks(TS_PACKET)
+            .filter(|c| {
+                c.len() == TS_PACKET && ((((c[1] & 0x1f) as u16) << 8) | c[2] as u16) == 0x0011
+            })
+            .count();
+        assert_eq!(sdt_packets, 1);
+    }
+
+    #[test]
+    fn ceiling_lookahead_drops_upstream_sdt_on_titled_stream() {
+        use ace_media::mpegts::read_sdt_service_name;
+        // segment_packets: 4 -> the titled prefix [PAT][PMT][SDT] plus the opening keyframe fill
+        // the ceiling exactly, so subsequent packets are classified by `scan_lookahead`. An
+        // upstream SDT that reaches the lookahead must be dropped there: without the filter it
+        // would discard the whole ceiling-full run (an SDT is not a keyframe and carries no PCR),
+        // and segment 0 would never emit.
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 4,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+            },
+            Some("Ceiling Title".to_string()),
+        );
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0)); // fills ceiling with [PAT][PMT][SDT][keyframe]
+        p.feed(&with_pid(packets(1), 0x0011)); // upstream SDT -> arrives in lookahead, filtered
+        p.feed(&video_access_packet(VIDEO_PID, 108_000)); // 1.2s elapsed -> emits ceiling segment
+        let seg = p
+            .segment(0)
+            .expect("the ceiling-full segment emits, not discarded by the upstream SDT");
+        assert_eq!(seg.len(), 4 * TS_PACKET);
+        // The injected SDT carries the title, and it is the only SDT-PID packet in the segment.
+        assert_eq!(
+            read_sdt_service_name(&seg).as_deref(),
+            Some("Ceiling Title")
+        );
         let sdt_packets = seg
             .chunks(TS_PACKET)
             .filter(|c| {
