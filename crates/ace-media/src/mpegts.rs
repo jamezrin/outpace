@@ -134,6 +134,8 @@ pub struct VideoAccessPointState {
     video_codec: Option<VideoCodec>,
     cached_pat: Option<Vec<u8>>,
     cached_pmt: Option<Vec<u8>>,
+    service_name: Option<String>,
+    program_number: Option<u16>,
 }
 
 impl VideoAccessPointState {
@@ -141,8 +143,26 @@ impl VideoAccessPointState {
         Self::default()
     }
 
+    /// Like [`new`](Self::new) but injects a synthesized SDT `service_name` into every
+    /// [`table_prefix`](Self::table_prefix). `raw` is sanitized/bounded here; a title that
+    /// sanitizes to empty leaves the state untitled.
+    pub fn with_service_name(raw: Option<String>) -> Self {
+        Self {
+            service_name: raw.as_deref().and_then(sanitize_service_name),
+            ..Self::default()
+        }
+    }
+
+    pub fn has_service_name(&self) -> bool {
+        self.service_name.is_some()
+    }
+
     pub fn reset(&mut self) {
-        *self = Self::default();
+        let name = self.service_name.take();
+        *self = Self {
+            service_name: name,
+            ..Self::default()
+        };
     }
 
     pub fn observe(&mut self, packet: &[u8]) -> bool {
@@ -151,8 +171,9 @@ impl VideoAccessPointState {
         }
         let pid = ts_pid(packet);
         if pid == 0 {
-            if let Some(pmt_pid) = parse_pat_pmt_pid(packet) {
+            if let Some((program, pmt_pid)) = parse_pat_first_program(packet) {
                 self.cached_pat = Some(packet.to_vec());
+                self.program_number = Some(program);
                 if self.pmt_pid != Some(pmt_pid) {
                     self.cached_pmt = None;
                     self.video_pid = None;
@@ -171,9 +192,12 @@ impl VideoAccessPointState {
     }
 
     pub fn table_prefix(&self) -> Option<Vec<u8>> {
-        let mut prefix = Vec::with_capacity(TS_PACKET_LEN * 2);
+        let mut prefix = Vec::with_capacity(TS_PACKET_LEN * 3);
         prefix.extend_from_slice(self.cached_pat.as_ref()?);
         prefix.extend_from_slice(self.cached_pmt.as_ref()?);
+        if let (Some(name), Some(program)) = (self.service_name.as_deref(), self.program_number) {
+            prefix.extend_from_slice(&build_sdt(program, name));
+        }
         Some(prefix)
     }
 }
@@ -313,8 +337,8 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     })
 }
 
-/// Parse a PAT packet, returning the PMT PID of the first real program.
-fn parse_pat_pmt_pid(pkt: &[u8]) -> Option<u16> {
+/// Parse a PAT packet, returning `(program_number, pmt_pid)` of the first real program.
+fn parse_pat_first_program(pkt: &[u8]) -> Option<(u16, u16)> {
     let sec = psi_section_start(pkt)?;
     if *pkt.get(sec)? != 0x00 {
         return None; // table_id must be PAT
@@ -328,7 +352,7 @@ fn parse_pat_pmt_pid(pkt: &[u8]) -> Option<u16> {
         let program = ((pkt[pos] as u16) << 8) | pkt[pos + 1] as u16;
         let pid = (((pkt[pos + 2] & 0x1F) as u16) << 8) | pkt[pos + 3] as u16;
         if program != 0 {
-            return Some(pid);
+            return Some((program, pid));
         }
         pos += 4;
     }
@@ -1017,6 +1041,44 @@ mod tests {
         assert!(name.chars().all(|c| c == 'é'));
         // Proves the cap keeps the SDT within a single TS packet.
         assert_eq!(build_sdt(1, &name).len(), TS_PACKET_LEN);
+    }
+
+    #[test]
+    fn table_prefix_appends_sdt_with_pat_program_number_when_titled() {
+        // PMT program_number is 1 (see the `pat`/`pmt` helpers).
+        let mut state = VideoAccessPointState::with_service_name(Some("My Channel".to_string()));
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+        let prefix = state.table_prefix().unwrap();
+        // PAT + PMT + one SDT packet.
+        assert_eq!(prefix.len(), TS_PACKET_LEN * 3);
+        assert_eq!(
+            read_sdt_service_name(&prefix).as_deref(),
+            Some("My Channel")
+        );
+    }
+
+    #[test]
+    fn table_prefix_omits_sdt_when_untitled() {
+        let mut state = VideoAccessPointState::new();
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+        let prefix = state.table_prefix().unwrap();
+        assert_eq!(prefix.len(), TS_PACKET_LEN * 2);
+        assert!(read_sdt_service_name(&prefix).is_none());
+    }
+
+    #[test]
+    fn reset_preserves_service_name() {
+        let mut state = VideoAccessPointState::with_service_name(Some("Keep Me".to_string()));
+        state.reset();
+        assert!(state.has_service_name());
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+        assert_eq!(
+            read_sdt_service_name(&state.table_prefix().unwrap()).as_deref(),
+            Some("Keep Me")
+        );
     }
 
     #[test]
