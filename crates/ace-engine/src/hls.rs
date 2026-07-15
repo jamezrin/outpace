@@ -277,7 +277,14 @@ impl HlsPackager {
             _ => None,
         };
 
-        if elapsed.is_some_and(|duration| duration >= self.seg_duration) && is_access_point {
+        // Once a full target duration has elapsed, emit the ceiling-full segment even if this
+        // boundary packet is not a keyframe. On a peaky or long-GOP stream (e.g. 2160p HEVC in a
+        // high-motion scene) the next keyframe can land just past the byte ceiling; discarding
+        // the run there would stall the playlist. Emitting keeps playback advancing. A run forced
+        // out this way does not end on a keyframe, so the continuation segment starts mid-GOP --
+        // seamless for sequential live playback, with the next keyframe re-aligning boundaries.
+        // It is not a transport discontinuity, so no #EXT-X-DISCONTINUITY is emitted.
+        if elapsed.is_some_and(|duration| duration >= self.seg_duration) {
             let duration = elapsed.unwrap_or(self.seg_duration);
             let boundary_pcr = st.last_pcr;
             let boundary_pcr_pid = st.pcr_pid;
@@ -285,7 +292,7 @@ impl HlsPackager {
             let prefix = st
                 .access
                 .table_prefix()
-                .expect("an observed video access point has PAT/PMT state");
+                .expect("an accumulated run past the ceiling has cached PAT/PMT state");
             self.seed_clean_run(st, &prefix, packet, timing);
             st.segment_start_pcr = boundary_pcr;
             st.last_pcr = boundary_pcr;
@@ -837,6 +844,37 @@ mod tests {
             .segments
             .iter()
             .all(|segment| segment.bytes.len() <= p.max_segment_bytes));
+    }
+
+    #[test]
+    fn hard_ceiling_emits_oversized_segment_instead_of_stalling_on_peaky_gop() {
+        // A peaky / long-GOP stream can fill the byte ceiling after a full target duration has
+        // elapsed but before the next keyframe arrives. Discarding the run there stalls the
+        // playlist (the #137 4K-HEVC bug); instead the packager emits the ceiling-full segment
+        // and continues. The forced cut is not a transport discontinuity, so no
+        // #EXT-X-DISCONTINUITY is introduced.
+        let p = HlsPackager::new(HlsConfig {
+            segment_packets: 5,
+            window_segments: 4,
+            segment_duration_ms: 100,
+        });
+        let pat = pat(PMT_PID);
+        let pmt = pmt(PMT_PID, VIDEO_PID);
+        p.feed(&pat);
+        p.feed(&pmt);
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&pcr_packet(VIDEO_PID, 45_000, false, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 90_000, false, false, 2));
+        // Ceiling is full; this packet arrives past the target duration with no keyframe.
+        p.feed(&pcr_packet(VIDEO_PID, 135_000, false, false, 3));
+
+        let segment = p
+            .segment(0)
+            .expect("ceiling-full segment is emitted, not discarded");
+        assert_eq!(segment.len(), 5 * TS_PACKET);
+        assert_eq!(&segment[..TS_PACKET], &pat);
+        assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], &pmt);
+        assert!(!p.playlist("test", "peaky").contains("#EXT-X-DISCONTINUITY"));
     }
 
     #[test]

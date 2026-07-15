@@ -144,7 +144,13 @@ pub struct HlsConfig {
 impl Default for HlsConfig {
     fn default() -> Self {
         Self {
-            segment_packets: 16_384,
+            // ~12.3 MB per segment. The ceiling is a memory-safety bound, not the primary cut
+            // mechanism (segments normally cut on a keyframe once the target duration elapses).
+            // It must comfortably hold one target-duration segment of a peaky high-bitrate
+            // stream -- e.g. 2160p HEVC in a high-motion scene can burst well past its ~3 MB
+            // average -- so a keyframe-aligned cut lands before the ceiling in the common case.
+            // Worst-case retained memory is bounded at (window + 1) * this (~86 MB here).
+            segment_packets: 65_536,
             window_segments: 6,
             segment_duration_ms: 1000,
         }
