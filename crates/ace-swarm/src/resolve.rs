@@ -555,9 +555,18 @@ fn is_safe_ip(ip: &IpAddr) -> bool {
 /// controlled self-hosted or test swarms on a private network, and mirrors
 /// [`crate::discover::TrackerPolicy`]'s `OUTPACE_TRACKER_ALLOW_NON_GLOBAL`.
 fn allow_non_global_transport() -> bool {
-    std::env::var("OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    allow_non_global_transport_value(
+        std::env::var("OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT` value: only `Some("1")` allows;
+/// anything else (including unset, `"0"`, or `"true"`) denies. Mirrors
+/// [`crate::discover::TrackerPolicy::from_env_value`].
+fn allow_non_global_transport_value(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 /// Whether `ip` is a private/LAN/loopback address — the *only* extra targets the
@@ -696,6 +705,18 @@ pub async fn transport_bytes_from_url(url: &str) -> Result<Vec<u8>, ResolveError
 mod tests {
     use super::*;
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+
+    #[test]
+    fn transport_non_global_env_value_parses_to_deny_unless_exactly_one() {
+        // Pure parse, no env mutation. Mirrors TrackerPolicy::from_env_value (#118): only the
+        // exact value "1" opts in. Note this is stricter than the daemon's general boolean gates
+        // (which also accept "true") -- "true" here denies, matching the sibling tracker knob.
+        assert!(!allow_non_global_transport_value(None));
+        assert!(!allow_non_global_transport_value(Some("0")));
+        assert!(!allow_non_global_transport_value(Some("true")));
+        assert!(!allow_non_global_transport_value(Some("")));
+        assert!(allow_non_global_transport_value(Some("1")));
+    }
 
     fn vod_transport(pieces_bytes: usize, length: Option<i64>, multifile: bool) -> Vec<u8> {
         use ace_wire::bencode::Bencode;

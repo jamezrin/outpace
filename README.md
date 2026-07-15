@@ -277,6 +277,20 @@ Environment variables parsed by the daemon include:
   about, since outpace itself never announces there. Use this to point a broadcast at a
   private/local tracker (announcing to a private-address tracker also requires the non-global
   tracker allowance, tracked separately).
+- `OUTPACE_TRACKER_ALLOW_NON_GLOBAL` - set to `1` to allow announcing to trackers that resolve
+  to non-globally-routable addresses (private/LAN/loopback/link-local/multicast). Default deny;
+  the SSRF guard on tracker destinations stays closed for normal use. Opt in only for controlled
+  self-hosted or offline/test swarms on a trusted network. Scoped to tracker traffic.
+- `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT` - set to `1` to allow fetching a transport descriptor
+  file from a private/LAN/loopback host. Default deny; this relaxes the SSRF guard on the
+  transport-file fetch **specifically** (not peer or tracker traffic), and even when enabled it
+  still blocks link-local (e.g. the `169.254.169.254` cloud-metadata endpoint), unspecified,
+  multicast, broadcast, and documentation ranges. Opt in only for controlled self-hosted / LAN
+  swarms. If that transport file also points at a private *tracker*, announcing to it
+  additionally needs `OUTPACE_TRACKER_ALLOW_NON_GLOBAL`.
+
+These two `*_ALLOW_NON_GLOBAL*` knobs enable on the exact string `1` only (unlike the general
+boolean gates below, `true` does **not** enable them).
 
 Boolean gates accept exactly `1`, `true`, `0`, or `false`; other values are configuration errors
 rather than silently disabling a feature.
