@@ -119,6 +119,7 @@ impl TsResync {
 pub struct VideoAccessPointState {
     pmt_pid: Option<u16>,
     video_pid: Option<u16>,
+    video_codec: Option<VideoCodec>,
     cached_pat: Option<Vec<u8>>,
     cached_pmt: Option<Vec<u8>>,
 }
@@ -143,16 +144,18 @@ impl VideoAccessPointState {
                 if self.pmt_pid != Some(pmt_pid) {
                     self.cached_pmt = None;
                     self.video_pid = None;
+                    self.video_codec = None;
                 }
                 self.pmt_pid = Some(pmt_pid);
             }
         } else if Some(pid) == self.pmt_pid {
-            if let Some(video_pid) = parse_pmt_video_pid(packet) {
+            if let Some((video_pid, codec)) = parse_pmt_video(packet) {
                 self.cached_pmt = Some(packet.to_vec());
                 self.video_pid = Some(video_pid);
+                self.video_codec = Some(codec);
             }
         }
-        Some(pid) == self.video_pid && is_random_access_point(packet)
+        Some(pid) == self.video_pid && is_random_access_point(packet, self.video_codec)
     }
 
     pub fn table_prefix(&self) -> Option<Vec<u8>> {
@@ -257,11 +260,11 @@ fn ts_payload_offset(pkt: &[u8]) -> Option<usize> {
 /// A random-access point: the start of a video access unit (PUSI) that is also a keyframe —
 /// flagged either by the adaptation field's random_access_indicator or by an H.264 IDR/SPS
 /// NAL in the payload (belt-and-suspenders across encoders).
-fn is_random_access_point(pkt: &[u8]) -> bool {
+fn is_random_access_point(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     if !ts_pusi(pkt) {
         return false;
     }
-    ts_random_access_indicator(pkt) || payload_has_idr_or_sps(pkt)
+    ts_random_access_indicator(pkt) || payload_has_irap(pkt, codec)
 }
 
 fn ts_random_access_indicator(pkt: &[u8]) -> bool {
@@ -273,15 +276,29 @@ fn ts_random_access_indicator(pkt: &[u8]) -> bool {
     af_len >= 1 && pkt[5] & 0x40 != 0
 }
 
-/// Scan the packet payload for an Annex-B start code `00 00 01` followed by an H.264 NAL whose
-/// type is IDR (5) or SPS (7).
-fn payload_has_idr_or_sps(pkt: &[u8]) -> bool {
+/// Scan the packet payload for an Annex-B start code `00 00 01` followed by a keyframe NAL for
+/// the stream's `codec`: H.264 IDR (5) / SPS (7), or HEVC IRAP (16..=21) / VPS/SPS/PPS (32..=34).
+/// The scan is codec-gated because the two codecs read the NAL-type bits differently (H.264 uses
+/// `byte & 0x1F`, HEVC uses `(byte >> 1) & 0x3F`), so an H.264 slice type would otherwise be
+/// misread as an HEVC parameter set (and vice versa). Without a resolved codec, returns false and
+/// leaves keyframe detection to the codec-agnostic random_access_indicator.
+fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
+    let Some(codec) = codec else {
+        return false;
+    };
     let Some(off) = ts_payload_offset(pkt) else {
         return false;
     };
     let p = &pkt[off..];
-    p.windows(4)
-        .any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && matches!(w[3] & 0x1F, 5 | 7))
+    p.windows(4).any(|w| {
+        if w[0] != 0 || w[1] != 0 || w[2] != 1 {
+            return false;
+        }
+        match codec {
+            VideoCodec::H264 => matches!(w[3] & 0x1F, 5 | 7),
+            VideoCodec::Hevc => matches!((w[3] >> 1) & 0x3F, 16..=21 | 32..=34),
+        }
+    })
 }
 
 /// Parse a PAT packet, returning the PMT PID of the first real program.
@@ -306,8 +323,17 @@ fn parse_pat_pmt_pid(pkt: &[u8]) -> Option<u16> {
     None
 }
 
-/// Parse a PMT packet, returning the elementary PID of the first H.264 video stream.
-fn parse_pmt_video_pid(pkt: &[u8]) -> Option<u16> {
+/// Elementary-stream video codec, as identified from the PMT `stream_type`. Determines which
+/// Annex-B NAL layout [`payload_has_irap`] scans for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VideoCodec {
+    H264,
+    Hevc,
+}
+
+/// Parse a PMT packet, returning the elementary PID and codec of the first recognized video
+/// stream: H.264 (`stream_type 0x1B`) or HEVC (`0x24`).
+fn parse_pmt_video(pkt: &[u8]) -> Option<(u16, VideoCodec)> {
     let sec = psi_section_start(pkt)?;
     if *pkt.get(sec)? != 0x02 {
         return None; // table_id must be PMT
@@ -323,8 +349,10 @@ fn parse_pmt_video_pid(pkt: &[u8]) -> Option<u16> {
         let stream_type = pkt[pos];
         let epid = (((pkt[pos + 1] & 0x1F) as u16) << 8) | pkt[pos + 2] as u16;
         let es_info_length = ((pkt[pos + 3] & 0x0F) as usize) << 8 | pkt[pos + 4] as usize;
-        if stream_type == 0x1B {
-            return Some(epid); // H.264
+        match stream_type {
+            0x1B => return Some((epid, VideoCodec::H264)),
+            0x24 => return Some((epid, VideoCodec::Hevc)),
+            _ => {}
         }
         pos += 5 + es_info_length;
     }
@@ -403,6 +431,11 @@ mod tests {
 
     /// Minimal PMT declaring one H.264 video elementary stream on `video_pid`.
     fn pmt(pmt_pid: u16, video_pid: u16) -> Vec<u8> {
+        pmt_codec(pmt_pid, video_pid, 0x1B) // H.264
+    }
+
+    /// PMT declaring one video elementary stream of `stream_type` on `video_pid`.
+    fn pmt_codec(pmt_pid: u16, video_pid: u16, stream_type: u8) -> Vec<u8> {
         // after table_id: prog#(2)+flags(1)+sec#(1)+last#(1)+pcrpid(2)+pinfolen(2)+stream(5)+crc(4)
         let section_length = 5 + 4 + 5 + 4;
         let mut s = vec![0x02u8]; // table_id = PMT
@@ -417,7 +450,7 @@ mod tests {
             (video_pid & 0xFF) as u8,
         ]); // PCR_PID = video
         s.extend_from_slice(&[0xF0, 0x00]); // program_info_length = 0
-        s.push(0x1B); // stream_type = H.264
+        s.push(stream_type);
         s.extend_from_slice(&[
             0xE0 | ((video_pid >> 8) as u8 & 0x1F),
             (video_pid & 0xFF) as u8,
@@ -586,6 +619,45 @@ mod tests {
         g.push(&pmt(PMT_PID, VIDEO_PID));
         // PES start (PUSI) but only a non-IDR slice NAL (type 1) and no RAI.
         let pes = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x61];
+        assert!(g.push(&ts(VIDEO_PID, true, false, &pes)).is_empty());
+    }
+
+    #[test]
+    fn video_access_point_state_resolves_hevc_stream_type() {
+        // HEVC (stream_type 0x24) must resolve the video PID so the codec-agnostic
+        // random_access_indicator path can flag keyframes (broadcast HEVC sets RAI).
+        let mut state = VideoAccessPointState::new();
+        assert!(!state.observe(&pat(PMT_PID)));
+        assert!(!state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x24)));
+        assert!(!state.observe(&random_access_packet(AUDIO_PID)));
+        assert!(
+            state.observe(&random_access_packet(VIDEO_PID)),
+            "a RAI packet on the HEVC video PID is a random-access point"
+        );
+    }
+
+    #[test]
+    fn gate_detects_hevc_irap_nal_when_rai_is_not_set() {
+        let mut g = KeyframeGate::new();
+        g.push(&pat(PMT_PID));
+        g.push(&pmt_codec(PMT_PID, VIDEO_PID, 0x24));
+        // HEVC video. Keyframe flagged only by an IDR_W_RADL NAL (type 19), no RAI bit.
+        // HEVC NAL header: byte0 = type << 1 = 19 << 1 = 0x26, byte1 = 0x01 (layer 0, tid 1).
+        let pes = [
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x26, 0x01,
+        ];
+        let out = g.push(&ts(VIDEO_PID, true, false, &pes));
+        assert_eq!(packet_count(&out), 3, "HEVC IRAP NAL should lock the gate");
+    }
+
+    #[test]
+    fn gate_does_not_treat_h264_pslice_as_hevc_irap() {
+        // Guards the codec-gating: NAL byte 0x41 is an H.264 P-slice (type 1), but under HEVC's
+        // (byte >> 1) & 0x3F it reads as 32 (VPS). An H.264 stream must not be mis-detected.
+        let mut g = KeyframeGate::new();
+        g.push(&pat(PMT_PID));
+        g.push(&pmt(PMT_PID, VIDEO_PID)); // H.264
+        let pes = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x41];
         assert!(g.push(&ts(VIDEO_PID, true, false, &pes)).is_empty());
     }
 
