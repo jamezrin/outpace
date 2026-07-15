@@ -445,6 +445,21 @@ fn build_sdt(service_id: u16, service_name: &str) -> [u8; TS_PACKET_LEN] {
     pkt
 }
 
+/// Turn a raw title into an SDT `service_name`: trim, strip control characters, and byte-cap on a
+/// UTF-8 boundary so the whole SDT section fits one TS packet. Returns `None` if nothing remains.
+fn sanitize_service_name(raw: &str) -> Option<String> {
+    let stripped: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
+    let stripped = stripped.trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    let mut end = stripped.len().min(MAX_SERVICE_NAME_BYTES);
+    while !stripped.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(stripped[..end].to_string())
+}
+
 /// Read the first SDT `service_name` from a run of 188-aligned TS packets, if present.
 pub fn read_sdt_service_name(ts: &[u8]) -> Option<String> {
     for pkt in ts.chunks_exact(TS_PACKET_LEN) {
@@ -973,6 +988,30 @@ mod tests {
         let stored = u32::from_be_bytes(pkt[crc_at..crc_at + 4].try_into().unwrap());
         assert_eq!(computed, stored);
         assert_eq!(read_sdt_service_name(&pkt).as_deref(), Some("EUROSPORT 1"));
+    }
+
+    #[test]
+    fn sanitize_service_name_strips_control_chars_and_trims() {
+        assert_eq!(
+            sanitize_service_name("  Synthetic Demo\r\n\0 Channel  ").as_deref(),
+            Some("Synthetic Demo Channel")
+        );
+    }
+
+    #[test]
+    fn sanitize_service_name_rejects_empty_and_whitespace() {
+        assert_eq!(sanitize_service_name(""), None);
+        assert_eq!(sanitize_service_name(" \r\n\t "), None);
+    }
+
+    #[test]
+    fn sanitize_service_name_byte_caps_on_char_boundary() {
+        // Multibyte chars must never be split, and the result must fit build_sdt (one packet).
+        let name = sanitize_service_name(&"é".repeat(200)).unwrap();
+        assert!(name.len() <= MAX_SERVICE_NAME_BYTES);
+        assert!(name.chars().all(|c| c == 'é'));
+        // Proves the cap keeps the SDT within a single TS packet.
+        assert_eq!(build_sdt(1, &name).len(), TS_PACKET_LEN);
     }
 
     #[test]
