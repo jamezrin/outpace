@@ -216,6 +216,7 @@ pub struct KeyframeGate {
     access: VideoAccessPointState,
     scanned: usize,
     max_scan_packets: usize,
+    filter_sdt: bool,
 }
 
 /// Default packet budget before the gate gives up looking for a keyframe and passes through.
@@ -236,7 +237,33 @@ impl KeyframeGate {
             access: VideoAccessPointState::new(),
             scanned: 0,
             max_scan_packets,
+            filter_sdt: false,
         }
+    }
+
+    /// Like [`new`](Self::new) but injects a synthesized SDT `service_name` at keyframe lock and
+    /// drops upstream SDT (PID 0x0011) packets from the post-lock passthrough, so the injected
+    /// title is the only SDT the client sees.
+    pub fn with_service_name(raw: Option<String>) -> Self {
+        let access = VideoAccessPointState::with_service_name(raw);
+        let filter_sdt = access.has_service_name();
+        KeyframeGate {
+            buf: Vec::new(),
+            locked: false,
+            access,
+            scanned: 0,
+            max_scan_packets: DEFAULT_MAX_SCAN_PACKETS,
+            filter_sdt,
+        }
+    }
+
+    /// Re-arm the gate (drop its buffer and re-require a keyframe) while preserving its
+    /// configured title, so a mid-stream reset keeps injecting/filtering the SDT.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.locked = false;
+        self.scanned = 0;
+        self.access.reset();
     }
 
     /// Append `data` (assumed 188-aligned TS) and return the bytes to forward to the client.
@@ -247,6 +274,10 @@ impl KeyframeGate {
         while i + TS_PACKET_LEN <= self.buf.len() {
             let pkt = &self.buf[i..i + TS_PACKET_LEN];
             if self.locked {
+                if self.filter_sdt && ts_pid(pkt) == SDT_PID {
+                    i += TS_PACKET_LEN;
+                    continue;
+                }
                 out.extend_from_slice(pkt);
                 i += TS_PACKET_LEN;
                 continue;
@@ -891,6 +922,40 @@ mod tests {
         // The first picture the player sees is the real keyframe at byte 9400 — not the
         // mid-GOP packet we joined on.
         assert_eq!(*first_video, &data[KEYFRAME2..KEYFRAME2 + TS_PACKET_LEN]);
+    }
+
+    /// An upstream SDT packet on PID 0x0011 advertising "Upstream" (a generic passthrough SDT).
+    fn upstream_sdt() -> Vec<u8> {
+        build_sdt(1, "Upstream").to_vec()
+    }
+
+    #[test]
+    fn keyframe_gate_replaces_upstream_sdt_with_titled_sdt() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".to_string()));
+        let mut input = Vec::new();
+        input.extend_from_slice(&pat(PMT_PID));
+        input.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        input.extend_from_slice(&upstream_sdt());
+        input.extend_from_slice(&random_access_packet(VIDEO_PID)); // keyframe -> lock
+        input.extend_from_slice(&upstream_sdt()); // must be filtered post-lock
+        let out = gate.push(&input);
+        assert_eq!(read_sdt_service_name(&out).as_deref(), Some("Titled"));
+        // No upstream "Upstream" SDT survives anywhere in the output.
+        assert!(!out
+            .chunks_exact(TS_PACKET_LEN)
+            .any(|p| read_sdt_service_name(p).as_deref() == Some("Upstream")));
+    }
+
+    #[test]
+    fn keyframe_gate_untitled_passes_upstream_sdt_through() {
+        let mut gate = KeyframeGate::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(&pat(PMT_PID));
+        input.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        input.extend_from_slice(&random_access_packet(VIDEO_PID));
+        input.extend_from_slice(&upstream_sdt());
+        let out = gate.push(&input);
+        assert_eq!(read_sdt_service_name(&out).as_deref(), Some("Upstream"));
     }
 
     #[test]
