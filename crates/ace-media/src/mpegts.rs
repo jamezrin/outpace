@@ -9,6 +9,18 @@ pub const TS_SYNC: u8 = 0x47;
 /// MPEG-TS packet length in bytes.
 pub const TS_PACKET_LEN: usize = 188;
 
+/// PID carrying the Service Description Table (and BAT).
+const SDT_PID: u16 = 0x0011;
+/// SDT `table_id` for the actual transport stream.
+const SDT_TABLE_ID: u8 = 0x42;
+/// DVB service descriptor tag.
+const SERVICE_DESCRIPTOR_TAG: u8 = 0x48;
+/// Fixed provider name advertised in every synthesized SDT.
+const SERVICE_PROVIDER_NAME: &[u8] = b"outpace";
+/// Largest `service_name` (in bytes) that still lets the whole SDT section fit one TS packet:
+/// 188 - 4 (TS header) - 1 (pointer_field) - 25 (fixed section fields + CRC) - provider length.
+const MAX_SERVICE_NAME_BYTES: usize = TS_PACKET_LEN - 4 - 1 - 25 - SERVICE_PROVIDER_NAME.len();
+
 /// Number of consecutive packets to check when probing for sync alignment.
 const PROBE_PACKETS: usize = 4;
 
@@ -365,6 +377,108 @@ fn psi_section_start(pkt: &[u8]) -> Option<usize> {
     let pointer = *pkt.get(po)? as usize;
     let sec = po + 1 + pointer;
     (sec < TS_PACKET_LEN).then_some(sec)
+}
+
+/// CRC-32/MPEG-2 (poly 0x04C11DB7, MSB-first, init 0xFFFFFFFF, no final XOR) — the CRC used by
+/// MPEG-2 PSI/SI sections.
+fn mpeg_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= (byte as u32) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Build a single-packet SDT on PID 0x0011 advertising `service_name` for `service_id`, with
+/// `service_provider_name = "outpace"`. `service_name` must already be sanitized/bounded by
+/// [`sanitize_service_name`] so the section fits one packet. Continuity counter is 0 (PSI
+/// tolerates a repeated CC on an unchanged section).
+fn build_sdt(service_id: u16, service_name: &str) -> [u8; TS_PACKET_LEN] {
+    let name = service_name.as_bytes();
+
+    // Service descriptor (0x48): service_type + provider + service_name.
+    let mut desc = Vec::new();
+    desc.push(SERVICE_DESCRIPTOR_TAG);
+    desc.push((3 + SERVICE_PROVIDER_NAME.len() + name.len()) as u8); // descriptor_length
+    desc.push(0x01); // service_type = digital television
+    desc.push(SERVICE_PROVIDER_NAME.len() as u8);
+    desc.extend_from_slice(SERVICE_PROVIDER_NAME);
+    desc.push(name.len() as u8);
+    desc.extend_from_slice(name);
+
+    // SDT section (table_id through CRC).
+    let mut sec = Vec::new();
+    sec.push(SDT_TABLE_ID);
+    let section_length = 8 + 5 + desc.len() + 4; // tsid..reserved, loop header, descriptors, CRC
+    sec.push(0xF0 | ((section_length >> 8) as u8 & 0x0F)); // syntax=1 + reserved bits + len hi
+    sec.push((section_length & 0xFF) as u8);
+    sec.extend_from_slice(&[0x00, 0x01]); // transport_stream_id
+    sec.push(0xC1); // version 0, current_next_indicator = 1
+    sec.push(0x00); // section_number
+    sec.push(0x00); // last_section_number
+    sec.extend_from_slice(&[0xFF, 0x01]); // original_network_id
+    sec.push(0xFF); // reserved_future_use
+    sec.extend_from_slice(&service_id.to_be_bytes());
+    sec.push(0xFC); // reserved(6) + EIT_schedule=0 + EIT_present_following=0
+    let dll = desc.len();
+    sec.push(0x80 | ((dll >> 8) as u8 & 0x0F)); // running_status=running + free_CA=0 + len hi
+    sec.push((dll & 0xFF) as u8);
+    sec.extend_from_slice(&desc);
+    let crc = mpeg_crc32(&sec);
+    sec.extend_from_slice(&crc.to_be_bytes());
+
+    // Wrap into a payload-only TS packet, PUSI set, pointer_field 0, rest padded 0xFF.
+    let mut pkt = [0xFFu8; TS_PACKET_LEN];
+    pkt[0] = TS_SYNC;
+    pkt[1] = 0x40 | ((SDT_PID >> 8) as u8 & 0x1F); // PUSI = 1
+    pkt[2] = (SDT_PID & 0xFF) as u8;
+    pkt[3] = 0x10; // AFC = 01 (payload only), CC = 0
+    pkt[4] = 0x00; // pointer_field
+    pkt[5..5 + sec.len()].copy_from_slice(&sec);
+    pkt
+}
+
+/// Read the first SDT `service_name` from a run of 188-aligned TS packets, if present.
+pub fn read_sdt_service_name(ts: &[u8]) -> Option<String> {
+    for pkt in ts.chunks_exact(TS_PACKET_LEN) {
+        if pkt[0] != TS_SYNC || ts_pid(pkt) != SDT_PID {
+            continue;
+        }
+        let Some(sec) = psi_section_start(pkt) else {
+            continue;
+        };
+        if *pkt.get(sec)? != SDT_TABLE_ID {
+            continue;
+        }
+        // sec + table_id(1) + section_length(2) + tsid..reserved(8) = first service loop entry.
+        let mut pos = sec + 3 + 8;
+        pos += 3; // service_id(2) + EIT flags(1)
+        let dll = (((*pkt.get(pos)? & 0x0F) as usize) << 8) | *pkt.get(pos + 1)? as usize;
+        pos += 2;
+        let end = (pos + dll).min(TS_PACKET_LEN);
+        while pos + 2 <= end {
+            let tag = pkt[pos];
+            let len = pkt[pos + 1] as usize;
+            if tag == SERVICE_DESCRIPTOR_TAG {
+                let mut p = pos + 2 + 1; // skip service_type
+                let provlen = *pkt.get(p)? as usize;
+                p += 1 + provlen;
+                let namelen = *pkt.get(p)? as usize;
+                p += 1;
+                let name = pkt.get(p..p + namelen)?;
+                return String::from_utf8(name.to_vec()).ok();
+            }
+            pos += 2 + len;
+        }
+    }
+    None
 }
 
 impl Default for KeyframeGate {
@@ -836,6 +950,29 @@ mod tests {
             "unconfirmed tail buffer must be capped to the sync lookahead, got {} bytes",
             r.buf.len()
         );
+    }
+
+    #[test]
+    fn mpeg_crc32_matches_canonical_check_value() {
+        // Canonical CRC-32/MPEG-2 check value for the ASCII string "123456789".
+        assert_eq!(mpeg_crc32(b"123456789"), 0x0376_E6E7);
+    }
+
+    #[test]
+    fn build_sdt_is_one_packet_with_correct_service_fields_and_crc() {
+        let pkt = build_sdt(0x0001, "EUROSPORT 1");
+        assert_eq!(pkt.len(), TS_PACKET_LEN);
+        assert_eq!(pkt[0], TS_SYNC);
+        assert_eq!(pid_of(&pkt), 0x0011); // SDT PID
+        let sec = psi_section_start(&pkt).unwrap();
+        assert_eq!(pkt[sec], 0x42); // table_id = SDT (actual TS)
+                                    // section_length spans from just after the length field through the CRC.
+        let section_length = (((pkt[sec + 1] & 0x0F) as usize) << 8) | pkt[sec + 2] as usize;
+        let crc_at = sec + 3 + section_length - 4;
+        let computed = mpeg_crc32(&pkt[sec..crc_at]);
+        let stored = u32::from_be_bytes(pkt[crc_at..crc_at + 4].try_into().unwrap());
+        assert_eq!(computed, stored);
+        assert_eq!(read_sdt_service_name(&pkt).as_deref(), Some("EUROSPORT 1"));
     }
 
     #[test]
