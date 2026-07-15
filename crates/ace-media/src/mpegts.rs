@@ -959,6 +959,31 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_gate_reset_preserves_title_and_rearms() {
+        let mut gate = KeyframeGate::with_service_name(Some("Kept".to_string()));
+        // Lock on a first keyframe.
+        let mut first = Vec::new();
+        first.extend_from_slice(&pat(PMT_PID));
+        first.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        first.extend_from_slice(&random_access_packet(VIDEO_PID));
+        assert_eq!(
+            read_sdt_service_name(&gate.push(&first)).as_deref(),
+            Some("Kept")
+        );
+        // Reset re-arms (drops lock) but must keep the title: the next locked output injects
+        // the SDT again.
+        gate.reset();
+        let mut second = Vec::new();
+        second.extend_from_slice(&pat(PMT_PID));
+        second.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        second.extend_from_slice(&random_access_packet(VIDEO_PID));
+        assert_eq!(
+            read_sdt_service_name(&gate.push(&second)).as_deref(),
+            Some("Kept")
+        );
+    }
+
+    #[test]
     fn aligned_stream_has_sync_offset_zero() {
         let mut s = packet(0);
         s.extend(packet(1));
