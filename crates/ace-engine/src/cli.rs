@@ -226,6 +226,8 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
         .with_cache(config.cache_type, config.cache_dir.clone())
         .with_seeding_enabled(config.enable_seeding);
 
+    // User-facing CLI progress: plain `eprintln!` on purpose (a human is watching this run,
+    // so no `alog!` timestamp/`[tag]` prefix). See the `ace_log` crate docs.
     eprintln!("outpace play: {}", args.input);
     eprintln!("outpace play: provider id {}", target.provider_id);
 

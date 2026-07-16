@@ -377,7 +377,7 @@ impl PeerListener {
                     // A backoff matters here: under fd exhaustion (EMFILE/ENFILE) accept()
                     // fails repeatedly with no natural delay, and a tight retry loop would
                     // busy-spin a core instead of giving the system room to recover.
-                    crate::swarm_log!("[seed-listener] accept error: {e}");
+                    crate::alog!("[seed-listener] accept error: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -405,7 +405,7 @@ impl PeerListener {
             };
             tokio::spawn(async move {
                 let _permit = permit;
-                crate::swarm_log!("[seed-listener] accepted connection from {addr}");
+                crate::alog!("[seed-listener] accepted connection from {addr}");
                 if let Err(e) = handle_inbound(
                     stream,
                     registry,
@@ -417,7 +417,7 @@ impl PeerListener {
                 )
                 .await
                 {
-                    crate::swarm_log!("[seed-listener] peer error from {addr}: {e:?}");
+                    crate::alog!("[seed-listener] peer error from {addr}: {e:?}");
                 }
             });
         }

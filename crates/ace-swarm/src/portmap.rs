@@ -253,7 +253,7 @@ async fn establish(cfg: &PortMapConfig, attempts: &[Box<dyn MapAttempt>]) -> Opt
             Ok(active) => return Some(active),
             Err(e) => {
                 // Matches the reference engine's `Failed to init port forward` log line.
-                swarm_log!(
+                crate::alog!(
                     "[portmap] {} failed to init port forward: {e} (continuing)",
                     attempt.name()
                 );
@@ -321,12 +321,12 @@ async fn run_port_mapping(
         active = establish(&cfg, &attempts) => active,
     };
     let Some(active) = active else {
-        swarm_log!("[portmap] no backend could map the inbound port; continuing NAT-bound");
+        crate::alog!("[portmap] no backend could map the inbound port; continuing NAT-bound");
         return;
     };
 
     let endpoint = active.endpoint();
-    swarm_log!(
+    crate::alog!(
         "[portmap] mapped external {}:{} -> local :{} via {} (lease {}s)",
         endpoint
             .external_ip
@@ -364,11 +364,11 @@ async fn renewal_loop(
             biased;
             _ = &mut shutdown_rx => {
                 match active.remove(&cfg).await {
-                    Ok(()) => swarm_log!(
+                    Ok(()) => crate::alog!(
                         "[portmap] removed mapping for external port {}",
                         endpoint.external_port
                     ),
-                    Err(e) => swarm_log!(
+                    Err(e) => crate::alog!(
                         "[portmap] failed to remove mapping for external port {}: {e}",
                         endpoint.external_port
                     ),
@@ -376,7 +376,7 @@ async fn renewal_loop(
                 return;
             }
             _ = tokio::time::sleep_until(expires_at) => {
-                swarm_log!("[portmap] mapping lease for external port {} expired; withdrawing endpoint", endpoint.external_port);
+                crate::alog!("[portmap] mapping lease for external port {} expired; withdrawing endpoint", endpoint.external_port);
                 let _ = endpoint_tx.send(None);
                 return;
             }
@@ -384,9 +384,9 @@ async fn renewal_loop(
                 match active.renew(&cfg).await {
                     Ok(()) => {
                         expires_at = tokio::time::Instant::now() + lease;
-                        swarm_log!("[portmap] renewed mapping for external port {}", endpoint.external_port);
+                        crate::alog!("[portmap] renewed mapping for external port {}", endpoint.external_port);
                     }
-                    Err(e) => swarm_log!(
+                    Err(e) => crate::alog!(
                         "[portmap] failed to renew mapping for external port {}: {e} (continuing)",
                         endpoint.external_port
                     ),

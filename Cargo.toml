@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ace-wire", "crates/ace-tracker", "crates/ace-peer", "crates/ace-media", "crates/ace-engine", "crates/ace-swarm", "tools/swarmtest"]
+members = ["crates/ace-log", "crates/ace-wire", "crates/ace-tracker", "crates/ace-peer", "crates/ace-media", "crates/ace-engine", "crates/ace-swarm", "tools/swarmtest"]
 resolver = "2"
 
 [workspace.package]

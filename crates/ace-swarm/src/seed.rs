@@ -63,7 +63,7 @@ impl SeederSession {
             (0, 0)
         };
         if debug {
-            crate::swarm_log!(
+            crate::alog!(
                 "[seed-session] peer={}.{}.{}.{} advertise window min={min} max={max} position={max} distance=-1",
                 peer_ip[0], peer_ip[1], peer_ip[2], peer_ip[3]
             );
@@ -132,7 +132,7 @@ impl SeederSession {
                                 .send(&if want { PeerMessage::Unchoke } else { PeerMessage::Choke })
                                 .await?;
                             if debug {
-                                crate::swarm_log!(
+                                crate::alog!(
                                     "[seed-session] -> {}",
                                     if want { "Unchoke" } else { "Choke" }
                                 );
@@ -151,7 +151,7 @@ impl SeederSession {
                 }
             };
             if debug {
-                crate::swarm_log!("[seed-session] <- {}", seed_message_summary(&msg));
+                crate::alog!("[seed-session] <- {}", seed_message_summary(&msg));
             }
             match msg {
                 PeerMessage::Extended { ext_id: 0, .. } if !advertised_bitfields => {
@@ -191,7 +191,7 @@ impl SeederSession {
                             session.send(&PeerMessage::Unchoke).await?;
                             unchoked = true;
                             if debug {
-                                crate::swarm_log!("[seed-session] -> Unchoke");
+                                crate::alog!("[seed-session] -> Unchoke");
                             }
                         }
                     }
@@ -226,7 +226,7 @@ impl SeederSession {
                         let reply = build_piece(stream, piece, chunk, header, &data);
                         session.send(&reply).await?;
                         if debug {
-                            crate::swarm_log!(
+                            crate::alog!(
                                 "[seed-session] -> Piece stream={stream} piece={piece} chunk={chunk} bytes={}",
                                 data.len()
                             );
@@ -270,7 +270,7 @@ async fn advertise_live_bitfields<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<Option<u64>> {
     let pieces = store.lock().await.have_pieces();
     if debug && !pieces.is_empty() {
-        crate::swarm_log!(
+        crate::alog!(
             "[seed-session] -> live Bitfield for {} complete piece(s)",
             pieces.len()
         );
@@ -311,7 +311,7 @@ async fn advance_live_edge<S: AsyncRead + AsyncWrite + Unpin>(
             session.send(&live_have(piece as u32)).await?;
             *advertised_max = Some(piece);
             if debug {
-                crate::swarm_log!("[seed-session] -> live HAVE piece={piece}");
+                crate::alog!("[seed-session] -> live HAVE piece={piece}");
             }
         }
     }

@@ -6,6 +6,7 @@ version = 4
 name = "ace-engine"
 version = "0.2.0"
 dependencies = [
+ "ace-log",
  "ace-media",
  "ace-peer",
  "ace-swarm",
@@ -31,6 +32,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ace-log"
+version = "0.2.0"
+
+[[package]]
 name = "ace-media"
 version = "0.2.0"
 
@@ -47,6 +52,7 @@ dependencies = [
 name = "ace-swarm"
 version = "0.2.0"
 dependencies = [
+ "ace-log",
  "ace-media",
  "ace-peer",
  "ace-tracker",

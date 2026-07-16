@@ -516,6 +516,10 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         identity,
     } = runtime;
 
+    // Startup banner: plain `eprintln!` on purpose. These lines are read live by whoever
+    // just ran the daemon, so they intentionally skip the `alog!` timestamp/`[tag]` prefix.
+    // Operational events that fire *later* (RTMP death, shutdown) do use `alog!`; see the
+    // `ace_log` crate docs before adding a line here.
     eprintln!(
         "outpace: node_id={} data_dir={}",
         hex_node_id(&identity),
@@ -613,7 +617,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
 
     tokio::spawn(async move {
         if let Err(e) = crate::rtmp::serve_rtmp(rtmp_bind, rtmp_broadcasts).await {
-            eprintln!("outpace: RTMP ingest stopped: {e}");
+            crate::alog!("[rtmp] ingest stopped: {e}");
         }
     });
     eprintln!(
@@ -657,7 +661,7 @@ async fn shutdown_signal() {
         () = ctrl_c => {},
         () = terminate => {},
     }
-    eprintln!("outpace: shutdown signal received; draining HTTP connections");
+    crate::alog!("[runtime] shutdown signal received; draining HTTP connections");
 }
 
 pub async fn mint_broadcast(runtime: &EngineRuntime, name: &str) -> Broadcast {
