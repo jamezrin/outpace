@@ -68,8 +68,8 @@ impl HlsPackager {
         // [PAT][PMT][SDT] (3) plus a keyframe = 4 packets. If the configured ceiling can't hold
         // that, serve this stream WITHOUT the title SDT rather than stalling every segment forever.
         if filter_sdt && seg_packets < 4 {
-            eprintln!(
-                "outpace: HLS segment ceiling too small ({seg_packets} packets) for SDT service_name; \
+            crate::alog!(
+                "[hls] segment ceiling too small ({seg_packets} packets) for SDT service_name; \
                  serving without title SDT (needs >= 4 packets)"
             );
             access = VideoAccessPointState::new();
