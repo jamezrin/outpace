@@ -33,6 +33,14 @@ rtmp-rs = "0.5"
 base64ct = { version = "1.8", features = ["alloc"] }
 hex = "0.4"
 
+# jemalloc is the default global allocator on every non-MSVC target (see main.rs). The
+# `background_threads` feature builds jemalloc with the purge thread that returns freed pages to the
+# OS while the process is idle; `unprefixed_malloc_on_supported_platforms` lets it back the global
+# allocator. `tikv-jemalloc-ctl` powers `/debug/memstats`.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
 [dev-dependencies]
 sha1 = "0.10"
 ace-tracker = { path = "../ace-tracker" }

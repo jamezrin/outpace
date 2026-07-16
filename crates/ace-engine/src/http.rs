@@ -431,10 +431,36 @@ impl BroadcastState {
     }
 }
 
+/// `GET /debug/memstats` — diagnostic heap counters. With `--features profiling`
+/// (jemalloc) this reports live-heap `allocated` vs `resident`/`retained`, which
+/// separates a real leak (`allocated` grows without bound) from allocator
+/// retention (`resident - allocated` grows). Without the feature it only reports
+/// that profiling is off; process RSS is still observable via `/proc`.
+async fn debug_memstats() -> Response {
+    #[cfg(not(target_env = "msvc"))]
+    let body = {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        let _ = epoch::advance();
+        let read = |r: Result<usize, tikv_jemalloc_ctl::Error>| r.map(|v| v as u64).unwrap_or(0);
+        json!({
+            "allocator": "jemalloc",
+            "allocated": read(stats::allocated::read()),
+            "active": read(stats::active::read()),
+            "resident": read(stats::resident::read()),
+            "retained": read(stats::retained::read()),
+            "mapped": read(stats::mapped::read()),
+        })
+    };
+    #[cfg(target_env = "msvc")]
+    let body = json!({ "allocator": "system" });
+    Json(body).into_response()
+}
+
 pub fn router(state: AppState) -> Router {
     let compat = state.experimental_ace_compat;
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/debug/memstats", get(debug_memstats))
         .route("/networks", get(networks))
         .route("/streams", get(list_streams))
         .route(
