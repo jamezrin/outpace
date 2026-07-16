@@ -303,8 +303,8 @@ impl KeyframeGate {
     }
 }
 
-/// PID of a TS packet (13-bit).
-fn ts_pid(pkt: &[u8]) -> u16 {
+/// PID (13-bit) of a TS packet.
+pub fn ts_pid(pkt: &[u8]) -> u16 {
     (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16
 }
 

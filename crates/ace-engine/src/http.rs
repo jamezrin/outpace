@@ -3377,6 +3377,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_hls_segment_carries_sdt_service_name() {
+        // The `.ts` path is covered by several HTTP round-trip tests asserting the SDT; this is
+        // the HLS-path equivalent, driven end-to-end through the actual served segment bytes
+        // rather than at the `HlsPackager` unit level.
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap()
+            .to_owned();
+        let playlist = wait_for_hls_playlist(&app, &playback).await;
+        let segment_path = playlist_segment_path(&playlist).to_owned();
+
+        let seg = app
+            .clone()
+            .oneshot(Request::get(&segment_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(seg.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(seg.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            ace_media::mpegts::read_sdt_service_name(&body).as_deref(),
+            Some("Synthetic Demo Channel")
+        );
+        // Keep `app`/`manager` alive through the reads above, mirroring the other live-HLS tests.
+        drop((app, manager));
+    }
+
+    #[tokio::test]
     async fn ace_manifest_json_returns_documented_hls_control_urls() {
         let id = "0123456789abcdef0123456789abcdef01234567";
         let app = router(ace_hls_state(Duration::from_secs(60), 8));
@@ -3948,7 +3993,9 @@ mod tests {
         // `icyx://` (Icecast) scheme and treat the body as a raw audio stream: the HLS demux
         // never loads, so VLC busy-loops the playlist and never fetches a segment. The manifest
         // must therefore carry no `icy-*` header even when the stream has a title (the title is
-        // still exposed to clients via the JSON metadata endpoints). It stays on direct `.ts`.
+        // still exposed to clients via the JSON metadata endpoints). No `icy-*` header is emitted
+        // on any path (direct `.ts` or HLS) any more; the title travels via the MPEG-TS SDT
+        // `service_name` instead.
         let resp = router(fixture_state(0))
             .oneshot(
                 Request::get("/streams/fix/chan.m3u8")
