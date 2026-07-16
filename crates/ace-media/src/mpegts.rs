@@ -435,8 +435,9 @@ fn psi_section_start(pkt: &[u8]) -> Option<usize> {
 }
 
 /// CRC-32/MPEG-2 (poly 0x04C11DB7, MSB-first, init 0xFFFFFFFF, no final XOR) — the CRC used by
-/// MPEG-2 PSI/SI sections.
-fn mpeg_crc32(data: &[u8]) -> u32 {
+/// MPEG-2 PSI/SI sections. Canonical impl for the workspace; `ace-engine`'s RTMP→TS PSI
+/// synthesis reuses it rather than keeping its own copy.
+pub fn mpeg_crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
         crc ^= (byte as u32) << 24;
