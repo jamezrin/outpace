@@ -1,22 +1,24 @@
 name: ARMv7 portability
 
 on:
-  # Only run when something that can actually change the ARMv7 build or its runtime
-  # behavior moves: the shipped crates, test fixtures, workspace/toolchain config, the
-  # container image, or this workflow itself. Docs and dev-only tooling (`tools/**`,
-  # excluded from the emulated workspace run below) cannot affect it, so they are skipped
-  # to keep the slow QEMU jobs off unrelated PRs.
+  # Only run when something that can change the shipped ARMv7 binary or its container
+  # definition moves. Tests, docs, and dev-only tooling do not affect the release build,
+  # so changes limited to those paths skip this portability gate.
   pull_request:
     paths:
       - .github/workflows/armv7-portability.yml
       - crates/**
-      - tests/**
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
       - Dockerfile
       - .dockerignore
   workflow_dispatch:
+    inputs:
+      run_container_smoke:
+        description: Run the emulated ARMv7 container startup smoke
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,12 +28,10 @@ env:
   TARGET: armv7-unknown-linux-musleabihf
 
 jobs:
-  test:
-    name: Workspace tests under ARMv7 QEMU
+  cross-build:
+    name: Cross-build ARMv7 release binary
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      QEMU_CPU: cortex-a7
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -43,22 +43,17 @@ jobs:
         with:
           targets: ${{ env.TARGET }}
 
-      - name: Install ARMv7 musl toolchain and QEMU runner
+      - name: Install ARMv7 musl toolchain
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: ${{ env.TARGET }}
-          runner: qemu-user
 
-      - name: Run offline workspace suite
-        env:
-          RUST_TEST_THREADS: 1
-        # `swarmtest` is a dev-only, `publish = false` docker-orchestration harness that never
-        # runs on an ARMv7 device; excluding it keeps its heavy dependency tree (reqwest,
-        # tokio, flate2, tar) from being cross-compiled and its tests from running under QEMU.
-        run: cargo test --locked --workspace --exclude swarmtest --all-targets --target "$TARGET"
+      - name: Cross-build release binary
+        run: cargo build --locked --release -p ace-engine --bin outpace --target "$TARGET"
 
   container-smoke:
     name: ARMv7 container startup and health smoke
+    if: github.event_name == 'workflow_dispatch' && inputs.run_container_smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

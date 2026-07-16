@@ -25,9 +25,10 @@ This change does not alter the supported platform list or release artifacts.
 
 ## Workflow Behavior
 
-The Compose workflow gains a boolean manual input for the ARM64 smoke. Its native AMD64 job runs
-on relevant pull requests and pushes as before. A separate ARM64 job runs only when a manual
-dispatch explicitly enables it, preventing QEMU setup and emulated compilation during ordinary CI.
+The Compose workflow gains a boolean manual input for the ARM64 smoke. Its platform matrix contains
+only AMD64 on relevant pull requests and pushes, and expands to include ARM64 only when a manual
+dispatch explicitly enables it. QEMU setup is conditional on the foreign-architecture matrix entry,
+preventing QEMU setup and emulated compilation during ordinary CI.
 
 The ARMv7 workflow replaces its QEMU workspace-test job with a cross-compiled release binary build
 using the existing ARM musl cross toolchain. Its container smoke remains defined but is guarded by

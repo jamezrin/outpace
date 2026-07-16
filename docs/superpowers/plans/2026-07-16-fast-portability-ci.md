@@ -26,22 +26,22 @@
 - Consumes: GitHub `workflow_dispatch` boolean input `run_arm64`.
 - Produces: automatic native `linux/amd64` smoke and opt-in `linux/arm64` smoke.
 
-- [ ] **Step 1: Add the manual ARM64 input**
+- [x] **Step 1: Add the manual ARM64 input**
 
 Define `workflow_dispatch.inputs.run_arm64` as a boolean with a `false` default.
 
-- [ ] **Step 2: Make the existing smoke native-only**
+- [x] **Step 2: Make the existing smoke native-only**
 
-Remove its platform matrix and QEMU setup, build with `--platform linux/amd64`, and retain all
-Compose model, health, permissions, architecture, SIGTERM, logging, and teardown assertions.
+Make its platform matrix resolve to only `linux/amd64` for automatic events, and retain all Compose
+model, health, permissions, architecture, SIGTERM, logging, and teardown assertions.
 
-- [ ] **Step 3: Add the opt-in ARM64 smoke**
+- [x] **Step 3: Add the opt-in ARM64 smoke**
 
-Add a second job guarded by
-`github.event_name == 'workflow_dispatch' && inputs.run_arm64`, with QEMU and Buildx setup and the
-same runtime assertions targeting `linux/arm64`.
+Expand the platform matrix to include `linux/arm64` only when
+`github.event_name == 'workflow_dispatch' && inputs.run_arm64`, and conditionally set up QEMU for
+the non-native matrix entry. Reuse the same runtime assertions for both platforms.
 
-- [ ] **Step 4: Validate workflow syntax**
+- [x] **Step 4: Validate workflow syntax**
 
 Run a YAML parser and `actionlint` when installed. Expected: both commands exit zero.
 
@@ -56,11 +56,11 @@ Run a YAML parser and `actionlint` when installed. Expected: both commands exit 
   `armv7-unknown-linux-musleabihf`.
 - Produces: automatic cross-compiled release binary and opt-in QEMU container health smoke.
 
-- [ ] **Step 1: Add the manual ARMv7 runtime input**
+- [x] **Step 1: Add the manual ARMv7 runtime input**
 
 Define `workflow_dispatch.inputs.run_container_smoke` as a boolean with a `false` default.
 
-- [ ] **Step 2: Convert the automatic test job to a cross-build job**
+- [x] **Step 2: Convert the automatic test job to a cross-build job**
 
 Keep the pinned Rust target and ARM musl toolchain installation, remove the QEMU runner and test
 execution, and run:
@@ -69,18 +69,18 @@ execution, and run:
 cargo build --locked --release -p ace-engine --bin outpace --target "$TARGET"
 ```
 
-- [ ] **Step 3: Guard the ARMv7 container smoke**
+- [x] **Step 3: Guard the ARMv7 container smoke**
 
 Set its job condition to
 `github.event_name == 'workflow_dispatch' && inputs.run_container_smoke` while preserving its image
 build and health check.
 
-- [ ] **Step 4: Correct portability documentation**
+- [x] **Step 4: Correct portability documentation**
 
 Describe cross-compilation as the pull-request compatibility gate and the QEMU container startup
 check as manually invoked runtime evidence.
 
-- [ ] **Step 5: Validate workflow syntax and repository checks**
+- [x] **Step 5: Validate workflow syntax and repository checks**
 
 Run YAML parsing, `actionlint` when available, `cargo fmt --all --check`, and
 `cargo test --workspace`. Expected: all available checks exit zero.
@@ -93,7 +93,7 @@ Run YAML parsing, `actionlint` when available, `cargo fmt --all --check`, and
 **Interfaces:**
 - Produces: a draft pull request from `fix/ci-emulation-smokes` to `main`.
 
-- [ ] **Step 1: Review the final diff and branch ancestry**
+- [x] **Step 1: Review the final diff and branch ancestry**
 
 Run `git diff --check`, inspect `git diff`, and verify
 `git merge-base --is-ancestor main fix/ci-emulation-smokes`.

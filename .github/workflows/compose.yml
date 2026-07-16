@@ -21,6 +21,11 @@ on:
       - Cargo.toml
       - crates/**
   workflow_dispatch:
+    inputs:
+      run_arm64:
+        description: Also run the emulated linux/arm64 smoke
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,11 +38,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [linux/amd64, linux/arm64]
+        platform: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.run_arm64 && '["linux/amd64", "linux/arm64"]' || '["linux/amd64"]') }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up QEMU
+        if: matrix.platform != 'linux/amd64'
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx

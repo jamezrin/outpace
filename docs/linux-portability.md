@@ -10,10 +10,11 @@ Linux hardware with a hard-float ABI. It does not cover ARMv6, soft-float ARM, o
 ARMv7 instruction set. QEMU CI is a compatibility gate, not a performance benchmark; operators
 should expect less throughput and fewer practical concurrent sessions than on 64-bit systems.
 
-The portability gate runs the complete non-ignored workspace test suite under ARMv7 QEMU and
-starts the published container shape with inbound serving disabled before checking `/healthz`.
-Tests marked `#[ignore]` remain excluded because they require live network content or external
-environment variables, just as they are in the ordinary offline suite.
+The automatic portability gate cross-compiles the release binary for ARMv7. This catches Rust,
+native dependency, linker, and target-ABI incompatibilities without paying the cost of running a
+full build and test suite through CPU emulation. The workflow also provides a manually enabled
+QEMU container smoke that starts the published container shape with inbound serving disabled and
+checks `/healthz` when runtime evidence is needed.
 
 The initial dependency and source audit found no ARMv7-specific blocker in the crypto/bigint,
 atomics, Tokio, RTMP, tracker, or NAT stacks. Transport geometry already caps individual piece
