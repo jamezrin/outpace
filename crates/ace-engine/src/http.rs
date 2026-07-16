@@ -11,7 +11,7 @@ use ace_swarm::resolve::{infohash_hex, resolve_via_catalog, stream_info_from_tra
 use ace_swarm::types::StreamMetadata;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::get, routing::put, Json, Router};
 use bytes::Bytes;
@@ -25,22 +25,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ACE_TOKEN_CAPACITY: usize = 4096;
-const MAX_ICY_NAME_BYTES: usize = 256;
 const HLS_PLAYLIST_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn icy_name_header(metadata: &StreamMetadata) -> Option<HeaderValue> {
-    let title = metadata.title.as_deref()?.trim();
-    let sanitized: String = title.chars().filter(|ch| !ch.is_control()).collect();
-    let sanitized = sanitized.trim();
-    if sanitized.is_empty() {
-        return None;
-    }
-    let mut end = sanitized.len().min(MAX_ICY_NAME_BYTES);
-    while !sanitized.is_char_boundary(end) {
-        end -= 1;
-    }
-    HeaderValue::from_bytes(&sanitized.as_bytes()[..end]).ok()
-}
 
 fn stream_metadata_json(metadata: &StreamMetadata) -> serde_json::Value {
     json!({
@@ -1434,8 +1419,8 @@ async fn stream_file_with_hls_timeout(
                 // Deliberately no `icy-*` header here: on an HLS manifest it makes VLC's HTTP
                 // access promote the URL to the `icyx://` (Icecast) scheme and treat the body as
                 // a raw audio stream, so the HLS demux never loads and playback busy-loops the
-                // playlist without fetching segments. The title still reaches clients via the
-                // JSON metadata endpoints; `icy-name` remains on the direct `.ts` responses.
+                // playlist without fetching segments. The title reaches clients via the MPEG-TS
+                // SDT `service_name` embedded in the segments themselves.
                 (
                     [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
                     pkg.playlist(&network, id),
@@ -1463,11 +1448,10 @@ async fn stream_file_with_hls_timeout(
 }
 
 fn stream_session_response(session: Arc<StreamSession>) -> Response {
-    let icy_name = icy_name_header(session.metadata());
     let sub = session.subscribe();
-    // Per-client keyframe gate: a player joining mid-GOP is held until the first clean
-    // keyframe (with PAT/PMT prepended) so it starts on a decodable picture, not garbage.
-    let gate = ace_media::mpegts::KeyframeGate::new();
+    // Per-client keyframe gate: holds a mid-GOP joiner until the first clean keyframe (with
+    // PAT/PMT — and, when the stream has a resolved title, a synthesized SDT — prepended).
+    let gate = ace_media::mpegts::KeyframeGate::with_service_name(session.metadata().title.clone());
     // Bridge the broadcast receiver to an HTTP body stream; the Subscription rides along so
     // its Drop (decrementing the client count) fires when the client disconnects.
     let stream = futures::stream::unfold((sub, gate), |(mut sub, mut gate)| async move {
@@ -1492,11 +1476,10 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
             }
         }
     });
-    let mut response = Response::builder().header(header::CONTENT_TYPE, "video/mp2t");
-    if let Some(value) = icy_name {
-        response = response.header("icy-name", value);
-    }
-    response.body(Body::from_stream(stream)).unwrap()
+    Response::builder()
+        .header(header::CONTENT_TYPE, "video/mp2t")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
 
 fn ace_stream_session_response(
@@ -1505,9 +1488,8 @@ fn ace_stream_session_response(
     cancel: tokio::sync::watch::Receiver<bool>,
     direct_lease: Option<AceDirectLeaseGuard>,
 ) -> Response {
-    let icy_name = icy_name_header(session.metadata());
     let sub = session.subscribe();
-    let gate = ace_media::mpegts::KeyframeGate::new();
+    let gate = ace_media::mpegts::KeyframeGate::with_service_name(session.metadata().title.clone());
     let stream = futures::stream::unfold(
         (sub, gate, cancel, expires_at, direct_lease),
         |(mut sub, mut gate, mut cancel, expires_at, direct_lease)| async move {
@@ -1536,15 +1518,14 @@ fn ace_stream_session_response(
             }
         },
     );
-    let mut response = Response::builder().header(header::CONTENT_TYPE, "video/mp2t");
-    if let Some(value) = icy_name {
-        response = response.header("icy-name", value);
-    }
-    response.body(Body::from_stream(stream)).unwrap()
+    Response::builder()
+        .header(header::CONTENT_TYPE, "video/mp2t")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
 
 fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
-    *gate = ace_media::mpegts::KeyframeGate::new();
+    gate.reset();
 }
 
 #[cfg(test)]
@@ -1561,39 +1542,6 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use bytes::Bytes;
     use tower::ServiceExt;
-
-    #[test]
-    fn icy_name_header_sanitizes_and_bounds_titles() {
-        let metadata = StreamMetadata {
-            title: Some("  Synthetic Demo\r\n\0 Channel  ".to_string()),
-            bitrate: None,
-            categories: vec![],
-        };
-        assert_eq!(
-            icy_name_header(&metadata).unwrap().as_bytes(),
-            b"Synthetic Demo Channel"
-        );
-
-        let metadata = StreamMetadata {
-            title: Some("é".repeat(200)),
-            bitrate: None,
-            categories: vec![],
-        };
-        let value = icy_name_header(&metadata).unwrap();
-        assert!(value.as_bytes().len() <= 256);
-        assert!(std::str::from_utf8(value.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn icy_name_header_omits_empty_titles() {
-        assert!(icy_name_header(&StreamMetadata::default()).is_none());
-        assert!(icy_name_header(&StreamMetadata {
-            title: Some(" \r\n\t ".to_string()),
-            bitrate: None,
-            categories: vec![],
-        })
-        .is_none());
-    }
 
     #[test]
     fn stream_metadata_json_has_stable_shape() {
@@ -2301,7 +2249,11 @@ mod tests {
                 registry,
                 32,
                 crate::config::HlsConfig {
-                    segment_packets: 3,
+                    // 4, not 3: PacedPacketSource's fixture metadata carries a title (Task 5,
+                    // #135), so the injected per-segment table prefix is [PAT][PMT][SDT] (3
+                    // packets) rather than [PAT][PMT] (2) -- one more packet of headroom is
+                    // needed to still fit a keyframe alongside it.
+                    segment_packets: 4,
                     window_segments: 3,
                     segment_duration_ms: 1000,
                 },
@@ -2616,11 +2568,15 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "video/mp2t");
-        assert_eq!(resp.headers()["icy-name"], "Synthetic Demo Channel");
+        assert!(!resp.headers().contains_key("icy-name"));
         // Live body is unbounded; read just the first TS chunk.
         let mut stream = resp.into_body().into_data_stream();
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first[0], 0x47);
+        assert_eq!(
+            ace_media::mpegts::read_sdt_service_name(&first).as_deref(),
+            Some("Synthetic Demo Channel")
+        );
     }
 
     #[tokio::test]
@@ -2686,10 +2642,14 @@ mod tests {
             .unwrap();
         assert_eq!(media.status(), StatusCode::OK);
         assert_eq!(media.headers()[header::CONTENT_TYPE], "video/mp2t");
-        assert_eq!(media.headers()["icy-name"], "Synthetic Demo Channel");
+        assert!(!media.headers().contains_key("icy-name"));
         let mut stream = media.into_body().into_data_stream();
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first[0], 0x47);
+        assert_eq!(
+            ace_media::mpegts::read_sdt_service_name(&first).as_deref(),
+            Some("Synthetic Demo Channel")
+        );
         assert!(manager
             .get("fix", &format!("cid:{content_id}"))
             .await
@@ -2716,9 +2676,14 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp2t");
-        assert_eq!(response.headers()["icy-name"], "Synthetic Demo Channel");
+        assert!(!response.headers().contains_key("icy-name"));
         let mut body = response.into_body().into_data_stream();
-        assert_eq!(body.next().await.unwrap().unwrap()[0], 0x47);
+        let first = body.next().await.unwrap().unwrap();
+        assert_eq!(first[0], 0x47);
+        assert_eq!(
+            ace_media::mpegts::read_sdt_service_name(&first).as_deref(),
+            Some("Synthetic Demo Channel")
+        );
         assert!(manager
             .get("fix", &format!("cid:{content_id}"))
             .await
@@ -3412,6 +3377,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_hls_segment_carries_sdt_service_name() {
+        // The `.ts` path is covered by several HTTP round-trip tests asserting the SDT; this is
+        // the HLS-path equivalent, driven end-to-end through the actual served segment bytes
+        // rather than at the `HlsPackager` unit level.
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let manager = state.manager.clone();
+        let app = router(state);
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let playback = start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap()
+            .to_owned();
+        let playlist = wait_for_hls_playlist(&app, &playback).await;
+        let segment_path = playlist_segment_path(&playlist).to_owned();
+
+        let seg = app
+            .clone()
+            .oneshot(Request::get(&segment_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(seg.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(seg.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            ace_media::mpegts::read_sdt_service_name(&body).as_deref(),
+            Some("Synthetic Demo Channel")
+        );
+        // Keep `app`/`manager` alive through the reads above, mirroring the other live-HLS tests.
+        drop((app, manager));
+    }
+
+    #[tokio::test]
     async fn ace_manifest_json_returns_documented_hls_control_urls() {
         let id = "0123456789abcdef0123456789abcdef01234567";
         let app = router(ace_hls_state(Duration::from_secs(60), 8));
@@ -3983,7 +3993,9 @@ mod tests {
         // `icyx://` (Icecast) scheme and treat the body as a raw audio stream: the HLS demux
         // never loads, so VLC busy-loops the playlist and never fetches a segment. The manifest
         // must therefore carry no `icy-*` header even when the stream has a title (the title is
-        // still exposed to clients via the JSON metadata endpoints). It stays on direct `.ts`.
+        // still exposed to clients via the JSON metadata endpoints). No `icy-*` header is emitted
+        // on any path (direct `.ts` or HLS) any more; the title travels via the MPEG-TS SDT
+        // `service_name` instead.
         let resp = router(fixture_state(0))
             .oneshot(
                 Request::get("/streams/fix/chan.m3u8")

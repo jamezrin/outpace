@@ -4,7 +4,7 @@
 
 use crate::config::HlsConfig;
 use crate::session::{StreamEvent, StreamSession};
-use ace_media::mpegts::VideoAccessPointState;
+use ace_media::mpegts::{ts_pid, VideoAccessPointState};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 const TS_PACKET: usize = 188;
 const PCR_HZ: u64 = 90_000;
 const PCR_MODULUS: u64 = 1 << 33;
+const SDT_PID: u16 = 0x0011;
 
 pub struct HlsPackager {
     state: Mutex<HlsState>,
@@ -40,6 +41,9 @@ struct HlsState {
     last_access: Option<Instant>,
     access: VideoAccessPointState,
     awaiting_access_point: bool,
+    /// Set when `access` carries a title, so upstream SDT-PID packets must be dropped from
+    /// segment bodies to avoid duplicating (or conflicting with) our synthesized SDT.
+    filter_sdt: bool,
     /// One packet outside the configured segment buffer, used only to classify a full segment's
     /// next boundary without appending past `max_segment_bytes`.
     lookahead: [u8; TS_PACKET],
@@ -53,11 +57,24 @@ struct HlsSegment {
 }
 
 impl HlsPackager {
-    fn new(config: HlsConfig) -> Arc<HlsPackager> {
+    fn new(config: HlsConfig, service_name: Option<String>) -> Arc<HlsPackager> {
         let seg_packets = config.segment_packets.max(3);
         let max_segment_bytes = seg_packets
             .checked_mul(TS_PACKET)
             .expect("HLS config must be validated before packager construction");
+        let mut access = VideoAccessPointState::with_service_name(service_name);
+        let mut filter_sdt = access.has_service_name();
+        // The injected SDT costs one extra prefix packet, so a titled segment must fit
+        // [PAT][PMT][SDT] (3) plus a keyframe = 4 packets. If the configured ceiling can't hold
+        // that, serve this stream WITHOUT the title SDT rather than stalling every segment forever.
+        if filter_sdt && seg_packets < 4 {
+            crate::alog!(
+                "[hls] segment ceiling too small ({seg_packets} packets) for SDT service_name; \
+                 serving without title SDT (needs >= 4 packets)"
+            );
+            access = VideoAccessPointState::new();
+            filter_sdt = false;
+        }
         Arc::new(HlsPackager {
             state: Mutex::new(HlsState {
                 media_seq: 0,
@@ -70,8 +87,9 @@ impl HlsPackager {
                 max_segment_duration: config.segment_duration_secs(),
                 discontinuity_pending: false,
                 last_access: None,
-                access: VideoAccessPointState::new(),
+                access,
                 awaiting_access_point: true,
+                filter_sdt,
                 lookahead: [0; TS_PACKET],
                 lookahead_len: 0,
             }),
@@ -84,7 +102,7 @@ impl HlsPackager {
 
     /// Start packaging `session`'s TS into segments in the background (uncounted receiver).
     pub fn start(session: &StreamSession, config: HlsConfig) -> Arc<HlsPackager> {
-        let me = Self::new(config);
+        let me = Self::new(config, session.metadata().title.clone());
         let pkg = me.clone();
         let mut rx = session.raw_receiver();
         tokio::spawn(async move {
@@ -161,6 +179,14 @@ impl HlsPackager {
                 st.discontinuity_pending = true;
                 st.awaiting_access_point = true;
                 continue;
+            }
+
+            // Drop a titled stream's upstream SDT before it becomes segment content, but only
+            // after the discontinuity check above: `ts_timing` flags discontinuity PID-agnostically,
+            // so a discontinuity-marked SDT must take the reset path, not be silently filtered.
+            if st.filter_sdt && ts_pid(&packet) == SDT_PID {
+                st.cur.drain(packet_offset..packet_offset + TS_PACKET);
+                continue; // scanned_packets unchanged: the next packet slides into this offset
             }
 
             if st.awaiting_access_point {
@@ -263,6 +289,13 @@ impl HlsPackager {
         if pcr_went_backwards(st.last_pcr, timing.pcr) {
             st.access.reset();
             self.discard_incomplete_run(st);
+            return;
+        }
+
+        // Drop a titled stream's upstream SDT lookahead packet only after the discontinuity and
+        // PCR-regression safety checks above (both PID-agnostic), so a flagged SDT still forces a
+        // reset. `feed` already zeroed `lookahead_len`, so returning here refills cleanly.
+        if st.filter_sdt && ts_pid(packet) == SDT_PID {
             return;
         }
 
@@ -483,7 +516,7 @@ fn ts_timing(packet: &[u8]) -> TsTiming {
     if packet.len() != TS_PACKET || packet[0] != 0x47 || packet[3] & 0x20 == 0 {
         return TsTiming::default();
     }
-    let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
+    let pid = ts_pid(packet);
     let adaptation_len = packet[4] as usize;
     if adaptation_len == 0 || adaptation_len > 183 {
         return TsTiming::default();
@@ -592,11 +625,14 @@ mod tests {
     use crate::config::HlsConfig;
 
     fn pkg() -> Arc<HlsPackager> {
-        HlsPackager::new(HlsConfig {
-            segment_packets: 6,
-            window_segments: 3,
-            segment_duration_ms: 1000,
-        })
+        HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                window_segments: 3,
+                segment_duration_ms: 1000,
+            },
+            None,
+        )
     }
 
     fn packets(n: usize) -> Vec<u8> {
@@ -609,11 +645,14 @@ mod tests {
     }
 
     fn timed_pkg(duration_ms: u64) -> Arc<HlsPackager> {
-        HlsPackager::new(HlsConfig {
-            segment_packets: 100,
-            window_segments: 6,
-            segment_duration_ms: duration_ms,
-        })
+        HlsPackager::new(
+            HlsConfig {
+                segment_packets: 100,
+                window_segments: 6,
+                segment_duration_ms: duration_ms,
+            },
+            None,
+        )
     }
 
     fn random_access_packet(marker: u8) -> Vec<u8> {
@@ -705,11 +744,14 @@ mod tests {
     }
 
     fn clean_pkg(segment_packets: usize) -> Arc<HlsPackager> {
-        HlsPackager::new(HlsConfig {
-            segment_packets,
-            window_segments: 4,
-            segment_duration_ms: 1000,
-        })
+        HlsPackager::new(
+            HlsConfig {
+                segment_packets,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+            },
+            None,
+        )
     }
 
     const PMT_PID: u16 = 0x0100;
@@ -853,11 +895,14 @@ mod tests {
         // playlist (the #137 4K-HEVC bug); instead the packager emits the ceiling-full segment
         // and continues. The forced cut is not a transport discontinuity, so no
         // #EXT-X-DISCONTINUITY is introduced.
-        let p = HlsPackager::new(HlsConfig {
-            segment_packets: 5,
-            window_segments: 4,
-            segment_duration_ms: 100,
-        });
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 5,
+                window_segments: 4,
+                segment_duration_ms: 100,
+            },
+            None,
+        );
         let pat = pat(PMT_PID);
         let pmt = pmt(PMT_PID, VIDEO_PID);
         p.feed(&pat);
@@ -993,7 +1038,7 @@ mod tests {
 
     #[test]
     fn default_ceiling_allows_a_timed_keyframe_beyond_256_packets() {
-        let p = HlsPackager::new(HlsConfig::default());
+        let p = HlsPackager::new(HlsConfig::default(), None);
         p.feed(&pat(PMT_PID));
         p.feed(&pmt(PMT_PID, VIDEO_PID));
         let input: Vec<u8> = (0..=300)
@@ -1010,11 +1055,14 @@ mod tests {
 
     #[test]
     fn pcr_mode_never_exceeds_the_hard_packet_ceiling() {
-        let p = HlsPackager::new(HlsConfig {
-            segment_packets: 5,
-            window_segments: 4,
-            segment_duration_ms: 60_000,
-        });
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 5,
+                window_segments: 4,
+                segment_duration_ms: 60_000,
+            },
+            None,
+        );
         p.feed(&pat(PMT_PID));
         p.feed(&pmt(PMT_PID, VIDEO_PID));
         p.feed(&video_access_packet(VIDEO_PID, 0));
@@ -1033,11 +1081,14 @@ mod tests {
 
     #[test]
     fn hard_ceiling_preserves_post_discontinuity_boundary() {
-        let p = HlsPackager::new(HlsConfig {
-            segment_packets: 6,
-            window_segments: 4,
-            segment_duration_ms: 1000,
-        });
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+            },
+            None,
+        );
         p.feed(&pat(PMT_PID));
         p.feed(&pmt(PMT_PID, VIDEO_PID));
         p.feed(&video_access_packet(VIDEO_PID, 0));
@@ -1112,11 +1163,14 @@ mod tests {
 
     #[test]
     fn packet_ceiling_drops_a_run_when_pcr_disappears() {
-        let p = HlsPackager::new(HlsConfig {
-            segment_packets: 5,
-            window_segments: 6,
-            segment_duration_ms: 1000,
-        });
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 5,
+                window_segments: 6,
+                segment_duration_ms: 1000,
+            },
+            None,
+        );
         p.feed(&pat(PMT_PID));
         p.feed(&pmt(PMT_PID, VIDEO_PID));
         p.feed(&pcr_packet(VIDEO_PID, 0, true, false, 1));
@@ -1170,11 +1224,14 @@ mod tests {
 
     #[test]
     fn target_duration_never_decreases_as_segments_slide() {
-        let p = HlsPackager::new(HlsConfig {
-            segment_packets: 100,
-            window_segments: 1,
-            segment_duration_ms: 1000,
-        });
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 100,
+                window_segments: 1,
+                segment_duration_ms: 1000,
+            },
+            None,
+        );
         p.feed(&pat(PMT_PID));
         p.feed(&pmt(PMT_PID, VIDEO_PID));
         p.feed(&pcr_packet(VIDEO_PID, 0, true, false, 1));
@@ -1284,11 +1341,14 @@ mod tests {
 
     #[test]
     fn repeated_gaps_keep_distinct_markers_and_monotonic_sequences() {
-        let p = HlsPackager::new(HlsConfig {
-            segment_packets: 6,
-            window_segments: 5,
-            segment_duration_ms: 1000,
-        });
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                window_segments: 5,
+                segment_duration_ms: 1000,
+            },
+            None,
+        );
         feed_clean_run(&p, 0, 1);
         p.discontinuity();
         feed_clean_run(&p, 1_000_000, 1);
@@ -1306,11 +1366,14 @@ mod tests {
 
     #[test]
     fn configured_hls_settings_control_playlist_and_segments() {
-        let p = HlsPackager::new(HlsConfig {
-            segment_packets: 6,
-            window_segments: 2,
-            segment_duration_ms: 2500,
-        });
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                window_segments: 2,
+                segment_duration_ms: 2500,
+            },
+            None,
+        );
         p.feed(&pat(PMT_PID));
         p.feed(&pmt(PMT_PID, VIDEO_PID));
         p.feed(&video_access_packet(VIDEO_PID, 0));
@@ -1374,12 +1437,105 @@ mod tests {
 
     #[test]
     fn minimum_segment_packets_is_preserved_at_construction() {
-        let p = HlsPackager::new(HlsConfig {
-            segment_packets: 3,
-            window_segments: 2,
-            segment_duration_ms: 1000,
-        });
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 3,
+                window_segments: 2,
+                segment_duration_ms: 1000,
+            },
+            None,
+        );
 
         assert_eq!(p.max_segment_bytes, 3 * TS_PACKET);
+    }
+
+    #[test]
+    fn segments_replace_upstream_sdt_with_titled_sdt() {
+        use ace_media::mpegts::read_sdt_service_name;
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 100,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+            },
+            Some("HLS Title".to_string()),
+        );
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0)); // opens segment 0 with [PAT][PMT][SDT]
+        p.feed(&with_pid(packets(1), 0x0011)); // upstream SDT-PID packet -> must be filtered
+        p.feed(&video_access_packet(VIDEO_PID, 108_000)); // 1.2s elapsed -> emits segment 0
+        let seg = p.segment(0).expect("a segment should be emitted");
+        // The injected SDT carries the title.
+        assert_eq!(read_sdt_service_name(&seg).as_deref(), Some("HLS Title"));
+        // Exactly one SDT-PID packet in the segment: ours. The upstream one was dropped.
+        let sdt_packets = seg
+            .chunks(TS_PACKET)
+            .filter(|c| {
+                c.len() == TS_PACKET && ((((c[1] & 0x1f) as u16) << 8) | c[2] as u16) == 0x0011
+            })
+            .count();
+        assert_eq!(sdt_packets, 1);
+    }
+
+    #[test]
+    fn ceiling_lookahead_drops_upstream_sdt_on_titled_stream() {
+        use ace_media::mpegts::read_sdt_service_name;
+        // segment_packets: 4 -> the titled prefix [PAT][PMT][SDT] plus the opening keyframe fill
+        // the ceiling exactly, so subsequent packets are classified by `scan_lookahead`. An
+        // upstream SDT that reaches the lookahead must be dropped there: without the filter it
+        // would discard the whole ceiling-full run (an SDT is not a keyframe and carries no PCR),
+        // and segment 0 would never emit.
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 4,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+            },
+            Some("Ceiling Title".to_string()),
+        );
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0)); // fills ceiling with [PAT][PMT][SDT][keyframe]
+        p.feed(&with_pid(packets(1), 0x0011)); // upstream SDT -> arrives in lookahead, filtered
+        p.feed(&video_access_packet(VIDEO_PID, 108_000)); // 1.2s elapsed -> emits ceiling segment
+        let seg = p
+            .segment(0)
+            .expect("the ceiling-full segment emits, not discarded by the upstream SDT");
+        assert_eq!(seg.len(), 4 * TS_PACKET);
+        // The injected SDT carries the title, and it is the only SDT-PID packet in the segment.
+        assert_eq!(
+            read_sdt_service_name(&seg).as_deref(),
+            Some("Ceiling Title")
+        );
+        let sdt_packets = seg
+            .chunks(TS_PACKET)
+            .filter(|c| {
+                c.len() == TS_PACKET && ((((c[1] & 0x1f) as u16) << 8) | c[2] as u16) == 0x0011
+            })
+            .count();
+        assert_eq!(sdt_packets, 1);
+    }
+
+    #[test]
+    fn titled_stream_below_sdt_ceiling_serves_without_stalling() {
+        // segment_packets=3 can't fit [PAT][PMT][SDT] + keyframe; must fall back to untitled and
+        // still emit segments (no permanent stall), just without the injected title SDT.
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 3,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+            },
+            Some("Too Big".to_string()),
+        );
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        let seg = p
+            .segment(0)
+            .expect("a segment should still emit at a sub-SDT ceiling");
+        assert!(ace_media::mpegts::read_sdt_service_name(&seg).is_none());
     }
 }

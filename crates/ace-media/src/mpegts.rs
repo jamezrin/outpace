@@ -9,6 +9,18 @@ pub const TS_SYNC: u8 = 0x47;
 /// MPEG-TS packet length in bytes.
 pub const TS_PACKET_LEN: usize = 188;
 
+/// PID carrying the Service Description Table (and BAT).
+const SDT_PID: u16 = 0x0011;
+/// SDT `table_id` for the actual transport stream.
+const SDT_TABLE_ID: u8 = 0x42;
+/// DVB service descriptor tag.
+const SERVICE_DESCRIPTOR_TAG: u8 = 0x48;
+/// Fixed provider name advertised in every synthesized SDT.
+const SERVICE_PROVIDER_NAME: &[u8] = b"outpace";
+/// Largest `service_name` (in bytes) that still lets the whole SDT section fit one TS packet:
+/// 188 - 4 (TS header) - 1 (pointer_field) - 25 (fixed section fields + CRC) - provider length.
+const MAX_SERVICE_NAME_BYTES: usize = TS_PACKET_LEN - 4 - 1 - 25 - SERVICE_PROVIDER_NAME.len();
+
 /// Number of consecutive packets to check when probing for sync alignment.
 const PROBE_PACKETS: usize = 4;
 
@@ -122,6 +134,8 @@ pub struct VideoAccessPointState {
     video_codec: Option<VideoCodec>,
     cached_pat: Option<Vec<u8>>,
     cached_pmt: Option<Vec<u8>>,
+    service_name: Option<String>,
+    program_number: Option<u16>,
 }
 
 impl VideoAccessPointState {
@@ -129,8 +143,26 @@ impl VideoAccessPointState {
         Self::default()
     }
 
+    /// Like [`new`](Self::new) but injects a synthesized SDT `service_name` into every
+    /// [`table_prefix`](Self::table_prefix). `raw` is sanitized/bounded here; a title that
+    /// sanitizes to empty leaves the state untitled.
+    pub fn with_service_name(raw: Option<String>) -> Self {
+        Self {
+            service_name: raw.as_deref().and_then(sanitize_service_name),
+            ..Self::default()
+        }
+    }
+
+    pub fn has_service_name(&self) -> bool {
+        self.service_name.is_some()
+    }
+
     pub fn reset(&mut self) {
-        *self = Self::default();
+        let name = self.service_name.take();
+        *self = Self {
+            service_name: name,
+            ..Self::default()
+        };
     }
 
     pub fn observe(&mut self, packet: &[u8]) -> bool {
@@ -139,8 +171,9 @@ impl VideoAccessPointState {
         }
         let pid = ts_pid(packet);
         if pid == 0 {
-            if let Some(pmt_pid) = parse_pat_pmt_pid(packet) {
+            if let Some((program, pmt_pid)) = parse_pat_first_program(packet) {
                 self.cached_pat = Some(packet.to_vec());
+                self.program_number = Some(program);
                 if self.pmt_pid != Some(pmt_pid) {
                     self.cached_pmt = None;
                     self.video_pid = None;
@@ -159,9 +192,12 @@ impl VideoAccessPointState {
     }
 
     pub fn table_prefix(&self) -> Option<Vec<u8>> {
-        let mut prefix = Vec::with_capacity(TS_PACKET_LEN * 2);
+        let mut prefix = Vec::with_capacity(TS_PACKET_LEN * 3);
         prefix.extend_from_slice(self.cached_pat.as_ref()?);
         prefix.extend_from_slice(self.cached_pmt.as_ref()?);
+        if let (Some(name), Some(program)) = (self.service_name.as_deref(), self.program_number) {
+            prefix.extend_from_slice(&build_sdt(program, name));
+        }
         Some(prefix)
     }
 }
@@ -180,6 +216,7 @@ pub struct KeyframeGate {
     access: VideoAccessPointState,
     scanned: usize,
     max_scan_packets: usize,
+    filter_sdt: bool,
 }
 
 /// Default packet budget before the gate gives up looking for a keyframe and passes through.
@@ -200,7 +237,33 @@ impl KeyframeGate {
             access: VideoAccessPointState::new(),
             scanned: 0,
             max_scan_packets,
+            filter_sdt: false,
         }
+    }
+
+    /// Like [`new`](Self::new) but injects a synthesized SDT `service_name` at keyframe lock and
+    /// drops upstream SDT (PID 0x0011) packets from the post-lock passthrough, so the injected
+    /// title is the only SDT the client sees.
+    pub fn with_service_name(raw: Option<String>) -> Self {
+        let access = VideoAccessPointState::with_service_name(raw);
+        let filter_sdt = access.has_service_name();
+        KeyframeGate {
+            buf: Vec::new(),
+            locked: false,
+            access,
+            scanned: 0,
+            max_scan_packets: DEFAULT_MAX_SCAN_PACKETS,
+            filter_sdt,
+        }
+    }
+
+    /// Re-arm the gate (drop its buffer and re-require a keyframe) while preserving its
+    /// configured title, so a mid-stream reset keeps injecting/filtering the SDT.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.locked = false;
+        self.scanned = 0;
+        self.access.reset();
     }
 
     /// Append `data` (assumed 188-aligned TS) and return the bytes to forward to the client.
@@ -211,6 +274,10 @@ impl KeyframeGate {
         while i + TS_PACKET_LEN <= self.buf.len() {
             let pkt = &self.buf[i..i + TS_PACKET_LEN];
             if self.locked {
+                if self.filter_sdt && ts_pid(pkt) == SDT_PID {
+                    i += TS_PACKET_LEN;
+                    continue;
+                }
                 out.extend_from_slice(pkt);
                 i += TS_PACKET_LEN;
                 continue;
@@ -236,8 +303,8 @@ impl KeyframeGate {
     }
 }
 
-/// PID of a TS packet (13-bit).
-fn ts_pid(pkt: &[u8]) -> u16 {
+/// PID (13-bit) of a TS packet.
+pub fn ts_pid(pkt: &[u8]) -> u16 {
     (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16
 }
 
@@ -301,8 +368,8 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     })
 }
 
-/// Parse a PAT packet, returning the PMT PID of the first real program.
-fn parse_pat_pmt_pid(pkt: &[u8]) -> Option<u16> {
+/// Parse a PAT packet, returning `(program_number, pmt_pid)` of the first real program.
+fn parse_pat_first_program(pkt: &[u8]) -> Option<(u16, u16)> {
     let sec = psi_section_start(pkt)?;
     if *pkt.get(sec)? != 0x00 {
         return None; // table_id must be PAT
@@ -316,7 +383,7 @@ fn parse_pat_pmt_pid(pkt: &[u8]) -> Option<u16> {
         let program = ((pkt[pos] as u16) << 8) | pkt[pos + 1] as u16;
         let pid = (((pkt[pos + 2] & 0x1F) as u16) << 8) | pkt[pos + 3] as u16;
         if program != 0 {
-            return Some(pid);
+            return Some((program, pid));
         }
         pos += 4;
     }
@@ -365,6 +432,125 @@ fn psi_section_start(pkt: &[u8]) -> Option<usize> {
     let pointer = *pkt.get(po)? as usize;
     let sec = po + 1 + pointer;
     (sec < TS_PACKET_LEN).then_some(sec)
+}
+
+/// CRC-32/MPEG-2 (poly 0x04C11DB7, MSB-first, init 0xFFFFFFFF, no final XOR) — the CRC used by
+/// MPEG-2 PSI/SI sections. Canonical impl for the workspace; `ace-engine`'s RTMP→TS PSI
+/// synthesis reuses it rather than keeping its own copy.
+pub fn mpeg_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= (byte as u32) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Build a single-packet SDT on PID 0x0011 advertising `service_name` for `service_id`, with
+/// `service_provider_name = "outpace"`. `service_name` must already be sanitized/bounded by
+/// [`sanitize_service_name`] so the section fits one packet. Continuity counter is 0 (PSI
+/// tolerates a repeated CC on an unchanged section).
+fn build_sdt(service_id: u16, service_name: &str) -> [u8; TS_PACKET_LEN] {
+    let name = service_name.as_bytes();
+
+    // Service descriptor (0x48): service_type + provider + service_name.
+    let mut desc = vec![
+        SERVICE_DESCRIPTOR_TAG,
+        (3 + SERVICE_PROVIDER_NAME.len() + name.len()) as u8, // descriptor_length
+        0x01,                                                 // service_type = digital television
+        SERVICE_PROVIDER_NAME.len() as u8,
+    ];
+    desc.extend_from_slice(SERVICE_PROVIDER_NAME);
+    desc.push(name.len() as u8);
+    desc.extend_from_slice(name);
+
+    // SDT section (table_id through CRC).
+    let mut sec = Vec::new();
+    sec.push(SDT_TABLE_ID);
+    let section_length = 8 + 5 + desc.len() + 4; // tsid..reserved, loop header, descriptors, CRC
+    sec.push(0xF0 | ((section_length >> 8) as u8 & 0x0F)); // syntax=1 + reserved bits + len hi
+    sec.push((section_length & 0xFF) as u8);
+    sec.extend_from_slice(&[0x00, 0x01]); // transport_stream_id
+    sec.push(0xC1); // version 0, current_next_indicator = 1
+    sec.push(0x00); // section_number
+    sec.push(0x00); // last_section_number
+    sec.extend_from_slice(&[0xFF, 0x01]); // original_network_id
+    sec.push(0xFF); // reserved_future_use
+    sec.extend_from_slice(&service_id.to_be_bytes());
+    sec.push(0xFC); // reserved(6) + EIT_schedule=0 + EIT_present_following=0
+    let dll = desc.len();
+    sec.push(0x80 | ((dll >> 8) as u8 & 0x0F)); // running_status=running + free_CA=0 + len hi
+    sec.push((dll & 0xFF) as u8);
+    sec.extend_from_slice(&desc);
+    let crc = mpeg_crc32(&sec);
+    sec.extend_from_slice(&crc.to_be_bytes());
+
+    // Wrap into a payload-only TS packet, PUSI set, pointer_field 0, rest padded 0xFF.
+    let mut pkt = [0xFFu8; TS_PACKET_LEN];
+    pkt[0] = TS_SYNC;
+    pkt[1] = 0x40 | ((SDT_PID >> 8) as u8 & 0x1F); // PUSI = 1
+    pkt[2] = (SDT_PID & 0xFF) as u8;
+    pkt[3] = 0x10; // AFC = 01 (payload only), CC = 0
+    pkt[4] = 0x00; // pointer_field
+    pkt[5..5 + sec.len()].copy_from_slice(&sec);
+    pkt
+}
+
+/// Turn a raw title into an SDT `service_name`: trim, strip control characters, and byte-cap on a
+/// UTF-8 boundary so the whole SDT section fits one TS packet. Returns `None` if nothing remains.
+fn sanitize_service_name(raw: &str) -> Option<String> {
+    let stripped: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
+    let stripped = stripped.trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    let mut end = stripped.len().min(MAX_SERVICE_NAME_BYTES);
+    while !stripped.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(stripped[..end].to_string())
+}
+
+/// Read the first SDT `service_name` from a run of 188-aligned TS packets, if present.
+pub fn read_sdt_service_name(ts: &[u8]) -> Option<String> {
+    for pkt in ts.chunks_exact(TS_PACKET_LEN) {
+        if pkt[0] != TS_SYNC || ts_pid(pkt) != SDT_PID {
+            continue;
+        }
+        let Some(sec) = psi_section_start(pkt) else {
+            continue;
+        };
+        if *pkt.get(sec)? != SDT_TABLE_ID {
+            continue;
+        }
+        // sec + table_id(1) + section_length(2) + tsid..reserved(8) = first service loop entry.
+        let mut pos = sec + 3 + 8;
+        pos += 3; // service_id(2) + EIT flags(1)
+        let dll = (((*pkt.get(pos)? & 0x0F) as usize) << 8) | *pkt.get(pos + 1)? as usize;
+        pos += 2;
+        let end = (pos + dll).min(TS_PACKET_LEN);
+        while pos + 2 <= end {
+            let tag = pkt[pos];
+            let len = pkt[pos + 1] as usize;
+            if tag == SERVICE_DESCRIPTOR_TAG {
+                let mut p = pos + 2 + 1; // skip service_type
+                let provlen = *pkt.get(p)? as usize;
+                p += 1 + provlen;
+                let namelen = *pkt.get(p)? as usize;
+                p += 1;
+                let name = pkt.get(p..p + namelen)?;
+                return String::from_utf8(name.to_vec()).ok();
+            }
+            pos += 2 + len;
+        }
+    }
+    None
 }
 
 impl Default for KeyframeGate {
@@ -740,6 +926,65 @@ mod tests {
         assert_eq!(*first_video, &data[KEYFRAME2..KEYFRAME2 + TS_PACKET_LEN]);
     }
 
+    /// An upstream SDT packet on PID 0x0011 advertising "Upstream" (a generic passthrough SDT).
+    fn upstream_sdt() -> Vec<u8> {
+        build_sdt(1, "Upstream").to_vec()
+    }
+
+    #[test]
+    fn keyframe_gate_replaces_upstream_sdt_with_titled_sdt() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".to_string()));
+        let mut input = Vec::new();
+        input.extend_from_slice(&pat(PMT_PID));
+        input.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        input.extend_from_slice(&upstream_sdt());
+        input.extend_from_slice(&random_access_packet(VIDEO_PID)); // keyframe -> lock
+        input.extend_from_slice(&upstream_sdt()); // must be filtered post-lock
+        let out = gate.push(&input);
+        assert_eq!(read_sdt_service_name(&out).as_deref(), Some("Titled"));
+        // No upstream "Upstream" SDT survives anywhere in the output.
+        assert!(!out
+            .chunks_exact(TS_PACKET_LEN)
+            .any(|p| read_sdt_service_name(p).as_deref() == Some("Upstream")));
+    }
+
+    #[test]
+    fn keyframe_gate_untitled_passes_upstream_sdt_through() {
+        let mut gate = KeyframeGate::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(&pat(PMT_PID));
+        input.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        input.extend_from_slice(&random_access_packet(VIDEO_PID));
+        input.extend_from_slice(&upstream_sdt());
+        let out = gate.push(&input);
+        assert_eq!(read_sdt_service_name(&out).as_deref(), Some("Upstream"));
+    }
+
+    #[test]
+    fn keyframe_gate_reset_preserves_title_and_rearms() {
+        let mut gate = KeyframeGate::with_service_name(Some("Kept".to_string()));
+        // Lock on a first keyframe.
+        let mut first = Vec::new();
+        first.extend_from_slice(&pat(PMT_PID));
+        first.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        first.extend_from_slice(&random_access_packet(VIDEO_PID));
+        assert_eq!(
+            read_sdt_service_name(&gate.push(&first)).as_deref(),
+            Some("Kept")
+        );
+        // Reset re-arms (drops lock) but must keep the title: the next locked output injects
+        // the SDT again.
+        gate.reset();
+        let mut second = Vec::new();
+        second.extend_from_slice(&pat(PMT_PID));
+        second.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        second.extend_from_slice(&random_access_packet(VIDEO_PID));
+        assert_eq!(
+            read_sdt_service_name(&gate.push(&second)).as_deref(),
+            Some("Kept")
+        );
+    }
+
     #[test]
     fn aligned_stream_has_sync_offset_zero() {
         let mut s = packet(0);
@@ -835,6 +1080,96 @@ mod tests {
             r.buf.len() <= MAX_UNSYNCED_TAIL,
             "unconfirmed tail buffer must be capped to the sync lookahead, got {} bytes",
             r.buf.len()
+        );
+    }
+
+    #[test]
+    fn mpeg_crc32_matches_canonical_check_value() {
+        // Canonical CRC-32/MPEG-2 check value for the ASCII string "123456789".
+        assert_eq!(mpeg_crc32(b"123456789"), 0x0376_E6E7);
+    }
+
+    #[test]
+    fn build_sdt_is_one_packet_with_correct_service_fields_and_crc() {
+        let pkt = build_sdt(0x0001, "EUROSPORT 1");
+        assert_eq!(pkt.len(), TS_PACKET_LEN);
+        assert_eq!(pkt[0], TS_SYNC);
+        assert_eq!(pid_of(&pkt), 0x0011); // SDT PID
+        let sec = psi_section_start(&pkt).unwrap();
+        assert_eq!(pkt[sec], 0x42); // table_id = SDT (actual TS)
+                                    // section_length spans from just after the length field through the CRC.
+        let section_length = (((pkt[sec + 1] & 0x0F) as usize) << 8) | pkt[sec + 2] as usize;
+        let crc_at = sec + 3 + section_length - 4;
+        let computed = mpeg_crc32(&pkt[sec..crc_at]);
+        let stored = u32::from_be_bytes(pkt[crc_at..crc_at + 4].try_into().unwrap());
+        assert_eq!(computed, stored);
+        assert_eq!(read_sdt_service_name(&pkt).as_deref(), Some("EUROSPORT 1"));
+    }
+
+    #[test]
+    fn sanitize_service_name_strips_control_chars_and_trims() {
+        assert_eq!(
+            sanitize_service_name("  Synthetic Demo\r\n\0 Channel  ").as_deref(),
+            Some("Synthetic Demo Channel")
+        );
+    }
+
+    #[test]
+    fn sanitize_service_name_rejects_empty_and_whitespace() {
+        assert_eq!(sanitize_service_name(""), None);
+        assert_eq!(sanitize_service_name(" \r\n\t "), None);
+    }
+
+    #[test]
+    fn sanitize_service_name_rejects_all_control_chars() {
+        assert_eq!(sanitize_service_name("\0\u{1}\u{2}"), None);
+    }
+
+    #[test]
+    fn sanitize_service_name_byte_caps_on_char_boundary() {
+        // Multibyte chars must never be split, and the result must fit build_sdt (one packet).
+        let name = sanitize_service_name(&"é".repeat(200)).unwrap();
+        assert!(name.len() <= MAX_SERVICE_NAME_BYTES);
+        assert!(name.chars().all(|c| c == 'é'));
+        // Proves the cap keeps the SDT within a single TS packet.
+        assert_eq!(build_sdt(1, &name).len(), TS_PACKET_LEN);
+    }
+
+    #[test]
+    fn table_prefix_appends_sdt_with_pat_program_number_when_titled() {
+        // PMT program_number is 1 (see the `pat`/`pmt` helpers).
+        let mut state = VideoAccessPointState::with_service_name(Some("My Channel".to_string()));
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+        let prefix = state.table_prefix().unwrap();
+        // PAT + PMT + one SDT packet.
+        assert_eq!(prefix.len(), TS_PACKET_LEN * 3);
+        assert_eq!(
+            read_sdt_service_name(&prefix).as_deref(),
+            Some("My Channel")
+        );
+    }
+
+    #[test]
+    fn table_prefix_omits_sdt_when_untitled() {
+        let mut state = VideoAccessPointState::new();
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+        let prefix = state.table_prefix().unwrap();
+        assert_eq!(prefix.len(), TS_PACKET_LEN * 2);
+        assert!(read_sdt_service_name(&prefix).is_none());
+    }
+
+    #[test]
+    fn reset_preserves_service_name() {
+        let mut state = VideoAccessPointState::with_service_name(Some("Keep Me".to_string()));
+        state.reset();
+        assert!(state.has_service_name());
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+        assert_eq!(
+            read_sdt_service_name(&state.table_prefix().unwrap()).as_deref(),
+            Some("Keep Me")
         );
     }
 

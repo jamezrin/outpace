@@ -217,7 +217,7 @@ fn pat_section() -> Vec<u8> {
         0xf0 | ((PMT_PID >> 8) as u8 & 0x1f),
         PMT_PID as u8,
     ];
-    let crc = mpeg_crc32(&section[1..]);
+    let crc = ace_media::mpegts::mpeg_crc32(&section[1..]);
     section.extend_from_slice(&crc.to_be_bytes());
     section
 }
@@ -249,24 +249,9 @@ fn pmt_section() -> Vec<u8> {
         0xf0,
         0x00,
     ];
-    let crc = mpeg_crc32(&section[1..]);
+    let crc = ace_media::mpegts::mpeg_crc32(&section[1..]);
     section.extend_from_slice(&crc.to_be_bytes());
     section
-}
-
-fn mpeg_crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffffffffu32;
-    for &byte in bytes {
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
-            if (crc & 0x80000000) != 0 {
-                crc = (crc << 1) ^ 0x04c11db7;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc
 }
 
 #[cfg(test)]
