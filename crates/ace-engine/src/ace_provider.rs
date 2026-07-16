@@ -1542,9 +1542,23 @@ impl Continuity {
         resume
     }
 
+    /// Whether a peer advertising `window` can still serve the piece we need next.
+    ///
+    /// A window that already covers the piece trivially can. The subtle case is the live edge:
+    /// once we are caught up, `next_needed` is the piece *after* the newest one the source has
+    /// produced, so no peer in the swarm can advertise it yet. Requiring coverage there rejects
+    /// every peer at once and leaves the pool reconnecting into "no usable upstreams" until some
+    /// advertisement drifts forward — a multi-second output gap on a stream that was healthy.
+    /// A peer that is current with the live edge is precisely the one to wait on: it delivers the
+    /// piece via a live HAVE as soon as the source produces it. A peer whose window ends short of
+    /// the edge is genuinely behind and still rejected.
     fn window_can_resume(&self, window: &LivePosition) -> bool {
         let needed = i64::try_from(self.reasm.next_needed()).unwrap_or(i64::MAX);
-        window.max_piece >= needed
+        if window.max_piece >= needed {
+            return true;
+        }
+        let head = i64::try_from(self.head).unwrap_or(i64::MAX);
+        needed > head && window.max_piece >= head
     }
 
     fn note_chunk(&mut self, piece: u64, chunk: u16, chunks_per_piece: u16) -> bool {
@@ -4016,6 +4030,44 @@ mod tests {
 
         assert!(!c.window_can_resume(&stale));
         assert!(c.window_can_resume(&covering));
+    }
+
+    #[test]
+    fn live_edge_peer_stays_usable_while_the_next_needed_piece_does_not_exist_yet() {
+        let (mut c, _start) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
+        // Caught up to the live edge: the piece we want next is one past the newest piece the
+        // source has produced, so no peer in the swarm can advertise it yet.
+        c.reasm.skip_to(150);
+        assert_eq!(c.reasm.next_needed(), 150);
+        assert_eq!(c.head, 149);
+
+        let at_live_edge = LivePosition {
+            min_piece: 100,
+            max_piece: 149,
+            position: 149,
+            distance_from_source: 1,
+        };
+        let lagging = LivePosition {
+            min_piece: 100,
+            max_piece: 120,
+            position: 120,
+            distance_from_source: 1,
+        };
+
+        assert!(
+            c.window_can_resume(&at_live_edge),
+            "a peer current with the live edge must stay usable while we wait on the next piece"
+        );
+        assert!(
+            !c.window_can_resume(&lagging),
+            "a peer far behind the live edge still cannot serve the piece we need"
+        );
     }
 
     #[test]

@@ -218,7 +218,13 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_DATA_DIR` - persistent identity/cache root, default platform data dir
   plus `outpace`.
 - `OUTPACE_PEER_LISTEN` - inbound peer listener bind, default `0.0.0.0:8621`.
-- `OUTPACE_SEED_STORE_BYTES` - byte budget for retained piece data (sizes both cache backends).
+- `OUTPACE_SEED_STORE_BYTES` - byte budget for retained piece data (sizes both cache backends),
+  default `134217728` (128 MiB). A hard safety cap; on a live stream
+  `OUTPACE_SEED_RETENTION_SECS` is the primary limiter.
+- `OUTPACE_SEED_RETENTION_SECS` - age bound (seconds) for a live reseed store, default `45`:
+  retain roughly this much recent downloaded data for reseeding instead of filling
+  `OUTPACE_SEED_STORE_BYTES`, so RAM tracks bitrate rather than always growing to the byte cap.
+  `0` disables the age bound (byte-only, the pre-0.2 behavior). VOD stores are always byte-only.
 - `OUTPACE_CACHE_TYPE` - where the seed store keeps piece data: `memory` (default) or `disk`.
   `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
 - `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per served stream; see
@@ -227,7 +233,9 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
 - `OUTPACE_REQUEST_TIMEOUT_MS` - per-piece request timeout before re-requesting or skipping an
-  evicted gap, default `4000`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`.
+  evicted gap, default `1500`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`. A live
+  player drains in realtime, so raising this leaves a stuck piece to be healed by the much slower
+  `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` pool teardown instead — a visible playback gap.
 - `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` - whole-upstream no-progress timeout before reconnecting,
   default `12000`.
 - `OUTPACE_REQUEST_CHECK_INTERVAL_MS` - request timeout sweep interval, default `1000`; must be
@@ -240,7 +248,10 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_MAX_REASM_PIECES_AHEAD` - max pieces accepted ahead of the emit cursor, default `512`;
   must be at least `OUTPACE_MAX_PIECE_ADVANCE`, max `65536`.
 - `OUTPACE_HLS_SEGMENT_PACKETS` - hard MPEG-TS packet ceiling per HLS segment and packet-count
-  fallback for streams without usable PCR, default `16384` (about 3.1 MB).
+  fallback for streams without usable PCR, default `65536` (about 12.3 MB). This is a
+  memory-safety bound, not the primary cut mechanism: segments normally cut on a keyframe once
+  the target duration elapses, so the ceiling must comfortably hold one target-duration segment
+  of a peaky high-bitrate stream (a 2160p HEVC GOP can burst well past its average).
 - `OUTPACE_HLS_WINDOW_SEGMENTS` - retained HLS live window size, default `6`.
 - `OUTPACE_HLS_SEGMENT_DURATION_MS` - requested PCR-timed HLS segment duration, default `1000`.
 - `OUTPACE_MAX_UNCHOKED` - max simultaneously-unchoked peers per served stream (default 8). Wired
@@ -250,7 +261,7 @@ Environment variables parsed by the daemon include:
   seed-registry entry (one with no live producer lease) is force-evicted by the reaper. A backstop
   only — normal teardown rides the lease drop, and entries held by a live producer or a broadcast
   are never reaped.
-- `OUTPACE_MAX_INBOUND` - inbound peer connection limit.
+- `OUTPACE_MAX_INBOUND` - inbound peer connection limit, default `64`.
 - `OUTPACE_ENABLE_SEEDING` - reciprocal upload gate over outbound leech connections
   (answering peers' chunk requests). Self-announce is gated on `OUTPACE_ENABLE_INBOUND`.
 - `OUTPACE_ENABLE_INBOUND` (default: on) - inbound peer serving (S2) gate. On by default,
