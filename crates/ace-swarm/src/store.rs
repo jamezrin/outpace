@@ -36,6 +36,11 @@ pub struct PieceStore {
     /// every retained piece has an entry, and eviction removes it. Only populated when `retention`
     /// is set, to avoid the bookkeeping cost on byte-only stores.
     first_seen: BTreeMap<u64, Instant>,
+    /// Newest insertion instant observed. Age eviction measures each piece against this, not against
+    /// wall-clock now, so the store keeps the last `retention` of *stream* content: a playback stall
+    /// (no new inserts) does not drain the reseed cache, and out-of-order arrival can't make the
+    /// window collapse. Only tracked when `retention` is set.
+    newest_seen: Option<Instant>,
 }
 
 /// How a [`PieceStore`] keeps its piece data. Selected once at construction.
@@ -310,6 +315,7 @@ impl PieceStore {
             backend,
             retention: None,
             first_seen: BTreeMap::new(),
+            newest_seen: None,
         })
     }
 
@@ -385,6 +391,7 @@ impl PieceStore {
         let stored = self.backend.put(piece, chunk, header, data);
         if self.retention.is_some() {
             self.first_seen.entry(piece).or_insert(now);
+            self.newest_seen = Some(self.newest_seen.map_or(now, |m| m.max(now)));
         }
         self.cur_bytes -= stored.removed;
         self.cur_bytes += stored.added;
@@ -396,12 +403,14 @@ impl PieceStore {
             };
             self.cur_bytes -= freed;
         }
-        // Age eviction: drop the oldest pieces once they fall outside the retention window. Pieces
-        // arrive in increasing index/time order on the live path, so the lowest-index piece is also
-        // the oldest — the same order the byte-budget loop evicts in.
-        if let Some(retention) = self.retention {
+        // Age eviction: the store evicts lowest-index-first (its FIFO contract), so we drop from the
+        // oldest end while the oldest retained piece is more than `retention` behind the newest
+        // piece we have seen. Measuring against `newest_seen` rather than wall-clock keeps the window
+        // pinned to recent *stream* content: a stall never drains the cache, and an out-of-order
+        // late arrival can't shrink the window (its own timestamp is recent, so it is kept).
+        if let (Some(retention), Some(newest)) = (self.retention, self.newest_seen) {
             while let Some((_, &seen)) = self.first_seen.iter().next() {
-                if now.saturating_duration_since(seen) < retention {
+                if newest.saturating_duration_since(seen) < retention {
                     break;
                 }
                 let Some(freed) = self.evict_lowest_tracked() else {
@@ -552,6 +561,22 @@ mod tests {
             s.window(),
             Some((2, 3)),
             "byte ceiling still caps the store when everything is inside the window"
+        );
+    }
+
+    #[test]
+    fn retention_window_survives_out_of_order_arrival() {
+        // A late-arriving lower-index piece is recent, so it (and the slightly older higher-index
+        // piece already held) stay within the window — the window is measured against the newest
+        // piece seen, not the lowest index's wall-clock age.
+        let mut s = store(1 << 20).with_retention(Duration::from_secs(30));
+        let t0 = Instant::now();
+        put_full_at(&mut s, t0, 5);
+        put_full_at(&mut s, t0 + Duration::from_secs(5), 4);
+        assert_eq!(
+            s.window(),
+            Some((4, 5)),
+            "recent out-of-order pieces are both retained"
         );
     }
 

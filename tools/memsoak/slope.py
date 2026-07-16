@@ -58,9 +58,12 @@ def main():
         rss = [_f(r["rss_kb"]) for r in proc]
         rss_v = [v for v in rss if v is not None]
         if rss_v:
-            first, last, peak = rss[0], rss[-1], max(rss_v)
+            # first/last from the valid samples, not the raw list: a transiently unreadable
+            # /proc sample (e.g. as the daemon exits) leaves None at an end and must not crash.
+            first, last, peak = rss_v[0], rss_v[-1], max(rss_v)
             slope_kb_s = linfit(el, rss)  # kB per second
-            emit(f"samples: {len(proc)}  duration: {el[-1]:.0f}s")
+            el_v = [e for e in el if e is not None]
+            emit(f"samples: {len(proc)}  duration: {(el_v[-1] if el_v else 0):.0f}s")
             emit(f"RSS  first={first/1024:.1f}MB  last={last/1024:.1f}MB  "
                  f"peak={peak/1024:.1f}MB  delta={(last-first)/1024:+.1f}MB")
             if slope_kb_s is not None:

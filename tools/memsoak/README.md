@@ -36,7 +36,7 @@ Results land in `tools/memsoak/results/<timestamp>-<label>-<mode>/` (`process.cs
 
 ## Reading the output
 
-`/debug/memstats` (jemalloc, on by default on non-Windows builds) is the truth layer:
+`/debug/memstats` (jemalloc, on by default on 64-bit non-MSVC targets) is the truth layer:
 
 - **`allocated` flat over time** → no leak; the live heap is bounded.
 - **`allocated` climbs without bound** → real leak; localize with subsystem toggles.

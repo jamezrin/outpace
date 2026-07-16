@@ -437,13 +437,17 @@ impl BroadcastState {
 /// retention (`resident - allocated` grows). Without the feature it only reports
 /// that profiling is off; process RSS is still observable via `/proc`.
 async fn debug_memstats() -> Response {
-    #[cfg(not(target_env = "msvc"))]
+    #[cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))]
     let body = {
         use tikv_jemalloc_ctl::{epoch, stats};
-        let _ = epoch::advance();
-        let read = |r: Result<usize, tikv_jemalloc_ctl::Error>| r.map(|v| v as u64).unwrap_or(0);
+        // Refresh the cached stats; report the failure rather than silently returning stale values.
+        let epoch_err = epoch::advance().err().map(|e| e.to_string());
+        // A failed counter read serializes as JSON null, not 0 — a zeroed probe must not look like
+        // a valid "0 bytes" reading.
+        let read = |r: Result<usize, tikv_jemalloc_ctl::Error>| r.ok().map(|v| v as u64);
         json!({
             "allocator": "jemalloc",
+            "epoch_error": epoch_err,
             "allocated": read(stats::allocated::read()),
             "active": read(stats::active::read()),
             "resident": read(stats::resident::read()),
@@ -451,7 +455,7 @@ async fn debug_memstats() -> Response {
             "mapped": read(stats::mapped::read()),
         })
     };
-    #[cfg(target_env = "msvc")]
+    #[cfg(not(all(not(target_env = "msvc"), target_pointer_width = "64")))]
     let body = json!({ "allocator": "system" });
     Json(body).into_response()
 }

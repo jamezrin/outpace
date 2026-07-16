@@ -81,18 +81,19 @@ for id in "${ID_ARR[@]}"; do [[ -n "$id" ]] && start_player "$id" || true; done
 
 frames_for() { awk -F= '/^frame=/{f=$2} END{print (f==""?0:f)}' "${PROG[$1]:-/dev/null}" 2>/dev/null || echo 0; }
 
-mem_kb() {  # container working-set in kB via cgroup (all processes)
-  local cid stat
+mem_kb() {  # container ANONYMOUS memory in kB (all processes), for a fair heap-to-heap A/B.
+  # `anon` from cgroup memory.stat is anonymous (heap/stack) pages only — it excludes the
+  # reclaimable file-backed page cache that Acestream's on-disk HLS segments would otherwise
+  # inflate. This is the counterpart of outpace's RssAnon.
+  local cid
   cid=$(docker inspect -f '{{.Id}}' "$CONTAINER" 2>/dev/null) || { echo ""; return; }
   for base in /sys/fs/cgroup/system.slice/docker-$cid.scope /sys/fs/cgroup/docker/$cid; do
-    if [[ -f "$base/memory.current" ]]; then
-      local cur inact
-      cur=$(cat "$base/memory.current" 2>/dev/null || echo 0)
-      inact=$(awk '/inactive_file /{print $2}' "$base/memory.stat" 2>/dev/null || echo 0)
-      echo $(( (cur - inact) / 1024 )); return
+    if [[ -f "$base/memory.stat" ]]; then
+      awk '/^anon /{print int($2/1024); found=1} END{if(!found) print ""}' "$base/memory.stat" 2>/dev/null
+      return
     fi
   done
-  # fallback: docker stats
+  # fallback: docker stats working set (includes some file cache)
   docker stats --no-stream --format '{{.MemUsage}}' "$CONTAINER" 2>/dev/null \
     | awk '{print $1}' | sed 's/MiB//;s/GiB/*1024/' | bc 2>/dev/null | awk '{print int($1*1024)}'
 }

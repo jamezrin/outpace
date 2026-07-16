@@ -113,13 +113,17 @@ pub(crate) fn build_piece_store(
     cache_dir: &Path,
     infohash: &[u8; 20],
 ) -> PieceStore {
-    let with_retention = |store: PieceStore| match retention {
-        Some(window) => store.with_retention(window),
-        None => store,
-    };
     match cache_type {
+        // Age retention applies to the in-RAM store only. Disk mode exists to retain *more* reseed
+        // data than RAM allows, and its `shared_put_chunk_with_header` write path bypasses the
+        // age-eviction code entirely, so a retention window there would be silently ineffective —
+        // disk stores stay byte-only by design.
         CacheType::Memory => {
-            with_retention(PieceStore::new(piece_length, chunk_length, max_bytes))
+            let store = PieceStore::new(piece_length, chunk_length, max_bytes);
+            match retention {
+                Some(window) => store.with_retention(window),
+                None => store,
+            }
         }
         CacheType::Disk => {
             let dir = cache_dir.join(disk_store_subdir(infohash));
@@ -129,7 +133,6 @@ pub(crate) fn build_piece_store(
                 max_bytes,
                 BackendKind::Disk { dir: dir.clone() },
             )
-            .map(with_retention)
             .unwrap_or_else(|e| {
                 let failures = DISK_STORE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
                 crate::alog!(
