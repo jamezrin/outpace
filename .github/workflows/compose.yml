@@ -41,6 +41,8 @@ jobs:
         platform: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.run_arm64 && '["linux/amd64", "linux/arm64"]' || '["linux/amd64"]') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU
         if: matrix.platform != 'linux/amd64'

@@ -13,8 +13,8 @@ should expect less throughput and fewer practical concurrent sessions than on 64
 The automatic portability gate cross-compiles the release binary for ARMv7. This catches Rust,
 native dependency, linker, and target-ABI incompatibilities without paying the cost of running a
 full build and test suite through CPU emulation. The workflow also provides a manually enabled
-QEMU container smoke that starts the published container shape with inbound serving disabled and
-checks `/healthz` when runtime evidence is needed.
+QEMU container smoke that builds and tests the release container shape locally from the Dockerfile,
+starts it with inbound serving disabled, and checks `/healthz` when runtime evidence is needed.
 
 The initial dependency and source audit found no ARMv7-specific blocker in the crypto/bigint,
 atomics, Tokio, RTMP, tracker, or NAT stacks. Transport geometry already caps individual piece
