@@ -227,7 +227,9 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
 - `OUTPACE_REQUEST_TIMEOUT_MS` - per-piece request timeout before re-requesting or skipping an
-  evicted gap, default `4000`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`.
+  evicted gap, default `1500`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`. A live
+  player drains in realtime, so raising this leaves a stuck piece to be healed by the much slower
+  `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` pool teardown instead — a visible playback gap.
 - `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` - whole-upstream no-progress timeout before reconnecting,
   default `12000`.
 - `OUTPACE_REQUEST_CHECK_INTERVAL_MS` - request timeout sweep interval, default `1000`; must be
