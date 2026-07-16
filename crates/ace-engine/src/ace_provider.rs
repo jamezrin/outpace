@@ -1466,6 +1466,8 @@ struct Continuity {
     /// and we skip forward rather than freeze.
     next_needed_since: Instant,
     head: u64,
+    /// Pieces behind the live edge to leave as a cushion when re-syncing forward to live.
+    prefetch: u64,
     emitted: u64,
     next_log: u64,
 }
@@ -1506,6 +1508,7 @@ impl Continuity {
                 requested_at: HashMap::new(),
                 next_needed_since: Instant::now(),
                 head: max_piece,
+                prefetch,
                 emitted: 0,
                 next_log: 1 << 20,
             },
@@ -1595,6 +1598,30 @@ impl Continuity {
         self.received_chunks.retain(|&p, _| p >= floor);
         self.next_needed_since = now;
         Some(floor)
+    }
+
+    /// If the cursor has fallen more than the reassembler's look-ahead behind the live edge
+    /// (`head`), re-sync forward to near the live edge. Past that lag, contiguous catch-up is
+    /// impossible — the reassembler can't even buffer pieces up to `head` — so grinding the backlog
+    /// only falls further behind a live stream. Unlike [`skip_evicted_gap`](Self::skip_evicted_gap),
+    /// this fires even while peers' windows nominally cover the stuck piece: that is exactly the
+    /// wedge where a peer advertises a piece it never actually delivers and the cursor freezes
+    /// forever (the whole-pool stale timer keeps resetting on chunks for pieces buffered ahead).
+    /// Returns the skip target if it re-synced. The forward jump is a logged discontinuity, the
+    /// live-stream equivalent of dropping to the live point.
+    fn skip_far_behind_live(&mut self, now: Instant) -> Option<u64> {
+        let next = self.reasm.next_needed();
+        if self.head.saturating_sub(next) <= self.live_recovery.max_reasm_pieces_ahead {
+            return None;
+        }
+        let target = self.head.saturating_sub(self.prefetch).max(next + 1);
+        self.reasm.skip_to(target);
+        self.arm_output_gate();
+        self.active_peers.prune_below(target);
+        self.requested_at.retain(|&p, _| p >= target);
+        self.received_chunks.retain(|&p, _| p >= target);
+        self.next_needed_since = now;
+        Some(target)
     }
 
     fn arm_output_gate(&mut self) {
@@ -2427,6 +2454,13 @@ async fn retransmit_stalled_requests(
     now: Instant,
 ) -> Vec<SocketAddrV4> {
     let mut changed = false;
+    let head = continuity.head;
+    if let Some(target) = continuity.skip_far_behind_live(now) {
+        crate::alog!(
+            "[ace] cursor fell too far behind live edge {head}; re-syncing forward to piece {target}"
+        );
+        changed = true;
+    }
     if let Some(floor) = continuity.skip_evicted_gap(now) {
         crate::alog!(
             "[ace] next needed piece evicted from all upstream windows; skipping ahead to {floor}"
@@ -3663,6 +3697,43 @@ mod tests {
         let now = c.next_needed_since + default_live_recovery().request_timeout();
         assert_eq!(c.skip_evicted_gap(now), Some(105));
         assert_eq!(c.reasm.next_needed(), 105);
+    }
+
+    #[test]
+    fn skip_far_behind_live_resyncs_forward_even_when_peers_cover_the_cursor() {
+        // Reproduces the production wedge: the cursor is stuck on a piece a peer's window still
+        // covers (so `skip_evicted_gap` refuses to skip), while the live edge has raced far ahead.
+        let lr = LiveRecoveryConfig {
+            max_reasm_pieces_ahead: 16,
+            ..LiveRecoveryConfig::default()
+        };
+        let (mut c, _) = Continuity::fresh(&info(), 100, 110, PREFETCH_PIECES, lr); // next=102, head=110
+        c.register_active_peer(1, test_addr(), win(100, 10_000)); // still "covers" 102
+        c.set_peer_unchoked(1, true);
+        // Live edge is now well beyond next + max_reasm_pieces_ahead (102 + 16).
+        c.head = 5_000;
+        // `skip_evicted_gap` would never fire here (a peer covers the cursor).
+        assert_eq!(
+            c.skip_evicted_gap(c.next_needed_since + Duration::from_secs(60)),
+            None
+        );
+        // The live-edge re-sync jumps forward to head - prefetch regardless of coverage.
+        let target = c.skip_far_behind_live(c.next_needed_since);
+        assert_eq!(target, Some(5_000 - PREFETCH_PIECES));
+        assert_eq!(c.reasm.next_needed(), 5_000 - PREFETCH_PIECES);
+    }
+
+    #[test]
+    fn skip_far_behind_live_stays_put_within_the_lookahead_window() {
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            110,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        ); // next=102, head=110, lag=8 << max_reasm_pieces_ahead
+        assert_eq!(c.skip_far_behind_live(c.next_needed_since), None);
+        assert_eq!(c.reasm.next_needed(), 102);
     }
 
     #[test]
