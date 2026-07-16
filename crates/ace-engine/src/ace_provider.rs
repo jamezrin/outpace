@@ -81,8 +81,15 @@ const DEFAULT_ACE_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announc
 /// How long a resolved content-id → `StreamInfo` stays cached.
 const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// Bytes of recently-downloaded data retained per active peer connection for reseeding.
+/// Byte ceiling for an infohash's shared reseed store. With `SEED_STORE_RETENTION` set this is a
+/// hard safety cap; the age bound is the primary limiter on a live stream.
 const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Default age bound for a live seed store: retain roughly the last 45s of downloaded pieces for
+/// reseeding rather than filling `SEED_STORE_BYTES`. This tracks bitrate (window × rate) instead of
+/// a fixed byte cap, so idle/steady RAM stays a fraction of the old default while still covering the
+/// recent pieces live peers actually re-request. VOD stores keep the byte-only policy (`None`).
+const SEED_STORE_RETENTION: Duration = Duration::from_secs(45);
 
 /// Disk mode promises not to turn the configured on-disk budget into an equal per-stream RAM
 /// allocation. If a per-stream directory becomes unavailable after startup, keep playback alive
@@ -101,12 +108,23 @@ pub(crate) fn build_piece_store(
     piece_length: u64,
     chunk_length: u64,
     max_bytes: u64,
+    retention: Option<Duration>,
     cache_type: CacheType,
     cache_dir: &Path,
     infohash: &[u8; 20],
 ) -> PieceStore {
     match cache_type {
-        CacheType::Memory => PieceStore::new(piece_length, chunk_length, max_bytes),
+        // Age retention applies to the in-RAM store only. Disk mode exists to retain *more* reseed
+        // data than RAM allows, and its `shared_put_chunk_with_header` write path bypasses the
+        // age-eviction code entirely, so a retention window there would be silently ineffective —
+        // disk stores stay byte-only by design.
+        CacheType::Memory => {
+            let store = PieceStore::new(piece_length, chunk_length, max_bytes);
+            match retention {
+                Some(window) => store.with_retention(window),
+                None => store,
+            }
+        }
         CacheType::Disk => {
             let dir = cache_dir.join(disk_store_subdir(infohash));
             PieceStore::with_backend(
@@ -144,6 +162,8 @@ fn disk_store_subdir(infohash: &[u8; 20]) -> String {
 struct SeedConfig {
     registry: SeedRegistry,
     store_bytes: u64,
+    /// Age bound for the live seed store (primary limiter; `store_bytes` is the hard ceiling).
+    store_retention: Option<Duration>,
     enabled: bool,
     /// Pieces behind the live edge the fresh follower starts at (playback cushion).
     prefetch_pieces: u64,
@@ -167,6 +187,8 @@ pub struct AceProvider {
     resolve_cache: ResolveCache,
     seed_registry: SeedRegistry,
     seed_store_bytes: u64,
+    /// Age bound for live seed stores; `None` disables it (byte-only). Default `SEED_STORE_RETENTION`.
+    seed_store_retention: Option<Duration>,
     prefetch_pieces: u64,
     live_recovery: LiveRecoveryConfig,
     enable_seeding: bool,
@@ -194,6 +216,7 @@ impl AceProvider {
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
+            seed_store_retention: Some(SEED_STORE_RETENTION),
             prefetch_pieces: PREFETCH_PIECES,
             live_recovery: LiveRecoveryConfig::default(),
             enable_seeding: true,
@@ -273,6 +296,15 @@ impl AceProvider {
     /// created, so changing this after a stream has already opened has no effect on it.
     pub fn with_seed_store_bytes(mut self, bytes: u64) -> Self {
         self.seed_store_bytes = bytes;
+        self
+    }
+
+    /// Bound live seed stores by age: retain roughly the last `window` of downloaded pieces for
+    /// reseeding instead of filling the byte budget, so RAM tracks bitrate. A zero `window`
+    /// disables the age bound (byte-only). Does not affect VOD stores. First-writer wins per
+    /// infohash, same as [`with_seed_store_bytes`](Self::with_seed_store_bytes).
+    pub fn with_seed_store_retention(mut self, window: Duration) -> Self {
+        self.seed_store_retention = (!window.is_zero()).then_some(window);
         self
     }
 
@@ -383,6 +415,8 @@ impl AceProvider {
                 piece_length,
                 chunk_length,
                 self.seed_store_bytes,
+                // VOD keeps downloaded pieces for range serving — byte-only, no age bound.
+                None,
                 self.cache_type,
                 &self.cache_dir,
                 &infohash,
@@ -789,6 +823,7 @@ impl StreamProvider for AceProvider {
         let seed = SeedConfig {
             registry: self.seed_registry.clone(),
             store_bytes: self.seed_store_bytes,
+            store_retention: self.seed_store_retention,
             enabled: self.enable_seeding,
             prefetch_pieces: self.prefetch_pieces,
             live_recovery: self.live_recovery,
@@ -1280,6 +1315,7 @@ async fn follow_live(
             info.piece_length,
             info.chunk_length,
             seed.store_bytes,
+            seed.store_retention,
             seed.cache_type,
             &seed.cache_dir,
             &info.infohash,
@@ -1430,6 +1466,8 @@ struct Continuity {
     /// and we skip forward rather than freeze.
     next_needed_since: Instant,
     head: u64,
+    /// Pieces behind the live edge to leave as a cushion when re-syncing forward to live.
+    prefetch: u64,
     emitted: u64,
     next_log: u64,
 }
@@ -1470,6 +1508,7 @@ impl Continuity {
                 requested_at: HashMap::new(),
                 next_needed_since: Instant::now(),
                 head: max_piece,
+                prefetch,
                 emitted: 0,
                 next_log: 1 << 20,
             },
@@ -1559,6 +1598,30 @@ impl Continuity {
         self.received_chunks.retain(|&p, _| p >= floor);
         self.next_needed_since = now;
         Some(floor)
+    }
+
+    /// If the cursor has fallen more than the reassembler's look-ahead behind the live edge
+    /// (`head`), re-sync forward to near the live edge. Past that lag, contiguous catch-up is
+    /// impossible — the reassembler can't even buffer pieces up to `head` — so grinding the backlog
+    /// only falls further behind a live stream. Unlike [`skip_evicted_gap`](Self::skip_evicted_gap),
+    /// this fires even while peers' windows nominally cover the stuck piece: that is exactly the
+    /// wedge where a peer advertises a piece it never actually delivers and the cursor freezes
+    /// forever (the whole-pool stale timer keeps resetting on chunks for pieces buffered ahead).
+    /// Returns the skip target if it re-synced. The forward jump is a logged discontinuity, the
+    /// live-stream equivalent of dropping to the live point.
+    fn skip_far_behind_live(&mut self, now: Instant) -> Option<u64> {
+        let next = self.reasm.next_needed();
+        if self.head.saturating_sub(next) <= self.live_recovery.max_reasm_pieces_ahead {
+            return None;
+        }
+        let target = self.head.saturating_sub(self.prefetch).max(next + 1);
+        self.reasm.skip_to(target);
+        self.arm_output_gate();
+        self.active_peers.prune_below(target);
+        self.requested_at.retain(|&p, _| p >= target);
+        self.received_chunks.retain(|&p, _| p >= target);
+        self.next_needed_since = now;
+        Some(target)
     }
 
     fn arm_output_gate(&mut self) {
@@ -2391,6 +2454,13 @@ async fn retransmit_stalled_requests(
     now: Instant,
 ) -> Vec<SocketAddrV4> {
     let mut changed = false;
+    let head = continuity.head;
+    if let Some(target) = continuity.skip_far_behind_live(now) {
+        crate::alog!(
+            "[ace] cursor fell too far behind live edge {head}; re-syncing forward to piece {target}"
+        );
+        changed = true;
+    }
     if let Some(floor) = continuity.skip_evicted_gap(now) {
         crate::alog!(
             "[ace] next needed piece evicted from all upstream windows; skipping ahead to {floor}"
@@ -2518,6 +2588,7 @@ async fn follow_one_peer(
             info.piece_length,
             info.chunk_length,
             seed.store_bytes,
+            seed.store_retention,
             seed.cache_type,
             &seed.cache_dir,
             &info.infohash,
@@ -3292,8 +3363,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let ih = [7u8; 20];
         // Two stores for the SAME infohash must land in DIFFERENT directories.
-        let _s1 = build_piece_store(1 << 20, 1 << 14, 1 << 20, CacheType::Disk, &tmp, &ih);
-        let _s2 = build_piece_store(1 << 20, 1 << 14, 1 << 20, CacheType::Disk, &tmp, &ih);
+        let _s1 = build_piece_store(1 << 20, 1 << 14, 1 << 20, None, CacheType::Disk, &tmp, &ih);
+        let _s2 = build_piece_store(1 << 20, 1 << 14, 1 << 20, None, CacheType::Disk, &tmp, &ih);
         let dirs: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -3323,6 +3394,7 @@ mod tests {
             8,
             4,
             128 * 1024 * 1024,
+            None,
             CacheType::Disk,
             &invalid_root,
             &[0x38; 20],
@@ -3625,6 +3697,43 @@ mod tests {
         let now = c.next_needed_since + default_live_recovery().request_timeout();
         assert_eq!(c.skip_evicted_gap(now), Some(105));
         assert_eq!(c.reasm.next_needed(), 105);
+    }
+
+    #[test]
+    fn skip_far_behind_live_resyncs_forward_even_when_peers_cover_the_cursor() {
+        // Reproduces the production wedge: the cursor is stuck on a piece a peer's window still
+        // covers (so `skip_evicted_gap` refuses to skip), while the live edge has raced far ahead.
+        let lr = LiveRecoveryConfig {
+            max_reasm_pieces_ahead: 16,
+            ..LiveRecoveryConfig::default()
+        };
+        let (mut c, _) = Continuity::fresh(&info(), 100, 110, PREFETCH_PIECES, lr); // next=102, head=110
+        c.register_active_peer(1, test_addr(), win(100, 10_000)); // still "covers" 102
+        c.set_peer_unchoked(1, true);
+        // Live edge is now well beyond next + max_reasm_pieces_ahead (102 + 16).
+        c.head = 5_000;
+        // `skip_evicted_gap` would never fire here (a peer covers the cursor).
+        assert_eq!(
+            c.skip_evicted_gap(c.next_needed_since + Duration::from_secs(60)),
+            None
+        );
+        // The live-edge re-sync jumps forward to head - prefetch regardless of coverage.
+        let target = c.skip_far_behind_live(c.next_needed_since);
+        assert_eq!(target, Some(5_000 - PREFETCH_PIECES));
+        assert_eq!(c.reasm.next_needed(), 5_000 - PREFETCH_PIECES);
+    }
+
+    #[test]
+    fn skip_far_behind_live_stays_put_within_the_lookahead_window() {
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            110,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        ); // next=102, head=110, lag=8 << max_reasm_pieces_ahead
+        assert_eq!(c.skip_far_behind_live(c.next_needed_since), None);
+        assert_eq!(c.reasm.next_needed(), 102);
     }
 
     #[test]

@@ -222,8 +222,13 @@ pub struct Config {
     /// Address the peer-protocol listener binds to (inbound seeding). Started by default —
     /// see `enable_inbound`.
     pub peer_listen: SocketAddr,
-    /// Bytes of recently-seen piece data retained per active peer connection for reseeding.
+    /// Byte ceiling for an infohash's shared reseed store (hard safety cap).
     pub seed_store_bytes: u64,
+    /// Age bound (seconds) for a live reseed store: retain roughly this much recent downloaded
+    /// data for reseeding instead of filling `seed_store_bytes`, so RAM tracks bitrate rather than
+    /// always growing to the byte cap. `0` disables the age bound (byte-only, the pre-0.2 behavior).
+    /// VOD stores are always byte-only. `OUTPACE_SEED_RETENTION_SECS`.
+    pub seed_retention_secs: u64,
     /// Backend the seed store uses for piece data (`memory` | `disk`).
     pub cache_type: CacheType,
     /// Root directory for disk-mode piece files (one subdirectory per infohash). Only used when
@@ -291,6 +296,7 @@ impl Default for Config {
             networks: vec!["ace".into()],
             peer_listen: "0.0.0.0:8621".parse().unwrap(),
             seed_store_bytes: 128 * 1024 * 1024,
+            seed_retention_secs: 45,
             cache_type: CacheType::Memory,
             cache_dir,
             prefetch_pieces: 8,
@@ -491,6 +497,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.peer_listen.port(), 8621);
         assert_eq!(c.seed_store_bytes, 128 * 1024 * 1024);
+        assert_eq!(c.seed_retention_secs, 45);
         assert_eq!(c.prefetch_pieces, 8);
         assert_eq!(c.session_buffer, 256);
         assert_eq!(c.max_unchoked, 8);
