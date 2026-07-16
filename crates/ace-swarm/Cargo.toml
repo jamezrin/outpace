@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ace-log = { path = "../ace-log" }
 ace-wire = { path = "../ace-wire" }
 ace-peer = { path = "../ace-peer" }
 ace-tracker = { path = "../ace-tracker" }

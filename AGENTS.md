@@ -16,6 +16,10 @@ Crates live under `crates/`: `ace-wire` for peer-wire codecs, `ace-tracker` for 
 
 Use the pinned Rust toolchain in `rust-toolchain.toml` and `rustfmt`. Follow Rust naming conventions: `snake_case` for modules, functions, variables, and tests; `PascalCase` for types and traits; `SCREAMING_SNAKE_CASE` for constants/env vars. Keep protocol parsing deterministic and covered by vectors where practical. Prefer focused modules that match crate boundaries.
 
+### Logging
+
+`ace-log`'s `alog!` is the only logging macro in the workspace (dependency-free by choice: no `log`, no `tracing`). Use it for **operational events** — anything read after the fact out of a log file — as `alog!("[tag] message")`, where `[tag]` names the module (`[dht]`, `[portmap]`, `[hls]`). Use plain `eprintln!` only for **user-facing output** a human reads live: the `outpace: listening on …` startup banner, `outpace play: …` CLI progress, and test-skip notices. `tools/swarmtest` is an operator-driven harness and is exempt entirely. The library crates (`ace-media`, `ace-peer`, `ace-tracker`, `ace-wire`) return errors instead of logging; keep them silent.
+
 ## Testing Guidelines
 
 Use `#[tokio::test]` for async behavior and regular unit tests for pure parsing or scheduling logic. Keep live-network tests marked `#[ignore]` and document required environment variables, as existing tests do for `ACE_INFOHASH`, `ACE_PEER`, and `ACE_TRANSPORT_FILE`. For live validation, keep Cloudflare WARP off and use a current public content id; live infohashes rotate. Update `tests/vectors/` when fixing wire-format, identity, transport, or media parsing.

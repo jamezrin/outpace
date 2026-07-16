@@ -278,7 +278,7 @@ impl Actor {
         self.files.clear();
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                crate::swarm_log!(
+                crate::alog!(
                     "[cache] disk cleanup failed for {}: {e}",
                     self.dir.display()
                 );
@@ -318,7 +318,7 @@ impl Actor {
             .file(piece, true)
             .and_then(|f| write_all_at(f, data, offset))
         {
-            crate::swarm_log!("[cache] disk write failed for piece {piece} chunk {chunk}: {e}");
+            crate::alog!("[cache] disk write failed for piece {piece} chunk {chunk}: {e}");
             return Stored::default();
         }
         let (stored, evicted) = {
@@ -376,7 +376,7 @@ impl Actor {
         }
         if let Err(e) = std::fs::remove_file(self.path(piece)) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                crate::swarm_log!("[cache] disk evict failed to remove piece {piece}: {e}");
+                crate::alog!("[cache] disk evict failed to remove piece {piece}: {e}");
             }
         }
     }

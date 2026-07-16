@@ -261,7 +261,7 @@ async fn dht_walk_frontier(
     let mut next_txid: u16 = 0;
     let deadline = Instant::now() + budget;
     let mut buf = [0u8; 2048];
-    crate::swarm_log!("[dht] seeded {} bootstrap node(s)", frontier.len());
+    crate::alog!("[dht] seeded {} bootstrap node(s)", frontier.len());
 
     'outer: while Instant::now() < deadline {
         // Drop expired inflight entries so a stale (source, txid) can't be matched by a much
@@ -278,7 +278,7 @@ async fn dht_walk_frontier(
             .collect();
         if batch.is_empty() {
             metrics.frontier_exhausted = true;
-            crate::swarm_log!("[dht] frontier exhausted: queried={}", queried.len());
+            crate::alog!("[dht] frontier exhausted: queried={}", queried.len());
             break;
         }
         for addr in &batch {
@@ -346,7 +346,7 @@ async fn dht_walk_frontier(
         }
     }
 
-    crate::swarm_log!(
+    crate::alog!(
         "[dht] walk done: seeded={} queried={} valid={} peers={} nodes={} malformed={} \
          krpc_err={} uncorrelated={} timeouts={} frontier_exhausted={}",
         metrics.bootstrap_seeded,

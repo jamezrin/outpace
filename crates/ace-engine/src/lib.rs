@@ -3,8 +3,11 @@
 //! `/streams/{network}/{id}` API. All network-specific protocol lives behind the
 //! [`provider::StreamProvider`] adapter (see the v1 design spec).
 
-#[macro_use]
-pub mod logts;
+// The workspace's one logging macro, re-exported so `crate::alog!` resolves here.
+// Operational events use it; user-facing CLI/banner lines stay plain `eprintln!`
+// (see the `ace_log` crate docs for the distinction).
+pub use ace_log::alog;
+
 pub mod ace_provider;
 pub mod broadcast;
 pub mod broadcast_ingest;
