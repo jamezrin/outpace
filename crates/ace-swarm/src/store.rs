@@ -10,6 +10,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// Maximum request block accepted from a standard BitTorrent peer (BEP 3 convention).
@@ -25,6 +26,16 @@ pub struct PieceStore {
     max_bytes: u64,
     cur_bytes: u64,
     backend: Backend,
+    /// Optional age bound: pieces first seen longer ago than this are evicted even while under
+    /// the byte budget. For a live stream this makes retained reseed data track *time* (window ×
+    /// bitrate) instead of a fixed byte cap, so RAM scales with the stream rather than always
+    /// filling `max_bytes`. `max_bytes` remains a hard safety ceiling. `None` preserves the
+    /// original byte-only behavior (used by VOD/broadcast stores).
+    retention: Option<Duration>,
+    /// First-seen instant per retained piece index, kept in lockstep with the backend's piece set:
+    /// every retained piece has an entry, and eviction removes it. Only populated when `retention`
+    /// is set, to avoid the bookkeeping cost on byte-only stores.
+    first_seen: BTreeMap<u64, Instant>,
 }
 
 /// How a [`PieceStore`] keeps its piece data. Selected once at construction.
@@ -297,7 +308,18 @@ impl PieceStore {
             max_bytes,
             cur_bytes: 0,
             backend,
+            retention: None,
+            first_seen: BTreeMap::new(),
         })
+    }
+
+    /// Bound retained pieces by age as well as bytes: on each write, pieces first seen more than
+    /// `retention` ago are evicted (oldest first), so a live seed store holds ~`retention` × bitrate
+    /// of recent data instead of always growing to `max_bytes`. `max_bytes` still caps the store as
+    /// a hard ceiling. A zero `retention` is treated as "no age bound".
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = (!retention.is_zero()).then_some(retention);
+        self
     }
 
     /// Convenience: a disk-backed store rooted at `dir` (its contents are wiped on creation).
@@ -332,6 +354,19 @@ impl PieceStore {
     /// placeholder so old call sites remain compatible while relay/source paths preserve real
     /// headers.
     pub fn put_chunk_with_header(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) {
+        self.put_chunk_with_header_at(Instant::now(), piece, chunk, header, data);
+    }
+
+    /// [`put_chunk_with_header`](Self::put_chunk_with_header) with an explicit "now", so age-based
+    /// eviction is deterministic under test. Production callers use the wall-clock wrapper.
+    fn put_chunk_with_header_at(
+        &mut self,
+        now: Instant,
+        piece: u64,
+        chunk: u16,
+        header: [u8; 8],
+        data: &[u8],
+    ) {
         // A zero budget is the explicit no-retention policy used when disk-mode construction
         // fails. Do not even touch backend metadata: empty payloads add zero accounted bytes and
         // would otherwise accumulate piece/chunk/header entries without triggering eviction.
@@ -348,16 +383,41 @@ impl PieceStore {
             return;
         }
         let stored = self.backend.put(piece, chunk, header, data);
+        if self.retention.is_some() {
+            self.first_seen.entry(piece).or_insert(now);
+        }
         self.cur_bytes -= stored.removed;
         self.cur_bytes += stored.added;
         while self.cur_bytes > self.max_bytes {
             // Stop only when the store is empty (`None`); a zero-byte piece (`Some(0)`) must not
             // halt eviction while real over-budget bytes remain in higher pieces.
-            let Some(freed) = self.backend.evict_lowest() else {
+            let Some(freed) = self.evict_lowest_tracked() else {
                 break;
             };
             self.cur_bytes -= freed;
         }
+        // Age eviction: drop the oldest pieces once they fall outside the retention window. Pieces
+        // arrive in increasing index/time order on the live path, so the lowest-index piece is also
+        // the oldest — the same order the byte-budget loop evicts in.
+        if let Some(retention) = self.retention {
+            while let Some((_, &seen)) = self.first_seen.iter().next() {
+                if now.saturating_duration_since(seen) < retention {
+                    break;
+                }
+                let Some(freed) = self.evict_lowest_tracked() else {
+                    break;
+                };
+                self.cur_bytes -= freed;
+            }
+        }
+    }
+
+    /// Evict the lowest-index (oldest) piece from the backend and drop its `first_seen` entry so the
+    /// age index stays in lockstep with the stored piece set. Returns the bytes freed.
+    fn evict_lowest_tracked(&mut self) -> Option<u64> {
+        let freed = self.backend.evict_lowest()?;
+        self.first_seen.pop_first();
+        Some(freed)
     }
 
     /// The Acestream live piece header for `piece`, if known.
@@ -442,6 +502,67 @@ mod tests {
         s.put_chunk(5, 1, &[5, 6, 7, 8]);
         assert!(s.has_piece(5));
         assert_eq!(s.have_pieces(), vec![5]);
+    }
+
+    // Fill piece `p` (both 4-byte chunks) at instant `t`.
+    fn put_full_at(s: &mut PieceStore, t: Instant, p: u64) {
+        s.put_chunk_with_header_at(t, p, 0, [0; 8], &[9; 4]);
+        s.put_chunk_with_header_at(t, p, 1, [0; 8], &[9; 4]);
+    }
+
+    #[test]
+    fn retention_evicts_pieces_older_than_window() {
+        let mut s = store(1 << 20).with_retention(Duration::from_secs(30));
+        let t0 = Instant::now();
+        for p in 0..3 {
+            put_full_at(&mut s, t0, p);
+        }
+        assert_eq!(s.window(), Some((0, 2)));
+        // A write 31s later pushes the t0 pieces outside the 30s window, evicting them.
+        put_full_at(&mut s, t0 + Duration::from_secs(31), 3);
+        assert_eq!(
+            s.window(),
+            Some((3, 3)),
+            "pieces older than the retention window are evicted even under the byte budget"
+        );
+    }
+
+    #[test]
+    fn retention_keeps_pieces_within_window() {
+        let mut s = store(1 << 20).with_retention(Duration::from_secs(30));
+        let t0 = Instant::now();
+        put_full_at(&mut s, t0, 0);
+        put_full_at(&mut s, t0 + Duration::from_secs(10), 1);
+        assert_eq!(
+            s.window(),
+            Some((0, 1)),
+            "both pieces are within the 30s window and are retained"
+        );
+    }
+
+    #[test]
+    fn retention_respects_byte_ceiling() {
+        // Generous window, but the byte ceiling only holds two full 8-byte pieces.
+        let mut s = store(16).with_retention(Duration::from_secs(3600));
+        let t0 = Instant::now();
+        for p in 0..4 {
+            put_full_at(&mut s, t0, p);
+        }
+        assert_eq!(
+            s.window(),
+            Some((2, 3)),
+            "byte ceiling still caps the store when everything is inside the window"
+        );
+    }
+
+    #[test]
+    fn without_retention_skips_age_bookkeeping() {
+        let mut s = store(1 << 20);
+        s.put_chunk(0, 0, &[1, 2, 3, 4]);
+        assert!(
+            s.first_seen.is_empty(),
+            "byte-only stores must not pay the per-piece age-tracking cost"
+        );
     }
 
     #[test]

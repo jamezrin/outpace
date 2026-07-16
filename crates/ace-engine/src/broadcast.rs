@@ -253,6 +253,9 @@ impl BroadcastRegistry {
                     PIECE_LENGTH,
                     CHUNK_LENGTH,
                     store_bytes,
+                    // Broadcast is the authoritative source; keep the byte-only policy so late
+                    // joiners can still pull recent pieces up to the byte budget.
+                    None,
                     self.cache_type,
                     &self.cache_dir,
                     &infohash,
@@ -378,6 +381,9 @@ impl BroadcastRegistry {
                     piece_length,
                     chunk_length,
                     store_bytes,
+                    // Broadcast is the authoritative source; keep the byte-only policy so late
+                    // joiners can still pull recent pieces up to the byte budget.
+                    None,
                     self.cache_type,
                     &self.cache_dir,
                     &infohash,

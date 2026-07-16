@@ -57,6 +57,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_SEED_STORE_BYTES") {
         config.seed_store_bytes = v.parse()?;
     }
+    if let Ok(v) = std::env::var("OUTPACE_SEED_RETENTION_SECS") {
+        config.seed_retention_secs = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_CACHE_TYPE") {
         config.cache_type = match v.as_str() {
             "memory" => CacheType::Memory,
@@ -418,6 +421,7 @@ pub async fn build_runtime(
             .with_bootstrap_peers(bootstrap_peers)
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
+            .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
             .with_cache(config.cache_type, config.cache_dir.clone())
             .with_prefetch_pieces(config.prefetch_pieces)
             .with_live_recovery(config.live_recovery)

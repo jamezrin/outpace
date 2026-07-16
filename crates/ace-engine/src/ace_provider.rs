@@ -81,8 +81,15 @@ const DEFAULT_ACE_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announc
 /// How long a resolved content-id → `StreamInfo` stays cached.
 const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// Bytes of recently-downloaded data retained per active peer connection for reseeding.
+/// Byte ceiling for an infohash's shared reseed store. With `SEED_STORE_RETENTION` set this is a
+/// hard safety cap; the age bound is the primary limiter on a live stream.
 const SEED_STORE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Default age bound for a live seed store: retain roughly the last 45s of downloaded pieces for
+/// reseeding rather than filling `SEED_STORE_BYTES`. This tracks bitrate (window × rate) instead of
+/// a fixed byte cap, so idle/steady RAM stays a fraction of the old default while still covering the
+/// recent pieces live peers actually re-request. VOD stores keep the byte-only policy (`None`).
+const SEED_STORE_RETENTION: Duration = Duration::from_secs(45);
 
 /// Disk mode promises not to turn the configured on-disk budget into an equal per-stream RAM
 /// allocation. If a per-stream directory becomes unavailable after startup, keep playback alive
@@ -101,12 +108,19 @@ pub(crate) fn build_piece_store(
     piece_length: u64,
     chunk_length: u64,
     max_bytes: u64,
+    retention: Option<Duration>,
     cache_type: CacheType,
     cache_dir: &Path,
     infohash: &[u8; 20],
 ) -> PieceStore {
+    let with_retention = |store: PieceStore| match retention {
+        Some(window) => store.with_retention(window),
+        None => store,
+    };
     match cache_type {
-        CacheType::Memory => PieceStore::new(piece_length, chunk_length, max_bytes),
+        CacheType::Memory => {
+            with_retention(PieceStore::new(piece_length, chunk_length, max_bytes))
+        }
         CacheType::Disk => {
             let dir = cache_dir.join(disk_store_subdir(infohash));
             PieceStore::with_backend(
@@ -115,6 +129,7 @@ pub(crate) fn build_piece_store(
                 max_bytes,
                 BackendKind::Disk { dir: dir.clone() },
             )
+            .map(with_retention)
             .unwrap_or_else(|e| {
                 let failures = DISK_STORE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
                 crate::alog!(
@@ -144,6 +159,8 @@ fn disk_store_subdir(infohash: &[u8; 20]) -> String {
 struct SeedConfig {
     registry: SeedRegistry,
     store_bytes: u64,
+    /// Age bound for the live seed store (primary limiter; `store_bytes` is the hard ceiling).
+    store_retention: Option<Duration>,
     enabled: bool,
     /// Pieces behind the live edge the fresh follower starts at (playback cushion).
     prefetch_pieces: u64,
@@ -167,6 +184,8 @@ pub struct AceProvider {
     resolve_cache: ResolveCache,
     seed_registry: SeedRegistry,
     seed_store_bytes: u64,
+    /// Age bound for live seed stores; `None` disables it (byte-only). Default `SEED_STORE_RETENTION`.
+    seed_store_retention: Option<Duration>,
     prefetch_pieces: u64,
     live_recovery: LiveRecoveryConfig,
     enable_seeding: bool,
@@ -194,6 +213,7 @@ impl AceProvider {
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
+            seed_store_retention: Some(SEED_STORE_RETENTION),
             prefetch_pieces: PREFETCH_PIECES,
             live_recovery: LiveRecoveryConfig::default(),
             enable_seeding: true,
@@ -273,6 +293,15 @@ impl AceProvider {
     /// created, so changing this after a stream has already opened has no effect on it.
     pub fn with_seed_store_bytes(mut self, bytes: u64) -> Self {
         self.seed_store_bytes = bytes;
+        self
+    }
+
+    /// Bound live seed stores by age: retain roughly the last `window` of downloaded pieces for
+    /// reseeding instead of filling the byte budget, so RAM tracks bitrate. A zero `window`
+    /// disables the age bound (byte-only). Does not affect VOD stores. First-writer wins per
+    /// infohash, same as [`with_seed_store_bytes`](Self::with_seed_store_bytes).
+    pub fn with_seed_store_retention(mut self, window: Duration) -> Self {
+        self.seed_store_retention = (!window.is_zero()).then_some(window);
         self
     }
 
@@ -383,6 +412,8 @@ impl AceProvider {
                 piece_length,
                 chunk_length,
                 self.seed_store_bytes,
+                // VOD keeps downloaded pieces for range serving — byte-only, no age bound.
+                None,
                 self.cache_type,
                 &self.cache_dir,
                 &infohash,
@@ -789,6 +820,7 @@ impl StreamProvider for AceProvider {
         let seed = SeedConfig {
             registry: self.seed_registry.clone(),
             store_bytes: self.seed_store_bytes,
+            store_retention: self.seed_store_retention,
             enabled: self.enable_seeding,
             prefetch_pieces: self.prefetch_pieces,
             live_recovery: self.live_recovery,
@@ -1280,6 +1312,7 @@ async fn follow_live(
             info.piece_length,
             info.chunk_length,
             seed.store_bytes,
+            seed.store_retention,
             seed.cache_type,
             &seed.cache_dir,
             &info.infohash,
@@ -2518,6 +2551,7 @@ async fn follow_one_peer(
             info.piece_length,
             info.chunk_length,
             seed.store_bytes,
+            seed.store_retention,
             seed.cache_type,
             &seed.cache_dir,
             &info.infohash,
@@ -3292,8 +3326,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let ih = [7u8; 20];
         // Two stores for the SAME infohash must land in DIFFERENT directories.
-        let _s1 = build_piece_store(1 << 20, 1 << 14, 1 << 20, CacheType::Disk, &tmp, &ih);
-        let _s2 = build_piece_store(1 << 20, 1 << 14, 1 << 20, CacheType::Disk, &tmp, &ih);
+        let _s1 = build_piece_store(1 << 20, 1 << 14, 1 << 20, None, CacheType::Disk, &tmp, &ih);
+        let _s2 = build_piece_store(1 << 20, 1 << 14, 1 << 20, None, CacheType::Disk, &tmp, &ih);
         let dirs: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -3323,6 +3357,7 @@ mod tests {
             8,
             4,
             128 * 1024 * 1024,
+            None,
             CacheType::Disk,
             &invalid_root,
             &[0x38; 20],

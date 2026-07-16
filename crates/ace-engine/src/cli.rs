@@ -222,6 +222,7 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
         .with_bootstrap_peers(peers)
         .with_seed_registry(seed_registry)
         .with_seed_store_bytes(config.seed_store_bytes)
+        .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
         .with_cache(config.cache_type, config.cache_dir.clone())
         .with_seeding_enabled(config.enable_seeding);
 
