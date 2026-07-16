@@ -4,7 +4,7 @@
 
 use crate::config::HlsConfig;
 use crate::session::{StreamEvent, StreamSession};
-use ace_media::mpegts::VideoAccessPointState;
+use ace_media::mpegts::{ts_pid, VideoAccessPointState};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -62,8 +62,19 @@ impl HlsPackager {
         let max_segment_bytes = seg_packets
             .checked_mul(TS_PACKET)
             .expect("HLS config must be validated before packager construction");
-        let access = VideoAccessPointState::with_service_name(service_name);
-        let filter_sdt = access.has_service_name();
+        let mut access = VideoAccessPointState::with_service_name(service_name);
+        let mut filter_sdt = access.has_service_name();
+        // The injected SDT costs one extra prefix packet, so a titled segment must fit
+        // [PAT][PMT][SDT] (3) plus a keyframe = 4 packets. If the configured ceiling can't hold
+        // that, serve this stream WITHOUT the title SDT rather than stalling every segment forever.
+        if filter_sdt && seg_packets < 4 {
+            eprintln!(
+                "outpace: HLS segment ceiling too small ({seg_packets} packets) for SDT service_name; \
+                 serving without title SDT (needs >= 4 packets)"
+            );
+            access = VideoAccessPointState::new();
+            filter_sdt = false;
+        }
         Arc::new(HlsPackager {
             state: Mutex::new(HlsState {
                 media_seq: 0,
@@ -499,13 +510,6 @@ struct TsTiming {
     pid: u16,
     pcr: Option<u64>,
     discontinuity: bool,
-}
-
-/// A packet's PID, independent of `ts_timing`'s adaptation-field gate. `ts_timing` returns a
-/// zeroed default (including `pid: 0`) for payload-only packets -- the common shape for PSI
-/// sections such as SDT -- so it cannot be used to identify the SDT PID for filtering.
-fn ts_pid(packet: &[u8]) -> u16 {
-    (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16
 }
 
 fn ts_timing(packet: &[u8]) -> TsTiming {
@@ -1511,5 +1515,27 @@ mod tests {
             })
             .count();
         assert_eq!(sdt_packets, 1);
+    }
+
+    #[test]
+    fn titled_stream_below_sdt_ceiling_serves_without_stalling() {
+        // segment_packets=3 can't fit [PAT][PMT][SDT] + keyframe; must fall back to untitled and
+        // still emit segments (no permanent stall), just without the injected title SDT.
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 3,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+            },
+            Some("Too Big".to_string()),
+        );
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        let seg = p
+            .segment(0)
+            .expect("a segment should still emit at a sub-SDT ceiling");
+        assert!(ace_media::mpegts::read_sdt_service_name(&seg).is_none());
     }
 }
