@@ -51,7 +51,14 @@ pub struct LiveRecoveryConfig {
 impl Default for LiveRecoveryConfig {
     fn default() -> Self {
         Self {
-            request_timeout_ms: 4000,
+            // A live follower rides the live edge, so this timer is the only thing between a
+            // silent upstream and a visible playback gap: the player drains in realtime while we
+            // wait one out. At 4s a single stuck piece outlived the retransmit path in practice
+            // and playback instead waited out `stale_upstream_timeout_ms`, tearing the pool down
+            // for a ~12s output gap where the real engine on the same swarm had none. 1500ms
+            // re-requests the piece to a peer with spare capacity while the pool stays up, and
+            // still leaves several retry rounds inside the stale budget.
+            request_timeout_ms: 1500,
             stale_upstream_timeout_ms: 12000,
             request_check_interval_ms: 1000,
             max_active_upstreams: 4,

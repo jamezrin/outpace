@@ -1091,7 +1091,7 @@ mod tests {
     #[test]
     fn default_config_has_live_recovery_and_hls_defaults() {
         let c = Config::default();
-        assert_eq!(c.live_recovery.request_timeout_ms, 4000);
+        assert_eq!(c.live_recovery.request_timeout_ms, 1500);
         assert_eq!(c.live_recovery.stale_upstream_timeout_ms, 12000);
         assert_eq!(c.live_recovery.request_check_interval_ms, 1000);
         assert_eq!(c.live_recovery.max_active_upstreams, 4);
