@@ -459,11 +459,12 @@ fn build_sdt(service_id: u16, service_name: &str) -> [u8; TS_PACKET_LEN] {
     let name = service_name.as_bytes();
 
     // Service descriptor (0x48): service_type + provider + service_name.
-    let mut desc = Vec::new();
-    desc.push(SERVICE_DESCRIPTOR_TAG);
-    desc.push((3 + SERVICE_PROVIDER_NAME.len() + name.len()) as u8); // descriptor_length
-    desc.push(0x01); // service_type = digital television
-    desc.push(SERVICE_PROVIDER_NAME.len() as u8);
+    let mut desc = vec![
+        SERVICE_DESCRIPTOR_TAG,
+        (3 + SERVICE_PROVIDER_NAME.len() + name.len()) as u8, // descriptor_length
+        0x01,                                                 // service_type = digital television
+        SERVICE_PROVIDER_NAME.len() as u8,
+    ];
     desc.extend_from_slice(SERVICE_PROVIDER_NAME);
     desc.push(name.len() as u8);
     desc.extend_from_slice(name);
