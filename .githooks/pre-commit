@@ -1,0 +1,6 @@
+#!/bin/sh
+# AceStream identifier hygiene gate. Blocks staged real content ids / infohashes
+# and any attempt to commit the private acestream-ids.txt registry.
+# Activate once per clone:  git config core.hooksPath .githooks
+root=$(git rev-parse --show-toplevel) || exit 1
+exec python3 "$root/tools/hygiene/check_identifiers.py" --staged

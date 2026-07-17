@@ -1,0 +1,39 @@
+# Allowlist for tools/hygiene/check_identifiers.py
+#
+# Legitimate non-placeholder 40-hex values that may appear in tracked files.
+# These are NOT real AceStream identifiers — they are synthetic-fixture digests,
+# standard test vectors, catalog-signature vectors, or git commit SHAs quoted in
+# docs. Every entry needs a justification. If you cannot justify a value as a
+# non-identifier, it does not belong here — and it does not belong in the tree.
+#
+# Format: <40-hex>  <justification>
+
+# --- Synthetic transport-fixture digests (tests/vectors/transport-0{1,2}.bin) ---
+# The committed fixtures are synthetic; these are their real derived digests, so
+# the assertions in crates/ace-wire/tests/vectors.rs stay meaningful.
+50e93529d3eb46a50506b14464185a15292d6e47  synthetic transport-01 infohash
+34df422b80a4bd94ac1e51be9ede60364ec7a7dd  synthetic transport-01 transport_file_hash
+3fe25f036fa7d30550a2c0e566a6c1005ac86906  synthetic transport-01 SHA1(pubkey)
+685edf209ccfdf88977c0d317e1407baca486067  synthetic transport-02 infohash
+ed2c05b3b022e9cc7b7c1ca46d20f10839dc4108  synthetic transport-02 transport_file_hash
+b359d6d1bb595e1a6da26369d4e033fae71a0c7f  synthetic transport-02 SHA1(pubkey)
+
+# --- Catalog signature vectors (crates/ace-swarm/src/resolve.rs test) ---
+# SHA1 outputs of the catalog signing algorithm over a synthetic content id;
+# they pin the algorithm, not any real stream.
+ee6c8422795ced4cd5c1fb80f10276801ab636c6  catalog signature vector
+08c4ba548457e883f8711d3f3cb846c20058d912  catalog signature vector
+c7c3cd3c7268be1a48144653cdbd7912991cb337  catalog signature vector
+
+# --- git commit SHAs quoted in docs/protocol/notes/57-old-engine-api-value-gate.md ---
+54a185dd0993f7f4eca774fb36c751a098f47f00  git commit SHA referenced in a note
+88ddcc93ae71a4a256b57757abdfad5e75b46cb1  git commit SHA referenced in a note
+e65c982a588414f23bed22615cbeb80fc59fd4c9  git commit SHA referenced in a note
+b33f3640b54ad727de61854200ad2b6689b2ca7e  git commit SHA referenced in a note
+ced69f36873ffbef9806f29321dbf9c68d4e52bf  git commit SHA referenced in a note
+73da4c4f1b9a20586ffc87502ab6a3c177c21634  git commit SHA referenced in a note (ValdikSS/AceProxy)
+
+# --- Build metadata ---
+# jemalloc's git-describe hash inside a Cargo.lock version string. Cargo.lock is
+# excluded from the scan, but list it so the value is documented as non-identifier.
+e13ca993e8ccb9ba9847cc330696e02839f328f7  jemalloc git-describe hash (tikv-jemalloc-sys version)

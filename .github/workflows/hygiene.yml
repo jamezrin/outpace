@@ -1,0 +1,17 @@
+name: hygiene
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  identifiers:
+    name: acestream identifier hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan tracked files for real AceStream identifiers
+        run: python3 tools/hygiene/check_identifiers.py
