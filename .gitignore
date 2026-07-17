@@ -7,3 +7,6 @@
 
 # Phase-0 reverse-engineering working artifacts (raw/derived, not committed)
 /re/
+
+# Local AceStream content-id registry (LLM context only, never committed)
+/acestream-ids.txt
