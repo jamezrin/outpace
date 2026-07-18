@@ -24,6 +24,13 @@ enum Phase {
     Released,
 }
 
+fn release_event(reason: ReleaseReason, duration: Duration, queued_bytes: usize) -> String {
+    format!(
+        "[prebuffer] startup buffer released: reason={reason:?} duration_ms={} queued_bytes={queued_bytes}",
+        duration.as_millis()
+    )
+}
+
 struct StartupReservoir {
     config: StartupBufferConfig,
     bitrate: Option<u64>,
@@ -204,6 +211,10 @@ impl StartupReservoir {
         ) {
             crate::alog!("[prebuffer] startup buffer released early: {:?}", reason);
         }
+        crate::alog!(
+            "{}",
+            release_event(reason, self.duration(), self.queued_bytes)
+        );
         self.release_clock_duration = self.clock.elapsed();
         self.release_bytes = self.queued_bytes;
         self.phase = Phase::Draining(reason);
@@ -605,6 +616,14 @@ mod tests {
         assert_eq!(reservoir.queued_bytes(), 250);
         assert!(reservoir.push(Bytes::from(vec![0; 100])).is_some());
         assert_eq!(reservoir.queued_bytes(), 250);
+    }
+
+    #[test]
+    fn release_event_reports_reason_duration_and_queued_bytes() {
+        assert_eq!(
+            release_event(ReleaseReason::TargetDuration, Duration::from_millis(20_125), 42_000),
+            "[prebuffer] startup buffer released: reason=TargetDuration duration_ms=20125 queued_bytes=42000"
+        );
     }
 
     #[tokio::test]
