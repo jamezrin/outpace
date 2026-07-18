@@ -382,6 +382,13 @@ fn url_host_from_ip(ip: IpAddr) -> String {
     }
 }
 
+fn ace_provider_from_config(provider: AceProvider, config: &Config) -> AceProvider {
+    provider
+        .with_prefetch_pieces(config.prefetch_pieces)
+        .with_startup_buffer(config.startup_buffer)
+        .with_live_recovery(config.live_recovery)
+}
+
 pub async fn build_runtime(
     mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
@@ -438,10 +445,8 @@ pub async fn build_runtime(
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
             .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
-            .with_cache(config.cache_type, config.cache_dir.clone())
-            .with_prefetch_pieces(config.prefetch_pieces)
-            .with_startup_buffer(config.startup_buffer)
-            .with_live_recovery(config.live_recovery)
+            .with_cache(config.cache_type, config.cache_dir.clone());
+        let provider = ace_provider_from_config(provider, &config)
             .with_seeding_enabled(config.enable_seeding)
             .with_inbound_announce_port_receiver(announce_port_rx.clone())
             .with_reachability(reachability.clone());
@@ -775,6 +780,27 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn daemon_provider_receives_startup_buffer_from_runtime_config() {
+        let config = Config {
+            startup_buffer: crate::config::StartupBufferConfig {
+                target_ms: 10_000,
+                max_bytes: 33_554_432,
+                timeout_ms: 9_000,
+            },
+            ..Config::default()
+        };
+        let provider = ace_provider_from_config(
+            AceProvider::new(
+                Arc::new(ace_wire::identity::Identity::generate()),
+                config.peer_listen.port(),
+            ),
+            &config,
+        );
+
+        assert_eq!(provider.startup_buffer_config(), config.startup_buffer);
+    }
 
     #[test]
     fn rtmp_bind_env_override_sets_config_rtmp_bind() {
