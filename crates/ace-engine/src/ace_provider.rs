@@ -549,8 +549,10 @@ fn derived_prefetch_pieces(
     let Some(bit_millis) = (target_ms as u128).checked_mul(bitrate as u128) else {
         return u64::MAX;
     };
-    let bytes = bit_millis / 8_000;
-    let pieces = bytes.div_ceil(payload).saturating_add(2);
+    let Some(piece_bit_millis) = 8_000_u128.checked_mul(payload) else {
+        return u64::MAX;
+    };
+    let pieces = bit_millis.div_ceil(piece_bit_millis).saturating_add(2);
     u64::try_from(pieces).unwrap_or(u64::MAX)
 }
 
@@ -3103,6 +3105,11 @@ mod tests {
             derived_prefetch_pieces(30_000, Some(8_000_000), 1_048_576, 96),
             31
         );
+    }
+
+    #[test]
+    fn prefetch_positive_fractional_byte_still_requires_one_history_piece() {
+        assert_eq!(derived_prefetch_pieces(1, Some(1), 1_048_576, 96), 3);
     }
 
     #[test]
