@@ -1821,6 +1821,7 @@ mod tests {
             segment_packets: seg_packets,
             window_segments: 6,
             segment_duration_ms: 2000,
+            ..crate::config::HlsConfig::default()
         };
         router(AppState {
             manager: StreamManager::with_config(r, 256, hls),
@@ -2134,7 +2135,15 @@ mod tests {
         let mut r = ProviderRegistry::new();
         r.register(std::sync::Arc::new(FixtureProvider { skip }));
         AppState {
-            manager: StreamManager::new(r),
+            manager: StreamManager::with_config(
+                r,
+                256,
+                crate::config::HlsConfig {
+                    window_segments: 6,
+                    segment_duration_ms: 1000,
+                    ..crate::config::HlsConfig::default()
+                },
+            ),
             networks: vec!["fix".into()],
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(AceSessionStore::default()),
@@ -2286,6 +2295,7 @@ mod tests {
                     segment_packets: 4,
                     window_segments: 3,
                     segment_duration_ms: 1000,
+                    ..crate::config::HlsConfig::default()
                 },
             ),
             networks: vec!["hlsfix".into()],
@@ -2307,6 +2317,7 @@ mod tests {
                     segment_packets: 3,
                     window_segments: 3,
                     segment_duration_ms: 1000,
+                    ..crate::config::HlsConfig::default()
                 },
             ),
             networks: vec!["stalled".into()],

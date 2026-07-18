@@ -502,6 +502,7 @@ mod tests {
             segment_packets: 64,
             window_segments: 4,
             segment_duration_ms: 1500,
+            ..HlsConfig::default()
         };
         let mgr = StreamManager::with_config(reg, 8, hls);
 

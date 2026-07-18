@@ -550,6 +550,7 @@ mod tests {
                 segment_packets: 6,
                 window_segments: 3,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             None,
         )
@@ -570,6 +571,7 @@ mod tests {
                 segment_packets: 100,
                 window_segments: 6,
                 segment_duration_ms: duration_ms,
+                ..HlsConfig::default()
             },
             None,
         )
@@ -669,6 +671,7 @@ mod tests {
                 segment_packets,
                 window_segments: 4,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             None,
         )
@@ -820,6 +823,7 @@ mod tests {
                 segment_packets: 5,
                 window_segments: 4,
                 segment_duration_ms: 100,
+                ..HlsConfig::default()
             },
             None,
         );
@@ -961,16 +965,16 @@ mod tests {
         let p = HlsPackager::new(HlsConfig::default(), None);
         p.feed(&pat(PMT_PID));
         p.feed(&pmt(PMT_PID, VIDEO_PID));
-        let input: Vec<u8> = (0..=300)
-            .flat_map(|i| pcr_packet(VIDEO_PID, i * 360, matches!(i, 0 | 300), false, i as u8))
+        let input: Vec<u8> = (0..=1300)
+            .flat_map(|i| pcr_packet(VIDEO_PID, i * 360, matches!(i, 0 | 1300), false, i as u8))
             .collect();
 
         p.feed(&input);
 
-        assert_eq!(p.segment(0).unwrap().len(), 302 * TS_PACKET);
+        assert_eq!(p.segment(0).unwrap().len(), 1302 * TS_PACKET);
         assert!(p
             .playlist("test", "default-ceiling")
-            .contains("#EXTINF:1.200,"));
+            .contains("#EXTINF:5.200,"));
     }
 
     #[test]
@@ -980,6 +984,7 @@ mod tests {
                 segment_packets: 5,
                 window_segments: 4,
                 segment_duration_ms: 60_000,
+                ..HlsConfig::default()
             },
             None,
         );
@@ -1006,6 +1011,7 @@ mod tests {
                 segment_packets: 6,
                 window_segments: 4,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             None,
         );
@@ -1088,6 +1094,7 @@ mod tests {
                 segment_packets: 5,
                 window_segments: 6,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             None,
         );
@@ -1149,6 +1156,7 @@ mod tests {
                 segment_packets: 100,
                 window_segments: 1,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             None,
         );
@@ -1266,6 +1274,7 @@ mod tests {
                 segment_packets: 6,
                 window_segments: 5,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             None,
         );
@@ -1291,6 +1300,7 @@ mod tests {
                 segment_packets: 6,
                 window_segments: 2,
                 segment_duration_ms: 2500,
+                ..HlsConfig::default()
             },
             None,
         );
@@ -1316,6 +1326,7 @@ mod tests {
             segment_packets: 3,
             window_segments: 6,
             segment_duration_ms: 2000,
+            ..HlsConfig::default()
         }
     }
 
@@ -1362,6 +1373,7 @@ mod tests {
                 segment_packets: 3,
                 window_segments: 2,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             None,
         );
@@ -1377,6 +1389,7 @@ mod tests {
                 segment_packets: 100,
                 window_segments: 4,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             Some("HLS Title".to_string()),
         );
@@ -1411,6 +1424,7 @@ mod tests {
                 segment_packets: 4,
                 window_segments: 4,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             Some("Ceiling Title".to_string()),
         );
@@ -1446,6 +1460,7 @@ mod tests {
                 segment_packets: 3,
                 window_segments: 4,
                 segment_duration_ms: 1000,
+                ..HlsConfig::default()
             },
             Some("Too Big".to_string()),
         );

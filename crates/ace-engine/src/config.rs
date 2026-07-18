@@ -142,10 +142,52 @@ impl LiveRecoveryConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct StartupBufferConfig {
+    pub target_ms: u64,
+    pub max_bytes: usize,
+    pub timeout_ms: u64,
+}
+
+impl Default for StartupBufferConfig {
+    fn default() -> Self {
+        Self {
+            target_ms: 30_000,
+            max_bytes: 134_217_728,
+            timeout_ms: 15_000,
+        }
+    }
+}
+
+impl StartupBufferConfig {
+    pub fn target(&self) -> Duration {
+        Duration::from_millis(self.target_ms)
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.target_ms > 0 && self.timeout_ms == 0 {
+            return Err(
+                "OUTPACE_PREBUFFER_TIMEOUT_MS must be >= 1 when OUTPACE_PREBUFFER_MS > 0".into(),
+            );
+        }
+        if self.max_bytes < 188 {
+            return Err("OUTPACE_PREBUFFER_BYTES must be >= 188".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct HlsConfig {
     pub segment_packets: usize,
     pub window_segments: usize,
     pub segment_duration_ms: u64,
+    pub startup_segments: usize,
+    pub startup_timeout_ms: u64,
 }
 
 impl Default for HlsConfig {
@@ -158,8 +200,10 @@ impl Default for HlsConfig {
             // average -- so a keyframe-aligned cut lands before the ceiling in the common case.
             // Worst-case retained memory is bounded at (window + 1) * this (~86 MB here).
             segment_packets: 65_536,
-            window_segments: 6,
-            segment_duration_ms: 1000,
+            window_segments: 8,
+            segment_duration_ms: 5000,
+            startup_segments: 6,
+            startup_timeout_ms: 45_000,
         }
     }
 }
@@ -182,6 +226,17 @@ impl HlsConfig {
         }
         if self.segment_duration_ms == 0 {
             return Err("OUTPACE_HLS_SEGMENT_DURATION_MS must be >= 1".into());
+        }
+        let effective_startup = self.startup_segments.max(1);
+        if effective_startup > self.window_segments {
+            return Err(
+                "OUTPACE_HLS_STARTUP_SEGMENTS must be <= OUTPACE_HLS_WINDOW_SEGMENTS".into(),
+            );
+        }
+        if self.startup_timeout_ms < self.segment_duration_ms {
+            return Err(
+                "OUTPACE_HLS_STARTUP_TIMEOUT_MS must be >= OUTPACE_HLS_SEGMENT_DURATION_MS".into(),
+            );
         }
 
         let segment_bytes = u64::try_from(self.segment_packets)
@@ -242,12 +297,14 @@ pub struct Config {
     /// `cache_type` is `Disk`. Defaults to `<data_dir>/cache`.
     pub cache_dir: PathBuf,
     /// Pieces behind the live edge to start at, giving an immediate playback cushion.
-    pub prefetch_pieces: u64,
+    pub prefetch_pieces: Option<u64>,
     /// Depth of the per-session fan-out broadcast channel (messages buffered per client).
     /// Must be >= 1.
     pub session_buffer: usize,
     /// Live lag-recovery policy and active upstream bounds.
     pub live_recovery: LiveRecoveryConfig,
+    /// Initial playback buffering policy.
+    pub startup_buffer: StartupBufferConfig,
     /// HLS byte-segment packaging policy.
     pub hls: HlsConfig,
     /// Max simultaneously-unchoked peers per served stream (S2). Wired into the inbound serve
@@ -306,9 +363,10 @@ impl Default for Config {
             seed_retention_secs: 45,
             cache_type: CacheType::Memory,
             cache_dir,
-            prefetch_pieces: 8,
+            prefetch_pieces: None,
             session_buffer: 256,
             live_recovery: LiveRecoveryConfig::default(),
+            startup_buffer: StartupBufferConfig::default(),
             hls: HlsConfig::default(),
             max_unchoked: 8,
             max_inbound_peers: 64,
@@ -408,6 +466,8 @@ mod tests {
             segment_packets: 1_000_000,
             window_segments: 1,
             segment_duration_ms: 1000,
+            startup_segments: 1,
+            startup_timeout_ms: 1000,
         };
         config.validate_for_object_limit(object_limit).unwrap();
 
@@ -455,6 +515,8 @@ mod tests {
             segment_packets: usize::try_from(segment_packets).unwrap(),
             window_segments: usize::try_from(max_retained_segments - 1).unwrap(),
             segment_duration_ms: 1000,
+            startup_segments: 1,
+            startup_timeout_ms: 1000,
         };
 
         config.validate_for_object_limit(object_limit).unwrap();
@@ -472,6 +534,8 @@ mod tests {
             segment_packets: 3,
             window_segments: usize::MAX,
             segment_duration_ms: 1000,
+            startup_segments: 1,
+            startup_timeout_ms: 1000,
         };
         assert!(config.validate_for_object_limit(u64::MAX).is_err());
     }
@@ -500,12 +564,60 @@ mod tests {
     }
 
     #[test]
+    fn playback_buffer_defaults_match_reference_candidate() {
+        let c = Config::default();
+        assert_eq!(c.startup_buffer.target_ms, 30_000);
+        assert_eq!(c.startup_buffer.max_bytes, 134_217_728);
+        assert_eq!(c.startup_buffer.timeout_ms, 15_000);
+        assert_eq!(c.prefetch_pieces, None);
+        assert_eq!(c.hls.segment_duration_ms, 5_000);
+        assert_eq!(c.hls.window_segments, 8);
+        assert_eq!(c.hls.startup_segments, 6);
+        assert_eq!(c.hls.startup_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn hls_rejects_startup_count_past_window_and_short_timeout() {
+        let mut hls = HlsConfig::default();
+        hls.startup_segments = hls.window_segments + 1;
+        assert!(hls
+            .validate()
+            .unwrap_err()
+            .contains("OUTPACE_HLS_STARTUP_SEGMENTS"));
+        hls = HlsConfig::default();
+        hls.startup_timeout_ms = hls.segment_duration_ms - 1;
+        assert!(hls
+            .validate()
+            .unwrap_err()
+            .contains("OUTPACE_HLS_STARTUP_TIMEOUT_MS"));
+    }
+
+    #[test]
+    fn startup_buffer_rejects_missing_timeout_and_sub_packet_budget() {
+        let mut startup = StartupBufferConfig::default();
+        startup.timeout_ms = 0;
+        assert!(startup
+            .validate()
+            .unwrap_err()
+            .contains("OUTPACE_PREBUFFER_TIMEOUT_MS"));
+
+        startup = StartupBufferConfig::default();
+        startup.max_bytes = 187;
+        assert!(startup
+            .validate()
+            .unwrap_err()
+            .contains("OUTPACE_PREBUFFER_BYTES"));
+        assert_eq!(startup.target(), Duration::from_secs(30));
+        assert_eq!(startup.timeout(), Duration::from_secs(15));
+    }
+
+    #[test]
     fn default_config_has_seeding_and_inbound_on() {
         let c = Config::default();
         assert_eq!(c.peer_listen.port(), 8621);
         assert_eq!(c.seed_store_bytes, 128 * 1024 * 1024);
         assert_eq!(c.seed_retention_secs, 45);
-        assert_eq!(c.prefetch_pieces, 8);
+        assert_eq!(c.prefetch_pieces, None);
         assert_eq!(c.session_buffer, 256);
         assert_eq!(c.max_unchoked, 8);
         assert_eq!(c.max_inbound_peers, 64);
