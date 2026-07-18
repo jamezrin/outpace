@@ -135,6 +135,15 @@ impl StreamManager {
         buffer: usize,
         hls: HlsConfig,
     ) -> Arc<StreamManager> {
+        Self::with_config_and_grace(registry, buffer, hls, Duration::from_secs(30))
+    }
+
+    pub(crate) fn with_config_and_grace(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        grace: Duration,
+    ) -> Arc<StreamManager> {
         Arc::new(StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
@@ -146,7 +155,7 @@ impl StreamManager {
             vod_resolve_lock: Mutex::new(()),
             buffer,
             hls,
-            grace: Duration::from_secs(30),
+            grace,
         })
     }
 
@@ -845,6 +854,30 @@ mod tests {
 
         assert!(m.get("test", "active-hls").await.is_some());
         assert!(m.get_hls("test", "active-hls").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn native_hls_recovery_grace_outlives_short_poll_gap_then_reaps() {
+        let m = StreamManager::with_config_and_grace(
+            registry(),
+            256,
+            HlsConfig::default(),
+            Duration::from_secs(300),
+        );
+        let pkg = m.get_or_start_hls("test", "recovering-hls").await.unwrap();
+        let last_access = Instant::now();
+        pkg.set_last_access_for_test(last_access);
+
+        m.reap_idle_at(last_access + Duration::from_secs(31)).await;
+        assert!(
+            m.get("test", "recovering-hls").await.is_some(),
+            "a transient upstream recovery must not tear down native HLS"
+        );
+
+        m.reap_idle_at(last_access + m.grace + Duration::from_secs(1))
+            .await;
+        assert!(m.get("test", "recovering-hls").await.is_none());
+        assert!(m.get_hls("test", "recovering-hls").await.is_none());
     }
 
     #[tokio::test]

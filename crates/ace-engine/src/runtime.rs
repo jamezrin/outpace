@@ -125,6 +125,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_HLS_STARTUP_TIMEOUT_MS") {
         config.hls.startup_timeout_ms = v.parse()?;
     }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_IDLE_TIMEOUT_MS") {
+        config.hls_idle_timeout_ms = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
         config.max_unchoked = v.parse()?;
     }
@@ -155,6 +158,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
+    if config.hls_idle_timeout_ms == 0 {
+        return Err("OUTPACE_HLS_IDLE_TIMEOUT_MS must be >= 1".into());
+    }
     validate_cache_budget(&config)?;
     Ok(config)
 }
@@ -454,7 +460,12 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager = StreamManager::with_config(registry, config.session_buffer, config.hls);
+    let manager = StreamManager::with_config_and_grace(
+        registry,
+        config.session_buffer,
+        config.hls,
+        std::time::Duration::from_millis(config.hls_idle_timeout_ms),
+    );
     manager.spawn_reaper();
     if config.seed_ttl_secs > 0 {
         let seed_registry_reap = seed_registry.clone();
@@ -1181,6 +1192,7 @@ mod tests {
         assert_eq!(c.hls.segment_duration_ms, 5000);
         assert_eq!(c.hls.startup_segments, 6);
         assert_eq!(c.hls.startup_timeout_ms, 45_000);
+        assert_eq!(c.hls_idle_timeout_ms, 300_000);
     }
 
     #[test]
@@ -1197,6 +1209,7 @@ mod tests {
             "OUTPACE_HLS_SEGMENT_PACKETS",
             "OUTPACE_HLS_WINDOW_SEGMENTS",
             "OUTPACE_HLS_SEGMENT_DURATION_MS",
+            "OUTPACE_HLS_IDLE_TIMEOUT_MS",
         ];
         for key in keys {
             std::env::remove_var(key);
@@ -1211,6 +1224,7 @@ mod tests {
         std::env::set_var("OUTPACE_HLS_SEGMENT_PACKETS", "64");
         std::env::set_var("OUTPACE_HLS_WINDOW_SEGMENTS", "7");
         std::env::set_var("OUTPACE_HLS_SEGMENT_DURATION_MS", "1500");
+        std::env::set_var("OUTPACE_HLS_IDLE_TIMEOUT_MS", "120000");
 
         let c = config_from_env().unwrap();
 
@@ -1224,6 +1238,7 @@ mod tests {
         assert_eq!(c.hls.segment_packets, 64);
         assert_eq!(c.hls.window_segments, 7);
         assert_eq!(c.hls.segment_duration_ms, 1500);
+        assert_eq!(c.hls_idle_timeout_ms, 120_000);
 
         for key in keys {
             std::env::remove_var(key);

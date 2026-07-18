@@ -99,6 +99,10 @@ retained window (`OUTPACE_HLS_WINDOW_SEGMENTS=8`), six completed startup segment
 the timeout. `OUTPACE_HLS_STARTUP_SEGMENTS=0` retains compatibility by behaving as one segment.
 The generated `EXT-X-START` points near the beginning of the retained startup window, but it is
 advisory: clients may choose a different starting position and maintain their own buffer policy.
+After the last successful native playlist or retained-segment read, outpace retains the HLS
+session for `OUTPACE_HLS_IDLE_TIMEOUT_MS` (default `300000`) so upstream recovery can outlive a
+short player polling gap. Missing or expired segment probes do not refresh this timer, and an
+abandoned session is still reaped when it expires.
 
 ## Player and middleware integration
 
