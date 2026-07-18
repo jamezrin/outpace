@@ -57,7 +57,7 @@ impl StartupReservoir {
         }
     }
 
-    fn push(&mut self, chunk: Bytes) -> Option<ReleaseReason> {
+    fn push(&mut self, mut chunk: Bytes) -> Option<ReleaseReason> {
         if self.phase != Phase::Collecting {
             return match self.phase {
                 Phase::Draining(reason) => Some(reason),
@@ -68,7 +68,9 @@ impl StartupReservoir {
             self.first_clean_byte = Some(Instant::now());
         }
 
-        self.observe_bytes(&chunk);
+        if let Some(retain_from) = self.observe_bytes(&chunk) {
+            self.discard_prefix(retain_from, &mut chunk);
+        }
         if self.first_clean_byte.is_none() {
             self.first_clean_byte = Some(Instant::now());
         }
@@ -87,8 +89,12 @@ impl StartupReservoir {
         reason
     }
 
-    fn observe_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
+    /// Observe complete packets and return the combined queued/current byte offset of the last
+    /// reset packet. The caller uses that boundary to retain the reset packet and its suffix.
+    fn observe_bytes(&mut self, bytes: &[u8]) -> Option<usize> {
+        let prior_bytes = self.queued_bytes;
+        let mut retain_from = None;
+        for (index, &byte) in bytes.iter().enumerate() {
             self.partial.push(byte);
             if self.partial.len() != TS_PACKET_LEN {
                 continue;
@@ -98,11 +104,42 @@ impl StartupReservoir {
             self.partial.clear();
             let timing = ts_timing(&packet);
             if self.clock.observe(timing) == ClockObservation::Reset {
-                self.discontinuity();
+                retain_from = Some(prior_bytes + index + 1 - TS_PACKET_LEN);
+                self.first_clean_byte = None;
+                self.release_clock_duration = None;
+                self.release_bytes = 0;
                 if !timing.discontinuity {
                     let _ = self.clock.observe(timing);
                 }
             }
+        }
+        retain_from
+    }
+
+    fn discard_prefix(&mut self, retain_from: usize, chunk: &mut Bytes) {
+        let prior_bytes = self.queued_bytes;
+        if retain_from >= prior_bytes {
+            self.queue.clear();
+            self.queued_bytes = 0;
+            *chunk = chunk.slice(retain_from - prior_bytes..);
+            return;
+        }
+
+        let mut discard = retain_from;
+        while discard > 0 {
+            let front_len = self.queue.front().map_or(0, Bytes::len);
+            if discard < front_len {
+                let retained = self
+                    .queue
+                    .pop_front()
+                    .expect("front length came from queue");
+                self.queue.push_front(retained.slice(discard..));
+                self.queued_bytes -= discard;
+                break;
+            }
+            self.queue.pop_front();
+            self.queued_bytes -= front_len;
+            discard -= front_len;
         }
     }
 
@@ -408,6 +445,55 @@ mod tests {
         assert_eq!(buffered.next().await.unwrap()[20], b'e');
         assert_eq!(buffered.next().await.unwrap()[20], b'f');
         assert!(buffered.take_discontinuity());
+    }
+
+    #[tokio::test]
+    async fn in_chunk_clock_reset_discards_every_byte_before_reset_packet() {
+        let pre_gap_a = packet(PID, Some(0), false, b'a');
+        let pre_gap_b = packet(PID, Some(45_000), false, b'b');
+        let reset = packet(PID, Some(90_000), true, b'c');
+        let post_gap_a = packet(PID, Some(0), false, b'd');
+        let post_gap_b = packet(PID, Some(90_000), false, b'e');
+        let chunk = [
+            pre_gap_a.as_ref(),
+            pre_gap_b.as_ref(),
+            reset.as_ref(),
+            post_gap_a.as_ref(),
+            post_gap_b.as_ref(),
+        ]
+        .concat();
+        let expected = [reset.as_ref(), post_gap_a.as_ref(), post_gap_b.as_ref()].concat();
+        let mut buffered = StartupBufferedSource::new(
+            boxed(vec![(Bytes::from(chunk), false)]),
+            config(1_000, 4096, 10_000),
+            None,
+        );
+
+        assert_eq!(buffered.next().await.unwrap().as_ref(), expected);
+    }
+
+    #[tokio::test]
+    async fn reset_packet_split_across_chunks_retains_its_prefix_not_pre_gap_bytes() {
+        let pre_gap = packet(PID, Some(0), false, b'a');
+        let reset = packet(PID, Some(45_000), true, b'b');
+        let post_gap_a = packet(PID, Some(0), false, b'c');
+        let post_gap_b = packet(PID, Some(90_000), false, b'd');
+        let first = [pre_gap.as_ref(), &reset[..73]].concat();
+        let second = [&reset[73..], post_gap_a.as_ref(), post_gap_b.as_ref()].concat();
+        let mut buffered = StartupBufferedSource::new(
+            boxed(vec![
+                (Bytes::from(first), false),
+                (Bytes::from(second), false),
+            ]),
+            config(1_000, 4096, 10_000),
+            None,
+        );
+
+        assert_eq!(buffered.next().await.unwrap().as_ref(), &reset[..73]);
+        assert_eq!(
+            buffered.next().await.unwrap().as_ref(),
+            [&reset[73..], post_gap_a.as_ref(), post_gap_b.as_ref()].concat()
+        );
     }
 
     #[tokio::test]
