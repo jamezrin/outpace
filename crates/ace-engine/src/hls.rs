@@ -243,6 +243,12 @@ impl HlsPackager {
                     st.discontinuity_pending = true;
                     continue;
                 }
+                // A source event may resume without an in-band marker. Once its first clean
+                // access point is accepted, do not let the recovery token swallow a later,
+                // unrelated transport discontinuity.
+                if !duplicate_source_marker {
+                    st.deduplicate_source_marker = false;
+                }
                 let trailing = st.cur.split_off(packet_offset + TS_PACKET);
                 st.cur.clear();
                 st.cur.extend_from_slice(&prefix);
@@ -892,6 +898,47 @@ mod tests {
                 .matches("#EXT-X-DISCONTINUITY\n")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn unmarked_resumed_access_closes_source_marker_dedup_window() {
+        let p = clean_pkg(12);
+        let first_pat = pat(PMT_PID);
+        let first_pmt = pmt(PMT_PID, VIDEO_PID);
+        let unmarked_resume = video_access_packet(VIDEO_PID, 900_000);
+        let genuine_marker = pcr_packet(VIDEO_PID, 2_000_000, true, true, 8);
+        let second_pat = pat(PMT_PID);
+        let second_pmt = pmt(PMT_PID, VIDEO_PID);
+        let post_marker_access = video_access_packet(VIDEO_PID, 2_100_000);
+
+        feed_one_clean_segment(&p);
+        p.discontinuity();
+        p.feed(&first_pat);
+        p.feed(&first_pmt);
+        p.feed(&unmarked_resume);
+        p.feed(&video_access_packet(VIDEO_PID, 1_008_000));
+
+        p.feed(&genuine_marker);
+        p.feed(&second_pat);
+        p.feed(&second_pmt);
+        p.feed(&post_marker_access);
+        p.feed(&video_access_packet(VIDEO_PID, 2_208_000));
+
+        let segment = p
+            .segment(2)
+            .expect("the later genuine marker must start another clean segment");
+        assert_eq!(&segment[..TS_PACKET], &second_pat);
+        assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], &second_pmt);
+        assert_eq!(&segment[TS_PACKET * 2..TS_PACKET * 3], &post_marker_access);
+        assert!(!segment
+            .chunks_exact(TS_PACKET)
+            .any(|packet| packet == genuine_marker));
+        assert_eq!(
+            p.playlist("test", "unmarked-resume")
+                .matches("#EXT-X-DISCONTINUITY\n")
+                .count(),
+            2
         );
     }
 
