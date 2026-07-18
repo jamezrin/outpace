@@ -1550,7 +1550,7 @@ fn ace_stream_session_response(
 }
 
 fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
-    gate.reset();
+    gate.reset_for_discontinuity();
 }
 
 #[cfg(test)]
@@ -2479,6 +2479,17 @@ mod tests {
         assert!(
             gate.push(mid_gop_packet).is_empty(),
             "after lag reset, mid-GOP packets are held until a keyframe"
+        );
+
+        let resumed = gate.push(FIXTURE);
+        let first_video = resumed
+            .chunks_exact(188)
+            .find(|packet| ace_media::mpegts::ts_pid(packet) == 0x0100)
+            .expect("resumed direct stream has a video keyframe");
+        let first_video: &[u8; 188] = first_video.try_into().unwrap();
+        assert!(
+            ace_media::mpegts::ts_timing(first_video).discontinuity,
+            "resumed direct TS must expose the discontinuity to the decoder"
         );
     }
 

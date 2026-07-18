@@ -184,24 +184,42 @@ const MAX_UNSYNCED_TAIL: usize = 2 * TS_PACKET_LEN - 1;
 #[derive(Default)]
 pub struct TsResync {
     buf: Vec<u8>,
+    locked: bool,
+}
+
+pub struct TsResyncOutput {
+    pub bytes: Vec<u8>,
+    pub discarded_bytes: usize,
 }
 
 impl TsResync {
     pub fn new() -> Self {
-        TsResync { buf: Vec::new() }
+        TsResync {
+            buf: Vec::new(),
+            locked: false,
+        }
     }
 
     /// Append `data`; return all newly emittable sync-locked packets (a whole number of
     /// 188-byte packets, each starting with `0x47`). Sync is confirmed with one packet of
     /// lookahead (`0x47` at the candidate AND at +188), so output trails input by ≤1 packet.
     pub fn push(&mut self, data: &[u8]) -> Vec<u8> {
+        self.push_report(data).bytes
+    }
+
+    /// Like [`Self::push`], while reporting bytes discarded after sync was first acquired.
+    /// Callers can treat such loss as a media discontinuity instead of silently joining
+    /// transport packets across an unrecoverable boundary.
+    pub fn push_report(&mut self, data: &[u8]) -> TsResyncOutput {
         self.buf.extend_from_slice(data);
         let n = self.buf.len();
         let mut out = Vec::new();
+        let mut discarded_bytes = 0;
         let mut i = 0;
         while i + 2 * TS_PACKET_LEN <= n {
             if self.buf[i] == TS_SYNC && self.buf[i + TS_PACKET_LEN] == TS_SYNC {
                 out.extend_from_slice(&self.buf[i..i + TS_PACKET_LEN]);
+                self.locked = true;
                 i += TS_PACKET_LEN;
             } else {
                 // Lost lock: scan forward to the next confirmable packet start.
@@ -212,6 +230,9 @@ impl TsResync {
                     j += 1;
                 }
                 if j + TS_PACKET_LEN < n {
+                    if self.locked {
+                        discarded_bytes += j - i;
+                    }
                     i = j;
                 } else {
                     break; // can't confirm yet; keep from i for the next push
@@ -225,9 +246,15 @@ impl TsResync {
         // re-lock, so drop it. Bounds memory against a non-TS junk flood (#14).
         if self.buf.len() > MAX_UNSYNCED_TAIL {
             let excess = self.buf.len() - MAX_UNSYNCED_TAIL;
+            if self.locked {
+                discarded_bytes += excess;
+            }
             self.buf.drain(0..excess);
         }
-        out
+        TsResyncOutput {
+            bytes: out,
+            discarded_bytes,
+        }
     }
 }
 
@@ -322,6 +349,7 @@ pub struct KeyframeGate {
     scanned: usize,
     max_scan_packets: usize,
     filter_sdt: bool,
+    mark_discontinuity: bool,
 }
 
 /// Default packet budget before the gate gives up looking for a keyframe and passes through.
@@ -343,6 +371,7 @@ impl KeyframeGate {
             scanned: 0,
             max_scan_packets,
             filter_sdt: false,
+            mark_discontinuity: false,
         }
     }
 
@@ -359,6 +388,7 @@ impl KeyframeGate {
             scanned: 0,
             max_scan_packets: DEFAULT_MAX_SCAN_PACKETS,
             filter_sdt,
+            mark_discontinuity: false,
         }
     }
 
@@ -369,6 +399,13 @@ impl KeyframeGate {
         self.locked = false;
         self.scanned = 0;
         self.access.reset();
+    }
+
+    /// Re-arm after known media loss and mark the first resumed video access point so MPEG-TS
+    /// decoders reset continuity/timestamp state at the same boundary.
+    pub fn reset_for_discontinuity(&mut self) {
+        self.reset();
+        self.mark_discontinuity = true;
     }
 
     /// Append `data` (assumed 188-aligned TS) and return the bytes to forward to the client.
@@ -393,7 +430,16 @@ impl KeyframeGate {
                 if let Some(prefix) = self.access.table_prefix() {
                     out.extend_from_slice(&prefix);
                 }
-                out.extend_from_slice(pkt);
+                if self.mark_discontinuity {
+                    let mut resumed = pkt.to_vec();
+                    if !set_discontinuity_indicator(&mut resumed) {
+                        out.extend_from_slice(&discontinuity_packet(ts_pid(pkt), pkt[3] & 0x0f));
+                    }
+                    out.extend_from_slice(&resumed);
+                    self.mark_discontinuity = false;
+                } else {
+                    out.extend_from_slice(pkt);
+                }
                 self.locked = true;
             } else if self.scanned >= self.max_scan_packets {
                 // Safety fallback: never found a keyframe; passthrough from here.
@@ -406,6 +452,27 @@ impl KeyframeGate {
         self.buf.drain(0..i);
         out
     }
+}
+
+fn set_discontinuity_indicator(packet: &mut [u8]) -> bool {
+    let afc = (packet[3] >> 4) & 0x03;
+    if matches!(afc, 0b10 | 0b11) && packet[4] >= 1 {
+        packet[5] |= 0x80;
+        true
+    } else {
+        false
+    }
+}
+
+fn discontinuity_packet(pid: u16, continuity_counter: u8) -> [u8; TS_PACKET_LEN] {
+    let mut packet = [0xff; TS_PACKET_LEN];
+    packet[0] = TS_SYNC;
+    packet[1] = ((pid >> 8) as u8) & 0x1f;
+    packet[2] = pid as u8;
+    packet[3] = 0x20 | continuity_counter;
+    packet[4] = 183;
+    packet[5] = 0x80;
+    packet
 }
 
 /// PID (13-bit) of a TS packet.
@@ -1196,6 +1263,21 @@ mod tests {
         assert!(out.chunks_exact(TS_PACKET_LEN).all(|p| p[0] == TS_SYNC));
         // we keep most packets (6 in, minus ≤1 lookahead) — junk doesn't corrupt the run
         assert!(packet_count(&out) >= 4);
+    }
+
+    #[test]
+    fn resync_reports_post_lock_boundary_loss_but_not_contiguous_carry() {
+        let mut r = TsResync::new();
+        let contiguous = [packet(1), packet(2), packet(3)].concat();
+        let first = r.push_report(&contiguous[..250]);
+        assert_eq!(first.discarded_bytes, 0);
+        let second = r.push_report(&contiguous[250..]);
+        assert_eq!(second.discarded_bytes, 0);
+
+        let boundary = [vec![0_u8; 96], packet(4), packet(5)].concat();
+        let resumed = r.push_report(&boundary);
+        assert_eq!(resumed.discarded_bytes, TS_PACKET_LEN + 96);
+        assert!(is_aligned(&resumed.bytes));
     }
 
     #[test]

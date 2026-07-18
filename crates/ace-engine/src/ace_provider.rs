@@ -1724,6 +1724,21 @@ impl Continuity {
         }
     }
 
+    fn resync_output(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let output = self.resync.push_report(bytes);
+        if output.discarded_bytes > 0 {
+            crate::alog!(
+                "[mpegts] transport resync discarded boundary bytes: discarded_bytes={}",
+                output.discarded_bytes
+            );
+            let mut gate = ace_media::mpegts::KeyframeGate::new();
+            gate.reset_for_discontinuity();
+            self.output_gate = Some(gate);
+            self.discontinuity_pending = true;
+        }
+        self.filter_output_after_discontinuity(output.bytes)
+    }
+
     fn take_discontinuity(&mut self) -> bool {
         std::mem::take(&mut self.discontinuity_pending)
     }
@@ -2221,8 +2236,7 @@ async fn follow_peer_pool(
                     made_activity = true;
                     let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
-                        let aligned = continuity.resync.push(&ready);
-                        let aligned = continuity.filter_output_after_discontinuity(aligned);
+                        let aligned = continuity.resync_output(&ready);
                         if !aligned.is_empty() {
                             let discontinuity = continuity.take_discontinuity();
                             continuity.emitted += aligned.len() as u64;
@@ -2790,8 +2804,7 @@ async fn follow_one_peer(
                     made_activity = true;
                     let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
-                        let aligned = continuity.resync.push(&ready);
-                        let aligned = continuity.filter_output_after_discontinuity(aligned);
+                        let aligned = continuity.resync_output(&ready);
                         if !aligned.is_empty() {
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
@@ -4339,6 +4352,33 @@ mod tests {
 
         assert_eq!(aligned.len(), TS_PACKET);
         assert_eq!(aligned[1], 0x22);
+    }
+
+    #[test]
+    fn resync_boundary_loss_marks_one_discontinuity_and_rearms_output_gate() {
+        const TS_PACKET: usize = 188;
+        fn packet(fill: u8) -> Vec<u8> {
+            let mut bytes = vec![fill; TS_PACKET];
+            bytes[0] = 0x47;
+            bytes
+        }
+
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
+        let initial = [packet(1), packet(2), packet(3)].concat();
+        assert!(!c.resync_output(&initial).is_empty());
+        assert!(!c.take_discontinuity());
+
+        let boundary = [vec![0; 96], packet(4), packet(5), packet(6)].concat();
+        assert!(c.resync_output(&boundary).is_empty());
+        assert!(c.output_gate_armed());
+        assert!(c.take_discontinuity());
+        assert!(!c.take_discontinuity());
     }
 
     #[test]

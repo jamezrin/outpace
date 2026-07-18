@@ -249,5 +249,4 @@ mod tests {
             StreamEvent::Data(Bytes::from_static(b"after"))
         );
     }
-
 }
