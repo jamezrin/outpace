@@ -229,7 +229,9 @@ Environment variables parsed by the daemon include:
   `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
 - `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per served stream; see
   below), default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`.
-- `OUTPACE_PREFETCH_PIECES` - pieces behind the live edge to start at, default `8`.
+- `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.
+  When unset, outpace derives the depth from the startup target and advertised bitrate, falling
+  back to `32` pieces when the bitrate is unavailable.
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
 - `OUTPACE_PREBUFFER_MS` - target server-resident live startup queue duration, default `30000`.
@@ -268,7 +270,7 @@ Environment variables parsed by the daemon include:
   becomes ready, default `6`. `0` is accepted as a compatibility setting and behaves as `1`.
 - `OUTPACE_HLS_STARTUP_TIMEOUT_MS` - maximum HLS playlist startup wait, default `45000`; must be
   at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. If the startup segment count is not reached, the
-  request returns the playlist available at the deadline.
+  request returns a retryable HTTP `503` at the deadline.
 - `OUTPACE_MAX_UNCHOKED` - max simultaneously-unchoked peers per served stream (default 8). Wired
   into the inbound serve path via the per-infohash serve coordinator: each stream unchokes up to
   this many interested peers plus one rotating optimistic slot (rotated on a ~10s rechoke tick).
