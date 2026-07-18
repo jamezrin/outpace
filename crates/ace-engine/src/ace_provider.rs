@@ -334,13 +334,18 @@ impl AceProvider {
     }
 
     #[cfg(test)]
-    fn prefetch_policy(&self) -> Option<u64> {
+    pub(crate) fn prefetch_policy(&self) -> Option<u64> {
         self.prefetch_pieces
     }
 
     #[cfg(test)]
-    fn startup_buffer_config(&self) -> StartupBufferConfig {
+    pub(crate) fn startup_buffer_config(&self) -> StartupBufferConfig {
         self.startup_buffer
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_recovery_config(&self) -> LiveRecoveryConfig {
+        self.live_recovery
     }
 
     fn prefetch_policy_for(&self, info: &StreamInfo) -> u64 {
@@ -955,7 +960,7 @@ pub async fn announce_infohash_periodically_dynamic(
             _ = tokio::time::sleep(SEEDER_ANNOUNCE_INTERVAL) => {},
             changed = port_rx.changed() => {
                 if changed.is_err() {
-                    return;
+                    std::future::pending::<()>().await;
                 }
             }
         }
@@ -3938,6 +3943,23 @@ mod tests {
         )
         .await;
         assert!(res.is_err(), "must never resolve without an inbound port");
+    }
+
+    #[tokio::test]
+    async fn closed_inbound_port_watch_keeps_self_announce_pending() {
+        let (port_tx, port_rx) = tokio::sync::watch::channel(None);
+        drop(port_tx);
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            announce_infohash_periodically_dynamic(vec![], [0; 20], port_rx),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "a closed disabled-port watch must not cancel the live follower"
+        );
     }
 
     #[test]
