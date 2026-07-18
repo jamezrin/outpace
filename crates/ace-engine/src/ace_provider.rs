@@ -7,7 +7,7 @@
 //! resolution first uses the official signed catalog path, with BEP-9 `ut_metadata` as a
 //! fallback (see [`ace_swarm::resolve`]); the infohash form works directly.
 
-use crate::config::{CacheType, LiveRecoveryConfig};
+use crate::config::{CacheType, LiveRecoveryConfig, StartupBufferConfig};
 use crate::provider::{
     ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource, VodContent,
 };
@@ -189,7 +189,8 @@ pub struct AceProvider {
     seed_store_bytes: u64,
     /// Age bound for live seed stores; `None` disables it (byte-only). Default `SEED_STORE_RETENTION`.
     seed_store_retention: Option<Duration>,
-    prefetch_pieces: u64,
+    prefetch_pieces: Option<u64>,
+    startup_buffer: StartupBufferConfig,
     live_recovery: LiveRecoveryConfig,
     enable_seeding: bool,
     cache_type: CacheType,
@@ -217,7 +218,8 @@ impl AceProvider {
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
             seed_store_retention: Some(SEED_STORE_RETENTION),
-            prefetch_pieces: PREFETCH_PIECES,
+            prefetch_pieces: None,
+            startup_buffer: StartupBufferConfig::default(),
             live_recovery: LiveRecoveryConfig::default(),
             enable_seeding: true,
             cache_type: CacheType::Memory,
@@ -317,11 +319,26 @@ impl AceProvider {
         self
     }
 
-    /// Override how many pieces behind the live edge a fresh follower starts at, tuning the
-    /// immediate playback cushion against extra startup latency. Defaults to `PREFETCH_PIECES`.
-    pub fn with_prefetch_pieces(mut self, pieces: u64) -> Self {
+    /// Set an exact operator prefetch depth, or preserve `None` for derived policy selection.
+    pub fn with_prefetch_pieces(mut self, pieces: Option<u64>) -> Self {
         self.prefetch_pieces = pieces;
         self
+    }
+
+    /// Store the validated startup buffering policy for installation around the live source.
+    pub fn with_startup_buffer(mut self, startup_buffer: StartupBufferConfig) -> Self {
+        self.startup_buffer = startup_buffer;
+        self
+    }
+
+    #[cfg(test)]
+    fn prefetch_policy(&self) -> Option<u64> {
+        self.prefetch_pieces
+    }
+
+    #[cfg(test)]
+    fn startup_buffer_config(&self) -> StartupBufferConfig {
+        self.startup_buffer
     }
 
     /// Override the live lag-recovery and active upstream policy. Values are validated by
@@ -825,7 +842,9 @@ impl StreamProvider for AceProvider {
             store_bytes: self.seed_store_bytes,
             store_retention: self.seed_store_retention,
             enabled: self.enable_seeding,
-            prefetch_pieces: self.prefetch_pieces,
+            // Task 4 resolves `None` from stream bitrate and startup target. Until then, retain
+            // the historical depth at the final integer-only SeedConfig boundary.
+            prefetch_pieces: self.prefetch_pieces.unwrap_or(PREFETCH_PIECES),
             live_recovery: self.live_recovery,
             cache_type: self.cache_type,
             cache_dir: self.cache_dir.clone(),
@@ -3008,6 +3027,27 @@ mod tests {
     async fn network_is_ace() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
         assert_eq!(p.network(), "ace");
+    }
+
+    #[test]
+    fn startup_policy_builders_preserve_absent_and_explicit_values() {
+        let startup = crate::config::StartupBufferConfig {
+            target_ms: 12_000,
+            max_bytes: 33_554_432,
+            timeout_ms: 9_000,
+        };
+        let default = AceProvider::new(Arc::new(Identity::generate()), 6878);
+        assert_eq!(default.prefetch_policy(), None);
+        assert_eq!(
+            default.startup_buffer_config(),
+            crate::config::StartupBufferConfig::default()
+        );
+
+        let configured = AceProvider::new(Arc::new(Identity::generate()), 6878)
+            .with_prefetch_pieces(Some(8))
+            .with_startup_buffer(startup);
+        assert_eq!(configured.prefetch_policy(), Some(8));
+        assert_eq!(configured.startup_buffer_config(), startup);
     }
 
     #[tokio::test]

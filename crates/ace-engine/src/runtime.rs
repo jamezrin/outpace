@@ -439,14 +439,12 @@ pub async fn build_runtime(
             .with_seed_store_bytes(config.seed_store_bytes)
             .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
             .with_cache(config.cache_type, config.cache_dir.clone())
+            .with_prefetch_pieces(config.prefetch_pieces)
+            .with_startup_buffer(config.startup_buffer)
             .with_live_recovery(config.live_recovery)
             .with_seeding_enabled(config.enable_seeding)
             .with_inbound_announce_port_receiver(announce_port_rx.clone())
             .with_reachability(reachability.clone());
-        let provider = match config.prefetch_pieces {
-            Some(pieces) => provider.with_prefetch_pieces(pieces),
-            None => provider,
-        };
         registry.register(Arc::new(provider));
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
