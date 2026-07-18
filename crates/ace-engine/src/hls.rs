@@ -27,11 +27,15 @@ pub struct HlsPackager {
     window: usize,
     /// Requested segment duration (seconds).
     seg_duration: f32,
+    /// Number of completed segments required before advertising startup readiness.
+    startup_segments: usize,
+    startup_timeout: Duration,
 }
 
 struct HlsState {
     /// Sequence number of the first retained segment.
     media_seq: u64,
+    discontinuity_sequence: u64,
     segments: VecDeque<HlsSegment>,
     cur: Vec<u8>,
     scanned_packets: usize,
@@ -80,6 +84,7 @@ impl HlsPackager {
         Arc::new(HlsPackager {
             state: Mutex::new(HlsState {
                 media_seq: 0,
+                discontinuity_sequence: 0,
                 segments: VecDeque::new(),
                 cur: Vec::new(),
                 scanned_packets: 0,
@@ -98,6 +103,8 @@ impl HlsPackager {
             max_segment_bytes,
             window: config.window_segments.max(1),
             seg_duration: config.segment_duration_secs(),
+            startup_segments: config.startup_segments.max(1),
+            startup_timeout: Duration::from_millis(config.startup_timeout_ms),
         })
     }
 
@@ -341,12 +348,18 @@ impl HlsPackager {
     }
 
     fn emit(&self, st: &mut HlsState, end: usize, duration: f32) {
-        let first_segment = st.segments.is_empty();
+        let was_ready = st.segments.len() >= self.startup_segments;
         // Evict before splitting/pushing so emission never transiently retains `window + 1`
         // completed segments in addition to the current segment. Configuration accounts for
         // exactly `window` completed segments plus `cur`.
         while st.segments.len() >= self.window {
-            st.segments.pop_front();
+            if st
+                .segments
+                .pop_front()
+                .is_some_and(|segment| segment.discontinuity)
+            {
+                st.discontinuity_sequence += 1;
+            }
             st.media_seq += 1;
         }
         let rest = st.cur.split_off(end);
@@ -357,16 +370,20 @@ impl HlsPackager {
             duration,
             discontinuity,
         });
-        if first_segment {
+        if !was_ready && st.segments.len() >= self.startup_segments {
             self.ready.notify_waiters();
         }
         st.max_segment_duration = st.max_segment_duration.max(duration);
         st.scanned_packets = 0;
     }
 
-    /// Whether at least one independently joinable live segment is available.
+    /// Whether the configured startup cushion of independently joinable segments is available.
     pub fn is_ready(&self) -> bool {
-        !self.state.lock().unwrap().segments.is_empty()
+        self.state.lock().unwrap().segments.len() >= self.startup_segments
+    }
+
+    pub fn startup_timeout(&self) -> Duration {
+        self.startup_timeout
     }
 
     /// Wait up to `timeout` for the first independently joinable live segment.
@@ -377,6 +394,8 @@ impl HlsPackager {
         tokio::time::timeout(timeout, async {
             loop {
                 let notified = self.ready.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.is_ready() {
                     break;
                 }
@@ -416,7 +435,18 @@ impl HlsPackager {
             "#EXT-X-TARGETDURATION:{}\n",
             st.max_segment_duration.ceil() as u64
         ));
+        if let Some(offset) = Self::advisory_start_offset(st) {
+            out.push_str(&format!(
+                "#EXT-X-START:TIME-OFFSET=-{offset:.3},PRECISE=NO\n"
+            ));
+        }
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", st.media_seq));
+        if st.discontinuity_sequence != 0 {
+            out.push_str(&format!(
+                "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
+                st.discontinuity_sequence
+            ));
+        }
         for (i, segment) in st.segments.iter().enumerate() {
             if segment.discontinuity {
                 out.push_str("#EXT-X-DISCONTINUITY\n");
@@ -428,6 +458,25 @@ impl HlsPackager {
             ));
         }
         out
+    }
+
+    fn advisory_start_offset(st: &HlsState) -> Option<f32> {
+        let safety_distance = 3.0 * st.max_segment_duration.ceil();
+        let mut suffix = 0.0;
+        let mut safe_boundary = None;
+        for index in (1..st.segments.len()).rev() {
+            suffix += st.segments[index].duration;
+            if suffix >= safety_distance {
+                safe_boundary = Some((index, suffix));
+                break;
+            }
+        }
+        let (index, suffix) = safe_boundary?;
+        if index > 1 {
+            Some(suffix + st.segments[index - 1].duration)
+        } else {
+            Some(suffix)
+        }
     }
 
     /// Fetch a retained segment by its absolute sequence number.
@@ -671,6 +720,7 @@ mod tests {
                 segment_packets,
                 window_segments: 4,
                 segment_duration_ms: 1000,
+                startup_segments: 1,
                 ..HlsConfig::default()
             },
             None,
@@ -898,6 +948,54 @@ mod tests {
         assert!(p.wait_ready(Duration::from_millis(50)).await);
         assert!(p.is_ready());
         assert_eq!(p.state.lock().unwrap().last_access, Some(stale));
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_configured_completed_segment_count() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 3,
+                startup_timeout_ms: 20,
+            },
+            None,
+        );
+
+        feed_clean_run(&p, 0, 2);
+        assert!(!p.is_ready());
+        assert_eq!(p.startup_timeout(), Duration::from_millis(20));
+        feed_clean_run(&p, 1_000_000, 1);
+        assert!(p.wait_ready(Duration::from_millis(20)).await);
+    }
+
+    #[test]
+    fn playlist_start_uses_irregular_retained_durations_inside_safe_edge() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                window_segments: 8,
+                segment_duration_ms: 5000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            None,
+        );
+        let mut state = p.state.lock().unwrap();
+        state.max_segment_duration = 7.0;
+        state.segments = [4.0, 6.0, 5.0, 7.0, 4.0, 6.0, 5.0, 7.0]
+            .into_iter()
+            .map(|duration| HlsSegment {
+                bytes: Bytes::new(),
+                duration,
+                discontinuity: false,
+            })
+            .collect();
+        drop(state);
+
+        let playlist = p.playlist("test", "synthetic");
+        assert!(playlist.contains("#EXT-X-START:TIME-OFFSET=-29.000,PRECISE=NO"));
     }
 
     #[test]
@@ -1264,7 +1362,8 @@ mod tests {
         }
         let evicted = p.playlist("test", "slide");
         assert!(evicted.contains("#EXT-X-MEDIA-SEQUENCE:4"));
-        assert_eq!(evicted.matches("#EXT-X-DISCONTINUITY").count(), 0);
+        assert!(evicted.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"));
+        assert_eq!(evicted.matches("#EXT-X-DISCONTINUITY\n").count(), 0);
     }
 
     #[test]

@@ -159,6 +159,10 @@ impl StreamManager {
         self.hls
     }
 
+    pub(crate) fn hls_startup_timeout(&self) -> Duration {
+        Duration::from_millis(self.hls.startup_timeout_ms)
+    }
+
     /// Resolve `id` to a single-file VOD, caching the resolved handle per `(network, id)` so a
     /// whole playback — the HLS manifest plus every segment read — shares one resolution (and, for
     /// the ace provider, one piece cache + one peer discovery) instead of re-resolving per request.
@@ -508,6 +512,10 @@ mod tests {
 
         assert_eq!(mgr.buffer(), 8);
         assert_eq!(mgr.hls_config(), hls);
+        assert_eq!(
+            mgr.hls_startup_timeout(),
+            Duration::from_millis(hls.startup_timeout_ms)
+        );
     }
 
     #[tokio::test]

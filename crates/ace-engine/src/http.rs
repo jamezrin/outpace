@@ -25,7 +25,6 @@ use tokio::sync::broadcast::error::RecvError;
 
 const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ACE_TOKEN_CAPACITY: usize = 4096;
-const HLS_PLAYLIST_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn stream_metadata_json(metadata: &StreamMetadata) -> serde_json::Value {
     json!({
@@ -951,8 +950,8 @@ async fn ace_hls_playback(
     State(s): State<AppState>,
     Path((id, manifest)): Path<(String, String)>,
 ) -> Response {
-    ace_hls_playback_with_timeout(State(s), Path((id, manifest)), HLS_PLAYLIST_STARTUP_TIMEOUT)
-        .await
+    let timeout = s.manager.hls_startup_timeout();
+    ace_hls_playback_with_timeout(State(s), Path((id, manifest)), timeout).await
 }
 
 async fn ace_hls_playback_with_timeout(
@@ -1427,12 +1426,8 @@ async fn stream_file(
     State(s): State<AppState>,
     Path((network, file)): Path<(String, String)>,
 ) -> Response {
-    stream_file_with_hls_timeout(
-        State(s),
-        Path((network, file)),
-        HLS_PLAYLIST_STARTUP_TIMEOUT,
-    )
-    .await
+    let timeout = s.manager.hls_startup_timeout();
+    stream_file_with_hls_timeout(State(s), Path((network, file)), timeout).await
 }
 
 async fn stream_file_with_hls_timeout(
@@ -2141,6 +2136,7 @@ mod tests {
                 crate::config::HlsConfig {
                     window_segments: 6,
                     segment_duration_ms: 1000,
+                    startup_segments: 1,
                     ..crate::config::HlsConfig::default()
                 },
             ),
@@ -2295,6 +2291,7 @@ mod tests {
                     segment_packets: 4,
                     window_segments: 3,
                     segment_duration_ms: 1000,
+                    startup_segments: 1,
                     ..crate::config::HlsConfig::default()
                 },
             ),
@@ -2317,6 +2314,7 @@ mod tests {
                     segment_packets: 3,
                     window_segments: 3,
                     segment_duration_ms: 1000,
+                    startup_segments: 1,
                     ..crate::config::HlsConfig::default()
                 },
             ),
