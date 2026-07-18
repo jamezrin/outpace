@@ -987,7 +987,7 @@ mod tests {
             "OUTPACE_PREFETCH_PIECES",
             "OUTPACE_SESSION_BUFFER",
         ];
-        let old: Vec<_> = names.iter().map(|name| std::env::var_os(name)).collect();
+        let old: Vec<_> = names.iter().map(std::env::var_os).collect();
         for name in names {
             std::env::remove_var(name);
         }

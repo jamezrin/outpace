@@ -594,8 +594,10 @@ mod tests {
 
     #[test]
     fn startup_buffer_rejects_missing_timeout_and_sub_packet_budget() {
-        let mut startup = StartupBufferConfig::default();
-        startup.timeout_ms = 0;
+        let mut startup = StartupBufferConfig {
+            timeout_ms: 0,
+            ..StartupBufferConfig::default()
+        };
         assert!(startup
             .validate()
             .unwrap_err()
