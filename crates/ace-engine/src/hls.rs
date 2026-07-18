@@ -223,7 +223,6 @@ impl HlsPackager {
 
             let observation = Self::observe_clock(st, timing);
             if observation == ClockObservation::Reset {
-                st.access.reset();
                 st.cur.drain(..packet_offset + TS_PACKET);
                 st.scanned_packets = 0;
                 st.discontinuity_pending = true;
@@ -264,7 +263,6 @@ impl HlsPackager {
         }
 
         if Self::observe_clock(st, timing) == ClockObservation::Reset {
-            st.access.reset();
             self.discard_incomplete_run(st);
             return;
         }
@@ -1365,6 +1363,27 @@ mod tests {
         assert!(p.segment(1).is_some());
         assert!(p
             .playlist("test", "mid-transport-resume")
+            .contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.200,"));
+    }
+
+    #[test]
+    fn reconnect_clock_reset_recovers_without_waiting_for_repeated_tables() {
+        let p = pkg();
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 900_000));
+        p.feed(&video_access_packet(VIDEO_PID, 1_008_000));
+
+        // A seamless piece reconnect need not emit StreamEvent::Discontinuity, but can resume
+        // from an older PCR epoch. Treat the clock reset as a segment discontinuity without
+        // forgetting the still-valid program map.
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        p.feed(&video_access_packet(VIDEO_PID, 216_000));
+
+        assert!(p.segment(1).is_some());
+        assert!(p
+            .playlist("test", "clock-reset-resume")
             .contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.200,"));
     }
 
