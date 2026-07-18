@@ -339,9 +339,11 @@ impl VideoAccessPointState {
 ///
 /// Feed it sync-locked, 188-aligned TS packets (e.g. [`TsResync`] output). Until it locks it
 /// emits nothing; on the first random-access point it emits the most-recent PAT and PMT
-/// followed by the keyframe packet, then passes everything through verbatim. If no keyframe is
-/// found within `max_scan_packets`, it gives up gating and passes through (better imperfect
-/// video than a starved client).
+/// followed by the keyframe packet, then passes everything through. A titled gate repeats its
+/// synthesized table prefix at later video access points and filters upstream SDT; an untitled
+/// gate remains byte-for-byte passthrough after lock. If no keyframe is found within
+/// `max_scan_packets`, it gives up gating and passes through (better imperfect video than a
+/// starved client).
 pub struct KeyframeGate {
     buf: Vec<u8>,
     locked: bool,
@@ -376,8 +378,8 @@ impl KeyframeGate {
     }
 
     /// Like [`new`](Self::new) but injects a synthesized SDT `service_name` at keyframe lock and
-    /// drops upstream SDT (PID 0x0011) packets from the post-lock passthrough, so the injected
-    /// title is the only SDT the client sees.
+    /// later video access points. Drops upstream SDT (PID 0x0011) packets from the post-lock
+    /// passthrough, so the injected title is the only SDT the client sees.
     pub fn with_service_name(raw: Option<String>) -> Self {
         let access = VideoAccessPointState::with_service_name(raw);
         let filter_sdt = access.has_service_name();
@@ -420,6 +422,11 @@ impl KeyframeGate {
                 if self.filter_sdt && ts_pid(pkt) == SDT_PID {
                     i += TS_PACKET_LEN;
                     continue;
+                }
+                if self.filter_sdt && self.access.observe(pkt) {
+                    if let Some(prefix) = self.access.table_prefix() {
+                        out.extend_from_slice(&prefix);
+                    }
                 }
                 out.extend_from_slice(pkt);
                 i += TS_PACKET_LEN;
@@ -1288,6 +1295,48 @@ mod tests {
         assert!(!out
             .chunks_exact(TS_PACKET_LEN)
             .any(|p| read_sdt_service_name(p).as_deref() == Some("Upstream")));
+    }
+
+    #[test]
+    fn titled_keyframe_gate_repeats_sdt_at_later_access_points() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".to_string()));
+        let ordinary = ts(VIDEO_PID, false, false, &[0x11, 0x22]);
+        let access = random_access_packet(VIDEO_PID);
+        let mut input = Vec::new();
+        input.extend_from_slice(&pat(PMT_PID));
+        input.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        input.extend_from_slice(&access);
+        input.extend_from_slice(&ordinary);
+        input.extend_from_slice(&access);
+
+        let out = gate.push(&input);
+        let titled_sdt_count = out
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|packet| read_sdt_service_name(packet).as_deref() == Some("Titled"))
+            .count();
+        assert_eq!(titled_sdt_count, 2);
+        assert_eq!(
+            out.chunks_exact(TS_PACKET_LEN)
+                .filter(|packet| *packet == ordinary.as_slice())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn untitled_keyframe_gate_does_not_repeat_tables_at_later_access_points() {
+        let mut gate = KeyframeGate::new();
+        let access = random_access_packet(VIDEO_PID);
+        let mut opening = Vec::new();
+        opening.extend_from_slice(&pat(PMT_PID));
+        opening.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        opening.extend_from_slice(&access);
+        let _ = gate.push(&opening);
+
+        let ordinary = ts(VIDEO_PID, false, false, &[0x33, 0x44]);
+        let mut later = ordinary.clone();
+        later.extend_from_slice(&access);
+        assert_eq!(gate.push(&later), later);
     }
 
     #[test]
