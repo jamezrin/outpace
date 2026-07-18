@@ -269,9 +269,6 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_HLS_STARTUP_TIMEOUT_MS` - maximum HLS playlist startup wait, default `45000`; must be
   at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. If the startup segment count is not reached, the
   request returns the playlist available at the deadline.
-- `OUTPACE_HLS_IDLE_TIMEOUT_MS` - native HLS session retention after the last successful playlist
-  or retained-segment read, default `300000`. This gives a temporarily stalled swarm time to
-  reconnect without permanently ending HLS; abandoned sessions are reaped after the bound.
 - `OUTPACE_MAX_UNCHOKED` - max simultaneously-unchoked peers per served stream (default 8). Wired
   into the inbound serve path via the per-infohash serve coordinator: each stream unchokes up to
   this many interested peers plus one rotating optimistic slot (rotated on a ~10s rechoke tick).

@@ -307,9 +307,6 @@ pub struct Config {
     pub startup_buffer: StartupBufferConfig,
     /// HLS byte-segment packaging policy.
     pub hls: HlsConfig,
-    /// How long native HLS remains alive without a successful playlist or retained-segment read,
-    /// allowing upstream recovery to complete before an abandoned session is reaped.
-    pub hls_idle_timeout_ms: u64,
     /// Max simultaneously-unchoked peers per served stream (S2). Wired into the inbound serve
     /// path via the per-infohash `ServeCoordinator`: each stream unchokes up to this many
     /// interested peers plus one rotating optimistic slot (rotated by the daemon's rechoke ticker).
@@ -371,7 +368,6 @@ impl Default for Config {
             live_recovery: LiveRecoveryConfig::default(),
             startup_buffer: StartupBufferConfig::default(),
             hls: HlsConfig::default(),
-            hls_idle_timeout_ms: 300_000,
             max_unchoked: 8,
             max_inbound_peers: 64,
             seed_ttl_secs: 300,
@@ -578,7 +574,6 @@ mod tests {
         assert_eq!(c.hls.window_segments, 8);
         assert_eq!(c.hls.startup_segments, 6);
         assert_eq!(c.hls.startup_timeout_ms, 45_000);
-        assert_eq!(c.hls_idle_timeout_ms, 300_000);
     }
 
     #[test]
