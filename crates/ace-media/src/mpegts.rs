@@ -431,11 +431,19 @@ impl KeyframeGate {
                 if let Some(prefix) = self.access.table_prefix() {
                     out.extend_from_slice(&prefix);
                 }
-                append_resumed_packet(&mut self.mark_discontinuity, pkt, &mut out);
+                append_resumed_packet(&mut self.mark_discontinuity, None, pkt, &mut out);
                 self.locked = true;
             } else if self.scanned >= self.max_scan_packets {
                 // Safety fallback: never found a keyframe; passthrough from here.
-                append_resumed_packet(&mut self.mark_discontinuity, pkt, &mut out);
+                // The discontinuity indicator is PID-specific. Prefer the video PID learned
+                // from the PMT; if tables never arrived, marking the triggering PID is an
+                // explicit best effort because no decoder-visible video PID is known.
+                append_resumed_packet(
+                    &mut self.mark_discontinuity,
+                    self.access.video_pid,
+                    pkt,
+                    &mut out,
+                );
                 self.locked = true;
             }
             // otherwise: drop this prefix packet and keep scanning.
@@ -446,8 +454,20 @@ impl KeyframeGate {
     }
 }
 
-fn append_resumed_packet(mark_discontinuity: &mut bool, packet: &[u8], out: &mut Vec<u8>) {
+fn append_resumed_packet(
+    mark_discontinuity: &mut bool,
+    marker_pid: Option<u16>,
+    packet: &[u8],
+    out: &mut Vec<u8>,
+) {
     if !std::mem::take(mark_discontinuity) {
+        out.extend_from_slice(packet);
+        return;
+    }
+
+    let marker_pid = marker_pid.unwrap_or_else(|| ts_pid(packet));
+    if marker_pid != ts_pid(packet) {
+        out.extend_from_slice(&discontinuity_packet(marker_pid, packet[3] & 0x0f));
         out.extend_from_slice(packet);
         return;
     }
@@ -1143,6 +1163,21 @@ mod tests {
         assert_eq!(packets.len(), 2, "fallback needs a separate marker packet");
         assert!(ts_timing(packets[0].try_into().unwrap()).discontinuity);
         assert_eq!(packets[1], resumed);
+    }
+
+    #[test]
+    fn discontinuity_fallback_marks_known_video_pid_when_audio_exhausts_budget() {
+        let mut gate = KeyframeGate::with_max_scan_packets(3);
+        gate.reset_for_discontinuity();
+        let audio = ts(AUDIO_PID, false, false, &[0xCC; 16]);
+
+        let out = gate.push(&[pat(PMT_PID), pmt(PMT_PID, VIDEO_PID), audio.clone()].concat());
+        let packets: Vec<_> = out.chunks_exact(TS_PACKET_LEN).collect();
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(pid_of(packets[0]), VIDEO_PID);
+        assert!(ts_timing(packets[0].try_into().unwrap()).discontinuity);
+        assert_eq!(packets[1], audio);
     }
 
     #[test]
