@@ -257,23 +257,39 @@ Use a current public content id resolved from the gitignored registry at runtime
 value, derived infohash, or stream name in tracked files, commands saved to the repository, logs
 committed to the repository, issue text, commit messages, or PR text.
 
-Run the reference engine and outpace under overlapping network conditions. Evaluate direct TS and
-native HLS independently with a real-time-paced decoder/player. Exclude intentional cold-start
-withholding from freeze scoring.
+Run the reference engine and Outpace under overlapping or interleaved network conditions without
+running competing trials that interfere with one another. Evaluate direct TS and native HLS with
+the same corrected real-time-paced decoder harness. The harness must continuously drain FFmpeg
+stderr, enforce a terminal watchdog, and exclude intentional cold-start withholding from gap
+scoring.
 
-For each path, run at least three ten-minute trials and record only redacted diagnostics:
+First benchmark the reference engine with three valid trials and use the maximum post-start
+advancing-media gap across them as the comparative baseline. A candidate trial passes the gap
+criterion when its maximum gap is no greater than `reference maximum + 0.5 seconds`.
+
+Then test `OUTPACE_PREBUFFER_MS` in ascending order: 10000, 20000, 30000. For each candidate, run
+three ten-minute direct-TS trials followed by three ten-minute native-HLS trials. Stop at the first
+candidate whose six trials all pass; do not run larger candidates after a full pass. Invalid
+trials do not count and must be rerun.
+
+Every valid trial must decode at least 599 seconds, exit normally, and have no terminal freeze.
+For each path record only redacted diagnostics:
 
 - time to first playable media;
 - initial playable media depth;
 - minimum steady-state lead and whether it progressively depletes;
-- media-clock stalls of at least two seconds after startup;
+- maximum post-start advancing-media gap and comparison with the reference allowance;
 - discontinuities, fan-out lag, live skips, and piece retransmissions;
 - peak process/reservoir/HLS memory.
 
-Test `OUTPACE_PREBUFFER_MS` at 10000, 20000, and 30000 on the same source. The accepted default is
-the smallest setting that produces no post-start media-clock stall of two seconds or longer in all
-three direct trials and all three HLS trials. Also test one constrained short-window or degraded
-case to prove bounded release.
+Lead must not show progressive trial-long depletion: compare early, middle, and late steady-state
+windows and reject a sustained downward trend that ends without recovery. HLS additionally
+requires readiness with the configured startup-segment count, a valid `EXT-X-START`, and complete
+retrieval/decoding through the requested duration. Run the controlled degraded fixture to prove
+byte-limit/deadline release, bounded memory, and redacted degraded logging.
+
+The accepted target is the smallest ascending candidate whose three direct and three HLS trials
+all satisfy these comparative and completion criteria.
 
 Before completion, run:
 

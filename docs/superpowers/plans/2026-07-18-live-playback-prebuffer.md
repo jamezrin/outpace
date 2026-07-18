@@ -529,15 +529,15 @@ Run: `cargo build --release -p ace-engine --bin outpace`
 
 Expected: release build exits 0.
 
-- [ ] **Step 4: Run direct-TS live trials**
+- [ ] **Step 4: Establish the comparative reference baseline**
 
-Resolve the current registry entry only into an interactive environment variable; never place it in a saved command or tracked file. Run three ten-minute real-time-paced decoder trials for each `OUTPACE_PREBUFFER_MS` value `10000`, `20000`, and `30000`. Save redacted timing/progress and engine logs under `/tmp`, record startup depth, stalls >=2 seconds after first media, minimum lead, re-requests, skips, discontinuities, and peak RSS.
+Resolve the current registry entry only into an interactive environment variable; never place it in a saved command or tracked file. Run three valid corrected-harness AceStream reference trials under overlapping/interleaved conditions. Continuously drain FFmpeg stderr, require at least 599 seconds decoded plus normal exit and no terminal freeze, and rerun invalid trials. Save only redacted artifacts under `/tmp` and set the comparative allowance to `maximum reference post-start advancing-media gap + 0.5 seconds`.
 
-Expected acceptance: choose the smallest target with zero post-start stalls >=2 seconds in all three trials and no progressive lead depletion.
+Expected: three valid reference trials establish one recorded maximum-gap allowance.
 
-- [ ] **Step 5: Run HLS live trials**
+- [ ] **Step 5: Test candidates sequentially**
 
-Repeat three ten-minute trials against `.m3u8` with the chosen direct target. Confirm playlists contain six retained startup segments before readiness, `EXT-X-START` is valid, segment downloads remain ahead of real-time playback, and no post-start media-clock stall >=2 seconds occurs.
+Test `OUTPACE_PREBUFFER_MS` in ascending order (`10000`, `20000`, `30000`). For each candidate run three valid ten-minute direct trials, then three valid ten-minute native-HLS trials. Each trial must decode at least 599 seconds, exit normally without a terminal freeze, stay at or below the comparative gap allowance, and show no progressive early/middle/late lead depletion. HLS must also reach the configured startup readiness, publish valid `EXT-X-START`, and retrieve/decode the complete duration. Rerun invalid trials. Stop at the first candidate whose six trials all pass; do not claim or select it before all six complete.
 
 - [ ] **Step 6: Run degraded-window acceptance**
 
@@ -545,7 +545,8 @@ Using a controlled fixture or currently short advertised live window, verify the
 
 - [ ] **Step 7: Commit documentation and any acceptance-driven default adjustment**
 
-If 10 or 20 seconds passes the full acceptance matrix, first update defaults/tests/docs/spec rationale consistently. Then:
+If the first fully passing target differs from 30000, update defaults test-first and update tests,
+docs, and spec rationale consistently. Then:
 
 ```text
 git add README.md docs/native-api.md crates/ace-engine/src/config.rs crates/ace-engine/src/runtime.rs
