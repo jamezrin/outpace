@@ -4,10 +4,115 @@
 //! sync byte `0x47`. Before re-exposing or segmenting we must confirm the byte stream is
 //! packet-aligned (and find the alignment offset if it isn't).
 
+use std::time::Duration;
+
 /// MPEG-TS sync byte at the start of every packet.
 pub const TS_SYNC: u8 = 0x47;
 /// MPEG-TS packet length in bytes.
 pub const TS_PACKET_LEN: usize = 188;
+
+const PCR_MODULUS: u64 = 1 << 33;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TsTiming {
+    pub pid: u16,
+    pub pcr: Option<u64>,
+    pub discontinuity: bool,
+}
+
+/// Parse the PID, PCR base, and discontinuity indicator from a complete TS packet.
+pub fn ts_timing(packet: &[u8; TS_PACKET_LEN]) -> TsTiming {
+    if packet[0] != TS_SYNC || packet[3] & 0x20 == 0 {
+        return TsTiming {
+            pid: 0,
+            pcr: None,
+            discontinuity: false,
+        };
+    }
+    let pid = ts_pid(packet);
+    let adaptation_len = packet[4] as usize;
+    if adaptation_len == 0 || adaptation_len > 183 {
+        return TsTiming {
+            pid,
+            pcr: None,
+            discontinuity: false,
+        };
+    }
+    let flags = packet[5];
+    let pcr = if flags & 0x10 != 0 && adaptation_len >= 7 {
+        Some(
+            ((packet[6] as u64) << 25)
+                | ((packet[7] as u64) << 17)
+                | ((packet[8] as u64) << 9)
+                | ((packet[9] as u64) << 1)
+                | ((packet[10] as u64) >> 7),
+        )
+    } else {
+        None
+    };
+    TsTiming {
+        pid,
+        pcr,
+        discontinuity: flags & 0x80 != 0,
+    }
+}
+
+fn pcr_delta(start: u64, end: u64) -> Option<u64> {
+    let delta = (end + PCR_MODULUS - start) % PCR_MODULUS;
+    (delta <= PCR_MODULUS / 2).then_some(delta)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockObservation {
+    Ignored,
+    Advanced(Duration),
+    Reset,
+}
+
+#[derive(Debug, Default)]
+pub struct SelectedPcrClock {
+    pid: Option<u16>,
+    start: Option<u64>,
+    last: Option<u64>,
+}
+
+impl SelectedPcrClock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn elapsed(&self) -> Option<Duration> {
+        Some(Duration::from_secs_f64(
+            pcr_delta(self.start?, self.last?)? as f64 / 90_000.0,
+        ))
+    }
+
+    pub fn observe(&mut self, timing: TsTiming) -> ClockObservation {
+        if timing.discontinuity {
+            self.reset();
+            return ClockObservation::Reset;
+        }
+        let Some(pcr) = timing.pcr else {
+            return ClockObservation::Ignored;
+        };
+        match self.pid {
+            Some(pid) if pid != timing.pid => return ClockObservation::Ignored,
+            None => self.pid = Some(timing.pid),
+            _ => {}
+        }
+        if self.last.is_some_and(|last| pcr_delta(last, pcr).is_none()) {
+            self.reset();
+            return ClockObservation::Reset;
+        }
+        self.start.get_or_insert(pcr);
+        self.last = Some(pcr);
+        ClockObservation::Advanced(self.elapsed().unwrap_or_default())
+    }
+}
 
 /// PID carrying the Service Description Table (and BAT).
 const SDT_PID: u16 = 0x0011;
@@ -562,6 +667,49 @@ impl Default for KeyframeGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timing(pid: u16, pcr: Option<u64>) -> TsTiming {
+        TsTiming {
+            pid,
+            pcr,
+            discontinuity: false,
+        }
+    }
+
+    #[test]
+    fn selected_pcr_clock_ignores_other_pids_and_handles_wrap() {
+        let mut clock = SelectedPcrClock::new();
+        assert_eq!(
+            clock.observe(timing(0x100, Some(PCR_MODULUS - 45_000))),
+            ClockObservation::Advanced(Duration::ZERO)
+        );
+        assert_eq!(
+            clock.observe(timing(0x101, Some(90_000))),
+            ClockObservation::Ignored
+        );
+        assert_eq!(
+            clock.observe(timing(0x100, Some(45_000))),
+            ClockObservation::Advanced(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn selected_pcr_clock_resets_on_backward_jump_or_discontinuity() {
+        let mut clock = SelectedPcrClock::new();
+        clock.observe(timing(0x100, Some(180_000)));
+        assert_eq!(
+            clock.observe(timing(0x100, Some(90_000))),
+            ClockObservation::Reset
+        );
+        clock.observe(timing(0x100, Some(180_000)));
+        assert_eq!(
+            clock.observe(TsTiming {
+                discontinuity: true,
+                ..timing(0x100, Some(270_000))
+            }),
+            ClockObservation::Reset
+        );
+    }
 
     fn packet(fill: u8) -> Vec<u8> {
         let mut p = vec![fill; TS_PACKET_LEN];

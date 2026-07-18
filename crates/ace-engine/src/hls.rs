@@ -4,14 +4,16 @@
 
 use crate::config::HlsConfig;
 use crate::session::{StreamEvent, StreamSession};
-use ace_media::mpegts::{ts_pid, VideoAccessPointState};
+use ace_media::mpegts::{
+    ts_pid, ts_timing, ClockObservation, SelectedPcrClock, TsTiming, VideoAccessPointState,
+};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TS_PACKET: usize = 188;
-const PCR_HZ: u64 = 90_000;
+#[cfg(test)]
 const PCR_MODULUS: u64 = 1 << 33;
 const SDT_PID: u16 = 0x0011;
 
@@ -33,9 +35,9 @@ struct HlsState {
     segments: VecDeque<HlsSegment>,
     cur: Vec<u8>,
     scanned_packets: usize,
-    segment_start_pcr: Option<u64>,
-    last_pcr: Option<u64>,
-    pcr_pid: Option<u16>,
+    clock: SelectedPcrClock,
+    /// Selected PCR retained only to rebase the clock at a segment boundary.
+    boundary_timing: Option<TsTiming>,
     max_segment_duration: f32,
     discontinuity_pending: bool,
     last_access: Option<Instant>,
@@ -81,9 +83,8 @@ impl HlsPackager {
                 segments: VecDeque::new(),
                 cur: Vec::new(),
                 scanned_packets: 0,
-                segment_start_pcr: None,
-                last_pcr: None,
-                pcr_pid: None,
+                clock: SelectedPcrClock::new(),
+                boundary_timing: None,
                 max_segment_duration: config.segment_duration_secs(),
                 discontinuity_pending: false,
                 last_access: None,
@@ -125,9 +126,8 @@ impl HlsPackager {
         let mut st = self.state.lock().unwrap();
         st.cur.clear();
         st.scanned_packets = 0;
-        st.segment_start_pcr = None;
-        st.last_pcr = None;
-        st.pcr_pid = None;
+        st.clock.reset();
+        st.boundary_timing = None;
         st.discontinuity_pending = true;
         st.access.reset();
         st.awaiting_access_point = true;
@@ -166,16 +166,15 @@ impl HlsPackager {
             let packet_offset = st.scanned_packets * TS_PACKET;
             let mut packet = [0; TS_PACKET];
             packet.copy_from_slice(&st.cur[packet_offset..packet_offset + TS_PACKET]);
-            let mut timing = ts_timing(&packet);
+            let timing = ts_timing(&packet);
             let is_access_point = st.access.observe(&packet);
 
             if timing.discontinuity {
                 st.access.reset();
                 st.cur.drain(..packet_offset + TS_PACKET);
                 st.scanned_packets = 0;
-                st.segment_start_pcr = None;
-                st.last_pcr = None;
-                st.pcr_pid = None;
+                st.clock.reset();
+                st.boundary_timing = None;
                 st.discontinuity_pending = true;
                 st.awaiting_access_point = true;
                 continue;
@@ -212,45 +211,19 @@ impl HlsPackager {
                 continue;
             }
 
-            // A transport stream may carry several programs, each with its own PCR clock. Until
-            // PAT/PMT metadata is available here, lock each uninterrupted run to the first PCR
-            // PID instead of combining unrelated clocks. Random-access flags remain useful on a
-            // separate video PID.
-            if timing.pcr.is_some() {
-                match st.pcr_pid {
-                    Some(pid) if pid != timing.pid => timing.pcr = None,
-                    None => st.pcr_pid = Some(timing.pid),
-                    _ => {}
-                }
-            }
-
-            if pcr_went_backwards(st.last_pcr, timing.pcr) {
+            let observation = Self::observe_clock(st, timing);
+            if observation == ClockObservation::Reset {
                 st.access.reset();
                 st.cur.drain(..packet_offset + TS_PACKET);
                 st.scanned_packets = 0;
-                st.segment_start_pcr = None;
-                st.last_pcr = None;
-                st.pcr_pid = None;
                 st.discontinuity_pending = true;
                 st.awaiting_access_point = true;
                 continue;
             }
-
-            if st.segment_start_pcr.is_none() {
-                st.segment_start_pcr = timing.pcr;
-            }
-            if timing.pcr.is_some() {
-                st.last_pcr = timing.pcr;
-            }
-
-            let elapsed = match (st.segment_start_pcr, st.last_pcr) {
-                (Some(start), Some(now)) => pcr_delta(start, now).map(pcr_seconds),
-                _ => None,
-            };
+            let elapsed = st.clock.elapsed().map(|duration| duration.as_secs_f32());
             let target_reached = elapsed.is_some_and(|d| d >= self.seg_duration);
             if packet_offset > 0 && target_reached && is_access_point {
                 let duration = elapsed.unwrap_or(self.seg_duration);
-                let boundary_pcr = st.last_pcr;
                 self.emit(st, packet_offset, duration);
                 let prefix = st
                     .access
@@ -258,8 +231,10 @@ impl HlsPackager {
                     .expect("an observed video access point has PAT/PMT state");
                 st.cur.splice(0..0, prefix.iter().copied());
                 st.scanned_packets = prefix.len() / TS_PACKET;
-                st.segment_start_pcr = boundary_pcr;
-                st.last_pcr = boundary_pcr;
+                st.clock.reset();
+                if let Some(boundary) = st.boundary_timing {
+                    st.clock.observe(boundary);
+                }
                 continue;
             }
             st.scanned_packets += 1;
@@ -269,7 +244,7 @@ impl HlsPackager {
     /// Classify the packet after a ceiling-full run. A clean access point completes the retained
     /// run; any other packet proves that run cannot end cleanly within its configured bound.
     fn scan_lookahead(&self, st: &mut HlsState, packet: &[u8; TS_PACKET]) {
-        let mut timing = ts_timing(packet);
+        let timing = ts_timing(packet);
         let is_access_point = st.access.observe(packet);
 
         if timing.discontinuity {
@@ -278,15 +253,7 @@ impl HlsPackager {
             return;
         }
 
-        if timing.pcr.is_some() {
-            match st.pcr_pid {
-                Some(pid) if pid != timing.pid => timing.pcr = None,
-                None => st.pcr_pid = Some(timing.pid),
-                _ => {}
-            }
-        }
-
-        if pcr_went_backwards(st.last_pcr, timing.pcr) {
+        if Self::observe_clock(st, timing) == ClockObservation::Reset {
             st.access.reset();
             self.discard_incomplete_run(st);
             return;
@@ -299,16 +266,7 @@ impl HlsPackager {
             return;
         }
 
-        if st.segment_start_pcr.is_none() {
-            st.segment_start_pcr = timing.pcr;
-        }
-        if timing.pcr.is_some() {
-            st.last_pcr = timing.pcr;
-        }
-        let elapsed = match (st.segment_start_pcr, st.last_pcr) {
-            (Some(start), Some(now)) => pcr_delta(start, now).map(pcr_seconds),
-            _ => None,
-        };
+        let elapsed = st.clock.elapsed().map(|duration| duration.as_secs_f32());
 
         // Once a full target duration has elapsed, emit the ceiling-full segment even if this
         // boundary packet is not a keyframe. On a peaky or long-GOP stream (e.g. 2160p HEVC in a
@@ -319,17 +277,18 @@ impl HlsPackager {
         // It is not a transport discontinuity, so no #EXT-X-DISCONTINUITY is emitted.
         if elapsed.is_some_and(|duration| duration >= self.seg_duration) {
             let duration = elapsed.unwrap_or(self.seg_duration);
-            let boundary_pcr = st.last_pcr;
-            let boundary_pcr_pid = st.pcr_pid;
+            let boundary_timing = st.boundary_timing;
             self.emit(st, self.max_segment_bytes, duration);
             let prefix = st
                 .access
                 .table_prefix()
                 .expect("an accumulated run past the ceiling has cached PAT/PMT state");
             self.seed_clean_run(st, &prefix, packet, timing);
-            st.segment_start_pcr = boundary_pcr;
-            st.last_pcr = boundary_pcr;
-            st.pcr_pid = boundary_pcr_pid;
+            st.boundary_timing = boundary_timing;
+            st.clock.reset();
+            if let Some(boundary) = boundary_timing {
+                st.clock.observe(boundary);
+            }
             return;
         }
 
@@ -355,21 +314,30 @@ impl HlsPackager {
         st.cur.extend_from_slice(prefix);
         st.cur.extend_from_slice(packet);
         st.scanned_packets = st.cur.len() / TS_PACKET;
-        st.segment_start_pcr = timing.pcr;
-        st.last_pcr = timing.pcr;
-        st.pcr_pid = timing.pcr.map(|_| timing.pid);
+        st.clock.reset();
+        st.boundary_timing = None;
+        Self::observe_clock(st, timing);
         st.awaiting_access_point = false;
     }
 
     fn discard_incomplete_run(&self, st: &mut HlsState) {
         st.cur.clear();
         st.scanned_packets = 0;
-        st.segment_start_pcr = None;
-        st.last_pcr = None;
-        st.pcr_pid = None;
+        st.clock.reset();
+        st.boundary_timing = None;
         st.discontinuity_pending = true;
         st.awaiting_access_point = true;
         st.lookahead_len = 0;
+    }
+
+    fn observe_clock(st: &mut HlsState, timing: TsTiming) -> ClockObservation {
+        let observation = st.clock.observe(timing);
+        match observation {
+            ClockObservation::Advanced(_) => st.boundary_timing = Some(timing),
+            ClockObservation::Reset => st.boundary_timing = None,
+            ClockObservation::Ignored => {}
+        }
+        observation
     }
 
     fn emit(&self, st: &mut HlsState, end: usize, duration: f32) {
@@ -503,54 +471,6 @@ impl HlsPackager {
     pub(crate) fn last_access_for_test(&self) -> Option<Instant> {
         self.state.lock().unwrap().last_access
     }
-}
-
-#[derive(Default)]
-struct TsTiming {
-    pid: u16,
-    pcr: Option<u64>,
-    discontinuity: bool,
-}
-
-fn ts_timing(packet: &[u8]) -> TsTiming {
-    if packet.len() != TS_PACKET || packet[0] != 0x47 || packet[3] & 0x20 == 0 {
-        return TsTiming::default();
-    }
-    let pid = ts_pid(packet);
-    let adaptation_len = packet[4] as usize;
-    if adaptation_len == 0 || adaptation_len > 183 {
-        return TsTiming::default();
-    }
-    let flags = packet[5];
-    let pcr = if flags & 0x10 != 0 && adaptation_len >= 7 {
-        Some(
-            ((packet[6] as u64) << 25)
-                | ((packet[7] as u64) << 17)
-                | ((packet[8] as u64) << 9)
-                | ((packet[9] as u64) << 1)
-                | ((packet[10] as u64) >> 7),
-        )
-    } else {
-        None
-    };
-    TsTiming {
-        pid,
-        pcr,
-        discontinuity: flags & 0x80 != 0,
-    }
-}
-
-fn pcr_delta(start: u64, end: u64) -> Option<u64> {
-    let delta = (end + PCR_MODULUS - start) % PCR_MODULUS;
-    (delta <= PCR_MODULUS / 2).then_some(delta)
-}
-
-fn pcr_went_backwards(previous: Option<u64>, current: Option<u64>) -> bool {
-    matches!((previous, current), (Some(old), Some(new)) if pcr_delta(old, new).is_none())
-}
-
-fn pcr_seconds(ticks: u64) -> f32 {
-    ticks as f32 / PCR_HZ as f32
 }
 
 /// Byte-range HLS layout for a finite, length-known VOD.
