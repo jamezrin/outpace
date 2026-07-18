@@ -399,6 +399,7 @@ impl KeyframeGate {
         self.locked = false;
         self.scanned = 0;
         self.access.reset();
+        self.mark_discontinuity = false;
     }
 
     /// Re-arm after known media loss and mark the first resumed video access point so MPEG-TS
@@ -430,20 +431,11 @@ impl KeyframeGate {
                 if let Some(prefix) = self.access.table_prefix() {
                     out.extend_from_slice(&prefix);
                 }
-                if self.mark_discontinuity {
-                    let mut resumed = pkt.to_vec();
-                    if !set_discontinuity_indicator(&mut resumed) {
-                        out.extend_from_slice(&discontinuity_packet(ts_pid(pkt), pkt[3] & 0x0f));
-                    }
-                    out.extend_from_slice(&resumed);
-                    self.mark_discontinuity = false;
-                } else {
-                    out.extend_from_slice(pkt);
-                }
+                append_resumed_packet(&mut self.mark_discontinuity, pkt, &mut out);
                 self.locked = true;
             } else if self.scanned >= self.max_scan_packets {
                 // Safety fallback: never found a keyframe; passthrough from here.
-                out.extend_from_slice(pkt);
+                append_resumed_packet(&mut self.mark_discontinuity, pkt, &mut out);
                 self.locked = true;
             }
             // otherwise: drop this prefix packet and keep scanning.
@@ -452,6 +444,19 @@ impl KeyframeGate {
         self.buf.drain(0..i);
         out
     }
+}
+
+fn append_resumed_packet(mark_discontinuity: &mut bool, packet: &[u8], out: &mut Vec<u8>) {
+    if !std::mem::take(mark_discontinuity) {
+        out.extend_from_slice(packet);
+        return;
+    }
+
+    let mut resumed = packet.to_vec();
+    if !set_discontinuity_indicator(&mut resumed) {
+        out.extend_from_slice(&discontinuity_packet(ts_pid(packet), packet[3] & 0x0f));
+    }
+    out.extend_from_slice(&resumed);
 }
 
 fn set_discontinuity_indicator(packet: &mut [u8]) -> bool {
@@ -1073,6 +1078,93 @@ mod tests {
         // and it stays open afterwards.
         let more = g.push(&ts(AUDIO_PID, false, false, &[0xCC; 16]));
         assert_eq!(packet_count(&more), 1);
+    }
+
+    #[test]
+    fn discontinuity_reset_marks_access_point_with_existing_adaptation_field() {
+        let mut gate = KeyframeGate::new();
+        gate.reset_for_discontinuity();
+
+        let out = gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        let first_video = out
+            .chunks_exact(TS_PACKET_LEN)
+            .find(|packet| pid_of(packet) == VIDEO_PID)
+            .expect("resumed video packet");
+
+        assert!(ts_timing(first_video.try_into().unwrap()).discontinuity);
+        assert_eq!(packet_count(&out), 3, "no marker packet is needed");
+    }
+
+    #[test]
+    fn discontinuity_reset_inserts_adaptation_only_marker_when_needed() {
+        let mut gate = KeyframeGate::new();
+        gate.reset_for_discontinuity();
+        let idr = [0x00, 0x00, 0x01, 0xE0, 0, 0, 0, 0, 1, 0x65];
+
+        let out = gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                ts(VIDEO_PID, true, false, &idr),
+            ]
+            .concat(),
+        );
+        let video: Vec<_> = out
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|packet| pid_of(packet) == VIDEO_PID)
+            .collect();
+
+        assert_eq!(
+            video.len(),
+            2,
+            "marker must precede payload-only access point"
+        );
+        assert!(ts_timing(video[0].try_into().unwrap()).discontinuity);
+        assert_eq!((video[0][3] >> 4) & 0x03, 0b10);
+        assert_eq!(video[1], ts(VIDEO_PID, true, false, &idr));
+    }
+
+    #[test]
+    fn discontinuity_reset_marks_scan_budget_fallback() {
+        let mut gate = KeyframeGate::with_max_scan_packets(1);
+        gate.reset_for_discontinuity();
+        let resumed = ts(VIDEO_PID, false, false, &[0xAA; 16]);
+
+        let out = gate.push(&resumed);
+        let packets: Vec<_> = out.chunks_exact(TS_PACKET_LEN).collect();
+
+        assert_eq!(packets.len(), 2, "fallback needs a separate marker packet");
+        assert!(ts_timing(packets[0].try_into().unwrap()).discontinuity);
+        assert_eq!(packets[1], resumed);
+    }
+
+    #[test]
+    fn ordinary_reset_clears_pending_discontinuity_marker() {
+        let mut gate = KeyframeGate::new();
+        gate.reset_for_discontinuity();
+        gate.reset();
+
+        let out = gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        let first_video = out
+            .chunks_exact(TS_PACKET_LEN)
+            .find(|packet| pid_of(packet) == VIDEO_PID)
+            .expect("resumed video packet");
+
+        assert!(!ts_timing(first_video.try_into().unwrap()).discontinuity);
     }
 
     #[test]
