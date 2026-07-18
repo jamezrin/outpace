@@ -136,10 +136,7 @@ impl HlsPackager {
         st.clock.reset();
         st.boundary_timing = None;
         st.discontinuity_pending = true;
-        // Keep the last PAT/PMT mapping across a source/receiver gap. A reconnect commonly
-        // resumes at the next media piece before those tables are repeated; clearing them here
-        // makes the packager discard an otherwise valid resumed stream indefinitely. Any new
-        // PAT/PMT observed after the gap still replaces this cached mapping.
+        st.access.reset();
         st.awaiting_access_point = true;
         st.lookahead_len = 0;
     }
@@ -802,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn in_band_transport_discontinuity_requires_fresh_tables_before_restarting() {
+    fn clean_discontinuity_requires_fresh_tables_before_restarting() {
         let p = clean_pkg(12);
         let stale_access = video_access_packet(VIDEO_PID, 0);
         let fresh_pat = pat(PMT_PID);
@@ -812,7 +809,7 @@ mod tests {
         p.feed(&pat(PMT_PID));
         p.feed(&pmt(PMT_PID, VIDEO_PID));
         p.feed(&video_access_packet(VIDEO_PID, 0));
-        p.feed(&pcr_packet(VIDEO_PID, 45_000, true, true, 9));
+        p.discontinuity();
         p.feed(&stale_access);
         p.feed(&fresh_pat);
         p.feed(&fresh_pmt);
@@ -1348,24 +1345,6 @@ mod tests {
         assert!(
             playlist.contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.200,\n/streams/test/gap/seg/0.ts")
         );
-    }
-
-    #[test]
-    fn source_gap_recovers_with_cached_tables_when_resume_starts_mid_transport() {
-        let p = pkg();
-        feed_one_clean_segment(&p);
-        p.discontinuity();
-
-        // A reconnect can resume at the next requested media piece, before the upstream repeats
-        // PAT/PMT. The cached program map is still valid for this stream and must be sufficient
-        // to recognize the next access point and restart segment emission.
-        p.feed(&video_access_packet(VIDEO_PID, 900_000));
-        p.feed(&video_access_packet(VIDEO_PID, 1_008_000));
-
-        assert!(p.segment(1).is_some());
-        assert!(p
-            .playlist("test", "mid-transport-resume")
-            .contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.200,"));
     }
 
     #[test]
