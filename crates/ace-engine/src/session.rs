@@ -14,10 +14,6 @@ pub enum StreamEvent {
     Discontinuity,
 }
 
-pub(crate) fn subscriber_lag_event(surface: &str, skipped_events: u64) -> String {
-    format!("[session] {surface} subscriber lagged: skipped_events={skipped_events}")
-}
-
 /// A live session: pulls from one `TsSource` and broadcasts TS chunks to subscribers.
 pub struct StreamSession {
     tx: broadcast::Sender<StreamEvent>,
@@ -254,11 +250,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subscriber_lag_event_reports_surface_and_skipped_events() {
-        assert_eq!(
-            subscriber_lag_event("direct", 17),
-            "[session] direct subscriber lagged: skipped_events=17"
-        );
-    }
 }

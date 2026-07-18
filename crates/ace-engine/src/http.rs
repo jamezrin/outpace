@@ -1493,11 +1493,7 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
                     reset_stream_keyframe_gate(&mut gate);
                     continue;
                 }
-                Err(RecvError::Lagged(skipped)) => {
-                    crate::alog!(
-                        "{}",
-                        crate::session::subscriber_lag_event("direct", skipped)
-                    );
+                Err(RecvError::Lagged(_)) => {
                     reset_stream_keyframe_gate(&mut gate);
                     continue;
                 }
@@ -1540,10 +1536,7 @@ fn ace_stream_session_response(
                         Ok(StreamEvent::Discontinuity) => {
                             reset_stream_keyframe_gate(&mut gate);
                         }
-                        Err(RecvError::Lagged(skipped)) => {
-                            crate::alog!("{}", crate::session::subscriber_lag_event("ace-direct", skipped));
-                            reset_stream_keyframe_gate(&mut gate);
-                        }
+                        Err(RecvError::Lagged(_)) => { reset_stream_keyframe_gate(&mut gate); }
                         Err(RecvError::Closed) => return None,
                     }
                 }

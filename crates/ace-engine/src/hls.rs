@@ -118,9 +118,7 @@ impl HlsPackager {
             loop {
                 match rx.recv().await {
                     Ok(StreamEvent::Data(chunk)) => pkg.feed(&chunk),
-                    Ok(StreamEvent::Discontinuity) => pkg.discontinuity(),
-                    Err(RecvError::Lagged(skipped)) => {
-                        crate::alog!("{}", crate::session::subscriber_lag_event("hls", skipped));
+                    Ok(StreamEvent::Discontinuity) | Err(RecvError::Lagged(_)) => {
                         pkg.discontinuity()
                     }
                     Err(RecvError::Closed) => break,
