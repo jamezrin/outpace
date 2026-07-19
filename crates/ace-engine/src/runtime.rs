@@ -71,7 +71,16 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         config.cache_dir = v.into();
     }
     if let Ok(v) = std::env::var("OUTPACE_PREFETCH_PIECES") {
-        config.prefetch_pieces = v.parse()?;
+        config.prefetch_pieces = Some(v.parse()?);
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PREBUFFER_MS") {
+        config.startup_buffer.target_ms = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PREBUFFER_BYTES") {
+        config.startup_buffer.max_bytes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_PREBUFFER_TIMEOUT_MS") {
+        config.startup_buffer.timeout_ms = v.parse()?;
     }
     if let Ok(v) = std::env::var("OUTPACE_SESSION_BUFFER") {
         let n: usize = v.parse()?;
@@ -110,6 +119,12 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_HLS_SEGMENT_DURATION_MS") {
         config.hls.segment_duration_ms = v.parse()?;
     }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_STARTUP_SEGMENTS") {
+        config.hls.startup_segments = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_STARTUP_TIMEOUT_MS") {
+        config.hls.startup_timeout_ms = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
         config.max_unchoked = v.parse()?;
     }
@@ -138,6 +153,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         config.experimental_ace_compat = v;
     }
     config.live_recovery.validate()?;
+    config.startup_buffer.validate()?;
     config.hls.validate()?;
     validate_cache_budget(&config)?;
     Ok(config)
@@ -366,6 +382,13 @@ fn url_host_from_ip(ip: IpAddr) -> String {
     }
 }
 
+fn ace_provider_from_config(provider: AceProvider, config: &Config) -> AceProvider {
+    provider
+        .with_prefetch_pieces(config.prefetch_pieces)
+        .with_startup_buffer(config.startup_buffer)
+        .with_live_recovery(config.live_recovery)
+}
+
 pub async fn build_runtime(
     mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
@@ -422,9 +445,8 @@ pub async fn build_runtime(
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
             .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
-            .with_cache(config.cache_type, config.cache_dir.clone())
-            .with_prefetch_pieces(config.prefetch_pieces)
-            .with_live_recovery(config.live_recovery)
+            .with_cache(config.cache_type, config.cache_dir.clone());
+        let provider = ace_provider_from_config(provider, &config)
             .with_seeding_enabled(config.enable_seeding)
             .with_inbound_announce_port_receiver(announce_port_rx.clone())
             .with_reachability(reachability.clone());
@@ -760,6 +782,27 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn daemon_provider_receives_startup_buffer_from_runtime_config() {
+        let config = Config {
+            startup_buffer: crate::config::StartupBufferConfig {
+                target_ms: 10_000,
+                max_bytes: 33_554_432,
+                timeout_ms: 9_000,
+            },
+            ..Config::default()
+        };
+        let provider = ace_provider_from_config(
+            AceProvider::new(
+                Arc::new(ace_wire::identity::Identity::generate()),
+                config.peer_listen.port(),
+            ),
+            &config,
+        );
+
+        assert_eq!(provider.startup_buffer_config(), config.startup_buffer);
+    }
+
+    #[test]
     fn rtmp_bind_env_override_sets_config_rtmp_bind() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("OUTPACE_RTMP_BIND");
@@ -959,15 +1002,50 @@ mod tests {
     }
 
     #[test]
-    fn parses_prefetch_and_session_buffer() {
+    fn parses_playback_policy_and_distinguishes_absent_prefetch() {
         let _g = ENV_LOCK.lock().unwrap();
+        let names = [
+            "OUTPACE_PREBUFFER_MS",
+            "OUTPACE_PREBUFFER_BYTES",
+            "OUTPACE_PREBUFFER_TIMEOUT_MS",
+            "OUTPACE_HLS_STARTUP_SEGMENTS",
+            "OUTPACE_HLS_STARTUP_TIMEOUT_MS",
+            "OUTPACE_PREFETCH_PIECES",
+            "OUTPACE_SESSION_BUFFER",
+        ];
+        let old: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for name in names {
+            std::env::remove_var(name);
+        }
+
+        let c = config_from_env().unwrap();
+        assert_eq!(c.prefetch_pieces, None);
+
+        std::env::set_var("OUTPACE_PREBUFFER_MS", "12000");
+        std::env::set_var("OUTPACE_PREBUFFER_BYTES", "33554432");
+        std::env::set_var("OUTPACE_PREBUFFER_TIMEOUT_MS", "9000");
+        std::env::set_var("OUTPACE_HLS_STARTUP_SEGMENTS", "3");
+        std::env::set_var("OUTPACE_HLS_STARTUP_TIMEOUT_MS", "18000");
         std::env::set_var("OUTPACE_PREFETCH_PIECES", "32");
         std::env::set_var("OUTPACE_SESSION_BUFFER", "512");
         let c = config_from_env().unwrap();
-        assert_eq!(c.prefetch_pieces, 32);
+        assert_eq!(c.startup_buffer.target_ms, 12_000);
+        assert_eq!(c.startup_buffer.max_bytes, 33_554_432);
+        assert_eq!(c.startup_buffer.timeout_ms, 9_000);
+        assert_eq!(c.hls.startup_segments, 3);
+        assert_eq!(c.hls.startup_timeout_ms, 18_000);
+        assert_eq!(c.prefetch_pieces, Some(32));
         assert_eq!(c.session_buffer, 512);
-        std::env::remove_var("OUTPACE_PREFETCH_PIECES");
-        std::env::remove_var("OUTPACE_SESSION_BUFFER");
+
+        std::env::set_var("OUTPACE_PREFETCH_PIECES", "8");
+        assert_eq!(config_from_env().unwrap().prefetch_pieces, Some(8));
+
+        for (name, value) in names.into_iter().zip(old) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 
     #[test]
@@ -1099,8 +1177,10 @@ mod tests {
         assert_eq!(c.live_recovery.max_piece_advance, 256);
         assert_eq!(c.live_recovery.max_reasm_pieces_ahead, 512);
         assert_eq!(c.hls.segment_packets, 65_536);
-        assert_eq!(c.hls.window_segments, 6);
-        assert_eq!(c.hls.segment_duration_ms, 1000);
+        assert_eq!(c.hls.window_segments, 8);
+        assert_eq!(c.hls.segment_duration_ms, 5000);
+        assert_eq!(c.hls.startup_segments, 6);
+        assert_eq!(c.hls.startup_timeout_ms, 45_000);
     }
 
     #[test]
@@ -1129,7 +1209,7 @@ mod tests {
         std::env::set_var("OUTPACE_MAX_PIECE_ADVANCE", "128");
         std::env::set_var("OUTPACE_MAX_REASM_PIECES_AHEAD", "256");
         std::env::set_var("OUTPACE_HLS_SEGMENT_PACKETS", "64");
-        std::env::set_var("OUTPACE_HLS_WINDOW_SEGMENTS", "4");
+        std::env::set_var("OUTPACE_HLS_WINDOW_SEGMENTS", "7");
         std::env::set_var("OUTPACE_HLS_SEGMENT_DURATION_MS", "1500");
 
         let c = config_from_env().unwrap();
@@ -1142,7 +1222,7 @@ mod tests {
         assert_eq!(c.live_recovery.max_piece_advance, 128);
         assert_eq!(c.live_recovery.max_reasm_pieces_ahead, 256);
         assert_eq!(c.hls.segment_packets, 64);
-        assert_eq!(c.hls.window_segments, 4);
+        assert_eq!(c.hls.window_segments, 7);
         assert_eq!(c.hls.segment_duration_ms, 1500);
 
         for key in keys {

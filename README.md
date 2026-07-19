@@ -229,9 +229,21 @@ Environment variables parsed by the daemon include:
   `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
 - `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per served stream; see
   below), default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`.
-- `OUTPACE_PREFETCH_PIECES` - pieces behind the live edge to start at, default `8`.
+- `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.
+  When unset, outpace derives the depth from the startup target and advertised bitrate, falling
+  back to `32` pieces when the bitrate is unavailable.
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
+- `OUTPACE_PREBUFFER_MS` - target server-resident live startup queue duration, default `30000`.
+  The server intentionally waits before sending the first media so clients begin with more
+  tolerance for swarm jitter. `0` disables startup prebuffering and preserves the previous
+  immediate-release behavior.
+- `OUTPACE_PREBUFFER_BYTES` - hard byte ceiling for the startup queue, default `134217728`
+  (128 MiB). Reaching it releases the available media early instead of exceeding the reservoir
+  budget. Queue metadata and the rest of the daemon add memory overhead beyond this payload cap.
+- `OUTPACE_PREBUFFER_TIMEOUT_MS` - deadline after the first clean media byte for reaching the
+  target duration, default `15000`. On expiry, outpace degrades gracefully by releasing the
+  available queue; it does not turn a short advertised live window into a playback failure.
 - `OUTPACE_REQUEST_TIMEOUT_MS` - per-piece request timeout before re-requesting or skipping an
   evicted gap, default `1500`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`. A live
   player drains in realtime, so raising this leaves a stuck piece to be healed by the much slower
@@ -252,8 +264,13 @@ Environment variables parsed by the daemon include:
   memory-safety bound, not the primary cut mechanism: segments normally cut on a keyframe once
   the target duration elapses, so the ceiling must comfortably hold one target-duration segment
   of a peaky high-bitrate stream (a 2160p HEVC GOP can burst well past its average).
-- `OUTPACE_HLS_WINDOW_SEGMENTS` - retained HLS live window size, default `6`.
-- `OUTPACE_HLS_SEGMENT_DURATION_MS` - requested PCR-timed HLS segment duration, default `1000`.
+- `OUTPACE_HLS_WINDOW_SEGMENTS` - retained HLS live window size, default `8`.
+- `OUTPACE_HLS_SEGMENT_DURATION_MS` - requested PCR-timed HLS segment duration, default `5000`.
+- `OUTPACE_HLS_STARTUP_SEGMENTS` - completed segments retained before a new HLS playlist request
+  becomes ready, default `6`. `0` is accepted as a compatibility setting and behaves as `1`.
+- `OUTPACE_HLS_STARTUP_TIMEOUT_MS` - maximum HLS playlist startup wait, default `45000`; must be
+  at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. If the startup segment count is not reached, the
+  request returns a retryable HTTP `503` at the deadline.
 - `OUTPACE_MAX_UNCHOKED` - max simultaneously-unchoked peers per served stream (default 8). Wired
   into the inbound serve path via the per-infohash serve coordinator: each stream unchokes up to
   this many interested peers plus one rotating optimistic slot (rotated on a ~10s rechoke tick).
