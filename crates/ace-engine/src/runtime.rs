@@ -158,6 +158,9 @@ fn bool_from_env(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>>
     }
 }
 
+/// Marker that `OUTPACE_CACHE_DIR` is a dedicated Outpace disk cache and may be wiped at startup.
+const DISK_CACHE_SENTINEL: &str = ".outpace-cache";
+
 /// Create and resolve the disk/data roots before any persistent state is loaded or cache cleanup
 /// runs. Validation and later deletion must use this exact canonical cache path: lexically
 /// collapsing `..` first is unsafe because `symlink/..` is resolved by the filesystem relative to
@@ -199,6 +202,45 @@ fn prepare_disk_cache_paths(config: &mut Config) -> Result<(), Box<dyn std::erro
     config.cache_dir = cache_dir;
     config.data_dir = data_dir;
     Ok(())
+}
+
+/// Startup wipe is safe only for a dedicated cache: an empty directory (first run) or one that
+/// already contains [`DISK_CACHE_SENTINEL`]. An operator path such as `/tmp` or a home directory
+/// is not dedicated merely because it is not an ancestor of `data_dir`.
+fn ensure_disk_cache_is_dedicated(
+    cache_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !cache_dir.exists() {
+        return Ok(());
+    }
+    let sentinel = cache_dir.join(DISK_CACHE_SENTINEL);
+    if sentinel.is_file() {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(cache_dir).map_err(|e| {
+        format!(
+            "cannot inspect OUTPACE_CACHE_DIR {}: {e}",
+            cache_dir.display()
+        )
+    })?;
+    if entries.next().is_none() {
+        return Ok(());
+    }
+    Err(format!(
+        "OUTPACE_CACHE_DIR {} is not a dedicated Outpace cache (missing {DISK_CACHE_SENTINEL}); refusing to wipe it. Use an empty directory or add {DISK_CACHE_SENTINEL} if this path is intentional",
+        cache_dir.display()
+    )
+    .into())
+}
+
+fn mark_disk_cache_dir(cache_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::write(cache_dir.join(DISK_CACHE_SENTINEL), b"outpace disk cache\n").map_err(|e| {
+        format!(
+            "cannot mark OUTPACE_CACHE_DIR {} as a dedicated cache: {e}",
+            cache_dir.display()
+        )
+        .into()
+    })
 }
 
 /// Reject an in-memory retention budget that leaves insufficient target-relative address space
@@ -383,9 +425,10 @@ pub async fn build_runtime(
     // Fail fast on a misconfigured disk cache, and start from a clean slate: wipe the cache root
     // so per-infohash dirs orphaned by a hard crash (no `Drop` ran) don't survive a restart. The
     // cache is ephemeral (piece data goes stale; broadcasts rebuild theirs from live ingest), so
-    // wiping is always safe. A bad OUTPACE_CACHE_DIR surfaces here rather than degrading per stream.
+    // wiping a dedicated cache is safe. An unmarked operator path is not wiped.
     if config.cache_type == CacheType::Disk {
         if config.cache_dir.exists() {
+            ensure_disk_cache_is_dedicated(&config.cache_dir)?;
             std::fs::remove_dir_all(&config.cache_dir).map_err(|e| {
                 format!(
                     "cannot clear OUTPACE_CACHE_DIR {}: {e}",
@@ -399,6 +442,7 @@ pub async fn build_runtime(
                 config.cache_dir.display()
             )
         })?;
+        mark_disk_cache_dir(&config.cache_dir)?;
     }
 
     // Register enabled providers. Only "ace" exists today; the registry is the path for more.
@@ -1326,6 +1370,99 @@ mod tests {
         assert!(
             marker.exists(),
             "validated cache path and deleted path must have identical filesystem semantics"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_sibling_of_data_dir_does_not_wipe_unrelated_contents() {
+        let root =
+            std::env::temp_dir().join(format!("outpace-cache-sibling-{}", rand::random::<u64>()));
+        let data_dir = root.join("data");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let canary = cache_dir.join("MUST_SURVIVE");
+        std::fs::write(&canary, b"unrelated").unwrap();
+
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            cache_dir: cache_dir.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        let result = build_runtime(config, vec![]).await;
+        assert!(
+            canary.exists(),
+            "disk cache cleanup must not wipe a sibling directory's unrelated contents"
+        );
+        let error = result
+            .err()
+            .expect("an unmarked cache directory must not be wiped")
+            .to_string();
+        assert!(
+            error.contains("dedicated Outpace cache") || error.contains(".outpace-cache"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_fresh_empty_dir_is_marked_and_starts() {
+        let root =
+            std::env::temp_dir().join(format!("outpace-cache-fresh-{}", rand::random::<u64>()));
+        let data_dir = root.join("data");
+        let cache_dir = data_dir.join("cache");
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            cache_dir: cache_dir.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        build_runtime(config, vec![])
+            .await
+            .expect("a fresh empty cache directory must start");
+        assert!(
+            cache_dir.join(".outpace-cache").is_file(),
+            "first startup must mark the cache so later wipes are allowed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_with_sentinel_still_wipes_leftover_files() {
+        let root =
+            std::env::temp_dir().join(format!("outpace-cache-marked-{}", rand::random::<u64>()));
+        let data_dir = root.join("data");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join(".outpace-cache"), b"outpace disk cache\n").unwrap();
+        let leftover = cache_dir.join("orphan");
+        std::fs::write(&leftover, b"stale").unwrap();
+
+        let config = Config {
+            data_dir,
+            cache_type: CacheType::Disk,
+            cache_dir: cache_dir.clone(),
+            enable_inbound: false,
+            ..Config::default()
+        };
+
+        build_runtime(config, vec![])
+            .await
+            .expect("a marked cache directory must still be wipeable");
+        assert!(
+            !leftover.exists(),
+            "a dedicated cache must still be cleared at startup"
+        );
+        assert!(
+            cache_dir.join(".outpace-cache").is_file(),
+            "the sentinel must be rewritten after the wipe"
         );
         let _ = std::fs::remove_dir_all(root);
     }
