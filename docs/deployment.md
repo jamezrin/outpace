@@ -67,9 +67,11 @@ OUTPACE_SEED_STORE_BYTES=536870912
 
 The named data volume already covers that path. `OUTPACE_CACHE_DIR` may be nested under
 `OUTPACE_DATA_DIR`, as shown, but it may never equal or contain the data directory; unsafe
-relationships are rejected before cache cleanup. The byte budget sizes each active stream's cache;
+relationships are rejected before cache cleanup. Startup also refuses to wipe a non-empty
+cache directory that is missing the `.outpace-cache` sentinel (written automatically on first
+successful disk-cache start). The byte budget sizes each active stream's cache;
 it is not a total volume quota. Disk pieces are ephemeral live-media cache, not durable media:
-the cache root is cleared at startup and stream directories are deleted at teardown. Startup
+a dedicated cache root is cleared at startup and stream directories are deleted at teardown. Startup
 fails if the cache root cannot be prepared. A later per-stream directory failure keeps playback
 running with zero retention for that stream rather than silently allocating the same amount of
 RAM.
