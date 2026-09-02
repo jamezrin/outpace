@@ -233,6 +233,9 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
 /// Fetch the raw `AceStreamTransport` metadata bytes over a peer via BEP-9 `ut_metadata`. The
 /// pure decode half is left to the caller ([`stream_info_from_transport`] for live,
 /// [`vod_info_from_transport`] for VOD).
+///
+/// After the fetch, the blob is bound to `handshake_infohash`: content-id is SHA-1 of the raw
+/// transport file, so a peer that serves a well-formed but different blob is rejected.
 pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut PeerSession<S>,
     handshake_infohash: [u8; 20],
@@ -260,10 +263,14 @@ pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|_| ResolveError::Peer("send extended handshake failed"))?;
 
     let (peer_ut_id, metadata_size) = read_metadata_params(session).await?;
-    session
+    let blob = session
         .fetch_metadata(peer_ut_id, metadata_size)
         .await
-        .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))
+        .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))?;
+    if !checked_transport_file_hash(&blob, handshake_infohash) {
+        return Err(ResolveError::Peer("metadata hash mismatch"));
+    }
+    Ok(blob)
 }
 
 /// Resolve a content-id through the official signed transport catalog.
@@ -357,7 +364,7 @@ fn catalog_response_transport(body: &[u8]) -> Result<Vec<u8>, ResolveError> {
     let transport = Base64::decode_vec(torrent)
         .map_err(|_| ResolveError::Catalog("bad catalog torrent base64"))?;
 
-    if transport_file_hash(&transport) != expected {
+    if !checked_transport_file_hash(&transport, expected) {
         return Err(ResolveError::Catalog("checksum mismatch"));
     }
     Ok(transport)
@@ -468,6 +475,14 @@ fn checked_metadata_size(size: i64) -> Result<usize, ResolveError> {
         return Err(ResolveError::Peer("invalid ut_metadata params"));
     }
     Ok(size as usize)
+}
+
+/// Whether `blob` is the transport file identified by `expected` (SHA-1 of the raw bytes).
+///
+/// Content-id **is** that hash. Catalog XML checksums and BEP-9 handshake keys must both bind
+/// the fetched blob to it; otherwise a peer can substitute any well-formed AceStreamTransport.
+fn checked_transport_file_hash(blob: &[u8], expected: [u8; 20]) -> bool {
+    transport_file_hash(blob) == expected
 }
 
 /// A small TTL cache of resolved `content-id → StreamInfo` so repeated `open()`s of the same
