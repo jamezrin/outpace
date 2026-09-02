@@ -137,7 +137,15 @@ pub fn decode_transport_with_key(
         return Err(WireError::Invalid("not a transport file"));
     }
 
-    // 2. Body = skip 18-byte magic + 2-byte version.
+    // 2. Magic + 2-byte version must be present before slicing the body.
+    // `is_transport_file` only tests the 18-byte prefix; 18- and 19-byte
+    // buffers would panic on `&bytes[20..]`.
+    let version = bytes.get(18..20).ok_or(WireError::Truncated)?;
+    if version != [0, 2] {
+        return Err(WireError::Invalid("unsupported transport version"));
+    }
+
+    // 3. Body = skip 18-byte magic + 2-byte version.
     let body = &bytes[20..];
     if body.is_empty() || !body.len().is_multiple_of(16) {
         return Err(WireError::Invalid("bad transport body length"));
@@ -409,6 +417,16 @@ mod tests {
         // magic but empty body
         let magic_only = b"AceStreamTransport\x00\x02";
         assert!(decode_transport_with_key(magic_only, &TRANSPORT_KEY, &TRANSPORT_IV).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_magic_prefix_without_panic() {
+        // is_transport_file is true for the 18-byte magic, but the decoder
+        // must not slice bytes[20..] on a shorter buffer.
+        assert!(decode_transport(b"AceStreamTransport").is_err());
+        let mut nineteen = b"AceStreamTransport".to_vec();
+        nineteen.push(0);
+        assert!(decode_transport(&nineteen).is_err());
     }
 
     // Diagnostic tool: decode a real captured .acelive transport file and dump its fields
