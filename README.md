@@ -229,9 +229,9 @@ Environment variables parsed by the daemon include:
   `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
 - `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per served stream; see
   below), default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`. Startup wipes
-  this directory only when it is empty or already contains a `.outpace-cache` sentinel (written
-  automatically on first successful disk-cache start). An unmarked non-empty path is refused
-  rather than deleted.
+  this directory only when it is empty or already contains a regular `.outpace-cache` sentinel
+  file (written automatically on first successful disk-cache start). A symlink is not accepted
+  as a sentinel. An unmarked non-empty path is refused rather than deleted.
 - `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.
   When unset, outpace derives the depth from the startup target and advertised bitrate, falling
   back to `32` pieces when the bitrate is unavailable.
@@ -330,8 +330,9 @@ The disk cache is **ephemeral**: a dedicated cache directory is cleared when a s
 never reloaded across restarts (live piece data goes stale), which also avoids serving
 evicted-stale pieces. Disk I/O is currently synchronous. The first disk-cache start writes a
 `.outpace-cache` sentinel so later wipes can distinguish a dedicated cache from an accidental
-operator path. An existing non-empty cache without that sentinel fails startup instead of being
-deleted; add the file or use an empty directory.
+operator path. An existing non-empty cache without that regular sentinel file fails startup
+instead of being deleted; use an empty directory or create the file only after verifying that
+all existing contents may be deleted.
 
 Disk mode never silently converts `OUTPACE_SEED_STORE_BYTES` into an equal per-stream RAM
 allocation. An invalid/unwritable cache root fails daemon startup. If a new per-stream directory

@@ -221,8 +221,8 @@ fn prepare_disk_cache_paths(config: &mut Config) -> Result<(), Box<dyn std::erro
 }
 
 /// Startup wipe is safe only for a dedicated cache: an empty directory (first run) or one that
-/// already contains [`DISK_CACHE_SENTINEL`]. An operator path such as `/tmp` or a home directory
-/// is not dedicated merely because it is not an ancestor of `data_dir`.
+/// already contains a regular [`DISK_CACHE_SENTINEL`] file. An operator path such as `/tmp` or
+/// a home directory is not dedicated merely because it is not an ancestor of `data_dir`.
 fn ensure_disk_cache_is_dedicated(
     cache_dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -230,7 +230,8 @@ fn ensure_disk_cache_is_dedicated(
         return Ok(());
     }
     let sentinel = cache_dir.join(DISK_CACHE_SENTINEL);
-    if sentinel.is_file() {
+    // A symlink to an unrelated file is not a marker owned by this cache directory.
+    if std::fs::symlink_metadata(sentinel).is_ok_and(|metadata| metadata.file_type().is_file()) {
         return Ok(());
     }
     let mut entries = std::fs::read_dir(cache_dir).map_err(|e| {
@@ -243,7 +244,7 @@ fn ensure_disk_cache_is_dedicated(
         return Ok(());
     }
     Err(format!(
-        "OUTPACE_CACHE_DIR {} is not a dedicated Outpace cache (missing {DISK_CACHE_SENTINEL}); refusing to wipe it. Use an empty directory or add {DISK_CACHE_SENTINEL} if this path is intentional",
+        "OUTPACE_CACHE_DIR {} is not a dedicated Outpace cache (missing regular {DISK_CACHE_SENTINEL} file); refusing to wipe it. Use an empty directory or create a regular {DISK_CACHE_SENTINEL} file only if all contents may be deleted",
         cache_dir.display()
     )
     .into())
@@ -1513,6 +1514,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_cache_symlink_sentinel_does_not_authorize_wipe() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "outpace-cache-linked-marker-{}",
+            rand::random::<u64>()
+        ));
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let canary = cache_dir.join("MUST_SURVIVE");
+        std::fs::write(&canary, b"unrelated").unwrap();
+        let link_target = root.join("external-file");
+        std::fs::write(&link_target, b"external data").unwrap();
+        symlink(&link_target, cache_dir.join(DISK_CACHE_SENTINEL)).unwrap();
+
+        let config = Config {
+            data_dir: root.join("data"),
+            cache_type: CacheType::Disk,
+            cache_dir,
+            enable_inbound: false,
+            ..Config::default()
+        };
+        let result = build_runtime(config, vec![]).await;
+        let canary_bytes = std::fs::read(canary).ok();
+        let target_bytes = std::fs::read(link_target).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(
+            canary_bytes.as_deref(),
+            Some(b"unrelated".as_slice()),
+            "a linked sentinel must not authorize deleting unrelated contents"
+        );
+        assert_eq!(target_bytes, b"external data");
+        let error = result
+            .err()
+            .expect("a symlink sentinel must be rejected")
+            .to_string();
+        assert!(error.contains("dedicated Outpace cache"), "{error}");
+    }
+
     #[tokio::test]
     async fn disk_cache_with_sentinel_still_wipes_leftover_files() {
         let root =
@@ -1521,7 +1564,8 @@ mod tests {
         let cache_dir = root.join("cache");
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
-        std::fs::write(cache_dir.join(".outpace-cache"), b"outpace disk cache\n").unwrap();
+        // Operators may explicitly dedicate an existing cache using an empty regular marker.
+        std::fs::write(cache_dir.join(".outpace-cache"), b"").unwrap();
         let leftover = cache_dir.join("orphan");
         std::fs::write(&leftover, b"stale").unwrap();
 
