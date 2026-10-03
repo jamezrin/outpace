@@ -22,7 +22,8 @@ pub struct SourceStats {
     pub peers_served: u32,
 }
 
-/// A live MPEG-TS byte source for one stream.
+/// A live MPEG-TS byte source for one stream. Source decorators may buffer chunks, but must
+/// preserve metadata, statistics, and the discontinuity associated with each returned chunk.
 #[async_trait]
 pub trait TsSource: Send {
     /// Next contiguous MPEG-TS chunk, or None at end-of-stream.

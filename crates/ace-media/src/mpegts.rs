@@ -4,10 +4,115 @@
 //! sync byte `0x47`. Before re-exposing or segmenting we must confirm the byte stream is
 //! packet-aligned (and find the alignment offset if it isn't).
 
+use std::time::Duration;
+
 /// MPEG-TS sync byte at the start of every packet.
 pub const TS_SYNC: u8 = 0x47;
 /// MPEG-TS packet length in bytes.
 pub const TS_PACKET_LEN: usize = 188;
+
+const PCR_MODULUS: u64 = 1 << 33;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TsTiming {
+    pub pid: u16,
+    pub pcr: Option<u64>,
+    pub discontinuity: bool,
+}
+
+/// Parse the PID, PCR base, and discontinuity indicator from a complete TS packet.
+pub fn ts_timing(packet: &[u8; TS_PACKET_LEN]) -> TsTiming {
+    if packet[0] != TS_SYNC || packet[3] & 0x20 == 0 {
+        return TsTiming {
+            pid: 0,
+            pcr: None,
+            discontinuity: false,
+        };
+    }
+    let pid = ts_pid(packet);
+    let adaptation_len = packet[4] as usize;
+    if adaptation_len == 0 || adaptation_len > 183 {
+        return TsTiming {
+            pid,
+            pcr: None,
+            discontinuity: false,
+        };
+    }
+    let flags = packet[5];
+    let pcr = if flags & 0x10 != 0 && adaptation_len >= 7 {
+        Some(
+            ((packet[6] as u64) << 25)
+                | ((packet[7] as u64) << 17)
+                | ((packet[8] as u64) << 9)
+                | ((packet[9] as u64) << 1)
+                | ((packet[10] as u64) >> 7),
+        )
+    } else {
+        None
+    };
+    TsTiming {
+        pid,
+        pcr,
+        discontinuity: flags & 0x80 != 0,
+    }
+}
+
+fn pcr_delta(start: u64, end: u64) -> Option<u64> {
+    let delta = (end + PCR_MODULUS - start) % PCR_MODULUS;
+    (delta <= PCR_MODULUS / 2).then_some(delta)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockObservation {
+    Ignored,
+    Advanced(Duration),
+    Reset,
+}
+
+#[derive(Debug, Default)]
+pub struct SelectedPcrClock {
+    pid: Option<u16>,
+    start: Option<u64>,
+    last: Option<u64>,
+}
+
+impl SelectedPcrClock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn elapsed(&self) -> Option<Duration> {
+        Some(Duration::from_secs_f64(
+            pcr_delta(self.start?, self.last?)? as f64 / 90_000.0,
+        ))
+    }
+
+    pub fn observe(&mut self, timing: TsTiming) -> ClockObservation {
+        if timing.discontinuity {
+            self.reset();
+            return ClockObservation::Reset;
+        }
+        let Some(pcr) = timing.pcr else {
+            return ClockObservation::Ignored;
+        };
+        match self.pid {
+            Some(pid) if pid != timing.pid => return ClockObservation::Ignored,
+            None => self.pid = Some(timing.pid),
+            _ => {}
+        }
+        if self.last.is_some_and(|last| pcr_delta(last, pcr).is_none()) {
+            self.reset();
+            return ClockObservation::Reset;
+        }
+        self.start.get_or_insert(pcr);
+        self.last = Some(pcr);
+        ClockObservation::Advanced(self.elapsed().unwrap_or_default())
+    }
+}
 
 /// PID carrying the Service Description Table (and BAT).
 const SDT_PID: u16 = 0x0011;
@@ -79,24 +184,42 @@ const MAX_UNSYNCED_TAIL: usize = 2 * TS_PACKET_LEN - 1;
 #[derive(Default)]
 pub struct TsResync {
     buf: Vec<u8>,
+    locked: bool,
+}
+
+pub struct TsResyncOutput {
+    pub bytes: Vec<u8>,
+    pub discarded_bytes: usize,
 }
 
 impl TsResync {
     pub fn new() -> Self {
-        TsResync { buf: Vec::new() }
+        TsResync {
+            buf: Vec::new(),
+            locked: false,
+        }
     }
 
     /// Append `data`; return all newly emittable sync-locked packets (a whole number of
     /// 188-byte packets, each starting with `0x47`). Sync is confirmed with one packet of
     /// lookahead (`0x47` at the candidate AND at +188), so output trails input by ≤1 packet.
     pub fn push(&mut self, data: &[u8]) -> Vec<u8> {
+        self.push_report(data).bytes
+    }
+
+    /// Like [`Self::push`], while reporting bytes discarded after sync was first acquired.
+    /// Callers can treat such loss as a media discontinuity instead of silently joining
+    /// transport packets across an unrecoverable boundary.
+    pub fn push_report(&mut self, data: &[u8]) -> TsResyncOutput {
         self.buf.extend_from_slice(data);
         let n = self.buf.len();
         let mut out = Vec::new();
+        let mut discarded_bytes = 0;
         let mut i = 0;
         while i + 2 * TS_PACKET_LEN <= n {
             if self.buf[i] == TS_SYNC && self.buf[i + TS_PACKET_LEN] == TS_SYNC {
                 out.extend_from_slice(&self.buf[i..i + TS_PACKET_LEN]);
+                self.locked = true;
                 i += TS_PACKET_LEN;
             } else {
                 // Lost lock: scan forward to the next confirmable packet start.
@@ -107,6 +230,9 @@ impl TsResync {
                     j += 1;
                 }
                 if j + TS_PACKET_LEN < n {
+                    if self.locked {
+                        discarded_bytes += j - i;
+                    }
                     i = j;
                 } else {
                     break; // can't confirm yet; keep from i for the next push
@@ -120,9 +246,15 @@ impl TsResync {
         // re-lock, so drop it. Bounds memory against a non-TS junk flood (#14).
         if self.buf.len() > MAX_UNSYNCED_TAIL {
             let excess = self.buf.len() - MAX_UNSYNCED_TAIL;
+            if self.locked {
+                discarded_bytes += excess;
+            }
             self.buf.drain(0..excess);
         }
-        out
+        TsResyncOutput {
+            bytes: out,
+            discarded_bytes,
+        }
     }
 }
 
@@ -207,9 +339,11 @@ impl VideoAccessPointState {
 ///
 /// Feed it sync-locked, 188-aligned TS packets (e.g. [`TsResync`] output). Until it locks it
 /// emits nothing; on the first random-access point it emits the most-recent PAT and PMT
-/// followed by the keyframe packet, then passes everything through verbatim. If no keyframe is
-/// found within `max_scan_packets`, it gives up gating and passes through (better imperfect
-/// video than a starved client).
+/// followed by the keyframe packet, then passes everything through. A titled gate repeats its
+/// synthesized table prefix at later video access points and filters upstream SDT; an untitled
+/// gate remains byte-for-byte passthrough after lock. If no keyframe is found within
+/// `max_scan_packets`, it gives up gating and passes through (better imperfect video than a
+/// starved client).
 pub struct KeyframeGate {
     buf: Vec<u8>,
     locked: bool,
@@ -217,6 +351,7 @@ pub struct KeyframeGate {
     scanned: usize,
     max_scan_packets: usize,
     filter_sdt: bool,
+    mark_discontinuity: bool,
 }
 
 /// Default packet budget before the gate gives up looking for a keyframe and passes through.
@@ -238,12 +373,13 @@ impl KeyframeGate {
             scanned: 0,
             max_scan_packets,
             filter_sdt: false,
+            mark_discontinuity: false,
         }
     }
 
     /// Like [`new`](Self::new) but injects a synthesized SDT `service_name` at keyframe lock and
-    /// drops upstream SDT (PID 0x0011) packets from the post-lock passthrough, so the injected
-    /// title is the only SDT the client sees.
+    /// later video access points. Drops upstream SDT (PID 0x0011) packets from the post-lock
+    /// passthrough, so the injected title is the only SDT the client sees.
     pub fn with_service_name(raw: Option<String>) -> Self {
         let access = VideoAccessPointState::with_service_name(raw);
         let filter_sdt = access.has_service_name();
@@ -254,6 +390,7 @@ impl KeyframeGate {
             scanned: 0,
             max_scan_packets: DEFAULT_MAX_SCAN_PACKETS,
             filter_sdt,
+            mark_discontinuity: false,
         }
     }
 
@@ -264,6 +401,14 @@ impl KeyframeGate {
         self.locked = false;
         self.scanned = 0;
         self.access.reset();
+        self.mark_discontinuity = false;
+    }
+
+    /// Re-arm after known media loss and mark the first resumed video access point so MPEG-TS
+    /// decoders reset continuity/timestamp state at the same boundary.
+    pub fn reset_for_discontinuity(&mut self) {
+        self.reset();
+        self.mark_discontinuity = true;
     }
 
     /// Append `data` (assumed 188-aligned TS) and return the bytes to forward to the client.
@@ -278,6 +423,11 @@ impl KeyframeGate {
                     i += TS_PACKET_LEN;
                     continue;
                 }
+                if self.filter_sdt && self.access.observe(pkt) {
+                    if let Some(prefix) = self.access.table_prefix() {
+                        out.extend_from_slice(&prefix);
+                    }
+                }
                 out.extend_from_slice(pkt);
                 i += TS_PACKET_LEN;
                 continue;
@@ -288,11 +438,19 @@ impl KeyframeGate {
                 if let Some(prefix) = self.access.table_prefix() {
                     out.extend_from_slice(&prefix);
                 }
-                out.extend_from_slice(pkt);
+                append_resumed_packet(&mut self.mark_discontinuity, None, pkt, &mut out);
                 self.locked = true;
             } else if self.scanned >= self.max_scan_packets {
                 // Safety fallback: never found a keyframe; passthrough from here.
-                out.extend_from_slice(pkt);
+                // The discontinuity indicator is PID-specific. Prefer the video PID learned
+                // from the PMT; if tables never arrived, marking the triggering PID is an
+                // explicit best effort because no decoder-visible video PID is known.
+                append_resumed_packet(
+                    &mut self.mark_discontinuity,
+                    self.access.video_pid,
+                    pkt,
+                    &mut out,
+                );
                 self.locked = true;
             }
             // otherwise: drop this prefix packet and keep scanning.
@@ -301,6 +459,52 @@ impl KeyframeGate {
         self.buf.drain(0..i);
         out
     }
+}
+
+fn append_resumed_packet(
+    mark_discontinuity: &mut bool,
+    marker_pid: Option<u16>,
+    packet: &[u8],
+    out: &mut Vec<u8>,
+) {
+    if !std::mem::take(mark_discontinuity) {
+        out.extend_from_slice(packet);
+        return;
+    }
+
+    let marker_pid = marker_pid.unwrap_or_else(|| ts_pid(packet));
+    if marker_pid != ts_pid(packet) {
+        out.extend_from_slice(&discontinuity_packet(marker_pid, packet[3] & 0x0f));
+        out.extend_from_slice(packet);
+        return;
+    }
+
+    let mut resumed = packet.to_vec();
+    if !set_discontinuity_indicator(&mut resumed) {
+        out.extend_from_slice(&discontinuity_packet(ts_pid(packet), packet[3] & 0x0f));
+    }
+    out.extend_from_slice(&resumed);
+}
+
+fn set_discontinuity_indicator(packet: &mut [u8]) -> bool {
+    let afc = (packet[3] >> 4) & 0x03;
+    if matches!(afc, 0b10 | 0b11) && packet[4] >= 1 {
+        packet[5] |= 0x80;
+        true
+    } else {
+        false
+    }
+}
+
+fn discontinuity_packet(pid: u16, continuity_counter: u8) -> [u8; TS_PACKET_LEN] {
+    let mut packet = [0xff; TS_PACKET_LEN];
+    packet[0] = TS_SYNC;
+    packet[1] = ((pid >> 8) as u8) & 0x1f;
+    packet[2] = pid as u8;
+    packet[3] = 0x20 | continuity_counter;
+    packet[4] = 183;
+    packet[5] = 0x80;
+    packet
 }
 
 /// PID (13-bit) of a TS packet.
@@ -562,6 +766,49 @@ impl Default for KeyframeGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timing(pid: u16, pcr: Option<u64>) -> TsTiming {
+        TsTiming {
+            pid,
+            pcr,
+            discontinuity: false,
+        }
+    }
+
+    #[test]
+    fn selected_pcr_clock_ignores_other_pids_and_handles_wrap() {
+        let mut clock = SelectedPcrClock::new();
+        assert_eq!(
+            clock.observe(timing(0x100, Some(PCR_MODULUS - 45_000))),
+            ClockObservation::Advanced(Duration::ZERO)
+        );
+        assert_eq!(
+            clock.observe(timing(0x101, Some(90_000))),
+            ClockObservation::Ignored
+        );
+        assert_eq!(
+            clock.observe(timing(0x100, Some(45_000))),
+            ClockObservation::Advanced(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn selected_pcr_clock_resets_on_backward_jump_or_discontinuity() {
+        let mut clock = SelectedPcrClock::new();
+        clock.observe(timing(0x100, Some(180_000)));
+        assert_eq!(
+            clock.observe(timing(0x100, Some(90_000))),
+            ClockObservation::Reset
+        );
+        clock.observe(timing(0x100, Some(180_000)));
+        assert_eq!(
+            clock.observe(TsTiming {
+                discontinuity: true,
+                ..timing(0x100, Some(270_000))
+            }),
+            ClockObservation::Reset
+        );
+    }
 
     fn packet(fill: u8) -> Vec<u8> {
         let mut p = vec![fill; TS_PACKET_LEN];
@@ -861,6 +1108,108 @@ mod tests {
     }
 
     #[test]
+    fn discontinuity_reset_marks_access_point_with_existing_adaptation_field() {
+        let mut gate = KeyframeGate::new();
+        gate.reset_for_discontinuity();
+
+        let out = gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        let first_video = out
+            .chunks_exact(TS_PACKET_LEN)
+            .find(|packet| pid_of(packet) == VIDEO_PID)
+            .expect("resumed video packet");
+
+        assert!(ts_timing(first_video.try_into().unwrap()).discontinuity);
+        assert_eq!(packet_count(&out), 3, "no marker packet is needed");
+    }
+
+    #[test]
+    fn discontinuity_reset_inserts_adaptation_only_marker_when_needed() {
+        let mut gate = KeyframeGate::new();
+        gate.reset_for_discontinuity();
+        let idr = [0x00, 0x00, 0x01, 0xE0, 0, 0, 0, 0, 1, 0x65];
+
+        let out = gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                ts(VIDEO_PID, true, false, &idr),
+            ]
+            .concat(),
+        );
+        let video: Vec<_> = out
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|packet| pid_of(packet) == VIDEO_PID)
+            .collect();
+
+        assert_eq!(
+            video.len(),
+            2,
+            "marker must precede payload-only access point"
+        );
+        assert!(ts_timing(video[0].try_into().unwrap()).discontinuity);
+        assert_eq!((video[0][3] >> 4) & 0x03, 0b10);
+        assert_eq!(video[1], ts(VIDEO_PID, true, false, &idr));
+    }
+
+    #[test]
+    fn discontinuity_reset_marks_scan_budget_fallback() {
+        let mut gate = KeyframeGate::with_max_scan_packets(1);
+        gate.reset_for_discontinuity();
+        let resumed = ts(VIDEO_PID, false, false, &[0xAA; 16]);
+
+        let out = gate.push(&resumed);
+        let packets: Vec<_> = out.chunks_exact(TS_PACKET_LEN).collect();
+
+        assert_eq!(packets.len(), 2, "fallback needs a separate marker packet");
+        assert!(ts_timing(packets[0].try_into().unwrap()).discontinuity);
+        assert_eq!(packets[1], resumed);
+    }
+
+    #[test]
+    fn discontinuity_fallback_marks_known_video_pid_when_audio_exhausts_budget() {
+        let mut gate = KeyframeGate::with_max_scan_packets(3);
+        gate.reset_for_discontinuity();
+        let audio = ts(AUDIO_PID, false, false, &[0xCC; 16]);
+
+        let out = gate.push(&[pat(PMT_PID), pmt(PMT_PID, VIDEO_PID), audio.clone()].concat());
+        let packets: Vec<_> = out.chunks_exact(TS_PACKET_LEN).collect();
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(pid_of(packets[0]), VIDEO_PID);
+        assert!(ts_timing(packets[0].try_into().unwrap()).discontinuity);
+        assert_eq!(packets[1], audio);
+    }
+
+    #[test]
+    fn ordinary_reset_clears_pending_discontinuity_marker() {
+        let mut gate = KeyframeGate::new();
+        gate.reset_for_discontinuity();
+        gate.reset();
+
+        let out = gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        let first_video = out
+            .chunks_exact(TS_PACKET_LEN)
+            .find(|packet| pid_of(packet) == VIDEO_PID)
+            .expect("resumed video packet");
+
+        assert!(!ts_timing(first_video.try_into().unwrap()).discontinuity);
+    }
+
+    #[test]
     fn gate_prepends_only_the_latest_cached_tables() {
         let mut g = KeyframeGate::new();
         g.push(&pat(PMT_PID));
@@ -946,6 +1295,48 @@ mod tests {
         assert!(!out
             .chunks_exact(TS_PACKET_LEN)
             .any(|p| read_sdt_service_name(p).as_deref() == Some("Upstream")));
+    }
+
+    #[test]
+    fn titled_keyframe_gate_repeats_sdt_at_later_access_points() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".to_string()));
+        let ordinary = ts(VIDEO_PID, false, false, &[0x11, 0x22]);
+        let access = random_access_packet(VIDEO_PID);
+        let mut input = Vec::new();
+        input.extend_from_slice(&pat(PMT_PID));
+        input.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        input.extend_from_slice(&access);
+        input.extend_from_slice(&ordinary);
+        input.extend_from_slice(&access);
+
+        let out = gate.push(&input);
+        let titled_sdt_count = out
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|packet| read_sdt_service_name(packet).as_deref() == Some("Titled"))
+            .count();
+        assert_eq!(titled_sdt_count, 2);
+        assert_eq!(
+            out.chunks_exact(TS_PACKET_LEN)
+                .filter(|packet| *packet == ordinary.as_slice())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn untitled_keyframe_gate_does_not_repeat_tables_at_later_access_points() {
+        let mut gate = KeyframeGate::new();
+        let access = random_access_packet(VIDEO_PID);
+        let mut opening = Vec::new();
+        opening.extend_from_slice(&pat(PMT_PID));
+        opening.extend_from_slice(&pmt(PMT_PID, VIDEO_PID));
+        opening.extend_from_slice(&access);
+        let _ = gate.push(&opening);
+
+        let ordinary = ts(VIDEO_PID, false, false, &[0x33, 0x44]);
+        let mut later = ordinary.clone();
+        later.extend_from_slice(&access);
+        assert_eq!(gate.push(&later), later);
     }
 
     #[test]
@@ -1048,6 +1439,21 @@ mod tests {
         assert!(out.chunks_exact(TS_PACKET_LEN).all(|p| p[0] == TS_SYNC));
         // we keep most packets (6 in, minus ≤1 lookahead) — junk doesn't corrupt the run
         assert!(packet_count(&out) >= 4);
+    }
+
+    #[test]
+    fn resync_reports_post_lock_boundary_loss_but_not_contiguous_carry() {
+        let mut r = TsResync::new();
+        let contiguous = [packet(1), packet(2), packet(3)].concat();
+        let first = r.push_report(&contiguous[..250]);
+        assert_eq!(first.discarded_bytes, 0);
+        let second = r.push_report(&contiguous[250..]);
+        assert_eq!(second.discarded_bytes, 0);
+
+        let boundary = [vec![0_u8; 96], packet(4), packet(5)].concat();
+        let resumed = r.push_report(&boundary);
+        assert_eq!(resumed.discarded_bytes, TS_PACKET_LEN + 96);
+        assert!(is_aligned(&resumed.bytes));
     }
 
     #[test]
