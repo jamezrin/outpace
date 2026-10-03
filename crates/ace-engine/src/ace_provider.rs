@@ -7,10 +7,11 @@
 //! resolution first uses the official signed catalog path, with BEP-9 `ut_metadata` as a
 //! fallback (see [`ace_swarm::resolve`]); the infohash form works directly.
 
-use crate::config::{CacheType, LiveRecoveryConfig};
+use crate::config::{CacheType, LiveRecoveryConfig, StartupBufferConfig};
 use crate::provider::{
     ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource, VodContent,
 };
+use crate::startup_buffer::StartupBufferedSource;
 use ace_peer::session::{connect, PeerSession};
 use ace_swarm::dht::dht_announce_peer;
 use ace_swarm::discover::{
@@ -48,6 +49,7 @@ use tokio::sync::mpsc;
 
 /// How many pieces behind the live edge to start, so we have buffer immediately.
 const PREFETCH_PIECES: u64 = 8;
+const UNKNOWN_BITRATE_BUFFER_PREFETCH_PIECES: u64 = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Legacy single-peer helper handle. The production path now assigns real peer handles
 /// starting at 1, but the old helper is kept as a short-term bisect fallback.
@@ -189,7 +191,8 @@ pub struct AceProvider {
     seed_store_bytes: u64,
     /// Age bound for live seed stores; `None` disables it (byte-only). Default `SEED_STORE_RETENTION`.
     seed_store_retention: Option<Duration>,
-    prefetch_pieces: u64,
+    prefetch_pieces: Option<u64>,
+    startup_buffer: StartupBufferConfig,
     live_recovery: LiveRecoveryConfig,
     enable_seeding: bool,
     cache_type: CacheType,
@@ -217,7 +220,8 @@ impl AceProvider {
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
             seed_store_retention: Some(SEED_STORE_RETENTION),
-            prefetch_pieces: PREFETCH_PIECES,
+            prefetch_pieces: None,
+            startup_buffer: StartupBufferConfig::default(),
             live_recovery: LiveRecoveryConfig::default(),
             enable_seeding: true,
             cache_type: CacheType::Memory,
@@ -317,11 +321,44 @@ impl AceProvider {
         self
     }
 
-    /// Override how many pieces behind the live edge a fresh follower starts at, tuning the
-    /// immediate playback cushion against extra startup latency. Defaults to `PREFETCH_PIECES`.
-    pub fn with_prefetch_pieces(mut self, pieces: u64) -> Self {
+    /// Set an exact operator prefetch depth, or preserve `None` for derived policy selection.
+    pub fn with_prefetch_pieces(mut self, pieces: Option<u64>) -> Self {
         self.prefetch_pieces = pieces;
         self
+    }
+
+    /// Store the validated startup buffering policy for installation around the live source.
+    pub fn with_startup_buffer(mut self, startup_buffer: StartupBufferConfig) -> Self {
+        self.startup_buffer = startup_buffer;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefetch_policy(&self) -> Option<u64> {
+        self.prefetch_pieces
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_buffer_config(&self) -> StartupBufferConfig {
+        self.startup_buffer
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_recovery_config(&self) -> LiveRecoveryConfig {
+        self.live_recovery
+    }
+
+    fn prefetch_policy_for(&self, info: &StreamInfo) -> u64 {
+        self.prefetch_pieces
+            .unwrap_or_else(|| {
+                derived_prefetch_pieces(
+                    self.startup_buffer.target_ms,
+                    info.metadata.bitrate,
+                    info.piece_length,
+                    info.sig_len,
+                )
+            })
+            .min(self.live_recovery.max_reasm_pieces_ahead)
     }
 
     /// Override the live lag-recovery and active upstream policy. Values are validated by
@@ -494,6 +531,34 @@ impl AceProvider {
             "vod content-id resolution: no metadata peer responded".into(),
         ))
     }
+}
+
+/// Resolve the live history depth needed to fill the startup reservoir. Known bitrates use
+/// media payload bytes per piece plus a two-piece scheduling margin. Without a bitrate hint,
+/// enabled startup buffering uses a conservative historical window; disabled buffering keeps
+/// the legacy depth.
+fn derived_prefetch_pieces(
+    target_ms: u64,
+    bitrate: Option<u64>,
+    piece_length: u64,
+    sig_len: usize,
+) -> u64 {
+    let Some(bitrate) = bitrate else {
+        return if target_ms == 0 {
+            PREFETCH_PIECES
+        } else {
+            UNKNOWN_BITRATE_BUFFER_PREFETCH_PIECES
+        };
+    };
+    let payload = piece_length.saturating_sub(sig_len as u64).max(1) as u128;
+    let Some(bit_millis) = (target_ms as u128).checked_mul(bitrate as u128) else {
+        return u64::MAX;
+    };
+    let Some(piece_bit_millis) = 8_000_u128.checked_mul(payload) else {
+        return u64::MAX;
+    };
+    let pieces = bit_millis.div_ceil(piece_bit_millis).saturating_add(2);
+    u64::try_from(pieces).unwrap_or(u64::MAX)
 }
 
 /// The leading run of `[first_piece, end_piece)` already present in `cache`. Returns those pieces'
@@ -820,12 +885,15 @@ impl StreamProvider for AceProvider {
         let stats_downloaded = downloaded.clone();
         let stats_uploaded = uploaded.clone();
         let stats_peers_served = peers_served.clone();
+        let prefetch_pieces = self.prefetch_policy_for(&info);
+        let startup_buffer = self.startup_buffer;
+        let bitrate = info.metadata.bitrate;
         let seed = SeedConfig {
             registry: self.seed_registry.clone(),
             store_bytes: self.seed_store_bytes,
             store_retention: self.seed_store_retention,
             enabled: self.enable_seeding,
-            prefetch_pieces: self.prefetch_pieces,
+            prefetch_pieces,
             live_recovery: self.live_recovery,
             cache_type: self.cache_type,
             cache_dir: self.cache_dir.clone(),
@@ -844,7 +912,7 @@ impl StreamProvider for AceProvider {
                 _ = announce_seeder_periodically(announce_info, announce_port) => {},
             }
         });
-        Ok(Box::new(AceSource {
+        let source = AceSource {
             rx,
             discontinuity: false,
             peers: peer_count,
@@ -852,7 +920,12 @@ impl StreamProvider for AceProvider {
             uploaded: stats_uploaded,
             peers_served: stats_peers_served,
             metadata,
-        }))
+        };
+        Ok(StartupBufferedSource::new(
+            Box::new(source),
+            startup_buffer,
+            bitrate,
+        ))
     }
 }
 
@@ -887,7 +960,7 @@ pub async fn announce_infohash_periodically_dynamic(
             _ = tokio::time::sleep(SEEDER_ANNOUNCE_INTERVAL) => {},
             changed = port_rx.changed() => {
                 if changed.is_err() {
-                    return;
+                    std::future::pending::<()>().await;
                 }
             }
         }
@@ -1651,6 +1724,21 @@ impl Continuity {
         }
     }
 
+    fn resync_output(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let output = self.resync.push_report(bytes);
+        if output.discarded_bytes > 0 {
+            crate::alog!(
+                "[mpegts] transport resync discarded boundary bytes: discarded_bytes={}",
+                output.discarded_bytes
+            );
+            let mut gate = ace_media::mpegts::KeyframeGate::new();
+            gate.reset_for_discontinuity();
+            self.output_gate = Some(gate);
+            self.discontinuity_pending = true;
+        }
+        self.filter_output_after_discontinuity(output.bytes)
+    }
+
     fn take_discontinuity(&mut self) -> bool {
         std::mem::take(&mut self.discontinuity_pending)
     }
@@ -2148,8 +2236,7 @@ async fn follow_peer_pool(
                     made_activity = true;
                     let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
-                        let aligned = continuity.resync.push(&ready);
-                        let aligned = continuity.filter_output_after_discontinuity(aligned);
+                        let aligned = continuity.resync_output(&ready);
                         if !aligned.is_empty() {
                             let discontinuity = continuity.take_discontinuity();
                             continuity.emitted += aligned.len() as u64;
@@ -2717,8 +2804,7 @@ async fn follow_one_peer(
                     made_activity = true;
                     let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
-                        let aligned = continuity.resync.push(&ready);
-                        let aligned = continuity.filter_output_after_discontinuity(aligned);
+                        let aligned = continuity.resync_output(&ready);
                         if !aligned.is_empty() {
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
@@ -3008,6 +3094,53 @@ mod tests {
     async fn network_is_ace() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
         assert_eq!(p.network(), "ace");
+    }
+
+    #[test]
+    fn startup_policy_builders_preserve_absent_and_explicit_values() {
+        let startup = crate::config::StartupBufferConfig {
+            target_ms: 12_000,
+            max_bytes: 33_554_432,
+            timeout_ms: 9_000,
+        };
+        let default = AceProvider::new(Arc::new(Identity::generate()), 6878);
+        assert_eq!(default.prefetch_policy(), None);
+        assert_eq!(
+            default.startup_buffer_config(),
+            crate::config::StartupBufferConfig::default()
+        );
+
+        let configured = AceProvider::new(Arc::new(Identity::generate()), 6878)
+            .with_prefetch_pieces(Some(8))
+            .with_startup_buffer(startup);
+        assert_eq!(configured.prefetch_policy(), Some(8));
+        assert_eq!(configured.startup_buffer_config(), startup);
+    }
+
+    #[test]
+    fn prefetch_derives_history_from_target_bitrate_and_payload_with_two_piece_margin() {
+        assert_eq!(
+            derived_prefetch_pieces(30_000, Some(8_000_000), 1_048_576, 96),
+            31
+        );
+    }
+
+    #[test]
+    fn prefetch_positive_fractional_byte_still_requires_one_history_piece() {
+        assert_eq!(derived_prefetch_pieces(1, Some(1), 1_048_576, 96), 3);
+    }
+
+    #[test]
+    fn prefetch_fallback_depends_on_whether_prebuffer_is_enabled() {
+        assert_eq!(derived_prefetch_pieces(30_000, None, 1_048_576, 96), 32);
+        assert_eq!(derived_prefetch_pieces(0, None, 1_048_576, 96), 8);
+    }
+
+    #[test]
+    fn prefetch_explicit_override_is_not_reinterpreted() {
+        let provider =
+            AceProvider::new(Arc::new(Identity::generate()), 6878).with_prefetch_pieces(Some(3));
+        assert_eq!(provider.prefetch_policy_for(&info()), 3);
     }
 
     #[tokio::test]
@@ -3825,6 +3958,23 @@ mod tests {
         assert!(res.is_err(), "must never resolve without an inbound port");
     }
 
+    #[tokio::test]
+    async fn closed_inbound_port_watch_keeps_self_announce_pending() {
+        let (port_tx, port_rx) = tokio::sync::watch::channel(None);
+        drop(port_tx);
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            announce_infohash_periodically_dynamic(vec![], [0; 20], port_rx),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "a closed disabled-port watch must not cancel the live follower"
+        );
+    }
+
     #[test]
     fn leech_self_announce_uses_the_peer_port_never_the_http_port() {
         // Regression for #21: a leeching provider configured the way `build_runtime` wires it
@@ -4202,6 +4352,33 @@ mod tests {
 
         assert_eq!(aligned.len(), TS_PACKET);
         assert_eq!(aligned[1], 0x22);
+    }
+
+    #[test]
+    fn resync_boundary_loss_marks_one_discontinuity_and_rearms_output_gate() {
+        const TS_PACKET: usize = 188;
+        fn packet(fill: u8) -> Vec<u8> {
+            let mut bytes = vec![fill; TS_PACKET];
+            bytes[0] = 0x47;
+            bytes
+        }
+
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            100,
+            149,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
+        let initial = [packet(1), packet(2), packet(3)].concat();
+        assert!(!c.resync_output(&initial).is_empty());
+        assert!(!c.take_discontinuity());
+
+        let boundary = [vec![0; 96], packet(4), packet(5), packet(6)].concat();
+        assert!(c.resync_output(&boundary).is_empty());
+        assert!(c.output_gate_armed());
+        assert!(c.take_discontinuity());
+        assert!(!c.take_discontinuity());
     }
 
     #[test]

@@ -66,12 +66,39 @@ An active stream status response has stable field names and numeric counters:
 
 `clients` counts direct consumers of the shared byte stream; internal HLS packaging does not
 inflate it. The top-level `bitrate` is the measured session rate; `metadata.bitrate` is the
-descriptor's advertised rate. Rates are bits per second, `buffer_ms` is milliseconds, and
-`uploaded` is bytes. Metadata always has the stable `title`, `bitrate`, and `categories` fields;
+descriptor's advertised rate. Rates are bits per second, `buffer_ms` is the estimated duration
+currently queued on the server, and `uploaded` is bytes. In particular, `buffer_ms` is not a
+decoder or player lead measurement: a client can drain the server queue faster than real time,
+or maintain its own independent buffer. Metadata always has the stable `title`, `bitrate`, and
+`categories` fields;
 bare infohashes and descriptors without metadata return `null`, `null`, and `[]` respectively.
 The descriptor title is authoritative for both `metadata.title` and `Icy-Name`; outpace does not
 invent a title for a bare infohash.
 Live HLS media playlists are unchanged because they have no portable stream-title field.
+
+## Live startup buffering
+
+Direct MPEG-TS playback now defaults to a server-resident startup reservoir with a 30-second
+target (`OUTPACE_PREBUFFER_MS=30000`), a 128 MiB payload ceiling
+(`OUTPACE_PREBUFFER_BYTES=134217728`), and a 15-second collection deadline
+(`OUTPACE_PREBUFFER_TIMEOUT_MS=15000`). The target is media-clock duration when usable timing is
+present, with the advertised bitrate as a fallback. This intentionally adds startup latency in
+exchange for resilience to transient swarm jitter. The server releases early when the byte limit
+or deadline is reached, so a short advertised live window degrades to the media collected so far
+rather than waiting indefinitely. The byte ceiling covers queued payload; allocation metadata,
+the seed store, HLS segments, and other daemon state are additional memory overhead.
+
+Set `OUTPACE_PREBUFFER_MS=0` to disable the reservoir and retain the earlier immediate-release
+behavior. The byte budget must still hold at least one 188-byte MPEG-TS packet. A nonzero target
+requires a nonzero timeout.
+
+HLS defaults to 5-second target segments (`OUTPACE_HLS_SEGMENT_DURATION_MS=5000`), an eight-segment
+retained window (`OUTPACE_HLS_WINDOW_SEGMENTS=8`), six completed startup segments
+(`OUTPACE_HLS_STARTUP_SEGMENTS=6`), and a 45-second playlist startup timeout
+(`OUTPACE_HLS_STARTUP_TIMEOUT_MS=45000`). A new playlist request waits for the startup count or
+the timeout. `OUTPACE_HLS_STARTUP_SEGMENTS=0` retains compatibility by behaving as one segment.
+The generated `EXT-X-START` points near the beginning of the retained startup window, but it is
+advisory: clients may choose a different starting position and maintain their own buffer policy.
 
 ## Player and middleware integration
 

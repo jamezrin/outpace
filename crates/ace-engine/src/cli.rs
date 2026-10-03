@@ -204,6 +204,26 @@ fn broadcast_output(
     )
 }
 
+fn play_provider_from_config(
+    identity: std::sync::Arc<ace_wire::identity::Identity>,
+    config: &crate::config::Config,
+    peers: Vec<SocketAddrV4>,
+    seed_registry: ace_swarm::listen::SeedRegistry,
+) -> crate::ace_provider::AceProvider {
+    // One-shot leech to stdout: it runs no inbound listener, so it discovers on the peer port
+    // (never the HTTP port — issue #21) and does not self-announce as a dial-able seeder.
+    crate::ace_provider::AceProvider::new(identity, config.peer_listen.port())
+        .with_bootstrap_peers(peers)
+        .with_seed_registry(seed_registry)
+        .with_seed_store_bytes(config.seed_store_bytes)
+        .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
+        .with_cache(config.cache_type, config.cache_dir.clone())
+        .with_seeding_enabled(config.enable_seeding)
+        .with_prefetch_pieces(config.prefetch_pieces)
+        .with_startup_buffer(config.startup_buffer)
+        .with_live_recovery(config.live_recovery)
+}
+
 async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     use crate::provider::StreamProvider;
     use tokio::io::AsyncWriteExt;
@@ -215,16 +235,12 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     peers.extend(args.peers);
 
     let identity = std::sync::Arc::new(crate::config::load_or_create_identity(&config.data_dir)?);
-    let seed_registry = ace_swarm::listen::SeedRegistry::new();
-    // One-shot leech to stdout: it runs no inbound listener, so it discovers on the peer port
-    // (never the HTTP port — issue #21) and does not self-announce as a dial-able seeder.
-    let provider = crate::ace_provider::AceProvider::new(identity, config.peer_listen.port())
-        .with_bootstrap_peers(peers)
-        .with_seed_registry(seed_registry)
-        .with_seed_store_bytes(config.seed_store_bytes)
-        .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
-        .with_cache(config.cache_type, config.cache_dir.clone())
-        .with_seeding_enabled(config.enable_seeding);
+    let provider = play_provider_from_config(
+        identity,
+        &config,
+        peers,
+        ace_swarm::listen::SeedRegistry::new(),
+    );
 
     // User-facing CLI progress: plain `eprintln!` on purpose (a human is watching this run,
     // so no `alog!` timestamp/`[tag]` prefix). See the `ace_log` crate docs.
@@ -338,8 +354,31 @@ fn percent_decode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{broadcast_output, Cli, Command, PlaybackTarget};
+    use super::{broadcast_output, play_provider_from_config, Cli, Command, PlaybackTarget};
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn play_provider_receives_live_playback_policy_from_runtime_config() {
+        let mut config = crate::config::Config::default();
+        config.prefetch_pieces = Some(17);
+        config.startup_buffer = crate::config::StartupBufferConfig {
+            target_ms: 12_000,
+            max_bytes: 33_554_432,
+            timeout_ms: 9_000,
+        };
+        config.live_recovery.max_active_upstreams = 7;
+
+        let provider = play_provider_from_config(
+            std::sync::Arc::new(ace_wire::identity::Identity::generate()),
+            &config,
+            vec![],
+            ace_swarm::listen::SeedRegistry::new(),
+        );
+
+        assert_eq!(provider.prefetch_policy(), Some(17));
+        assert_eq!(provider.startup_buffer_config(), config.startup_buffer);
+        assert_eq!(provider.live_recovery_config(), config.live_recovery);
+    }
 
     #[test]
     fn help_identifies_native_surface_and_describes_each_command() {

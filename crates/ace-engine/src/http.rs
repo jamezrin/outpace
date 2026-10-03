@@ -25,7 +25,6 @@ use tokio::sync::broadcast::error::RecvError;
 
 const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ACE_TOKEN_CAPACITY: usize = 4096;
-const HLS_PLAYLIST_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn stream_metadata_json(metadata: &StreamMetadata) -> serde_json::Value {
     json!({
@@ -951,8 +950,8 @@ async fn ace_hls_playback(
     State(s): State<AppState>,
     Path((id, manifest)): Path<(String, String)>,
 ) -> Response {
-    ace_hls_playback_with_timeout(State(s), Path((id, manifest)), HLS_PLAYLIST_STARTUP_TIMEOUT)
-        .await
+    let timeout = s.manager.hls_startup_timeout();
+    ace_hls_playback_with_timeout(State(s), Path((id, manifest)), timeout).await
 }
 
 async fn ace_hls_playback_with_timeout(
@@ -1427,12 +1426,8 @@ async fn stream_file(
     State(s): State<AppState>,
     Path((network, file)): Path<(String, String)>,
 ) -> Response {
-    stream_file_with_hls_timeout(
-        State(s),
-        Path((network, file)),
-        HLS_PLAYLIST_STARTUP_TIMEOUT,
-    )
-    .await
+    let timeout = s.manager.hls_startup_timeout();
+    stream_file_with_hls_timeout(State(s), Path((network, file)), timeout).await
 }
 
 async fn stream_file_with_hls_timeout(
@@ -1555,7 +1550,7 @@ fn ace_stream_session_response(
 }
 
 fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
-    gate.reset();
+    gate.reset_for_discontinuity();
 }
 
 #[cfg(test)]
@@ -1821,6 +1816,7 @@ mod tests {
             segment_packets: seg_packets,
             window_segments: 6,
             segment_duration_ms: 2000,
+            ..crate::config::HlsConfig::default()
         };
         router(AppState {
             manager: StreamManager::with_config(r, 256, hls),
@@ -2134,7 +2130,16 @@ mod tests {
         let mut r = ProviderRegistry::new();
         r.register(std::sync::Arc::new(FixtureProvider { skip }));
         AppState {
-            manager: StreamManager::new(r),
+            manager: StreamManager::with_config(
+                r,
+                256,
+                crate::config::HlsConfig {
+                    window_segments: 6,
+                    segment_duration_ms: 1000,
+                    startup_segments: 1,
+                    ..crate::config::HlsConfig::default()
+                },
+            ),
             networks: vec!["fix".into()],
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(AceSessionStore::default()),
@@ -2286,6 +2291,8 @@ mod tests {
                     segment_packets: 4,
                     window_segments: 3,
                     segment_duration_ms: 1000,
+                    startup_segments: 1,
+                    ..crate::config::HlsConfig::default()
                 },
             ),
             networks: vec!["hlsfix".into()],
@@ -2307,6 +2314,8 @@ mod tests {
                     segment_packets: 3,
                     window_segments: 3,
                     segment_duration_ms: 1000,
+                    startup_segments: 1,
+                    ..crate::config::HlsConfig::default()
                 },
             ),
             networks: vec!["stalled".into()],
@@ -2470,6 +2479,17 @@ mod tests {
         assert!(
             gate.push(mid_gop_packet).is_empty(),
             "after lag reset, mid-GOP packets are held until a keyframe"
+        );
+
+        let resumed = gate.push(FIXTURE);
+        let first_video = resumed
+            .chunks_exact(188)
+            .find(|packet| ace_media::mpegts::ts_pid(packet) == 0x0100)
+            .expect("resumed direct stream has a video keyframe");
+        let first_video: &[u8; 188] = first_video.try_into().unwrap();
+        assert!(
+            ace_media::mpegts::ts_timing(first_video).discontinuity,
+            "resumed direct TS must expose the discontinuity to the decoder"
         );
     }
 
