@@ -39,9 +39,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          targets: ${{ env.TARGET }}
+          target: ${{ env.TARGET }}
+          cache: false
+          build-warnings: ""
 
       - name: Install ARMv7 musl toolchain
         uses: taiki-e/setup-cross-toolchain-action@v1

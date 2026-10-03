@@ -1,16 +1,25 @@
 # syntax=docker/dockerfile:1
 
-ARG RUST_VERSION=1.96.0
-
-FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+FROM debian:bookworm-slim AS builder
 WORKDIR /src
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        curl \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+
+COPY rust-toolchain.toml ./
+RUN rustup show
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates

@@ -88,9 +88,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          targets: ${{ matrix.target }}
+          target: ${{ matrix.target }}
+          cache: false
+          build-warnings: ""
 
       - name: Install Linux cross toolchain
         if: contains(matrix.target, 'unknown-linux-musl')
