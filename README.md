@@ -228,7 +228,10 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_CACHE_TYPE` - where the seed store keeps piece data: `memory` (default) or `disk`.
   `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
 - `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per served stream; see
-  below), default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`.
+  below), default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`. Startup wipes
+  this directory only when it is empty or already contains a regular `.outpace-cache` sentinel
+  file (written automatically on first successful disk-cache start). A symlink is not accepted
+  as a sentinel. An unmarked non-empty path is refused rather than deleted.
 - `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.
   When unset, outpace derives the depth from the startup target and advertised bitrate, falling
   back to `32` pieces when the bitrate is unavailable.
@@ -323,9 +326,13 @@ boolean gates below, `true` does **not** enable them).
 Boolean gates accept exactly `1`, `true`, `0`, or `false`; other values are configuration errors
 rather than silently disabling a feature.
 
-The disk cache is **ephemeral**: its directory is cleared when a store is created and
+The disk cache is **ephemeral**: a dedicated cache directory is cleared when a store is created and
 never reloaded across restarts (live piece data goes stale), which also avoids serving
-evicted-stale pieces. Disk I/O is currently synchronous.
+evicted-stale pieces. Disk I/O is currently synchronous. The first disk-cache start writes a
+`.outpace-cache` sentinel so later wipes can distinguish a dedicated cache from an accidental
+operator path. An existing non-empty cache without that regular sentinel file fails startup
+instead of being deleted; use an empty directory or create the file only after verifying that
+all existing contents may be deleted.
 
 Disk mode never silently converts `OUTPACE_SEED_STORE_BYTES` into an equal per-stream RAM
 allocation. An invalid/unwritable cache root fails daemon startup. If a new per-stream directory
@@ -337,8 +344,8 @@ pieces to serve. This favors the operator's RAM bound over transient seeding cap
 In disk mode each served stream keeps its pieces under
 `<OUTPACE_CACHE_DIR>/<infohash_hex>-<generation>` (a process-unique suffix per store instance).
 The directory is removed automatically when the stream is torn down (leech consumer disconnects,
-broadcast `DELETE`, or process exit), and the whole cache root is wiped on startup, so no
-per-stream directories accumulate.
+broadcast `DELETE`, or process exit), and a dedicated cache root is wiped on startup only if it
+is empty or contains `.outpace-cache`, so no per-stream directories accumulate.
 
 ## Project Docs
 

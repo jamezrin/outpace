@@ -137,25 +137,33 @@ pub fn decode_transport_with_key(
         return Err(WireError::Invalid("not a transport file"));
     }
 
-    // 2. Body = skip 18-byte magic + 2-byte version.
+    // 2. Magic + 2-byte version must be present before slicing the body.
+    // `is_transport_file` only tests the 18-byte prefix; 18- and 19-byte
+    // buffers would panic on `&bytes[20..]`.
+    let version = bytes.get(18..20).ok_or(WireError::Truncated)?;
+    if version != [0, 2] {
+        return Err(WireError::Invalid("unsupported transport version"));
+    }
+
+    // 3. Body = skip 18-byte magic + 2-byte version.
     let body = &bytes[20..];
     if body.is_empty() || !body.len().is_multiple_of(16) {
         return Err(WireError::Invalid("bad transport body length"));
     }
 
-    // 3. AES-128-CBC decrypt + PKCS#7 unpad.
+    // 4. AES-128-CBC decrypt + PKCS#7 unpad.
     let pt = Dec::new_from_slices(key, iv)
         .map_err(|_| WireError::Invalid("aes key/iv length"))?
         .decrypt_padded_vec::<Pkcs7>(body)
         .map_err(|_| WireError::Invalid("aes/pad"))?;
 
-    // 4. Bencode parse — must be a Dict.
+    // 5. Bencode parse — must be a Dict.
     let raw = Bencode::parse(&pt)?;
     if !matches!(raw, Bencode::Dict(_)) {
         return Err(WireError::Invalid("descriptor not a dict"));
     }
 
-    // 5. Extract fields.
+    // 6. Extract fields.
     let name = raw
         .get(b"name")
         .and_then(|v| v.as_bytes())
@@ -184,7 +192,7 @@ pub fn decode_transport_with_key(
         _ => Vec::new(),
     };
 
-    // 6. VOD pieces: concatenated 20-byte SHA-1 hashes; absent on live streams.
+    // 7. VOD pieces: concatenated 20-byte SHA-1 hashes; absent on live streams.
     let pieces: Vec<[u8; 20]> = match raw.get(b"pieces") {
         Some(Bencode::Bytes(p)) if p.len().is_multiple_of(20) && !p.is_empty() => p
             .chunks_exact(20)
@@ -409,6 +417,29 @@ mod tests {
         // magic but empty body
         let magic_only = b"AceStreamTransport\x00\x02";
         assert!(decode_transport_with_key(magic_only, &TRANSPORT_KEY, &TRANSPORT_IV).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_magic_prefix_without_panic() {
+        // is_transport_file is true for the 18-byte magic, but the decoder
+        // must not slice bytes[20..] on a shorter buffer.
+        let magic = include_bytes!("../../../tests/vectors/transport/truncated-magic.bin");
+        let version = include_bytes!("../../../tests/vectors/transport/truncated-version.bin");
+        assert_eq!(decode_transport(magic).unwrap_err(), WireError::Truncated);
+        assert_eq!(decode_transport(version).unwrap_err(), WireError::Truncated);
+    }
+
+    #[test]
+    fn rejects_unsupported_transport_version_with_valid_body() {
+        let mut transport = make_transport(b"d12:chunk_lengthi16384e12:piece_lengthi131072ee");
+        for version in [[0, 0], [0, 1], [0, 3], [1, 2]] {
+            transport[18..20].copy_from_slice(&version);
+            assert_eq!(
+                decode_transport(&transport).unwrap_err(),
+                WireError::Invalid("unsupported transport version"),
+                "version {version:?} must be rejected even with a valid encrypted body"
+            );
+        }
     }
 
     // Diagnostic tool: decode a real captured .acelive transport file and dump its fields
