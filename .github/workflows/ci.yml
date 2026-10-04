@@ -22,7 +22,8 @@ env:
 
 jobs:
   # The job names are the check contexts that the main ruleset requires.
-  # Renaming a job silently drops it from the gate, so rename the ruleset entry too.
+  # Renaming a job leaves the ruleset waiting on the old name and blocks every PR,
+  # so update the ruleset in the same change.
   lint:
     name: Rust lint
     runs-on: ubuntu-24.04
@@ -64,6 +65,10 @@ jobs:
         with:
           build-warnings: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The RTMP loopback test self-skips without ffmpeg; the hosted image has none.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
       # Live-network tests are #[ignore]d, so the default run stays offline.
       - name: Test
