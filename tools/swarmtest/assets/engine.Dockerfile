@@ -13,7 +13,7 @@
 # Default CMD runs the engine as a CONSUMER (client-console HTTP API on :6878). The
 # harness overrides `command:` for the source node with `--stream-source-node ...`.
 
-FROM python:3.10-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 # Break-system-packages so pip installs the engine's wheels into the base env; unbuffered
 # so `--log-stderr` shows up promptly in `docker compose logs`.
