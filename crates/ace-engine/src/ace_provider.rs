@@ -597,10 +597,6 @@ impl AceProvider {
     }
 }
 
-/// Resolve the live history depth needed to fill the startup reservoir. Known bitrates use
-/// media payload bytes per piece plus a two-piece scheduling margin. Without a bitrate hint,
-/// enabled startup buffering uses a conservative historical window; disabled buffering keeps
-/// the legacy depth.
 /// Whether `id` is a bare 40-hex string: a swarm infohash, or a content id missing its `cid:`
 /// prefix (#165). The two are indistinguishable by shape.
 fn is_bare_hex40(id: &str) -> bool {
@@ -617,6 +613,10 @@ fn unresolved_infohash_message(id: &str) -> String {
     )
 }
 
+/// Resolve the live history depth needed to fill the startup reservoir. Known bitrates use
+/// media payload bytes per piece plus a two-piece scheduling margin. Without a bitrate hint,
+/// enabled startup buffering uses a conservative historical window; disabled buffering keeps
+/// the legacy depth.
 fn derived_prefetch_pieces(
     target_ms: u64,
     bitrate: Option<u64>,
