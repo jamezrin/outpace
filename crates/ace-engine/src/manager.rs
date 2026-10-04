@@ -5,7 +5,7 @@ use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
 use crate::provider::{ProviderError, ProviderRegistry, TsSource, VodContent};
 use crate::session::{StreamSession, Subscription};
-use ace_swarm::types::StreamMetadata;
+use ace_swarm::types::{StreamInfo, StreamMetadata};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
@@ -161,6 +161,25 @@ impl StreamManager {
 
     pub(crate) fn hls_startup_timeout(&self) -> Duration {
         Duration::from_millis(self.hls.startup_timeout_ms)
+    }
+
+    /// Offline pre-check that `id` can be opened on `network`; see
+    /// [`StreamProvider::check_openable`](crate::provider::StreamProvider::check_openable).
+    /// `NotFound` if the network is unregistered.
+    pub fn check_openable(&self, network: &str, id: &str) -> Result<(), ProviderError> {
+        self.registry
+            .get(network)
+            .ok_or(ProviderError::NotFound)?
+            .check_openable(id)
+    }
+
+    /// Hand a live descriptor resolved outside `open` to `network`'s provider; see
+    /// [`StreamProvider::remember_live_descriptor`](crate::provider::StreamProvider::remember_live_descriptor).
+    /// A no-op for an unregistered network.
+    pub fn remember_live_descriptor(&self, network: &str, info: &StreamInfo) {
+        if let Some(provider) = self.registry.get(network) {
+            provider.remember_live_descriptor(info);
+        }
     }
 
     /// Resolve `id` to a single-file VOD, caching the resolved handle per `(network, id)` so a
@@ -661,6 +680,23 @@ mod tests {
             m.get_or_start("nope", "x").await,
             Err(ProviderError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn check_openable_is_not_found_for_an_unregistered_network() {
+        let manager = StreamManager::new(ProviderRegistry::new());
+        assert!(matches!(
+            manager.check_openable("nope", "x"),
+            Err(ProviderError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_openable_delegates_to_the_provider_default() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(TestProvider { chunks: 1 }));
+        let manager = StreamManager::new(registry);
+        assert!(manager.check_openable("test", "anything").is_ok());
     }
 
     #[tokio::test]

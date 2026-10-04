@@ -2,7 +2,7 @@
 //! protocol. The `{network}` segment in the URL selects a `StreamProvider` via
 //! `ProviderRegistry`. The generic engine never names a network.
 
-use ace_swarm::types::StreamMetadata;
+use ace_swarm::types::{StreamInfo, StreamMetadata};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -86,12 +86,38 @@ pub trait StreamProvider: Send + Sync {
             "this network does not support VOD".into(),
         ))
     }
+
+    /// Offline check that [`open`](Self::open) would get past id resolution, for routes that
+    /// hand out playback URLs before opening (compat `/ace/getstream?format=json`). Must not
+    /// touch the network or start anything. Defaults to accepting every id.
+    fn check_openable(&self, _id: &str) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    /// Record a live descriptor that was resolved outside [`open`](Self::open) (the compat
+    /// routes resolve content ids for their JSON responses), so a later open by its infohash can
+    /// use it (#164). Defaults to ignoring it.
+    fn remember_live_descriptor(&self, _info: &StreamInfo) {}
 }
 
 #[derive(Debug)]
 pub enum ProviderError {
     NotFound,
     Backend(String),
+    /// The id is well-formed, but the provider holds no verified metadata to open it with and
+    /// will not guess (#164: a bare infohash without a verified transport descriptor). The
+    /// message is user-facing: it explains the refusal and how to open the stream instead, and
+    /// is safe to return to HTTP clients and to print in the CLI.
+    Unresolvable(String),
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderError::NotFound => f.write_str("not found"),
+            ProviderError::Backend(msg) | ProviderError::Unresolvable(msg) => f.write_str(msg),
+        }
+    }
 }
 
 /// Maps network name → provider.
@@ -139,6 +165,24 @@ mod tests {
         assert!(r.get("dummy").is_some());
         assert!(r.get("nope").is_none());
         assert_eq!(r.networks(), vec!["dummy"]);
+    }
+
+    #[test]
+    fn provider_error_display_is_the_user_facing_message() {
+        assert_eq!(
+            ProviderError::Unresolvable("use cid:<id>".into()).to_string(),
+            "use cid:<id>"
+        );
+        assert_eq!(
+            ProviderError::Backend("no peers".into()).to_string(),
+            "no peers"
+        );
+        assert_eq!(ProviderError::NotFound.to_string(), "not found");
+    }
+
+    #[test]
+    fn default_check_openable_accepts_any_id() {
+        assert!(DummyProvider.check_openable("anything").is_ok());
     }
 
     #[test]
