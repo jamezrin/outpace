@@ -22,8 +22,8 @@ use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::reachability::ReachabilityMonitor;
 use ace_swarm::resolve::{
     catalog_transport_bytes, hex20, infohash_hex, resolve_via_catalog, resolve_via_peer,
-    stream_info_from_transport_url, transport_bytes_from_url, transport_bytes_via_peer,
-    vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
+    stream_info_from_transport, stream_info_from_transport_url, transport_bytes_from_url,
+    transport_bytes_via_peer, vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
 };
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
@@ -498,6 +498,19 @@ impl AceProvider {
         let infohash = hex20(id).map_err(|_| ProviderError::Backend("bad infohash".into()))?;
         if let Some(info) = self.infohash_index.get(&infohash) {
             return Ok(info);
+        }
+        // A broadcast this daemon originates: the shared seed registry holds its transport,
+        // which outpace minted itself. Decoding recomputes the infohash from those bytes.
+        if let Some(transport) = self
+            .seed_registry
+            .broadcast_transport_for_infohash(&infohash)
+        {
+            if let Ok(info) = stream_info_from_transport(&transport) {
+                if info.infohash == infohash {
+                    self.infohash_index.put(info.clone());
+                    return Ok(info);
+                }
+            }
         }
         Err(ProviderError::Unresolvable(unresolved_infohash_message(id)))
     }
@@ -3749,6 +3762,35 @@ mod tests {
             p.check_openable(PLACEHOLDER_ID),
             Err(ProviderError::Unresolvable(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn own_broadcast_opens_by_infohash_with_its_minted_geometry() {
+        let seed = SeedRegistry::new();
+        let broadcasts = crate::broadcast::BroadcastRegistry::new();
+        let (bc, _) = broadcasts
+            .start_or_resume(
+                "t164",
+                "T164",
+                &["udp://tracker.invalid:80".into()],
+                &seed,
+                1 << 20,
+            )
+            .await;
+        let id = infohash_hex(&bc.infohash);
+
+        // A provider that does not share the broadcast's registry still refuses it.
+        assert!(matches!(
+            test_provider().check_openable(&id),
+            Err(ProviderError::Unresolvable(_))
+        ));
+
+        let p = test_provider().with_seed_registry(seed);
+        assert!(p.check_openable(&id).is_ok());
+        let info = p.resolve_live_info(&id).await.unwrap();
+        assert_eq!(info.infohash, bc.infohash);
+        assert_eq!(info.piece_length, crate::broadcast::PIECE_LENGTH);
+        assert_eq!(info.source_pubkey, bc.auth.pubkey_der());
     }
 
     #[test]
