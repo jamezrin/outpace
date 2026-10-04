@@ -24,7 +24,6 @@ use ace_tracker::codec::{
     build_announce_response, build_connect_response, parse_announce_request, parse_connect_request,
     AnnounceEvent,
 };
-use rand::Rng;
 use serde::Serialize;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
@@ -170,7 +169,7 @@ fn handle_datagram(
     // We issue a connection id (clients expect one) but never validate it on
     // announce — permissive by design for a test tracker.
     if let Ok(req) = parse_connect_request(datagram) {
-        let connection_id = rand::thread_rng().gen::<u64>();
+        let connection_id = rand::random::<u64>();
         return Some(build_connect_response(req.txid, connection_id).to_vec());
     }
 

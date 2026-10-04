@@ -440,6 +440,58 @@ fn read_exact_at(file: &File, data: &mut [u8], offset: u64) -> std::io::Result<(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cancelled_disk_put_still_commits_index_and_budget_atomically() {
+        use crate::store::{Backend, PieceStore};
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(
+            PieceStore::new_disk(4, 4, 4, dir.path().join("cache")).unwrap(),
+        ));
+        PieceStore::shared_put_chunk_with_header(&store, 1, 0, [1; 8], b"1111").await;
+        let actor_state = {
+            let guard = store.lock().await;
+            let Backend::Disk(disk) = &guard.backend else {
+                panic!("expected disk backend");
+            };
+            Arc::clone(&disk.state)
+        };
+
+        // Hold the actor's commit lock while polling the caller once. This proves
+        // the command is queued and its reply is pending before cancellation.
+        {
+            let pause_commit = actor_state.lock().unwrap();
+            let mut write = Box::pin(PieceStore::shared_put_chunk_with_header(
+                &store, 2, 0, [2; 8], b"2222",
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(write.as_mut().poll(&mut context).is_pending());
+            drop(write);
+            drop(pause_commit);
+        }
+
+        // The read is queued behind the cancelled write, so its reply is a
+        // completion barrier rather than a guess about thread scheduling.
+        let chunk = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            PieceStore::shared_chunk(&store, 2, 0),
+        )
+        .await
+        .expect("disk actor completes queued commands");
+        assert_eq!(chunk, Some((b"2222".to_vec(), [2; 8])));
+        let guard = store.lock().await;
+        assert!(
+            guard.has_piece(2),
+            "actor commits after caller cancellation"
+        );
+        assert!(
+            !guard.has_piece(1),
+            "the same transaction enforces the budget"
+        );
+    }
+
     #[test]
     fn actor_fd_lru_is_bounded_and_eviction_closes_handles() {
         let temp = tempfile::tempdir().unwrap();

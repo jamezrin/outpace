@@ -106,7 +106,7 @@ pub fn parse_response(buf: &[u8]) -> Option<GetPeersResponse> {
         }
     }
     if let Some(nb) = r.get(b"nodes").and_then(Bencode::as_bytes) {
-        for c in nb.chunks_exact(26) {
+        for c in nb.as_chunks::<26>().0 {
             let mut id = [0u8; 20];
             id.copy_from_slice(&c[0..20]);
             if let Some(addr) = compact_peer(&c[20..26]) {

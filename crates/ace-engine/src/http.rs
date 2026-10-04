@@ -34,15 +34,17 @@ fn stream_metadata_json(metadata: &StreamMetadata) -> serde_json::Value {
     })
 }
 
-async fn await_hls_ready(pkg: &HlsPackager, timeout: Duration) -> Result<(), Response> {
+async fn await_hls_ready(pkg: &HlsPackager, timeout: Duration) -> Result<(), Box<Response>> {
     if pkg.wait_ready(timeout).await {
         Ok(())
     } else {
-        Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, "1")],
-        )
-            .into_response())
+        Err(Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+            )
+                .into_response(),
+        ))
     }
 }
 
@@ -113,9 +115,11 @@ impl AceSessionStore {
     }
 
     fn mint(&self, playback_id: String, session_key: String) -> String {
-        use rand::RngCore;
+        use rand::TryRng;
         let mut bytes = [0_u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("OS randomness for playback token");
         let token = hex::encode(bytes);
         self.insert_at(token.clone(), playback_id, session_key, Instant::now());
         token
@@ -127,9 +131,11 @@ impl AceSessionStore {
         session_key: String,
         pin: Subscription,
     ) -> String {
-        use rand::RngCore;
+        use rand::TryRng;
         let mut bytes = [0_u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("OS randomness for playback token");
         let token = hex::encode(bytes);
         self.insert_hls_at(token.clone(), playback_id, session_key, Instant::now(), pin);
         self.ensure_hls_reaper();
@@ -452,16 +458,16 @@ pub fn router(state: AppState) -> Router {
         .route("/networks", get(networks))
         .route("/streams", get(list_streams))
         .route(
-            "/streams/:network/:file",
+            "/streams/{network}/{file}",
             get(stream_file).delete(delete_stream),
         )
-        .route("/streams/:network/:id/status", get(stream_status))
-        .route("/streams/:network/:id/seg/:seg", get(stream_segment))
-        .route("/vod/:network/:id", get(vod_stream))
-        .route("/vod/:network/:id/manifest.m3u8", get(vod_manifest))
-        .route("/vod/:network/:id/seg/:seg", get(vod_hls_segment))
+        .route("/streams/{network}/{id}/status", get(stream_status))
+        .route("/streams/{network}/{id}/seg/{seg}", get(stream_segment))
+        .route("/vod/{network}/{id}", get(vod_stream))
+        .route("/vod/{network}/{id}/manifest.m3u8", get(vod_manifest))
+        .route("/vod/{network}/{id}/seg/{seg}", get(vod_hls_segment))
         .route(
-            "/broadcast/:name",
+            "/broadcast/{name}",
             put(broadcast_ingest)
                 .get(broadcast_transport)
                 .delete(broadcast_delete),
@@ -469,12 +475,12 @@ pub fn router(state: AppState) -> Router {
     if compat {
         router = router
             .route("/ace/getstream", get(ace_getstream))
-            .route("/ace/r/:id/:token", get(ace_playback))
+            .route("/ace/r/{id}/{token}", get(ace_playback))
             .route("/ace/manifest.m3u8", get(ace_manifest))
-            .route("/ace/m/:id/:manifest", get(ace_hls_playback))
-            .route("/ace/c/:session/:segment", get(ace_hls_segment))
-            .route("/ace/stat/:id/:token", get(ace_stat))
-            .route("/ace/cmd/:id/:token", get(ace_command))
+            .route("/ace/m/{id}/{manifest}", get(ace_hls_playback))
+            .route("/ace/c/{session}/{segment}", get(ace_hls_segment))
+            .route("/ace/stat/{id}/{token}", get(ace_stat))
+            .route("/ace/cmd/{id}/{token}", get(ace_command))
             .route("/server/api", get(server_api));
     }
     router.with_state(state)
@@ -490,7 +496,7 @@ async fn vod_stream(
 ) -> Response {
     let vod = match resolve_vod(&s, &network, &id).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let total = vod.content_length();
     if total == 0 {
@@ -637,13 +643,15 @@ async fn resolve_vod(
     s: &AppState,
     network: &str,
     id: &str,
-) -> Result<Arc<dyn VodContent>, Response> {
+) -> Result<Arc<dyn VodContent>, Box<Response>> {
     match s.manager.resolve_vod(network, id).await {
         Ok(v) => Ok(v),
-        Err(ProviderError::NotFound) => {
-            Err((StatusCode::NOT_FOUND, "unknown network").into_response())
-        }
-        Err(e) => Err((StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response()),
+        Err(ProviderError::NotFound) => Err(Box::new(
+            (StatusCode::NOT_FOUND, "unknown network").into_response(),
+        )),
+        Err(e) => Err(Box::new(
+            (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+        )),
     }
 }
 
@@ -657,7 +665,7 @@ async fn vod_manifest(
 ) -> Response {
     let vod = match resolve_vod(&s, &network, &id).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let layout = crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config());
     (
@@ -679,7 +687,7 @@ async fn vod_hls_segment(
     };
     let vod = match resolve_vod(&s, &network, &id).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let layout = crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config());
     let Some((start, end)) = layout.segment_range(index) else {
@@ -1439,7 +1447,7 @@ async fn stream_file_with_hls_timeout(
         return match s.manager.get_or_start_hls(&network, id).await {
             Ok(pkg) => {
                 if let Err(response) = await_hls_ready(&pkg, timeout).await {
-                    return response;
+                    return *response;
                 }
                 // Deliberately no `icy-*` header here: on an HLS manifest it makes VLC's HTTP
                 // access promote the URL to the `icyx://` (Icecast) scheme and treat the body as
@@ -2454,7 +2462,10 @@ mod tests {
         // The first video packet the client sees must be the real keyframe at byte 9400,
         // not the mid-GOP packet we joined on.
         let first_video = body
-            .chunks_exact(188)
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .find(|p| (((p[1] & 0x1F) as u16) << 8 | p[2] as u16) == VIDEO_PID)
             .expect("a video packet was served");
         assert_eq!(first_video, &FIXTURE[KEYFRAME2..KEYFRAME2 + 188]);
@@ -2483,7 +2494,10 @@ mod tests {
 
         let resumed = gate.push(FIXTURE);
         let first_video = resumed
-            .chunks_exact(188)
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .find(|packet| ace_media::mpegts::ts_pid(packet) == 0x0100)
             .expect("resumed direct stream has a video keyframe");
         let first_video: &[u8; 188] = first_video.try_into().unwrap();

@@ -194,14 +194,9 @@ pub fn decode_transport_with_key(
 
     // 7. VOD pieces: concatenated 20-byte SHA-1 hashes; absent on live streams.
     let pieces: Vec<[u8; 20]> = match raw.get(b"pieces") {
-        Some(Bencode::Bytes(p)) if p.len().is_multiple_of(20) && !p.is_empty() => p
-            .chunks_exact(20)
-            .map(|c| {
-                let mut arr = [0u8; 20];
-                arr.copy_from_slice(c);
-                arr
-            })
-            .collect(),
+        Some(Bencode::Bytes(p)) if p.len().is_multiple_of(20) && !p.is_empty() => {
+            p.as_chunks::<20>().0.to_vec()
+        }
         _ => Vec::new(),
     };
     let is_live = pieces.is_empty();

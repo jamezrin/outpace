@@ -191,7 +191,7 @@ pub async fn acquire_engine(engine_dir: Option<&Path>, engine_url: &str) -> Resu
 /// Download `url` fully into memory. Bounded by a connect + overall timeout so a stalled or
 /// half-open connection can't hang engine acquisition indefinitely.
 async fn download_bytes(url: &str) -> Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(600))
         .build()

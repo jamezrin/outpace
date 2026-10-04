@@ -178,7 +178,7 @@ async fn measure(
     let mut notes = Vec::new();
     compose_up(compose_path).await?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::http_client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .context("building http client")?;

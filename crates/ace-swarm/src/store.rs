@@ -823,37 +823,4 @@ mod tests {
             "partial piece (1 of 2 chunks) not complete"
         );
     }
-
-    #[tokio::test]
-    async fn cancelled_disk_put_still_commits_index_and_budget_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Mutex::new(
-            PieceStore::new_disk(4, 4, 4, dir.path().join("cache")).unwrap(),
-        ));
-        PieceStore::shared_put_chunk_with_header(&store, 1, 0, [1; 8], b"1111").await;
-        let task = tokio::spawn({
-            let store = Arc::clone(&store);
-            async move {
-                PieceStore::shared_put_chunk_with_header(&store, 2, 0, [2; 8], b"2222").await;
-            }
-        });
-        tokio::task::yield_now().await; // command has been submitted; cancellation drops its reply
-        task.abort();
-        for _ in 0..100 {
-            if store.lock().await.has_piece(2) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        let guard = store.lock().await;
-        assert!(
-            guard.has_piece(2),
-            "actor commits after the caller is cancelled"
-        );
-        assert!(
-            !guard.has_piece(1),
-            "the same actor transaction enforces the budget"
-        );
-        assert_eq!(guard.chunk(2, 0).unwrap().as_ref(), b"2222");
-    }
 }

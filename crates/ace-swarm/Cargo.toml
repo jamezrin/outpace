@@ -12,10 +12,14 @@ ace-peer = { path = "../ace-peer" }
 ace-tracker = { path = "../ace-tracker" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 bytes = "1"
-rand = "0.8"
-sha1 = "0.10"
+rand = "0.10"
+sha1 = "0.11"
 base64ct = { version = "1.8", features = ["alloc"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# Preserve the ring TLS provider so musl builds do not need AWS-LC's CMake toolchain.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Retain bundled trust roots for portable binaries without a system CA store.
+webpki-root-certs = "1"
 hex = "0.4"
 igd-next = { version = "0.17", features = ["aio_tokio"] }
 crab_nat = "0.8"
