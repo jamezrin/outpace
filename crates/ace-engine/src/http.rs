@@ -1176,11 +1176,16 @@ async fn resolve_server_api_selector(
                 return Err("content-id catalog resolution is disabled".to_string());
             }
             match resolve_via_catalog(&cid).await {
-                Ok(info) => Ok(ResolvedContent {
-                    infohash: infohash_hex(&info.infohash),
-                    content_id: Some(cid),
-                    is_live: true,
-                }),
+                Ok(info) => {
+                    if let Some(network) = ace_network(s) {
+                        s.manager.remember_live_descriptor(&network, &info);
+                    }
+                    Ok(ResolvedContent {
+                        infohash: infohash_hex(&info.infohash),
+                        content_id: Some(cid),
+                        is_live: true,
+                    })
+                }
                 Err(e) => Err(format!("content-id resolution failed: {e:?}")),
             }
         }
@@ -1239,6 +1244,10 @@ async fn resolve_ace_selection(
         if let Some(content_id) = selection.content_id.as_deref() {
             match resolve_via_catalog(content_id).await {
                 Ok(info) => {
+                    // A client may open this infohash directly later (#164).
+                    if let Some(network) = network.as_deref() {
+                        s.manager.remember_live_descriptor(network, &info);
+                    }
                     selection =
                         selection.with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
                 }
