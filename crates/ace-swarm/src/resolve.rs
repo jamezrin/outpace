@@ -18,7 +18,7 @@ use ace_wire::infohash::{infohash_of_descriptor, transport_file_hash};
 use ace_wire::message::PeerMessage;
 use ace_wire::transport::decode_transport;
 use base64ct::{Base64, Encoding};
-use rand::Rng;
+use rand::RngExt;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -309,8 +309,8 @@ async fn fetch_catalog_transport(
     content_id: &str,
 ) -> Result<Vec<u8>, ResolveError> {
     let request_random = {
-        let mut rng = rand::thread_rng();
-        rng.gen_range(1..=i64::MAX as u64)
+        let mut rng = rand::rng();
+        rng.random_range(1..=i64::MAX as u64)
     };
     let signature = catalog_signature(content_id, request_random);
     let path = format!(
@@ -662,7 +662,13 @@ async fn fetch_transport_bytes_from(
     host: &str,
     addr: SocketAddr,
 ) -> Result<Vec<u8>, ResolveError> {
+    // Reqwest 0.13 needs an installed provider with rustls-no-provider. Respect a
+    // provider already selected by the embedding application.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
+        .tls_certs_only(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().map(|cert| {
+            reqwest::Certificate::from_der(cert.as_ref()).expect("bundled TLS root certificate")
+        }))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(TRANSPORT_URL_CONNECT_TIMEOUT)
         .timeout(TRANSPORT_URL_TOTAL_TIMEOUT)

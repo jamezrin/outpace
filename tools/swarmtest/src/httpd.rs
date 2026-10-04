@@ -142,7 +142,7 @@ mod tests {
         httpd.register("/stream.acelive", b"hello-descriptor".to_vec());
         let base = httpd.base_url();
 
-        let client = reqwest::Client::new();
+        let client = crate::http_client_builder().build().unwrap();
         let ok = client
             .get(format!("{base}/stream.acelive"))
             .send()

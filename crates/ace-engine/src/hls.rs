@@ -838,7 +838,10 @@ mod tests {
 
         let first = p.segment(0).expect("first clean segment");
         assert!(first
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .any(|packet| packet == non_video_access));
         let second = p.segment(1).expect("second clean segment");
         assert_eq!(&second[..TS_PACKET], &pat);
@@ -869,7 +872,10 @@ mod tests {
         assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], &fresh_pmt);
         assert_eq!(&segment[TS_PACKET * 2..TS_PACKET * 3], &fresh_access);
         assert!(!segment
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .any(|packet| packet == stale_access));
     }
 
@@ -932,7 +938,10 @@ mod tests {
         assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], &second_pmt);
         assert_eq!(&segment[TS_PACKET * 2..TS_PACKET * 3], &post_marker_access);
         assert!(!segment
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .any(|packet| packet == genuine_marker));
         assert_eq!(
             p.playlist("test", "unmarked-resume")

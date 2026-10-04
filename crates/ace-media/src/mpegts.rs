@@ -160,7 +160,10 @@ pub fn is_aligned(buf: &[u8]) -> bool {
     if buf.is_empty() || !buf.len().is_multiple_of(TS_PACKET_LEN) {
         return false;
     }
-    buf.chunks_exact(TS_PACKET_LEN).all(|p| p[0] == TS_SYNC)
+    buf.as_chunks::<TS_PACKET_LEN>()
+        .0
+        .iter()
+        .all(|p| p[0] == TS_SYNC)
 }
 
 /// Number of complete TS packets in `buf` (truncating any trailing partial packet).
@@ -723,7 +726,7 @@ fn sanitize_service_name(raw: &str) -> Option<String> {
 
 /// Read the first SDT `service_name` from a run of 188-aligned TS packets, if present.
 pub fn read_sdt_service_name(ts: &[u8]) -> Option<String> {
-    for pkt in ts.chunks_exact(TS_PACKET_LEN) {
+    for pkt in ts.as_chunks::<TS_PACKET_LEN>().0.iter() {
         if pkt[0] != TS_SYNC || ts_pid(pkt) != SDT_PID {
             continue;
         }
@@ -995,7 +998,12 @@ mod tests {
 
         let out = g.push(&input);
         assert!(is_aligned(&out), "output must stay packet-aligned");
-        let pkts: Vec<&[u8]> = out.chunks_exact(TS_PACKET_LEN).collect();
+        let pkts: Vec<&[u8]> = out
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .collect();
         // PAT, PMT, keyframe, audio — the mid-GOP video packet is gone.
         assert_eq!(pkts.len(), 4, "mid-GOP packet should be dropped");
         assert_eq!(pid_of(pkts[0]), 0, "first emitted packet is PAT");
@@ -1040,7 +1048,14 @@ mod tests {
         let out = g.push(&ts(VIDEO_PID, true, false, &pes));
         assert_eq!(packet_count(&out), 3, "IDR NAL should lock the gate");
         assert_eq!(
-            pid_of(out.chunks_exact(TS_PACKET_LEN).nth(2).unwrap()),
+            pid_of(
+                out.as_chunks::<TS_PACKET_LEN>()
+                    .0
+                    .iter()
+                    .map(|packet| packet.as_slice())
+                    .nth(2)
+                    .unwrap()
+            ),
             VIDEO_PID
         );
     }
@@ -1121,7 +1136,10 @@ mod tests {
             .concat(),
         );
         let first_video = out
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .find(|packet| pid_of(packet) == VIDEO_PID)
             .expect("resumed video packet");
 
@@ -1144,7 +1162,10 @@ mod tests {
             .concat(),
         );
         let video: Vec<_> = out
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .filter(|packet| pid_of(packet) == VIDEO_PID)
             .collect();
 
@@ -1165,7 +1186,12 @@ mod tests {
         let resumed = ts(VIDEO_PID, false, false, &[0xAA; 16]);
 
         let out = gate.push(&resumed);
-        let packets: Vec<_> = out.chunks_exact(TS_PACKET_LEN).collect();
+        let packets: Vec<_> = out
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .collect();
 
         assert_eq!(packets.len(), 2, "fallback needs a separate marker packet");
         assert!(ts_timing(packets[0].try_into().unwrap()).discontinuity);
@@ -1179,7 +1205,12 @@ mod tests {
         let audio = ts(AUDIO_PID, false, false, &[0xCC; 16]);
 
         let out = gate.push(&[pat(PMT_PID), pmt(PMT_PID, VIDEO_PID), audio.clone()].concat());
-        let packets: Vec<_> = out.chunks_exact(TS_PACKET_LEN).collect();
+        let packets: Vec<_> = out
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .collect();
 
         assert_eq!(packets.len(), 2);
         assert_eq!(pid_of(packets[0]), VIDEO_PID);
@@ -1202,7 +1233,10 @@ mod tests {
             .concat(),
         );
         let first_video = out
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .find(|packet| pid_of(packet) == VIDEO_PID)
             .expect("resumed video packet");
 
@@ -1219,7 +1253,12 @@ mod tests {
         let out = g.push(&ts(VIDEO_PID, true, true, &[0xBB; 16]));
         // Exactly one PAT + one PMT precede the keyframe, not the whole history.
         assert_eq!(packet_count(&out), 3);
-        let pkts: Vec<&[u8]> = out.chunks_exact(TS_PACKET_LEN).collect();
+        let pkts: Vec<&[u8]> = out
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .collect();
         assert_eq!(pid_of(pkts[0]), 0);
         assert_eq!(pid_of(pkts[1]), PMT_PID);
         assert_eq!(pid_of(pkts[2]), VIDEO_PID);
@@ -1239,7 +1278,12 @@ mod tests {
             out.extend(g.push(fragment));
         }
         assert!(is_aligned(&out));
-        let pkts: Vec<&[u8]> = out.chunks_exact(TS_PACKET_LEN).collect();
+        let pkts: Vec<&[u8]> = out
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .collect();
         assert_eq!(pkts.len(), 3); // PAT, PMT, keyframe (mid-GOP dropped)
         assert_eq!(pid_of(pkts[2]), VIDEO_PID);
     }
@@ -1263,7 +1307,12 @@ mod tests {
         let out = g.push(&data[JOIN..]);
         assert!(is_aligned(&out) && !out.is_empty());
 
-        let pkts: Vec<&[u8]> = out.chunks_exact(TS_PACKET_LEN).collect();
+        let pkts: Vec<&[u8]> = out
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .collect();
         assert_eq!(pid_of(pkts[0]), 0, "tables prepended: PAT first");
         assert_eq!(pid_of(pkts[1]), FIX_PMT_PID, "then PMT");
         let first_video = pkts
@@ -1293,7 +1342,10 @@ mod tests {
         assert_eq!(read_sdt_service_name(&out).as_deref(), Some("Titled"));
         // No upstream "Upstream" SDT survives anywhere in the output.
         assert!(!out
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .any(|p| read_sdt_service_name(p).as_deref() == Some("Upstream")));
     }
 
@@ -1311,12 +1363,18 @@ mod tests {
 
         let out = gate.push(&input);
         let titled_sdt_count = out
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .filter(|packet| read_sdt_service_name(packet).as_deref() == Some("Titled"))
             .count();
         assert_eq!(titled_sdt_count, 2);
         assert_eq!(
-            out.chunks_exact(TS_PACKET_LEN)
+            out.as_chunks::<TS_PACKET_LEN>()
+                .0
+                .iter()
+                .map(|packet| packet.as_slice())
                 .filter(|packet| *packet == ordinary.as_slice())
                 .count(),
             1
@@ -1436,7 +1494,12 @@ mod tests {
         let out = r.push(&s);
         assert!(is_aligned(&out), "output must be packet-aligned");
         // every emitted packet starts with sync; junk was discarded
-        assert!(out.chunks_exact(TS_PACKET_LEN).all(|p| p[0] == TS_SYNC));
+        assert!(out
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .all(|p| p[0] == TS_SYNC));
         // we keep most packets (6 in, minus ≤1 lookahead) — junk doesn't corrupt the run
         assert!(packet_count(&out) >= 4);
     }

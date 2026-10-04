@@ -28,6 +28,15 @@ pub mod scenario;
 pub mod tracker;
 pub mod transport;
 
+/// Build clients with the same portable TLS provider as outpace.
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
+    // A provider already installed by the caller takes precedence.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder().tls_certs_only(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().map(
+        |cert| reqwest::Certificate::from_der(cert.as_ref()).expect("bundled TLS root certificate"),
+    ))
+}
+
 /// Absolute path to a committed asset under `tools/swarmtest/assets/`.
 pub fn asset_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
