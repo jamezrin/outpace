@@ -1,0 +1,75 @@
+name: CI
+
+# Merge gate for main (#163): rustfmt, Clippy and the offline test suite.
+# No path filters, on purpose: when a path filter skips a workflow, its required
+# checks stay "Pending" forever and block the pull request.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request cancels its stale run. Runs on main are
+# never cancelled mid-flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The job names are the check contexts that the main ruleset requires.
+  # Renaming a job leaves the ruleset waiting on the old name and blocks every PR,
+  # so update the ruleset in the same change.
+  lint:
+    name: Rust lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml, with clippy and rustfmt.
+      # The bundled Swatinem/rust-cache restores on every run but saves only from
+      # main, so pull requests reuse main's cache without filling the cache quota.
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Rust test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Same toolchain and cache policy as the lint job.
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The RTMP loopback test self-skips without ffmpeg; the hosted image has none.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      # Live-network tests are #[ignore]d, so the default run stays offline.
+      - name: Test
+        run: cargo test --workspace --locked
