@@ -20,7 +20,7 @@ Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 
 | Route | Status | Notes |
 | --- | --- | --- |
-| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t` and emits `Icy-Name` when the descriptor has a title; `format=json` returns playback/stat/command URLs and nested descriptor metadata with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
+| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t` and emits `Icy-Name` when the descriptor has a title; `format=json` returns playback/stat/command URLs and nested descriptor metadata with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector, and it (like `magnet`) is accepted only when the daemon already holds a verified descriptor for that infohash. Otherwise the route returns an error envelope suggesting `cid:<id>`, and mints no lease. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
 | `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a valid lease. Missing, invalid, expired, stopped, or wrong-content tokens return HTTP 404. |
 | `GET /ace/manifest.m3u8` | Supported (live) | Uses the same selectors and catalog resolution as `getstream`. The default and `format=redirect` return `302` to a stable `/ace/m/...` playlist; `format=json` returns documented playback/stat/command fields plus nested descriptor metadata. Each request owns one bounded HLS lease over the shared native packager. |
 | `GET /ace/m/<id>/<token>.m3u8` | Supported (live) | Token-authenticated media playlist over the native live HLS window. Missing, forged, expired, stopped, or evicted leases return `404`; responses are `no-store`. |
@@ -34,6 +34,11 @@ through to another selector. Compatibility hints such as `use_api_events` and ot
 parameters are safely ignored. Missing/malformed selectors and unsupported formats currently use
 HTTP 200 with `{ "response": null, "error": "..." }`; this is outpace's pinned compatibility
 behavior pending a broader official-engine error capture.
+
+An `infohash=` or `magnet=` selector is refused with an error envelope (HTTP 200,
+`response: null`) unless the daemon holds a verified transport descriptor for that infohash.
+That happens when it resolved the stream by content id earlier in this process,
+or originates the broadcast. outpace does not guess live geometry for a bare infohash.
 
 Compatibility HLS is currently limited to public, unencrypted live inputs. Playlist/transcode
 parameters are accepted as inert compatibility hints: the adapter always exposes the existing raw
@@ -54,7 +59,7 @@ Dispatched on `?method=`; the response envelope is `{ "result": <value>, "error"
 | `get_version` | Supported | `version`, `code` | `version` is the crate version; `code` packs `MAJOR*10000 + MINOR*100 + PATCH`. |
 | `get_status` | Supported | `status`, `active_sessions` | `status` is `dl` when any session is active, else `idle`. |
 | `get_network_connection_status` | Supported | `status`, `connected`, `networks` | `connected` reflects whether any provider network is registered. |
-| `analyze_content` | Supported | `infohash`, `content_id`, `is_live`, `is_encrypted`, `status` | Resolves the content selector to its infohash. `infohash`/`magnet` selectors resolve offline; `content_id`/`url` need the live catalog/transport and are gated by the same switch as `/ace/getstream` content-id resolution. |
+| `analyze_content` | Supported | `infohash`, `content_id`, `is_live`, `is_encrypted`, `status` | Resolves the content selector to its infohash. `infohash`/`magnet` selectors resolve offline; `content_id`/`url` need the live catalog/transport and are gated by the same switch as `/ace/getstream` content-id resolution. Resolving a `content_id` here also lets a later `infohash=` playback of the result succeed (a `url` does not); an offline `infohash`/`magnet` analysis does not make that infohash playable. |
 | `get_content_id` | Supported (echo only) | `content_id` | Echoes a caller-supplied `content_id`/`query`. It cannot derive a content id from a bare infohash/url and returns an error envelope in that case. |
 | `get_media_files` | Supported (best-effort) | `infohash`, `files[]` | outpace transports are single-file, so one media file is reported, keyed by infohash. `dump_transport_file` is not supported. |
 
@@ -77,4 +82,4 @@ These are **non-goals** for outpace (see the epic #46 non-goals) and are not pla
 
 - Legacy HLS VOD behavior (native `/vod` HLS exists).
 - `get_media_files&dump_transport_file=1` raw transport-file dumping.
-- Reverse `get_content_id` (deriving a content id from an infohash/transport).
+- Reverse `get_content_id` (deriving a content id from an infohash/transport). The official engine does this remotely, which is how it plays a cold infohash; adopting it would let outpace play cold infohash inputs.
