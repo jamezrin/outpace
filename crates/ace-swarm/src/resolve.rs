@@ -1,13 +1,11 @@
 //! Resolve a stream identifier to a downloadable [`StreamInfo`].
 //!
-//! Two identifier shapes:
-//!   * **infohash** — a 40-hex BitTorrent infohash; usable directly with default live
-//!     geometry (peers advertise their piece range in the handshake `mi`).
-//!   * **content-id** — locates an `AceStreamTransport` metadata file which, once fetched
-//!     over the network (BEP-9 ut_metadata) and decoded, yields the infohash + geometry +
-//!     trackers. The fetch is network-native (no Acestream API); see [`stream_info_from_transport`]
-//!     for the pure decode half. The ut_metadata exchange is the remaining live-gated step
-//!     (documented in the design spec).
+//! Every live [`StreamInfo`] comes from a decoded `AceStreamTransport` descriptor
+//! ([`stream_info_from_transport`]): the descriptor supplies the swarm infohash, geometry,
+//! trackers and source pubkey. The descriptor is located by content id (the signed catalog,
+//! then BEP-9 `ut_metadata` as a fallback) or fetched from a transport-file URL. A bare
+//! infohash carries no geometry, so it is never turned into a `StreamInfo` by guessing
+//! (issue #164); callers keep descriptors they have verified in an [`InfohashIndex`].
 
 use crate::types::{StreamInfo, StreamMetadata, VodInfo};
 use ace_peer::session::PeerSession;
@@ -27,8 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Default live geometry when only an infohash is known: 1 MiB pieces / 16 KiB chunks.
-pub const DEFAULT_PIECE_LENGTH: u64 = 1_048_576;
+/// The fixed Acestream chunk size (16 KiB) that the wire codec and every descriptor use.
 pub const DEFAULT_CHUNK_LENGTH: u64 = 16_384;
 
 /// Upper bound on a metadata-swarm peer's advertised `metadata_size` (bytes).
@@ -46,9 +43,9 @@ pub const MAX_METADATA_SIZE: usize = 1_048_576;
 /// The piece length is untrusted and sizes the [`PieceReassembler`](ace_wire::reassembly)
 /// per-piece buffer (`vec![0u8; piece_length]`, allocated on the first block of every
 /// in-flight piece) as well as the request fan-out. Real Acestream geometry is small: 64 KiB
-/// source-node pieces (`broadcast::PIECE_LENGTH`) and 1 MiB default live pieces
-/// ([`DEFAULT_PIECE_LENGTH`]). This ceiling leaves generous headroom for higher-bitrate
-/// sources while bounding the allocation a hostile transport can force at stream start.
+/// source-node pieces (`broadcast::PIECE_LENGTH`) and 512 KiB-1 MiB public live pieces. This
+/// ceiling leaves generous headroom for higher-bitrate sources while bounding the allocation a
+/// hostile transport can force at stream start.
 pub const MAX_PIECE_LENGTH: u64 = 8 * 1_048_576;
 const MAX_TITLE_BYTES: usize = 256;
 
@@ -181,27 +178,6 @@ fn validate_geometry(piece_length: u64, chunk_length: u64) -> Result<(), Resolve
         return Err(ResolveError::Transport("too many chunks per piece"));
     }
     Ok(())
-}
-
-/// Build a [`StreamInfo`] from a 40-char hex infohash with default live geometry. `trackers`
-/// are supplied separately (config defaults / DHT), since a bare infohash carries none.
-pub fn stream_info_from_infohash(
-    hex: &str,
-    trackers: Vec<String>,
-) -> Result<StreamInfo, ResolveError> {
-    let bytes = decode_hex20(hex).ok_or(ResolveError::BadInfohash)?;
-    Ok(StreamInfo {
-        infohash: bytes,
-        piece_length: DEFAULT_PIECE_LENGTH,
-        chunk_length: DEFAULT_CHUNK_LENGTH,
-        trackers,
-        metadata: StreamMetadata::default(),
-        // No transport => no pubkey to measure; assume the standard Acestream 768-bit
-        // source key (96-byte signature tail). See DEFAULT_SIG_LEN. Without the actual pubkey
-        // we can strip that tail but cannot *verify* it, so `source_pubkey` stays empty (#10).
-        sig_len: crate::types::DEFAULT_SIG_LEN,
-        source_pubkey: Vec::new(),
-    })
 }
 
 /// Decode a 40-hex content-id/infohash into 20 bytes (the metadata-swarm handshake key).
@@ -1131,26 +1107,9 @@ mod tests {
     }
 
     #[test]
-    fn infohash_form_uses_default_geometry() {
-        let hex = "0123456789abcdef0123456789abcdef01234567";
-        let si = stream_info_from_infohash(hex, vec!["udp://x:1".into()]).unwrap();
-        assert_eq!(si.piece_length, DEFAULT_PIECE_LENGTH);
-        assert_eq!(si.chunk_length, DEFAULT_CHUNK_LENGTH);
-        assert_eq!(si.infohash[0], 0x01);
-        assert_eq!(si.infohash[19], 0x67);
-        assert_eq!(si.metadata, crate::types::StreamMetadata::default());
-    }
-
-    #[test]
     fn bad_infohash_rejected() {
-        assert_eq!(
-            stream_info_from_infohash("xyz", vec![]),
-            Err(ResolveError::BadInfohash)
-        );
-        assert_eq!(
-            stream_info_from_infohash(&"z".repeat(40), vec![]),
-            Err(ResolveError::BadInfohash)
-        );
+        assert_eq!(hex20("xyz"), Err(ResolveError::BadInfohash));
+        assert_eq!(hex20(&"z".repeat(40)), Err(ResolveError::BadInfohash));
     }
 
     #[test]
