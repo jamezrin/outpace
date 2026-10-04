@@ -6,8 +6,9 @@ consumer nodes. It is an **on-demand, local-only** harness: it downloads and run
 proprietary engine and drives `docker compose`, so it is **NOT part of CI**.
 
 > **NOT in CI.** This harness needs the proprietary AceStream engine binary and a rootful
-> Docker daemon. Both are unavailable to CI runners, so `swarmtest` is never executed
-> there. Run it by hand on a Linux box when you want engine<->outpace interop evidence.
+> Docker daemon. Both are unavailable to CI runners, so the harness never runs there;
+> CI only runs its offline unit tests as part of `cargo test --workspace`. Run it by
+> hand on a Linux box when you want engine<->outpace interop evidence.
 
 ## What it proves
 

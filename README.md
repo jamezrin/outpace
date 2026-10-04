@@ -27,9 +27,14 @@ The live byte path is built and proven against real public swarms:
 Run the normal local gate with:
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
+
+CI runs these same three commands on every pull request and on every push to `main`
+(`.github/workflows/ci.yml`, reported as the `Rust lint` and `Rust test` checks). The
+ignored live-network tests never run in CI.
 
 ## Quick Start
 
