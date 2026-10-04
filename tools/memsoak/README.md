@@ -7,7 +7,7 @@ against the reference Acestream engine. Everything plays **real bytes** (ffmpeg 
 ## Scripts
 
 - `run.sh` — launch `outpace serve` with a fresh isolated data-dir, drive N real decoders against
-  `/streams/ace/<id>.ts` (or `.m3u8`), and sample process memory + `/debug/memstats` +
+  `/streams/ace/cid:<id>.ts` (or `.m3u8`), and sample process memory + `/debug/memstats` +
   `/streams/.../status` into CSVs. Modes: `idle`, `play`, `churn`.
 - `acestream_probe.sh` — run `jopsis/aceserve` (Acestream 3.2.11) in docker, play the same ids,
   sample the container's working-set memory. Same CSV schema for apples-to-apples comparison.
@@ -44,6 +44,10 @@ Results land in `tools/memsoak/results/<timestamp>-<label>-<mode>/` (`process.cs
   not a leak.
 
 ## Note on stream liveness
+
+`--ids` accepts content ids; the outpace harness adds the native API's `cid:` prefix so the
+daemon resolves their current infohash and piece geometry. Both harnesses decode video and
+audio, leaving subtitle and data tracks out of the null output.
 
 Public content ids go offline without warning. `streams.csv` records decoded `frames` and `peers`
 per id; if a stream shows `peers~0` and flat frames, confirm with `acestream_probe.sh` before

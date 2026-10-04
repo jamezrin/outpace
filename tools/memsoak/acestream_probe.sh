@@ -72,7 +72,7 @@ start_player() {  # start_player <id>
   [[ -z "$playback" ]] && { echo "no playback_url for $id: $resp" >&2; return 1; }
   STAT_URL[$id]="$stat"
   local prog="$OUTDIR/progress-$id.txt"; : >"$prog"; PROG[$id]="$prog"
-  ffmpeg -nostdin -hide_banner -loglevel error -i "$playback" -map 0 -f null - \
+  ffmpeg -nostdin -hide_banner -loglevel error -i "$playback" -map '0:v?' -map '0:a?' -f null - \
     -progress "$prog" -y >"$OUTDIR/ffmpeg-$id.log" 2>&1 &
   PLAYER_PIDS+=($!)
 }

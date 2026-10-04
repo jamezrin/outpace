@@ -127,11 +127,11 @@ IFS=',' read -ra ID_ARR <<<"$IDS"
 start_player() {  # start_player <id>
   local id="$1" ext="ts"
   [[ "$TRANSPORT" == "m3u8" ]] && ext="m3u8"
-  local url="$BASE_URL/streams/ace/$id.$ext"
+  local url="$BASE_URL/streams/ace/cid:$id.$ext"
   local prog="$OUTDIR/progress-$id.txt"
   : >"$prog"
   ffmpeg -nostdin -hide_banner -loglevel error \
-    -i "$url" -map 0 -f null - -progress "$prog" -y \
+    -i "$url" -map '0:v?' -map '0:a?' -f null - -progress "$prog" -y \
     >"$OUTDIR/ffmpeg-$id.log" 2>&1 &
   echo $!
 }
@@ -179,7 +179,7 @@ while :; do
   # per-stream status
   for id in "${ID_ARR[@]}"; do
     [[ -z "$id" ]] && continue
-    body=$(curl -fsS -w '\n%{http_code}' "$BASE_URL/streams/ace/$id/status" 2>/dev/null || printf '\n000')
+    body=$(curl -fsS -w '\n%{http_code}' "$BASE_URL/streams/ace/cid:$id/status" 2>/dev/null || printf '\n000')
     code=$(echo "$body" | tail -n1)
     json=$(echo "$body" | sed '$d')
     if [[ "$code" == "200" ]]; then
@@ -194,7 +194,7 @@ while :; do
   # churn mode: cycle the active stream
   if [[ "$MODE" == "churn" && $NOW -ge $CHURN_NEXT ]]; then
     for id in "${!PLAYER_PID[@]}"; do kill "${PLAYER_PID[$id]}" 2>/dev/null || true; done
-    curl -fsS -X DELETE "$BASE_URL/streams/ace/${ID_ARR[$CHURN_IDX]}" >/dev/null 2>&1 || true
+    curl -fsS -X DELETE "$BASE_URL/streams/ace/cid:${ID_ARR[$CHURN_IDX]}" >/dev/null 2>&1 || true
     PLAYER_PID=()
     CHURN_IDX=$(((CHURN_IDX + 1) % ${#ID_ARR[@]}))
     nid="${ID_ARR[$CHURN_IDX]}"
