@@ -6,7 +6,7 @@
 
 **Architecture:**
 - `AceProvider::resolve_live_info` becomes the single live resolver behind `open()`. The native `/streams` routes, compat `/ace/getstream` and `/ace/manifest.m3u8`, and `outpace play` all reach it.
-- Every successful `cid:` or transport-URL resolution records its `StreamInfo` in a new `InfohashIndex`, keyed by the 20-byte infohash.
+- Every successful `cid:` resolution records its `StreamInfo` in a new `InfohashIndex`, keyed by the 20-byte infohash. Transport-URL resolutions do not (controller Ruling G, below).
   - The index is a separate type from `ResolveCache`, which is keyed by the content-id string.
   - Each entry is keyed by its own `info.infohash`. `stream_info_from_transport` computed that value from the same descriptor that supplied the geometry and pubkey, so the binding holds by construction.
 - A bare 40-hex id is served from two places:
@@ -88,9 +88,7 @@
 1. **CLI `infohash=` and `magnet:` inputs always fail.** A one-shot `outpace play` process starts with an empty index and runs no broadcasts, so for the CLI, acceptance item 1 ("uses the descriptor's geometry") can only mean "fails closed". The docs say this plainly (Task 9).
 2. **Acceptance item 1's literal "add it under `tests/vectors/transport/`"** is replaced by in-test construction; see Design Notes.
 3. **Live check (R7)** uses the "no network source" variant (Task 10).
-4. **Unbound descriptor fields.** The infohash does not commit to `trackers` or `categories`. The index is last-write-wins, so a later transport URL that copies the six hashed fields can replace those two fields on an entry.
-   - That transport has the same pubkey, so it cannot inject media. The impact is limited to peer discovery.
-   - This is accepted. See Review Focus 3.
+4. **Unbound descriptor fields (controller Ruling G, added during execution).** The infohash does not commit to `trackers` or `categories`. A background security review flagged that recording caller-supplied transport-URL descriptors in the shared, last-write-wins index would let any API client swap the trackers other clients' bare-infohash opens announce to (IP disclosure, peer steering; media injection stays blocked by RSA verification). Transport-URL resolutions (the provider's `turl-` branch and `/server/api` `url`) therefore do **not** feed the index; only content-id resolutions and the daemon's own broadcasts do. A transport-URL stream reopens by its `turl-` id, not by bare infohash.
 
 ## Review Focus
 
@@ -582,9 +580,9 @@ const INFOHASH_INDEX_CAPACITY: usize = 256;
 3. In `pub struct AceProvider`, directly after the `resolve_cache: ResolveCache,` field, add:
 
 ```rust
-    /// Verified live descriptors keyed by swarm infohash, filled by every successful `cid:` and
-    /// transport-url resolution so a later bare-infohash open uses the real geometry and pubkey
-    /// (#164). Separate from `resolve_cache`, which is keyed by the content-id string.
+    /// Verified live descriptors keyed by swarm infohash, filled by every successful `cid:`
+    /// resolution (never transport-url; Ruling G) so a later bare-infohash open uses the real
+    /// geometry and pubkey (#164). Separate from `resolve_cache`, keyed by the content-id string.
     infohash_index: InfohashIndex,
 ```
 
@@ -690,7 +688,7 @@ fn is_bare_hex40(id: &str) -> bool {
 fn unresolved_infohash_message(id: &str) -> String {
     format!(
         "no verified transport descriptor for infohash {id}: outpace does not guess live stream \
-         geometry. Open the stream by content id (cid:<content-id>) or transport URL first; its \
+         geometry. Open the stream by content id (cid:<content-id>) first; its \
          infohash then works in this process. If {id} is a content id, use cid:{id}"
     )
 }
@@ -1295,9 +1293,9 @@ In the `Ok(info) => { … }` arm written in Task 6, insert before `selection = �
 
 In `async fn resolve_server_api_selector`, make two edits:
 - in the `Selector::ContentId(cid)` arm, change `Ok(info) => Ok(ResolvedContent {` into a block that records the descriptor first;
-- do the same in the `Selector::Url(url)` arm.
+- leave the `Selector::Url(url)` arm unchanged: transport URLs are caller-supplied and must not feed the shared index (Ruling G).
 
-The two arms become:
+The `ContentId` arm becomes:
 
 ```rust
         Selector::ContentId(cid) => {
@@ -1316,24 +1314,6 @@ The two arms become:
                     })
                 }
                 Err(e) => Err(format!("content-id resolution failed: {e:?}")),
-            }
-        }
-        Selector::Url(url) => {
-            if !s.resolve_content_ids_in_getstream {
-                return Err("transport-url resolution is disabled".to_string());
-            }
-            match stream_info_from_transport_url(&url).await {
-                Ok(info) => {
-                    if let Some(network) = ace_network(s) {
-                        s.manager.remember_live_descriptor(&network, &info);
-                    }
-                    Ok(ResolvedContent {
-                        infohash: infohash_hex(&info.infohash),
-                        content_id: None,
-                        is_live: true,
-                    })
-                }
-                Err(e) => Err(format!("transport-url resolution failed: {e:?}")),
             }
         }
 ```
@@ -1476,15 +1456,16 @@ guesses them. An infohash input (the native `/streams/ace/<40-hex>` form, compat
 verified transport descriptor for it:
 
 - the same daemon resolved the stream earlier by content id (`cid:<content-id>`,
-  `acestream://`, `content_id=`/`id=`) or transport URL, or answered `analyze_content` /
-  `get_media_files` for it; or
+  `acestream://`, `content_id=`/`id=`), or answered `analyze_content` / `get_media_files` for
+  its content id; or
 - the daemon originates that broadcast itself.
 
 The descriptor's infohash commits to its piece length, chunk length and pubkey, so such a stream
 uses the real geometry and verifies every piece's RSA signature. Otherwise the request fails
 closed: the native routes return `422` with the reason, compat routes return an error envelope,
 and `outpace play` exits with an error. The reason suggests `cid:<id>`, which also covers a content
-id pasted without its prefix. Prefer content ids or transport URLs.
+id pasted without its prefix. Prefer content ids. Transport-URL streams reopen by their `turl-`
+id, not by infohash: a caller-supplied transport never feeds the shared infohash index.
 ```
 
 - [ ] **Step 2: `README.md`, compat paragraph**
@@ -1520,8 +1501,8 @@ invent a title.
 
 A bare infohash carries no piece geometry or source key, and outpace never guesses them. An
 infohash `<id>` plays only when this daemon already holds a verified transport descriptor for it:
-the stream was resolved earlier in this process by `cid:<content-id>` or transport URL (natively
-or through the compatibility routes), or it is a broadcast this daemon originates. Such a stream
+the stream was resolved earlier in this process by `cid:<content-id>` (natively or through the
+compatibility routes), or it is a broadcast this daemon originates. Such a stream
 uses the descriptor's piece length and verifies each piece against the descriptor's pubkey.
 Otherwise playback routes return `422 Unprocessable Content` with a plain-text reason that
 suggests `cid:<id>`. Prefer `cid:<content-id>` ids in playlists.
@@ -1535,11 +1516,11 @@ suggests `cid:<id>`. Prefer `cid:<content-id>` ids in playlists.
 ```markdown
 An `infohash=` or `magnet=` selector is refused with an error envelope (HTTP 200,
 `response: null`) unless the daemon holds a verified transport descriptor for that infohash.
-That happens when it resolved the stream by content id or transport URL earlier in this process,
+That happens when it resolved the stream by content id earlier in this process,
 or originates the broadcast. outpace does not guess live geometry for a bare infohash.
 ```
 
-3. In the `analyze_content` row, append ` Resolving a `content_id`/`url` here also lets a later `infohash=` playback of the result succeed; an offline `infohash`/`magnet` analysis does not make that infohash playable.` after `…content-id resolution.`
+3. In the `analyze_content` row, append ` Resolving a `content_id` here also lets a later `infohash=` playback of the result succeed (a `url` does not); an offline `infohash`/`magnet` analysis does not make that infohash playable.` after `…content-id resolution.`
 4. Replace the deferred bullet `- Reverse `get_content_id` (deriving a content id from an infohash/transport).` with `- Reverse `get_content_id` (deriving a content id from an infohash/transport). The official engine does this remotely, which is how it plays a cold infohash; adopting it would let outpace play cold infohash inputs.`
 
 - [ ] **Step 5: Check the docs for leftovers**
