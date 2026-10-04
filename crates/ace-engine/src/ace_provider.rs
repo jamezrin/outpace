@@ -191,8 +191,8 @@ pub struct AceProvider {
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
     resolve_cache: ResolveCache,
-    /// Verified live descriptors keyed by swarm infohash, filled by every successful `cid:` and
-    /// transport-url resolution so a later bare-infohash open uses the real geometry and pubkey
+    /// Verified live descriptors keyed by swarm infohash, filled by every successful `cid:`
+    /// resolution (never by a transport url) so a later bare-infohash open uses the real geometry and pubkey
     /// (#164). Separate from `resolve_cache`, which is keyed by the content-id string.
     infohash_index: InfohashIndex,
     seed_registry: SeedRegistry,
@@ -456,22 +456,22 @@ impl AceProvider {
     /// `outpace play`). See #164.
     ///
     /// - `cid:<40hex>`: signed catalog, then BEP-9 peers ([`Self::resolve_content_id`]).
-    /// - a transport-url id: fetched under the SSRF guard.
+    /// - a transport-url id: fetched under the SSRF guard; not recorded in the infohash index.
     /// - a bare 40-hex infohash: only a descriptor this process has already verified
     ///   ([`Self::verified_info_for_infohash`]); otherwise [`ProviderError::Unresolvable`].
     ///
-    /// Every descriptor resolved here is recorded in the infohash index, so the stream can later
-    /// be opened by its infohash too. outpace never guesses live geometry.
+    /// Every content-id descriptor resolved here is recorded in the infohash index, so the stream
+    /// can later be opened by its infohash too. outpace never guesses live geometry.
     async fn resolve_live_info(&self, id: &str) -> Result<StreamInfo, ProviderError> {
         if let Some(content_id) = id.strip_prefix("cid:") {
             return self.resolve_content_id(content_id).await;
         }
         if let Some(url) = crate::transport_url::decode_transport_url(id) {
-            let info = stream_info_from_transport_url(&url)
+            // Not recorded in the index: a transport URL is caller-supplied, and the index is
+            // shared state whose trackers the infohash does not bind (#164).
+            return stream_info_from_transport_url(&url)
                 .await
-                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")))?;
-            self.infohash_index.put(info.clone());
-            return Ok(info);
+                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")));
         }
         if is_bare_hex40(id) {
             return match self.verified_info_for_infohash(id) {
@@ -608,8 +608,8 @@ fn is_bare_hex40(id: &str) -> bool {
 fn unresolved_infohash_message(id: &str) -> String {
     format!(
         "no verified transport descriptor for infohash {id}: outpace does not guess live stream \
-         geometry. Open the stream by content id (cid:<content-id>) or transport URL first; its \
-         infohash then works in this process. If {id} is a content id, use cid:{id}"
+         geometry. Open the stream by content id (cid:<content-id>) first; its infohash \
+         then works in this process. If {id} is a content id, use cid:{id}"
     )
 }
 
