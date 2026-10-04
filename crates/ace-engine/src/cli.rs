@@ -68,7 +68,9 @@ fn parse_broadcast_name(value: &str) -> Result<String, String> {
 
 #[derive(Debug, Args)]
 pub struct PlayArgs {
-    /// Acestream URL, magnet URI, or HTTP(S) transport-file URL.
+    /// acestream://<content-id> URL or HTTP(S) transport-file URL. `acestream:?infohash=` and
+    /// magnet inputs are accepted but fail closed: a one-shot play holds no verified transport
+    /// descriptor for a bare infohash.
     pub input: String,
     /// Bootstrap peer to try in addition to configured discovery (repeatable).
     #[arg(long = "peer")]
@@ -252,7 +254,10 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
         let vod = provider
             .resolve_vod(&target.provider_id)
             .await
-            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            .map_err(|e| {
+                eprintln!("outpace play: {e}");
+                std::io::Error::other(e.to_string())
+            })?;
         let total = vod.content_length();
         if total == 0 {
             return Ok(());
@@ -269,10 +274,10 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut source = provider
-        .open(&target.provider_id)
-        .await
-        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+    let mut source = provider.open(&target.provider_id).await.map_err(|e| {
+        eprintln!("outpace play: {e}");
+        std::io::Error::other(e.to_string())
+    })?;
     let mut stdout = tokio::io::stdout();
     while let Some(chunk) = source.next().await {
         stdout.write_all(&chunk).await?;
@@ -394,8 +399,37 @@ mod tests {
             .expect("play subcommand")
             .render_long_help()
             .to_string();
-        assert!(play.contains("Acestream URL, magnet URI, or HTTP(S) transport-file URL"));
+        let play_flat = play.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(play_flat.contains("acestream://<content-id> URL or HTTP(S) transport-file URL"));
+        assert!(play_flat.contains("fail closed"));
         assert!(play.contains("verified VOD"));
+    }
+
+    #[tokio::test]
+    async fn play_infohash_and_magnet_inputs_fail_closed_with_the_cid_hint() {
+        use crate::provider::StreamProvider;
+        let ih = "0123456789abcdef0123456789abcdef01234567";
+        let provider = play_provider_from_config(
+            std::sync::Arc::new(ace_wire::identity::Identity::generate()),
+            &crate::config::Config::default(),
+            vec![],
+            ace_swarm::listen::SeedRegistry::new(),
+        );
+        for input in [
+            format!("acestream:?infohash={ih}"),
+            format!("magnet:?xt=urn:btih:{ih}"),
+        ] {
+            let target = PlaybackTarget::parse(&input).unwrap();
+            let err = provider
+                .open(&target.provider_id)
+                .await
+                .err()
+                .expect("a one-shot play has no verified descriptor for a bare infohash");
+            assert!(
+                err.to_string().contains(&format!("cid:{ih}")),
+                "{input}: {err}"
+            );
+        }
     }
 
     #[test]
