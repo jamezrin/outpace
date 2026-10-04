@@ -20,7 +20,7 @@ use ace_wire::transport::decode_transport;
 use base64ct::{Base64, Encoding};
 use rand::RngExt;
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -513,6 +513,52 @@ impl ResolveCache {
             .lock()
             .unwrap()
             .insert(key.to_string(), (info, Instant::now()));
+    }
+}
+
+/// Verified live descriptors keyed by their swarm infohash (issue #164).
+///
+/// Deliberately separate from [`ResolveCache`], which is keyed by the content-id *string*:
+/// content ids and infohashes share the 40-hex space, so a shared map could hand one kind of
+/// id's entry to a lookup of the other. Every entry here is keyed by its own `info.infohash`,
+/// which [`stream_info_from_transport`] computed from the same descriptor that supplied the
+/// geometry and pubkey. The swarm infohash commits to `piece_length`, `chunk_length` and
+/// `pubkey` (see [`infohash_of_descriptor`]), so an entry can neither pair an infohash with
+/// another stream's geometry nor go stale. Entries therefore carry no TTL; the index is bounded
+/// by evicting the least recently stored entry once `capacity` is reached.
+pub struct InfohashIndex {
+    entries: Mutex<VecDeque<StreamInfo>>,
+    capacity: usize,
+}
+
+impl InfohashIndex {
+    /// An empty index holding at most `capacity` descriptors (at least one).
+    pub fn new(capacity: usize) -> Self {
+        InfohashIndex {
+            entries: Mutex::new(VecDeque::new()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record a verified descriptor under `info.infohash`, replacing any previous entry for that
+    /// infohash and evicting the least recently stored entry when full.
+    pub fn put(&self, info: StreamInfo) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|e| e.infohash != info.infohash);
+        if entries.len() >= self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(info);
+    }
+
+    /// The verified descriptor stored for `infohash`, if any.
+    pub fn get(&self, infohash: &[u8; 20]) -> Option<StreamInfo> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| &e.infohash == infohash)
+            .cloned()
     }
 }
 
@@ -1197,5 +1243,86 @@ mod tests {
         assert_eq!(c.get("k"), Some(info));
         std::thread::sleep(Duration::from_millis(55));
         assert_eq!(c.get("k"), None, "entry expires after the TTL");
+    }
+
+    fn indexed_info(infohash: [u8; 20], piece_length: u64) -> StreamInfo {
+        StreamInfo {
+            infohash,
+            piece_length,
+            chunk_length: 16_384,
+            trackers: vec![],
+            metadata: StreamMetadata::default(),
+            sig_len: 0,
+            source_pubkey: vec![],
+        }
+    }
+
+    #[test]
+    fn infohash_index_returns_only_the_entry_for_that_infohash() {
+        let index = InfohashIndex::new(4);
+        assert_eq!(index.get(&[1; 20]), None);
+        index.put(indexed_info([1; 20], 524_288));
+        index.put(indexed_info([2; 20], 65_536));
+        assert_eq!(index.get(&[1; 20]).unwrap().piece_length, 524_288);
+        assert_eq!(index.get(&[2; 20]).unwrap().piece_length, 65_536);
+        assert_eq!(index.get(&[3; 20]), None);
+    }
+
+    #[test]
+    fn infohash_index_replaces_an_entry_and_evicts_the_oldest_when_full() {
+        let index = InfohashIndex::new(2);
+        index.put(indexed_info([1; 20], 1));
+        index.put(indexed_info([2; 20], 2));
+        // Re-storing [1] replaces it in place and makes it the newest entry.
+        index.put(indexed_info([1; 20], 10));
+        index.put(indexed_info([3; 20], 3));
+        assert_eq!(index.get(&[2; 20]), None, "the oldest entry is evicted");
+        assert_eq!(index.get(&[1; 20]).unwrap().piece_length, 10);
+        assert_eq!(index.get(&[3; 20]).unwrap().piece_length, 3);
+    }
+
+    /// A synthetic live transport with 512 KiB pieces and a freshly generated RSA source key,
+    /// built with outpace's own encoder (#164). Nothing here comes from a real stream.
+    fn synthetic_512k_transport() -> (Vec<u8>, Vec<u8>) {
+        use ace_wire::bencode::Bencode;
+        let pubkey = ace_wire::live_auth::LiveSourceAuth::generate().pubkey_der();
+        let mut d = std::collections::BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"Synthetic Live".to_vec()));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(524_288));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16_384));
+        d.insert(b"bitrate".to_vec(), Bencode::Int(1_000_000));
+        d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"RSA".to_vec()));
+        d.insert(b"pubkey".to_vec(), Bencode::Bytes(pubkey.clone()));
+        d.insert(
+            b"trackers".to_vec(),
+            Bencode::List(vec![Bencode::Bytes(b"udp://tracker.invalid:80".to_vec())]),
+        );
+        (
+            ace_wire::transport::encode_transport(&Bencode::Dict(d)),
+            pubkey,
+        )
+    }
+
+    #[test]
+    fn synthetic_512k_descriptor_keeps_geometry_and_pubkey_through_the_index() {
+        let (transport, pubkey) = synthetic_512k_transport();
+        let info = stream_info_from_transport(&transport).unwrap();
+        // The infohash is computed at test time, never written down.
+        assert_eq!(
+            info.infohash,
+            ace_wire::infohash::infohash_of_transport(&transport)
+        );
+        assert_eq!(info.piece_length, 524_288);
+        assert_eq!(info.chunk_length, 16_384);
+        assert_eq!(info.chunks_per_piece(), 32);
+        assert_eq!(
+            info.sig_len, 96,
+            "768-bit source key => 96-byte signature tail"
+        );
+        assert_eq!(info.source_pubkey, pubkey);
+
+        let index = InfohashIndex::new(8);
+        index.put(info.clone());
+        assert_eq!(index.get(&info.infohash), Some(info));
     }
 }
