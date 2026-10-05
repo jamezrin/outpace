@@ -73,3 +73,17 @@ jobs:
       # Live-network tests are #[ignore]d, so the default run stays offline.
       - name: Test
         run: cargo test --workspace --locked
+
+  abcompare:
+    name: A/B harness test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Standard-library fixtures and loopback HTTP only; no public stream or Docker.
+      - name: Test A/B capture and analysis
+        run: python3 -m unittest discover -s tools/abcompare -v
