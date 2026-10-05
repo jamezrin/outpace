@@ -205,8 +205,9 @@ def player(r, duration, prebuf=PREBUF, dt=0.05):
         samples.append((wall, head if start is not None else None))
     if stall_at is not None:
         stalls.append((stall_at, max(0, duration - stall_at)))
-    return dict(start=start, stalls=len(stalls), stall_time=sum(s for _, s in stalls),
-                stall_list=stalls, disp=samples)
+    return dict(start=start, stalls=len(stalls) if start is not None else None,
+                stall_time=sum(s for _, s in stalls) if start is not None else None,
+                stall_list=stalls if start is not None else None, disp=samples)
 
 
 def media_packets(ts):

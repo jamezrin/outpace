@@ -3,6 +3,7 @@ import contextlib
 import io
 import http.server
 import json
+import stat
 from pathlib import Path
 import subprocess
 import socket
@@ -144,6 +145,23 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(result['stale_prefix'][0], 188)
             self.assertIsNone(analyze.player(result, 10)['start'])
 
+    def test_summary_no_start_has_unavailable_stall_metrics(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            path.joinpath('x.ts').write_bytes(packet(0, 1) + packet(1, 2))
+            path.joinpath('x.arrivals.csv').write_text('t,nbytes,offset\n1,188,0\n2,188,188\n')
+            summary = analyze.summarize(path, 10, ['x'])
+            player = summary['streams']['x']['player']
+            self.assertIsNone(player['start'])
+            self.assertIsNone(player['stalls'])
+            self.assertIsNone(player['stall_time'])
+            self.assertIsNone(player['stall_list'])
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name('ab_analyze.py')),
+                                     d, '10', 'x'], capture_output=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            written = json.loads(path.joinpath('summary.json').read_text())
+            self.assertIsNone(written['streams']['x']['player']['stall_time'])
+
     def test_player_stalls_and_no_media_overlap(self):
         r = {'pcrs': [(0, 0, 0), (1, 4, 188), (8, 8, 376)]}
         p = analyze.player(r, 10)
@@ -159,6 +177,61 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def capture_cli(self, outdir):
+        # Change umask inside the subprocess, avoiding process-global test state
+        # and preexec_fn while HTTP tests may have background handler threads.
+        code = ('import os,runpy,sys; os.umask(0o022); sys.argv=sys.argv[1:]; '
+                'runpy.run_path(sys.argv[0], run_name="__main__")')
+        return subprocess.run([sys.executable, '-c', code,
+            str(Path(__file__).with_name('ab_capture.py')),
+            '0123456789abcdef0123456789abcdef01234567', '.05', str(outdir),
+            'x=nativecid:http://127.0.0.1:1'], capture_output=True, timeout=3)
+
+    def test_public_capture_is_private_under_permissive_umask(self):
+        with tempfile.TemporaryDirectory() as d:
+            outdir = Path(d, 'new-run')
+            result = self.capture_cli(outdir)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(stat.S_IMODE(outdir.stat().st_mode), 0o700)
+            files = list(outdir.iterdir())
+            self.assertEqual(len(files), 5)
+            self.assertTrue(all(stat.S_IMODE(f.stat().st_mode) == 0o600 for f in files))
+
+    def test_existing_private_directory_accepts_runner_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            outdir = Path(d)
+            outdir.joinpath('run.json').write_text('{"owned_runner_metadata": true}')
+            outdir.joinpath('candidate-state').mkdir()
+            before = outdir.joinpath('run.json').read_bytes()
+            result = self.capture_cli(outdir)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(outdir.joinpath('run.json').read_bytes(), before)
+            self.assertEqual(stat.S_IMODE(outdir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(outdir.joinpath('x.ts').stat().st_mode), 0o600)
+
+    def test_existing_unsafe_directory_is_rejected_without_chmod(self):
+        with tempfile.TemporaryDirectory() as d:
+            outdir = Path(d, 'shared')
+            outdir.mkdir()
+            outdir.chmod(0o755)
+            outdir.joinpath('keep.txt').write_text('unrelated')
+            result = self.capture_cli(outdir)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(stat.S_IMODE(outdir.stat().st_mode), 0o755)
+            self.assertEqual([f.name for f in outdir.iterdir()], ['keep.txt'])
+            self.assertEqual(outdir.joinpath('keep.txt').read_text(), 'unrelated')
+
+    def test_symlink_output_directory_is_rejected_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d, 'target')
+            target.mkdir(mode=0o700)
+            link = Path(d, 'link')
+            link.symlink_to(target, target_is_directory=True)
+            result = self.capture_cli(link)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(list(target.iterdir()), [])
+
+
     def test_stop_process_leaves_unrelated_child_running(self):
         owned = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
         other = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])

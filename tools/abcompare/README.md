@@ -64,11 +64,22 @@ HTTP(S) redirects. Capture retries EOF/errors after one second; these reconnects
 remain visible in the events log. Playback-url discovery retries every two seconds.
 All workers use one monotonic clock and a fixed global capture deadline.
 
+Direct capture requires POSIX owner/mode permissions. It creates the requested
+output directory with mode 0700 and exclusively reserves capture files with mode
+0600 before writing. The parent directory must already exist. An existing output
+directory is accepted only if it is a non-symlink directory owned by the caller
+with mode 0700; otherwise capture rejects it without changing its permissions or
+contents. This accepts the runner's existing private directory and preserves its
+other files. Existing capture artifacts, including symlinks, are never overwritten.
+Endpoint details also appear on stdout; redirect it only into private storage.
+
 Files are `<name>.ts`, `<name>.arrivals.csv` (`t,nbytes,offset`),
 `<name>.events.txt`, `<name>.stats.jsonl` (five-second polls) and `capture.json`.
 The analyzer prints a concise per-client report and writes schema-versioned
 `summary.json`. Missing media, missing PCR/RAI and no overlapping window are
-reported as null metrics, not success. Successful capture/analysis exit status
+reported as null metrics, not success. When PCR exists but the player never
+starts, its stall count, stall time and stall list are null, because playback
+quality has not been measured. Successful capture/analysis exit status
 means artifacts were produced, **not** that the candidate passed a quality gate.
 No automatic pass/fail thresholds are imposed on source-dependent live streams.
 

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
 import threading
 import time
 import urllib.parse
@@ -203,11 +204,25 @@ class Capture:
                 out.flush()
 
     def run(self):
-        self.outdir.mkdir(parents=True, exist_ok=True)
+        # Only create the requested final directory. Existing parent directories
+        # belong to the operator; never create/chmod a chain of unrelated paths.
+        try:
+            self.outdir.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        info = self.outdir.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or
+                stat.S_IMODE(info.st_mode) & 0o777 != 0o700):
+            raise ValueError('output must be a non-symlink directory owned by the caller with mode 0700')
         expected = ['capture.json'] + [name + suffix for name, _, _ in self.specs
                     for suffix in ('.ts', '.arrivals.csv', '.events.txt', '.stats.jsonl')]
-        if any(self.outdir.joinpath(p).exists() for p in expected):
+        if any(self.outdir.joinpath(p).exists() or self.outdir.joinpath(p).is_symlink() for p in expected):
             raise ValueError('capture artifacts already exist; use a fresh directory')
+        # Reserve every capture artifact exclusively and privately before threads
+        # write. Ordinary later opens preserve these modes, including event append.
+        for name in expected:
+            fd = os.open(self.outdir / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.close(fd)
         threads = []
         self.t0 = time.monotonic()
         for name, mode, base in self.specs:
