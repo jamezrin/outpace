@@ -6,7 +6,7 @@
 
 **Architecture:**
 - `AceProvider::resolve_live_info` becomes the single live resolver behind `open()`. The native `/streams` routes, compat `/ace/getstream` and `/ace/manifest.m3u8`, and `outpace play` all reach it.
-- Every successful `cid:` resolution records its `StreamInfo` in a new `InfohashIndex`, keyed by the 20-byte infohash. Transport-URL resolutions do not (controller Ruling G, below).
+- Every successful signed-catalog `cid:` resolution records its `StreamInfo` in a new `InfohashIndex`, keyed by the 20-byte infohash. BEP-9 and transport-URL resolutions do not (controller Rulings G and J, below).
   - The index is a separate type from `ResolveCache`, which is keyed by the content-id string.
   - Each entry is keyed by its own `info.infohash`. `stream_info_from_transport` computed that value from the same descriptor that supplied the geometry and pubkey, so the binding holds by construction.
 - A bare 40-hex id is served from two places:
@@ -88,7 +88,11 @@
 1. **CLI `infohash=` and `magnet:` inputs always fail.** A one-shot `outpace play` process starts with an empty index and runs no broadcasts, so for the CLI, acceptance item 1 ("uses the descriptor's geometry") can only mean "fails closed". The docs say this plainly (Task 9).
 2. **Acceptance item 1's literal "add it under `tests/vectors/transport/`"** is replaced by in-test construction; see Design Notes.
 3. **Live check (R7)** uses the "no network source" variant (Task 10).
-4. **Unbound descriptor fields (controller Ruling G, added during execution).** The infohash does not commit to `trackers` or `categories`. A background security review flagged that recording caller-supplied transport-URL descriptors in the shared, last-write-wins index would let any API client swap the trackers other clients' bare-infohash opens announce to (IP disclosure, peer steering; media injection stays blocked by RSA verification). Transport-URL resolutions (the provider's `turl-` branch and `/server/api` `url`) therefore do **not** feed the index; only content-id resolutions and the daemon's own broadcasts do. A transport-URL stream reopens by its `turl-` id, not by bare infohash.
+4. **Unbound descriptor fields (controller Rulings G and J, added during execution).** The infohash does not commit to `trackers` or `categories`, and the index is shared state.
+   - Ruling G: transport-URL resolutions never feed the index (caller-supplied descriptors).
+   - The final review found the same exposure through BEP-9 content-id resolutions, which bind a blob only to a content id the caller chose. A first fix replaced indexed trackers with the daemon's default tracker; a live A/B showed that breaks playback (0 tracker peers, no reachable upstream), so it was reverted.
+   - Ruling J: only signed-catalog content-id resolutions and the daemon's own broadcasts (checked first) make an infohash openable, and the descriptor's own trackers are kept. BEP-9 results go to a separate cache that never feeds the index.
+   - Residual risk, accepted and disclosed: the catalog is plain HTTP with a self-asserted checksum, so whoever can tamper with that fetch, or register a third-party transport if the catalog allows it, can plant trackers for a real infohash (IP disclosure and peer steering; no media injection, because the infohash binds the pubkey). The same attacker can already substitute a whole descriptor on any `cid:` open, which predates this plan.
 
 ## Review Focus
 
