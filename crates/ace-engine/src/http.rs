@@ -374,7 +374,7 @@ pub struct AppState {
     pub resolve_content_ids_in_getstream: bool,
     /// Official `/ace/getstream?content_id=` returns URLs keyed by the resolved infohash.
     /// Internally, keep using `cid:<content_id>` so playback gets the catalog-derived
-    /// transport geometry/trackers instead of the index's bound-fields-only infohash view.
+    /// transport geometry/trackers (a bare infohash would need an already-indexed descriptor).
     pub ace_sessions: Arc<AceSessionStore>,
     /// Experimental legacy Acestream HTTP compatibility surface. Native `/streams` and
     /// `/broadcast` routes remain available regardless of this flag.
@@ -1177,6 +1177,7 @@ async fn resolve_server_api_selector(
             }
             match resolve_via_catalog(&cid).await {
                 Ok(info) => {
+                    // `resolve_via_catalog` is the signed catalog, so this descriptor is indexable.
                     if let Some(network) = ace_network(s) {
                         s.manager.remember_live_descriptor(&network, &info);
                     }
@@ -1244,7 +1245,8 @@ async fn resolve_ace_selection(
         if let Some(content_id) = selection.content_id.as_deref() {
             match resolve_via_catalog(content_id).await {
                 Ok(info) => {
-                    // A client may open this infohash directly later (#164).
+                    // A client may open this infohash directly later (#164). Signed catalog
+                    // (`resolve_via_catalog`) only, so the descriptor is indexable.
                     if let Some(network) = network.as_deref() {
                         s.manager.remember_live_descriptor(network, &info);
                     }

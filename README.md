@@ -80,8 +80,8 @@ guesses them. An infohash input (the native `/streams/ace/<40-hex>` form, compat
 `magnet=`, CLI `acestream:?infohash=` or `magnet:`) plays only when the process already holds a
 verified transport descriptor for it:
 
-- the same daemon resolved the stream earlier by content id (`cid:<content-id>`,
-  `acestream://`, `content_id=`/`id=`), or answered `analyze_content` / `get_media_files` for
+- the same daemon resolved the stream earlier by content id through the signed catalog
+  (`cid:<content-id>`, `acestream://`, `content_id=`/`id=`), or answered `analyze_content` / `get_media_files` for
   its content id; or
 - the daemon originates that broadcast itself.
 
@@ -90,9 +90,11 @@ uses the real geometry and verifies every piece's RSA signature. Otherwise the r
 closed: the native routes return `422` with the reason, compat routes return an error envelope,
 and `outpace play` exits with an error. The reason suggests `cid:<id>`, which also covers a content
 id pasted without its prefix. Prefer content ids. Transport-URL streams reopen by their `turl-`
-id, not by infohash. An infohash open trusts only what the infohash commits to (name, piece and
-chunk length, bitrate, pubkey); it announces to the daemon's default trackers and DHT, not to
-trackers from an earlier descriptor.
+id, not by infohash. An infohash becomes playable only from a descriptor fetched through the signed
+catalog (a content-id resolution) or from the daemon's own broadcast; it then uses that
+descriptor's geometry, pubkey and trackers. A content id resolved from BEP-9 peers, or a
+transport URL, never makes an infohash playable: neither binds the descriptor's trackers to
+the infohash.
 
 ### VOD (single-file)
 

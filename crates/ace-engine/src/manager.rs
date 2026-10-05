@@ -175,7 +175,8 @@ impl StreamManager {
 
     /// Hand a live descriptor resolved outside `open` to `network`'s provider; see
     /// [`StreamProvider::remember_live_descriptor`](crate::provider::StreamProvider::remember_live_descriptor).
-    /// A no-op for an unregistered network.
+    /// Callers must pass only descriptors resolved through the signed catalog. A no-op for an
+    /// unregistered network.
     pub fn remember_live_descriptor(&self, network: &str, info: &StreamInfo) {
         if let Some(provider) = self.registry.get(network) {
             provider.remember_live_descriptor(info);

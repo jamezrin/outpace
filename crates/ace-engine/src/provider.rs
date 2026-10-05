@@ -96,7 +96,8 @@ pub trait StreamProvider: Send + Sync {
 
     /// Record a live descriptor that was resolved outside [`open`](Self::open) (the compat
     /// routes resolve content ids for their JSON responses), so a later open by its infohash can
-    /// use it (#164). Defaults to ignoring it.
+    /// use it (#164). Callers must pass only descriptors resolved through the signed catalog
+    /// (never BEP-9 or a transport url): the index trusts them as-is. Defaults to ignoring it.
     fn remember_live_descriptor(&self, _info: &StreamInfo) {}
 }
 

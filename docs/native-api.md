@@ -82,12 +82,14 @@ Live HLS media playlists are unchanged because they have no portable stream-titl
 
 A bare infohash carries no piece geometry or source key, and outpace never guesses them. An
 infohash `<id>` plays only when this daemon already holds a verified transport descriptor for it:
-the stream was resolved earlier in this process by native `cid:<content-id>`, compat
-`content_id=`/`id=`, or `/server/api` `analyze_content` / `get_media_files` with a `content_id`,
+the stream was resolved earlier in this process through the signed catalog by native
+`cid:<content-id>`, compat `content_id=`/`id=`, or `/server/api` `analyze_content` / `get_media_files` with a `content_id`,
 or it is a broadcast this daemon originates. Such a stream uses the descriptor's piece length
-and verifies each piece against the descriptor's pubkey. An infohash open trusts only what the
-infohash commits to (name, piece and chunk length, bitrate, pubkey); it announces to the daemon's
-default trackers and DHT, not to trackers from an earlier descriptor.
+and verifies each piece against the descriptor's pubkey. An infohash becomes playable only
+from a descriptor fetched through the signed catalog (a content-id resolution) or from the
+daemon's own broadcast; it then uses that descriptor's geometry, pubkey and trackers. A content
+id resolved from BEP-9 peers, or a transport URL, never makes an infohash playable: neither
+binds the descriptor's trackers to the infohash.
 Otherwise playback routes return `422 Unprocessable Content` with a plain-text reason that
 suggests `cid:<id>`. Prefer `cid:<content-id>` ids in playlists.
 
