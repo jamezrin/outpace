@@ -90,7 +90,9 @@ uses the real geometry and verifies every piece's RSA signature. Otherwise the r
 closed: the native routes return `422` with the reason, compat routes return an error envelope,
 and `outpace play` exits with an error. The reason suggests `cid:<id>`, which also covers a content
 id pasted without its prefix. Prefer content ids. Transport-URL streams reopen by their `turl-`
-id, not by infohash: a caller-supplied transport never feeds the shared infohash index.
+id, not by infohash. An infohash open trusts only what the infohash commits to (name, piece and
+chunk length, bitrate, pubkey); it announces to the daemon's default trackers and DHT, not to
+trackers from an earlier descriptor.
 
 ### VOD (single-file)
 
@@ -222,8 +224,8 @@ http://127.0.0.1:6878/ace/getstream?id=<content-id>
 
 Call `/ace/getstream?format=json&content_id=<content-id>` when the client needs the tokenized
 playback/stat/command URL envelope instead. `id=` and `content_id=` enter content-ID catalog
-resolution; `infohash=` is an explicit swarm key and plays only under the rules in "Infohash inputs". All hash selectors must be
-40 hexadecimal characters. The route also accepts `url=` (transport-file URL) and `magnet=`;
+resolution; `infohash=` is an explicit swarm key and plays only under the rules in "Infohash
+inputs". All hash selectors must be 40 hexadecimal characters. The route also accepts `url=` (transport-file URL) and `magnet=`;
 see the compatibility matrix for exact precedence and error behavior.
 
 `/server/api` serves a targeted subset of the engine's JSON control API, dispatched

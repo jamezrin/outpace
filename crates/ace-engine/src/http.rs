@@ -374,7 +374,7 @@ pub struct AppState {
     pub resolve_content_ids_in_getstream: bool,
     /// Official `/ace/getstream?content_id=` returns URLs keyed by the resolved infohash.
     /// Internally, keep using `cid:<content_id>` so playback gets the catalog-derived
-    /// transport geometry/trackers instead of degrading to bare-infohash defaults.
+    /// transport geometry/trackers instead of the index's bound-fields-only infohash view.
     pub ace_sessions: Arc<AceSessionStore>,
     /// Experimental legacy Acestream HTTP compatibility surface. Native `/streams` and
     /// `/broadcast` routes remain available regardless of this flag.
@@ -4677,6 +4677,11 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            let content_type = resp.headers()[header::CONTENT_TYPE].to_str().unwrap();
+            assert!(
+                content_type.starts_with("text/plain"),
+                "{path}: {content_type}"
+            );
             let body = body_text(resp).await;
             assert!(
                 body.contains(&format!("cid:{UNRESOLVED_IH}")),

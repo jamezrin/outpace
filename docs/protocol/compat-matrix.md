@@ -61,7 +61,7 @@ Dispatched on `?method=`; the response envelope is `{ "result": <value>, "error"
 | `get_network_connection_status` | Supported | `status`, `connected`, `networks` | `connected` reflects whether any provider network is registered. |
 | `analyze_content` | Supported | `infohash`, `content_id`, `is_live`, `is_encrypted`, `status` | Resolves the content selector to its infohash. `infohash`/`magnet` selectors resolve offline; `content_id`/`url` need the live catalog/transport and are gated by the same switch as `/ace/getstream` content-id resolution. Resolving a `content_id` here also lets a later `infohash=` playback of the result succeed (a `url` does not); an offline `infohash`/`magnet` analysis does not make that infohash playable. |
 | `get_content_id` | Supported (echo only) | `content_id` | Echoes a caller-supplied `content_id`/`query`. It cannot derive a content id from a bare infohash/url and returns an error envelope in that case. |
-| `get_media_files` | Supported (best-effort) | `infohash`, `files[]` | outpace transports are single-file, so one media file is reported, keyed by infohash. `dump_transport_file` is not supported. |
+| `get_media_files` | Supported (best-effort) | `infohash`, `files[]` | outpace transports are single-file, so one media file is reported, keyed by infohash. Resolving a `content_id` here also lets a later `infohash=` playback of the result succeed (a `url` does not). `dump_transport_file` is not supported. |
 
 ### Selector parameters (`analyze_content`, `get_content_id`, `get_media_files`)
 
@@ -82,4 +82,4 @@ These are **non-goals** for outpace (see the epic #46 non-goals) and are not pla
 
 - Legacy HLS VOD behavior (native `/vod` HLS exists).
 - `get_media_files&dump_transport_file=1` raw transport-file dumping.
-- Reverse `get_content_id` (deriving a content id from an infohash/transport). The official engine does this remotely, which is how it plays a cold infohash; adopting it would let outpace play cold infohash inputs.
+- Reverse `get_content_id` (deriving a content id from an infohash/transport). The official engine maps an infohash to its content id (observed during #164's spike; the request it uses was not captured), which is presumably how it plays a cold infohash; adopting it would let outpace play cold infohash inputs.

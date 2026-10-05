@@ -76,9 +76,10 @@ const RESOLVE_PEER_TIMEOUT: Duration = Duration::from_secs(6);
 const BACKGROUND_DISCOVERY_BUDGET: Duration = Duration::from_secs(8);
 const BACKGROUND_DISCOVERY_PEER_TARGET: usize = 64;
 
-/// Acestream's hardcoded public UDP tracker (see `docs/protocol/notes/03`). A bare
-/// content-id/infohash carries no tracker of its own, so we announce here to find peers.
-/// DHT discovery runs alongside this tracker in `discover_peers`.
+/// Acestream's hardcoded public UDP tracker (see `docs/protocol/notes/03`). Used for
+/// content-id/metadata discovery and for bare-infohash opens served from the infohash index,
+/// neither of which has trusted trackers of its own. DHT discovery runs alongside this tracker
+/// in `discover_peers`.
 const DEFAULT_ACE_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announce"];
 
 /// How long a resolved content-id → `StreamInfo` stays cached.
@@ -284,8 +285,9 @@ impl AceProvider {
         self.announce_peer_port.borrow().unwrap_or(0)
     }
 
-    /// Trackers used for a bare infohash (which carries none); transport files supply their
-    /// own. Operators can extend this; DHT discovery is a documented follow-up.
+    /// Trackers used for content-id/metadata discovery and for bare-infohash opens served from
+    /// the infohash index (a bare infohash opens only from a verified descriptor). Transport
+    /// files supply their own. Operators can extend this; DHT discovery runs alongside.
     pub fn with_trackers(mut self, trackers: Vec<String>) -> Self {
         self.default_trackers = trackers;
         self
@@ -638,8 +640,10 @@ fn bound_fields_only(mut info: StreamInfo, trackers: &[String]) -> StreamInfo {
 fn unresolved_infohash_message(id: &str) -> String {
     format!(
         "no verified transport descriptor for infohash {id}: outpace does not guess live stream \
-         geometry. Open the stream by content id (cid:<content-id>) first; its infohash \
-         then works in this process. If {id} is a content id, use cid:{id}"
+         geometry. Open the stream by content id first (cid:<content-id> on /streams, \
+         content_id=<content-id> on /ace/getstream, acestream://<content-id> for outpace play); \
+         its infohash then works in this process. If {id} is itself a content id, open it as one \
+         (cid:{id})."
     )
 }
 
