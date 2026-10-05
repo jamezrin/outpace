@@ -1,7 +1,7 @@
 //! Parse a `magnet:` link's `xt=urn:btih:` info-hash into a 40-hex string (BitTorrent v1 only).
 //! Accepts the two standard btih encodings — 40-char hex and 32-char RFC-4648 base32 — and
-//! rejects everything else (notably v2 `urn:btmh:`), so magnet inputs reduce to the existing
-//! bare-infohash playback path.
+//! rejects everything else (notably v2 `urn:btmh:`), so magnet inputs reduce to a bare infohash
+//! and therefore fail closed unless a verified transport descriptor for it is held.
 
 use ace_swarm::resolve::infohash_hex;
 

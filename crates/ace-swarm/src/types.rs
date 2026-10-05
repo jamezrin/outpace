@@ -20,7 +20,7 @@ pub struct StreamInfo {
     pub chunk_length: u64,
     /// Tracker URLs from the transport file (UDP `udp://host:port` entries used).
     pub trackers: Vec<String>,
-    /// Human-readable descriptor metadata, empty for a bare infohash.
+    /// Human-readable descriptor metadata (empty when the descriptor carries none).
     pub metadata: StreamMetadata,
     /// Per-piece live-source signature length in bytes (the RSA modulus's byte length). Each
     /// wire piece carries this many trailing signature bytes that are NOT media and must be
@@ -28,15 +28,10 @@ pub struct StreamInfo {
     pub sig_len: usize,
     /// The broadcast source's DER SubjectPublicKeyInfo — the transport descriptor's `pubkey`
     /// field — used to *verify* each piece's in-band RSA signature before its bytes are served
-    /// (issue #10, B0/note 27). Only a resolved transport descriptor carries this; a bare
-    /// infohash has no source key, so this is empty and pieces are stripped but not verified.
+    /// (issue #10, B0/note 27). Empty when the descriptor has no parseable RSA pubkey; such a
+    /// stream is treated as unsigned (nothing stripped, nothing verified).
     pub source_pubkey: Vec<u8>,
 }
-
-/// Default per-piece live-source signature length: Acestream source nodes generate 768-bit
-/// RSA keys (note 25), so each piece's signature is 96 trailing bytes. Used when we only have
-/// a bare infohash and no transport `pubkey` to measure the real modulus from.
-pub const DEFAULT_SIG_LEN: usize = 96;
 
 impl StreamInfo {
     /// Number of chunks per piece (`piece_length / chunk_length`).
@@ -94,7 +89,7 @@ mod tests {
             chunk_length: 16_384,
             trackers: vec![],
             metadata: StreamMetadata::default(),
-            sig_len: DEFAULT_SIG_LEN,
+            sig_len: 96,
             source_pubkey: vec![],
         };
         assert_eq!(si.chunks_per_piece(), 64);

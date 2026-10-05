@@ -56,7 +56,8 @@ cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
 `content_id` > `infohash` > `url` > `magnet`:
 
 - `acestream://<content_id>` or `acestream:?content_id=<40-hex>`;
-- `acestream:?infohash=<40-hex>`;
+- `acestream:?infohash=<40-hex>` - accepted, but `play` fails closed with an error: a one-shot
+  process holds no verified transport descriptor for a bare infohash (see "Infohash inputs");
 - a transport-file URL - either passed bare (`play https://host/x.acelive?a=1&b=2`,
   which handles a URL carrying its own `&`-joined query) or as
   `acestream:?url=<https://…>` (in the `acestream:?` form the URL's own query must
@@ -65,12 +66,35 @@ cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
   size cap, disabled redirects, and a request timeout; unsafe, oversized, or
   non-transport responses fail closed;
 - `magnet:?xt=urn:btih:<40-hex-or-32-base32>` - a BitTorrent v1 magnet, reduced to
-  its infohash (v2 `urn:btmh:` magnets are rejected).
+  its infohash (v2 `urn:btmh:` magnets are rejected). Like `infohash=`, it fails closed in `play`.
 
 The `/ace/getstream` compatibility route accepts the same selectors plus legacy
 `id=<40-hex>`, which is an alias for `content_id` (not `infohash`). Its precedence is
 `content_id` > `infohash` > `id` > `url` > `magnet`. A `url=` selector uses a self-contained
 playback id, so playback works after a daemon restart without any server-side alias table.
+
+### Infohash inputs
+
+A bare infohash identifies a swarm but carries no piece geometry or source key. outpace never
+guesses them. An infohash input (the native `/streams/ace/<40-hex>` form, compat `infohash=` or
+`magnet=`, CLI `acestream:?infohash=` or `magnet:`) plays only when the process already holds a
+verified transport descriptor for it:
+
+- the same daemon resolved the stream earlier by content id through the signed catalog
+  (`cid:<content-id>`, `acestream://`, `content_id=`/`id=`), or answered `analyze_content` / `get_media_files` for
+  its content id; or
+- the daemon originates that broadcast itself.
+
+The descriptor's infohash commits to its piece length, chunk length and pubkey, so such a stream
+uses the real geometry and verifies every piece's RSA signature. Otherwise the request fails
+closed: the native routes return `422` with the reason, compat routes return an error envelope,
+and `outpace play` exits with an error. The reason suggests `cid:<id>`, which also covers a content
+id pasted without its prefix. Prefer content ids. Transport-URL streams reopen by their `turl-`
+id, not by infohash. An infohash becomes playable only from a descriptor fetched through the signed
+catalog (a content-id resolution) or from the daemon's own broadcast; it then uses that
+descriptor's geometry, pubkey and trackers. A content id resolved from BEP-9 peers, or a
+transport URL, never makes an infohash playable: neither binds the descriptor's trackers to
+the infohash.
 
 ### VOD (single-file)
 
@@ -202,8 +226,8 @@ http://127.0.0.1:6878/ace/getstream?id=<content-id>
 
 Call `/ace/getstream?format=json&content_id=<content-id>` when the client needs the tokenized
 playback/stat/command URL envelope instead. `id=` and `content_id=` enter content-ID catalog
-resolution; only `infohash=` bypasses it as an explicit swarm key. All hash selectors must be
-40 hexadecimal characters. The route also accepts `url=` (transport-file URL) and `magnet=`;
+resolution; `infohash=` is an explicit swarm key and plays only under the rules in "Infohash
+inputs". All hash selectors must be 40 hexadecimal characters. The route also accepts `url=` (transport-file URL) and `magnet=`;
 see the compatibility matrix for exact precedence and error behavior.
 
 `/server/api` serves a targeted subset of the engine's JSON control API, dispatched

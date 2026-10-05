@@ -236,6 +236,24 @@ impl SeedRegistry {
         self.stores.lock().unwrap().get(key)?.metadata.clone()
     }
 
+    /// The transport descriptor of a broadcast this registry originates whose swarm infohash is
+    /// `infohash`, if any (#164). Broadcast transports are registered under their content id
+    /// (the BEP-9 metadata key), so this scans broadcast-owned metadata and keeps the descriptor
+    /// that hashes to `infohash`. A daemon originates a handful of broadcasts at most, so the
+    /// scan is cheap; hashing happens after the registry lock is released.
+    pub fn broadcast_transport_for_infohash(&self, infohash: &[u8; 20]) -> Option<Arc<Vec<u8>>> {
+        let candidates: Vec<SharedMetadata> = {
+            let map = self.stores.lock().unwrap();
+            map.values()
+                .filter(|e| e.kind == OwnerKind::Broadcast)
+                .filter_map(|e| e.metadata.clone())
+                .collect()
+        };
+        candidates.into_iter().find(|meta| {
+            ace_wire::infohash::try_infohash_of_transport(meta).is_ok_and(|ih| &ih == infohash)
+        })
+    }
+
     /// True iff we serve `infohash` (used as the inbound handshake's accept predicate).
     pub fn serves(&self, infohash: &[u8; 20]) -> bool {
         self.stores.lock().unwrap().contains_key(infohash)
@@ -582,6 +600,39 @@ mod tests {
         drop(lease);
         assert!(!reg.serves(&ih), "infohash entry evicted");
         assert!(!reg.serves(&cid), "content_id entry evicted");
+    }
+
+    #[test]
+    fn broadcast_transport_is_found_by_its_swarm_infohash_only() {
+        use ace_wire::bencode::Bencode;
+        let mut d = std::collections::BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"Synthetic".to_vec()));
+        d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"RSA".to_vec()));
+        d.insert(b"pubkey".to_vec(), Bencode::Bytes(b"k".to_vec()));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(65_536));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16_384));
+        d.insert(b"bitrate".to_vec(), Bencode::Int(1));
+        let transport = ace_wire::transport::encode_transport(&Bencode::Dict(d));
+        let ih = ace_wire::infohash::infohash_of_transport(&transport);
+        let cid = ace_wire::infohash::transport_file_hash(&transport);
+
+        let reg = SeedRegistry::new();
+        assert!(reg.broadcast_transport_for_infohash(&ih).is_none());
+        let (_store, lease) =
+            reg.lease_broadcast(ih, cid, transport.clone(), || PieceStore::new(4, 4, 1024));
+        assert_eq!(
+            reg.broadcast_transport_for_infohash(&ih).as_deref(),
+            Some(&transport)
+        );
+        assert!(
+            reg.broadcast_transport_for_infohash(&cid).is_none(),
+            "a content id is not a swarm infohash"
+        );
+        drop(lease);
+        assert!(reg.broadcast_transport_for_infohash(&ih).is_none());
+        // Metadata registered outside a broadcast lease is not an originated broadcast.
+        reg.register_metadata(cid, transport);
+        assert!(reg.broadcast_transport_for_infohash(&ih).is_none());
     }
 
     #[test]

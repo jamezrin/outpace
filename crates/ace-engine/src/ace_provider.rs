@@ -5,7 +5,8 @@
 //! LIVE-GATED: the peer I/O path requires the real Acestream swarm and is verified in the
 //! operator's environment (it cannot run in CI/sandbox). Content-id → transport-file
 //! resolution first uses the official signed catalog path, with BEP-9 `ut_metadata` as a
-//! fallback (see [`ace_swarm::resolve`]); the infohash form works directly.
+//! fallback (see [`ace_swarm::resolve`]). A bare infohash opens only from a transport descriptor
+//! this process has already verified, and otherwise fails closed (issue #164).
 
 use crate::config::{CacheType, LiveRecoveryConfig, StartupBufferConfig};
 use crate::provider::{
@@ -21,8 +22,8 @@ use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::reachability::ReachabilityMonitor;
 use ace_swarm::resolve::{
     catalog_transport_bytes, hex20, infohash_hex, resolve_via_catalog, resolve_via_peer,
-    stream_info_from_infohash, stream_info_from_transport_url, transport_bytes_from_url,
-    transport_bytes_via_peer, vod_info_from_transport, ResolveCache, ResolveError,
+    stream_info_from_transport, stream_info_from_transport_url, transport_bytes_from_url,
+    transport_bytes_via_peer, vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
 };
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
@@ -75,13 +76,16 @@ const RESOLVE_PEER_TIMEOUT: Duration = Duration::from_secs(6);
 const BACKGROUND_DISCOVERY_BUDGET: Duration = Duration::from_secs(8);
 const BACKGROUND_DISCOVERY_PEER_TARGET: usize = 64;
 
-/// Acestream's hardcoded public UDP tracker (see `docs/protocol/notes/03`). A bare
-/// content-id/infohash carries no tracker of its own, so we announce here to find peers.
-/// DHT discovery runs alongside this tracker in `discover_peers`.
+/// Acestream's hardcoded public UDP tracker (see `docs/protocol/notes/03`). Used for
+/// content-id/metadata discovery and as the fallback list where a descriptor has none. DHT
+/// discovery runs alongside this tracker in `discover_peers`.
 const DEFAULT_ACE_TRACKERS: &[&str] = &["udp://t1.torrentstream.org:2710/announce"];
 
 /// How long a resolved content-id → `StreamInfo` stays cached.
 const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
+/// How many verified live descriptors the infohash index keeps (#164). Each entry is a few KiB
+/// at most (geometry, trackers, pubkey, metadata).
+const INFOHASH_INDEX_CAPACITY: usize = 256;
 
 /// Byte ceiling for an infohash's shared reseed store. With `SEED_STORE_RETENTION` set this is a
 /// hard safety cap; the age bound is the primary limiter on a live stream.
@@ -187,6 +191,15 @@ pub struct AceProvider {
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
     resolve_cache: ResolveCache,
+    /// Content ids resolved over BEP-9 peers. BEP-9 binds a blob only to the content id the
+    /// caller chose, and the infohash does not bind trackers/categories, so these results must
+    /// never make an infohash openable (#164): they are never put into `infohash_index`.
+    peer_resolve_cache: ResolveCache,
+    /// Live descriptors keyed by swarm infohash. Filled only by signed-catalog content-id
+    /// resolutions (never BEP-9 or a transport url; own broadcasts are read from the seed
+    /// registry instead), so a later bare-infohash open uses the real geometry, pubkey and
+    /// trackers (#164). Separate from `resolve_cache`, which is keyed by the content-id string.
+    infohash_index: InfohashIndex,
     seed_registry: SeedRegistry,
     seed_store_bytes: u64,
     /// Age bound for live seed stores; `None` disables it (byte-only). Default `SEED_STORE_RETENTION`.
@@ -217,6 +230,8 @@ impl AceProvider {
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_peers: Vec::new(),
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
+            peer_resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
+            infohash_index: InfohashIndex::new(INFOHASH_INDEX_CAPACITY),
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
             seed_store_retention: Some(SEED_STORE_RETENTION),
@@ -273,8 +288,9 @@ impl AceProvider {
         self.announce_peer_port.borrow().unwrap_or(0)
     }
 
-    /// Trackers used for a bare infohash (which carries none); transport files supply their
-    /// own. Operators can extend this; DHT discovery is a documented follow-up.
+    /// Trackers used for content-id/metadata discovery and as the fallback where a descriptor
+    /// has none (a bare infohash opens only from a verified descriptor). Transport files supply
+    /// their own. Operators can extend this; DHT discovery runs alongside.
     pub fn with_trackers(mut self, trackers: Vec<String>) -> Self {
         self.default_trackers = trackers;
         self
@@ -381,9 +397,16 @@ impl AceProvider {
     /// Resolve a content-id to a [`StreamInfo`] by fetching its `AceStreamTransport` metadata
     /// from the signed catalog path, falling back to BEP-9 `ut_metadata` from a metadata-swarm
     /// peer (cached with a TTL). The content-id itself is the metadata-swarm handshake key;
-    /// the result carries the real infohash.
+    /// the result carries the real infohash. Only a signed-catalog result is recorded in the
+    /// infohash index; a BEP-9 result goes to `peer_resolve_cache` and never makes its infohash
+    /// openable (#164).
     async fn resolve_content_id(&self, content_id: &str) -> Result<StreamInfo, ProviderError> {
         if let Some(info) = self.resolve_cache.get(content_id) {
+            // Re-record: the bounded infohash index may have evicted it since (#164).
+            self.infohash_index.put(info.clone());
+            return Ok(info);
+        }
+        if let Some(info) = self.peer_resolve_cache.get(content_id) {
             return Ok(info);
         }
         let key = hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
@@ -393,6 +416,7 @@ impl AceProvider {
                 let ih = infohash_hex(&info.infohash);
                 crate::alog!("[ace] resolved cid:{content_id} via catalog -> infohash {ih}");
                 self.resolve_cache.put(content_id, info.clone());
+                self.infohash_index.put(info.clone());
                 return Ok(info);
             }
             Err(e) => crate::alog!("[ace] resolve cid:{content_id}: catalog failed: {e:?}"),
@@ -426,7 +450,9 @@ impl AceProvider {
                 Ok(info) => {
                     let ih = infohash_hex(&info.infohash);
                     crate::alog!("[ace] resolved cid:{content_id} via {addr} -> infohash {ih}");
-                    self.resolve_cache.put(content_id, info.clone());
+                    // BEP-9 only binds the blob to the content id the caller chose: keep it
+                    // out of the infohash index (#164).
+                    self.peer_resolve_cache.put(content_id, info.clone());
                     return Ok(info);
                 }
                 Err(ResolveError::Peer(why)) => crate::alog!("[ace] resolve {addr}: {why}"),
@@ -436,6 +462,75 @@ impl AceProvider {
         Err(ProviderError::Backend(
             "content-id resolution: no metadata peer responded".into(),
         ))
+    }
+
+    /// Resolve a live `id` to a verified [`StreamInfo`]: the single resolver behind every live
+    /// entry point (native `/streams`, compat `/ace/getstream` + `/ace/manifest.m3u8`, and
+    /// `outpace play`). See #164.
+    ///
+    /// - `cid:<40hex>`: signed catalog, then BEP-9 peers ([`Self::resolve_content_id`]).
+    /// - a transport-url id: fetched under the SSRF guard; not recorded in the infohash index.
+    /// - a bare 40-hex infohash: a broadcast this daemon originates, or a descriptor resolved
+    ///   through the signed catalog and indexed ([`Self::verified_info_for_infohash`]);
+    ///   otherwise [`ProviderError::Unresolvable`]. BEP-9 and transport-url descriptors never
+    ///   qualify.
+    ///
+    /// Every signed-catalog content-id descriptor resolved here is recorded in the infohash
+    /// index, so the stream can later be opened by its infohash too (BEP-9 results are not). outpace never guesses live geometry.
+    async fn resolve_live_info(&self, id: &str) -> Result<StreamInfo, ProviderError> {
+        if let Some(content_id) = id.strip_prefix("cid:") {
+            return self.resolve_content_id(content_id).await;
+        }
+        if let Some(url) = crate::transport_url::decode_transport_url(id) {
+            // Not recorded in the index: a transport URL is caller-supplied, and the index is
+            // shared state whose trackers the infohash does not bind (#164).
+            return stream_info_from_transport_url(&url)
+                .await
+                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")));
+        }
+        if is_bare_hex40(id) {
+            return match self.verified_info_for_infohash(id) {
+                Ok(info) => {
+                    crate::alog!("[ace] open {id}: using a descriptor verified in this process");
+                    Ok(info)
+                }
+                Err(e) => {
+                    crate::alog!("[ace] open {id}: refused, no verified descriptor for it");
+                    Err(e)
+                }
+            };
+        }
+        Err(ProviderError::Backend(
+            "id must be a 40-hex infohash, cid:<40hex>, or a transport-url id".into(),
+        ))
+    }
+
+    /// The verified live descriptor for a bare 40-hex infohash, or
+    /// [`ProviderError::Unresolvable`] with a user-facing reason. Offline and synchronous, so
+    /// the compat routes can pre-check an id before minting playback URLs
+    /// ([`StreamProvider::check_openable`]).
+    ///
+    /// A broadcast this daemon originates wins: its transport is self-minted. Otherwise the
+    /// shared index serves a descriptor resolved through the signed catalog. BEP-9 and
+    /// transport-url descriptors are never in the index: neither binds the descriptor's
+    /// trackers to the infohash (#164).
+    fn verified_info_for_infohash(&self, id: &str) -> Result<StreamInfo, ProviderError> {
+        let infohash = hex20(id).map_err(|_| ProviderError::Backend("bad infohash".into()))?;
+        // Decoding recomputes the infohash from the minted bytes.
+        if let Some(transport) = self
+            .seed_registry
+            .broadcast_transport_for_infohash(&infohash)
+        {
+            if let Ok(info) = stream_info_from_transport(&transport) {
+                if info.infohash == infohash {
+                    return Ok(info);
+                }
+            }
+        }
+        if let Some(info) = self.infohash_index.get(&infohash) {
+            return Ok(info);
+        }
+        Err(ProviderError::Unresolvable(unresolved_infohash_message(id)))
     }
 
     /// Resolve `id` to a single-file VOD, returning a handle that knows its total length and can
@@ -531,6 +626,24 @@ impl AceProvider {
             "vod content-id resolution: no metadata peer responded".into(),
         ))
     }
+}
+
+/// Whether `id` is a bare 40-hex string: a swarm infohash, or a content id missing its `cid:`
+/// prefix (#165). The two are indistinguishable by shape.
+fn is_bare_hex40(id: &str) -> bool {
+    id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The user-facing reason a bare 40-hex id cannot be opened (#164), with the `cid:` hint for a
+/// content id pasted without its prefix (#165).
+fn unresolved_infohash_message(id: &str) -> String {
+    format!(
+        "no verified transport descriptor for infohash {id}: outpace does not guess live stream \
+         geometry. Open the stream by content id first (cid:<content-id> on /streams, \
+         content_id=<content-id> on /ace/getstream, acestream://<content-id> for outpace play); \
+         its infohash then works in this process. If {id} is itself a content id, open it as one \
+         (cid:{id})."
+    )
 }
 
 /// Resolve the live history depth needed to fill the startup reservoir. Known bitrates use
@@ -836,24 +949,22 @@ impl StreamProvider for AceProvider {
         self.resolve_vod_inner(id).await
     }
 
-    async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
-        // Two id shapes: a bare 40-hex infohash resolves directly with default live geometry;
-        // a `cid:<40hex>` content-id is resolved over the network via ut_metadata (the engine
-        // does content_id→infohash internally — we do it ourselves, no Acestream API).
-        let info = if let Some(content_id) = id.strip_prefix("cid:") {
-            self.resolve_content_id(content_id).await?
-        } else if let Some(url) = crate::transport_url::decode_transport_url(id) {
-            stream_info_from_transport_url(&url)
-                .await
-                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")))?
-        } else if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            stream_info_from_infohash(id, self.default_trackers.clone())
-                .map_err(|_| ProviderError::Backend("bad infohash".into()))?
+    fn check_openable(&self, id: &str) -> Result<(), ProviderError> {
+        if is_bare_hex40(id) {
+            self.verified_info_for_infohash(id).map(|_| ())
         } else {
-            return Err(ProviderError::Backend(
-                "id must be a 40-hex infohash, cid:<40hex>, or a transport-url id".into(),
-            ));
-        };
+            Ok(())
+        }
+    }
+
+    fn remember_live_descriptor(&self, info: &StreamInfo) {
+        self.infohash_index.put(info.clone());
+    }
+
+    async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        // One resolver for every live entry point. A bare infohash without a verified
+        // descriptor fails closed here, before any discovery (#164).
+        let info = self.resolve_live_info(id).await?;
 
         // Bootstrap peers are the proven/direct path and must be tried without waiting for
         // tracker/DHT discovery. Background refill can still discover more peers after start.
@@ -1562,8 +1673,9 @@ impl Continuity {
         let start = prefetch_start(min_piece, max_piece, prefetch);
         // Strip the per-piece signature tail from the emitted media stream, and — when the
         // resolved transport gave us the source's `pubkey` — verify each piece's in-band RSA
-        // signature before its bytes can be served (issue #10). A bare-infohash stream has no
-        // `source_pubkey`, so it only strips; `with_source_pubkey` is then a no-op.
+        // signature before its bytes can be served (issue #10). A descriptor without a
+        // parseable pubkey yields `sig_len == 0` and an empty `source_pubkey`, so nothing is
+        // stripped or verified.
         let reasm = PieceReassembler::new(info.piece_length, start)
             .with_piece_trailer(info.sig_len as u64)
             .with_source_pubkey(info.source_pubkey.clone())
@@ -3027,6 +3139,35 @@ async fn read_peer_window(
     None
 }
 
+/// Test-only builders shared by the provider and HTTP tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use ace_wire::bencode::Bencode;
+    use std::collections::BTreeMap;
+
+    /// A synthetic live `AceStreamTransport` built with outpace's own encoder and a freshly
+    /// generated RSA source key (#164). Nothing is derived from a real stream; callers compute
+    /// its infohash at test time. Returns `(transport_bytes, pubkey_der)`.
+    pub(crate) fn synthetic_live_transport(piece_length: i64) -> (Vec<u8>, Vec<u8>) {
+        let pubkey = ace_wire::live_auth::LiveSourceAuth::generate().pubkey_der();
+        let mut d: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+        d.insert(b"name".to_vec(), Bencode::Bytes(b"Synthetic Live".to_vec()));
+        d.insert(b"piece_length".to_vec(), Bencode::Int(piece_length));
+        d.insert(b"chunk_length".to_vec(), Bencode::Int(16_384));
+        d.insert(b"bitrate".to_vec(), Bencode::Int(1_000_000));
+        d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"RSA".to_vec()));
+        d.insert(b"pubkey".to_vec(), Bencode::Bytes(pubkey.clone()));
+        d.insert(
+            b"trackers".to_vec(),
+            Bencode::List(vec![Bencode::Bytes(b"udp://tracker.invalid:80".to_vec())]),
+        );
+        (
+            ace_wire::transport::encode_transport(&Bencode::Dict(d)),
+            pubkey,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3566,6 +3707,190 @@ mod tests {
         ));
     }
 
+    const PLACEHOLDER_ID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn test_provider() -> AceProvider {
+        AceProvider::new(Arc::new(Identity::generate()), 0)
+    }
+
+    #[tokio::test]
+    async fn bare_infohash_without_a_verified_descriptor_fails_closed() {
+        let p = test_provider();
+        // No descriptor and no bootstrap peers: the refusal must come before any discovery, so
+        // the timeout only trips if open() regressed into tracker/DHT I/O.
+        let err = tokio::time::timeout(Duration::from_secs(2), p.open(PLACEHOLDER_ID))
+            .await
+            .expect("must fail before any network I/O")
+            .err()
+            .expect("a bare infohash with no verified descriptor must not stream");
+        match err {
+            ProviderError::Unresolvable(msg) => {
+                assert!(msg.contains(&format!("cid:{PLACEHOLDER_ID}")), "{msg}");
+            }
+            other => panic!("expected Unresolvable, got {other:?}"),
+        }
+        assert!(matches!(
+            p.check_openable(PLACEHOLDER_ID),
+            Err(ProviderError::Unresolvable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bare_infohash_uses_the_verified_descriptors_geometry_and_pubkey() {
+        let (transport, pubkey) = test_support::synthetic_live_transport(524_288);
+        let verified = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
+        let p = test_provider();
+        p.remember_live_descriptor(&verified);
+
+        // Hex ids are case-insensitive: an upper-case infohash must hit the same entry.
+        let id = infohash_hex(&verified.infohash).to_ascii_uppercase();
+        assert!(p.check_openable(&id).is_ok());
+        let info = p.resolve_live_info(&id).await.unwrap();
+        assert_eq!(
+            info.infohash,
+            ace_wire::infohash::infohash_of_transport(&transport)
+        );
+        assert_eq!(info.piece_length, 524_288, "not the old 1 MiB guess");
+        assert_eq!(info.chunk_length, 16_384);
+        assert_eq!(info.sig_len, 96);
+        assert_eq!(
+            info.source_pubkey, pubkey,
+            "pubkey enables RSA piece verification"
+        );
+        assert_eq!(info.metadata.title.as_deref(), Some("Synthetic Live"));
+    }
+
+    #[tokio::test]
+    async fn content_id_resolution_records_the_descriptor_under_its_infohash() {
+        let (transport, _) = test_support::synthetic_live_transport(524_288);
+        let verified = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
+        let p = test_provider();
+        let ih = infohash_hex(&verified.infohash);
+        assert!(p.check_openable(&ih).is_err());
+
+        // A cached content-id resolution (no network) must also feed the infohash index.
+        p.resolve_cache.put(PLACEHOLDER_ID, verified.clone());
+        let via_cid = p
+            .resolve_live_info(&format!("cid:{PLACEHOLDER_ID}"))
+            .await
+            .unwrap();
+        assert_eq!(via_cid, verified);
+        assert_eq!(p.resolve_live_info(&ih).await.unwrap(), verified);
+
+        // The content id itself is not an infohash: the two namespaces stay separate (#165).
+        assert!(matches!(
+            p.check_openable(PLACEHOLDER_ID),
+            Err(ProviderError::Unresolvable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn own_broadcast_opens_by_infohash_with_its_minted_geometry() {
+        let seed = SeedRegistry::new();
+        let broadcasts = crate::broadcast::BroadcastRegistry::new();
+        let (bc, _) = broadcasts
+            .start_or_resume(
+                "t164",
+                "T164",
+                &["udp://tracker.invalid:80".into()],
+                &seed,
+                1 << 20,
+            )
+            .await;
+        let id = infohash_hex(&bc.infohash);
+
+        // A provider that does not share the broadcast's registry still refuses it.
+        assert!(matches!(
+            test_provider().check_openable(&id),
+            Err(ProviderError::Unresolvable(_))
+        ));
+
+        let p = test_provider().with_seed_registry(seed);
+        assert!(p.check_openable(&id).is_ok());
+        let info = p.resolve_live_info(&id).await.unwrap();
+        assert_eq!(info.infohash, bc.infohash);
+        assert_eq!(info.piece_length, crate::broadcast::PIECE_LENGTH);
+        assert_eq!(info.source_pubkey, bc.auth.pubkey_der());
+    }
+
+    #[tokio::test]
+    async fn peer_resolved_content_id_does_not_make_its_infohash_openable() {
+        let (transport, _) = test_support::synthetic_live_transport(524_288);
+        let verified = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
+        let p = test_provider();
+        p.peer_resolve_cache.put(PLACEHOLDER_ID, verified.clone());
+
+        // The caller who chose this content id gets its descriptor...
+        let via_cid = p
+            .resolve_live_info(&format!("cid:{PLACEHOLDER_ID}"))
+            .await
+            .unwrap();
+        assert_eq!(via_cid, verified);
+
+        // ...but BEP-9 binds the blob only to that content id, so the infohash stays closed.
+        let ih = infohash_hex(&verified.infohash);
+        assert!(matches!(
+            p.check_openable(&ih),
+            Err(ProviderError::Unresolvable(_))
+        ));
+        assert!(matches!(
+            p.resolve_live_info(&ih).await,
+            Err(ProviderError::Unresolvable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn own_broadcast_wins_over_a_conflicting_index_entry() {
+        use ace_wire::bencode::Bencode;
+        let seed = SeedRegistry::new();
+        let broadcasts = crate::broadcast::BroadcastRegistry::new();
+        let (bc, _) = broadcasts
+            .start_or_resume(
+                "t164b",
+                "T164B",
+                &["udp://own.invalid:80".into()],
+                &seed,
+                1 << 20,
+            )
+            .await;
+        let own = seed.broadcast_transport_for_infohash(&bc.infohash).unwrap();
+
+        // Same infohash, different (unbound) trackers.
+        let decoded = ace_wire::transport::decode_transport(&own).unwrap();
+        let Bencode::Dict(mut dict) = decoded.raw else {
+            panic!("transport is not a dict");
+        };
+        dict.insert(
+            b"trackers".to_vec(),
+            Bencode::List(vec![Bencode::Bytes(b"udp://evil.invalid:80".to_vec())]),
+        );
+        let patched = ace_wire::transport::encode_transport(&Bencode::Dict(dict));
+        assert_eq!(
+            ace_wire::infohash::infohash_of_transport(&patched),
+            bc.infohash
+        );
+
+        let p = test_provider().with_seed_registry(seed);
+        let evil = ace_swarm::resolve::stream_info_from_transport(&patched).unwrap();
+        assert_eq!(evil.trackers, vec!["udp://evil.invalid:80".to_string()]);
+        p.remember_live_descriptor(&evil);
+
+        let info = p
+            .resolve_live_info(&infohash_hex(&bc.infohash))
+            .await
+            .unwrap();
+        assert_eq!(info.trackers, vec!["udp://own.invalid:80".to_string()]);
+    }
+
+    #[test]
+    fn check_openable_leaves_non_infohash_ids_to_open() {
+        let p = test_provider();
+        assert!(p.check_openable(&format!("cid:{PLACEHOLDER_ID}")).is_ok());
+        let turl = crate::transport_url::encode_transport_url("https://example.invalid/x.acelive")
+            .unwrap();
+        assert!(p.check_openable(&turl).is_ok());
+    }
+
     #[tokio::test]
     async fn content_id_with_bad_hex_is_rejected_without_network() {
         let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
@@ -3724,8 +4049,15 @@ mod tests {
 
     #[test]
     fn continuity_uses_configured_live_recovery_bounds() {
-        let info =
-            stream_info_from_infohash("0123456789abcdef0123456789abcdef01234567", vec![]).unwrap();
+        let info = StreamInfo {
+            infohash: [0x01; 20],
+            piece_length: 1_048_576,
+            chunk_length: 16_384,
+            trackers: vec![],
+            metadata: StreamMetadata::default(),
+            sig_len: 96,
+            source_pubkey: vec![],
+        };
         let policy = LiveRecoveryConfig {
             max_piece_advance: 7,
             max_reasm_pieces_ahead: 9,

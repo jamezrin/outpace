@@ -10,7 +10,7 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 /// Default tracker for minted broadcasts (B1) — the same public UDP tracker `AceProvider`
-/// falls back to for bare infohashes with none of their own. A freshly minted broadcast
+/// uses for content-id discovery and as its fallback where a descriptor has none. A freshly minted broadcast
 /// self-announces to this tracker *and* DHT (`ace_provider::announce_infohash_periodically`,
 /// spawned from `http.rs`'s ingest handler) as soon as it's minted, independent of whether
 /// anything is locally following it — a pure origin needs to be discoverable too.

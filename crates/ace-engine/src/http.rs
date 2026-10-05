@@ -374,7 +374,7 @@ pub struct AppState {
     pub resolve_content_ids_in_getstream: bool,
     /// Official `/ace/getstream?content_id=` returns URLs keyed by the resolved infohash.
     /// Internally, keep using `cid:<content_id>` so playback gets the catalog-derived
-    /// transport geometry/trackers instead of degrading to bare-infohash defaults.
+    /// transport geometry/trackers (a bare infohash would need an already-indexed descriptor).
     pub ace_sessions: Arc<AceSessionStore>,
     /// Experimental legacy Acestream HTTP compatibility surface. Native `/streams` and
     /// `/broadcast` routes remain available regardless of this flag.
@@ -1176,11 +1176,17 @@ async fn resolve_server_api_selector(
                 return Err("content-id catalog resolution is disabled".to_string());
             }
             match resolve_via_catalog(&cid).await {
-                Ok(info) => Ok(ResolvedContent {
-                    infohash: infohash_hex(&info.infohash),
-                    content_id: Some(cid),
-                    is_live: true,
-                }),
+                Ok(info) => {
+                    // `resolve_via_catalog` is the signed catalog, so this descriptor is indexable.
+                    if let Some(network) = ace_network(s) {
+                        s.manager.remember_live_descriptor(&network, &info);
+                    }
+                    Ok(ResolvedContent {
+                        infohash: infohash_hex(&info.infohash),
+                        content_id: Some(cid),
+                        is_live: true,
+                    })
+                }
                 Err(e) => Err(format!("content-id resolution failed: {e:?}")),
             }
         }
@@ -1232,12 +1238,18 @@ impl AceStreamSelection {
 async fn resolve_ace_selection(
     s: &AppState,
     params: &HashMap<String, String>,
-) -> Result<AceStreamSelection, &'static str> {
+) -> Result<AceStreamSelection, String> {
     let mut selection = ace_selected_stream(params)?;
+    let network = ace_network(s);
     if s.resolve_content_ids_in_getstream {
         if let Some(content_id) = selection.content_id.as_deref() {
             match resolve_via_catalog(content_id).await {
                 Ok(info) => {
+                    // A client may open this infohash directly later (#164). Signed catalog
+                    // (`resolve_via_catalog`) only, so the descriptor is indexable.
+                    if let Some(network) = network.as_deref() {
+                        s.manager.remember_live_descriptor(network, &info);
+                    }
                     selection =
                         selection.with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
                 }
@@ -1245,6 +1257,15 @@ async fn resolve_ace_selection(
                     "[ace] content-id catalog resolution failed, falling back to cid: {e:?}"
                 ),
             }
+        }
+    }
+    // A bare infohash (`infohash=` or `magnet=`) carries no descriptor: refuse it before minting
+    // playback URLs unless the provider already holds a verified one (#164).
+    if let Some(network) = network.as_deref() {
+        if let Err(ProviderError::Unresolvable(reason)) =
+            s.manager.check_openable(network, &selection.session_key)
+        {
+            return Err(reason);
         }
     }
     Ok(selection)
@@ -1428,6 +1449,18 @@ async fn stream_segment(
     }
 }
 
+/// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
+/// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
+/// that text; every other failure keeps the historical bodiless `404`.
+fn stream_start_error(e: ProviderError) -> Response {
+    match e {
+        ProviderError::Unresolvable(reason) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// `GET /streams/{network}/{id}` or `{id}.ts` (continuous MPEG-TS), or `.m3u8` (live HLS
 /// playlist).
 async fn stream_file(
@@ -1460,7 +1493,7 @@ async fn stream_file_with_hls_timeout(
                 )
                     .into_response()
             }
-            Err(_) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => stream_start_error(e),
         };
     }
     let id = if let Some(id) = file.strip_suffix(".ts") {
@@ -1475,7 +1508,7 @@ async fn stream_file_with_hls_timeout(
     };
     let session = match s.manager.get_or_start(&network, id).await {
         Ok(sess) => sess,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return stream_start_error(e),
     };
     stream_session_response(session)
 }
@@ -4605,5 +4638,112 @@ mod tests {
         // fixture_state leaves the compat surface off, so /server/api is not routed at all.
         let (status, _) = server_api_json(fixture_state(0), "method=get_version").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    const UNRESOLVED_IH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// An app whose `ace` network is a real `AceProvider` with no peers and an empty infohash
+    /// index, so bare-infohash requests exercise the #164 refusal without network I/O.
+    fn ace_provider_state() -> AppState {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(crate::ace_provider::AceProvider::new(
+            Arc::new(ace_wire::identity::Identity::generate()),
+            0,
+        )));
+        AppState {
+            manager: StreamManager::new(registry),
+            networks: vec!["ace".into()],
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: Arc::new(AceSessionStore::default()),
+            experimental_ace_compat: true,
+            broadcasts: None,
+        }
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_routes_refuse_a_bare_infohash_without_a_descriptor() {
+        for path in [
+            format!("/streams/ace/{UNRESOLVED_IH}"),
+            format!("/streams/ace/{UNRESOLVED_IH}.ts"),
+            format!("/streams/ace/{UNRESOLVED_IH}.m3u8"),
+        ] {
+            let resp = router(ace_provider_state())
+                .oneshot(Request::get(path.as_str()).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            let content_type = resp.headers()[header::CONTENT_TYPE].to_str().unwrap();
+            assert!(
+                content_type.starts_with("text/plain"),
+                "{path}: {content_type}"
+            );
+            let body = body_text(resp).await;
+            assert!(
+                body.contains(&format!("cid:{UNRESOLVED_IH}")),
+                "{path}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_routes_refuse_a_bare_infohash_before_minting_a_lease() {
+        let state = ace_provider_state();
+        let sessions = state.ace_sessions.clone();
+        let app = router(state);
+        for query in [
+            format!("/ace/getstream?format=json&infohash={UNRESOLVED_IH}"),
+            format!("/ace/getstream?infohash={UNRESOLVED_IH}"),
+            format!(
+                "/ace/getstream?format=json&magnet=magnet%3A%3Fxt%3Durn%3Abtih%3A{UNRESOLVED_IH}"
+            ),
+            format!("/ace/manifest.m3u8?format=json&infohash={UNRESOLVED_IH}"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(query.as_str()).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{query}");
+            let json: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+            assert!(json["response"].is_null(), "{query}: {json}");
+            let error = json["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains(&format!("cid:{UNRESOLVED_IH}")),
+                "{query}: {error}"
+            );
+        }
+        assert_eq!(
+            sessions.active_count(),
+            0,
+            "a refused selector mints no lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn compat_getstream_mints_urls_for_an_infohash_with_a_verified_descriptor() {
+        let state = ace_provider_state();
+        let (transport, _) = crate::ace_provider::test_support::synthetic_live_transport(524_288);
+        let info = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
+        state.manager.remember_live_descriptor("ace", &info);
+        let ih = infohash_hex(&info.infohash);
+        // JSON mode only mints URLs; it never opens the stream, so this stays offline.
+        let resp = router(state)
+            .oneshot(
+                Request::get(format!("/ace/getstream?format=json&infohash={ih}").as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert!(json["error"].is_null(), "{json}");
+        assert_eq!(json["response"]["infohash"], ih);
     }
 }

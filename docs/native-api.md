@@ -4,15 +4,17 @@ The native CLI and HTTP routes are outpace's supported integration surface. They
 players such as VLC, media servers such as Jellyfin, and playlist/proxy tools such as dispatcharr.
 Playback requests start and share sessions, while status routes observe sessions already active.
 
-Examples use `http://127.0.0.1:6878` and the built-in `ace` network. An `<id>` may be a
-40-character infohash or another provider identifier accepted by the configured network.
+Examples use `http://127.0.0.1:6878` and the built-in `ace` network. An `<id>` is
+`cid:<content-id>` (recommended), a transport-url id (`turl-…`), or a 40-character infohash.
+An infohash plays only when this daemon already holds a verified transport descriptor for it
+(see [Infohash inputs](#infohash-inputs)); otherwise the request fails closed.
 
 ## CLI
 
 | Command | Behavior |
 | --- | --- |
 | `outpace serve` | Runs the native HTTP API, RTMP ingest, and enabled peer services. With no command, outpace defaults to `serve`. |
-| `outpace play <input>` | Writes live MPEG-TS bytes to stdout. Diagnostics go to stderr, so redirection and piping are safe. Accepts `acestream://`, `acestream:?`, `magnet:`, and HTTP(S) transport-file inputs. |
+| `outpace play <input>` | Writes live MPEG-TS bytes to stdout. Diagnostics go to stderr, so redirection and piping are safe. Accepts `acestream://`, `acestream:?`, `magnet:`, and HTTP(S) transport-file inputs; infohash and magnet inputs fail closed (no verified descriptor in a one-shot process). |
 | `outpace play --vod <input>` | Downloads a single-file VOD, verifies every piece, and writes the file to stdout. |
 | `outpace broadcast <name>` | Creates or resumes a broadcast, prints HTTP/RTMP ingest and playback metadata to stderr, and runs the server. |
 
@@ -31,9 +33,9 @@ outpace broadcast sports --public-host stream.example
 | `GET /healthz` | `200 text/plain` (`ok`) | Process health probe; it does not prove swarm connectivity. |
 | `GET /networks` | `200 application/json`, `{"networks":["ace"]}` | Provider networks configured in this daemon. |
 | `GET /streams` | `200 application/json`, `{"streams":[...]}` | Active shared sessions. Entries have `network`, `id`, direct-client count `clients`, and descriptor `metadata`. |
-| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. |
+| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. A bare infohash without a verified descriptor returns `422` with a plain-text reason. |
 | `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Explicit continuous MPEG-TS form; equivalent for dot-free ids, preserves dots within the provider id, and includes `Icy-Name` when the descriptor supplies a title. |
-| `GET /streams/<network>/<id>.m3u8` | `200 application/vnd.apple.mpegurl` | Starts or joins live HLS packaging and returns a sliding playlist. |
+| `GET /streams/<network>/<id>.m3u8` | `200 application/vnd.apple.mpegurl` | Starts or joins live HLS packaging and returns a sliding playlist. The same `422` applies. |
 | `GET /streams/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Retained live HLS segment. Missing, expired, or not-yet-produced segments return `404`; a segment request alone never starts a stream. |
 | `GET /streams/<network>/<id>/status` | `200 application/json` | Active-session status; `404` before playback starts or after teardown. |
 | `DELETE /streams/<network>/<id>` | `204` | Force-stops an active session; `404` if inactive. A `.ts` or `.m3u8` suffix is also accepted. |
@@ -71,10 +73,25 @@ currently queued on the server, and `uploaded` is bytes. In particular, `buffer_
 decoder or player lead measurement: a client can drain the server queue faster than real time,
 or maintain its own independent buffer. Metadata always has the stable `title`, `bitrate`, and
 `categories` fields;
-bare infohashes and descriptors without metadata return `null`, `null`, and `[]` respectively.
+descriptors without metadata return `null`, `null`, and `[]` respectively.
 The descriptor title is authoritative for both `metadata.title` and `Icy-Name`; outpace does not
-invent a title for a bare infohash.
+invent a title.
 Live HLS media playlists are unchanged because they have no portable stream-title field.
+
+## Infohash inputs
+
+A bare infohash carries no piece geometry or source key, and outpace never guesses them. An
+infohash `<id>` plays only when this daemon already holds a verified transport descriptor for it:
+the stream was resolved earlier in this process through the signed catalog by native
+`cid:<content-id>`, compat `content_id=`/`id=`, or `/server/api` `analyze_content` / `get_media_files` with a `content_id`,
+or it is a broadcast this daemon originates. Such a stream uses the descriptor's piece length
+and verifies each piece against the descriptor's pubkey. An infohash becomes playable only
+from a descriptor fetched through the signed catalog (a content-id resolution) or from the
+daemon's own broadcast; it then uses that descriptor's geometry, pubkey and trackers. A content
+id resolved from BEP-9 peers, or a transport URL, never makes an infohash playable: neither
+binds the descriptor's trackers to the infohash.
+Otherwise playback routes return `422 Unprocessable Content` with a plain-text reason that
+suggests `cid:<id>`. Prefer `cid:<content-id>` ids in playlists.
 
 ## Live startup buffering
 
