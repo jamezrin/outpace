@@ -14,7 +14,7 @@ descriptor. Cold infohash network lookup remains tracked in
 | Non-1 MiB vector under `tests/vectors/transport/` | `synthetic-live-512k.bin` now satisfies the literal fixture requirement; its provenance and invented fields are documented beside it. PR #179 initially generated the vector in tests instead. |
 | No descriptor fails clearly | Native raw/TS/HLS routes return 422 with a content-id hint. Compat infohash/magnet starts return a JSON error before minting a lease. Tests inspect the actual session store and find zero active leases. |
 | CLI `infohash=` and `magnet:` use metadata | One-shot CLI processes have no remembered descriptor or own broadcast, so these inputs fail closed. Positive cold CLI playback remains a #176 parity gap. |
-| Live cid9/infohash equivalence and no sustained continuity corruption | Requires simultaneous capture of the warmed infohash path, content-id path and official engine, with current runtime identifiers and explicitly verified direct routing. Source faults and reserved-table continuity are distinguished from payload corruption. |
+| Live cid9/infohash equivalence and no sustained continuity corruption | Requires two staged comparisons, each simultaneous with the official engine: candidate content-id first, then warmed native/compat infohash sharing one candidate session after the content-id pool stops. Current runtime identifiers and explicitly verified direct routing are required. Source faults and reserved-table continuity are distinguished from payload corruption. |
 
 `warm_infohash_continuity_authenticates_pieces_before_emitting` resolves a
 generated-key 512 KiB descriptor through the catalog cache and infohash index,
@@ -45,11 +45,36 @@ Build a release candidate, start it and official engine 3.2.11 with fresh state,
 and inspect active connections plus `ip route get` before the live capture.
 Resolve cid9 from the gitignored registry as operator context, supply its value
 through runtime environment/arguments, and derive its infohash at runtime.
-Exercise refusals before warming the candidate. Resolve the content id in the
-candidate process, then use `tools/abcompare` capture/analysis with native
-content-id, native infohash, compat infohash and reference content-id endpoints
-on the same monotonic clock. Keep raw descriptors, keys, names, identifiers,
-media, event logs and capture metadata in private scratch outside the repository.
+Exercise refusals before warming the candidate. Use `tools/abcompare` for two
+phases, each with its own monotonic capture clock and simultaneous reference:
+
+1. Capture official-engine content-id playback alongside candidate native
+   content-id playback. This resolves and remembers the candidate descriptor.
+2. Close the phase's readers and explicitly delete the candidate `cid:` session.
+   Confirm its status returns 404, the session list is empty and its logged
+   upstream peer TCP connections have closed. Check that the retained descriptor still permits a
+   compat infohash JSON start; revoke that probe lease without opening playback.
+   Keep the candidate daemon running so its descriptor index survives.
+3. Capture official-engine playback alongside candidate native and compat
+   infohash playback. During capture, require exactly one candidate infohash
+   session with two clients and no CID session. The two candidate listeners share
+   one upstream pool, keeping each phase to two upstream consumers on the host.
+
+The content-id and infohash windows differ. Compare each candidate path against
+its own simultaneous reference window; source drift prevents cross-phase startup,
+throughput or packet-identity claims. Native and compat infohash outputs can be
+compared within their shared phase. Keep raw descriptors, keys, names, identifiers,
+media, event logs and capture metadata in private disk-backed directories under
+`/home/jamezrin/.cache`, outside the repository. Avoid `/tmp` for captures because
+its quota was exhausted during this audit.
+
+The stop removes the manager session and aborts its pull pump; source follower
+shutdown is asynchronous. Match sockets belonging to the owned candidate PID
+against peer-specific pool/window log entries. Local HTTP clients and unrelated
+catalog/tracker connections are separate observations. This confirms manager
+removal and closure of observed peer connections, not that every background task
+has stopped. If peer evidence or the transition cannot be confirmed, stop before
+the infohash phase and report the limitation.
 
 Analyzer success means it produced metrics. No media, no startup or no shared
 PCR window yields null/unmeasured quality, and cannot establish equivalence.
