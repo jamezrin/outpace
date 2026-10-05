@@ -4,8 +4,14 @@ Validated the harness against the official 3.2.11 engine image and a candidate
 built from main at `af5b176` with `cargo build -p ace-engine --bin outpace`.
 The runner captured **cid9**, resolved by the operator, simultaneously for 180
 seconds with fresh state, host networking and default candidate playback settings.
-No WARP interface or other playback client was present. Raw evidence remains
-outside the repository; this document contains no live identifiers or stream names.
+No other playback client was present. Default routing was not verified for this
+run. A later audit found NetworkManager recorded WARP activation at 16:57:10 UTC,
+before the approximately 17:16–17:20 UTC capture, and the subsequent routing
+inspection selected that interface for ordinary Internet traffic. Exact routes
+at capture time were not recorded. Treat these results as harness observations
+under unverified, likely WARP egress; they establish no direct-route performance
+guarantee. Raw evidence remains outside the repository; this document contains no
+live identifiers or stream names.
 
 | Measurement | Original engine | Current-main candidate |
 | --- | ---: | ---: |
@@ -59,3 +65,6 @@ Both owned clients were removed at completion; the pre-existing BuildKit contain
 remained. Offline tests cover the deadline and cleanup boundaries. Results are
 one source-dependent run with a debug candidate build, not a performance guarantee;
 re-run using the README command and a release build for release comparisons.
+Before a qualifying live run, explicitly verify WARP is off and `ip route get`
+selects the intended direct Internet interface. Interface presence alone is
+insufficient; preserve the route and active-connection inspection privately.

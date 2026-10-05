@@ -3761,6 +3761,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_infohash_vector_preserves_non_default_geometry() {
+        let transport = include_bytes!("../../../tests/vectors/transport/synthetic-live-512k.bin");
+        let descriptor = ace_wire::transport::decode_transport(transport).unwrap();
+        let verified = ace_swarm::resolve::stream_info_from_transport(transport).unwrap();
+        let p = test_provider();
+        p.resolve_cache.put(PLACEHOLDER_ID, verified.clone());
+        p.resolve_live_info(&format!("cid:{PLACEHOLDER_ID}"))
+            .await
+            .unwrap();
+
+        let info = p
+            .resolve_live_info(&infohash_hex(&verified.infohash))
+            .await
+            .unwrap();
+        assert_eq!(info.piece_length, 524_288);
+        assert_eq!(info.chunk_length, 16_384);
+        assert_eq!(info.chunks_per_piece(), 32);
+        assert_eq!(info.sig_len, 96);
+        assert_eq!(info.source_pubkey, descriptor.pubkey);
+        assert!(!info.source_pubkey.is_empty());
+        assert_eq!(info.trackers, vec!["udp://tracker.invalid:80"]);
+    }
+
+    #[tokio::test]
+    async fn warm_infohash_continuity_authenticates_pieces_before_emitting() {
+        let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+        let (transport, _) = test_support::synthetic_live_transport(524_288);
+        // Keep the descriptor and its computed infohash bound to this test's signing key.
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        let ace_wire::bencode::Bencode::Dict(mut fields) = decoded.raw else {
+            panic!("synthetic transport must be a dict");
+        };
+        fields.insert(
+            b"pubkey".to_vec(),
+            ace_wire::bencode::Bencode::Bytes(auth.pubkey_der()),
+        );
+        let transport =
+            ace_wire::transport::encode_transport(&ace_wire::bencode::Bencode::Dict(fields));
+        let verified = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
+        let p = test_provider();
+        p.resolve_cache.put(PLACEHOLDER_ID, verified.clone());
+        p.resolve_live_info(&format!("cid:{PLACEHOLDER_ID}"))
+            .await
+            .unwrap();
+        let info = p
+            .resolve_live_info(&infohash_hex(&verified.infohash))
+            .await
+            .unwrap();
+        let (mut continuity, start) = Continuity::fresh(&info, 7, 7, 0, default_live_recovery());
+        let payload = vec![0x47; info.piece_length as usize - auth.signature_len()];
+        let mut piece = payload.clone();
+        piece.extend(auth.sign(&payload));
+        let mut corrupt = piece.clone();
+        corrupt[0] ^= 1;
+        let chunk_length = info.chunk_length as usize;
+        for (index, block) in corrupt.chunks(chunk_length).enumerate() {
+            let result = continuity
+                .reasm
+                .add_block(start, (index * chunk_length) as u64, block);
+            if index + 1 == info.chunks_per_piece() as usize {
+                assert!(result.is_err(), "bad RSA signature must reject the piece");
+            } else {
+                result.unwrap();
+            }
+        }
+        assert!(continuity.reasm.take_ready().is_empty());
+        assert_eq!(continuity.reasm.next_needed(), start);
+
+        for (index, block) in piece.chunks(chunk_length).enumerate() {
+            continuity
+                .reasm
+                .add_block(start, (index * chunk_length) as u64, block)
+                .unwrap();
+        }
+        assert_eq!(continuity.reasm.take_ready(), payload);
+        assert_eq!(continuity.reasm.next_needed(), start + 1);
+    }
+
+    #[tokio::test]
     async fn content_id_resolution_records_the_descriptor_under_its_infohash() {
         let (transport, _) = test_support::synthetic_live_transport(524_288);
         let verified = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
