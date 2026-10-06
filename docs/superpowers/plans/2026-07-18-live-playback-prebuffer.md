@@ -336,7 +336,7 @@ git commit -m "feat(ace-engine): buffer clean live startup media"
 ```rust
 #[test]
 fn derives_history_from_target_bitrate_and_payload_with_two_piece_margin() {
-    assert_eq!(derived_prefetch_pieces(30_000, Some(8_000_000), 1_048_576, 96), 31);
+    assert_eq!(derived_prefetch_pieces(30_000, Some(1_000_000), 1_048_576, 96), 31);
 }
 
 #[test]
@@ -352,7 +352,7 @@ fn explicit_prefetch_override_is_not_reinterpreted() {
 }
 ```
 
-The arithmetic is `ceil(target_ms * bitrate / 8000 / media_payload_per_piece) + 2`, using checked `u128`; payload is `piece_length - sig_len`, at least one byte.
+The arithmetic is `ceil(target_ms * bitrate / 1000 / media_payload_per_piece) + 2`, with descriptor bitrate in bytes/s, using checked `u128`; payload is `piece_length - sig_len`, at least one byte.
 
 - [ ] **Step 2: Verify RED**
 

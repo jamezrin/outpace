@@ -29,7 +29,8 @@ const ACE_TOKEN_CAPACITY: usize = 4096;
 fn stream_metadata_json(metadata: &StreamMetadata) -> serde_json::Value {
     json!({
         "title": metadata.title,
-        "bitrate": metadata.bitrate,
+        // Transport metadata stores bytes/s; public API rates are bits/s.
+        "bitrate": metadata.bitrate.map(|rate| rate.saturating_mul(8)),
         "categories": metadata.categories,
     })
 }
@@ -1623,10 +1624,19 @@ mod tests {
             }),
             json!({
                 "title": "Synthetic Demo Channel",
-                "bitrate": 100_000,
+                "bitrate": 800_000,
                 "categories": ["sports"],
             })
         );
+    }
+
+    #[test]
+    fn stream_metadata_json_saturates_rate_conversion() {
+        let metadata = StreamMetadata {
+            bitrate: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(stream_metadata_json(&metadata)["bitrate"], u64::MAX);
     }
 
     struct FakeVod {
@@ -3127,7 +3137,7 @@ mod tests {
         assert_eq!(json["response"]["peers"], 1);
         assert_eq!(
             json["response"]["metadata"],
-            stream_metadata_json(&fixture_metadata())
+            json!({ "title": "Synthetic Demo Channel", "bitrate": 800_000, "categories": ["sports"] })
         );
         assert!(json["response"]["downloaded"].as_u64().unwrap() > 0);
 
@@ -3542,7 +3552,7 @@ mod tests {
         assert_eq!(value["response"]["is_live"], 1);
         assert_eq!(
             value["response"]["metadata"],
-            stream_metadata_json(&fixture_metadata())
+            json!({ "title": "Synthetic Demo Channel", "bitrate": 800_000, "categories": ["sports"] })
         );
         let token = value["response"]["playback_session_id"].as_str().unwrap();
         assert_eq!(token.len(), 64);
@@ -4080,7 +4090,8 @@ mod tests {
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["metadata"], stream_metadata_json(&fixture_metadata()));
+        assert_eq!(value["metadata"]["bitrate"], 800_000);
+        assert_eq!(value["metadata"]["title"], "Synthetic Demo Channel");
         assert_eq!(value["bitrate"], 0, "measured bitrate keeps its meaning");
     }
 
@@ -4178,7 +4189,7 @@ mod tests {
         assert_eq!(value["streams"][0]["id"], "abc");
         assert_eq!(
             value["streams"][0]["metadata"],
-            stream_metadata_json(&fixture_metadata())
+            json!({ "title": "Synthetic Demo Channel", "bitrate": 800_000, "categories": ["sports"] })
         );
     }
 

@@ -63,7 +63,7 @@ explicitly supplied:
 
 - explicit value: use that exact requested history depth, subject only to the upstream's real live
   window and existing safety bounds;
-- absent value: derive a history depth for `OUTPACE_PREBUFFER_MS` from descriptor bitrate and
+- absent value: derive a history depth for `OUTPACE_PREBUFFER_MS` from descriptor bitrate in bytes per second and
   piece payload geometry when bitrate is available, with two extra pieces for rounding/jitter;
 - missing/untrusted bitrate: use a conservative fallback of 32 pieces;
 - prebuffer disabled: preserve the existing fallback of 8 pieces.
@@ -120,7 +120,7 @@ Readiness occurs on the first of:
 3. `OUTPACE_PREBUFFER_TIMEOUT_MS` elapses after the first clean packet.
 
 If PCR is unavailable, a trustworthy positive descriptor bitrate may estimate queued duration as
-`queued_bytes * 8 / bitrate`. This estimate may satisfy the duration target. Without PCR or usable
+`queued_bytes / bitrate` (descriptor bytes per second). This estimate may satisfy the duration target. Without PCR or usable
 bitrate, only the byte ceiling or startup deadline releases the reservoir. Every degraded release
 uses `alog!` with the `[prebuffer]` tag and states the reason without including a content id,
 infohash, or stream name.

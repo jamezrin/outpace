@@ -33,6 +33,7 @@ fn release_event(reason: ReleaseReason, duration: Duration, queued_bytes: usize)
 
 struct StartupReservoir {
     config: StartupBufferConfig,
+    /// Raw transport descriptor rate in bytes/s; measured source stats remain bits/s.
     bitrate: Option<u64>,
     queue: VecDeque<Bytes>,
     queued_bytes: usize,
@@ -168,9 +169,8 @@ impl StartupReservoir {
         (clock_duration > Duration::ZERO)
             .then_some(clock_duration)
             .or_else(|| {
-                self.bitrate.map(|rate| {
-                    Duration::from_secs_f64(self.queued_bytes as f64 * 8.0 / rate as f64)
-                })
+                self.bitrate
+                    .map(|rate| Duration::from_secs_f64(self.queued_bytes as f64 / rate as f64))
             })
             .unwrap_or_default()
     }
@@ -568,10 +568,22 @@ mod tests {
             (Bytes::from(vec![b'b'; 500]), false),
         ]);
         let mut buffered =
-            StartupBufferedSource::new(source, config(1_000, 4096, 10_000), Some(8_000));
+            StartupBufferedSource::new(source, config(1_000, 4096, 10_000), Some(1_000));
         let first = buffered.next().await.unwrap();
         assert_eq!(first[0], b'a');
         assert_eq!(buffered.stats().buffer_ms, 500);
+    }
+
+    #[test]
+    fn no_pcr_duration_uses_descriptor_bytes_per_second() {
+        let mut reservoir = StartupReservoir::new(config(1_000, 4096, 10_000), Some(1_000));
+        assert_eq!(reservoir.push(Bytes::from(vec![b'a'; 500])), None);
+        assert_eq!(reservoir.duration(), Duration::from_millis(500));
+        assert_eq!(
+            reservoir.push(Bytes::from(vec![b'b'; 500])),
+            Some(ReleaseReason::TargetDuration)
+        );
+        assert_eq!(reservoir.duration(), Duration::from_secs(1));
     }
 
     #[tokio::test]

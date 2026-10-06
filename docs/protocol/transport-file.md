@@ -33,12 +33,20 @@ descriptor = bencode_parse(plaintext)          # a single dict
 | `name` | channel/content name |
 | `piece_length` | bytes per piece (e.g. 1048576 or 131072) |
 | `chunk_length` | bytes per chunk (16384 = 16 KiB) |
-| `bitrate`, `quality` | media hints |
+| `bitrate` | advertised media rate in bytes per second |
+| `quality` | media quality hint |
 | `authmethod` | `RSA` (live integrity via source signature) |
 | `pubkey` | 124-byte RSA DER public key of the broadcaster |
 | `trackers` | list of `udp://…/announce` tracker URLs |
 | `categories`, `allow_public_trackers`, `permanent` | metadata/flags |
 | `pieces` | **VOD only** — concatenated 20-byte SHA1 piece hashes (see OPEN) |
+
+The bitrate unit is bytes per second, matching the original engine 3.2.11. Its torrent
+metadata duration fallback computes media byte length divided by seconds: a synthetic
+10,000,000-byte file with a 10-second duration reports 1,000,000. The transport descriptor
+getter returns the raw `bitrate` value. Outpace keeps that unit internally and converts it
+to bits per second for public API rate fields.
+
 
 Validated decode:
 - `transport-01.bin` → name "Synthetic Live Channel 1080 …", `piece_length=1048576`, RSA, 2 trackers, **live (no `pieces`)**.
