@@ -44,7 +44,7 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: exit 1 # Intentional disposable issue 180 merge-gate probe; never merge.
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
