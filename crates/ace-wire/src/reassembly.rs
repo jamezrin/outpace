@@ -158,6 +158,12 @@ impl PieceReassembler {
         Ok(())
     }
 
+    /// Discard only incomplete bytes for a rejected piece before requesting it again.
+    /// The emit cursor and completed, authenticated pieces remain unchanged.
+    pub fn discard_partial(&mut self, index: u64) {
+        self.partial.remove(&index);
+    }
+
     /// Pull all contiguous completed pieces from `next_emit` onward as one byte buffer,
     /// advancing the emit cursor. Returns empty if the next needed piece isn't ready yet.
     pub fn take_ready(&mut self) -> Vec<u8> {
@@ -194,6 +200,23 @@ impl PieceReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discarding_partial_preserves_cursor_other_partials_and_completed_pieces() {
+        let mut r = PieceReassembler::new(4, 7);
+        r.add_block(7, 0, &[1, 2]).unwrap();
+        r.add_block(8, 0, &[5, 6]).unwrap();
+        r.add_block(9, 0, &[9, 10, 11, 12]).unwrap();
+        r.discard_partial(7);
+        r.discard_partial(9);
+        assert_eq!(r.next_needed(), 7);
+        r.add_block(7, 2, &[3, 4]).unwrap();
+        assert!(r.take_ready().is_empty());
+        r.add_block(7, 0, &[1, 2]).unwrap();
+        assert_eq!(r.take_ready(), vec![1, 2, 3, 4]);
+        r.add_block(8, 2, &[7, 8]).unwrap();
+        assert_eq!(r.take_ready(), vec![5, 6, 7, 8, 9, 10, 11, 12]);
+    }
 
     #[test]
     fn assembles_single_piece_from_in_order_chunks() {

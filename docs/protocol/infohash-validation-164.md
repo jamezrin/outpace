@@ -115,8 +115,8 @@ before obtaining an upstream while its simultaneous reference delivered media.
 The cause was not established. Logs do not identify every failed peer or detailed
 handshake error; this does not prove the source-node loss or stale-window causes
 in #168/#170. The discovery wait and good-peer caching proposal remain relevant to #167, but
-all-handshake exhaustion needs a separate bounded investigation; this audit
-changes no connection behavior.
+all-handshake exhaustion needs a separate bounded investigation within #167;
+the original capture phase introduced no connection changes.
 
 For qualifying cid10 infohash output, all 663,814 nonambiguous whole-candidate
 media packets mapped in order to the reference, with zero reference holes or
@@ -156,3 +156,66 @@ The evidence supports closing the guessed-geometry/unverified-output safety
 scope after independent review, with positive cold CLI/network parity in #176,
 all-PID SDT continuity in #172 and connection availability still explicit. It
 supports neither full original-engine parity nor general network performance.
+
+
+## Rejection and timeout recovery remediation
+
+External review of this audit found that signature rejection bypassed request
+completion bookkeeping: a full peer pool could retain its slots and fail to
+request the rejected piece again. The final candidate includes production fixes
+in both provider receive paths. Rejection clears that piece's partial bytes,
+chunk counters, scheduler ownership, timer and all peer assignments, then
+schedules a retry. Clearing partial bytes matters for malformed blocks too:
+their offset errors can leave earlier bytes buffered while resetting counters
+would otherwise allow reassembly to finish before request accounting.
+
+Ordinary request timeouts preserve partial bytes and first try peers with spare
+capacity. If no retry was assigned, the old slots for that timed-out piece are
+released and scheduling runs again. This fixes the demonstrated full-capacity
+stall while preserving the preference for another available peer. If every peer
+is ineligible, a later unchoke can still schedule the piece.
+
+Regressions exercise the actual pool, peer worker and wire requests with a
+corrupt signed piece, an authentic retry and late/duplicate deliveries. Focused
+scheduler tests cover full capacity, spare-peer preference, duplicate assignments
+with a choked or out-of-window rejecting peer, retained ordinary-timeout partial
+state, and eventual unchoke. Reassembler discard tests preserve the cursor,
+unrelated partial pieces and completed output. These changes concern rejection
+and request capacity; the unresolved live handshake availability observation
+above remains with #167.
+
+
+A fresh optimized control on 2026-10-07 validates the amended production tree
+through the authorized WARP route. Both stages used fresh candidate state and
+simultaneous official engine 3.2.11 playback. The CID pool was deleted and its
+observed peer sockets closed while the descriptor index survived; the subsequent
+native/compat readers shared one infohash session. The same non-default geometry
+and key/tail sizes were measured again.
+
+The 180-second CID phase produced 129,585,768 candidate bytes, with 163.68 seconds
+of shared PCR coverage and 677,962 media packets each, matching 100% in both
+directions. The warm infohash phase produced 137,834,832 bytes per listener:
+174.0 seconds of shared PCR coverage, 720,744 media packets each and 100%
+bidirectional identity against its simultaneous reference. All 729,401 eligible
+whole-candidate packets mapped in order with no reference holes or backward or
+duplicate steps. The complete native/compat captures were identical.
+
+Warm candidate media duplication, sync losses, malformed/transport-error packets
+and PCR jumps were zero. SDT PID 17 still had 87 continuity errors and 264 exact
+repeated PSI packets (88 each PAT/PMT/SDT), retaining the #172 limitation. First
+bytes arrived at about 24.622 seconds for both warm listeners versus 0.782 seconds
+for their reference; zero modeled post-start stalls does not remove that startup
+delay. Separate source windows and the persistent reference daemon prevent
+cross-phase or historical performance claims. This live control logged no rejected
+blocks or timed-out request retries; the failure-recovery behavior is demonstrated
+by the deterministic regressions, rather than inferred from fault-free playback.
+
+
+All five fresh captures were identified as H.264 1080p/AAC 48 kHz and passed
+full video/audio decode commands with exit 0. Diagnostics still contained one
+line per candidate capture, versus 111 and 75 reference lines in the CID and
+infohash phases. Unequal startup boundaries and spans prevent a decoder-score
+comparison; exit 0 does not mean error-free decoding. Fresh cold refusals also
+passed, while the official cold-infohash JSON observation remains URL minting
+only. The final workspace suite passed 836 tests with 7 ignored, alongside
+Clippy, formatting and identifier-hygiene gates.

@@ -1746,6 +1746,16 @@ impl Continuity {
         needed > head && window.max_piece >= head
     }
 
+    /// Rejected bytes cannot complete a request. Forget the partial chunk count and all
+    /// outstanding copies, including requests assigned before a retransmission to another peer.
+    fn release_rejected_piece(&mut self, piece: u64) {
+        self.reasm.discard_partial(piece);
+        self.received_chunks.remove(&piece);
+        self.scheduler.on_drop(piece);
+        self.active_peers.complete_everywhere(piece);
+        self.requested_at.remove(&piece);
+    }
+
     fn note_chunk(&mut self, piece: u64, chunk: u16, chunks_per_piece: u16) -> bool {
         let chunks_per_piece = chunks_per_piece.max(1) as usize;
         let chunks = self.received_chunks.entry(piece).or_default();
@@ -2342,6 +2352,10 @@ async fn follow_peer_pool(
                         // didn't verify (#10): drop it rather than emit unauthenticated bytes.
                         // The piece stays incomplete, so it's re-requested from the pool.
                         crate::alog!("[ace] {addr}: dropped piece {piece} block: {e:?}");
+                        continuity.release_rejected_piece(piece);
+                        let newly_lost =
+                            advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
+                        lost_addrs.extend(newly_lost);
                         continue;
                     }
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
@@ -2658,8 +2672,9 @@ async fn advance_pool_requests(
 /// piece outstanding past the configured request timeout and skip a piece evicted from every
 /// upstream window, then re-issue requests. A timed-out piece is only requeued in the *scheduler* (its
 /// original peer keeps the in-flight slot), so [`ActivePeers::assign`] steers the retry to a
-/// peer with more spare capacity — i.e. a different, faster one when available. Returns any
-/// peers dropped while re-issuing requests.
+/// peer with more spare capacity — i.e. a different, faster one when available. If no retry
+/// was assigned, release the old slots for that piece so full capacity cannot prevent retrying.
+/// Returns any peers dropped while re-issuing requests.
 async fn retransmit_stalled_requests(
     peers: &mut BTreeMap<u64, PeerRuntime>,
     continuity: &mut Continuity,
@@ -2689,14 +2704,25 @@ async fn retransmit_stalled_requests(
             request_timeout,
             continuity.reasm.next_needed()
         );
-        for piece in timed_out {
+        for &piece in &timed_out {
             continuity.scheduler.on_drop(piece);
             continuity.requested_at.remove(&piece);
         }
         changed = true;
     }
     if changed {
-        advance_pool_requests(peers, continuity, chunks_per_piece).await
+        let mut lost = advance_pool_requests(peers, continuity, chunks_per_piece).await;
+        let mut released = false;
+        for piece in timed_out {
+            if !continuity.requested_at.contains_key(&piece) {
+                continuity.active_peers.complete_everywhere(piece);
+                released = true;
+            }
+        }
+        if released {
+            lost.extend(advance_pool_requests(peers, continuity, chunks_per_piece).await);
+        }
+        lost
     } else {
         Vec::new()
     }
@@ -2910,6 +2936,14 @@ async fn follow_one_peer(
                         // didn't verify (#10): drop it rather than emit unauthenticated bytes.
                         // The piece stays incomplete, so it's re-requested from the pool.
                         crate::alog!("[ace] {addr}: dropped piece {piece} block: {e:?}");
+                        continuity.release_rejected_piece(piece);
+                        if unchoked
+                            && advance_requests(session, continuity, chunks_per_piece)
+                                .await
+                                .is_err()
+                        {
+                            return FollowEnd::PeerLost(vec![addr]);
+                        }
                         continue;
                     }
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
@@ -3840,6 +3874,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_signed_piece_retries_through_full_peer_pool() {
+        let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+        let payload: Vec<u8> = (0..4)
+            .flat_map(|cc| {
+                let mut packet = vec![0x55; 188];
+                packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | cc]);
+                packet
+            })
+            .collect();
+        let mut authentic = payload.clone();
+        authentic.extend(auth.sign(&payload));
+        let mut corrupt = authentic.clone();
+        corrupt[0] ^= 1;
+        let info = StreamInfo {
+            infohash: [0; 20],
+            piece_length: authentic.len() as u64,
+            chunk_length: authentic.len() as u64 / 2,
+            trackers: vec![],
+            metadata: StreamMetadata::default(),
+            sig_len: auth.signature_len(),
+            source_pubkey: auth.pubkey_der(),
+        };
+        let policy = LiveRecoveryConfig {
+            max_active_upstreams: 1,
+            max_piece_advance: 1,
+            request_timeout_ms: 5_000,
+            request_check_interval_ms: 10,
+            ..default_live_recovery()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = match listener.local_addr().unwrap() {
+            std::net::SocketAddr::V4(addr) => addr,
+            _ => unreachable!(),
+        };
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (retry_tx, retry_rx) = tokio::sync::oneshot::channel();
+        let (allow_tx, allow_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let chunk_length = info.chunk_length as usize;
+        let server = tokio::spawn(async move {
+            let mut retry_tx = Some(retry_tx);
+            let mut allow_rx = Some(allow_rx);
+            let mut finish_rx = Some(finish_rx);
+            let mut session = PeerSession::new(server);
+            session.send(&PeerMessage::Unchoke).await.unwrap();
+            for attempt in 0..2 {
+                let mut chunks = Vec::new();
+                while chunks.len() < 2 {
+                    let msg = session.read_message().await.unwrap();
+                    if let PeerMessage::Unknown { id: 6, payload } = msg {
+                        assert_eq!(u32::from_be_bytes(payload[4..8].try_into().unwrap()), 7);
+                        chunks.push(u16::from_be_bytes(payload[8..10].try_into().unwrap()));
+                    }
+                }
+                assert_eq!(chunks, vec![0, 1]);
+                if attempt == 0 {
+                    for chunk in [0, 0, 1] {
+                        let begin = chunk as usize * chunk_length;
+                        session
+                            .send(&build_piece(
+                                0,
+                                7,
+                                chunk,
+                                [0; 8],
+                                &corrupt[begin..begin + chunk_length],
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                } else {
+                    retry_tx.take().unwrap().send(()).unwrap();
+                    allow_rx.take().unwrap().await.unwrap();
+                    // Deliver the previously rejected last chunk first. Stale chunk counts
+                    // must not free the slot and start a third request before completion.
+                    session
+                        .send(&build_piece(0, 7, 1, [0; 8], &authentic[chunk_length..]))
+                        .await
+                        .unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), session.read_message())
+                            .await
+                            .is_err(),
+                        "partial retry must stay in flight"
+                    );
+                    session
+                        .send(&build_piece(0, 7, 0, [0; 8], &authentic[..chunk_length]))
+                        .await
+                        .unwrap();
+                    // Late copies must not emit the authenticated piece twice.
+                    for chunk in 0..2 {
+                        let begin = chunk as usize * chunk_length;
+                        session
+                            .send(&build_piece(
+                                0,
+                                7,
+                                chunk,
+                                [0; 8],
+                                &authentic[begin..begin + chunk_length],
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    finish_rx.take().unwrap().await.unwrap();
+                }
+            }
+        });
+        let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(
+            info.piece_length,
+            info.chunk_length,
+            4096,
+        )));
+        let seed = SeedConfig {
+            registry: SeedRegistry::new(),
+            store_bytes: 4096,
+            store_retention: None,
+            enabled: false,
+            prefetch_pieces: 0,
+            live_recovery: policy,
+            cache_type: CacheType::Memory,
+            cache_dir: PathBuf::new(),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let pool = tokio::spawn(async move {
+            let mut continuity = None;
+            follow_peer_pool(
+                vec![ConnectedUpstream {
+                    session: PeerSession::new(client),
+                    addr,
+                    window: live_pos(7, 7),
+                    yourip: None,
+                }],
+                &info,
+                &Identity::generate(),
+                2,
+                &tx,
+                &Arc::new(AtomicU64::new(0)),
+                &Arc::new(AtomicU64::new(0)),
+                &Arc::new(AtomicU32::new(0)),
+                &seed,
+                &store,
+                &mut continuity,
+                vec![],
+                vec![],
+                tokio::sync::watch::channel(None).1,
+                &Arc::new(AtomicU32::new(0)),
+                None,
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), retry_rx)
+            .await
+            .expect("pool must re-request the rejected piece without waiting for timeout")
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "corrupt piece must emit nothing");
+        allow_tx.send(()).unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // The existing TS resynchronizer retains one packet for its next-sync check.
+        assert_eq!(output.bytes.as_ref(), &payload[..564]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "late duplicate blocks must not emit another piece"
+        );
+        finish_tx.send(()).unwrap();
+        server.await.unwrap();
+        pool.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn content_id_resolution_records_the_descriptor_under_its_infohash() {
         let (transport, _) = test_support::synthetic_live_transport(524_288);
         let verified = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
@@ -4236,6 +4444,228 @@ mod tests {
         out.sort_unstable();
         assert_eq!(out, vec![8]);
         assert!(!c.requested_at.contains_key(&4), "passed piece pruned");
+    }
+
+    fn test_pool_peer(addr: SocketAddrV4) -> (PeerRuntime, mpsc::Receiver<PeerCommand>) {
+        let (commands, receiver) = mpsc::channel(8);
+        (
+            PeerRuntime {
+                addr,
+                min_piece: 7,
+                max_piece: 8,
+                unchoked_peer: false,
+                seen_ids: HashSet::new(),
+                commands,
+                worker: tokio::spawn(std::future::pending()),
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn timed_out_piece_retries_when_all_peer_slots_are_full() {
+        let policy = LiveRecoveryConfig {
+            max_piece_advance: 1,
+            ..default_live_recovery()
+        };
+        let (mut c, _) = Continuity::fresh(&info(), 7, 7, 0, policy);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let (peer, mut commands) = test_pool_peer(addr);
+        let mut peers = BTreeMap::from([(1, peer)]);
+        c.register_active_peer(1, addr, live_pos(7, 7));
+        c.set_peer_unchoked(1, true);
+        advance_pool_requests(&mut peers, &mut c, 32).await;
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(PeerCommand::RequestPiece { piece: 7, .. })
+        ));
+        let now = Instant::now() + policy.request_timeout();
+        retransmit_stalled_requests(&mut peers, &mut c, 32, now).await;
+        let retry = commands.try_recv();
+        shutdown_peer_runtimes(&mut peers);
+        assert!(
+            matches!(retry, Ok(PeerCommand::RequestPiece { piece: 7, .. })),
+            "timeout must queue a retry even when every peer was at capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_piece_still_prefers_a_peer_with_spare_capacity() {
+        let policy = LiveRecoveryConfig {
+            max_piece_advance: 1,
+            ..default_live_recovery()
+        };
+        let (mut c, _) = Continuity::fresh(&info(), 7, 7, 0, policy);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let (peer, mut original) = test_pool_peer(addr);
+        let mut peers = BTreeMap::from([(1, peer)]);
+        c.register_active_peer(1, addr, live_pos(7, 7));
+        c.set_peer_unchoked(1, true);
+        advance_pool_requests(&mut peers, &mut c, 32).await;
+        original.try_recv().unwrap();
+        let (peer, mut faster) = test_pool_peer(addr);
+        peers.insert(2, peer);
+        c.register_active_peer(2, addr, live_pos(7, 7));
+        c.set_peer_unchoked(2, true);
+        retransmit_stalled_requests(
+            &mut peers,
+            &mut c,
+            32,
+            Instant::now() + policy.request_timeout(),
+        )
+        .await;
+        let retry = faster.try_recv();
+        let unexpected = original.try_recv();
+        shutdown_peer_runtimes(&mut peers);
+        assert!(matches!(
+            retry,
+            Ok(PeerCommand::RequestPiece { piece: 7, .. })
+        ));
+        assert!(
+            unexpected.is_err(),
+            "normal retry should still prefer spare peer capacity"
+        );
+        assert_eq!(
+            c.active_peers.in_flight_count(1),
+            1,
+            "original late response stays tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_piece_releases_duplicate_assignments_without_dropping_other_requests() {
+        for rejecting_peer_choked in [true, false] {
+            let policy = LiveRecoveryConfig {
+                max_piece_advance: 2,
+                ..default_live_recovery()
+            };
+            let (mut c, _) = Continuity::fresh(&info(), 7, 8, 1, policy);
+            let addr = "127.0.0.1:1".parse().unwrap();
+            let (peer, mut original) = test_pool_peer(addr);
+            let mut peers = BTreeMap::from([(1, peer)]);
+            c.register_active_peer(1, addr, live_pos(7, 8));
+            c.set_peer_unchoked(1, true);
+            advance_pool_requests(&mut peers, &mut c, 32).await;
+            original.try_recv().unwrap(); // piece 7
+            original.try_recv().unwrap(); // unrelated piece 8
+            let (peer, mut rejecting) = test_pool_peer(addr);
+            peers.insert(2, peer);
+            c.register_active_peer(2, addr, live_pos(7, 7));
+            c.set_peer_unchoked(2, true);
+            let now = Instant::now() + policy.request_timeout();
+            c.requested_at.insert(8, now);
+            retransmit_stalled_requests(&mut peers, &mut c, 32, now).await;
+            assert!(matches!(
+                rejecting.try_recv(),
+                Ok(PeerCommand::RequestPiece { piece: 7, .. })
+            ));
+            assert_eq!(c.active_peers.in_flight_count(1), 2);
+            if rejecting_peer_choked {
+                c.set_peer_unchoked(2, false);
+            } else {
+                c.update_peer_window(2, 8, 9);
+            }
+            c.received_chunks.insert(7, HashSet::from([0]));
+            c.received_chunks.insert(8, HashSet::from([0]));
+            c.release_rejected_piece(7);
+            assert!(!c.received_chunks.contains_key(&7));
+            assert!(!c.requested_at.contains_key(&7));
+            assert_eq!(c.received_chunks.get(&8).unwrap().len(), 1);
+            assert_eq!(c.requested_at.get(&8), Some(&now));
+            advance_pool_requests(&mut peers, &mut c, 32).await;
+            let retry = original.try_recv();
+            let unexpected = rejecting.try_recv();
+            shutdown_peer_runtimes(&mut peers);
+            assert!(matches!(
+                retry,
+                Ok(PeerCommand::RequestPiece { piece: 7, .. })
+            ));
+            assert!(unexpected.is_err());
+            assert_eq!(
+                c.active_peers.in_flight_count(1),
+                2,
+                "piece 8 remains outstanding"
+            );
+            assert_eq!(
+                c.active_peers.in_flight_count(2),
+                0,
+                "all rejected copies must release"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_malformed_block_resets_partial_bytes_with_chunk_counts() {
+        let mut stream = info();
+        stream.piece_length = 8;
+        stream.chunk_length = 4;
+        stream.sig_len = 0;
+        let (mut c, _) = Continuity::fresh(&stream, 7, 7, 0, default_live_recovery());
+        c.reasm.add_block(7, 0, &[1, 2, 3, 4]).unwrap();
+        assert!(!c.note_chunk(7, 0, 2));
+        assert!(c.reasm.add_block(7, 8, &[9]).is_err());
+        c.release_rejected_piece(7);
+        assert_eq!(c.reasm.next_needed(), 7);
+        c.reasm.add_block(7, 4, &[5, 6, 7, 8]).unwrap();
+        assert!(!c.note_chunk(7, 1, 2));
+        assert!(
+            c.reasm.take_ready().is_empty(),
+            "retry must not use discarded partial bytes"
+        );
+        c.reasm.add_block(7, 0, &[1, 2, 3, 4]).unwrap();
+        assert!(c.note_chunk(7, 0, 2));
+        assert_eq!(c.reasm.take_ready(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[tokio::test]
+    async fn timed_out_piece_without_eligible_peer_retries_on_unchoke_and_keeps_partial_data() {
+        let mut stream = info();
+        stream.piece_length = 8;
+        stream.chunk_length = 4;
+        stream.sig_len = 0;
+        let policy = LiveRecoveryConfig {
+            max_piece_advance: 1,
+            ..default_live_recovery()
+        };
+        let (mut c, _) = Continuity::fresh(&stream, 7, 7, 0, policy);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let (peer, mut commands) = test_pool_peer(addr);
+        let mut peers = BTreeMap::from([(1, peer)]);
+        c.register_active_peer(1, addr, live_pos(7, 7));
+        c.set_peer_unchoked(1, true);
+        advance_pool_requests(&mut peers, &mut c, 2).await;
+        commands.try_recv().unwrap();
+        c.reasm.add_block(7, 0, &[1, 2, 3, 4]).unwrap();
+        assert!(!c.note_chunk(7, 0, 2));
+        c.set_peer_unchoked(1, false);
+        retransmit_stalled_requests(
+            &mut peers,
+            &mut c,
+            2,
+            Instant::now() + policy.request_timeout(),
+        )
+        .await;
+        assert!(
+            commands.try_recv().is_err(),
+            "choked peer cannot receive retry requests"
+        );
+        assert_eq!(c.active_peers.in_flight_count(1), 0);
+        assert!(!c.requested_at.contains_key(&7));
+        assert_eq!(c.received_chunks.get(&7).unwrap().len(), 1);
+        c.set_peer_unchoked(1, true);
+        advance_pool_requests(&mut peers, &mut c, 2).await;
+        let retry = commands.try_recv();
+        shutdown_peer_runtimes(&mut peers);
+        assert!(matches!(
+            retry,
+            Ok(PeerCommand::RequestPiece {
+                piece: 7,
+                chunks_per_piece: 2
+            })
+        ));
+        c.reasm.add_block(7, 4, &[5, 6, 7, 8]).unwrap();
+        assert!(c.note_chunk(7, 1, 2));
+        assert_eq!(c.reasm.take_ready(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
