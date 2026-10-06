@@ -14,7 +14,7 @@ descriptor. Cold infohash network lookup remains tracked in
 | Non-1 MiB vector under `tests/vectors/transport/` | `synthetic-live-512k.bin` now satisfies the literal fixture requirement; its provenance and invented fields are documented beside it. PR #179 initially generated the vector in tests instead. |
 | No descriptor fails clearly | Native raw/TS/HLS routes return 422 with a content-id hint. Compat infohash/magnet starts return a JSON error before minting a lease. Tests inspect the actual session store and find zero active leases. |
 | CLI `infohash=` and `magnet:` use metadata | One-shot CLI processes have no remembered descriptor or own broadcast, so these inputs fail closed. Positive cold CLI playback remains a #176 parity gap. |
-| Live cid9/infohash equivalence and no sustained continuity corruption | Requires two staged comparisons, each simultaneous with the official engine: candidate content-id first, then warmed native/compat infohash sharing one candidate session after the content-id pool stops. Current runtime identifiers and explicitly verified direct routing are required. Source faults and reserved-table continuity are distinguished from payload corruption. |
+| Live cid9/infohash equivalence and no sustained continuity corruption | Two staged WARP captures now provide nonempty simultaneous-reference coverage on the user-authorized alternative cid10, with measured 512 KiB geometry. cid9 content-id matched but its subsequent infohash phase received no media. SDT continuity remains #172; no sustained media duplication/corruption was observed in qualifying overlap. See the measured results below; this is narrowed safety acceptance, not all-counter-zero or availability parity. |
 
 `warm_infohash_continuity_authenticates_pieces_before_emitting` resolves a
 generated-key 512 KiB descriptor through the catalog cache and infohash index,
@@ -43,7 +43,12 @@ fallback, persistent index, network lookup or new exposed default.
 
 Build a release candidate, start it and official engine 3.2.11 with fresh state,
 and inspect active connections plus `ip route get` before the live capture.
-Resolve cid9 from the gitignored registry as operator context, supply its value
+The user's 2026-10-06 session instruction keeps WARP enabled for online work,
+overriding the repository's WARP-off guidance. Record the actual WARP route and
+settings without changing VPN/services; these captures establish no direct-route
+or general network performance guarantee.
+Resolve cid9 or a user-supplied alternative from the gitignored registry as
+operator context, supply its value
 through runtime environment/arguments, and derive its infohash at runtime.
 Exercise refusals before warming the candidate. Use `tools/abcompare` for two
 phases, each with its own monotonic capture clock and simultaneous reference:
@@ -80,3 +85,74 @@ Analyzer success means it produced metrics. No media, no startup or no shared
 PCR window yields null/unmeasured quality, and cannot establish equivalence.
 Decoder diagnostic counts include startup/discontinuity effects and are not
 standardized quality scores. Cold lookup parity is not implied by warm playback.
+
+## Measured live evidence (2026-10-06)
+
+Fresh release outpace and official engine 3.2.11 ran with fresh state and default
+playback settings through the explicitly authorized WARP route. Candidate listener
+and storage isolation plus experimental compat opt-in were the only overrides.
+The descriptor probe measured both cid9 and cid10 at 524,288-byte pieces,
+16,384-byte chunks, 32 chunks per piece, a 96-byte RSA tail and a 124-byte source
+public key. Catalog resolution placed the exact `StreamInfo` clone in the index;
+subsequent infohash logs confirmed that index path and the privately derived hash
+matched the catalog result. Discovery, handshake, identity, playback settings and
+`Continuity` then follow the same provider path. Live media therefore traversed
+the configured source-key verification and tail-removal path; the generated-key
+corruption/retry regression supplies independent rejection evidence. This was not
+an independent forensic verification of captured raw peer signatures.
+
+| Target/phase | Candidate bytes / first byte | Shared PCR span / media identity |
+| --- | --- | --- |
+| cid9 content-id, 180 s | 80,097,024 / 133.778 s | 54.48 s; 389,862 packets each, 100% both directions |
+| cid9 warmed native/compat infohash, 180 s | 0 / unmeasured | No overlap; not passing playback evidence |
+| cid10 content-id, 180 s | 130,251,476 / 32.327 s | 164.48 s; 680,931 packets each, 100% both directions |
+| cid10 warmed native/compat infohash, 180 s | 125,453,152 each / 40.049 s | 158.48 s; 655,267 packets each, 100% both directions against the reference |
+
+The user supplied alternative targets and authorized trying any. cid10 supplies
+positive non-default live geometry coverage; cid9's no-media infohash window
+remains an observed availability failure. It repeatedly failed peer handshakes
+before obtaining an upstream while its simultaneous reference delivered media.
+The cause was not established. Logs do not identify every failed peer or detailed
+handshake error; this does not prove the source-node loss or stale-window causes
+in #168/#170. The discovery wait and good-peer caching proposal remain relevant to #167, but
+all-handshake exhaustion needs a separate bounded investigation; this audit
+changes no connection behavior.
+
+For qualifying cid10 infohash output, all 663,814 nonambiguous whole-candidate
+media packets mapped in order to the reference, with zero reference holes or
+backward/duplicate mapping steps. Native and compat whole captures were identical.
+Measured candidate media duplication, sync losses, malformed/transport-error
+packets and PCR jumps were zero. SDT PID 17 still had 79 continuity errors and
+240 exact repeated PSI packets (80 each PAT/PMT/SDT), so the literal requirement
+for zero continuity errors across all PIDs remains covered by
+[#172](https://github.com/jamezrin/outpace/issues/172). The media-integrity result
+does not claim that every transport counter is zero.
+
+Both staged transitions returned DELETE 204 and reached stable status 404,
+empty manager sessions and no observed logged-peer sockets after approximately
+15 seconds. Descriptor-only probe leases were revoked without opening media;
+no source session remained. Each infohash phase observed one shared session with
+two clients and no CID session. Sampled manager/socket evidence has the lifecycle
+limits described above. The reference daemon persisted across phases, and a cold
+infohash JSON preflight may have warmed its metadata: these timings are measured
+observations, not cold-start or cross-phase performance comparisons.
+
+`ffprobe` identified H.264 1080p video and 48 kHz AAC on all cid10 outputs;
+`ffprobe` and full video/audio `ffmpeg` decodes exited 0. Decoder error logs still
+contained one line per candidate capture, versus 147 and 51 reference lines in
+CID and infohash phases, including reference startup PPS/frame diagnostics.
+These unequal media spans and startup boundaries prevent a quality-score
+comparison; exit 0 does not mean error-free decoding. Exact overlapping media
+identity supplies the stronger corruption check.
+
+Actual descriptorless native raw/TS/HLS requests returned 422; compat infohash
+and magnet getstream/manifest requests returned error/null response without a
+playback URL; release CLI infohash/magnet commands exited 1 with no stdout. Exact
+zero-lease refusal is independently asserted against the offline session store.
+The official engine's cold-infohash JSON request returned HTTP 200 and minted a
+URL, but that URL was not opened: this establishes URL minting only.
+
+The evidence supports closing the guessed-geometry/unverified-output safety
+scope after independent review, with positive cold CLI/network parity in #176,
+all-PID SDT continuity in #172 and connection availability still explicit. It
+supports neither full original-engine parity nor general network performance.
