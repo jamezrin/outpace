@@ -8,6 +8,11 @@
 //! fallback (see [`ace_swarm::resolve`]). A bare infohash opens only from a transport descriptor
 //! this process has already verified, and otherwise fails closed (issue #164).
 
+mod reconnect;
+#[cfg(test)]
+mod reconnect_tests;
+use reconnect::{CandidateKind, SessionCandidates};
+
 use crate::config::{CacheType, LiveRecoveryConfig, StartupBufferConfig};
 use crate::provider::{
     ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource, VodContent,
@@ -39,8 +44,10 @@ use ace_wire::reassembly::PieceReassembler;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,9 +62,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Legacy single-peer helper handle. The production path now assigns real peer handles
 /// starting at 1, but the old helper is kept as a short-term bisect fallback.
 const SINGLE_PEER_ID: u64 = 0;
-/// After the first peer completes handshake + advertises a live window, briefly collect any
-/// other already-near-complete candidates so we can prefer a fresher live head without paying
-/// the full timeout of dead peers.
+/// One total deadline for gossip-only harvesting of a stale connected batch.
+const STALE_GOSSIP_BUDGET: Duration = Duration::from_millis(750);
+
+type PeerDiscovery = Arc<
+    dyn Fn(DiscoveryOptions) -> Pin<Box<dyn Future<Output = Vec<SocketAddrV4>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Briefly collect other near-complete candidates after the first live handshake.
 const UPSTREAM_SELECTION_GRACE: Duration = Duration::from_millis(250);
 /// How often an active session re-announces itself as a seeder to its trackers, so
 /// outpace becomes organically discoverable while it's serving (see
@@ -1109,53 +1123,6 @@ async fn announce_infohash_once(
         );
 }
 
-/// Which peers to try connecting to next: everyone except those already known bad this
-/// session — unless that would leave nothing to try, in which case give the whole list
-/// another chance. `peers` is a fixed, one-time-discovered set for this stream, so
-/// permanently avoiding every peer that ever failed once (a transient timeout, or a peer
-/// that just never happened to unchoke us) would end the session rather than let it retry —
-/// worse than the wasted reconnect attempt this is guarding against.
-fn candidates_for_reconnect(
-    peers: &[SocketAddrV4],
-    excluded: &HashSet<SocketAddrV4>,
-) -> Vec<SocketAddrV4> {
-    let filtered: Vec<SocketAddrV4> = peers
-        .iter()
-        .copied()
-        .filter(|a| !excluded.contains(a))
-        .collect();
-    if filtered.is_empty() {
-        peers.to_vec()
-    } else {
-        filtered
-    }
-}
-
-fn merge_discovered_peers(peers: &mut Vec<SocketAddrV4>, discovered: Vec<SocketAddrV4>) -> usize {
-    let mut known: HashSet<SocketAddrV4> = peers.iter().copied().collect();
-    let before = peers.len();
-    for addr in discovered {
-        if known.insert(addr) {
-            peers.push(addr);
-        }
-    }
-    peers.len() - before
-}
-
-fn reconcile_peer_rediscovery(
-    peers: &mut Vec<SocketAddrV4>,
-    excluded: &mut HashSet<SocketAddrV4>,
-    discovered: Vec<SocketAddrV4>,
-) -> usize {
-    let added = merge_discovered_peers(peers, discovered);
-    if added == 0 {
-        // No fresh candidates appeared. Let previously-lost peers back into rotation after a
-        // discovery cycle so a reachable peer whose live window later advances can be retried.
-        excluded.clear();
-    }
-    added
-}
-
 fn prefer_window(candidate: &LivePosition, current: &LivePosition) -> bool {
     let score = |w: &LivePosition| (w.max_piece, w.position, -w.distance_from_source);
     score(candidate) > score(current)
@@ -1318,7 +1285,32 @@ struct PeerRuntime {
     worker: tokio::task::JoinHandle<()>,
 }
 
+struct SessionPeerCount(Arc<AtomicU32>);
+impl Drop for SessionPeerCount {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Drop for PeerRuntime {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
+// Bound the entire handshake/window exchange, not just TCP establishment: a silent
+// preferred source must not monopolize a reconnect batch for the peer I/O timeout.
 async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnectAttempt {
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect_upstream_inner(addr, infohash)).await {
+        Ok(result) => result,
+        Err(_) => PeerConnectAttempt::Failed(PeerConnectFailure {
+            addr,
+            stage: PeerConnectStage::Window,
+        }),
+    }
+}
+
+async fn connect_upstream_inner(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnectAttempt {
     let mut session = match tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
     {
         Ok(Ok(session)) => session,
@@ -1355,13 +1347,12 @@ async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnect
 
 fn pool_refill_candidates(
     peers: &[SocketAddrV4],
-    excluded: &HashSet<SocketAddrV4>,
     active: &HashSet<SocketAddrV4>,
 ) -> Vec<SocketAddrV4> {
     peers
         .iter()
         .copied()
-        .filter(|addr| !excluded.contains(addr) && !active.contains(addr))
+        .filter(|addr| !active.contains(addr))
         .collect()
 }
 
@@ -1386,18 +1377,17 @@ fn background_discovery_options() -> DiscoveryOptions {
 /// that also advertised a live window. Dead/firewalled peers no longer serialize the time
 /// to first byte — a couple of unreachable peers at the front of the list used to cost
 /// `CONNECT_TIMEOUT` each before we ever reached a live one (the "slow to load" report).
-/// `excluded` accumulates every peer lost so far this session (not just the most recent),
-/// so a reconnect doesn't keep re-picking a peer that's already proven bad — see
-/// `candidates_for_reconnect` for the "everyone excluded" fallback.
+/// Candidate snapshots are ordered by learned-source priority and exclude cooling peers.
+/// Each snapshot is visited once, so slow sources cannot restart the round ahead of alternatives.
 async fn connect_pool(
     peers: &[SocketAddrV4],
     infohash: [u8; 20],
-    excluded: &HashSet<SocketAddrV4>,
+    candidates: &mut SessionCandidates,
     live_recovery: LiveRecoveryConfig,
 ) -> Vec<ConnectedUpstream> {
-    let candidates = candidates_for_reconnect(peers, excluded);
+    let attempts = peers.to_vec();
     let mut stats = PeerConnectStats::default();
-    for batch in candidates.chunks(live_recovery.max_parallel_connect) {
+    for batch in attempts.chunks(live_recovery.max_parallel_connect) {
         let mut set = tokio::task::JoinSet::new();
         for &addr in batch {
             set.spawn(connect_upstream(addr, infohash));
@@ -1410,7 +1400,10 @@ async fn connect_pool(
                     connected.push(candidate);
                     break;
                 }
-                Ok(PeerConnectAttempt::Failed(failure)) => stats.record_failure(failure),
+                Ok(PeerConnectAttempt::Failed(failure)) => {
+                    candidates.failed(failure.addr, Instant::now());
+                    stats.record_failure(failure);
+                }
                 Err(_) => stats.record_task_failure(),
             }
         }
@@ -1433,6 +1426,7 @@ async fn connect_pool(
                     connected.push(candidate);
                 }
                 Ok(Some(Ok(PeerConnectAttempt::Failed(failure)))) => {
+                    candidates.failed(failure.addr, Instant::now());
                     stats.record_failure(failure);
                 }
                 Ok(Some(Err(_))) => stats.record_task_failure(),
@@ -1467,7 +1461,7 @@ async fn connect_pool(
 #[allow(clippy::too_many_arguments)]
 async fn follow_live(
     info: StreamInfo,
-    mut peers: Vec<SocketAddrV4>,
+    peers: Vec<SocketAddrV4>,
     identity: Arc<Identity>,
     tx: mpsc::Sender<LiveOutput>,
     peer_count: Arc<AtomicU32>,
@@ -1478,17 +1472,55 @@ async fn follow_live(
     discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
     reachability: Option<Arc<ReachabilityMonitor>>,
 ) {
+    let trackers = info.trackers.clone();
+    let infohash = info.infohash;
+    let discovery: PeerDiscovery = Arc::new(move |options| {
+        let trackers = trackers.clone();
+        let port = discovery_port.borrow().unwrap_or(0);
+        Box::pin(async move {
+            discover_peers_with_options(&trackers, &infohash, &random_peer_id(), port, options)
+                .await
+        })
+    });
+    follow_live_session(
+        info,
+        peers,
+        identity,
+        tx,
+        peer_count,
+        downloaded,
+        uploaded,
+        peers_served,
+        seed,
+        discovery,
+        reachability,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn follow_live_session(
+    info: StreamInfo,
+    peers: Vec<SocketAddrV4>,
+    identity: Arc<Identity>,
+    tx: mpsc::Sender<LiveOutput>,
+    peer_count: Arc<AtomicU32>,
+    downloaded: Arc<AtomicU64>,
+    uploaded: Arc<AtomicU64>,
+    peers_served: Arc<AtomicU32>,
+    seed: SeedConfig,
+    discovery: PeerDiscovery,
+    reachability: Option<Arc<ReachabilityMonitor>>,
+) {
+    let _peer_count_guard = SessionPeerCount(peer_count.clone());
     let chunks_per_piece = info.chunks_per_piece();
-    // Every peer lost so far this session (cumulative, not just the most recent) — see
-    // `candidates_for_reconnect`.
-    let mut excluded: HashSet<SocketAddrV4> = HashSet::new();
-    // Piece-continuity state (reassembler, resync filter, request frontier, head) survives
-    // across reconnects — see `Continuity`. `None` only before the very first connection.
+    let mut candidates = SessionCandidates::default();
+    for addr in peers {
+        candidates.learn(addr, CandidateKind::Discovered);
+    }
     let mut continuity: Option<Continuity> = None;
-    // `emitted` byte count at the last time a stalled pool was retried without excluding its
-    // peers. If we stall again having produced nothing since, those peers are genuinely
-    // unproductive (e.g. a frozen source) and get excluded so we look elsewhere.
-    let mut last_stall_emitted: Option<u64> = None;
+    // One owned discovery attempt can finish while learned candidates are retried.
+    let mut rediscovery = tokio::task::JoinSet::new();
     // Acquire the leech producer lease once for the whole session. `store` is created here and
     // reused across every reconnect (preserving buffered pieces, exactly like the old idempotent
     // `get_or_create`); `_seed_lease` lives for the entire `follow_live` body and drops on return
@@ -1508,45 +1540,77 @@ async fn follow_live(
         if tx.is_closed() {
             return;
         }
-        let mut upstreams =
-            connect_pool(&peers, info.infohash, &excluded, seed.live_recovery).await;
+        if let Some(Ok(found)) = rediscovery.try_join_next() {
+            for addr in found {
+                candidates.learn(addr, CandidateKind::Discovered);
+            }
+        }
+        let ready = candidates.eligible(Instant::now());
+        let (sources, pex) = candidates.learned_counts();
+        crate::alog!(
+            "[ace] reconnect candidates: eligible={} learned_source={sources} learned_pex={pex}",
+            ready.len()
+        );
+        let mut upstreams = tokio::select! {
+            _ = tx.closed() => return,
+            connected = connect_pool(&ready,info.infohash,&mut candidates,seed.live_recovery) => connected,
+        };
+        if let Some(c) = &continuity {
+            let mut usable = Vec::new();
+            let mut stale = Vec::new();
+            for upstream in upstreams {
+                if c.window_can_resume(&upstream.window) {
+                    usable.push(upstream);
+                } else {
+                    stale.push(upstream);
+                }
+            }
+            if !stale.is_empty() {
+                for upstream in &stale {
+                    crate::alog!("[ace] {}: stale advertised window min={} max={} cannot cover next needed piece {}; harvesting gossip only",upstream.addr,upstream.window.min_piece,upstream.window.max_piece,c.reasm.next_needed());
+                    candidates.failed(upstream.addr, Instant::now());
+                }
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    _ = harvest_stale_gossip(stale,&identity,&mut candidates) => {},
+                }
+            }
+            upstreams = usable;
+        }
         if upstreams.is_empty() {
             peer_count.store(0, Ordering::Relaxed);
-            let known = peers.len();
-            let announce_port = discovery_port.borrow().unwrap_or(0);
-            let discovered = discover_peers(
-                &info.trackers,
-                &info.infohash,
-                &random_peer_id(),
-                announce_port,
-            )
-            .await;
-            let found = discovered.len();
-            let added = reconcile_peer_rediscovery(&mut peers, &mut excluded, discovered);
-            crate::alog!(
-                "[ace] no reachable peer among {known} known; rediscovery found {found}, added {added} (known now {})",
-                peers.len()
-            );
-            continue;
-        }
-        if let Some(c) = &continuity {
-            upstreams.retain(|upstream| {
-                let usable = c.window_can_resume(&upstream.window);
-                if !usable {
-                    crate::alog!(
-                        "[ace] {}: stale advertised window min={} max={} cannot cover next needed piece {}; trying another peer",
-                        upstream.addr,
-                        upstream.window.min_piece,
-                        upstream.window.max_piece,
-                        c.reasm.next_needed()
-                    );
-                    excluded.insert(upstream.addr);
-                }
-                usable
-            });
-            if upstreams.is_empty() {
+            // Gossip may just have supplied an immediately eligible source. Try it before
+            // rediscovery or waiting, rather than dropping it with the stale relay.
+            let newly_ready = candidates.eligible(Instant::now());
+            if newly_ready.iter().any(|a| !ready.contains(a)) {
                 continue;
             }
+            let delay = candidates
+                .retry_delay(Instant::now())
+                .max(Duration::from_millis(50));
+            if ready.is_empty() && !candidates.all().is_empty() {
+                // Cooling learned peers get their first rebuild attempt before launching
+                // another discovery. A failed eligible round can discover concurrently.
+                tokio::select! {_ = tx.closed()=>return, _ = tokio::time::sleep(delay)=>{}}
+                continue;
+            }
+            if rediscovery.is_empty() {
+                rediscovery.spawn(discovery(DiscoveryOptions::default()));
+            }
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(delay) => {},
+                found = rediscovery.join_next() => {
+                    if let Some(Ok(found)) = found {
+                        let count = found.len();
+                        for addr in found { candidates.learn(addr,CandidateKind::Discovered); }
+                        crate::alog!("[ace] upstream rediscovery found {count}; known now {}",candidates.all().len());
+                        // An empty/unchanged discovery must not erase retry cooldowns.
+                        tokio::select! {_ = tx.closed()=>return, _ = tokio::time::sleep(delay)=>{}}
+                    }
+                }
+            }
+            continue;
         }
         let windows = upstreams
             .iter()
@@ -1554,14 +1618,19 @@ async fn follow_live(
             .collect::<Vec<_>>()
             .join(", ");
         let active_addrs: HashSet<SocketAddrV4> = upstreams.iter().map(|u| u.addr).collect();
-        let refill_candidates = pool_refill_candidates(&peers, &excluded, &active_addrs);
-        let known_refill_peers = peers.clone();
+        let refill_candidates = pool_refill_candidates(
+            &candidates.eligible_discovered(Instant::now()),
+            &active_addrs,
+        );
+        let known_refill_peers = candidates.all();
         crate::alog!(
             "[ace] connected + handshaked upstream pool ({} peer(s)): {windows}",
             upstreams.len()
         );
         peer_count.store(upstreams.len() as u32, Ordering::Relaxed);
-        match follow_peer_pool(
+        let end = tokio::select! {
+            _ = tx.closed() => return,
+            end = follow_peer_pool(
             upstreams,
             &info,
             &identity,
@@ -1575,35 +1644,25 @@ async fn follow_live(
             &mut continuity,
             refill_candidates,
             known_refill_peers,
-            discovery_port.clone(),
+            discovery.clone(),
+            &mut candidates,
             &peer_count,
             reachability.as_ref(),
         )
-        .await
-        {
+        => end,
+        };
+        match end {
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost(lost) => {
                 peer_count.store(0, Ordering::Relaxed);
-                excluded.extend(lost);
-                continue;
+                crate::alog!("[ace] rebuilding upstream pool: reason=PeerLost lost={lost} learned_source={} learned_pex={}",candidates.learned_counts().0,candidates.learned_counts().1);
             }
             FollowEnd::PoolStale { stalled, lost } => {
                 peer_count.store(0, Ordering::Relaxed);
-                excluded.extend(lost);
-                let emitted = continuity.as_ref().map(|c| c.emitted);
-                if retry_stalled_pool(emitted, &mut last_stall_emitted) {
-                    // We've produced output since the last stall retry: these peers are
-                    // productive, just hit a gap. Reconnect to them (don't exclude) so
-                    // `Continuity::resume`/`skip_to` can skip past the evicted piece.
-                } else {
-                    // Stalled again with nothing emitted in between — give up on them.
-                    crate::alog!(
-                        "[ace] {} stalled peer(s) made no progress on retry; excluding",
-                        stalled.len()
-                    );
-                    excluded.extend(stalled);
+                for addr in stalled {
+                    candidates.failed(addr, Instant::now());
                 }
-                continue;
+                crate::alog!("[ace] rebuilding upstream pool: reason=PoolStale lost={lost} learned_source={} learned_pex={}",candidates.learned_counts().0,candidates.learned_counts().1);
             }
         }
     }
@@ -1611,17 +1670,13 @@ async fn follow_live(
 
 enum FollowEnd {
     ConsumerGone,
-    PeerLost(Vec<SocketAddrV4>),
-    /// The pool stopped producing contiguous output past the configured stale-upstream timeout,
-    /// but its
-    /// peers were still connected (reachable). Unlike `PeerLost`, these `stalled` peers are
-    /// NOT excluded on their own: a stall is usually us falling behind the live edge (the
-    /// piece we still need got evicted from the peers' windows) rather than a bad peer, and
-    /// the reconnect's `Continuity::resume`/`skip_to` is exactly how we skip that gap. Retry
-    /// them (bounded by no-progress in `follow_live`); `lost` are genuine drops to exclude.
+    PeerLost(usize),
+    /// Connected peers stopped producing contiguous output past the stale timeout.
+    /// Both these peers and genuine drops retain session candidates with bounded cooldowns;
+    /// reconnect still uses Continuity::resume/skip_to to recover an evicted gap.
     PoolStale {
         stalled: Vec<SocketAddrV4>,
-        lost: Vec<SocketAddrV4>,
+        lost: usize,
     },
 }
 
@@ -1883,6 +1938,7 @@ impl Continuity {
 }
 
 enum PoolWake {
+    ConsumerGone,
     Peer(Option<PeerEvent>),
     Refill(Option<ConnectedUpstream>),
 }
@@ -1958,9 +2014,8 @@ async fn activate_upstream_peer(
 
 async fn refill_upstream_pool(
     initial_candidates: Vec<SocketAddrV4>,
-    trackers: Vec<String>,
     infohash: [u8; 20],
-    discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
+    discovery: PeerDiscovery,
     known_peers: Vec<SocketAddrV4>,
     live_recovery: LiveRecoveryConfig,
     refills: mpsc::Sender<ConnectedUpstream>,
@@ -1970,18 +2025,8 @@ async fn refill_upstream_pool(
     let mut stats = PeerConnectStats::default();
     let mut sent = 0usize;
     let mut candidates = initial_candidates;
-    let discovery_handle = tokio::spawn(async move {
-        let announce_port = discovery_port.borrow().unwrap_or(0);
-        discover_peers_with_options(
-            &trackers,
-            &infohash,
-            &random_peer_id(),
-            announce_port,
-            background_discovery_options(),
-        )
-        .await
-    });
-    let mut discovery_handle = Some(discovery_handle);
+    let mut discovery_tasks = tokio::task::JoinSet::new();
+    discovery_tasks.spawn(discovery(background_discovery_options()));
     loop {
         for batch in candidates.chunks(live_recovery.max_parallel_connect) {
             let mut set = tokio::task::JoinSet::new();
@@ -2017,10 +2062,10 @@ async fn refill_upstream_pool(
         if sent >= live_recovery.max_active_upstreams {
             break;
         }
-        let Some(handle) = discovery_handle.take() else {
+        let Some(discovered) = discovery_tasks.join_next().await else {
             break;
         };
-        let discovered = handle.await.unwrap_or_default();
+        let discovered = discovered.unwrap_or_default();
         let found = discovered.len();
         candidates = take_new_refill_candidates(&mut known, discovered);
         crate::alog!(
@@ -2039,9 +2084,16 @@ async fn refill_upstream_pool(
     }
 }
 
-fn abort_refill(handle: &mut Option<tokio::task::JoinHandle<()>>) {
+struct OwnedTask(tokio::task::JoinHandle<()>);
+impl Drop for OwnedTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn abort_refill(handle: &mut Option<OwnedTask>) {
     if let Some(handle) = handle.take() {
-        handle.abort();
+        handle.0.abort();
     }
 }
 
@@ -2073,7 +2125,8 @@ async fn follow_peer_pool(
     continuity: &mut Option<Continuity>,
     refill_candidates: Vec<SocketAddrV4>,
     known_refill_peers: Vec<SocketAddrV4>,
-    discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
+    discovery: PeerDiscovery,
+    candidates: &mut SessionCandidates,
     peer_count: &Arc<AtomicU32>,
     reachability: Option<&Arc<ReachabilityMonitor>>,
 ) -> FollowEnd {
@@ -2121,7 +2174,9 @@ async fn follow_peer_pool(
     // gossip can be connected and fed into the same pool-add path (keeps `refill_rx` open
     // even after the background refill task finishes).
     let pex_tx = refill_tx.clone();
-    let mut pex_tried: HashSet<SocketAddrV4> = HashSet::new();
+    let mut learned_connects: tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>)> =
+        tokio::task::JoinSet::new();
+    let mut learned_pending = HashSet::new();
     let mut refill_handle = if refill_candidates.is_empty() {
         None
     } else {
@@ -2129,18 +2184,17 @@ async fn follow_peer_pool(
             "[ace] background upstream refill: trying {} candidate(s)",
             refill_candidates.len()
         );
-        Some(tokio::spawn(refill_upstream_pool(
+        Some(OwnedTask(tokio::spawn(refill_upstream_pool(
             refill_candidates,
-            info.trackers.clone(),
             info.infohash,
-            discovery_port.clone(),
+            discovery.clone(),
             known_refill_peers,
             live_recovery,
             refill_tx,
-        )))
+        ))))
     };
     let mut peers: BTreeMap<u64, PeerRuntime> = BTreeMap::new();
-    let mut lost_addrs = Vec::new();
+    let mut loss_count = 0usize;
     let mut next_peer_id = 1u64;
 
     for upstream in upstreams {
@@ -2160,18 +2214,37 @@ async fn follow_peer_pool(
             Ok(runtime) => {
                 peers.insert(peer_id, runtime);
             }
-            Err(addr) => lost_addrs.push(addr),
+            Err(addr) => record_pool_losses(candidates, &mut loss_count, [addr]),
         }
     }
     if peers.is_empty() {
         abort_refill(&mut refill_handle);
-        return FollowEnd::PeerLost(lost_addrs);
+        return FollowEnd::PeerLost(loss_count);
     }
     peer_count.store(peers.len() as u32, Ordering::Relaxed);
 
+    if peers.len() < live_recovery.max_active_upstreams {
+        spawn_learned_connects(
+            candidates,
+            &peers,
+            info.infohash,
+            live_recovery.max_parallel_connect,
+            &pex_tx,
+            &mut learned_connects,
+            &mut learned_pending,
+        );
+    }
     let mut last_progress = Instant::now();
-    let mut refill_closed = refill_handle.is_none();
+    let mut refill_closed = false;
     loop {
+        while let Some(joined) = learned_connects.try_join_next() {
+            if let Ok((addr, failure)) = joined {
+                learned_pending.remove(&addr);
+                if let Some(failure) = failure {
+                    candidates.failed(failure.addr, Instant::now());
+                }
+            }
+        }
         let now = Instant::now();
         let Some(stale_budget) =
             stale_upstream_budget(last_progress, now, live_recovery.stale_upstream_timeout())
@@ -2186,7 +2259,7 @@ async fn follow_peer_pool(
             abort_refill(&mut refill_handle);
             return FollowEnd::PoolStale {
                 stalled,
-                lost: lost_addrs,
+                lost: loss_count,
             };
         };
         // Self-heal a single stuck piece well before the whole-pool stale timeout: re-request
@@ -2194,10 +2267,10 @@ async fn follow_peer_pool(
         // skip a piece evicted from every upstream window.
         let newly_lost =
             retransmit_stalled_requests(&mut peers, continuity, chunks_per_piece, now).await;
-        lost_addrs.extend(newly_lost);
+        record_pool_losses(candidates, &mut loss_count, newly_lost);
         if peers.is_empty() {
             abort_refill(&mut refill_handle);
-            return FollowEnd::PeerLost(lost_addrs);
+            return FollowEnd::PeerLost(loss_count);
         }
         peer_count.store(peers.len() as u32, Ordering::Relaxed);
 
@@ -2206,6 +2279,7 @@ async fn follow_peer_pool(
         let wait = stale_budget.min(live_recovery.request_check_interval());
         let event = match tokio::time::timeout(wait, async {
             tokio::select! {
+                _ = tx.closed() => PoolWake::ConsumerGone,
                 event = event_rx.recv() => PoolWake::Peer(event),
                 upstream = refill_rx.recv(), if !refill_closed && peers.len() < live_recovery.max_active_upstreams => {
                     PoolWake::Refill(upstream)
@@ -2219,13 +2293,15 @@ async fn follow_peer_pool(
         };
 
         let event = match event {
+            PoolWake::ConsumerGone => return FollowEnd::ConsumerGone,
             PoolWake::Peer(Some(event)) => event,
             PoolWake::Peer(None) => {
                 shutdown_peer_runtimes(&mut peers);
                 abort_refill(&mut refill_handle);
-                return FollowEnd::PeerLost(lost_addrs);
+                return FollowEnd::PeerLost(loss_count);
             }
             PoolWake::Refill(Some(upstream)) => {
+                candidates.learn(upstream.addr, CandidateKind::Discovered);
                 if !continuity.window_can_resume(&upstream.window) {
                     crate::alog!(
                         "[ace] {}: background refill stale window min={} max={} cannot cover next needed piece {}; dropping",
@@ -2234,9 +2310,26 @@ async fn follow_peer_pool(
                         upstream.window.max_piece,
                         continuity.reasm.next_needed()
                     );
-                    lost_addrs.push(upstream.addr);
+                    candidates.failed(upstream.addr, Instant::now());
+                    tokio::select! {
+                        _ = tx.closed() => return FollowEnd::ConsumerGone,
+                        _ = harvest_stale_gossip(vec![upstream],identity,candidates) => {},
+                    }
+                    spawn_learned_connects(
+                        candidates,
+                        &peers,
+                        info.infohash,
+                        live_recovery.max_parallel_connect,
+                        &pex_tx,
+                        &mut learned_connects,
+                        &mut learned_pending,
+                    );
                     continue;
                 }
+                if peers.values().any(|p| p.addr == upstream.addr) {
+                    continue;
+                }
+                candidates.learn(upstream.addr, CandidateKind::Discovered);
                 let peer_id = next_peer_id;
                 next_peer_id += 1;
                 let addr = upstream.addr;
@@ -2261,9 +2354,9 @@ async fn follow_peer_pool(
                         peer_count.store(peers.len() as u32, Ordering::Relaxed);
                         let newly_lost =
                             advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                        lost_addrs.extend(newly_lost);
+                        record_pool_losses(candidates, &mut loss_count, newly_lost);
                     }
-                    Err(addr) => lost_addrs.push(addr),
+                    Err(addr) => record_pool_losses(candidates, &mut loss_count, [addr]),
                 }
                 continue;
             }
@@ -2277,15 +2370,15 @@ async fn follow_peer_pool(
             PeerEvent::Lost { peer_id, addr } => {
                 if let Some(lost) = drop_peer_runtime(peer_id, &mut peers, continuity) {
                     crate::alog!("[ace] {addr}: upstream peer lost");
-                    lost_addrs.push(lost);
+                    record_pool_losses(candidates, &mut loss_count, [lost]);
                     let newly_lost =
                         advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                    lost_addrs.extend(newly_lost);
+                    record_pool_losses(candidates, &mut loss_count, newly_lost);
                     peer_count.store(peers.len() as u32, Ordering::Relaxed);
                 }
                 if peers.is_empty() {
                     abort_refill(&mut refill_handle);
-                    return FollowEnd::PeerLost(lost_addrs);
+                    return FollowEnd::PeerLost(loss_count);
                 }
                 continue;
             }
@@ -2309,7 +2402,7 @@ async fn follow_peer_pool(
                 );
                 let newly_lost =
                     advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                lost_addrs.extend(newly_lost);
+                record_pool_losses(candidates, &mut loss_count, newly_lost);
                 made_activity = true;
             }
             PeerMessage::Choke => {
@@ -2322,7 +2415,7 @@ async fn follow_peer_pool(
                 made_activity |= continuity.head > old_head;
                 let newly_lost =
                     advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                lost_addrs.extend(newly_lost);
+                record_pool_losses(candidates, &mut loss_count, newly_lost);
             }
             PeerMessage::Extended { ref payload, .. } => {
                 if let Some(new_head) = advance_head_from_window(payload, continuity.head) {
@@ -2331,7 +2424,7 @@ async fn follow_peer_pool(
                     made_activity = true;
                     let newly_lost =
                         advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                    lost_addrs.extend(newly_lost);
+                    record_pool_losses(candidates, &mut loss_count, newly_lost);
                 }
             }
             m @ PeerMessage::Piece { .. } => {
@@ -2354,7 +2447,7 @@ async fn follow_peer_pool(
                         continuity.release_rejected_piece(piece);
                         let newly_lost =
                             advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                        lost_addrs.extend(newly_lost);
+                        record_pool_losses(candidates, &mut loss_count, newly_lost);
                         continue;
                     }
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
@@ -2393,7 +2486,7 @@ async fn follow_peer_pool(
                     }
                     let newly_lost =
                         advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                    lost_addrs.extend(newly_lost);
+                    record_pool_losses(candidates, &mut loss_count, newly_lost);
                 }
             }
             PeerMessage::Interested => {
@@ -2414,7 +2507,7 @@ async fn follow_peer_pool(
                         send_peer_command(peer_id, PeerMessage::Unchoke, &mut peers, continuity)
                             .await
                     {
-                        lost_addrs.push(lost);
+                        record_pool_losses(candidates, &mut loss_count, [lost]);
                     }
                 }
             }
@@ -2432,7 +2525,7 @@ async fn follow_peer_pool(
                     )
                     .await
                     {
-                        lost_addrs.push(lost);
+                        record_pool_losses(candidates, &mut loss_count, [lost]);
                     } else {
                         uploaded.fetch_add(len as u64, Ordering::Relaxed);
                         peers_served.store(peers.len() as u32, Ordering::Relaxed);
@@ -2448,7 +2541,7 @@ async fn follow_peer_pool(
                     made_activity = true;
                     let newly_lost =
                         advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                    lost_addrs.extend(newly_lost);
+                    record_pool_losses(candidates, &mut loss_count, newly_lost);
                 }
             }
             PeerMessage::Unknown { id: 10, .. } => {}
@@ -2456,56 +2549,43 @@ async fn follow_peer_pool(
                 id: 12,
                 ref payload,
             } => {
-                // Peer-exchange gossip: connect to peers we don't already have and feed the
-                // successes into the same pool-add path as the background refill, so a stalled
-                // pool has fresh, swarm-sourced upstreams to fall back on (notes 41-43).
-                // Rank the advertised peers by their advertised live window first, so the
-                // limited `max_parallel_connect` attempts prefer peers that can already serve
-                // the piece we still need (#2) before peers whose window is unknown or behind.
+                let advertised = ace_wire::peer_exchange::parse_peer_exchange_detailed(payload);
+                let ranked = ace_wire::peer_exchange::rank_by_window_coverage(
+                    &advertised,
+                    continuity.reasm.next_needed(),
+                );
+                for addr in ranked {
+                    candidates.learn(addr, CandidateKind::Pex);
+                }
                 if peers.len() < live_recovery.max_active_upstreams {
-                    let advertised = ace_wire::peer_exchange::parse_peer_exchange_detailed(payload);
-                    let total = advertised.len();
-                    let next_needed = continuity.reasm.next_needed();
-                    let covering = advertised
-                        .iter()
-                        .filter(|p| p.window.is_some_and(|w| w.covers(next_needed)))
-                        .count();
-                    let ranked =
-                        ace_wire::peer_exchange::rank_by_window_coverage(&advertised, next_needed);
-                    let spawned = harvest_peers(
-                        &ranked,
+                    spawn_learned_connects(
+                        candidates,
                         &peers,
-                        &mut pex_tried,
                         info.infohash,
                         live_recovery.max_parallel_connect,
                         &pex_tx,
+                        &mut learned_connects,
+                        &mut learned_pending,
                     );
-                    if spawned > 0 {
-                        crate::alog!(
-                            "[ace] peer-exchange from {addr}: {spawned} new peer(s) to try (of {total} advertised, {covering} covering piece {next_needed})"
-                        );
-                    }
                 }
             }
             PeerMessage::Unknown {
                 id: 36,
                 ref payload,
             } => {
-                // Source-node descriptor (the stream origin, re-announced by every peer). The
-                // source never stalls, so try it once if we don't already have it.
-                if peers.len() < live_recovery.max_active_upstreams {
-                    if let Some(source) = ace_wire::peer_exchange::parse_peer_announce(payload) {
-                        if harvest_peers(
-                            &[source],
+                if let Some(source) = ace_wire::peer_exchange::parse_peer_announce(payload) {
+                    candidates.learn(source, CandidateKind::Source);
+                    crate::alog!("[ace] source-node announce from {addr}: retained {source}");
+                    if peers.len() < live_recovery.max_active_upstreams {
+                        spawn_learned_connects(
+                            candidates,
                             &peers,
-                            &mut pex_tried,
                             info.infohash,
                             live_recovery.max_parallel_connect,
                             &pex_tx,
-                        ) > 0
-                        {
-                            crate::alog!("[ace] source-node announce from {addr}: trying {source}");
-                        }
+                            &mut learned_connects,
+                            &mut learned_pending,
+                        );
                     }
                 }
             }
@@ -2525,7 +2605,7 @@ async fn follow_peer_pool(
                     made_activity = true;
                     let newly_lost =
                         advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                    lost_addrs.extend(newly_lost);
+                    record_pool_losses(candidates, &mut loss_count, newly_lost);
                 } else {
                     let should_log = peers
                         .get_mut(&peer_id)
@@ -2544,16 +2624,28 @@ async fn follow_peer_pool(
         }
         if peers.is_empty() {
             abort_refill(&mut refill_handle);
-            return FollowEnd::PeerLost(lost_addrs);
+            return FollowEnd::PeerLost(loss_count);
         }
         if should_refresh_stale_deadline(continuity.emitted, made_output, made_activity) {
             last_progress = Instant::now();
         }
         if made_output {
+            candidates.productive(addr);
             // Contiguous output means the playback cursor advanced: reset the per-piece
             // eviction-skip timer so it only fires when the cursor is genuinely stuck.
             continuity.next_needed_since = Instant::now();
         }
+    }
+}
+
+fn record_pool_losses(
+    candidates: &mut SessionCandidates,
+    loss_count: &mut usize,
+    addrs: impl IntoIterator<Item = SocketAddrV4>,
+) {
+    for addr in addrs {
+        candidates.failed(addr, Instant::now());
+        *loss_count = loss_count.saturating_add(1);
     }
 }
 
@@ -2583,41 +2675,101 @@ async fn send_peer_command(
     }
 }
 
-/// Connect-race `advertised` peers we don't already have and feed the successes into the
-/// pool-add channel (`pex_tx`), skipping already-active peers and any addr tried before this
-/// session (`pex_tried`). Bounded to the configured parallel-connect cap per call. Returns how
-/// many connect attempts were spawned. Shared by peer-exchange (`id=12`) and source-node (`id=36`).
-fn harvest_peers(
-    advertised: &[SocketAddrV4],
+fn spawn_learned_connects(
+    candidates: &mut SessionCandidates,
     peers: &BTreeMap<u64, PeerRuntime>,
-    pex_tried: &mut HashSet<SocketAddrV4>,
     infohash: [u8; 20],
-    max_parallel_connect: usize,
-    pex_tx: &mpsc::Sender<ConnectedUpstream>,
-) -> usize {
-    if pex_tried.len() > 1024 {
-        pex_tried.clear();
+    max_parallel: usize,
+    tx: &mpsc::Sender<ConnectedUpstream>,
+    tasks: &mut tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>)>,
+    pending: &mut HashSet<SocketAddrV4>,
+) {
+    let (sources, pex) = candidates.learned_counts();
+    if sources + pex == 0 {
+        return;
     }
-    let active: HashSet<SocketAddrV4> = peers.values().map(|p| p.addr).collect();
-    let mut spawned = 0usize;
-    for &cand in advertised {
-        if spawned >= max_parallel_connect {
+    for addr in candidates.eligible_learned(Instant::now()) {
+        if tasks.len() >= max_parallel {
             break;
         }
-        if active.contains(&cand) || !pex_tried.insert(cand) {
+        if peers.values().any(|p| p.addr == addr) || !pending.insert(addr) {
             continue;
         }
-        let tx = pex_tx.clone();
-        tokio::spawn(async move {
-            if let PeerConnectAttempt::Connected(upstream) = connect_upstream(cand, infohash).await
-            {
-                // Drop the connection if the pool isn't currently taking peers.
-                let _ = tx.try_send(upstream);
-            }
+        // Reserve a retry slot before spawning: gossip floods cannot duplicate pending work.
+        candidates.attempting(addr, Instant::now() + CONNECT_TIMEOUT);
+        let tx = tx.clone();
+        tasks.spawn(async move {
+            let failure = match connect_upstream(addr, infohash).await {
+                PeerConnectAttempt::Connected(upstream) => {
+                    let _ = tx.try_send(upstream);
+                    // Failure reservation stays until this peer actually delivers media.
+                    None
+                }
+                PeerConnectAttempt::Failed(failure) => Some(failure),
+            };
+            (addr, failure)
         });
-        spawned += 1;
     }
-    spawned
+}
+
+// Stale peers are gossip transports only. One deadline covers the whole batch,
+// including our handshake writes; no Interested, media requests or continuity updates.
+async fn harvest_stale_gossip(
+    upstreams: Vec<ConnectedUpstream>,
+    identity: &Identity,
+    candidates: &mut SessionCandidates,
+) {
+    let deadline = tokio::time::Instant::now() + STALE_GOSSIP_BUDGET;
+    let mut tasks = tokio::task::JoinSet::new();
+    for mut upstream in upstreams {
+        let hs = OutgoingExtendedHandshake {
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            mi: None,
+            node: NodeFields::default(),
+            peer_ip: Some(upstream.addr.ip().octets()),
+            metadata_size: None,
+        };
+        let handshake = PeerMessage::Extended {
+            ext_id: 0,
+            payload: hs.sign_and_encode(identity),
+        };
+        tasks.spawn(async move {
+            let mut learned = SessionCandidates::default();
+            let _ = tokio::time::timeout_at(deadline, async {
+                if upstream.session.send(&handshake).await.is_err() {
+                    return;
+                }
+                for _ in 0..32 {
+                    match upstream.session.read_message().await {
+                        Ok(PeerMessage::Unknown { id: 12, payload }) => {
+                            for addr in ace_wire::peer_exchange::parse_peer_exchange(&payload) {
+                                learned.learn(addr, CandidateKind::Pex);
+                            }
+                        }
+                        Ok(PeerMessage::Unknown { id: 36, payload }) => {
+                            if let Some(addr) =
+                                ace_wire::peer_exchange::parse_peer_announce(&payload)
+                            {
+                                learned.learn(addr, CandidateKind::Source);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            })
+            .await;
+            learned.into_learned()
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(learned) = joined {
+            for (addr, kind) in learned {
+                candidates.learn(addr, kind);
+            }
+        }
+    }
 }
 
 async fn advance_pool_requests(
@@ -2815,7 +2967,7 @@ async fn follow_one_peer(
         .is_err()
         || session.send(&PeerMessage::Interested).await.is_err()
     {
-        return FollowEnd::PeerLost(vec![addr]);
+        return FollowEnd::PeerLost(1);
     }
 
     let mut unchoked = false;
@@ -2847,17 +2999,17 @@ async fn follow_one_peer(
                 "[ace] {addr}: stale upstream — no live progress for {:?}; reconnecting",
                 seed.live_recovery.stale_upstream_timeout()
             );
-            return FollowEnd::PeerLost(vec![addr]);
+            return FollowEnd::PeerLost(1);
         };
         let msg = match tokio::time::timeout(read_budget, session.read_message()).await {
             Ok(Ok(m)) => m,
-            Ok(Err(_)) => return FollowEnd::PeerLost(vec![addr]),
+            Ok(Err(_)) => return FollowEnd::PeerLost(1),
             Err(_) => {
                 crate::alog!(
                     "[ace] {addr}: stale upstream — no live progress for {:?}; reconnecting",
                     seed.live_recovery.stale_upstream_timeout()
                 );
-                return FollowEnd::PeerLost(vec![addr]);
+                return FollowEnd::PeerLost(1);
             }
         };
         let mut made_activity = false;
@@ -2875,7 +3027,7 @@ async fn follow_one_peer(
                     .await
                     .is_err()
                 {
-                    return FollowEnd::PeerLost(vec![addr]);
+                    return FollowEnd::PeerLost(1);
                 }
                 made_activity = true;
             }
@@ -2894,7 +3046,7 @@ async fn follow_one_peer(
                         .await
                         .is_err()
                 {
-                    return FollowEnd::PeerLost(vec![addr]);
+                    return FollowEnd::PeerLost(1);
                 }
             }
             // The live edge advances via a periodic `myinfo` window update (engine symbol
@@ -2914,7 +3066,7 @@ async fn follow_one_peer(
                             .await
                             .is_err()
                     {
-                        return FollowEnd::PeerLost(vec![addr]);
+                        return FollowEnd::PeerLost(1);
                     }
                 }
             }
@@ -2941,7 +3093,7 @@ async fn follow_one_peer(
                                 .await
                                 .is_err()
                         {
-                            return FollowEnd::PeerLost(vec![addr]);
+                            return FollowEnd::PeerLost(1);
                         }
                         continue;
                     }
@@ -2974,7 +3126,7 @@ async fn follow_one_peer(
                             .await
                             .is_err()
                     {
-                        return FollowEnd::PeerLost(vec![addr]);
+                        return FollowEnd::PeerLost(1);
                     }
                 }
             }
@@ -3017,7 +3169,7 @@ async fn follow_one_peer(
                             .await
                             .is_err()
                     {
-                        return FollowEnd::PeerLost(vec![addr]);
+                        return FollowEnd::PeerLost(1);
                     }
                 }
             }
@@ -3042,7 +3194,7 @@ async fn follow_one_peer(
                             .await
                             .is_err()
                     {
-                        return FollowEnd::PeerLost(vec![addr]);
+                        return FollowEnd::PeerLost(1);
                     }
                 } else if seen_ids.insert(id) {
                     crate::alog!(
@@ -3082,19 +3234,6 @@ fn stale_upstream_budget(
 
 fn should_refresh_stale_deadline(emitted: u64, made_output: bool, made_activity: bool) -> bool {
     made_output || (emitted == 0 && made_activity)
-}
-
-/// Decide whether a just-stalled pool's (reachable) peers should be reconnected to rather than
-/// excluded. Retry while the session keeps producing output between stalls (`emitted` differs
-/// from the last retry's watermark); once two stalls bracket zero output, stop retrying so we
-/// look elsewhere instead of looping on a frozen source. Updates the watermark on retry.
-fn retry_stalled_pool(emitted: Option<u64>, last_stall_emitted: &mut Option<u64>) -> bool {
-    if emitted != *last_stall_emitted {
-        *last_stall_emitted = emitted;
-        true
-    } else {
-        false
-    }
 }
 
 fn schedule_piece_requests(
@@ -4049,7 +4188,8 @@ mod tests {
                 &mut continuity,
                 vec![],
                 vec![],
-                tokio::sync::watch::channel(None).1,
+                Arc::new(|_| Box::pin(async { vec![] })),
+                &mut SessionCandidates::default(),
                 &Arc::new(AtomicU32::new(0)),
                 None,
             )
@@ -4420,26 +4560,6 @@ mod tests {
             stale_upstream_budget(now, now + timeout + Duration::from_millis(1), timeout),
             None
         );
-    }
-
-    #[test]
-    fn stalled_pool_retries_while_making_progress_then_gives_up() {
-        let mut watermark = None;
-        // First stall (some bytes already served): retry, record watermark.
-        assert!(retry_stalled_pool(Some(40), &mut watermark));
-        // Recovered and served more before stalling again: retry again.
-        assert!(retry_stalled_pool(Some(52), &mut watermark));
-        // Stalled again with nothing emitted since: stop retrying (exclude the peers).
-        assert!(!retry_stalled_pool(Some(52), &mut watermark));
-        // If it later produces output, it's productive again -> retry resumes.
-        assert!(retry_stalled_pool(Some(53), &mut watermark));
-    }
-
-    #[test]
-    fn stalled_pool_before_any_playback_retries_once_then_gives_up() {
-        let mut watermark = None;
-        assert!(retry_stalled_pool(Some(0), &mut watermark)); // first stall at 0 bytes: one retry
-        assert!(!retry_stalled_pool(Some(0), &mut watermark)); // still 0 -> give up
     }
 
     fn win(min: i64, max: i64) -> LivePosition {
@@ -5311,85 +5431,16 @@ mod tests {
     }
 
     #[test]
-    fn candidates_exclude_previously_lost_peers() {
-        let peers = addrs(&[1, 2, 3]);
-        let excluded: HashSet<SocketAddrV4> = [addrs(&[2])[0]].into_iter().collect();
-        let candidates = candidates_for_reconnect(&peers, &excluded);
-        assert_eq!(
-            candidates,
-            addrs(&[1, 3]),
-            "peer 2 was excluded, having failed before"
-        );
-    }
-
-    #[test]
-    fn candidates_accumulate_across_multiple_losses() {
-        // The bug this fixes: excluding only the MOST RECENT loss let a session flip-flop
-        // back to a peer that had already failed earlier in the same run.
-        let peers = addrs(&[1, 2, 3]);
-        let excluded: HashSet<SocketAddrV4> = addrs(&[1, 2]).into_iter().collect();
-        let candidates = candidates_for_reconnect(&peers, &excluded);
-        assert_eq!(
-            candidates,
-            addrs(&[3]),
-            "both earlier failures stay excluded, not just the latest"
-        );
-    }
-
-    #[test]
-    fn candidates_fall_back_to_the_full_list_once_everyone_has_failed() {
-        // The peer list is fixed for this stream (discovered once at `open`); permanently
-        // blacklisting every peer that ever failed once would end the session rather than
-        // give a transient failure another chance.
-        let peers = addrs(&[1, 2]);
-        let excluded: HashSet<SocketAddrV4> = addrs(&[1, 2]).into_iter().collect();
-        let candidates = candidates_for_reconnect(&peers, &excluded);
-        assert_eq!(
-            candidates, peers,
-            "nothing left to try -> give the whole list another chance"
-        );
-    }
-
-    #[test]
-    fn rediscovery_merges_only_new_peers_and_keeps_existing_order() {
-        let mut peers = addrs(&[1, 2]);
-        let added = merge_discovered_peers(&mut peers, addrs(&[2, 3, 1, 4]));
-
-        assert_eq!(added, 2);
-        assert_eq!(peers, addrs(&[1, 2, 3, 4]));
-    }
-
-    #[test]
-    fn rediscovery_reports_zero_when_every_peer_was_already_known() {
-        let mut peers = addrs(&[1, 2]);
-        let added = merge_discovered_peers(&mut peers, addrs(&[2, 1, 2]));
-
-        assert_eq!(added, 0);
-        assert_eq!(peers, addrs(&[1, 2]));
-    }
-
-    #[test]
-    fn rediscovery_without_new_peers_allows_excluded_peers_to_be_retried() {
-        let mut peers = addrs(&[1, 2]);
-        let mut excluded: HashSet<SocketAddrV4> = addrs(&[1]).into_iter().collect();
-
-        let added = reconcile_peer_rediscovery(&mut peers, &mut excluded, addrs(&[2, 1]));
-
-        assert_eq!(added, 0);
-        assert!(
-            excluded.is_empty(),
-            "a refresh cycle with no new peers should let known peers be re-evaluated"
-        );
-    }
-
-    #[test]
-    fn pool_refill_candidates_skip_active_and_excluded_peers() {
+    fn pool_refill_candidates_skip_active_and_cooling_peers() {
         let peers = addrs(&[1, 2, 3, 4]);
         let active: HashSet<SocketAddrV4> = addrs(&[2]).into_iter().collect();
-        let excluded: HashSet<SocketAddrV4> = addrs(&[3]).into_iter().collect();
-
+        let mut candidates = SessionCandidates::default();
+        for addr in peers {
+            candidates.learn(addr, CandidateKind::Discovered);
+        }
+        candidates.failed(addrs(&[3])[0], Instant::now());
         assert_eq!(
-            pool_refill_candidates(&peers, &excluded, &active),
+            pool_refill_candidates(&candidates.eligible_discovered(Instant::now()), &active),
             addrs(&[1, 4])
         );
     }
