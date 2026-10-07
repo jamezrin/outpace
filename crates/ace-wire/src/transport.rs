@@ -37,7 +37,7 @@ pub struct TransportDescriptor {
     pub piece_length: u64,
     /// Bytes per chunk (typically 16 384 = 16 KiB).
     pub chunk_length: u64,
-    /// Media bitrate hint, if present.
+    /// Raw media bitrate hint in bytes per second, if present.
     pub bitrate: Option<i64>,
     /// Bounded content categories advertised by the descriptor.
     pub categories: Vec<String>,

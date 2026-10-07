@@ -646,7 +646,7 @@ fn unresolved_infohash_message(id: &str) -> String {
     )
 }
 
-/// Resolve the live history depth needed to fill the startup reservoir. Known bitrates use
+/// Resolve the live history depth needed to fill the startup reservoir. Descriptor bytes/s use
 /// media payload bytes per piece plus a two-piece scheduling margin. Without a bitrate hint,
 /// enabled startup buffering uses a conservative historical window; disabled buffering keeps
 /// the legacy depth.
@@ -656,21 +656,20 @@ fn derived_prefetch_pieces(
     piece_length: u64,
     sig_len: usize,
 ) -> u64 {
-    let Some(bitrate) = bitrate else {
-        return if target_ms == 0 {
-            PREFETCH_PIECES
-        } else {
-            UNKNOWN_BITRATE_BUFFER_PREFETCH_PIECES
-        };
+    if target_ms == 0 {
+        return PREFETCH_PIECES;
+    }
+    let Some(bytes_per_second) = bitrate.filter(|rate| *rate > 0) else {
+        return UNKNOWN_BITRATE_BUFFER_PREFETCH_PIECES;
     };
     let payload = piece_length.saturating_sub(sig_len as u64).max(1) as u128;
-    let Some(bit_millis) = (target_ms as u128).checked_mul(bitrate as u128) else {
+    let Some(byte_millis) = (target_ms as u128).checked_mul(bytes_per_second as u128) else {
         return u64::MAX;
     };
-    let Some(piece_bit_millis) = 8_000_u128.checked_mul(payload) else {
+    let Some(piece_byte_millis) = 1_000_u128.checked_mul(payload) else {
         return u64::MAX;
     };
-    let pieces = bit_millis.div_ceil(piece_bit_millis).saturating_add(2);
+    let pieces = byte_millis.div_ceil(piece_byte_millis).saturating_add(2);
     u64::try_from(pieces).unwrap_or(u64::MAX)
 }
 
@@ -3295,8 +3294,8 @@ mod tests {
     #[test]
     fn prefetch_derives_history_from_target_bitrate_and_payload_with_two_piece_margin() {
         assert_eq!(
-            derived_prefetch_pieces(30_000, Some(8_000_000), 1_048_576, 96),
-            31
+            derived_prefetch_pieces(30_000, Some(1_000_000), 524_288, 128),
+            60
         );
     }
 
@@ -3309,6 +3308,38 @@ mod tests {
     fn prefetch_fallback_depends_on_whether_prebuffer_is_enabled() {
         assert_eq!(derived_prefetch_pieces(30_000, None, 1_048_576, 96), 32);
         assert_eq!(derived_prefetch_pieces(0, None, 1_048_576, 96), 8);
+    }
+
+    #[test]
+    fn prefetch_disabled_with_known_bitrate_preserves_eight_pieces() {
+        assert_eq!(derived_prefetch_pieces(0, Some(1_000_000), 524_288, 128), 8);
+        assert_eq!(derived_prefetch_pieces(0, Some(0), 524_288, 128), 8);
+    }
+
+    #[test]
+    fn prefetch_zero_bitrate_uses_unknown_history_fallback() {
+        assert_eq!(derived_prefetch_pieces(30_000, Some(0), 524_288, 128), 32);
+    }
+
+    #[test]
+    fn prefetch_bounds_huge_rates_payload_and_peer_window() {
+        assert_eq!(
+            derived_prefetch_pieces(u64::MAX, Some(u64::MAX), 0, 128),
+            u64::MAX
+        );
+        assert_eq!(derived_prefetch_pieces(1_000, Some(1), 128, 128), 3);
+        let mut descriptor = info();
+        descriptor.metadata.bitrate = Some(u64::MAX);
+        let recovery = LiveRecoveryConfig {
+            max_reasm_pieces_ahead: 64,
+            ..Default::default()
+        };
+        let provider =
+            AceProvider::new(Arc::new(Identity::generate()), 6878).with_live_recovery(recovery);
+        let depth = provider.prefetch_policy_for(&descriptor);
+        assert_eq!(depth, 64);
+        assert_eq!(prefetch_start(180, 200, depth), 180);
+        assert_eq!(prefetch_start(0, 20, u64::MAX), 0);
     }
 
     #[test]

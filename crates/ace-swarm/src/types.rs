@@ -1,10 +1,10 @@
 //! Stream descriptors shared across resolution and download.
 
-/// Client-facing metadata resolved from an Acestream transport descriptor.
+/// Metadata resolved from an Acestream transport descriptor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamMetadata {
     pub title: Option<String>,
-    /// Descriptor bitrate hint in bits per second.
+    /// Raw descriptor bitrate hint in bytes per second. Public API consumers convert to bits/s.
     pub bitrate: Option<u64>,
     pub categories: Vec<String>,
 }

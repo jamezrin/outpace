@@ -68,8 +68,9 @@ An active stream status response has stable field names and numeric counters:
 
 `clients` counts direct consumers of the shared byte stream; internal HLS packaging does not
 inflate it. The top-level `bitrate` is the measured session rate; `metadata.bitrate` is the
-descriptor's advertised rate. Rates are bits per second, `buffer_ms` is the estimated duration
-currently queued on the server, and `uploaded` is bytes. In particular, `buffer_ms` is not a
+descriptor's advertised rate converted from its raw bytes-per-second unit. Both JSON rates
+are bits per second (conversion saturates at the unsigned 64-bit maximum). `buffer_ms` is the
+estimated duration currently queued on the server, and `uploaded` is bytes. In particular, `buffer_ms` is not a
 decoder or player lead measurement: a client can drain the server queue faster than real time,
 or maintain its own independent buffer. Metadata always has the stable `title`, `bitrate`, and
 `categories` fields;
