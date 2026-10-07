@@ -1153,6 +1153,7 @@ enum PeerConnectStage {
     Tcp,
     Handshake,
     Window,
+    TotalTimeout,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1161,6 +1162,7 @@ struct PeerConnectStats {
     tcp: usize,
     handshake: usize,
     window: usize,
+    total_timeout: usize,
     task: usize,
 }
 
@@ -1175,6 +1177,7 @@ impl PeerConnectStats {
             PeerConnectStage::Tcp => self.tcp += 1,
             PeerConnectStage::Handshake => self.handshake += 1,
             PeerConnectStage::Window => self.window += 1,
+            PeerConnectStage::TotalTimeout => self.total_timeout += 1,
         }
     }
 
@@ -1183,11 +1186,17 @@ impl PeerConnectStats {
     }
 
     fn has_observations(&self) -> bool {
-        self.connected + self.tcp + self.handshake + self.window + self.task > 0
+        self.connected + self.tcp + self.handshake + self.window + self.total_timeout + self.task
+            > 0
     }
 
     fn summary(&self) -> String {
-        let attempted = self.connected + self.tcp + self.handshake + self.window + self.task;
+        let attempted = self.connected
+            + self.tcp
+            + self.handshake
+            + self.window
+            + self.total_timeout
+            + self.task;
         let mut parts = vec![format!("attempted={attempted}")];
         if self.connected > 0 {
             parts.push(format!("connected={}", self.connected));
@@ -1200,6 +1209,9 @@ impl PeerConnectStats {
         }
         if self.window > 0 {
             parts.push(format!("window={}", self.window));
+        }
+        if self.total_timeout > 0 {
+            parts.push(format!("total_timeout={}", self.total_timeout));
         }
         if self.task > 0 {
             parts.push(format!("task={}", self.task));
@@ -1305,7 +1317,7 @@ async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnect
         Ok(result) => result,
         Err(_) => PeerConnectAttempt::Failed(PeerConnectFailure {
             addr,
-            stage: PeerConnectStage::Window,
+            stage: PeerConnectStage::TotalTimeout,
         }),
     }
 }
@@ -1378,18 +1390,25 @@ fn background_discovery_options() -> DiscoveryOptions {
 /// to first byte — a couple of unreachable peers at the front of the list used to cost
 /// `CONNECT_TIMEOUT` each before we ever reached a live one (the "slow to load" report).
 /// Candidate snapshots are ordered by learned-source priority and exclude cooling peers.
-/// Each snapshot is visited once, so slow sources cannot restart the round ahead of alternatives.
+/// Each snapshot is visited once. Peers with fewer prior admissions are tried in separate
+/// cohorts, so a fast but unproductive source cannot repeatedly cancel an unadmitted peer.
 async fn connect_pool(
     peers: &[SocketAddrV4],
     infohash: [u8; 20],
     candidates: &mut SessionCandidates,
     live_recovery: LiveRecoveryConfig,
 ) -> Vec<ConnectedUpstream> {
-    let attempts = peers.to_vec();
+    // Do not race a previously admitted fast peer against an alternative that has not
+    // received an admission opportunity. Aborted attempts do not advance service history.
+    let batches: Vec<Vec<_>> = peers
+        .chunk_by(|a, b| candidates.admissions(*a) == candidates.admissions(*b))
+        .flat_map(|cohort| cohort.chunks(live_recovery.max_parallel_connect))
+        .map(<[_]>::to_vec)
+        .collect();
     let mut stats = PeerConnectStats::default();
-    for batch in attempts.chunks(live_recovery.max_parallel_connect) {
+    for batch in batches {
         let mut set = tokio::task::JoinSet::new();
-        for &addr in batch {
+        for &addr in &batch {
             set.spawn(connect_upstream(addr, infohash));
         }
         let mut connected: Vec<ConnectedUpstream> = Vec::new();
@@ -1595,7 +1614,21 @@ async fn follow_live_session(
                 continue;
             }
             if rediscovery.is_empty() {
-                rediscovery.spawn(discovery(DiscoveryOptions::default()));
+                // After an unusable discovered-only cohort, do not repeatedly cancel a
+                // slower peer source as soon as the same small DHT set arrives again.
+                // These options bound DHT, not total tracker/DNS completion; the single
+                // owned discovery remains concurrent with known-candidate retries.
+                let options = if candidates.learned_counts() == (0, 0) {
+                    background_discovery_options()
+                } else {
+                    DiscoveryOptions::default()
+                };
+                crate::alog!(
+                    "[ace] failed-round rediscovery: target={} dht_budget={:?}",
+                    options.peer_target,
+                    options.dht_budget
+                );
+                rediscovery.spawn(discovery(options));
             }
             tokio::select! {
                 _ = tx.closed() => return,
@@ -1618,8 +1651,14 @@ async fn follow_live_session(
             .collect::<Vec<_>>()
             .join(", ");
         let active_addrs: HashSet<SocketAddrV4> = upstreams.iter().map(|u| u.addr).collect();
+        let refill_cohort =
+            candidates.admission_cohort(Instant::now(), &active_addrs, &HashSet::new());
         let refill_candidates = pool_refill_candidates(
-            &candidates.eligible_discovered(Instant::now()),
+            &candidates
+                .eligible_discovered(Instant::now())
+                .into_iter()
+                .filter(|addr| Some(candidates.admissions(*addr)) == refill_cohort)
+                .collect::<Vec<_>>(),
             &active_addrs,
         );
         let known_refill_peers = candidates.all();
@@ -2174,8 +2213,11 @@ async fn follow_peer_pool(
     // gossip can be connected and fed into the same pool-add path (keeps `refill_rx` open
     // even after the background refill task finishes).
     let pex_tx = refill_tx.clone();
-    let mut learned_connects: tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>)> =
-        tokio::task::JoinSet::new();
+    let mut learned_connects: tokio::task::JoinSet<(
+        SocketAddrV4,
+        Option<PeerConnectFailure>,
+        bool,
+    )> = tokio::task::JoinSet::new();
     let mut learned_pending = HashSet::new();
     let mut refill_handle = if refill_candidates.is_empty() {
         None
@@ -2212,6 +2254,7 @@ async fn follow_peer_pool(
         .await
         {
             Ok(runtime) => {
+                candidates.admitted(runtime.addr);
                 peers.insert(peer_id, runtime);
             }
             Err(addr) => record_pool_losses(candidates, &mut loss_count, [addr]),
@@ -2238,8 +2281,10 @@ async fn follow_peer_pool(
     let mut refill_closed = false;
     loop {
         while let Some(joined) = learned_connects.try_join_next() {
-            if let Ok((addr, failure)) = joined {
-                learned_pending.remove(&addr);
+            if let Ok((addr, failure, queued)) = joined {
+                if !queued {
+                    learned_pending.remove(&addr);
+                }
                 if let Some(failure) = failure {
                     candidates.failed(failure.addr, Instant::now());
                 }
@@ -2301,6 +2346,7 @@ async fn follow_peer_pool(
                 return FollowEnd::PeerLost(loss_count);
             }
             PoolWake::Refill(Some(upstream)) => {
+                learned_pending.remove(&upstream.addr);
                 candidates.learn(upstream.addr, CandidateKind::Discovered);
                 if !continuity.window_can_resume(&upstream.window) {
                     crate::alog!(
@@ -2329,6 +2375,15 @@ async fn follow_peer_pool(
                 if peers.values().any(|p| p.addr == upstream.addr) {
                     continue;
                 }
+                let active = peers.values().map(|peer| peer.addr).collect();
+                if candidates
+                    .admission_cohort(Instant::now(), &active, &learned_pending)
+                    .is_some_and(|cohort| candidates.admissions(upstream.addr) > cohort)
+                {
+                    // Preserve the opportunity of a lower-admission peer still connecting
+                    // or queued. Dropping this older transport consumes no new admission.
+                    continue;
+                }
                 candidates.learn(upstream.addr, CandidateKind::Discovered);
                 let peer_id = next_peer_id;
                 next_peer_id += 1;
@@ -2346,6 +2401,7 @@ async fn follow_peer_pool(
                 .await
                 {
                     Ok(runtime) => {
+                        candidates.admitted(runtime.addr);
                         crate::alog!(
                             "[ace] {addr}: added to active upstream pool ({} peer(s))",
                             peers.len() + 1
@@ -2681,15 +2737,20 @@ fn spawn_learned_connects(
     infohash: [u8; 20],
     max_parallel: usize,
     tx: &mpsc::Sender<ConnectedUpstream>,
-    tasks: &mut tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>)>,
+    tasks: &mut tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>, bool)>,
     pending: &mut HashSet<SocketAddrV4>,
 ) {
     let (sources, pex) = candidates.learned_counts();
     if sources + pex == 0 {
         return;
     }
+    let active = peers.values().map(|peer| peer.addr).collect();
+    let cohort = candidates.admission_cohort(Instant::now(), &active, pending);
     for addr in candidates.eligible_learned(Instant::now()) {
-        if tasks.len() >= max_parallel {
+        if Some(candidates.admissions(addr)) != cohort {
+            continue;
+        }
+        if tasks.len() >= max_parallel || pending.len() >= max_parallel {
             break;
         }
         if peers.values().any(|p| p.addr == addr) || !pending.insert(addr) {
@@ -2699,15 +2760,13 @@ fn spawn_learned_connects(
         candidates.attempting(addr, Instant::now() + CONNECT_TIMEOUT);
         let tx = tx.clone();
         tasks.spawn(async move {
-            let failure = match connect_upstream(addr, infohash).await {
-                PeerConnectAttempt::Connected(upstream) => {
-                    let _ = tx.try_send(upstream);
-                    // Failure reservation stays until this peer actually delivers media.
-                    None
-                }
-                PeerConnectAttempt::Failed(failure) => Some(failure),
+            let (failure, queued) = match connect_upstream(addr, infohash).await {
+                PeerConnectAttempt::Connected(upstream) => (None, tx.try_send(upstream).is_ok()),
+                PeerConnectAttempt::Failed(failure) => (Some(failure), false),
             };
-            (addr, failure)
+            // Successful queued peers remain pending until activation/rejection; neither
+            // cooldown expiry nor gossip can race an older cohort into their capacity.
+            (addr, failure, queued)
         });
     }
 }

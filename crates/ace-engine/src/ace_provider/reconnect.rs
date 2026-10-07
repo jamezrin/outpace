@@ -1,5 +1,6 @@
 //! Bounded, session-local upstream knowledge and retry timing.
 
+use std::collections::HashSet;
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ struct Candidate {
     addr: SocketAddrV4,
     kind: CandidateKind,
     failures: u32,
+    admissions: u64,
     retry_at: Instant,
 }
 
@@ -69,13 +71,14 @@ impl SessionCandidates {
             addr,
             kind,
             failures: 0,
+            admissions: 0,
             retry_at: Instant::now(),
         });
     }
 
     pub(super) fn eligible(&self, now: Instant) -> Vec<SocketAddrV4> {
         let mut eligible: Vec<_> = self.entries.iter().filter(|c| c.retry_at <= now).collect();
-        eligible.sort_by_key(|c| c.kind);
+        eligible.sort_by_key(|c| (c.admissions, c.kind));
         eligible.into_iter().map(|c| c.addr).collect()
     }
 
@@ -93,8 +96,23 @@ impl SessionCandidates {
             .iter()
             .filter(|c| c.retry_at <= now && (c.kind == CandidateKind::Discovered) == discovered)
             .collect();
-        eligible.sort_by_key(|c| c.kind);
+        eligible.sort_by_key(|c| (c.admissions, c.kind));
         eligible.into_iter().map(|c| c.addr).collect()
+    }
+
+    pub(super) fn admission_cohort(
+        &self,
+        now: Instant,
+        active: &HashSet<SocketAddrV4>,
+        pending: &HashSet<SocketAddrV4>,
+    ) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter(|c| {
+                !active.contains(&c.addr) && (c.retry_at <= now || pending.contains(&c.addr))
+            })
+            .map(|c| c.admissions)
+            .min()
     }
 
     pub(super) fn into_learned(self) -> Vec<(SocketAddrV4, CandidateKind)> {
@@ -103,6 +121,19 @@ impl SessionCandidates {
 
     pub(super) fn all(&self) -> Vec<SocketAddrV4> {
         self.entries.iter().map(|c| c.addr).collect()
+    }
+
+    pub(super) fn admissions(&self, addr: SocketAddrV4) -> u64 {
+        self.entries
+            .iter()
+            .find(|c| c.addr == addr)
+            .map_or(0, |c| c.admissions)
+    }
+
+    pub(super) fn admitted(&mut self, addr: SocketAddrV4) {
+        if let Some(c) = self.entries.iter_mut().find(|c| c.addr == addr) {
+            c.admissions = c.admissions.saturating_add(1);
+        }
     }
 
     pub(super) fn attempting(&mut self, addr: SocketAddrV4, until: Instant) {
@@ -125,6 +156,11 @@ impl SessionCandidates {
     }
 
     pub(super) fn productive(&mut self, addr: SocketAddrV4) {
+        // Real contiguous output ends nonproductive exploration. Restore source priority
+        // for the next outage without resetting any other peer's failure/cooldown history.
+        for candidate in &mut self.entries {
+            candidate.admissions = 0;
+        }
         if let Some(c) = self.entries.iter_mut().find(|c| c.addr == addr) {
             c.failures = 0;
             c.retry_at = Instant::now();
