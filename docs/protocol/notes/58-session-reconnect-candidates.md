@@ -2,25 +2,29 @@
 
 Live sessions retain upstream addresses learned from peer exchange (`id=12`) and
 source-node announcements (`id=36`) through `PoolStale` and `PeerLost`. Learning
-continues when the active pool is full. Eligible candidates with fewer real pool admissions are tried first; within an
-equal-admission cohort, source addresses lead PEX then discovery addresses. Each
-connection batch stays within one cohort. Initial activation, learned connections
-and discovered refills record admission only after successful signed-handshake
-activation. Failed or stale transports and cancelled attempts do not consume an
-admission. Thus fast-handshaking but nonproducing sources cannot repeatedly end
-all connection rounds before an unadmitted alternative has a real opportunity.
-The finite snapshot and cohort rule also apply while learned connections are
-pending or ready in the refill queue. A cooldown expiring or repeated gossip does
-not let older peers overtake that pending opportunity.
+continues when the active pool is full. Eligible candidates with fewer completed
+transport opportunities are tried first; within an equal-exploration cohort,
+source addresses lead PEX then discovery addresses, with real admissions breaking
+remaining ties. Each connection batch stays within one cohort. A connect failure,
+stale-window rejection, failed signed activation, or successful real admission
+consumes exactly one opportunity. Later loss or pool staleness of an admitted
+transport applies cooldown without consuming that opportunity again. Successful
+activation records a separate admission count. Cancelled, duplicate, unselected,
+and deferred higher-cohort transports consume neither count. This lets both a
+healthy untried PEX peer and a previously admitted returning source advance past
+fast but unusable peers, without treating stale transports as media admissions.
+The cohort rule also applies while learned connections are pending or ready in
+the refill queue. Cooldown expiry and repeated gossip preserve both histories.
 
-Authenticated contiguous output resets all admission counts, restoring ordinary
-source priority for later outages without preempting healthy active media. Other
-peers' failure/cooldown histories are unchanged. Counts are session-local,
-saturating u64 values: equally saturated counters lose historical distinction
-after an impractical number of actual admissions. Candidate churn and slow or
-unusable peers prevent a universal wall-clock recovery bound. The default
-four-slot/eight-source fault topology with a healthy500ms PEX handshake is covered
-by a30s output bound across two nonproductive pool lifetimes.
+Authenticated contiguous output resets exploration and admission counts,
+restoring ordinary source priority for later outages without preempting healthy
+active media. Other peers' failure/cooldown histories are unchanged. Counts are
+session-local, saturating u64 values: equally saturated counters lose historical
+distinction after an impractical number of completed opportunities. Candidate
+churn and slow or unusable peers prevent a universal wall-clock recovery bound.
+The default four-slot/eight-source topology with a healthy 500-ms PEX handshake,
+and a returning source after 20 seconds among 64 stale PEX endpoints, each have a
+30-second actual-output regression bound.
 
 The collection contains at most 1024 distinct valid IPv4 endpoints. Higher-priority
 learned addresses can replace lower-priority entries when full. At most eight
@@ -68,7 +72,11 @@ Learned connection attempts are deduplicated while pending and collectively capp
 by the existing parallel-connect setting. Running attempts plus successfully
 queued learned transports share that one cap; queued transports remain pending
 until activation/rejection and close with the pool. Discovered refill attempts are separate
-from this learned queue; active endpoints are deduplicated on admission. Pool
+from this learned queue. Receipts carry producer ownership: a discovered transport
+cannot release a separate learned reservation at the same endpoint. Completed
+discovered failures use this bounded channel too, so their receipts advance
+exploration and cooldown exactly once without releasing learned ownership.
+Cancelled or discarded receipts consume no opportunity. Active endpoints are deduplicated on admission. Pool
 teardown or consumer cancellation aborts owned peer workers, learned attempts,
 refill tasks, and their discovery work, and clears active-peer statistics. Rebuild
 logs include the end reason and retained source/PEX counts.

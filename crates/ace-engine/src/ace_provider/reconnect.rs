@@ -21,6 +21,7 @@ struct Candidate {
     kind: CandidateKind,
     failures: u32,
     admissions: u64,
+    explorations: u64,
     retry_at: Instant,
 }
 
@@ -72,13 +73,14 @@ impl SessionCandidates {
             kind,
             failures: 0,
             admissions: 0,
+            explorations: 0,
             retry_at: Instant::now(),
         });
     }
 
     pub(super) fn eligible(&self, now: Instant) -> Vec<SocketAddrV4> {
         let mut eligible: Vec<_> = self.entries.iter().filter(|c| c.retry_at <= now).collect();
-        eligible.sort_by_key(|c| (c.admissions, c.kind));
+        eligible.sort_by_key(|c| (c.explorations, c.kind, c.admissions));
         eligible.into_iter().map(|c| c.addr).collect()
     }
 
@@ -96,11 +98,11 @@ impl SessionCandidates {
             .iter()
             .filter(|c| c.retry_at <= now && (c.kind == CandidateKind::Discovered) == discovered)
             .collect();
-        eligible.sort_by_key(|c| (c.admissions, c.kind));
+        eligible.sort_by_key(|c| (c.explorations, c.kind, c.admissions));
         eligible.into_iter().map(|c| c.addr).collect()
     }
 
-    pub(super) fn admission_cohort(
+    pub(super) fn exploration_cohort(
         &self,
         now: Instant,
         active: &HashSet<SocketAddrV4>,
@@ -111,7 +113,7 @@ impl SessionCandidates {
             .filter(|c| {
                 !active.contains(&c.addr) && (c.retry_at <= now || pending.contains(&c.addr))
             })
-            .map(|c| c.admissions)
+            .map(|c| c.explorations)
             .min()
     }
 
@@ -123,14 +125,23 @@ impl SessionCandidates {
         self.entries.iter().map(|c| c.addr).collect()
     }
 
-    pub(super) fn admissions(&self, addr: SocketAddrV4) -> u64 {
+    pub(super) fn explorations(&self, addr: SocketAddrV4) -> u64 {
         self.entries
             .iter()
             .find(|c| c.addr == addr)
-            .map_or(0, |c| c.admissions)
+            .map_or(0, |c| c.explorations)
+    }
+
+    // A completed opportunity advances exploration even when its window is stale.
+    // Cancelled, duplicate and unselected transports consume no opportunity.
+    pub(super) fn explored(&mut self, addr: SocketAddrV4) {
+        if let Some(c) = self.entries.iter_mut().find(|c| c.addr == addr) {
+            c.explorations = c.explorations.saturating_add(1);
+        }
     }
 
     pub(super) fn admitted(&mut self, addr: SocketAddrV4) {
+        self.explored(addr);
         if let Some(c) = self.entries.iter_mut().find(|c| c.addr == addr) {
             c.admissions = c.admissions.saturating_add(1);
         }
@@ -160,6 +171,7 @@ impl SessionCandidates {
         // for the next outage without resetting any other peer's failure/cooldown history.
         for candidate in &mut self.entries {
             candidate.admissions = 0;
+            candidate.explorations = 0;
         }
         if let Some(c) = self.entries.iter_mut().find(|c| c.addr == addr) {
             c.failures = 0;

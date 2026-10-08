@@ -1205,3 +1205,347 @@ async fn failed_round_recovery_waits_for_delayed_discovery_alternative() {
 async fn recovery_preserves_discovery_alternative_after_dht_budget() {
     failed_round_discovery_control(Duration::from_millis(8500), Duration::from_secs(20)).await;
 }
+
+#[tokio::test]
+async fn stale_zero_admission_cohort_must_not_lock_out_returning_source() {
+    let mut listeners = Vec::new();
+    for _ in 0..73 {
+        listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    }
+    let addrs: Vec<_> = listeners
+        .iter()
+        .map(|l| match l.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        })
+        .collect();
+    let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let mut servers = tokio::task::JoinSet::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let all = addrs.clone();
+        let available = available.clone();
+        let attempts = attempts.clone();
+        servers.spawn(async move {
+            let mut clients = tokio::task::JoinSet::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let all = all.clone();
+                let available = available.clone();
+                let attempts = attempts.clone();
+                clients.spawn(async move {
+                    let ready = index == 1 && available.load(Ordering::Relaxed);
+                    if ready {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut peer = PeerSession::new(stream);
+                    if peer.accept_handshake([0; 20], |_| true).await.is_err() {
+                        return;
+                    }
+                    if peer
+                        .send_extended_handshake(&OutgoingExtendedHandshake {
+                            mi: Some(if index < 9 {
+                                live_pos(7, 8)
+                            } else {
+                                live_pos(1, 1)
+                            }),
+                            ace_metadata_version: 1,
+                            ut_metadata_id: 2,
+                            node: NodeFields::default(),
+                            peer_ip: None,
+                            metadata_size: None,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if index == 0 {
+                        for addr in &all[1..9] {
+                            let mut payload = vec![0; 14];
+                            payload[8..12].copy_from_slice(&addr.ip().octets());
+                            payload[12..14].copy_from_slice(&addr.port().to_be_bytes());
+                            if peer
+                                .send(&PeerMessage::Unknown { id: 36, payload })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        for addr in &all[9..] {
+                            let mut payload = vec![0; 124];
+                            payload[1..3].copy_from_slice(&1u16.to_be_bytes());
+                            payload[3..7].copy_from_slice(&17u32.to_be_bytes());
+                            payload[7..11].copy_from_slice(&108u32.to_be_bytes());
+                            payload[27..31].copy_from_slice(&addr.ip().octets());
+                            payload[31..33].copy_from_slice(&addr.port().to_be_bytes());
+                            if peer
+                                .send(&PeerMessage::Unknown { id: 12, payload })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    if ready && peer.send(&PeerMessage::Unchoke).await.is_err() {
+                        return;
+                    }
+                    while let Ok(msg) = peer.read_message().await {
+                        if ready {
+                            if let PeerMessage::Unknown {
+                                id: 6,
+                                payload: req,
+                            } = msg
+                            {
+                                let piece = u32::from_be_bytes(req[4..8].try_into().unwrap());
+                                let payload: Vec<_> = (0..4)
+                                    .flat_map(|cc| {
+                                        let mut p = vec![0x66; 188];
+                                        p[..4].copy_from_slice(&[0x47, 1, 0, 0x10 | cc]);
+                                        p
+                                    })
+                                    .collect();
+                                if peer
+                                    .send(&build_piece(0, piece, 0, [0; 8], &payload))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let run = |bootstrap: Vec<SocketAddrV4>| {
+        let (info, mut seed) = cancellation_fixture();
+        seed.live_recovery.stale_upstream_timeout_ms = 5000;
+        let (tx, rx) = mpsc::channel(16);
+        let task = tokio::spawn(follow_live_session(
+            info,
+            bootstrap,
+            Arc::new(Identity::generate()),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            seed,
+            Arc::new(|_| Box::pin(async { vec![] })),
+            None,
+        ));
+        (rx, task)
+    };
+    let (mut rx, direct) = run(vec![addrs[1]]);
+    assert!(tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .is_some());
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(1), direct)
+        .await
+        .unwrap()
+        .unwrap();
+    available.store(false, Ordering::Relaxed);
+    attempts.store(0, Ordering::Relaxed);
+    let started = Instant::now();
+    let (mut rx, session) = run(vec![addrs[0]]);
+    let ready = available.clone();
+    let wake = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        ready.store(true, Ordering::Relaxed);
+    });
+    let output = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
+    let elapsed = started.elapsed();
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(1), session)
+        .await
+        .unwrap()
+        .unwrap();
+    wake.await.unwrap();
+    drop(servers);
+    eprintln!(
+        "stale-cohort control: first_ms={}, healthy_attempts={}",
+        elapsed.as_millis(),
+        attempts.load(Ordering::Relaxed)
+    );
+    assert!(
+        attempts.load(Ordering::Relaxed) > 0,
+        "returning source received no healthy attempt"
+    );
+    assert!(
+        matches!(output, Ok(Some(_))),
+        "returning source starved by stale cohort: healthy attempts={}",
+        attempts.load(Ordering::Relaxed)
+    );
+}
+
+#[tokio::test]
+async fn discovered_refill_preserves_overlapping_learned_reservation() {
+    let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let c = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = |listener: &tokio::net::TcpListener| match listener.local_addr().unwrap() {
+        std::net::SocketAddr::V4(a) => a,
+        _ => unreachable!(),
+    };
+    let addrs = [addr(&a), addr(&b), addr(&c)];
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let waiting = Arc::new(AtomicU32::new(0));
+    let closed = Arc::new(AtomicU32::new(0));
+    let mut servers = tokio::task::JoinSet::new();
+    for (index, listener) in [a, b].into_iter().enumerate() {
+        let gate = gate.clone();
+        let waiting = waiting.clone();
+        let closed = closed.clone();
+        servers.spawn(async move {
+            let mut clients = tokio::task::JoinSet::new();
+            let mut count = 0;
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let gated = index == 1 || count > 0;
+                count += 1;
+                let gate = gate.clone();
+                let waiting = waiting.clone();
+                let closed = closed.clone();
+                clients.spawn(async move {
+                    let mut peer = PeerSession::new(stream);
+                    peer.accept_handshake([0; 20], |_| true).await.unwrap();
+                    if gated {
+                        waiting.fetch_add(1, Ordering::Relaxed);
+                        gate.notified().await;
+                    }
+                    peer.send_extended_handshake(&OutgoingExtendedHandshake {
+                        mi: Some(live_pos(7, 8)),
+                        ace_metadata_version: 1,
+                        ut_metadata_id: 2,
+                        node: NodeFields::default(),
+                        peer_ip: None,
+                        metadata_size: None,
+                    })
+                    .await
+                    .unwrap();
+                    while peer.read_message().await.is_ok() {}
+                    closed.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        });
+    }
+    // A discovered transport exists independently of the cap-two learned producers.
+    let PeerConnectAttempt::Connected(discovered) = connect_upstream(addrs[0], [0; 20]).await
+    else {
+        panic!("discovered positive control")
+    };
+    let (tx, mut rx) = mpsc::channel(2);
+    tx.send(PoolRefill::Discovered(discovered)).await.unwrap();
+    let mut candidates = SessionCandidates::default();
+    for addr in addrs {
+        candidates.learn(addr, CandidateKind::Pex);
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut pending = HashSet::new();
+    spawn_learned_connects(
+        &mut candidates,
+        &BTreeMap::new(),
+        [0; 20],
+        2,
+        &tx,
+        &mut tasks,
+        &mut pending,
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while waiting.load(Ordering::Relaxed) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let discovered =
+        receive_pool_refill(rx.recv().await.unwrap(), &mut pending, &mut candidates).unwrap();
+    gate.notify_waiters();
+    while let Some(joined) = tasks.join_next().await {
+        let (_, failure, queued) = joined.unwrap();
+        assert!(failure.is_none() && queued);
+    }
+    assert_eq!(rx.len(), 2); // Both actual learned connections are ready and owned.
+    spawn_learned_connects(
+        &mut candidates,
+        &BTreeMap::new(),
+        [0; 20],
+        2,
+        &tx,
+        &mut tasks,
+        &mut pending,
+    );
+    let unexpected = tokio::time::timeout(Duration::from_millis(100), c.accept()).await;
+    let exceeds_cap = unexpected.is_ok();
+    drop(unexpected);
+    drop(tasks);
+    drop(rx);
+    drop(discovered);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while closed.load(Ordering::Relaxed) != 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(servers);
+    assert!(!exceeds_cap,"discovered A receipt released distinct learned A, allowing learned C alongside ready A/B under cap2");
+}
+
+#[tokio::test]
+async fn discovered_refill_reports_completed_transport_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        drop(socket); // TCP succeeds, but the real BT exchange fails.
+    });
+    let (tx, mut rx) = mpsc::channel(1);
+    let producer = tokio::spawn(refill_upstream_pool(
+        vec![addr],
+        [0; 20],
+        Arc::new(|_| Box::pin(async { vec![] })),
+        vec![addr],
+        default_live_recovery(),
+        tx,
+    ));
+    let receipt = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), producer)
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+    assert!(
+        receipt.is_some(),
+        "completed discovered failure never reaches session exploration history"
+    );
+    let mut candidates = SessionCandidates::default();
+    let mut pending = HashSet::from([addr]);
+    assert!(receive_pool_refill(receipt.unwrap(), &mut pending, &mut candidates).is_none());
+    assert_eq!(candidates.explorations(addr), 1);
+    assert!(candidates.eligible(Instant::now()).is_empty());
+    assert!(
+        pending.contains(&addr),
+        "discovered failure released distinct learned ownership"
+    );
+    candidates.learn(addr, CandidateKind::Source);
+    assert_eq!(
+        candidates.explorations(addr),
+        1,
+        "announcement reset consumed opportunity"
+    );
+    assert_eq!(
+        candidates.eligible(Instant::now() + Duration::from_secs(2)),
+        vec![addr]
+    );
+}
