@@ -188,11 +188,21 @@ const MAX_UNSYNCED_TAIL: usize = 2 * TS_PACKET_LEN - 1;
 pub struct TsResync {
     buf: Vec<u8>,
     locked: bool,
+    acquired_sync: bool,
+}
+
+/// Loss immediately before `output_offset` in one push's aligned output. An offset at the
+/// end arms recovery for a later push; offsets are ordered and packet aligned.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TsResyncBoundary {
+    pub output_offset: usize,
+    pub discarded_bytes: usize,
 }
 
 pub struct TsResyncOutput {
     pub bytes: Vec<u8>,
     pub discarded_bytes: usize,
+    pub boundaries: Vec<TsResyncBoundary>,
 }
 
 impl TsResync {
@@ -200,12 +210,14 @@ impl TsResync {
         TsResync {
             buf: Vec::new(),
             locked: false,
+            acquired_sync: false,
         }
     }
 
     /// Append `data`; return all newly emittable sync-locked packets (a whole number of
-    /// 188-byte packets, each starting with `0x47`). Sync is confirmed with one packet of
-    /// lookahead (`0x47` at the candidate AND at +188), so output trails input by ≤1 packet.
+    /// 188-byte packets, each starting with `0x47`). Initial/reacquired sync requires a pair
+    /// of packet starts. Once locked, retain the complete packet at an expected sync start
+    /// even when its successor is misaligned. One packet of lookahead stays buffered.
     pub fn push(&mut self, data: &[u8]) -> Vec<u8> {
         self.push_report(data).bytes
     }
@@ -218,14 +230,28 @@ impl TsResync {
         let n = self.buf.len();
         let mut out = Vec::new();
         let mut discarded_bytes = 0;
+        let mut boundaries: Vec<TsResyncBoundary> = Vec::new();
+        let mut report_loss = |offset, count| {
+            discarded_bytes += count;
+            if let Some(last) = boundaries.last_mut().filter(|b| b.output_offset == offset) {
+                last.discarded_bytes += count;
+            } else {
+                boundaries.push(TsResyncBoundary {
+                    output_offset: offset,
+                    discarded_bytes: count,
+                });
+            }
+        };
         let mut i = 0;
         while i + 2 * TS_PACKET_LEN <= n {
-            if self.buf[i] == TS_SYNC && self.buf[i + TS_PACKET_LEN] == TS_SYNC {
+            if self.buf[i] == TS_SYNC && (self.locked || self.buf[i + TS_PACKET_LEN] == TS_SYNC) {
                 out.extend_from_slice(&self.buf[i..i + TS_PACKET_LEN]);
                 self.locked = true;
+                self.acquired_sync = true;
                 i += TS_PACKET_LEN;
             } else {
                 // Lost lock: scan forward to the next confirmable packet start.
+                self.locked = false;
                 let mut j = i + 1;
                 while j + TS_PACKET_LEN < n
                     && !(self.buf[j] == TS_SYNC && self.buf[j + TS_PACKET_LEN] == TS_SYNC)
@@ -233,8 +259,8 @@ impl TsResync {
                     j += 1;
                 }
                 if j + TS_PACKET_LEN < n {
-                    if self.locked {
-                        discarded_bytes += j - i;
+                    if self.acquired_sync {
+                        report_loss(out.len(), j - i);
                     }
                     i = j;
                 } else {
@@ -249,14 +275,16 @@ impl TsResync {
         // re-lock, so drop it. Bounds memory against a non-TS junk flood (#14).
         if self.buf.len() > MAX_UNSYNCED_TAIL {
             let excess = self.buf.len() - MAX_UNSYNCED_TAIL;
-            if self.locked {
-                discarded_bytes += excess;
+            if self.acquired_sync {
+                report_loss(out.len(), excess);
             }
+            self.locked = false;
             self.buf.drain(0..excess);
         }
         TsResyncOutput {
             bytes: out,
             discarded_bytes,
+            boundaries,
         }
     }
 }
@@ -306,21 +334,23 @@ impl VideoAccessPointState {
         }
         let pid = ts_pid(packet);
         if pid == 0 {
-            if let Some((program, pmt_pid)) = parse_pat_first_program(packet) {
+            if let Some(mapping) = parse_pat_first_program(packet) {
                 self.cached_pat = Some(packet.to_vec());
-                self.program_number = Some(program);
-                if self.pmt_pid != Some(pmt_pid) {
+                let program = mapping.map(|(program, _)| program);
+                let pmt_pid = mapping.map(|(_, pid)| pid);
+                if self.pmt_pid != pmt_pid || self.program_number != program {
                     self.cached_pmt = None;
                     self.video_pid = None;
                     self.video_codec = None;
                 }
-                self.pmt_pid = Some(pmt_pid);
+                self.program_number = program;
+                self.pmt_pid = pmt_pid;
             }
         } else if Some(pid) == self.pmt_pid {
-            if let Some((video_pid, codec)) = parse_pmt_video(packet) {
+            if let Some(video) = parse_pmt_video(packet, self.program_number) {
                 self.cached_pmt = Some(packet.to_vec());
-                self.video_pid = Some(video_pid);
-                self.video_codec = Some(codec);
+                self.video_pid = video.map(|(pid, _)| pid);
+                self.video_codec = video.map(|(_, codec)| codec);
             }
         }
         Some(pid) == self.video_pid && is_random_access_point(packet, self.video_codec)
@@ -357,6 +387,19 @@ pub struct KeyframeGate {
     mark_discontinuity: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateResume {
+    AccessPoint,
+    ScanBudget,
+}
+
+pub struct KeyframeGateOutput {
+    pub bytes: Vec<u8>,
+    /// Input bytes actually withheld, excluding the resumed packet and inserted tables/marker.
+    pub withheld_bytes: usize,
+    pub resumed: Option<GateResume>,
+}
+
 /// Default packet budget before the gate gives up looking for a keyframe and passes through.
 /// ~60k packets ≈ 11 MB ≈ a few seconds of HD — far longer than any sane GOP.
 const DEFAULT_MAX_SCAN_PACKETS: usize = 60_000;
@@ -364,6 +407,19 @@ const DEFAULT_MAX_SCAN_PACKETS: usize = 60_000;
 impl KeyframeGate {
     pub fn new() -> Self {
         Self::with_max_scan_packets(DEFAULT_MAX_SCAN_PACKETS)
+    }
+
+    /// Observe current tables while passing initial media through unchanged. A later
+    /// same-stream transport loss can rearm without waiting for repeated PSI.
+    pub fn new_passthrough() -> Self {
+        Self {
+            locked: true,
+            ..Self::new()
+        }
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked
     }
 
     /// Like [`new`](Self::new) but with an explicit safety budget (packets scanned before
@@ -414,10 +470,27 @@ impl KeyframeGate {
         self.mark_discontinuity = true;
     }
 
+    /// Re-arm after byte loss within the same stream, retaining only complete learned tables
+    /// and video metadata. Partial input and the scan budget belong to the lost region.
+    /// For an unrelated stream or unknown table changes during subscriber lag, use the fresh
+    /// [`Self::reset_for_discontinuity`] instead.
+    pub fn rearm_for_discontinuity(&mut self) {
+        self.buf.clear();
+        self.locked = false;
+        self.scanned = 0;
+        self.mark_discontinuity = true;
+    }
+
     /// Append `data` (assumed 188-aligned TS) and return the bytes to forward to the client.
     pub fn push(&mut self, data: &[u8]) -> Vec<u8> {
+        self.push_report(data).bytes
+    }
+
+    pub fn push_report(&mut self, data: &[u8]) -> KeyframeGateOutput {
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
+        let mut withheld_bytes = 0;
+        let mut resumed = None;
         let mut i = 0;
         while i + TS_PACKET_LEN <= self.buf.len() {
             let pkt = &self.buf[i..i + TS_PACKET_LEN];
@@ -426,7 +499,8 @@ impl KeyframeGate {
                     i += TS_PACKET_LEN;
                     continue;
                 }
-                if self.filter_sdt && self.access.observe(pkt) {
+                let access_point = self.access.observe(pkt);
+                if self.filter_sdt && access_point {
                     if let Some(prefix) = self.access.table_prefix() {
                         out.extend_from_slice(&prefix);
                     }
@@ -443,6 +517,7 @@ impl KeyframeGate {
                 }
                 append_resumed_packet(&mut self.mark_discontinuity, None, pkt, &mut out);
                 self.locked = true;
+                resumed = Some(GateResume::AccessPoint);
             } else if self.scanned >= self.max_scan_packets {
                 // Safety fallback: never found a keyframe; passthrough from here.
                 // The discontinuity indicator is PID-specific. Prefer the video PID learned
@@ -455,12 +530,19 @@ impl KeyframeGate {
                     &mut out,
                 );
                 self.locked = true;
+                resumed = Some(GateResume::ScanBudget);
+            } else {
+                withheld_bytes += TS_PACKET_LEN;
             }
             // otherwise: drop this prefix packet and keep scanning.
             i += TS_PACKET_LEN;
         }
         self.buf.drain(0..i);
-        out
+        KeyframeGateOutput {
+            bytes: out,
+            withheld_bytes,
+            resumed,
+        }
     }
 }
 
@@ -575,26 +657,37 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     })
 }
 
-/// Parse a PAT packet, returning `(program_number, pmt_pid)` of the first real program.
-fn parse_pat_first_program(pkt: &[u8]) -> Option<(u16, u16)> {
-    let sec = psi_section_start(pkt)?;
-    if *pkt.get(sec)? != 0x00 {
-        return None; // table_id must be PAT
+/// Only complete, current single-packet tables may replace the cached metadata. Multi-packet
+/// PSI remains unsupported here; a fragment must not become a synthesized table prefix.
+fn current_psi_section(pkt: &[u8], table_id: u8, minimum_length: usize) -> Option<(usize, usize)> {
+    if !ts_pusi(pkt) {
+        return None;
     }
-    let section_length = ((pkt.get(sec + 1)? & 0x0F) as usize) << 8 | *pkt.get(sec + 2)? as usize;
-    let end = (sec + 3 + section_length)
-        .saturating_sub(4)
-        .min(TS_PACKET_LEN); // drop CRC
+    let sec = psi_section_start(pkt)?;
+    if *pkt.get(sec)? != table_id || *pkt.get(sec + 5)? & 1 == 0 {
+        return None;
+    }
+    let length = ((pkt.get(sec + 1)? & 0x0f) as usize) << 8 | *pkt.get(sec + 2)? as usize;
+    let end = sec.checked_add(3)?.checked_add(length)?;
+    (length >= minimum_length && end <= pkt.len()).then_some((sec, end - 4))
+}
+
+/// First real program of a current PAT, or no mapping when the table removes all programs.
+fn parse_pat_first_program(pkt: &[u8]) -> Option<Option<(u16, u16)>> {
+    let (sec, end) = current_psi_section(pkt, 0x00, 9)?;
+    if (end - (sec + 8)) % 4 != 0 {
+        return None;
+    }
     let mut pos = sec + 8;
     while pos + 4 <= end {
         let program = ((pkt[pos] as u16) << 8) | pkt[pos + 1] as u16;
         let pid = (((pkt[pos + 2] & 0x1F) as u16) << 8) | pkt[pos + 3] as u16;
         if program != 0 {
-            return Some((program, pid));
+            return Some(Some((program, pid)));
         }
         pos += 4;
     }
-    None
+    Some(None)
 }
 
 /// Elementary-stream video codec, as identified from the PMT `stream_type`. Determines which
@@ -607,30 +700,30 @@ enum VideoCodec {
 
 /// Parse a PMT packet, returning the elementary PID and codec of the first recognized video
 /// stream: H.264 (`stream_type 0x1B`) or HEVC (`0x24`).
-fn parse_pmt_video(pkt: &[u8]) -> Option<(u16, VideoCodec)> {
-    let sec = psi_section_start(pkt)?;
-    if *pkt.get(sec)? != 0x02 {
-        return None; // table_id must be PMT
+fn parse_pmt_video(pkt: &[u8], program: Option<u16>) -> Option<Option<(u16, VideoCodec)>> {
+    let (sec, end) = current_psi_section(pkt, 0x02, 13)?;
+    let table_program = u16::from_be_bytes([pkt[sec + 3], pkt[sec + 4]]);
+    if program != Some(table_program) {
+        return None;
     }
-    let section_length = ((pkt.get(sec + 1)? & 0x0F) as usize) << 8 | *pkt.get(sec + 2)? as usize;
-    let end = (sec + 3 + section_length)
-        .saturating_sub(4)
-        .min(TS_PACKET_LEN); // drop CRC
     let program_info_length =
         ((pkt.get(sec + 10)? & 0x0F) as usize) << 8 | *pkt.get(sec + 11)? as usize;
     let mut pos = sec + 12 + program_info_length;
+    let mut video = None;
     while pos + 5 <= end {
         let stream_type = pkt[pos];
         let epid = (((pkt[pos + 1] & 0x1F) as u16) << 8) | pkt[pos + 2] as u16;
         let es_info_length = ((pkt[pos + 3] & 0x0F) as usize) << 8 | pkt[pos + 4] as usize;
-        match stream_type {
-            0x1B => return Some((epid, VideoCodec::H264)),
-            0x24 => return Some((epid, VideoCodec::Hevc)),
-            _ => {}
+        if video.is_none() {
+            video = match stream_type {
+                0x1B => Some((epid, VideoCodec::H264)),
+                0x24 => Some((epid, VideoCodec::Hevc)),
+                _ => None,
+            };
         }
         pos += 5 + es_info_length;
     }
-    None
+    (pos == end).then_some(video)
 }
 
 /// Start offset of the PSI section within a table packet (skips payload offset + pointer_field).
@@ -1505,6 +1598,208 @@ mod tests {
     }
 
     #[test]
+    fn resync_keeps_last_complete_packet_before_junk() {
+        let mut resync = TsResync::new();
+        let input = [packet(1), packet(2), vec![0; 8], packet(3), packet(4)].concat();
+        assert_eq!(
+            resync.push_report(&input).bytes,
+            [packet(1), packet(2), packet(3)].concat()
+        );
+    }
+
+    #[test]
+    fn resync_reports_every_aligned_loss_offset() {
+        let mut resync = TsResync::new();
+        let input = [
+            packet(1),
+            packet(2),
+            vec![0; 8],
+            packet(3),
+            packet(4),
+            vec![0; 12],
+            packet(5),
+            packet(6),
+        ]
+        .concat();
+        let report = resync.push_report(&input);
+        assert_eq!(
+            report.bytes,
+            [packet(1), packet(2), packet(3), packet(4), packet(5)].concat()
+        );
+        assert_eq!(report.discarded_bytes, 20);
+        assert_eq!(
+            report.boundaries,
+            vec![
+                TsResyncBoundary {
+                    output_offset: 376,
+                    discarded_bytes: 8
+                },
+                TsResyncBoundary {
+                    output_offset: 752,
+                    discarded_bytes: 12
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn resync_reports_tail_loss_at_end_and_keeps_unsynced_bound() {
+        let mut resync = TsResync::new();
+        let report = resync.push_report(&[packet(1), packet(2), vec![0; 1024]].concat());
+        assert_eq!(report.bytes, [packet(1), packet(2)].concat());
+        assert_eq!(
+            report.boundaries,
+            vec![TsResyncBoundary {
+                output_offset: 376,
+                discarded_bytes: 649
+            }]
+        );
+        assert_eq!(resync.buf.len(), 375);
+        let report = resync.push_report(&[packet(3), packet(4)].concat());
+        assert_eq!(report.bytes, packet(3));
+        assert_eq!(
+            report.boundaries,
+            vec![TsResyncBoundary {
+                output_offset: 0,
+                discarded_bytes: 375
+            }]
+        );
+    }
+
+    #[test]
+    fn gate_report_counts_withheld_input_without_inserted_tables() {
+        let mut gate = KeyframeGate::new_passthrough();
+        assert_eq!(
+            gate.push_report(&[pat(PMT_PID), pmt(PMT_PID, VIDEO_PID)].concat())
+                .withheld_bytes,
+            0
+        );
+        gate.rearm_for_discontinuity();
+        let input = [
+            ts(VIDEO_PID, false, false, &[0x41]),
+            ts(AUDIO_PID, false, false, &[0x11]),
+            random_access_packet(VIDEO_PID),
+        ]
+        .concat();
+        let report = gate.push_report(&input);
+        assert_eq!(report.withheld_bytes, 376);
+        assert_eq!(report.resumed, Some(GateResume::AccessPoint));
+        assert_eq!(report.bytes.len(), 564);
+        let following = gate.push_report(&ts(AUDIO_PID, false, false, &[0x22]));
+        assert_eq!(following.withheld_bytes, 0);
+        assert_eq!(following.resumed, None);
+    }
+
+    #[test]
+    fn discontinuity_gate_resumes_without_repeating_tables() {
+        let mut gate = KeyframeGate::new();
+        gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        gate.rearm_for_discontinuity();
+        assert!(gate
+            .push(&ts(VIDEO_PID, true, false, &[0, 0, 1, 0x41]))
+            .is_empty());
+        let resumed = gate.push(&random_access_packet(VIDEO_PID));
+        assert_eq!(resumed.len(), 3 * TS_PACKET_LEN);
+        assert_eq!(pid_of(&resumed[2 * TS_PACKET_LEN..]), VIDEO_PID);
+        assert!(ts_timing(resumed[2 * TS_PACKET_LEN..].try_into().unwrap()).discontinuity);
+    }
+
+    #[test]
+    fn discontinuity_gate_uses_metadata_updated_during_passthrough() {
+        let mut gate = KeyframeGate::new();
+        gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        let new_video = VIDEO_PID + 2;
+        gate.push(&pmt_codec(PMT_PID, new_video, 0x24));
+        gate.rearm_for_discontinuity();
+        assert!(gate.push(&random_access_packet(VIDEO_PID)).is_empty());
+        // HEVC IDR_W_RADL (NAL type19); no RAI. Cached codec is required.
+        let resumed = gate.push(&ts(new_video, true, false, &[0, 0, 1, 0x26]));
+        assert!(!resumed.is_empty());
+        assert_eq!(pid_of(&resumed[2 * TS_PACKET_LEN..]), new_video);
+    }
+
+    #[test]
+    fn cached_rearm_rejects_old_program_on_unchanged_pmt_pid() {
+        let mut gate = KeyframeGate::new();
+        gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        let mut new_pat = pat(PMT_PID);
+        new_pat[14] = 2; // program_number 2, same PMT PID
+        gate.push(&new_pat);
+        gate.rearm_for_discontinuity();
+        assert!(gate.push(&random_access_packet(VIDEO_PID)).is_empty());
+        assert!(
+            gate.push(&[pmt(PMT_PID, VIDEO_PID), random_access_packet(VIDEO_PID)].concat())
+                .is_empty(),
+            "old-program PMT must not restore stale video"
+        );
+        let mut new_pmt = pmt(PMT_PID, VIDEO_PID);
+        new_pmt[9] = 2;
+        assert!(!gate
+            .push(&[new_pmt, random_access_packet(VIDEO_PID)].concat())
+            .is_empty());
+    }
+
+    #[test]
+    fn cached_rearm_ignores_incomplete_or_not_current_psi() {
+        let mut gate = KeyframeGate::new();
+        gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        let mut incomplete = pat(PMT_PID + 2);
+        incomplete[7] = 200; // section extends beyond this packet
+        let mut next_table = pat(PMT_PID + 2);
+        next_table[10] &= !1; // current_next_indicator 0
+        gate.push(&[incomplete, next_table].concat());
+        gate.rearm_for_discontinuity();
+        assert!(
+            !gate.push(&random_access_packet(VIDEO_PID)).is_empty(),
+            "only complete current PSI replaces the cache"
+        );
+    }
+
+    #[test]
+    fn cached_rearm_rejects_video_removed_from_current_pmt() {
+        let mut gate = KeyframeGate::new();
+        gate.push(
+            &[
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        gate.push(&pmt_codec(PMT_PID, VIDEO_PID, 0x03));
+        gate.rearm_for_discontinuity();
+        assert!(gate.push(&random_access_packet(VIDEO_PID)).is_empty());
+    }
+
+    #[test]
     fn resync_reports_post_lock_boundary_loss_but_not_contiguous_carry() {
         let mut r = TsResync::new();
         let contiguous = [packet(1), packet(2), packet(3)].concat();
@@ -1515,7 +1810,7 @@ mod tests {
 
         let boundary = [vec![0_u8; 96], packet(4), packet(5)].concat();
         let resumed = r.push_report(&boundary);
-        assert_eq!(resumed.discarded_bytes, TS_PACKET_LEN + 96);
+        assert_eq!(resumed.discarded_bytes, 96);
         assert!(is_aligned(&resumed.bytes));
     }
 

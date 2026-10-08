@@ -11,6 +11,8 @@
 mod reconnect;
 #[cfg(test)]
 mod reconnect_tests;
+#[cfg(test)]
+mod resync_tests;
 use reconnect::{CandidateKind, SessionCandidates};
 
 use crate::config::{CacheType, LiveRecoveryConfig, StartupBufferConfig};
@@ -1733,7 +1735,8 @@ struct Continuity {
     live_recovery: LiveRecoveryConfig,
     reasm: PieceReassembler,
     resync: ace_media::mpegts::TsResync,
-    output_gate: Option<ace_media::mpegts::KeyframeGate>,
+    output_gate: ace_media::mpegts::KeyframeGate,
+    transport_recovery: Option<TransportRecovery>,
     discontinuity_pending: bool,
     scheduler: Scheduler,
     active_peers: ActivePeers,
@@ -1750,6 +1753,13 @@ struct Continuity {
     prefetch: u64,
     emitted: u64,
     next_log: u64,
+}
+
+struct TransportRecovery {
+    started: Instant,
+    discarded_bytes: usize,
+    withheld_bytes: usize,
+    loss_events: usize,
 }
 
 /// First piece to request given a peer window and a configured prefetch depth.
@@ -1781,7 +1791,8 @@ impl Continuity {
                 live_recovery,
                 reasm,
                 resync: ace_media::mpegts::TsResync::new(),
-                output_gate: None,
+                output_gate: ace_media::mpegts::KeyframeGate::new_passthrough(),
+                transport_recovery: None,
                 discontinuity_pending: false,
                 scheduler: Scheduler::new(live_recovery.max_piece_advance as usize),
                 active_peers: ActivePeers::new(),
@@ -1930,31 +1941,78 @@ impl Continuity {
     }
 
     fn arm_output_gate(&mut self) {
-        self.output_gate = Some(ace_media::mpegts::KeyframeGate::new());
+        if let Some(recovery) = self.transport_recovery.take() {
+            crate::alog!(
+                "[mpegts] transport recovery superseded by piece skip: discarded_bytes={} withheld_bytes={} duration_ms={} loss_events={}",
+                recovery.discarded_bytes,
+                recovery.withheld_bytes,
+                recovery.started.elapsed().as_millis(),
+                recovery.loss_events
+            );
+        }
+        self.output_gate = ace_media::mpegts::KeyframeGate::new();
         self.resync = ace_media::mpegts::TsResync::new();
         self.discontinuity_pending = true;
     }
 
-    fn filter_output_after_discontinuity(&mut self, aligned: Vec<u8>) -> Vec<u8> {
-        match &mut self.output_gate {
-            Some(gate) => gate.push(&aligned),
-            None => aligned,
+    fn filter_output_after_discontinuity(&mut self, aligned: &[u8]) -> Option<LiveOutput> {
+        let output = self.output_gate.push_report(aligned);
+        if let Some(recovery) = &mut self.transport_recovery {
+            recovery.withheld_bytes += output.withheld_bytes;
         }
+        if let Some(reason) = output.resumed {
+            if let Some(recovery) = self.transport_recovery.take() {
+                crate::alog!(
+                    "[mpegts] transport recovery resumed: reason={reason:?} discarded_bytes={} withheld_bytes={} duration_ms={} loss_events={}",
+                    recovery.discarded_bytes,
+                    recovery.withheld_bytes,
+                    recovery.started.elapsed().as_millis(),
+                    recovery.loss_events
+                );
+            }
+        }
+        (!output.bytes.is_empty()).then(|| LiveOutput {
+            bytes: Bytes::from(output.bytes),
+            discontinuity: self.take_discontinuity(),
+        })
     }
 
-    fn resync_output(&mut self, bytes: &[u8]) -> Vec<u8> {
+    fn resync_output(&mut self, bytes: &[u8]) -> Vec<LiveOutput> {
         let output = self.resync.push_report(bytes);
-        if output.discarded_bytes > 0 {
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let mut emitted = self.emitted;
+        for boundary in output.boundaries {
+            if let Some(prefix) =
+                self.filter_output_after_discontinuity(&output.bytes[start..boundary.output_offset])
+            {
+                emitted += prefix.bytes.len() as u64;
+                chunks.push(prefix);
+            }
             crate::alog!(
-                "[mpegts] transport resync discarded boundary bytes: discarded_bytes={}",
-                output.discarded_bytes
+                "[mpegts] transport resync discarded boundary bytes: discarded_bytes={} batch_aligned_offset={} stream_output_offset={}",
+                boundary.discarded_bytes,
+                boundary.output_offset,
+                emitted
             );
-            let mut gate = ace_media::mpegts::KeyframeGate::new();
-            gate.reset_for_discontinuity();
-            self.output_gate = Some(gate);
+            let recovery = self
+                .transport_recovery
+                .get_or_insert_with(|| TransportRecovery {
+                    started: Instant::now(),
+                    discarded_bytes: 0,
+                    withheld_bytes: 0,
+                    loss_events: 0,
+                });
+            recovery.discarded_bytes += boundary.discarded_bytes;
+            recovery.loss_events += 1;
+            self.output_gate.rearm_for_discontinuity();
             self.discontinuity_pending = true;
+            start = boundary.output_offset;
         }
-        self.filter_output_after_discontinuity(output.bytes)
+        if let Some(suffix) = self.filter_output_after_discontinuity(&output.bytes[start..]) {
+            chunks.push(suffix);
+        }
+        chunks
     }
 
     fn take_discontinuity(&mut self) -> bool {
@@ -1963,7 +2021,7 @@ impl Continuity {
 
     #[cfg(test)]
     fn output_gate_armed(&self) -> bool {
-        self.output_gate.is_some()
+        !self.output_gate.is_locked()
     }
 
     fn register_active_peer(&mut self, id: u64, addr: SocketAddrV4, window: LivePosition) {
@@ -2569,9 +2627,8 @@ async fn follow_peer_pool(
                     made_activity = true;
                     let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
-                        let aligned = continuity.resync_output(&ready);
-                        if !aligned.is_empty() {
-                            let discontinuity = continuity.take_discontinuity();
+                        for output in continuity.resync_output(&ready) {
+                            let aligned = output.bytes;
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
                                 crate::alog!(
@@ -2585,8 +2642,8 @@ async fn follow_peer_pool(
                             let len = aligned.len() as u64;
                             if tx
                                 .send(LiveOutput {
-                                    bytes: Bytes::from(aligned),
-                                    discontinuity,
+                                    bytes: aligned,
+                                    discontinuity: output.discontinuity,
                                 })
                                 .await
                                 .is_err()
@@ -3221,8 +3278,8 @@ async fn follow_one_peer(
                     made_activity = true;
                     let ready = continuity.reasm.take_ready();
                     if !ready.is_empty() {
-                        let aligned = continuity.resync_output(&ready);
-                        if !aligned.is_empty() {
+                        for output in continuity.resync_output(&ready) {
+                            let aligned = output.bytes;
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
                                 crate::alog!(
@@ -3234,7 +3291,7 @@ async fn follow_one_peer(
                                 continuity.next_log = continuity.emitted + (4 << 20);
                             }
                             let len = aligned.len() as u64;
-                            if tx.send(Bytes::from(aligned)).await.is_err() {
+                            if tx.send(aligned).await.is_err() {
                                 return FollowEnd::ConsumerGone;
                             }
                             downloaded.fetch_add(len, Ordering::Relaxed);
@@ -5487,7 +5544,10 @@ mod tests {
         assert!(!c.take_discontinuity());
 
         let boundary = [vec![0; 96], packet(4), packet(5), packet(6)].concat();
-        assert!(c.resync_output(&boundary).is_empty());
+        let prefix = c.resync_output(&boundary);
+        assert_eq!(prefix.len(), 1);
+        assert!(!prefix[0].discontinuity);
+        assert_eq!(prefix[0].bytes[1], 3);
         assert!(c.output_gate_armed());
         assert!(c.take_discontinuity());
         assert!(!c.take_discontinuity());
