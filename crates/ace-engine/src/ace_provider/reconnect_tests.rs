@@ -335,7 +335,8 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         store_bytes: 4096,
         store_retention: None,
         enabled: false,
-        prefetch_pieces: 0,
+        // The fixture emits piece7 before its advertised head8.
+        prefetch_pieces: 1,
         live_recovery: LiveRecoveryConfig {
             request_timeout_ms: 100,
             request_check_interval_ms: 10,
@@ -805,8 +806,18 @@ async fn fast_source_fairness(return_source: bool) {
                                 let piece = u32::from_be_bytes(request[4..8].try_into().unwrap());
                                 let mut payload = payload.clone();
                                 if resumed_source {
-                                    for packet in payload.chunks_mut(188) {
-                                        packet[4..].fill(0x66);
+                                    // The live floor now skips to head16, requiring the real
+                                    // fresh discontinuity gate. Supply synthetic current PSI
+                                    // and a video access point rather than bypassing that gate.
+                                    payload = include_bytes!(
+                                        "../../../../tests/vectors/media/transport-resync.ts"
+                                    )[..752]
+                                        .to_vec();
+                                    for packet in payload
+                                        .chunks_mut(188)
+                                        .filter(|p| ace_media::mpegts::ts_pid(p) == 0x101)
+                                    {
+                                        packet[6..].fill(0x66);
                                     }
                                 }
                                 if session
