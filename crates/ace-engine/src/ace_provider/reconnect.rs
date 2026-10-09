@@ -186,12 +186,38 @@ impl SessionCandidates {
         }
     }
 
+    // Refreshing an obsolete active source window is neither a network failure nor a
+    // new exploration. Preserve failure history while allowing fresh window validation.
+    pub(super) fn refresh_stale_transport(&mut self, addr: SocketAddrV4, now: Instant) {
+        if let Some(candidate) = self.entries.iter_mut().find(|c| c.addr == addr) {
+            candidate.retry_at = now;
+        }
+    }
+
     pub(super) fn retry_delay(&self, now: Instant) -> Duration {
         self.entries
             .iter()
             .map(|c| c.retry_at.saturating_duration_since(now))
             .min()
             .unwrap_or(Duration::from_secs(1))
+    }
+
+    /// The next eligibility transition not yet observed by the active scheduler.
+    /// Keeping an observation watermark instead of filtering against `now` preserves
+    /// a deadline that passed during another event, without repeatedly waking for it.
+    pub(super) fn retry_deadline_after(
+        &self,
+        observed: Instant,
+        active: &HashSet<SocketAddrV4>,
+        pending: &HashSet<SocketAddrV4>,
+    ) -> Option<Instant> {
+        self.entries
+            .iter()
+            .filter(|c| {
+                c.retry_at > observed && !active.contains(&c.addr) && !pending.contains(&c.addr)
+            })
+            .map(|c| c.retry_at)
+            .min()
     }
 
     pub(super) fn learned_counts(&self) -> (usize, usize) {

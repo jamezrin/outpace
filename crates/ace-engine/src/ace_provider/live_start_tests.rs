@@ -207,6 +207,7 @@ async fn known_live_floor_prunes_buffered_and_inflight_stale_pieces_before_reque
             min_piece: 7,
             max_piece: 10,
             unchoked_peer: false,
+            produced_output: false,
             seen_ids: HashSet::new(),
             commands,
             worker,

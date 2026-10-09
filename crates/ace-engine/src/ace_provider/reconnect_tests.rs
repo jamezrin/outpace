@@ -470,6 +470,119 @@ fn cancellation_fixture() -> (StreamInfo, SeedConfig) {
 }
 
 #[tokio::test]
+async fn retired_same_address_worker_events_cannot_target_fresh_source_runtime() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let (info, seed) = cancellation_fixture();
+    let (mut continuity, _) = Continuity::fresh(&info, 7, 10, 1, seed.live_recovery);
+    let identity = Identity::generate();
+    let (events, mut receiver) = mpsc::channel(8);
+    let mut peers = BTreeMap::new();
+    for peer_id in [41, 42] {
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let server = tokio::spawn(async move {
+            let mut session = PeerSession::new(server);
+            assert!(matches!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Extended { .. }
+            ));
+            assert!(matches!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Interested
+            ));
+            session
+                .send(&build_piece(
+                    0,
+                    9,
+                    0,
+                    [0; 8],
+                    &[if peer_id == 41 { 0x55 } else { 0x66 }; 752],
+                ))
+                .await
+                .unwrap();
+            if peer_id == 42 {
+                while session.read_message().await.is_ok() {}
+            }
+        });
+        let (mut runtime, _) = activate_upstream_peer(
+            peer_id,
+            ConnectedUpstream {
+                session: PeerSession::new(client),
+                addr,
+                window: live_pos(7, 10),
+                yourip: None,
+            },
+            9,
+            &identity,
+            &mut continuity,
+            &events,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        if peer_id == 41 {
+            // Both the actual old block and EOF event are queued before its transport
+            // is retired and a fresh runtime at the identical endpoint is admitted.
+            server.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), &mut runtime.worker)
+                .await
+                .unwrap()
+                .unwrap();
+            peers.insert(peer_id, runtime);
+            assert_eq!(
+                drop_peer_runtime(peer_id, &mut peers, &mut continuity),
+                Some(addr)
+            );
+        } else {
+            peers.insert(peer_id, runtime);
+            let old_block = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let old_loss = receiver.recv().await.unwrap();
+            assert!(matches!(
+                old_block,
+                PeerEvent::Message {
+                    peer_id: 41,
+                    msg: PeerMessage::Piece { .. },
+                    ..
+                }
+            ));
+            assert!(matches!(old_loss, PeerEvent::Lost { peer_id: 41, .. }));
+            assert!(!old_block.is_current(&peers));
+            assert!(!old_loss.is_current(&peers));
+            let fresh_block = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(fresh_block.is_current(&peers));
+            assert!(
+                matches!(fresh_block, PeerEvent::Message { peer_id: 42, msg: PeerMessage::Piece {ref block,..},..} if block.contains(&0x66))
+            );
+            let runtime = peers.get_mut(&peer_id).unwrap();
+            runtime.commands.send(PeerCommand::Stop).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), &mut runtime.worker)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                drop_peer_runtime(peer_id, &mut peers, &mut continuity),
+                Some(addr)
+            );
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    assert!(peers.is_empty());
+}
+
+#[tokio::test]
 async fn consumer_close_cancels_pending_connect() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {

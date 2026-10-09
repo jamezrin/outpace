@@ -22,10 +22,20 @@ All candidate transports use one scheduler. Running connections and queued ready
 share the configured parallel limit; active transports retain their separate active limit.
 Source and PEX provenance, exploration cohorts, real admission accounting, productive-history
 reset and failure cooldowns remain authoritative. A duplicate discovered hint cannot release
-another producer's reservation. Completed failures and cooldown deadlines wake useful work;
+another producer's reservation. Active peer loss and consumed/rejected ready receipts wake
+released capacity even when other upstreams survive. Completed failures and the earliest
+unobserved cooldown deadline wake useful work; each deadline is consumed once, including
+when it elapsed during another event. Active and pending peers are excluded from retry wakes;
 ordinary request ticks do not repeatedly fan out old-window transports. Aborted attempts do
 not count as completed exploration. The one-second live-window gate and current-piece floor,
 per-chunk worker floor, ordered transport recovery and descriptor authentication remain intact.
+
+When the last upstream that emitted usable media is lost, an announced Source transport whose
+window ends below the next-needed cursor is refreshed without a false network failure or added
+exploration. Current-cursor-capable fallback and ready transports remain usable. Fresh runtime
+ids distinguish the new session at the same endpoint; queued blocks and loss events from retired
+workers cannot affect its progress or ownership. A window behind the head remains usable when
+it covers the cursor; productive-history reset does not discard such prepared peers.
 
 ## Durable productive-peer hints
 

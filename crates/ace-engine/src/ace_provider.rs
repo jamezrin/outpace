@@ -1370,6 +1370,15 @@ enum PeerEvent {
     },
 }
 
+impl PeerEvent {
+    fn is_current(&self, peers: &BTreeMap<u64, PeerRuntime>) -> bool {
+        let (peer_id, addr) = match self {
+            Self::Message { peer_id, addr, .. } | Self::Lost { peer_id, addr } => (peer_id, addr),
+        };
+        peers.get(peer_id).is_some_and(|peer| peer.addr == *addr)
+    }
+}
+
 async fn peer_worker<S>(
     peer_id: u64,
     addr: SocketAddrV4,
@@ -1426,6 +1435,7 @@ struct PeerRuntime {
     min_piece: u64,
     max_piece: u64,
     unchoked_peer: bool,
+    produced_output: bool,
     seen_ids: HashSet<u8>,
     commands: mpsc::Sender<PeerCommand>,
     worker: tokio::task::JoinHandle<()>,
@@ -2219,8 +2229,7 @@ fn receive_pool_refill(
 ) -> Option<ConnectedUpstream> {
     match refill {
         PoolRefill::Learned(upstream) | PoolRefill::ReservedDiscovered(upstream) => {
-            learned_pending.remove(&upstream.addr);
-            Some(upstream)
+            learned_pending.remove(&upstream.addr).then_some(upstream)
         }
     }
 }
@@ -2233,6 +2242,7 @@ enum PoolWake {
     Refill(Option<PoolRefill>),
     Discovery(Option<SocketAddrV4>),
     ConnectCompletion(Option<Result<CandidateConnectCompletion, tokio::task::JoinError>>),
+    CandidateRetry,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2302,6 +2312,7 @@ async fn activate_upstream_peer(
             min_piece: peer_min,
             max_piece: peer_max,
             unchoked_peer: false,
+            produced_output: false,
             seen_ids: HashSet::new(),
             commands: command_tx,
             worker,
@@ -2513,13 +2524,17 @@ async fn follow_peer_pool_with_discovery(
     }
     let mut last_progress = Instant::now();
     let mut refill_closed = false;
+    let mut observed_capacity = (peers.len(), learned_pending.len());
+    let mut observed_retry = Instant::now();
     loop {
         let mut released_failed_slot = false;
         while let Some(Ok(result)) = learned_connects.try_join_next() {
             released_failed_slot |=
                 finish_candidate_connect(result, &mut learned_pending, candidates);
         }
-        if released_failed_slot
+        let capacity_released =
+            peers.len() < observed_capacity.0 || learned_pending.len() < observed_capacity.1;
+        if (released_failed_slot || capacity_released)
             && (peers.len() < live_recovery.max_active_upstreams
                 || continuity.startup_deadline.is_some())
         {
@@ -2534,6 +2549,7 @@ async fn follow_peer_pool_with_discovery(
                 true,
             );
         }
+        observed_capacity = (peers.len(), learned_pending.len());
         let now = Instant::now();
         if continuity
             .startup_deadline
@@ -2586,11 +2602,24 @@ async fn follow_peer_pool_with_discovery(
                     .map(|deadline| deadline.saturating_duration_since(now))
                     .unwrap_or(stale_budget),
             );
+        let active = peers.values().map(|peer| peer.addr).collect();
+        let retry_deadline = if (peers.len() < live_recovery.max_active_upstreams
+            || continuity.startup_deadline.is_some())
+            && learned_pending.len() < live_recovery.max_parallel_connect
+            && learned_connects.len() < live_recovery.max_parallel_connect
+        {
+            candidates.retry_deadline_after(observed_retry, &active, &learned_pending)
+        } else {
+            None
+        };
         let event = match tokio::time::timeout(wait, async {
             tokio::select! {
                 _ = tx.closed() => PoolWake::ConsumerGone,
                 event = event_rx.recv() => PoolWake::Peer(event),
                 result=learned_connects.join_next(), if !learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
+                _ = async {
+                    tokio::time::sleep_until(retry_deadline.expect("enabled retry deadline").into()).await;
+                }, if retry_deadline.is_some() => PoolWake::CandidateRetry,
                 peer=next_discovery_peer(discovery_run), if discovery_run.is_some()=>PoolWake::Discovery(peer),
                 upstream = refill_rx.recv(), if !refill_closed && (peers.len() < live_recovery.max_active_upstreams || continuity.startup_deadline.is_some()) => {
                     PoolWake::Refill(upstream)
@@ -2605,6 +2634,20 @@ async fn follow_peer_pool_with_discovery(
 
         let event = match event {
             PoolWake::ConsumerGone => return FollowEnd::ConsumerGone,
+            PoolWake::CandidateRetry => {
+                observed_retry = Instant::now();
+                spawn_candidate_connects(
+                    candidates,
+                    &peers,
+                    info.infohash,
+                    live_recovery.max_parallel_connect,
+                    &pex_tx,
+                    &mut learned_connects,
+                    &mut learned_pending,
+                    true,
+                );
+                continue;
+            }
             PoolWake::ConnectCompletion(result) => {
                 if let Some(Ok(result)) = result {
                     if finish_candidate_connect(result, &mut learned_pending, candidates)
@@ -2645,7 +2688,8 @@ async fn follow_peer_pool_with_discovery(
                 }
                 continue;
             }
-            PoolWake::Peer(Some(event)) => event,
+            PoolWake::Peer(Some(event)) if event.is_current(&peers) => event,
+            PoolWake::Peer(Some(_)) => continue,
             PoolWake::Peer(None) => {
                 shutdown_peer_runtimes(&mut peers);
                 return FollowEnd::PeerLost(loss_count);
@@ -2792,6 +2836,7 @@ async fn follow_peer_pool_with_discovery(
 
         let (peer_id, addr, msg) = match event {
             PeerEvent::Lost { peer_id, addr } => {
+                let lost_producer = peers.get(&peer_id).is_some_and(|peer| peer.produced_output);
                 if let Some(lost) = drop_peer_runtime(peer_id, &mut peers, continuity) {
                     crate::alog!("[ace] {addr}: upstream peer lost");
                     record_pool_losses(candidates, &mut loss_count, [lost]);
@@ -2800,17 +2845,35 @@ async fn follow_peer_pool_with_discovery(
                     record_pool_losses(candidates, &mut loss_count, newly_lost);
                     peer_count.store(peers.len() as u32, Ordering::Relaxed);
                 }
+                if lost_producer && !peers.values().any(|peer| peer.produced_output) {
+                    let cursor = continuity.reasm.next_needed();
+                    let stale_sources: Vec<_> = peers
+                        .iter()
+                        .filter_map(|(&id, peer)| {
+                            (peer.max_piece < cursor
+                                && candidates.kind(peer.addr) == CandidateKind::Source)
+                                .then_some(id)
+                        })
+                        .collect();
+                    for id in stale_sources {
+                        if let Some(source) = drop_peer_runtime(id, &mut peers, continuity) {
+                            // This transport still works but its old window cannot cover
+                            // the cursor. Refresh current source priority after the last
+                            // producer is lost; retain all usable fallback transports.
+                            candidates.refresh_stale_transport(source, Instant::now());
+                            crate::alog!(
+                                "[ace] refreshing stale source window after producer loss"
+                            );
+                        }
+                    }
+                    peer_count.store(peers.len() as u32, Ordering::Relaxed);
+                }
                 if peers.is_empty() {
                     return FollowEnd::PeerLost(loss_count);
                 }
                 continue;
             }
-            PeerEvent::Message { peer_id, addr, msg } => {
-                if !peers.contains_key(&peer_id) {
-                    continue;
-                }
-                (peer_id, addr, msg)
-            }
+            PeerEvent::Message { peer_id, addr, msg } => (peer_id, addr, msg),
         };
 
         let mut made_activity = false;
@@ -3106,6 +3169,9 @@ async fn follow_peer_pool_with_discovery(
             last_progress = Instant::now();
         }
         if made_output {
+            if let Some(peer) = peers.get_mut(&peer_id) {
+                peer.produced_output = true;
+            }
             candidates.productive(addr);
             // Contiguous output means the playback cursor advanced: reset the per-piece
             // eviction-skip timer so it only fires when the cursor is genuinely stuck.
@@ -5170,6 +5236,7 @@ mod tests {
                 min_piece: 7,
                 max_piece: 8,
                 unchoked_peer: false,
+                produced_output: false,
                 seen_ids: HashSet::new(),
                 commands,
                 worker: tokio::spawn(std::future::pending()),
