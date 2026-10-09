@@ -125,6 +125,13 @@ impl SessionCandidates {
         self.entries.iter().map(|c| c.addr).collect()
     }
 
+    pub(super) fn kind(&self, addr: SocketAddrV4) -> CandidateKind {
+        self.entries
+            .iter()
+            .find(|candidate| candidate.addr == addr)
+            .map_or(CandidateKind::Discovered, |candidate| candidate.kind)
+    }
+
     pub(super) fn explorations(&self, addr: SocketAddrV4) -> u64 {
         self.entries
             .iter()

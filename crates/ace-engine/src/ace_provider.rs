@@ -9,8 +9,12 @@
 //! this process has already verified, and otherwise fails closed (issue #164).
 
 #[cfg(test)]
+mod discovery_tests;
+#[cfg(test)]
 mod live_start_tests;
 mod reconnect;
+mod warm_peers;
+use warm_peers::WarmPeerCache;
 #[cfg(test)]
 mod reconnect_tests;
 #[cfg(test)]
@@ -25,7 +29,8 @@ use crate::startup_buffer::StartupBufferedSource;
 use ace_peer::session::{connect, PeerSession};
 use ace_swarm::dht::dht_announce_peer;
 use ace_swarm::discover::{
-    announce_seeder, discover_peers, discover_peers_with_options, DiscoveryOptions,
+    announce_seeder, discover_peers, discover_peers_incremental, DiscoveryOptions,
+    MAX_DISCOVERY_PEERS,
 };
 use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::reachability::ReachabilityMonitor;
@@ -70,10 +75,68 @@ const SINGLE_PEER_ID: u64 = 0;
 const STALE_GOSSIP_BUDGET: Duration = Duration::from_millis(750);
 
 type PeerDiscovery = Arc<
-    dyn Fn(DiscoveryOptions) -> Pin<Box<dyn Future<Output = Vec<SocketAddrV4>> + Send>>
+    dyn Fn(DiscoveryOptions, mpsc::Sender<SocketAddrV4>) -> Pin<Box<dyn Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
+
+struct DiscoveryRun {
+    receiver: mpsc::Receiver<SocketAddrV4>,
+    _worker: OwnedTask,
+}
+impl DiscoveryRun {
+    fn start(discovery: &PeerDiscovery, options: DiscoveryOptions) -> Self {
+        let (sender, receiver) = mpsc::channel(MAX_DISCOVERY_PEERS);
+        Self {
+            receiver,
+            _worker: OwnedTask(tokio::spawn(discovery(options, sender))),
+        }
+    }
+}
+
+#[cfg(test)]
+fn completed_discovery<F, Fut>(factory: F) -> PeerDiscovery
+where
+    F: Fn(DiscoveryOptions) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Vec<SocketAddrV4>> + Send + 'static,
+{
+    Arc::new(move |options, sender| {
+        let future = factory(options);
+        Box::pin(async move {
+            for peer in future.await {
+                if sender.send(peer).await.is_err() {
+                    return;
+                }
+            }
+        })
+    })
+}
+
+fn drain_discovery(run: &mut Option<DiscoveryRun>, candidates: &mut SessionCandidates) {
+    let Some(discovery) = run.as_mut() else {
+        return;
+    };
+    loop {
+        match discovery.receiver.try_recv() {
+            Ok(peer) => candidates.learn(peer, CandidateKind::Discovered),
+            Err(mpsc::error::TryRecvError::Empty) => return,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *run = None;
+                return;
+            }
+        }
+    }
+}
+async fn next_discovery_peer(run: &mut Option<DiscoveryRun>) -> Option<SocketAddrV4> {
+    let Some(discovery) = run.as_mut() else {
+        return std::future::pending().await;
+    };
+    let peer = discovery.receiver.recv().await;
+    if peer.is_none() {
+        *run = None;
+    }
+    peer
+}
 
 /// Briefly collect other near-complete candidates after the first live handshake.
 const UPSTREAM_SELECTION_GRACE: Duration = Duration::from_millis(250);
@@ -199,6 +262,7 @@ struct SeedConfig {
     cache_type: CacheType,
     /// Root dir for disk-mode piece files (per-infohash subdir derived from this).
     cache_dir: PathBuf,
+    warm_peers: WarmPeerCache,
 }
 
 pub struct AceProvider {
@@ -230,6 +294,7 @@ pub struct AceProvider {
     enable_seeding: bool,
     cache_type: CacheType,
     cache_dir: PathBuf,
+    warm_peers: WarmPeerCache,
     /// Records the public IP peers echo back in `yourip` on our outbound handshakes (issue #22).
     /// `None` unless inbound serving is enabled — with inbound off we can't be dialed anyway, so
     /// harvesting is inert (never wired). Shared with the inbound listener and the daemon's
@@ -261,6 +326,7 @@ impl AceProvider {
             enable_seeding: true,
             cache_type: CacheType::Memory,
             cache_dir: PathBuf::new(),
+            warm_peers: WarmPeerCache::memory(),
             reachability: None,
         }
     }
@@ -349,10 +415,19 @@ impl AceProvider {
     }
 
     /// Select where the per-infohash seed store keeps piece data. In `Disk` mode each store
-    /// lives under `<cache_dir>/<infohash_hex>`; `cache_dir` is ignored in `Memory` mode.
+    /// lives under `<cache_dir>/<infohash_hex>`. A nonempty directory also stores private
+    /// productive-peer hints in either backend; an empty directory keeps hints in memory.
     /// Defaults to `Memory`.
     pub fn with_cache(mut self, cache_type: CacheType, cache_dir: PathBuf) -> Self {
         self.cache_type = cache_type;
+        self.warm_peers = WarmPeerCache::new(&cache_dir, false);
+        self.cache_dir = cache_dir;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_warm_cache_loopback_policy(mut self, cache_dir: PathBuf) -> Self {
+        self.warm_peers = WarmPeerCache::new(&cache_dir, true);
         self.cache_dir = cache_dir;
         self
     }
@@ -983,21 +1058,70 @@ impl StreamProvider for AceProvider {
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
         // One resolver for every live entry point. A bare infohash without a verified
         // descriptor fails closed here, before any discovery (#164).
+        let opening = Instant::now();
+        crate::alog!("[ace] discovery stage=open-request");
         let info = self.resolve_live_info(id).await?;
+        crate::alog!(
+            "[ace] discovery stage=resolved resolve_ms={}",
+            opening.elapsed().as_millis()
+        );
 
+        let trackers = info.trackers.clone();
+        let infohash = info.infohash;
+        let port = self.discovery_announce_port();
+        let discovery: PeerDiscovery = Arc::new(move |options, sender| {
+            let trackers = trackers.clone();
+            Box::pin(async move {
+                discover_peers_incremental(
+                    &trackers,
+                    &infohash,
+                    &random_peer_id(),
+                    port,
+                    options,
+                    sender,
+                )
+                .await
+            })
+        });
+        self.open_resolved(id, info, discovery).await
+    }
+}
+
+impl AceProvider {
+    // Shared resolved-live entry point; injected discovery keeps protocol regressions offline.
+    async fn open_resolved(
+        &self,
+        id: &str,
+        info: StreamInfo,
+        discovery: PeerDiscovery,
+    ) -> Result<Box<dyn TsSource>, ProviderError> {
+        let resolved_at = Instant::now();
         // Bootstrap peers are the proven/direct path and must be tried without waiting for
         // tracker/DHT discovery. Background refill can still discover more peers after start.
+        let mut initial_run = None;
         let peers = if self.bootstrap_peers.is_empty() {
-            discover_peers(
-                &info.trackers,
-                &info.infohash,
-                &random_peer_id(),
-                self.discovery_announce_port(),
-            )
-            .await
+            let mut run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
+            self.warm_peers.initialized().await;
+            let hints = self.warm_peers.hints(&info.infohash);
+            let mut peers: Vec<_> = hints.into_iter().map(|(addr, _)| addr).collect();
+            if peers.is_empty() {
+                peers.extend(run.receiver.recv().await);
+            }
+            while let Ok(peer) = run.receiver.try_recv() {
+                peers.push(peer);
+            }
+            if !peers.is_empty() {
+                initial_run = Some(run);
+            }
+            peers
         } else {
             self.bootstrap_peers.clone()
         };
+        crate::alog!(
+            "[ace] discovery stage=first-candidates after_resolution_ms={} count={}",
+            resolved_at.elapsed().as_millis(),
+            peers.len()
+        );
         crate::alog!("[ace] open {id}: discovered {} peer(s)", peers.len());
         if peers.is_empty() {
             return Err(ProviderError::Backend(
@@ -1027,18 +1151,18 @@ impl StreamProvider for AceProvider {
             live_recovery: self.live_recovery,
             cache_type: self.cache_type,
             cache_dir: self.cache_dir.clone(),
+            warm_peers: self.warm_peers.clone(),
         };
         let announce_info = info.clone();
         let metadata = info.metadata.clone();
         let announce_port = self.announce_peer_port.clone();
-        let discovery_port = self.announce_peer_port.clone();
         let reachability = self.reachability.clone();
         tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
             // whichever ends first (normally `follow_live`, when the consumer drops) tears
             // down the other — no separate lifecycle to manage.
             tokio::select! {
-                _ = follow_live(info, peers, identity, tx, stats_peers, downloaded, uploaded, peers_served, seed, discovery_port, reachability) => {},
+                _ = follow_live(info, peers, identity, tx, stats_peers, downloaded, uploaded, peers_served, seed, discovery, reachability, initial_run) => {},
                 _ = announce_seeder_periodically(announce_info, announce_port) => {},
             }
         });
@@ -1333,6 +1457,7 @@ async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnect
 }
 
 async fn connect_upstream_inner(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnectAttempt {
+    crate::alog!("[ace] discovery stage=tcp-attempt");
     let mut session = match tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
     {
         Ok(Ok(session)) => session,
@@ -1343,6 +1468,7 @@ async fn connect_upstream_inner(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerC
             });
         }
     };
+    crate::alog!("[ace] discovery stage=tcp-connected");
     if session
         .perform_handshake(infohash, random_peer_id())
         .await
@@ -1353,6 +1479,7 @@ async fn connect_upstream_inner(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerC
             stage: PeerConnectStage::Handshake,
         });
     }
+    crate::alog!("[ace] discovery stage=bt-handshake");
     let Some((window, yourip)) = read_peer_window(&mut session).await else {
         return PeerConnectAttempt::Failed(PeerConnectFailure {
             addr,
@@ -1375,16 +1502,6 @@ fn pool_refill_candidates(
         .iter()
         .copied()
         .filter(|addr| !active.contains(addr))
-        .collect()
-}
-
-fn take_new_refill_candidates(
-    known: &mut HashSet<SocketAddrV4>,
-    discovered: Vec<SocketAddrV4>,
-) -> Vec<SocketAddrV4> {
-    discovered
-        .into_iter()
-        .filter(|addr| known.insert(*addr))
         .collect()
 }
 
@@ -1500,20 +1617,11 @@ async fn follow_live(
     uploaded: Arc<AtomicU64>,
     peers_served: Arc<AtomicU32>,
     seed: SeedConfig,
-    discovery_port: tokio::sync::watch::Receiver<Option<u16>>,
+    discovery: PeerDiscovery,
     reachability: Option<Arc<ReachabilityMonitor>>,
+    initial_run: Option<DiscoveryRun>,
 ) {
-    let trackers = info.trackers.clone();
-    let infohash = info.infohash;
-    let discovery: PeerDiscovery = Arc::new(move |options| {
-        let trackers = trackers.clone();
-        let port = discovery_port.borrow().unwrap_or(0);
-        Box::pin(async move {
-            discover_peers_with_options(&trackers, &infohash, &random_peer_id(), port, options)
-                .await
-        })
-    });
-    follow_live_session(
+    follow_live_session_with_run(
         info,
         peers,
         identity,
@@ -1525,11 +1633,13 @@ async fn follow_live(
         seed,
         discovery,
         reachability,
+        initial_run,
     )
     .await;
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn follow_live_session(
     info: StreamInfo,
     peers: Vec<SocketAddrV4>,
@@ -1543,15 +1653,50 @@ async fn follow_live_session(
     discovery: PeerDiscovery,
     reachability: Option<Arc<ReachabilityMonitor>>,
 ) {
+    follow_live_session_with_run(
+        info,
+        peers,
+        identity,
+        tx,
+        peer_count,
+        downloaded,
+        uploaded,
+        peers_served,
+        seed,
+        discovery,
+        reachability,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn follow_live_session_with_run(
+    info: StreamInfo,
+    peers: Vec<SocketAddrV4>,
+    identity: Arc<Identity>,
+    tx: mpsc::Sender<LiveOutput>,
+    peer_count: Arc<AtomicU32>,
+    downloaded: Arc<AtomicU64>,
+    uploaded: Arc<AtomicU64>,
+    peers_served: Arc<AtomicU32>,
+    seed: SeedConfig,
+    discovery: PeerDiscovery,
+    reachability: Option<Arc<ReachabilityMonitor>>,
+    mut rediscovery: Option<DiscoveryRun>,
+) {
     let _peer_count_guard = SessionPeerCount(peer_count.clone());
+    let _warm_flush = WarmFlush(seed.warm_peers.clone());
     let chunks_per_piece = info.chunks_per_piece();
     let mut candidates = SessionCandidates::default();
     for addr in peers {
         candidates.learn(addr, CandidateKind::Discovered);
     }
+    for (addr, kind) in seed.warm_peers.hints(&info.infohash) {
+        candidates.learn(addr, kind);
+    }
     let mut continuity: Option<Continuity> = None;
     // One owned discovery attempt can finish while learned candidates are retried.
-    let mut rediscovery = tokio::task::JoinSet::new();
     // Acquire the leech producer lease once for the whole session. `store` is created here and
     // reused across every reconnect (preserving buffered pieces, exactly like the old idempotent
     // `get_or_create`); `_seed_lease` lives for the entire `follow_live` body and drops on return
@@ -1571,11 +1716,7 @@ async fn follow_live_session(
         if tx.is_closed() {
             return;
         }
-        if let Some(Ok(found)) = rediscovery.try_join_next() {
-            for addr in found {
-                candidates.learn(addr, CandidateKind::Discovered);
-            }
-        }
+        drain_discovery(&mut rediscovery, &mut candidates);
         let ready = candidates.eligible(Instant::now());
         let (sources, pex) = candidates.learned_counts();
         crate::alog!(
@@ -1621,16 +1762,17 @@ async fn follow_live_session(
                 .retry_delay(Instant::now())
                 .max(Duration::from_millis(50));
             if ready.is_empty() && !candidates.all().is_empty() {
-                // Cooling learned peers get their first rebuild attempt before launching
-                // another discovery. A failed eligible round can discover concurrently.
-                tokio::select! {_ = tx.closed()=>return, _ = tokio::time::sleep(delay)=>{}}
+                // Keep cooling histories; a genuinely new batch can wake the retry earlier.
+                tokio::select! {
+                    _=tx.closed()=>return,
+                    _=tokio::time::sleep(delay)=>{},
+                    peer=next_discovery_peer(&mut rediscovery), if rediscovery.is_some()=> {
+                        if let Some(peer)=peer {candidates.learn(peer,CandidateKind::Discovered);}
+                    }
+                }
                 continue;
             }
-            if rediscovery.is_empty() {
-                // After an unusable discovered-only cohort, do not repeatedly cancel a
-                // slower peer source as soon as the same small DHT set arrives again.
-                // These options bound DHT, not total tracker/DNS completion; the single
-                // owned discovery remains concurrent with known-candidate retries.
+            if rediscovery.is_none() {
                 let options = if candidates.learned_counts() == (0, 0) {
                     background_discovery_options()
                 } else {
@@ -1641,19 +1783,13 @@ async fn follow_live_session(
                     options.peer_target,
                     options.dht_budget
                 );
-                rediscovery.spawn(discovery(options));
+                rediscovery = Some(DiscoveryRun::start(&discovery, options));
             }
             tokio::select! {
-                _ = tx.closed() => return,
-                _ = tokio::time::sleep(delay) => {},
-                found = rediscovery.join_next() => {
-                    if let Some(Ok(found)) = found {
-                        let count = found.len();
-                        for addr in found { candidates.learn(addr,CandidateKind::Discovered); }
-                        crate::alog!("[ace] upstream rediscovery found {count}; known now {}",candidates.all().len());
-                        // An empty/unchanged discovery must not erase retry cooldowns.
-                        tokio::select! {_ = tx.closed()=>return, _ = tokio::time::sleep(delay)=>{}}
-                    }
+                _=tx.closed()=>return,
+                _=tokio::time::sleep(delay)=>{},
+                peer=next_discovery_peer(&mut rediscovery)=> {
+                    if let Some(peer)=peer {candidates.learn(peer,CandidateKind::Discovered);}
                 }
             }
             continue;
@@ -1682,7 +1818,7 @@ async fn follow_live_session(
         peer_count.store(upstreams.len() as u32, Ordering::Relaxed);
         let end = tokio::select! {
             _ = tx.closed() => return,
-            end = follow_peer_pool(
+            end = follow_peer_pool_with_discovery(
             upstreams,
             &info,
             &identity,
@@ -1700,6 +1836,7 @@ async fn follow_live_session(
             &mut candidates,
             &peer_count,
             reachability.as_ref(),
+            &mut rediscovery,
         )
         => end,
         };
@@ -1739,6 +1876,13 @@ enum FollowEnd {
 /// `PieceReassembler` only ever emits strictly contiguously from its cursor. Real swarm
 /// connections drop and reconnect routinely, so this was a guaranteed visible stutter on
 /// every hop, not an edge case. See `docs/protocol/notes/23-reconnect-continuity.md`.
+struct WarmFlush(WarmPeerCache);
+impl Drop for WarmFlush {
+    fn drop(&mut self) {
+        self.0.request_flush();
+    }
+}
+
 struct Continuity {
     live_recovery: LiveRecoveryConfig,
     reasm: PieceReassembler,
@@ -1749,6 +1893,8 @@ struct Continuity {
     scheduler: Scheduler,
     active_peers: ActivePeers,
     received_chunks: BTreeMap<u64, HashSet<u16>>,
+    /// None marks mixed producers; entries share the bounded reassembly accept window.
+    piece_producers: BTreeMap<u64, Option<SocketAddrV4>>,
     /// When each still-outstanding piece was (re-)requested — drives per-piece retransmission
     /// independent of the whole-pool stale timer.
     requested_at: HashMap<u64, Instant>,
@@ -1765,6 +1911,7 @@ struct Continuity {
     prefetch: u64,
     emitted: u64,
     next_log: u64,
+    authenticated_logged: bool,
 }
 
 struct TransportRecovery {
@@ -1809,6 +1956,7 @@ impl Continuity {
                 scheduler: Scheduler::new(live_recovery.max_piece_advance as usize),
                 active_peers: ActivePeers::new(),
                 received_chunks: BTreeMap::new(),
+                piece_producers: BTreeMap::new(),
                 requested_at: HashMap::new(),
                 next_needed_since: Instant::now(),
                 head: max_piece,
@@ -1817,6 +1965,7 @@ impl Continuity {
                 prefetch,
                 emitted: 0,
                 next_log: 1 << 20,
+                authenticated_logged: false,
             },
             start,
         )
@@ -1833,6 +1982,7 @@ impl Continuity {
         self.scheduler.clear_in_flight();
         self.active_peers = ActivePeers::new();
         self.received_chunks.clear();
+        self.piece_producers.clear();
         self.requested_at.clear();
         self.next_needed_since = Instant::now();
         let next = self.reasm.next_needed();
@@ -1872,6 +2022,7 @@ impl Continuity {
     fn release_rejected_piece(&mut self, piece: u64) {
         self.reasm.discard_partial(piece);
         self.received_chunks.remove(&piece);
+        self.piece_producers.remove(&piece);
         self.scheduler.on_drop(piece);
         self.active_peers.complete_everywhere(piece);
         self.requested_at.remove(&piece);
@@ -1926,6 +2077,7 @@ impl Continuity {
         self.active_peers.prune_below(floor);
         self.requested_at.retain(|&p, _| p >= floor);
         self.received_chunks.retain(|&p, _| p >= floor);
+        self.piece_producers.retain(|&p, _| p >= floor);
         self.next_needed_since = now;
         Some(floor)
     }
@@ -1953,6 +2105,7 @@ impl Continuity {
         self.active_peers.prune_below(target);
         self.requested_at.retain(|&p, _| p >= target);
         self.received_chunks.retain(|&p, _| p >= target);
+        self.piece_producers.retain(|&p, _| p >= target);
         self.next_needed_since = now;
         Some(target)
     }
@@ -2054,36 +2207,32 @@ impl Continuity {
     }
 }
 
-// Producers can overlap at the same endpoint. Only a learned receipt owns its reservation.
+// Each typed receipt owns its endpoint reservation, including queued discovered transports.
 enum PoolRefill {
-    Discovered(ConnectedUpstream),
+    ReservedDiscovered(ConnectedUpstream),
     Learned(ConnectedUpstream),
-    Failed(PeerConnectFailure),
 }
 fn receive_pool_refill(
     refill: PoolRefill,
     learned_pending: &mut HashSet<SocketAddrV4>,
-    candidates: &mut SessionCandidates,
+    _candidates: &mut SessionCandidates,
 ) -> Option<ConnectedUpstream> {
     match refill {
-        PoolRefill::Discovered(upstream) => Some(upstream),
-        PoolRefill::Learned(upstream) => {
+        PoolRefill::Learned(upstream) | PoolRefill::ReservedDiscovered(upstream) => {
             learned_pending.remove(&upstream.addr);
             Some(upstream)
         }
-        PoolRefill::Failed(failure) => {
-            candidates.learn(failure.addr, CandidateKind::Discovered);
-            candidates.explored(failure.addr);
-            candidates.failed(failure.addr, Instant::now());
-            None
-        }
     }
 }
+
+type CandidateConnectCompletion = (SocketAddrV4, Option<PeerConnectFailure>, bool);
 
 enum PoolWake {
     ConsumerGone,
     Peer(Option<PeerEvent>),
     Refill(Option<PoolRefill>),
+    Discovery(Option<SocketAddrV4>),
+    ConnectCompletion(Option<Result<CandidateConnectCompletion, tokio::task::JoinError>>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2161,97 +2310,10 @@ async fn activate_upstream_peer(
     ))
 }
 
-async fn refill_upstream_pool(
-    initial_candidates: Vec<SocketAddrV4>,
-    infohash: [u8; 20],
-    discovery: PeerDiscovery,
-    known_peers: Vec<SocketAddrV4>,
-    live_recovery: LiveRecoveryConfig,
-    refills: mpsc::Sender<PoolRefill>,
-) {
-    let mut known: HashSet<SocketAddrV4> = known_peers.into_iter().collect();
-    known.extend(initial_candidates.iter().copied());
-    let mut stats = PeerConnectStats::default();
-    let mut sent = 0usize;
-    let mut candidates = initial_candidates;
-    let mut discovery_tasks = tokio::task::JoinSet::new();
-    discovery_tasks.spawn(discovery(background_discovery_options()));
-    loop {
-        for batch in candidates.chunks(live_recovery.max_parallel_connect) {
-            let mut set = tokio::task::JoinSet::new();
-            for &addr in batch {
-                set.spawn(connect_upstream(addr, infohash));
-            }
-            while let Some(joined) = set.join_next().await {
-                match joined {
-                    Ok(PeerConnectAttempt::Connected(upstream)) => {
-                        stats.record_connected();
-                        if refills
-                            .send(PoolRefill::Discovered(upstream))
-                            .await
-                            .is_err()
-                        {
-                            if stats.has_observations() {
-                                crate::alog!(
-                                    "[ace] background upstream refill stopped: {}",
-                                    stats.summary()
-                                );
-                            }
-                            return;
-                        }
-                        sent += 1;
-                        if sent >= live_recovery.max_active_upstreams {
-                            break;
-                        }
-                    }
-                    Ok(PeerConnectAttempt::Failed(failure)) => {
-                        stats.record_failure(failure);
-                        if refills.send(PoolRefill::Failed(failure)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => stats.record_task_failure(),
-                }
-            }
-            if sent >= live_recovery.max_active_upstreams {
-                break;
-            }
-        }
-        if sent >= live_recovery.max_active_upstreams {
-            break;
-        }
-        let Some(discovered) = discovery_tasks.join_next().await else {
-            break;
-        };
-        let discovered = discovered.unwrap_or_default();
-        let found = discovered.len();
-        candidates = take_new_refill_candidates(&mut known, discovered);
-        crate::alog!(
-            "[ace] background upstream discovery: found {found}, added {}",
-            candidates.len()
-        );
-        if candidates.is_empty() {
-            break;
-        }
-    }
-    if stats.has_observations() {
-        crate::alog!(
-            "[ace] background upstream refill finished: {}",
-            stats.summary()
-        );
-    }
-}
-
 struct OwnedTask(tokio::task::JoinHandle<()>);
 impl Drop for OwnedTask {
     fn drop(&mut self) {
         self.0.abort();
-    }
-}
-
-fn abort_refill(handle: &mut Option<OwnedTask>) {
-    if let Some(handle) = handle.take() {
-        handle.0.abort();
     }
 }
 
@@ -2269,6 +2331,7 @@ fn recovery_channel_capacities(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn follow_peer_pool(
     upstreams: Vec<ConnectedUpstream>,
     info: &StreamInfo,
@@ -2287,6 +2350,50 @@ async fn follow_peer_pool(
     candidates: &mut SessionCandidates,
     peer_count: &Arc<AtomicU32>,
     reachability: Option<&Arc<ReachabilityMonitor>>,
+) -> FollowEnd {
+    follow_peer_pool_with_discovery(
+        upstreams,
+        info,
+        identity,
+        chunks_per_piece,
+        tx,
+        downloaded,
+        uploaded,
+        peers_served,
+        seed,
+        store,
+        continuity,
+        refill_candidates,
+        known_refill_peers,
+        discovery,
+        candidates,
+        peer_count,
+        reachability,
+        &mut None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn follow_peer_pool_with_discovery(
+    upstreams: Vec<ConnectedUpstream>,
+    info: &StreamInfo,
+    identity: &Identity,
+    chunks_per_piece: u16,
+    tx: &mpsc::Sender<LiveOutput>,
+    downloaded: &Arc<AtomicU64>,
+    uploaded: &Arc<AtomicU64>,
+    peers_served: &Arc<AtomicU32>,
+    seed: &SeedConfig,
+    store: &Arc<tokio::sync::Mutex<PieceStore>>,
+    continuity: &mut Option<Continuity>,
+    refill_candidates: Vec<SocketAddrV4>,
+    known_refill_peers: Vec<SocketAddrV4>,
+    discovery: PeerDiscovery,
+    candidates: &mut SessionCandidates,
+    peer_count: &Arc<AtomicU32>,
+    reachability: Option<&Arc<ReachabilityMonitor>>,
+    discovery_run: &mut Option<DiscoveryRun>,
 ) -> FollowEnd {
     debug_assert!(!upstreams.is_empty());
     let lone_fresh = continuity.is_none() && upstreams.len() == 1;
@@ -2345,22 +2452,19 @@ async fn follow_peer_pool(
         bool,
     )> = tokio::task::JoinSet::new();
     let mut learned_pending = HashSet::new();
-    let mut refill_handle = if refill_candidates.is_empty() {
-        None
-    } else {
-        crate::alog!(
-            "[ace] background upstream refill: trying {} candidate(s)",
-            refill_candidates.len()
-        );
-        Some(OwnedTask(tokio::spawn(refill_upstream_pool(
-            refill_candidates,
-            info.infohash,
-            discovery.clone(),
-            known_refill_peers,
-            live_recovery,
-            refill_tx,
-        ))))
-    };
+    if discovery_run.is_none() && !refill_candidates.is_empty() {
+        *discovery_run = Some(DiscoveryRun::start(
+            &discovery,
+            background_discovery_options(),
+        ));
+    }
+    for addr in refill_candidates {
+        candidates.learn(addr, CandidateKind::Discovered);
+    }
+    let _ = known_refill_peers; // Knowledge already lives in the session candidate store.
+                                // No detached discovery/refill producer: the session owns its stream and this pool owns
+                                // one capped transport set, including queued reservations of every provenance.
+    drop(refill_tx);
     let mut peers: BTreeMap<u64, PeerRuntime> = BTreeMap::new();
     let mut loss_count = 0usize;
     let mut next_peer_id = 1u64;
@@ -2391,13 +2495,12 @@ async fn follow_peer_pool(
         }
     }
     if peers.is_empty() {
-        abort_refill(&mut refill_handle);
         return FollowEnd::PeerLost(loss_count);
     }
     peer_count.store(peers.len() as u32, Ordering::Relaxed);
 
     if peers.len() < live_recovery.max_active_upstreams || continuity.startup_deadline.is_some() {
-        spawn_learned_connects(
+        spawn_candidate_connects(
             candidates,
             &peers,
             info.infohash,
@@ -2405,21 +2508,31 @@ async fn follow_peer_pool(
             &pex_tx,
             &mut learned_connects,
             &mut learned_pending,
+            true,
         );
     }
     let mut last_progress = Instant::now();
     let mut refill_closed = false;
     loop {
-        while let Some(joined) = learned_connects.try_join_next() {
-            if let Ok((addr, failure, queued)) = joined {
-                if !queued {
-                    learned_pending.remove(&addr);
-                }
-                if let Some(failure) = failure {
-                    candidates.explored(failure.addr);
-                    candidates.failed(failure.addr, Instant::now());
-                }
-            }
+        let mut released_failed_slot = false;
+        while let Some(Ok(result)) = learned_connects.try_join_next() {
+            released_failed_slot |=
+                finish_candidate_connect(result, &mut learned_pending, candidates);
+        }
+        if released_failed_slot
+            && (peers.len() < live_recovery.max_active_upstreams
+                || continuity.startup_deadline.is_some())
+        {
+            spawn_candidate_connects(
+                candidates,
+                &peers,
+                info.infohash,
+                live_recovery.max_parallel_connect,
+                &pex_tx,
+                &mut learned_connects,
+                &mut learned_pending,
+                true,
+            );
         }
         let now = Instant::now();
         if continuity
@@ -2447,7 +2560,6 @@ async fn follow_peer_pool(
                 stalled.len()
             );
             shutdown_peer_runtimes(&mut peers);
-            abort_refill(&mut refill_handle);
             return FollowEnd::PoolStale {
                 stalled,
                 lost: loss_count,
@@ -2460,7 +2572,6 @@ async fn follow_peer_pool(
             retransmit_stalled_requests(&mut peers, continuity, chunks_per_piece, now).await;
         record_pool_losses(candidates, &mut loss_count, newly_lost);
         if peers.is_empty() {
-            abort_refill(&mut refill_handle);
             return FollowEnd::PeerLost(loss_count);
         }
         peer_count.store(peers.len() as u32, Ordering::Relaxed);
@@ -2479,6 +2590,8 @@ async fn follow_peer_pool(
             tokio::select! {
                 _ = tx.closed() => PoolWake::ConsumerGone,
                 event = event_rx.recv() => PoolWake::Peer(event),
+                result=learned_connects.join_next(), if !learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
+                peer=next_discovery_peer(discovery_run), if discovery_run.is_some()=>PoolWake::Discovery(peer),
                 upstream = refill_rx.recv(), if !refill_closed && (peers.len() < live_recovery.max_active_upstreams || continuity.startup_deadline.is_some()) => {
                     PoolWake::Refill(upstream)
                 }
@@ -2492,17 +2605,34 @@ async fn follow_peer_pool(
 
         let event = match event {
             PoolWake::ConsumerGone => return FollowEnd::ConsumerGone,
-            PoolWake::Peer(Some(event)) => event,
-            PoolWake::Peer(None) => {
-                shutdown_peer_runtimes(&mut peers);
-                abort_refill(&mut refill_handle);
-                return FollowEnd::PeerLost(loss_count);
+            PoolWake::ConnectCompletion(result) => {
+                if let Some(Ok(result)) = result {
+                    if finish_candidate_connect(result, &mut learned_pending, candidates)
+                        && (peers.len() < live_recovery.max_active_upstreams
+                            || continuity.startup_deadline.is_some())
+                    {
+                        spawn_candidate_connects(
+                            candidates,
+                            &peers,
+                            info.infohash,
+                            live_recovery.max_parallel_connect,
+                            &pex_tx,
+                            &mut learned_connects,
+                            &mut learned_pending,
+                            true,
+                        );
+                    }
+                }
+                continue;
             }
-            PoolWake::Refill(Some(upstream)) => {
-                let Some(upstream) =
-                    receive_pool_refill(upstream, &mut learned_pending, candidates)
-                else {
-                    spawn_learned_connects(
+            PoolWake::Discovery(peer) => {
+                if let Some(peer) = peer {
+                    candidates.learn(peer, CandidateKind::Discovered);
+                }
+                if peers.len() < live_recovery.max_active_upstreams
+                    || continuity.startup_deadline.is_some()
+                {
+                    spawn_candidate_connects(
                         candidates,
                         &peers,
                         info.infohash,
@@ -2510,6 +2640,29 @@ async fn follow_peer_pool(
                         &pex_tx,
                         &mut learned_connects,
                         &mut learned_pending,
+                        true,
+                    );
+                }
+                continue;
+            }
+            PoolWake::Peer(Some(event)) => event,
+            PoolWake::Peer(None) => {
+                shutdown_peer_runtimes(&mut peers);
+                return FollowEnd::PeerLost(loss_count);
+            }
+            PoolWake::Refill(Some(upstream)) => {
+                let Some(upstream) =
+                    receive_pool_refill(upstream, &mut learned_pending, candidates)
+                else {
+                    spawn_candidate_connects(
+                        candidates,
+                        &peers,
+                        info.infohash,
+                        live_recovery.max_parallel_connect,
+                        &pex_tx,
+                        &mut learned_connects,
+                        &mut learned_pending,
+                        true,
                     );
                     continue;
                 };
@@ -2536,7 +2689,7 @@ async fn follow_peer_pool(
                         _ = tx.closed() => return FollowEnd::ConsumerGone,
                         _ = harvest_stale_gossip_with_budget(vec![upstream],identity,candidates,gossip_budget) => {},
                     }
-                    spawn_learned_connects(
+                    spawn_candidate_connects(
                         candidates,
                         &peers,
                         info.infohash,
@@ -2544,6 +2697,7 @@ async fn follow_peer_pool(
                         &pex_tx,
                         &mut learned_connects,
                         &mut learned_pending,
+                        true,
                     );
                     continue;
                 }
@@ -2647,7 +2801,6 @@ async fn follow_peer_pool(
                     peer_count.store(peers.len() as u32, Ordering::Relaxed);
                 }
                 if peers.is_empty() {
-                    abort_refill(&mut refill_handle);
                     return FollowEnd::PeerLost(loss_count);
                 }
                 continue;
@@ -2726,12 +2879,43 @@ async fn follow_peer_pool(
                         record_pool_losses(candidates, &mut loss_count, newly_lost);
                         continue;
                     }
+                    continuity
+                        .piece_producers
+                        .entry(piece)
+                        .and_modify(|producer| {
+                            if *producer != Some(addr) {
+                                *producer = None;
+                            }
+                        })
+                        .or_insert(Some(addr));
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
                     made_activity = true;
+                    let before = continuity.reasm.next_needed();
                     let ready = continuity.reasm.take_ready();
+                    let after = continuity.reasm.next_needed();
+                    let productive: Vec<_> = continuity
+                        .piece_producers
+                        .range(before..after)
+                        .filter_map(|(_, producer)| *producer)
+                        .collect();
+                    continuity
+                        .piece_producers
+                        .retain(|&piece, _| piece >= after);
                     if !ready.is_empty() {
+                        if !continuity.authenticated_logged
+                            && info.sig_len > 0
+                            && ace_wire::live_auth::signature_len_from_pubkey_der(
+                                &info.source_pubkey,
+                            ) == Some(info.sig_len)
+                        {
+                            continuity.authenticated_logged = true;
+                            crate::alog!("[ace] discovery stage=authenticated-contiguous");
+                        }
                         for output in continuity.resync_output(&ready) {
                             let aligned = output.bytes;
+                            if continuity.emitted == 0 {
+                                crate::alog!("[ace] discovery stage=first-source-output");
+                            }
                             continuity.emitted += aligned.len() as u64;
                             if continuity.emitted >= continuity.next_log {
                                 crate::alog!(
@@ -2752,11 +2936,23 @@ async fn follow_peer_pool(
                                 .is_err()
                             {
                                 shutdown_peer_runtimes(&mut peers);
-                                abort_refill(&mut refill_handle);
                                 return FollowEnd::ConsumerGone;
                             }
                             downloaded.fetch_add(len, Ordering::Relaxed);
                             made_output = true;
+                        }
+                    }
+                    if made_output
+                        && info.sig_len > 0
+                        && ace_wire::live_auth::signature_len_from_pubkey_der(&info.source_pubkey)
+                            == Some(info.sig_len)
+                    {
+                        for producer in productive {
+                            seed.warm_peers.record_productive(
+                                info.infohash,
+                                producer,
+                                candidates.kind(producer),
+                            );
                         }
                     }
                     let newly_lost =
@@ -2835,7 +3031,7 @@ async fn follow_peer_pool(
                 if peers.len() < live_recovery.max_active_upstreams
                     || continuity.startup_deadline.is_some()
                 {
-                    spawn_learned_connects(
+                    spawn_candidate_connects(
                         candidates,
                         &peers,
                         info.infohash,
@@ -2843,6 +3039,7 @@ async fn follow_peer_pool(
                         &pex_tx,
                         &mut learned_connects,
                         &mut learned_pending,
+                        true,
                     );
                 }
             }
@@ -2856,7 +3053,7 @@ async fn follow_peer_pool(
                     if peers.len() < live_recovery.max_active_upstreams
                         || continuity.startup_deadline.is_some()
                     {
-                        spawn_learned_connects(
+                        spawn_candidate_connects(
                             candidates,
                             &peers,
                             info.infohash,
@@ -2864,6 +3061,7 @@ async fn follow_peer_pool(
                             &pex_tx,
                             &mut learned_connects,
                             &mut learned_pending,
+                            true,
                         );
                     }
                 }
@@ -2902,7 +3100,6 @@ async fn follow_peer_pool(
             _ => {}
         }
         if peers.is_empty() {
-            abort_refill(&mut refill_handle);
             return FollowEnd::PeerLost(loss_count);
         }
         if should_refresh_stale_deadline(continuity.emitted, made_output, made_activity) {
@@ -2954,6 +3151,7 @@ async fn send_peer_command(
     }
 }
 
+#[cfg(test)]
 fn spawn_learned_connects(
     candidates: &mut SessionCandidates,
     peers: &BTreeMap<u64, PeerRuntime>,
@@ -2963,13 +3161,57 @@ fn spawn_learned_connects(
     tasks: &mut tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>, bool)>,
     pending: &mut HashSet<SocketAddrV4>,
 ) {
+    spawn_candidate_connects(
+        candidates,
+        peers,
+        infohash,
+        max_parallel,
+        tx,
+        tasks,
+        pending,
+        false,
+    );
+}
+
+fn finish_candidate_connect(
+    (addr, failure, queued): (SocketAddrV4, Option<PeerConnectFailure>, bool),
+    pending: &mut HashSet<SocketAddrV4>,
+    candidates: &mut SessionCandidates,
+) -> bool {
+    if !queued {
+        pending.remove(&addr);
+    }
+    if let Some(failure) = failure {
+        candidates.explored(failure.addr);
+        candidates.failed(failure.addr, Instant::now());
+        return true;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_candidate_connects(
+    candidates: &mut SessionCandidates,
+    peers: &BTreeMap<u64, PeerRuntime>,
+    infohash: [u8; 20],
+    max_parallel: usize,
+    tx: &mpsc::Sender<PoolRefill>,
+    tasks: &mut tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>, bool)>,
+    pending: &mut HashSet<SocketAddrV4>,
+    include_discovered: bool,
+) {
     let (sources, pex) = candidates.learned_counts();
-    if sources + pex == 0 {
+    if !include_discovered && sources + pex == 0 {
         return;
     }
     let active = peers.values().map(|peer| peer.addr).collect();
     let cohort = candidates.exploration_cohort(Instant::now(), &active, pending);
-    for addr in candidates.eligible_learned(Instant::now()) {
+    let eligible = if include_discovered {
+        candidates.eligible(Instant::now())
+    } else {
+        candidates.eligible_learned(Instant::now())
+    };
+    for addr in eligible {
         if Some(candidates.explorations(addr)) != cohort {
             continue;
         }
@@ -2981,11 +3223,17 @@ fn spawn_learned_connects(
         }
         // Reserve a retry slot before spawning: gossip floods cannot duplicate pending work.
         candidates.attempting(addr, Instant::now() + CONNECT_TIMEOUT);
+        let discovered = candidates.kind(addr) == CandidateKind::Discovered;
         let tx = tx.clone();
         tasks.spawn(async move {
             let (failure, queued) = match connect_upstream(addr, infohash).await {
                 PeerConnectAttempt::Connected(upstream) => {
-                    (None, tx.try_send(PoolRefill::Learned(upstream)).is_ok())
+                    let receipt = if discovered {
+                        PoolRefill::ReservedDiscovered(upstream)
+                    } else {
+                        PoolRefill::Learned(upstream)
+                    };
+                    (None, tx.try_send(receipt).is_ok())
                 }
                 PeerConnectAttempt::Failed(failure) => (Some(failure), false),
             };
@@ -4467,6 +4715,7 @@ mod tests {
             live_recovery: policy,
             cache_type: CacheType::Memory,
             cache_dir: PathBuf::new(),
+            warm_peers: WarmPeerCache::memory(),
         };
         let (tx, mut rx) = mpsc::channel(4);
         let pool = tokio::spawn(async move {
@@ -4490,7 +4739,7 @@ mod tests {
                 &mut continuity,
                 vec![],
                 vec![],
-                Arc::new(|_| Box::pin(async { vec![] })),
+                completed_discovery(|_| Box::pin(async { vec![] })),
                 &mut SessionCandidates::default(),
                 &Arc::new(AtomicU32::new(0)),
                 None,
@@ -5789,16 +6038,24 @@ mod tests {
 
     #[test]
     fn newly_discovered_refill_candidates_are_deduped_against_known_peers() {
-        let mut known: HashSet<SocketAddrV4> = addrs(&[1, 2]).into_iter().collect();
-
+        let mut candidates = SessionCandidates::default();
+        for addr in addrs(&[1, 2]) {
+            candidates.learn(addr, CandidateKind::Discovered);
+        }
+        let before = candidates.all();
+        for addr in addrs(&[2, 3, 1, 4, 3]) {
+            candidates.learn(addr, CandidateKind::Discovered);
+        }
+        let after = candidates.all();
         assert_eq!(
-            take_new_refill_candidates(&mut known, addrs(&[2, 3, 1, 4, 3])),
+            after
+                .iter()
+                .copied()
+                .filter(|addr| !before.contains(addr))
+                .collect::<Vec<_>>(),
             addrs(&[3, 4])
         );
-        assert!(known.contains(&addrs(&[1])[0]));
-        assert!(known.contains(&addrs(&[2])[0]));
-        assert!(known.contains(&addrs(&[3])[0]));
-        assert!(known.contains(&addrs(&[4])[0]));
+        assert_eq!(after.len(), 4);
     }
 
     #[test]

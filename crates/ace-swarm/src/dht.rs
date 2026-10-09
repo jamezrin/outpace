@@ -203,23 +203,39 @@ async fn dht_walk(
     sock: &UdpSocket,
     on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
 ) -> DhtWalkMetrics {
-    // Frontier of candidate nodes keyed by XOR distance; seed with bootstrap routers.
+    let deadline = tokio::time::Instant::now() + budget;
     let mut frontier: BTreeMap<[u8; 20], SocketAddrV4> = BTreeMap::new();
+    let mut lookups = tokio::task::JoinSet::new();
     for (i, host) in BOOTSTRAP.iter().enumerate() {
-        if let Ok(addrs) = tokio::net::lookup_host(host).await {
-            for a in addrs {
-                if let SocketAddr::V4(v4) = a {
-                    // Bootstrap ids unknown; use distinct max-distance keys so real nodes
-                    // outrank them AND the bootstraps don't collide on one map key.
-                    let mut key = [0xffu8; 20];
-                    key[19] = i as u8;
-                    frontier.insert(key, v4);
-                    break;
-                }
-            }
+        lookups.spawn(async move {
+            let addr = tokio::time::timeout_at(deadline, tokio::net::lookup_host(*host))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|mut addresses| {
+                    addresses.find_map(|addr| match addr {
+                        SocketAddr::V4(v4) => Some(v4),
+                        _ => None,
+                    })
+                });
+            (i, addr)
+        });
+    }
+    while let Some(result) = lookups.join_next().await {
+        if let Ok((i, Some(addr))) = result {
+            let mut key = [0xff; 20];
+            key[19] = i as u8;
+            frontier.insert(key, addr);
         }
     }
-    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await
+    dht_walk_frontier(
+        infohash,
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        sock,
+        frontier,
+        on_response,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -295,7 +311,7 @@ async fn dht_walk_frontier(
         // Collect responses for a short window. A round in which no datagram arrives at all is
         // a timeout; datagrams that arrive but are rejected are counted by their failure mode.
         let mut received_any = false;
-        let window = Instant::now() + Duration::from_millis(1500);
+        let window = (Instant::now() + Duration::from_millis(1500)).min(deadline);
         while Instant::now() < window {
             let remaining = window.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
@@ -373,37 +389,87 @@ pub async fn dht_get_peers_with_target(
     budget: Duration,
     peer_target: usize,
 ) -> Vec<SocketAddrV4> {
-    let sock = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    dht_get_peers_incremental(infohash, budget, peer_target, |_| true).await
+}
+
+/// Publish each unique peer immediately after its source/transaction correlation succeeds.
+/// Returning false from the observer cancels further harvesting. The complete set remains
+/// available to aggregate callers; at most 1024 addresses are retained per walk.
+pub async fn dht_get_peers_incremental(
+    infohash: &[u8; 20],
+    budget: Duration,
+    peer_target: usize,
+    mut on_peer: impl FnMut(SocketAddrV4) -> bool,
+) -> Vec<SocketAddrV4> {
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
+        return Vec::new();
     };
-    let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
-    dht_walk(infohash, budget, &sock, |_src, resp| {
-        peers.extend(resp.peers.iter().copied());
-        peers.len() >= peer_target
+    let mut peers = BTreeSet::new();
+    dht_walk(infohash, budget, &sock, |_src, response| {
+        collect_response_peers(response, &mut peers, peer_target, &mut on_peer)
     })
     .await;
     peers.into_iter().collect()
+}
+
+fn collect_response_peers(
+    response: &GetPeersResponse,
+    peers: &mut BTreeSet<SocketAddrV4>,
+    target: usize,
+    on_peer: &mut impl FnMut(SocketAddrV4) -> bool,
+) -> bool {
+    for &peer in &response.peers {
+        if peers.len() >= 1024 {
+            return true;
+        }
+        if peers.insert(peer) && !on_peer(peer) {
+            return true;
+        }
+    }
+    peers.len() >= target.max(1)
 }
 
 #[cfg(test)]
 async fn dht_get_peers_from_seeds(
     infohash: &[u8; 20],
     budget: Duration,
-    peer_target: usize,
+    target: usize,
     seeds: Vec<SocketAddrV4>,
 ) -> Vec<SocketAddrV4> {
-    let sock = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    dht_peers_from_seeds_with_observer(infohash, budget, target, seeds, |_| true).await
+}
+
+#[cfg(test)]
+async fn dht_peers_from_seeds_with_observer(
+    infohash: &[u8; 20],
+    budget: Duration,
+    target: usize,
+    seeds: Vec<SocketAddrV4>,
+    mut observer: impl FnMut(SocketAddrV4) -> bool,
+) -> Vec<SocketAddrV4> {
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
+        return Vec::new();
     };
-    let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
-    dht_walk_from_seeds(infohash, budget, &sock, seeds, |_src, resp| {
-        peers.extend(resp.peers.iter().copied());
-        peers.len() >= peer_target
+    let mut peers = BTreeSet::new();
+    dht_walk_from_seeds(infohash, budget, &socket, seeds, |_, response| {
+        collect_response_peers(response, &mut peers, target, &mut observer)
     })
     .await;
     peers.into_iter().collect()
+}
+
+#[cfg(test)]
+async fn dht_stream_from_seeds(
+    infohash: &[u8; 20],
+    budget: Duration,
+    target: usize,
+    seeds: Vec<SocketAddrV4>,
+    peers: tokio::sync::mpsc::Sender<SocketAddrV4>,
+) {
+    dht_peers_from_seeds_with_observer(infohash, budget, target, seeds, |peer| {
+        peers.try_send(peer).is_ok()
+    })
+    .await;
 }
 
 /// The DHT half of self-announcement (BEP-5's `announce_peer`), never previously
@@ -737,6 +803,119 @@ mod tests {
         let resp = values_response(b"Zx", &["10.0.0.9:9000".parse().unwrap()]);
         let got = parse_response(&resp).unwrap();
         assert_eq!(got.txid, b"Zx".to_vec());
+    }
+
+    #[tokio::test]
+    async fn dht_stream_publishes_first_correlated_reply_before_later_reply() {
+        let mut servers = tokio::task::JoinSet::new();
+        let mut seeds = Vec::new();
+        for (i, delay) in [Duration::ZERO, Duration::from_millis(600)]
+            .into_iter()
+            .enumerate()
+        {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let SocketAddr::V4(seed) = socket.local_addr().unwrap() else {
+                unreachable!()
+            };
+            seeds.push(seed);
+            servers.spawn(async move {
+                let mut buf = [0; 2048];
+                let (n, client) = socket.recv_from(&mut buf).await.unwrap();
+                let txid = buf_txid(&buf[..n]);
+                tokio::time::sleep(delay).await;
+                let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1000 + i as u16);
+                socket
+                    .send_to(&values_response(&txid, &[peer]), client)
+                    .await
+                    .unwrap();
+            });
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let walk = tokio::spawn(async move {
+            dht_stream_from_seeds(&[9; 20], Duration::from_secs(2), 2, seeds, tx).await;
+        });
+        let first = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await;
+        if first.is_err() {
+            walk.abort();
+            servers.abort_all();
+        }
+        if first.is_ok() {
+            let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first.as_ref().unwrap().as_ref().unwrap(), &second);
+        }
+        let _ = walk.await;
+        while servers.join_next().await.is_some() {}
+        assert!(
+            first.is_ok(),
+            "first correlated peer was hidden until the walk completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_observer_rejects_wrong_txid_source_replay_and_duplicate_values() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spoof = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(seed) = socket.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let expected = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
+        let server = tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            let (n, client) = socket.recv_from(&mut bytes).await.unwrap();
+            let txid = buf_txid(&bytes[..n]);
+            let mut wrong = txid.clone();
+            wrong.push(0xff);
+            let bad = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321);
+            socket
+                .send_to(&values_response(&wrong, &[bad]), client)
+                .await
+                .unwrap();
+            spoof
+                .send_to(&values_response(&txid, &[bad]), client)
+                .await
+                .unwrap();
+            socket
+                .send_to(&values_response(&txid, &[expected, expected]), client)
+                .await
+                .unwrap();
+            socket
+                .send_to(&values_response(&txid, &[bad]), client)
+                .await
+                .unwrap();
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        dht_stream_from_seeds(&[0; 20], Duration::from_millis(150), 8, vec![seed], sender).await;
+        server.await.unwrap();
+        assert_eq!(receiver.recv().await, Some(expected));
+        assert!(
+            receiver.recv().await.is_none(),
+            "uncorrelated/replayed/duplicate peer reached production observer"
+        );
+    }
+
+    #[tokio::test]
+    async fn dht_response_window_respects_remaining_walk_budget() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(seed) = server.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let start = Instant::now();
+        let peers =
+            dht_get_peers_from_seeds(&[9; 20], Duration::from_millis(40), 8, vec![seed]).await;
+        let elapsed = start.elapsed();
+        assert!(peers.is_empty());
+        let mut query = [0; 2048];
+        assert!(
+            server.try_recv_from(&mut query).is_ok(),
+            "actual UDP query required"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "40ms walk consumed {elapsed:?}"
+        );
     }
 
     #[tokio::test]
