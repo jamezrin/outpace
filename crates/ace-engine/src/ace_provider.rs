@@ -8,6 +8,8 @@
 //! fallback (see [`ace_swarm::resolve`]). A bare infohash opens only from a transport descriptor
 //! this process has already verified, and otherwise fails closed (issue #164).
 
+#[cfg(test)]
+mod live_start_tests;
 mod reconnect;
 #[cfg(test)]
 mod reconnect_tests;
@@ -75,6 +77,8 @@ type PeerDiscovery = Arc<
 
 /// Briefly collect other near-complete candidates after the first live handshake.
 const UPSTREAM_SELECTION_GRACE: Duration = Duration::from_millis(250);
+/// Process gossip while withholding media from an uncorroborated first window.
+const LIVE_START_CORROBORATION: Duration = Duration::from_secs(1);
 /// How often an active session re-announces itself as a seeder to its trackers, so
 /// outpace becomes organically discoverable while it's serving (see
 /// `docs/protocol/notes/24-seeder-self-announce.md`). Doesn't yet honor a tracker's
@@ -1248,6 +1252,7 @@ async fn peer_worker<S>(
     mut session: PeerSession<S>,
     mut commands: mpsc::Receiver<PeerCommand>,
     events: mpsc::Sender<PeerEvent>,
+    request_floor: Arc<AtomicU64>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1257,6 +1262,9 @@ async fn peer_worker<S>(
                 match command {
                     Some(PeerCommand::RequestPiece { piece, chunks_per_piece }) => {
                         for chunk in 0..chunks_per_piece {
+                            if piece < request_floor.load(Ordering::Relaxed) {
+                                break;
+                            }
                             if session.send(&chunk_request(piece as u32, chunk)).await.is_err() {
                                 let _ = events.send(PeerEvent::Lost { peer_id, addr }).await;
                                 return;
@@ -1749,6 +1757,10 @@ struct Continuity {
     /// and we skip forward rather than freeze.
     next_needed_since: Instant,
     head: u64,
+    /// Only a fresh lone-window pool delays media; reconnect continuity stays authoritative.
+    startup_deadline: Option<Instant>,
+    /// Workers discard queued stale chunk writes after new live-head evidence.
+    request_floor: Arc<AtomicU64>,
     /// Pieces behind the live edge to leave as a cushion when re-syncing forward to live.
     prefetch: u64,
     emitted: u64,
@@ -1800,6 +1812,8 @@ impl Continuity {
                 requested_at: HashMap::new(),
                 next_needed_since: Instant::now(),
                 head: max_piece,
+                startup_deadline: None,
+                request_floor: Arc::new(AtomicU64::new(start)),
                 prefetch,
                 emitted: 0,
                 next_log: 1 << 20,
@@ -1916,23 +1930,26 @@ impl Continuity {
         Some(floor)
     }
 
-    /// If the cursor has fallen more than the reassembler's look-ahead behind the live edge
-    /// (`head`), re-sync forward to near the live edge. Past that lag, contiguous catch-up is
-    /// impossible — the reassembler can't even buffer pieces up to `head` — so grinding the backlog
-    /// only falls further behind a live stream. Unlike [`skip_evicted_gap`](Self::skip_evicted_gap),
-    /// this fires even while peers' windows nominally cover the stuck piece: that is exactly the
-    /// wedge where a peer advertises a piece it never actually delivers and the cursor freezes
-    /// forever (the whole-pool stale timer keeps resetting on chunks for pieces buffered ahead).
-    /// Returns the skip target if it re-synced. The forward jump is a logged discontinuity, the
-    /// live-stream equivalent of dropping to the live point.
+    /// Enforce the configured live cushion immediately, before requests or publication.
+    /// This also drops stale partial/completed pieces and releases their peer slots when
+    /// a newly learned head outruns the cursor. Once output exists, a forward skip uses
+    /// the same fresh discontinuity gate as an unknown whole-piece loss (issue #169).
+    /// Provisional startup positioning has no previously published stream to interrupt.
     fn skip_far_behind_live(&mut self, now: Instant) -> Option<u64> {
+        self.request_floor
+            .fetch_max(self.head.saturating_sub(self.prefetch), Ordering::Relaxed);
         let next = self.reasm.next_needed();
-        if self.head.saturating_sub(next) <= self.live_recovery.max_reasm_pieces_ahead {
+        if self.head.saturating_sub(next) <= self.prefetch {
             return None;
         }
-        let target = self.head.saturating_sub(self.prefetch).max(next + 1);
+        let target = self.head.saturating_sub(self.prefetch);
         self.reasm.skip_to(target);
-        self.arm_output_gate();
+        if self.emitted > 0 {
+            self.arm_output_gate();
+        } else {
+            // No published stream exists to mark discontinuous at provisional startup.
+            self.resync = ace_media::mpegts::TsResync::new();
+        }
         self.active_peers.prune_below(target);
         self.requested_at.retain(|&p, _| p >= target);
         self.received_chunks.retain(|&p, _| p >= target);
@@ -2069,6 +2086,7 @@ enum PoolWake {
     Refill(Option<PoolRefill>),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn activate_upstream_peer(
     peer_id: u64,
     mut upstream: ConnectedUpstream,
@@ -2077,7 +2095,8 @@ async fn activate_upstream_peer(
     continuity: &mut Continuity,
     event_tx: &mpsc::Sender<PeerEvent>,
     reachability: Option<&Arc<ReachabilityMonitor>>,
-) -> Result<PeerRuntime, SocketAddrV4> {
+    replacing: Option<(&mut BTreeMap<u64, PeerRuntime>, u64)>,
+) -> Result<(PeerRuntime, Option<SocketAddrV4>), SocketAddrV4> {
     // Harvest the public IP this peer echoed to us in `yourip` (issue #22). This is the single
     // funnel every activated outbound upstream passes through, so recording here captures the
     // observation once per live peer. Inert when no monitor is supplied (inbound serving off).
@@ -2086,7 +2105,6 @@ async fn activate_upstream_peer(
     }
     let peer_min = upstream.window.min_piece.max(0) as u64;
     let peer_max = upstream.window.max_piece.max(0) as u64;
-    continuity.register_active_peer(peer_id, upstream.addr, upstream.window);
     let hs = OutgoingExtendedHandshake {
         ace_metadata_version: 1,
         ut_metadata_id: 2,
@@ -2114,11 +2132,12 @@ async fn activate_upstream_peer(
             .await
             .is_err()
     {
-        for piece in continuity.active_peers.remove(peer_id) {
-            continuity.scheduler.on_drop(piece);
-        }
         return Err(upstream.addr);
     }
+    // Only successful writes consume the old provisional transport. A failed candidate
+    // leaves its runtime, gossip reader, and request slots intact.
+    let replaced = replacing.and_then(|(peers, id)| drop_peer_runtime(id, peers, continuity));
+    continuity.register_active_peer(peer_id, upstream.addr, upstream.window);
     let (command_tx, command_rx) = mpsc::channel(64);
     let worker = tokio::spawn(peer_worker(
         peer_id,
@@ -2126,16 +2145,20 @@ async fn activate_upstream_peer(
         upstream.session,
         command_rx,
         event_tx.clone(),
+        continuity.request_floor.clone(),
     ));
-    Ok(PeerRuntime {
-        addr: upstream.addr,
-        min_piece: peer_min,
-        max_piece: peer_max,
-        unchoked_peer: false,
-        seen_ids: HashSet::new(),
-        commands: command_tx,
-        worker,
-    })
+    Ok((
+        PeerRuntime {
+            addr: upstream.addr,
+            min_piece: peer_min,
+            max_piece: peer_max,
+            unchoked_peer: false,
+            seen_ids: HashSet::new(),
+            commands: command_tx,
+            worker,
+        },
+        replaced,
+    ))
 }
 
 async fn refill_upstream_pool(
@@ -2266,6 +2289,7 @@ async fn follow_peer_pool(
     reachability: Option<&Arc<ReachabilityMonitor>>,
 ) -> FollowEnd {
     debug_assert!(!upstreams.is_empty());
+    let lone_fresh = continuity.is_none() && upstreams.len() == 1;
     let primary = upstreams[0].window;
     let primary_addr = upstreams[0].addr;
     let min_piece = primary.min_piece.max(0) as u64;
@@ -2296,6 +2320,12 @@ async fn follow_peer_pool(
     };
     let continuity = continuity.as_mut().expect("initialized just above");
     let live_recovery = continuity.live_recovery;
+    if lone_fresh {
+        continuity.startup_deadline = Some(Instant::now() + LIVE_START_CORROBORATION);
+        crate::alog!(
+            "[ace] live start: withholding media for independent window evidence (up to 1000 ms)"
+        );
+    }
     let (event_capacity, refill_capacity) = match recovery_channel_capacities(live_recovery) {
         Ok(capacities) => capacities,
         Err(err) => {
@@ -2346,10 +2376,11 @@ async fn follow_peer_pool(
             continuity,
             &event_tx,
             reachability,
+            None,
         )
         .await
         {
-            Ok(runtime) => {
+            Ok((runtime, _)) => {
                 candidates.admitted(runtime.addr);
                 peers.insert(peer_id, runtime);
             }
@@ -2365,7 +2396,7 @@ async fn follow_peer_pool(
     }
     peer_count.store(peers.len() as u32, Ordering::Relaxed);
 
-    if peers.len() < live_recovery.max_active_upstreams {
+    if peers.len() < live_recovery.max_active_upstreams || continuity.startup_deadline.is_some() {
         spawn_learned_connects(
             candidates,
             &peers,
@@ -2391,8 +2422,23 @@ async fn follow_peer_pool(
             }
         }
         let now = Instant::now();
+        if continuity
+            .startup_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            continuity.startup_deadline = None;
+            last_progress = now;
+            crate::alog!("[ace] live start: corroboration deadline reached; using best known window without freshness proof");
+            let lost = advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
+            record_pool_losses(candidates, &mut loss_count, lost);
+        }
         let Some(stale_budget) =
             stale_upstream_budget(last_progress, now, live_recovery.stale_upstream_timeout())
+                .or_else(|| {
+                    continuity
+                        .startup_deadline
+                        .map(|deadline| deadline.saturating_duration_since(now))
+                })
         else {
             let stalled = peers.values().map(|p| p.addr).collect::<Vec<_>>();
             crate::alog!(
@@ -2421,12 +2467,19 @@ async fn follow_peer_pool(
 
         // Wake at least every configured request-check interval so the sweep above runs even
         // while no peer sends anything.
-        let wait = stale_budget.min(live_recovery.request_check_interval());
+        let wait = stale_budget
+            .min(live_recovery.request_check_interval())
+            .min(
+                continuity
+                    .startup_deadline
+                    .map(|deadline| deadline.saturating_duration_since(now))
+                    .unwrap_or(stale_budget),
+            );
         let event = match tokio::time::timeout(wait, async {
             tokio::select! {
                 _ = tx.closed() => PoolWake::ConsumerGone,
                 event = event_rx.recv() => PoolWake::Peer(event),
-                upstream = refill_rx.recv(), if !refill_closed && peers.len() < live_recovery.max_active_upstreams => {
+                upstream = refill_rx.recv(), if !refill_closed && (peers.len() < live_recovery.max_active_upstreams || continuity.startup_deadline.is_some()) => {
                     PoolWake::Refill(upstream)
                 }
             }
@@ -2474,9 +2527,14 @@ async fn follow_peer_pool(
                     );
                     candidates.explored(upstream.addr);
                     candidates.failed(upstream.addr, Instant::now());
+                    let gossip_budget = continuity
+                        .startup_deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or(STALE_GOSSIP_BUDGET)
+                        .min(STALE_GOSSIP_BUDGET);
                     tokio::select! {
                         _ = tx.closed() => return FollowEnd::ConsumerGone,
-                        _ = harvest_stale_gossip(vec![upstream],identity,candidates) => {},
+                        _ = harvest_stale_gossip_with_budget(vec![upstream],identity,candidates,gossip_budget) => {},
                     }
                     spawn_learned_connects(
                         candidates,
@@ -2498,11 +2556,39 @@ async fn follow_peer_pool(
                     // or queued. Dropping this older transport consumes no new opportunity.
                     continue;
                 }
+                let corroborates = continuity.startup_deadline.is_some()
+                    && upstream.window.max_piece.max(0) as u64 >= continuity.head;
+                if corroborates
+                    && peers.len() >= live_recovery.max_active_upstreams
+                    && upstream.window.max_piece.max(0) as u64 == continuity.head
+                {
+                    // Independent matching evidence is enough to start. Keep the sole
+                    // healthy provisional transport rather than churn it for capacity.
+                    continuity.startup_deadline = None;
+                    last_progress = Instant::now();
+                    crate::alog!("[ace] live start: matching independent window confirmed; retaining current upstream");
+                    let lost =
+                        advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
+                    record_pool_losses(candidates, &mut loss_count, lost);
+                    continue;
+                }
+                let replacement = if peers.len() >= live_recovery.max_active_upstreams {
+                    if !corroborates {
+                        continue;
+                    }
+                    peers
+                        .iter()
+                        .min_by_key(|(_, peer)| peer.max_piece)
+                        .map(|(&id, _)| id)
+                } else {
+                    None
+                };
                 candidates.learn(upstream.addr, CandidateKind::Discovered);
                 let peer_id = next_peer_id;
                 next_peer_id += 1;
                 let addr = upstream.addr;
                 continuity.head = continuity.head.max(upstream.window.max_piece.max(0) as u64);
+                continuity.skip_far_behind_live(Instant::now());
                 match activate_upstream_peer(
                     peer_id,
                     upstream,
@@ -2511,10 +2597,21 @@ async fn follow_peer_pool(
                     continuity,
                     &event_tx,
                     reachability,
+                    replacement.map(|id| (&mut peers, id)),
                 )
                 .await
                 {
-                    Ok(runtime) => {
+                    Ok((runtime, replaced)) => {
+                        if let Some(replaced) = replaced {
+                            // Already admitted once: no extra exploration or physical-loss
+                            // event for retiring a provisional, nonproducing transport.
+                            candidates.failed(replaced, Instant::now());
+                        }
+                        if corroborates {
+                            continuity.startup_deadline = None;
+                            last_progress = Instant::now();
+                            crate::alog!("[ace] live start: independent upstream window confirmed; starting at best known head");
+                        }
                         candidates.admitted(runtime.addr);
                         crate::alog!(
                             "[ace] {addr}: added to active upstream pool ({} peer(s))",
@@ -2602,7 +2699,13 @@ async fn follow_peer_pool(
             }
             m @ PeerMessage::Piece { .. } => {
                 if let Some(lc) = LiveChunk::from_message(&m) {
+                    continuity.skip_far_behind_live(Instant::now());
                     let piece = lc.piece as u64;
+                    if continuity.startup_deadline.is_some()
+                        || piece < continuity.reasm.next_needed()
+                    {
+                        continue;
+                    }
                     PieceStore::shared_put_chunk_with_header(
                         store,
                         piece,
@@ -2729,7 +2832,9 @@ async fn follow_peer_pool(
                 for addr in ranked {
                     candidates.learn(addr, CandidateKind::Pex);
                 }
-                if peers.len() < live_recovery.max_active_upstreams {
+                if peers.len() < live_recovery.max_active_upstreams
+                    || continuity.startup_deadline.is_some()
+                {
                     spawn_learned_connects(
                         candidates,
                         &peers,
@@ -2748,7 +2853,9 @@ async fn follow_peer_pool(
                 if let Some(source) = ace_wire::peer_exchange::parse_peer_announce(payload) {
                     candidates.learn(source, CandidateKind::Source);
                     crate::alog!("[ace] source-node announce from {addr}: retained {source}");
-                    if peers.len() < live_recovery.max_active_upstreams {
+                    if peers.len() < live_recovery.max_active_upstreams
+                        || continuity.startup_deadline.is_some()
+                    {
                         spawn_learned_connects(
                             candidates,
                             &peers,
@@ -2896,7 +3003,16 @@ async fn harvest_stale_gossip(
     identity: &Identity,
     candidates: &mut SessionCandidates,
 ) {
-    let deadline = tokio::time::Instant::now() + STALE_GOSSIP_BUDGET;
+    harvest_stale_gossip_with_budget(upstreams, identity, candidates, STALE_GOSSIP_BUDGET).await;
+}
+
+async fn harvest_stale_gossip_with_budget(
+    upstreams: Vec<ConnectedUpstream>,
+    identity: &Identity,
+    candidates: &mut SessionCandidates,
+    budget: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + budget;
     let mut tasks = tokio::task::JoinSet::new();
     for mut upstream in upstreams {
         let hs = OutgoingExtendedHandshake {
@@ -2954,6 +3070,10 @@ async fn advance_pool_requests(
     continuity: &mut Continuity,
     chunks_per_piece: u16,
 ) -> Vec<SocketAddrV4> {
+    continuity.skip_far_behind_live(Instant::now());
+    if continuity.startup_deadline.is_some() {
+        return Vec::new();
+    }
     let assignments = schedule_piece_assignments(
         &mut continuity.scheduler,
         &mut continuity.active_peers,
@@ -3393,7 +3513,7 @@ async fn follow_one_peer(
 /// the new head; otherwise `None`. The single place window recognition feeds the loop.
 fn advance_head_from_window(payload: &[u8], head: u64) -> Option<u64> {
     let w = LiveWindow::from_myinfo_payload(payload)?;
-    (w.max_piece > head).then_some(w.max_piece)
+    (w.max_piece > head && w.max_piece <= u32::MAX as u64).then_some(w.max_piece)
 }
 
 fn stale_upstream_budget(
@@ -3474,10 +3594,15 @@ async fn read_peer_window(
             let yourip = eh.yourip();
             let mi = eh.raw.get(b"mi")?;
             let get = |k: &[u8]| mi.get(k).and_then(|v| v.as_int()).unwrap_or(-1);
+            let min_piece = get(b"min_piece");
+            let max_piece = get(b"max_piece");
+            if min_piece < 0 || max_piece < min_piece || max_piece > u32::MAX as i64 {
+                return None;
+            }
             return Some((
                 LivePosition {
-                    min_piece: get(b"min_piece"),
-                    max_piece: get(b"max_piece"),
+                    min_piece,
+                    max_piece,
                     position: get(b"position"),
                     distance_from_source: get(b"distance_from_source"),
                 },
@@ -4577,7 +4702,14 @@ mod tests {
         let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
         let (command_tx, command_rx) = mpsc::channel(4);
         let (event_tx, _event_rx) = mpsc::channel(4);
-        let worker = tokio::spawn(peer_worker(1, addr, session, command_rx, event_tx));
+        let worker = tokio::spawn(peer_worker(
+            1,
+            addr,
+            session,
+            command_rx,
+            event_tx,
+            Arc::new(AtomicU64::new(0)),
+        ));
 
         command_tx
             .send(PeerCommand::RequestPiece {
@@ -4605,7 +4737,14 @@ mod tests {
         let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
         let (command_tx, command_rx) = mpsc::channel(4);
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let worker = tokio::spawn(peer_worker(7, addr, session, command_rx, event_tx));
+        let worker = tokio::spawn(peer_worker(
+            7,
+            addr,
+            session,
+            command_rx,
+            event_tx,
+            Arc::new(AtomicU64::new(0)),
+        ));
 
         server
             .write_all(&PeerMessage::Unchoke.encode())
