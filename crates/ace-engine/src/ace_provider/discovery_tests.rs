@@ -1122,3 +1122,373 @@ async fn prepared_within_floor_peer_survives_productive_history_reset() {
 async fn prepared_newer_window_peer_survives_productive_history_reset() {
     prepared_peer_after_output_control(true).await;
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeCredit {
+    MixedPartial,
+    CompleteDuplicate,
+    SameProducer,
+}
+
+struct SignedResumePool {
+    info: StreamInfo,
+    seed: SeedConfig,
+    store: Arc<tokio::sync::Mutex<PieceStore>>,
+    continuity: Option<Continuity>,
+    candidates: SessionCandidates,
+}
+impl SignedResumePool {
+    async fn run(
+        &mut self,
+        addresses: Vec<SocketAddrV4>,
+        tx: &mpsc::Sender<LiveOutput>,
+    ) -> FollowEnd {
+        let mut upstreams = Vec::new();
+        for addr in addresses {
+            match connect_upstream(addr, self.info.infohash).await {
+                PeerConnectAttempt::Connected(upstream) => upstreams.push(upstream),
+                PeerConnectAttempt::Failed(_) => panic!("signed reconnect fixture must connect"),
+            }
+        }
+        follow_peer_pool_with_discovery(
+            upstreams,
+            &self.info,
+            &Identity::generate(),
+            self.info.chunks_per_piece(),
+            tx,
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU32::new(0)),
+            &self.seed,
+            &self.store,
+            &mut self.continuity,
+            vec![],
+            vec![],
+            completed_discovery(|_| async { Vec::new() }),
+            &mut self.candidates,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+            &mut None,
+        )
+        .await
+    }
+}
+
+async fn signed_resume_session(
+    stream: tokio::net::TcpStream,
+    pieces: Arc<Vec<Vec<u8>>>,
+    blocks: &[(u32, u16)],
+    initial: bool,
+    close: bool,
+    ready: Option<tokio::sync::oneshot::Receiver<()>>,
+) {
+    let mut session = PeerSession::new(stream);
+    session.accept_handshake([0; 20], |_| true).await.unwrap();
+    session
+        .send_extended_handshake(&OutgoingExtendedHandshake {
+            mi: Some(LivePosition {
+                min_piece: 7,
+                max_piece: 8,
+                position: -1,
+                distance_from_source: 0,
+            }),
+            ace_metadata_version: 1,
+            ut_metadata_id: 2,
+            node: NodeFields::default(),
+            peer_ip: None,
+            metadata_size: None,
+        })
+        .await
+        .unwrap();
+    session.send(&PeerMessage::Unchoke).await.unwrap();
+    while let Ok(message) = session.read_message().await {
+        if matches!(message, PeerMessage::Unknown { id: 6, .. }) {
+            break;
+        }
+    }
+    if initial {
+        // Preserve the actual one-second lone-window gate; send accepted chunks only afterward.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
+    if let Some(ready) = ready {
+        let _ = ready.await;
+    }
+    for &(piece, chunk) in blocks {
+        let signed = &pieces[(piece - 7) as usize];
+        let half = signed.len() / 2;
+        session
+            .send(&build_piece(
+                0,
+                piece,
+                chunk,
+                [0; 8],
+                &signed[chunk as usize * half..(chunk as usize + 1) * half],
+            ))
+            .await
+            .unwrap();
+    }
+    if close {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    } else {
+        while session.read_message().await.is_ok() {}
+    }
+}
+
+async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
+    let _guard = warm_peers::test_guard().await;
+    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+    let pieces = Arc::new(
+        [0xa7, 0xa8]
+            .into_iter()
+            .map(|marker| {
+                let mut bytes = media_piece(marker);
+                bytes.extend(auth.sign(&bytes));
+                bytes
+            })
+            .collect::<Vec<_>>(),
+    );
+    let descriptor = StreamInfo {
+        piece_length: pieces[0].len() as u64,
+        chunk_length: pieces[0].len() as u64 / 2,
+        sig_len: auth.signature_len(),
+        source_pubkey: auth.pubkey_der(),
+        ..info()
+    };
+    let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let c = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = |listener: &tokio::net::TcpListener| match listener.local_addr().unwrap() {
+        std::net::SocketAddr::V4(addr) => addr,
+        _ => unreachable!(),
+    };
+    let a_addr = address(&a);
+    let b_addr = address(&b);
+    let c_addr = address(&c);
+    let (permit_gap, gap_ready) = tokio::sync::oneshot::channel();
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn({
+        let pieces = pieces.clone();
+        async move {
+            let (stream, _) = a.accept().await.unwrap();
+            let blocks: &[(u32, u16)] = if mode == ResumeCredit::CompleteDuplicate {
+                &[(8, 0), (8, 1)]
+            } else {
+                &[(7, 0)]
+            };
+            signed_resume_session(stream, pieces.clone(), blocks, true, true, None).await;
+            if mode == ResumeCredit::SameProducer {
+                let (stream, _) = a.accept().await.unwrap();
+                signed_resume_session(stream, pieces, &[(7, 1)], false, false, None).await;
+            }
+        }
+    });
+    if mode != ResumeCredit::SameProducer {
+        servers.spawn({
+            let pieces = pieces.clone();
+            async move {
+                let (stream, _) = b.accept().await.unwrap();
+                let blocks: &[(u32, u16)] = if mode == ResumeCredit::CompleteDuplicate {
+                    &[(8, 0)]
+                } else {
+                    &[(7, 1)]
+                };
+                signed_resume_session(stream, pieces, blocks, false, false, None).await;
+            }
+        });
+    }
+    if mode == ResumeCredit::CompleteDuplicate {
+        servers.spawn({
+            let pieces = pieces.clone();
+            async move {
+                let (stream, _) = c.accept().await.unwrap();
+                signed_resume_session(
+                    stream,
+                    pieces,
+                    &[(7, 0), (7, 1)],
+                    false,
+                    false,
+                    Some(gap_ready),
+                )
+                .await;
+            }
+        });
+    } else {
+        drop(gap_ready);
+    }
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let cache_dir = std::env::temp_dir().join(format!(
+        "outpace-resume-credit-{}-{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    let make_provider = || {
+        AceProvider::new(Arc::new(Identity::generate()), 0)
+            .with_warm_cache_loopback_policy(cache_dir.clone())
+    };
+    let first = make_provider();
+    let seed = SeedConfig {
+        registry: SeedRegistry::new(),
+        store_bytes: 16384,
+        store_retention: None,
+        enabled: false,
+        prefetch_pieces: 1,
+        live_recovery: LiveRecoveryConfig {
+            max_active_upstreams: 2,
+            max_parallel_connect: 2,
+            ..LiveRecoveryConfig::default()
+        },
+        cache_type: CacheType::Memory,
+        cache_dir: PathBuf::new(),
+        warm_peers: first.warm_peers.clone(),
+    };
+    let mut fixture = SignedResumePool {
+        info: descriptor.clone(),
+        store: Arc::new(tokio::sync::Mutex::new(PieceStore::new(
+            descriptor.piece_length,
+            descriptor.chunk_length,
+            16384,
+        ))),
+        seed,
+        continuity: None,
+        candidates: SessionCandidates::default(),
+    };
+    fixture.candidates.learn(a_addr, CandidateKind::Source);
+    let (tx, mut output) = mpsc::channel(16);
+    let ended = tokio::time::timeout(Duration::from_secs(3), fixture.run(vec![a_addr], &tx))
+        .await
+        .unwrap();
+    assert!(
+        matches!(ended, FollowEnd::PeerLost(_)),
+        "first pool must actually tear down"
+    );
+    let retained_piece = if mode == ResumeCredit::CompleteDuplicate {
+        8
+    } else {
+        7
+    };
+    let continuity = fixture.continuity.as_mut().unwrap();
+    assert_eq!(
+        continuity.reasm.next_needed(),
+        7,
+        "reconnect must retain the earlier gap cursor"
+    );
+    assert_eq!(
+        continuity.piece_producers.get(&retained_piece),
+        Some(&Some(a_addr)),
+        "actual initial signed chunks must have reached reassembly"
+    );
+    assert!(
+        output.try_recv().is_err(),
+        "partial/ahead data must not emit before its gap closes"
+    );
+    let (observed, mut contributions) = mpsc::unbounded_channel();
+    continuity.contribution_observer = Some(observed);
+    let replacement = if mode == ResumeCredit::SameProducer {
+        a_addr
+    } else {
+        b_addr
+    };
+    fixture.candidates.learn(replacement, CandidateKind::Source);
+    let mut replacements = vec![replacement];
+    if mode == ResumeCredit::CompleteDuplicate {
+        fixture.candidates.learn(c_addr, CandidateKind::Pex);
+        replacements.push(c_addr);
+    }
+    let pool = tokio::spawn(async move {
+        let end = fixture.run(replacements, &tx).await;
+        (end, fixture)
+    });
+    if mode == ResumeCredit::CompleteDuplicate {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some((piece, addr)) = contributions.recv().await {
+                if piece == 8 && addr == b_addr {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // This signal comes from the actual handler after B's completed-piece no-op, not its server write.
+        permit_gap.send(()).unwrap();
+    } else {
+        drop(permit_gap);
+    }
+    let wanted = if mode == ResumeCredit::CompleteDuplicate {
+        0xa8
+    } else {
+        0xa7
+    };
+    let emitted = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(bytes) = output.recv().await {
+            if bytes.bytes.contains(&wanted) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    drop(output);
+    let (end, fixture) = tokio::time::timeout(Duration::from_secs(1), pool)
+        .await
+        .unwrap()
+        .unwrap();
+    while let Some(server) = tokio::time::timeout(Duration::from_secs(1), servers.join_next())
+        .await
+        .unwrap()
+    {
+        server.unwrap();
+    }
+    let cursor = fixture.continuity.as_ref().unwrap().reasm.next_needed();
+    assert!(first.warm_peers.flush().await);
+    drop(fixture);
+    drop(first);
+    assert!(
+        warm_peers::retired_terminal(&cache_dir).await,
+        "prior cache writer must actually terminate before reconstruction"
+    );
+    let fresh = make_provider();
+    fresh.warm_peers.initialized().await;
+    let hints = fresh.warm_peers.hints(&descriptor.infohash);
+    drop(fresh);
+    assert!(warm_peers::retired_terminal(&cache_dir).await);
+    std::fs::remove_dir_all(cache_dir).unwrap();
+    assert!(matches!(end, FollowEnd::ConsumerGone));
+    assert!(
+        matches!(emitted, Ok(true)),
+        "useful retained authenticated media was discarded or stranded"
+    );
+    assert!(
+        cursor > retained_piece,
+        "actual retained piece must become contiguous"
+    );
+    if mode == ResumeCredit::SameProducer {
+        assert!(
+            hints.contains(&(a_addr, CandidateKind::Source)),
+            "legitimate single-producer signed reconnect lost durable credit"
+        );
+    } else {
+        assert!(
+            !hints.iter().any(|(addr, _)| *addr == b_addr),
+            "replacement B acquired false durable source credit for retained bytes"
+        );
+    }
+    if mode == ResumeCredit::CompleteDuplicate {
+        assert!(
+            hints.contains(&(a_addr, CandidateKind::Source)),
+            "completed retained A provenance was lost to B's no-op"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_partial_signed_reconnect_does_not_credit_only_the_last_producer() {
+    retained_signed_resume_credit_control(ResumeCredit::MixedPartial).await;
+}
+#[tokio::test]
+async fn retained_complete_signed_reconnect_ignores_duplicate_producer_credit() {
+    retained_signed_resume_credit_control(ResumeCredit::CompleteDuplicate).await;
+}
+#[tokio::test]
+async fn retained_single_producer_signed_reconnect_preserves_media_and_durable_credit() {
+    retained_signed_resume_credit_control(ResumeCredit::SameProducer).await;
+}

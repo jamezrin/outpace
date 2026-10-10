@@ -13,14 +13,26 @@ responses publish unique values immediately. Bootstrap resolution and response w
 its total budget. Default discovery keeps its target of eight and 15-second DHT budget;
 background discovery uses an eight-second budget, below the default 12-second stale timeout.
 
-These deadlines bound the awaited asynchronous jobs, not operating-system DNS work. The locked
-Tokio resolver uses a blocking task for hostname resolution. Dropping or timing out its future
-cannot terminate an already-running OS resolver call or establish that it was joined. Four
-asynchronous tracker jobs therefore do not impose a four-call OS resolver limit: subsequent
-jobs can start while timed-out resolver calls remain active. The per-generation URL cap does
-not establish a cumulative resource bound across repeated sessions; DHT bootstrap resolution
-has the same limitation. Review must assess this residual ownership and queueing risk before
-claiming bounded resolver resources. Literal-address fixtures do not exercise an OS DNS stall.
+Tracker and DHT hostname resolution share one process-wide service with at most four dedicated
+native resolver workers and eight queued requests. A worker retains its physical capacity until
+its OS call returns, even after the caller times out or cancels. Queued cancellation removes the
+request; overload fails promptly without another queue, waiter or thread. Literal addresses
+bypass native resolution, preserving destination policy. Partial thread initialization retains
+only the successfully started workers and never replaces a stalled one. No successful workers
+means hostname resolution is unavailable while literals remain usable. Resolved results retain
+at most sixteen socket addresses.
+
+The process owner retains those fixed worker handles; stream cancellation and Tokio runtime
+shutdown do not wait on an OS resolver call. A genuinely stalled NSS call can occupy a worker
+indefinitely, reducing available resolution capacity. No hard cancellation or joined-shutdown
+guarantee is made for such a call. Unlike an async permit around Tokio lookup, this service bounds
+actual executing and queued work across repeated discovery sessions. Other hostname users
+outside tracker/DHT discovery are outside this facility's bound.
+
+Bootstrap completions enter one owning DHT frontier immediately, while other resolutions remain
+outstanding. Its original absolute deadline covers all seed queries and response windows. Later
+useful seeds are retained without restarting the walk; interrupted response rounds preserve
+correlation and completed rounds retain their original exhaustion and timeout accounting.
 
 The combined discovery feed retains at most 1024 unique peers. Reaching that cap or losing the
 consumer cancels its remaining source futures. Normal source completion drains its buffered
@@ -62,8 +74,10 @@ endpoints and must never be committed or included in public reports.
 Credit requires a complete authenticated contiguous piece from one actual producer and usable
 media output. The session retains that producer's provenance, including an id36-learned source.
 Mixed-producer pieces, unsigned output, invalid signatures, incomplete pieces, announcements
-and stale chunks do not earn credit. Attribution is bounded by the reassembly window and
-cleared on rejection, skip and reconnect. Hints never populate the verified-descriptor index or
+and stale chunks do not earn credit. Attribution follows the buffered reassembly lifetime,
+including partial and completed ahead pieces retained through reconnect. Actually written
+blocks update it; completed-piece duplicate no-ops cannot establish another producer's credit.
+Attribution is bounded by the reassembly window and pruned on rejection, actual skip and emission. Hints never populate the verified-descriptor index or
 confirm a current live head; fresh peer validation and the original descriptor remain required.
 
 Hints expire after 300 seconds. Retention is bounded to 256 swarms, 16 peers per swarm, eight
@@ -76,7 +90,8 @@ One coalesced writer owns each normalized cache path across provider handles. Lo
 on that worker alongside already started fresh discovery, with at most 100 ms of startup wait.
 New productive records merge with loaded records without replacing newer progress. Streaming
 changes only bounded memory and signals the writer; snapshots normally coalesce over five
-seconds. Session shutdown requests a flush without blocking stream cancellation. Private files
+seconds. Clean writers wait without a timer until notification; dirty/retry work retains its
+coalescing deadline and explicit flush/stop wakes it. Session shutdown requests a flush without blocking stream cancellation. Private files
 must be owned regular single-link files with mode 0600. Directory descriptors, nofollow and
 nonblocking opens, inode validation, private temporary files and atomic replacement avoid
 symlink, FIFO and path-replacement hazards. A directory inode lock excludes alias writers.

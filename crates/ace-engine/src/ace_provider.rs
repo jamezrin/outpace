@@ -1905,6 +1905,8 @@ struct Continuity {
     received_chunks: BTreeMap<u64, HashSet<u16>>,
     /// None marks mixed producers; entries share the bounded reassembly accept window.
     piece_producers: BTreeMap<u64, Option<SocketAddrV4>>,
+    #[cfg(test)]
+    contribution_observer: Option<mpsc::UnboundedSender<(u64, SocketAddrV4)>>,
     /// When each still-outstanding piece was (re-)requested — drives per-piece retransmission
     /// independent of the whole-pool stale timer.
     requested_at: HashMap<u64, Instant>,
@@ -1967,6 +1969,8 @@ impl Continuity {
                 active_peers: ActivePeers::new(),
                 received_chunks: BTreeMap::new(),
                 piece_producers: BTreeMap::new(),
+                #[cfg(test)]
+                contribution_observer: None,
                 requested_at: HashMap::new(),
                 next_needed_since: Instant::now(),
                 head: max_piece,
@@ -1992,7 +1996,7 @@ impl Continuity {
         self.scheduler.clear_in_flight();
         self.active_peers = ActivePeers::new();
         self.received_chunks.clear();
-        self.piece_producers.clear();
+        // Retained partial and authenticated ahead pieces keep their producer evidence.
         self.requested_at.clear();
         self.next_needed_since = Instant::now();
         let next = self.reasm.next_needed();
@@ -2005,6 +2009,7 @@ impl Continuity {
             self.reasm.skip_to(resume);
             self.arm_output_gate();
         }
+        self.piece_producers.retain(|&piece, _| piece >= resume);
         resume
     }
 
@@ -2931,28 +2936,43 @@ async fn follow_peer_pool_with_discovery(
                     )
                     .await;
                     let begin = lc.chunk as u64 * info.chunk_length;
-                    if let Err(e) = continuity.reasm.add_block(lc.piece as u64, begin, &lc.data) {
-                        // A malformed block, or a completed piece whose live-source signature
-                        // didn't verify (#10): drop it rather than emit unauthenticated bytes.
-                        // The piece stays incomplete, so it's re-requested from the pool.
-                        crate::alog!("[ace] {addr}: dropped piece {piece} block: {e:?}");
-                        continuity.release_rejected_piece(piece);
-                        let newly_lost =
-                            advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                        record_pool_losses(candidates, &mut loss_count, newly_lost);
-                        continue;
+                    let contribution = match continuity
+                        .reasm
+                        .add_block_with_contribution(piece, begin, &lc.data)
+                    {
+                        Ok(contribution) => contribution,
+                        Err(e) => {
+                            // A malformed block, or a completed piece whose live-source signature
+                            // didn't verify (#10): drop it rather than emit unauthenticated bytes.
+                            // The piece stays incomplete, so it's re-requested from the pool.
+                            crate::alog!("[ace] {addr}: dropped piece {piece} block: {e:?}");
+                            continuity.release_rejected_piece(piece);
+                            let newly_lost =
+                                advance_pool_requests(&mut peers, continuity, chunks_per_piece)
+                                    .await;
+                            record_pool_losses(candidates, &mut loss_count, newly_lost);
+                            continue;
+                        }
+                    };
+                    if contribution {
+                        continuity
+                            .piece_producers
+                            .entry(piece)
+                            .and_modify(|producer| {
+                                if *producer != Some(addr) {
+                                    *producer = None;
+                                }
+                            })
+                            .or_insert(Some(addr));
                     }
-                    continuity
-                        .piece_producers
-                        .entry(piece)
-                        .and_modify(|producer| {
-                            if *producer != Some(addr) {
-                                *producer = None;
-                            }
-                        })
-                        .or_insert(Some(addr));
+                    // Request receipt/activity accounting is independent of durable byte
+                    // provenance; retain its existing behavior for completed-piece no-ops.
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
                     made_activity = true;
+                    #[cfg(test)]
+                    if let Some(observer) = &continuity.contribution_observer {
+                        let _ = observer.send((piece, addr));
+                    }
                     let before = continuity.reasm.next_needed();
                     let ready = continuity.reasm.take_ready();
                     let after = continuity.reasm.next_needed();

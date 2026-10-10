@@ -28,7 +28,21 @@ struct State {
     flush: bool,
     stop: bool,
 }
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum WriterObservation {
+    Wait {
+        timed: bool,
+        dirty: bool,
+        delay: Duration,
+    },
+    Write {
+        success: bool,
+    },
+}
 struct Shared {
+    #[cfg(test)]
+    observations: Mutex<Option<std::sync::mpsc::SyncSender<WriterObservation>>>,
     state: Mutex<State>,
     wake: Condvar,
     changed: tokio::sync::Notify,
@@ -146,6 +160,8 @@ impl WarmPeerCache {
         #[cfg(test)] pause: Option<Arc<(Mutex<bool>, Condvar)>>,
     ) -> Self {
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            observations: Mutex::new(None),
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             changed: tokio::sync::Notify::new(),
@@ -453,6 +469,12 @@ fn parse(bytes: &[u8], allow_loopback: bool) -> io::Result<BTreeMap<[u8; 20], Ve
     }
     Ok(entries)
 }
+#[cfg(test)]
+fn observe_writer(shared: &Shared, event: WriterObservation) {
+    if let Some(observer) = &*shared.observations.lock().unwrap() {
+        let _ = observer.try_send(event);
+    }
+}
 fn worker(shared: Arc<Shared>, path: PathBuf) {
     let directory = secure::Directory::open(&path);
     let loaded = directory
@@ -478,14 +500,33 @@ fn worker(shared: Arc<Shared>, path: PathBuf) {
     loop {
         let (snapshot, revision, stop) = {
             let mut state = shared.state.lock().unwrap();
-            while !state.stop
-                && (state.revision == state.persisted
-                    || (!state.flush && last_write.elapsed() < Duration::from_secs(5)))
-            {
-                let delay = Duration::from_secs(5)
-                    .saturating_sub(last_write.elapsed())
-                    .max(Duration::from_millis(10));
-                state = shared.wake.wait_timeout(state, delay).unwrap().0;
+            while !state.stop {
+                if state.revision == state.persisted {
+                    #[cfg(test)]
+                    observe_writer(
+                        &shared,
+                        WriterObservation::Wait {
+                            timed: false,
+                            dirty: false,
+                            delay: Duration::ZERO,
+                        },
+                    );
+                    state = shared.wake.wait(state).unwrap();
+                } else if !state.flush && last_write.elapsed() < Duration::from_secs(5) {
+                    let delay = Duration::from_secs(5).saturating_sub(last_write.elapsed());
+                    #[cfg(test)]
+                    observe_writer(
+                        &shared,
+                        WriterObservation::Wait {
+                            timed: true,
+                            dirty: true,
+                            delay,
+                        },
+                    );
+                    state = shared.wake.wait_timeout(state, delay).unwrap().0;
+                } else {
+                    break;
+                }
             }
             prune(&mut state.entries, now());
             state.flush = false;
@@ -495,6 +536,8 @@ fn worker(shared: Arc<Shared>, path: PathBuf) {
             .as_ref()
             .is_ok_and(|directory| directory.write(&snapshot).is_ok());
         last_write = Instant::now();
+        #[cfg(test)]
+        observe_writer(&shared, WriterObservation::Write { success });
         if success {
             shared.state.lock().unwrap().persisted = revision;
             shared.changed.notify_waiters();
@@ -510,6 +553,15 @@ fn worker(shared: Arc<Shared>, path: PathBuf) {
             // Failed writes retry only after coalescing interval, never a hot spin.
             let state = shared.state.lock().unwrap();
             if !state.stop {
+                #[cfg(test)]
+                observe_writer(
+                    &shared,
+                    WriterObservation::Wait {
+                        timed: true,
+                        dirty: true,
+                        delay: Duration::from_secs(5),
+                    },
+                );
                 let _ = shared.wake.wait_timeout(state, Duration::from_secs(5));
             }
         }
@@ -740,6 +792,106 @@ pub(super) async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    async fn writer_observation(
+        receiver: &std::sync::mpsc::Receiver<WriterObservation>,
+    ) -> WriterObservation {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(event) = receiver.try_recv() {
+                    return event;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned writer must reach the observed state")
+    }
+    fn observed_cache(
+        path: &Path,
+    ) -> (WarmPeerCache, std::sync::mpsc::Receiver<WriterObservation>) {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let cache = WarmPeerCache::new_inner(path, true, Some(gate.clone()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(16);
+        *cache.0.shared.observations.lock().unwrap() = Some(sender);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        (cache, receiver)
+    }
+    #[tokio::test]
+    async fn idle_writer_uses_untimed_wait_and_dirty_flush_stop_wake_it() {
+        let _guard = test_guard().await;
+        let path = temp();
+        let (cache, events) = observed_cache(&path);
+        cache.initialized().await;
+        let idle = writer_observation(&events).await;
+        cache.record_productive([0; 20], peer(34561), CandidateKind::Source);
+        assert!(
+            cache.flush().await,
+            "dirty notification/flush must persist actual revision"
+        );
+        cache.record_productive([0; 20], peer(34562), CandidateKind::Discovered);
+        assert!(
+            cache.flush().await,
+            "a new revision must wake the idle owner again"
+        );
+        drop(cache);
+        assert!(
+            retired_terminal(&path).await,
+            "stop must wake and join the owned writer"
+        );
+        let entries = parse(&std::fs::read(path.join(FILE)).unwrap(), true).unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+        assert_eq!(entries[&[0; 20]].len(), 2);
+        assert!(
+            matches!(
+                idle,
+                WriterObservation::Wait {
+                    timed: false,
+                    dirty: false,
+                    ..
+                }
+            ),
+            "clean writer entered timed polling instead of notification wait: {idle:?}"
+        );
+    }
+    #[tokio::test]
+    async fn dirty_writer_retry_delay_survives_notification_and_flush_stop() {
+        let _guard = test_guard().await;
+        let path = temp();
+        std::fs::create_dir_all(path.join(FILE)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (cache, events) = observed_cache(&path);
+        cache.initialized().await;
+        let _ = writer_observation(&events).await;
+        cache.record_productive([0; 20], peer(34563), CandidateKind::Source);
+        loop {
+            if matches!(
+                writer_observation(&events).await,
+                WriterObservation::Write { success: false }
+            ) {
+                break;
+            }
+        }
+        let retry = writer_observation(&events).await;
+        cache.record_productive([0; 20], peer(34564), CandidateKind::Discovered);
+        let dirty_wait = writer_observation(&events).await;
+        std::fs::remove_dir(path.join(FILE)).unwrap();
+        assert!(
+            cache.flush().await,
+            "explicit flush must wake retry and persist both revisions"
+        );
+        drop(cache);
+        assert!(retired_terminal(&path).await);
+        let entries = parse(&std::fs::read(path.join(FILE)).unwrap(), true).unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+        assert_eq!(entries[&[0; 20]].len(), 2);
+        for wait in [retry, dirty_wait] {
+            assert!(
+                matches!(wait,WriterObservation::Wait{timed:true,dirty:true,delay} if delay>Duration::ZERO && delay<=Duration::from_secs(5)),
+                "dirty retry lost its coalescing interval: {wait:?}"
+            );
+        }
+    }
     fn temp() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(

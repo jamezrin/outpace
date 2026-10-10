@@ -5,13 +5,13 @@
 //! multi-second live network call into this module's fast, offline-testable functions.
 
 use crate::dht::{dht_get_peers_incremental, dht_get_peers_with_target};
+use crate::resolver::Resolver;
 use ace_tracker::client::announce;
 use ace_tracker::codec::{AnnounceEvent, TransferState};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddrV4;
 use std::time::Duration;
-use tokio::net::lookup_host;
 
 const DISCOVERY_PEER_TARGET: usize = 8;
 const TRACKER_PARALLELISM: usize = 4;
@@ -83,6 +83,14 @@ pub async fn resolve_trackers_with_policy(
     trackers: &[String],
     policy: TrackerPolicy,
 ) -> Vec<SocketAddrV4> {
+    resolve_trackers_with_resolver(trackers, policy, &Resolver::global()).await
+}
+
+pub(crate) async fn resolve_trackers_with_resolver(
+    trackers: &[String],
+    policy: TrackerPolicy,
+    resolver: &Resolver,
+) -> Vec<SocketAddrV4> {
     let mut out = Vec::new();
     for t in trackers.iter().take(MAX_TRACKERS) {
         if t.len() > MAX_TRACKER_URL_LEN {
@@ -96,7 +104,7 @@ pub async fn resolve_trackers_with_policy(
         if hostport.is_empty() {
             continue;
         }
-        if let Ok(addrs) = lookup_host(hostport).await {
+        if let Ok(addrs) = resolver.lookup(hostport).await {
             for a in addrs {
                 if let std::net::SocketAddr::V4(v4) = a {
                     if policy.allow_non_global || !is_non_global_v4(v4.ip()) {
