@@ -13,6 +13,15 @@ responses publish unique values immediately. Bootstrap resolution and response w
 its total budget. Default discovery keeps its target of eight and 15-second DHT budget;
 background discovery uses an eight-second budget, below the default 12-second stale timeout.
 
+These deadlines bound the awaited asynchronous jobs, not operating-system DNS work. The locked
+Tokio resolver uses a blocking task for hostname resolution. Dropping or timing out its future
+cannot terminate an already-running OS resolver call or establish that it was joined. Four
+asynchronous tracker jobs therefore do not impose a four-call OS resolver limit: subsequent
+jobs can start while timed-out resolver calls remain active. The per-generation URL cap does
+not establish a cumulative resource bound across repeated sessions; DHT bootstrap resolution
+has the same limitation. Review must assess this residual ownership and queueing risk before
+claiming bounded resolver resources. Literal-address fixtures do not exercise an OS DNS stall.
+
 The combined discovery feed retains at most 1024 unique peers. Reaching that cap or losing the
 consumer cancels its remaining source futures. Normal source completion drains its buffered
 final candidates. Reaching one source's target does not cancel the other incremental source.
