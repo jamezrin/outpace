@@ -37,6 +37,11 @@ ids distinguish the new session at the same endpoint; queued blocks and loss eve
 workers cannot affect its progress or ownership. A window behind the head remains usable when
 it covers the cursor; productive-history reset does not discard such prepared peers.
 
+An id=4 announcement advances its own peer window independently of the shared head. A faster
+gossip peer cannot suppress another producer announcing the same or a lower head. The shared
+head remains monotonic; request scheduling wakes only when that peer window or the shared head
+actually grows. Cursor, prefetch and per-chunk floors still constrain usable media.
+
 ## Durable productive-peer hints
 
 A nonempty configured cache directory stores private productive-peer hints in `recent-peers-v1`,

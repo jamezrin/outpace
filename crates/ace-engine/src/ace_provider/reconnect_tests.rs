@@ -1680,3 +1680,184 @@ async fn discovered_refill_reports_completed_transport_failure() {
         "announcement reset completed opportunity"
     );
 }
+
+// Real pool/worker control for per-peer id=4 updates behind another peer's shared head.
+async fn retained_producer_window_control(producer_first: bool, head_only_max: u32) {
+    let mut upstreams = Vec::new();
+    let mut servers = tokio::task::JoinSet::new();
+    let mut commands = Vec::new();
+    let mut requested = Vec::new();
+    let mut requests = Vec::new();
+    for healthy in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        upstreams.push(ConnectedUpstream {
+            session: PeerSession::new(client),
+            addr,
+            window: live_pos(7, 8),
+            yourip: None,
+        });
+        let (command, mut control) = mpsc::channel::<()>(1);
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        requests.push(seen.clone());
+        commands.push(command);
+        requested.push(Some(request_rx));
+        servers.spawn(async move {
+            let mut session = PeerSession::new(stream);
+            let mut request_tx = Some(request_tx);
+            loop {
+                tokio::select! {
+                    command = control.recv() => {
+                        if command.is_none() { break; }
+                        let mut payload = vec![0; 8];
+                        payload[4..].copy_from_slice(&(if healthy { 10 } else { head_only_max }).to_be_bytes());
+                        session.send(&PeerMessage::Unknown { id: 4, payload }).await.unwrap();
+                        if !healthy {
+                            session.send(&PeerMessage::Unchoke).await.unwrap();
+                        }
+                    }
+                    message = session.read_message() => {
+                        let Ok(message) = message else { break; };
+                        if healthy && matches!(message, PeerMessage::Interested) {
+                            session.send(&PeerMessage::Unchoke).await.unwrap();
+                        }
+                        if let PeerMessage::Unknown { id: 6, payload } = message {
+                            let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                            seen.lock().unwrap().push(piece);
+                            if piece == 9 {
+                                if let Some(sender) = request_tx.take() {
+                                    let _ = sender.send(());
+                                }
+                                if !healthy {
+                                    // Head-only peer makes the ordering observable, then stops
+                                    // owning new requests. Its old reservation expires normally.
+                                    session.send(&PeerMessage::Choke).await.unwrap();
+                                }
+                            }
+                            if healthy {
+                                let marker = if piece <= 8 { 0x44 } else { 0x66 };
+                                let media: Vec<_> = (0..4).flat_map(|cc| {
+                                    let mut packet = vec![marker; 188];
+                                    packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | cc]);
+                                    packet
+                                }).collect();
+                                if session.send(&build_piece(0, piece, 0, [0; 8], &media)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let (info, mut seed) = cancellation_fixture();
+    seed.prefetch_pieces = u64::from(head_only_max - 9);
+    seed.live_recovery.max_active_upstreams = 2;
+    let (tx, mut rx) = mpsc::channel(16);
+    let addresses: Vec<_> = upstreams.iter().map(|peer| peer.addr).collect();
+    let pool = tokio::spawn(async move {
+        let mut candidates = SessionCandidates::default();
+        candidates.learn(addresses[0], CandidateKind::Pex);
+        candidates.learn(addresses[1], CandidateKind::Source);
+        let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(752, 752, 4096)));
+        let mut continuity = None;
+        let end = follow_peer_pool(
+            upstreams,
+            &info,
+            &Identity::generate(),
+            1,
+            &tx,
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU32::new(0)),
+            &seed,
+            &store,
+            &mut continuity,
+            vec![],
+            addresses,
+            completed_discovery(|_| Box::pin(async { panic!("no discovery required") })),
+            &mut candidates,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .await;
+        let continuity = continuity.unwrap();
+        (end, continuity.head, continuity.reasm.next_needed())
+    });
+    // Require both original pieces through the actual media path before advancing either head.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut bytes = 0;
+        while bytes < 7 * 188 {
+            let output = rx.recv().await.unwrap();
+            assert!(output.bytes.contains(&0x44));
+            bytes += output.bytes.len();
+        }
+    })
+    .await
+    .expect("healthy initial producer fixture");
+    let first = if producer_first { 0 } else { 1 };
+    commands[first].send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), requested[first].take().unwrap())
+        .await
+        .expect("first id=4 must actually schedule piece9")
+        .unwrap();
+    commands[1 - first].send(()).await.unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(output) = rx.recv().await {
+            if output.bytes.contains(&0x66) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    drop(rx);
+    let (end, head, cursor) = tokio::time::timeout(Duration::from_secs(1), pool)
+        .await
+        .unwrap()
+        .unwrap();
+    while let Some(server) = tokio::time::timeout(Duration::from_secs(1), servers.join_next())
+        .await
+        .unwrap()
+    {
+        server.unwrap();
+    }
+    assert!(matches!(end, FollowEnd::ConsumerGone));
+    assert_eq!(
+        head,
+        u64::from(head_only_max),
+        "shared head must stay monotonic"
+    );
+    assert!(
+        cursor > 9,
+        "new producer media must advance the actual cursor"
+    );
+    eprintln!("window control: producer_first={producer_first} head={head} cursor={cursor} healthy_requests={:?} head_only_requests={:?}",
+        requests[0].lock().unwrap(), requests[1].lock().unwrap());
+    assert!(
+        matches!(output, Ok(true)),
+        "retained healthy producer's same-head id=4 must extend its request window"
+    );
+}
+
+#[tokio::test]
+async fn retained_producer_same_head_window_update_supplies_media() {
+    retained_producer_window_control(false, 10).await;
+}
+
+#[tokio::test]
+async fn retained_producer_first_window_update_positive_control() {
+    retained_producer_window_control(true, 10).await;
+}
+
+#[tokio::test]
+async fn retained_producer_lower_than_shared_head_window_update_supplies_media() {
+    // Shared head11/cursor9; producer head10 remains usable inside prefetch2.
+    retained_producer_window_control(false, 11).await;
+}

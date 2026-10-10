@@ -3069,8 +3069,13 @@ async fn follow_peer_pool_with_discovery(
             PeerMessage::Unknown { id: 4, ref payload } if payload.len() == 8 => {
                 let piece =
                     u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as u64;
-                if piece > continuity.head {
-                    continuity.head = piece;
+                let window_advanced = peers
+                    .get(&peer_id)
+                    .is_some_and(|peer| piece > peer.max_piece);
+                if piece > continuity.head || window_advanced {
+                    // Another upstream can advertise the shared head first. Its gossip
+                    // must not suppress this producer's independently advancing window.
+                    continuity.head = continuity.head.max(piece);
                     update_runtime_window(&mut peers, continuity, peer_id, piece);
                     made_activity = true;
                     let newly_lost =
