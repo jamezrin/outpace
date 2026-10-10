@@ -23,6 +23,7 @@ pub mod live;
 pub mod portmap;
 pub mod reachability;
 pub mod resolve;
+mod resolver;
 pub mod scheduler;
 pub mod seed;
 pub mod store;

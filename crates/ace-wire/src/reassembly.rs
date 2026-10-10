@@ -105,8 +105,22 @@ impl PieceReassembler {
     /// far-future index that would otherwise pin a `piece_length` buffer — issue #13).
     /// Assumes non-overlapping blocks that together cover `[0, piece_length)`.
     pub fn add_block(&mut self, index: u64, begin: u64, block: &[u8]) -> Result<()> {
+        self.add_block_with_contribution(index, begin, block)
+            .map(|_| ())
+    }
+
+    /// Like [`Self::add_block`], also report whether nonempty bytes were written into a
+    /// partial piece. Completed/stale submissions are no-ops, even when their blocks are
+    /// malformed. A repeated partial offset still overwrites bytes and is a contribution.
+    /// Callers tracking producer provenance must not credit completed-piece duplicates.
+    pub fn add_block_with_contribution(
+        &mut self,
+        index: u64,
+        begin: u64,
+        block: &[u8],
+    ) -> Result<bool> {
         if index < self.next_emit || self.complete.contains_key(&index) {
-            return Ok(()); // stale or already complete
+            return Ok(false); // stale or already complete
         }
         if index >= self.next_emit.saturating_add(self.max_ahead) {
             // Outside the accept window: reject before allocating a piece buffer. The caller
@@ -155,7 +169,7 @@ impl PieceReassembler {
             }
             self.complete.insert(index, done.buf);
         }
-        Ok(())
+        Ok(!block.is_empty())
     }
 
     /// Discard only incomplete bytes for a rejected piece before requesting it again.
@@ -200,6 +214,19 @@ impl PieceReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contribution_reports_partial_writes_and_preserves_completed_no_ops() {
+        let mut r = PieceReassembler::new(4, 7);
+        assert!(r.add_block_with_contribution(8, 0, &[1, 2]).unwrap());
+        assert!(r.add_block_with_contribution(8, 0, &[3, 4]).unwrap());
+        assert!(r.add_block_with_contribution(8, 2, &[5, 6]).unwrap());
+        assert!(!r.add_block_with_contribution(8, u64::MAX, &[9]).unwrap());
+        assert!(r.take_ready().is_empty());
+        r.add_block(7, 0, &[7, 7, 7, 7]).unwrap();
+        assert_eq!(r.take_ready(), vec![7, 7, 7, 7, 3, 4, 5, 6]);
+        assert!(!r.add_block_with_contribution(8, 0, &[9, 9]).unwrap());
+    }
 
     #[test]
     fn discarding_partial_preserves_cursor_other_partials_and_completed_pieces() {

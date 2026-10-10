@@ -42,6 +42,7 @@ fn fixture(max_active: usize) -> (StreamInfo, SeedConfig) {
             },
             cache_type: CacheType::Memory,
             cache_dir: PathBuf::new(),
+            warm_peers: WarmPeerCache::memory(),
         },
     )
 }
@@ -144,7 +145,7 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
             &mut None,
             vec![],
             vec![relay_addr],
-            Arc::new(|_| Box::pin(async { vec![] })),
+            completed_discovery(|_| Box::pin(async { vec![] })),
             &mut candidates,
             &pool_count,
             None,
@@ -206,6 +207,7 @@ async fn known_live_floor_prunes_buffered_and_inflight_stale_pieces_before_reque
             min_piece: 7,
             max_piece: 10,
             unchoked_peer: false,
+            produced_output: false,
             seen_ids: HashSet::new(),
             commands,
             worker,
@@ -377,7 +379,7 @@ async fn single_peer_with_hint_or_head(
             &mut None,
             vec![],
             vec![addr],
-            Arc::new(|_| Box::pin(async { vec![] })),
+            completed_discovery(|_| Box::pin(async { vec![] })),
             &mut SessionCandidates::default(),
             &Arc::new(AtomicU32::new(0)),
             None,

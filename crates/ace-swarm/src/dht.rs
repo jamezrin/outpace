@@ -6,6 +6,7 @@
 //! bootstraps off the well-known routers, walks closer to the target collecting `nodes`,
 //! and harvests any `values` (peers) it's handed along the way.
 
+use crate::resolver::Resolver;
 use ace_wire::bencode::Bencode;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -203,23 +204,58 @@ async fn dht_walk(
     sock: &UdpSocket,
     on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
 ) -> DhtWalkMetrics {
-    // Frontier of candidate nodes keyed by XOR distance; seed with bootstrap routers.
-    let mut frontier: BTreeMap<[u8; 20], SocketAddrV4> = BTreeMap::new();
-    for (i, host) in BOOTSTRAP.iter().enumerate() {
-        if let Ok(addrs) = tokio::net::lookup_host(host).await {
-            for a in addrs {
-                if let SocketAddr::V4(v4) = a {
-                    // Bootstrap ids unknown; use distinct max-distance keys so real nodes
-                    // outrank them AND the bootstraps don't collide on one map key.
-                    let mut key = [0xffu8; 20];
-                    key[19] = i as u8;
-                    frontier.insert(key, v4);
-                    break;
-                }
-            }
-        }
+    dht_walk_with_bootstraps(
+        infohash,
+        budget,
+        sock,
+        BOOTSTRAP,
+        Resolver::global(),
+        on_response,
+    )
+    .await
+}
+
+async fn dht_walk_with_bootstraps(
+    infohash: &[u8; 20],
+    budget: Duration,
+    sock: &UdpSocket,
+    bootstraps: &[&str],
+    resolver: Resolver,
+    on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
+) -> DhtWalkMetrics {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut lookups = tokio::task::JoinSet::new();
+    for (i, host) in bootstraps.iter().take(BOOTSTRAP.len()).enumerate() {
+        let resolver = resolver.clone();
+        let host = host.to_string();
+        lookups.spawn(async move { (i, resolve_bootstrap(host, resolver, deadline).await) });
     }
-    dht_walk_frontier(infohash, budget, sock, frontier, on_response).await
+    dht_walk_owned(
+        infohash,
+        deadline.into_std(),
+        sock,
+        BTreeMap::new(),
+        lookups,
+        on_response,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_bootstrap(
+    host: String,
+    resolver: Resolver,
+    deadline: tokio::time::Instant,
+) -> Option<SocketAddrV4> {
+    tokio::time::timeout_at(deadline, resolver.lookup(&host))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|addresses| {
+            addresses.into_iter().find_map(|addr| match addr {
+                SocketAddr::V4(v4) => Some(v4),
+                _ => None,
+            })
+        })
 }
 
 #[cfg(test)]
@@ -239,11 +275,47 @@ async fn dht_walk_from_seeds(
     dht_walk_frontier(infohash, budget, sock, frontier, on_response).await
 }
 
+#[cfg(test)]
 async fn dht_walk_frontier(
     infohash: &[u8; 20],
     budget: Duration,
     sock: &UdpSocket,
+    frontier: BTreeMap<[u8; 20], SocketAddrV4>,
+    on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
+) -> DhtWalkMetrics {
+    dht_walk_owned(
+        infohash,
+        Instant::now() + budget,
+        sock,
+        frontier,
+        tokio::task::JoinSet::new(),
+        on_response,
+    )
+    .await
+}
+
+fn add_bootstrap(
+    result: Result<(usize, Option<SocketAddrV4>), tokio::task::JoinError>,
+    frontier: &mut BTreeMap<[u8; 20], SocketAddrV4>,
+    metrics: &mut DhtWalkMetrics,
+) {
+    if let Ok((i, Some(addr))) = result {
+        let mut key = [0xff; 20];
+        key[19] = i as u8;
+        frontier.insert(key, addr);
+        metrics.bootstrap_seeded += 1;
+        while frontier.len() > 64 {
+            let key = *frontier.keys().next_back().unwrap();
+            frontier.remove(&key);
+        }
+    }
+}
+async fn dht_walk_owned(
+    infohash: &[u8; 20],
+    deadline: Instant,
+    sock: &UdpSocket,
     mut frontier: BTreeMap<[u8; 20], SocketAddrV4>,
+    mut lookups: tokio::task::JoinSet<(usize, Option<SocketAddrV4>)>,
     mut on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
 ) -> DhtWalkMetrics {
     let node_id: [u8; 20] = rand::random();
@@ -259,11 +331,16 @@ async fn dht_walk_frontier(
     let mut inflight: HashMap<(SocketAddrV4, Vec<u8>), Instant> = HashMap::new();
     // Monotonic per-walk counter → a distinct 2-byte transaction id for every outbound query.
     let mut next_txid: u16 = 0;
-    let deadline = Instant::now() + budget;
     let mut buf = [0u8; 2048];
+    // A bootstrap completion may interrupt a response round to send useful new queries.
+    // Retain that round when no new batch exists, rather than losing its pending replies.
+    let mut interrupted_window: Option<(Instant, bool, bool)> = None;
     crate::alog!("[dht] seeded {} bootstrap node(s)", frontier.len());
 
     'outer: while Instant::now() < deadline {
+        while let Some(result) = lookups.try_join_next() {
+            add_bootstrap(result, &mut frontier, &mut metrics);
+        }
         // Drop expired inflight entries so a stale (source, txid) can't be matched by a much
         // later packet — an unanswered query is abandoned, not left open for the whole walk.
         let now = Instant::now();
@@ -276,7 +353,21 @@ async fn dht_walk_frontier(
             .take(8)
             .copied()
             .collect();
-        if batch.is_empty() {
+        if batch.is_empty()
+            && !lookups.is_empty()
+            && inflight.is_empty()
+            && interrupted_window.is_none()
+        {
+            // Empty frontier is not exhaustion while a later bootstrap can still resolve.
+            tokio::select! {
+                result = lookups.join_next() => {
+                    if let Some(result) = result { add_bootstrap(result, &mut frontier, &mut metrics); }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break,
+            }
+            continue;
+        }
+        if batch.is_empty() && lookups.is_empty() && interrupted_window.is_none() {
             metrics.frontier_exhausted = true;
             crate::alog!("[dht] frontier exhausted: queried={}", queried.len());
             break;
@@ -286,7 +377,13 @@ async fn dht_walk_frontier(
             let txid = next_txid.to_be_bytes().to_vec();
             next_txid = next_txid.wrapping_add(1);
             let q = build_get_peers(&node_id, infohash, &txid);
-            if sock.send_to(&q, SocketAddr::V4(*addr)).await.is_ok() {
+            if tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                sock.send_to(&q, SocketAddr::V4(*addr)),
+            )
+            .await
+            .is_ok_and(|sent| sent.is_ok())
+            {
                 metrics.nodes_queried += 1;
                 inflight.insert((*addr, txid), Instant::now() + INFLIGHT_TTL);
             }
@@ -294,12 +391,34 @@ async fn dht_walk_frontier(
 
         // Collect responses for a short window. A round in which no datagram arrives at all is
         // a timeout; datagrams that arrive but are rejected are counted by their failure mode.
-        let mut received_any = false;
-        let window = Instant::now() + Duration::from_millis(1500);
+        let (window, mut received_any, count_round) = if batch.is_empty() {
+            interrupted_window.take().unwrap_or((
+                (Instant::now() + Duration::from_millis(1500)).min(deadline),
+                false,
+                false,
+            ))
+        } else {
+            interrupted_window.take();
+            (
+                (Instant::now() + Duration::from_millis(1500)).min(deadline),
+                false,
+                true,
+            )
+        };
         while Instant::now() < window {
-            let remaining = window.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
-                Ok(Ok((n, src))) => {
+            let received = tokio::select! {
+                result = lookups.join_next(), if !lookups.is_empty() => {
+                    if let Some(result) = result { add_bootstrap(result, &mut frontier, &mut metrics); }
+                    interrupted_window = Some((window, received_any, count_round));
+                    // Query the newly useful frontier immediately, keeping existing inflight
+                    // correlation and the original absolute deadline in this same walk.
+                    continue 'outer;
+                }
+                received = sock.recv_from(&mut buf) => received,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(window)) => break,
+            };
+            match received {
+                Ok((n, src)) => {
                     received_any = true;
                     // Bootstrap/frontier addresses are always v4 (see below), so a real reply
                     // is always from a v4 peer; skip (not break — keep collecting within the
@@ -341,7 +460,7 @@ async fn dht_walk_frontier(
                 _ => break,
             }
         }
-        if !received_any {
+        if count_round && !received_any {
             metrics.timeouts += 1;
         }
     }
@@ -373,37 +492,87 @@ pub async fn dht_get_peers_with_target(
     budget: Duration,
     peer_target: usize,
 ) -> Vec<SocketAddrV4> {
-    let sock = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    dht_get_peers_incremental(infohash, budget, peer_target, |_| true).await
+}
+
+/// Publish each unique peer immediately after its source/transaction correlation succeeds.
+/// Returning false from the observer cancels further harvesting. The complete set remains
+/// available to aggregate callers; at most 1024 addresses are retained per walk.
+pub async fn dht_get_peers_incremental(
+    infohash: &[u8; 20],
+    budget: Duration,
+    peer_target: usize,
+    mut on_peer: impl FnMut(SocketAddrV4) -> bool,
+) -> Vec<SocketAddrV4> {
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
+        return Vec::new();
     };
-    let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
-    dht_walk(infohash, budget, &sock, |_src, resp| {
-        peers.extend(resp.peers.iter().copied());
-        peers.len() >= peer_target
+    let mut peers = BTreeSet::new();
+    dht_walk(infohash, budget, &sock, |_src, response| {
+        collect_response_peers(response, &mut peers, peer_target, &mut on_peer)
     })
     .await;
     peers.into_iter().collect()
+}
+
+fn collect_response_peers(
+    response: &GetPeersResponse,
+    peers: &mut BTreeSet<SocketAddrV4>,
+    target: usize,
+    on_peer: &mut impl FnMut(SocketAddrV4) -> bool,
+) -> bool {
+    for &peer in &response.peers {
+        if peers.len() >= 1024 {
+            return true;
+        }
+        if peers.insert(peer) && !on_peer(peer) {
+            return true;
+        }
+    }
+    peers.len() >= target.max(1)
 }
 
 #[cfg(test)]
 async fn dht_get_peers_from_seeds(
     infohash: &[u8; 20],
     budget: Duration,
-    peer_target: usize,
+    target: usize,
     seeds: Vec<SocketAddrV4>,
 ) -> Vec<SocketAddrV4> {
-    let sock = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    dht_peers_from_seeds_with_observer(infohash, budget, target, seeds, |_| true).await
+}
+
+#[cfg(test)]
+async fn dht_peers_from_seeds_with_observer(
+    infohash: &[u8; 20],
+    budget: Duration,
+    target: usize,
+    seeds: Vec<SocketAddrV4>,
+    mut observer: impl FnMut(SocketAddrV4) -> bool,
+) -> Vec<SocketAddrV4> {
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
+        return Vec::new();
     };
-    let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
-    dht_walk_from_seeds(infohash, budget, &sock, seeds, |_src, resp| {
-        peers.extend(resp.peers.iter().copied());
-        peers.len() >= peer_target
+    let mut peers = BTreeSet::new();
+    dht_walk_from_seeds(infohash, budget, &socket, seeds, |_, response| {
+        collect_response_peers(response, &mut peers, target, &mut observer)
     })
     .await;
     peers.into_iter().collect()
+}
+
+#[cfg(test)]
+async fn dht_stream_from_seeds(
+    infohash: &[u8; 20],
+    budget: Duration,
+    target: usize,
+    seeds: Vec<SocketAddrV4>,
+    peers: tokio::sync::mpsc::Sender<SocketAddrV4>,
+) {
+    dht_peers_from_seeds_with_observer(infohash, budget, target, seeds, |peer| {
+        peers.try_send(peer).is_ok()
+    })
+    .await;
 }
 
 /// The DHT half of self-announcement (BEP-5's `announce_peer`), never previously
@@ -448,6 +617,167 @@ pub async fn dht_announce_peer(infohash: &[u8; 20], peer_port: u16, budget: Dura
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn bootstrap_resolution_control(slow: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = v4_addr(&responder);
+        let peer: SocketAddrV4 = "127.0.0.1:43210".parse().unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let slow_started = Arc::new(AtomicUsize::new(0));
+        let slow_finished = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::controlled({
+            let gate = gate.clone();
+            let started = slow_started.clone();
+            let finished = slow_finished.clone();
+            move |host| {
+                if host.starts_with("slow.") {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let mut released = gate.0.lock().unwrap();
+                    while !*released {
+                        released = gate.1.wait(released).unwrap();
+                    }
+                    finished.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(vec![SocketAddr::V4(seed)])
+            }
+        });
+        let server = tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            let (n, caller) = responder.recv_from(&mut bytes).await.unwrap();
+            let reply = response_with(&buf_txid(&bytes[..n]), &[peer], &[]);
+            responder.send_to(&reply, caller).await.unwrap();
+        });
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (publication, mut received) = tokio::sync::mpsc::channel(1);
+        let terminal_resolver = resolver.clone();
+        let run = tokio::spawn(async move {
+            let hosts: &[&str] = if slow {
+                &["healthy.invalid:1", "slow.invalid:1"]
+            } else {
+                &["healthy.invalid:1"]
+            };
+            dht_walk_with_bootstraps(
+                &[0; 20],
+                Duration::from_millis(500),
+                &socket,
+                hosts,
+                resolver,
+                |_, response| {
+                    if response.peers.contains(&peer) {
+                        let _ = publication.try_send(peer);
+                        return true;
+                    }
+                    false
+                },
+            )
+            .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_millis(200), received.recv()).await;
+        let slow_pending = !slow
+            || (slow_started.load(Ordering::SeqCst) == 1
+                && slow_finished.load(Ordering::SeqCst) == 0);
+        let terminal = tokio::time::timeout(Duration::from_millis(800), run)
+            .await
+            .unwrap()
+            .unwrap();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slow_finished.load(Ordering::SeqCst) != slow_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        terminal_resolver.finish_controlled().await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            slow_pending,
+            "slow native lookup was not outstanding at the measured publication boundary"
+        );
+        assert!(matches!(prompt, Ok(Some(found)) if found == peer), "healthy resolved bootstrap received no prompt correlated query/publication while another lookup remained pending; queried={}", terminal.nodes_queried);
+    }
+    #[tokio::test]
+    async fn healthy_bootstrap_publishes_before_slow_resolution_finishes() {
+        bootstrap_resolution_control(true).await;
+    }
+    #[tokio::test]
+    async fn healthy_bootstrap_resolution_positive_control() {
+        bootstrap_resolution_control(false).await;
+    }
+
+    #[tokio::test]
+    async fn late_bootstrap_joins_the_same_walk_after_first_seed_is_unproductive() {
+        use std::sync::{Arc, Condvar, Mutex};
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = v4_addr(&silent);
+        let healthy_addr = v4_addr(&healthy);
+        let peer: SocketAddrV4 = "127.0.0.1:43211".parse().unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let resolver = Resolver::controlled({
+            let gate = gate.clone();
+            move |host| {
+                if host.starts_with("late.") {
+                    let mut released = gate.0.lock().unwrap();
+                    while !*released {
+                        released = gate.1.wait(released).unwrap();
+                    }
+                    Ok(vec![SocketAddr::V4(healthy_addr)])
+                } else {
+                    Ok(vec![SocketAddr::V4(silent_addr)])
+                }
+            }
+        });
+        let release_gate = gate.clone();
+        let servers = tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            // Resolve the late useful seed only once the first real UDP query was sent.
+            silent.recv_from(&mut bytes).await.unwrap();
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            let (n, caller) = healthy.recv_from(&mut bytes).await.unwrap();
+            healthy
+                .send_to(&response_with(&buf_txid(&bytes[..n]), &[peer], &[]), caller)
+                .await
+                .unwrap();
+        });
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let started = Instant::now();
+        let mut published = false;
+        let metrics = dht_walk_with_bootstraps(
+            &[0; 20],
+            Duration::from_millis(500),
+            &socket,
+            &["first.invalid:1", "late.invalid:1"],
+            resolver.clone(),
+            |_, response| {
+                published |= response.peers.contains(&peer);
+                published
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        *release_gate.0.lock().unwrap() = true;
+        release_gate.1.notify_all();
+        servers.abort();
+        let _ = servers.await;
+        resolver.finish_controlled().await;
+        assert!(
+            published,
+            "later bootstrap was lost after first unproductive seed"
+        );
+        assert_eq!(metrics.bootstrap_seeded, 2);
+        assert_eq!(metrics.nodes_queried, 2);
+        assert_eq!(metrics.valid_responses, 1);
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "late seed waited for a renewed/serial response budget"
+        );
+    }
 
     #[test]
     fn get_peers_query_roundtrips() {
@@ -737,6 +1067,119 @@ mod tests {
         let resp = values_response(b"Zx", &["10.0.0.9:9000".parse().unwrap()]);
         let got = parse_response(&resp).unwrap();
         assert_eq!(got.txid, b"Zx".to_vec());
+    }
+
+    #[tokio::test]
+    async fn dht_stream_publishes_first_correlated_reply_before_later_reply() {
+        let mut servers = tokio::task::JoinSet::new();
+        let mut seeds = Vec::new();
+        for (i, delay) in [Duration::ZERO, Duration::from_millis(600)]
+            .into_iter()
+            .enumerate()
+        {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let SocketAddr::V4(seed) = socket.local_addr().unwrap() else {
+                unreachable!()
+            };
+            seeds.push(seed);
+            servers.spawn(async move {
+                let mut buf = [0; 2048];
+                let (n, client) = socket.recv_from(&mut buf).await.unwrap();
+                let txid = buf_txid(&buf[..n]);
+                tokio::time::sleep(delay).await;
+                let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1000 + i as u16);
+                socket
+                    .send_to(&values_response(&txid, &[peer]), client)
+                    .await
+                    .unwrap();
+            });
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let walk = tokio::spawn(async move {
+            dht_stream_from_seeds(&[9; 20], Duration::from_secs(2), 2, seeds, tx).await;
+        });
+        let first = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await;
+        if first.is_err() {
+            walk.abort();
+            servers.abort_all();
+        }
+        if first.is_ok() {
+            let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first.as_ref().unwrap().as_ref().unwrap(), &second);
+        }
+        let _ = walk.await;
+        while servers.join_next().await.is_some() {}
+        assert!(
+            first.is_ok(),
+            "first correlated peer was hidden until the walk completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_observer_rejects_wrong_txid_source_replay_and_duplicate_values() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spoof = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(seed) = socket.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let expected = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
+        let server = tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            let (n, client) = socket.recv_from(&mut bytes).await.unwrap();
+            let txid = buf_txid(&bytes[..n]);
+            let mut wrong = txid.clone();
+            wrong.push(0xff);
+            let bad = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321);
+            socket
+                .send_to(&values_response(&wrong, &[bad]), client)
+                .await
+                .unwrap();
+            spoof
+                .send_to(&values_response(&txid, &[bad]), client)
+                .await
+                .unwrap();
+            socket
+                .send_to(&values_response(&txid, &[expected, expected]), client)
+                .await
+                .unwrap();
+            socket
+                .send_to(&values_response(&txid, &[bad]), client)
+                .await
+                .unwrap();
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        dht_stream_from_seeds(&[0; 20], Duration::from_millis(150), 8, vec![seed], sender).await;
+        server.await.unwrap();
+        assert_eq!(receiver.recv().await, Some(expected));
+        assert!(
+            receiver.recv().await.is_none(),
+            "uncorrelated/replayed/duplicate peer reached production observer"
+        );
+    }
+
+    #[tokio::test]
+    async fn dht_response_window_respects_remaining_walk_budget() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(seed) = server.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let start = Instant::now();
+        let peers =
+            dht_get_peers_from_seeds(&[9; 20], Duration::from_millis(40), 8, vec![seed]).await;
+        let elapsed = start.elapsed();
+        assert!(peers.is_empty());
+        let mut query = [0; 2048];
+        assert!(
+            server.try_recv_from(&mut query).is_ok(),
+            "actual UDP query required"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "40ms walk consumed {elapsed:?}"
+        );
     }
 
     #[tokio::test]

@@ -347,6 +347,7 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         },
         cache_type: CacheType::Memory,
         cache_dir: PathBuf::new(),
+        warm_peers: WarmPeerCache::memory(),
     };
     let (tx, mut rx) = mpsc::channel(16);
     let peer_count = Arc::new(AtomicU32::new(0));
@@ -363,7 +364,7 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU32::new(0)),
         seed,
-        Arc::new(move |_| {
+        completed_discovery(move |_| {
             calls.fetch_add(1, Ordering::Relaxed);
             Box::pin(async { vec![] })
         }),
@@ -463,8 +464,122 @@ fn cancellation_fixture() -> (StreamInfo, SeedConfig) {
         live_recovery: LiveRecoveryConfig::default(),
         cache_type: CacheType::Memory,
         cache_dir: PathBuf::new(),
+        warm_peers: WarmPeerCache::memory(),
     };
     (info, seed)
+}
+
+#[tokio::test]
+async fn retired_same_address_worker_events_cannot_target_fresh_source_runtime() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let (info, seed) = cancellation_fixture();
+    let (mut continuity, _) = Continuity::fresh(&info, 7, 10, 1, seed.live_recovery);
+    let identity = Identity::generate();
+    let (events, mut receiver) = mpsc::channel(8);
+    let mut peers = BTreeMap::new();
+    for peer_id in [41, 42] {
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let server = tokio::spawn(async move {
+            let mut session = PeerSession::new(server);
+            assert!(matches!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Extended { .. }
+            ));
+            assert!(matches!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Interested
+            ));
+            session
+                .send(&build_piece(
+                    0,
+                    9,
+                    0,
+                    [0; 8],
+                    &[if peer_id == 41 { 0x55 } else { 0x66 }; 752],
+                ))
+                .await
+                .unwrap();
+            if peer_id == 42 {
+                while session.read_message().await.is_ok() {}
+            }
+        });
+        let (mut runtime, _) = activate_upstream_peer(
+            peer_id,
+            ConnectedUpstream {
+                session: PeerSession::new(client),
+                addr,
+                window: live_pos(7, 10),
+                yourip: None,
+            },
+            9,
+            &identity,
+            &mut continuity,
+            &events,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        if peer_id == 41 {
+            // Both the actual old block and EOF event are queued before its transport
+            // is retired and a fresh runtime at the identical endpoint is admitted.
+            server.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), &mut runtime.worker)
+                .await
+                .unwrap()
+                .unwrap();
+            peers.insert(peer_id, runtime);
+            assert_eq!(
+                drop_peer_runtime(peer_id, &mut peers, &mut continuity),
+                Some(addr)
+            );
+        } else {
+            peers.insert(peer_id, runtime);
+            let old_block = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let old_loss = receiver.recv().await.unwrap();
+            assert!(matches!(
+                old_block,
+                PeerEvent::Message {
+                    peer_id: 41,
+                    msg: PeerMessage::Piece { .. },
+                    ..
+                }
+            ));
+            assert!(matches!(old_loss, PeerEvent::Lost { peer_id: 41, .. }));
+            assert!(!old_block.is_current(&peers));
+            assert!(!old_loss.is_current(&peers));
+            let fresh_block = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(fresh_block.is_current(&peers));
+            assert!(
+                matches!(fresh_block, PeerEvent::Message { peer_id: 42, msg: PeerMessage::Piece {ref block,..},..} if block.contains(&0x66))
+            );
+            let runtime = peers.get_mut(&peer_id).unwrap();
+            runtime.commands.send(PeerCommand::Stop).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), &mut runtime.worker)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                drop_peer_runtime(peer_id, &mut peers, &mut continuity),
+                Some(addr)
+            );
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    assert!(peers.is_empty());
 }
 
 #[tokio::test]
@@ -486,7 +601,9 @@ async fn consumer_close_cancels_pending_connect() {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU32::new(0)),
         seed,
-        Arc::new(|_| Box::pin(async { panic!("connect cancellation must not reach discovery") })),
+        completed_discovery(|_| {
+            Box::pin(async { panic!("connect cancellation must not reach discovery") })
+        }),
         None,
     ));
     let (mut stream, _) = listener.accept().await.unwrap();
@@ -521,7 +638,7 @@ async fn consumer_close_cancels_owned_rediscovery() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
     let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, dropped_tx))));
-    let discovery: PeerDiscovery = Arc::new(move |_| {
+    let discovery: PeerDiscovery = completed_discovery(move |_| {
         let (started, dropped) = signals
             .lock()
             .unwrap()
@@ -640,7 +757,7 @@ async fn active_source_loss_enters_cooldown_before_another_announcement() {
             &mut None,
             vec![],
             vec![relay_addr, source_addr],
-            Arc::new(|_| Box::pin(async { panic!("no discovery required") })),
+            completed_discovery(|_| Box::pin(async { panic!("no discovery required") })),
             &mut candidates,
             &Arc::new(AtomicU32::new(0)),
             None,
@@ -850,7 +967,7 @@ async fn fast_source_fairness(return_source: bool) {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
             seed,
-            Arc::new(|_| Box::pin(async { vec![] })),
+            completed_discovery(|_| Box::pin(async { vec![] })),
             None,
         ));
         (rx, session, peer_count)
@@ -1151,7 +1268,10 @@ async fn failed_round_discovery_control(healthy_delay: Duration, output_bound: D
         ));
         (rx, session, count)
     };
-    let (mut rx, direct, _) = run(vec![healthy], Arc::new(|_| Box::pin(async { vec![] })));
+    let (mut rx, direct, _) = run(
+        vec![healthy],
+        completed_discovery(|_| Box::pin(async { vec![] })),
+    );
     assert!(tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .unwrap()
@@ -1162,7 +1282,7 @@ async fn failed_round_discovery_control(healthy_delay: Duration, output_bound: D
         .unwrap()
         .unwrap();
     let known = early.clone();
-    let discovery: PeerDiscovery = Arc::new(move |options| {
+    let discovery: PeerDiscovery = completed_discovery(move |options| {
         let early = known.clone();
         Box::pin(async move {
             // Discovery I/O only: preserve ace-swarm's actual first_peer_source_with_target
@@ -1346,7 +1466,7 @@ async fn stale_zero_admission_cohort_must_not_lock_out_returning_source() {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
             seed,
-            Arc::new(|_| Box::pin(async { vec![] })),
+            completed_discovery(|_| Box::pin(async { vec![] })),
             None,
         ));
         (rx, task)
@@ -1409,27 +1529,22 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
     let waiting = Arc::new(AtomicU32::new(0));
     let closed = Arc::new(AtomicU32::new(0));
     let mut servers = tokio::task::JoinSet::new();
-    for (index, listener) in [a, b].into_iter().enumerate() {
+    for listener in [a, b] {
         let gate = gate.clone();
         let waiting = waiting.clone();
         let closed = closed.clone();
         servers.spawn(async move {
             let mut clients = tokio::task::JoinSet::new();
-            let mut count = 0;
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-                let gated = index == 1 || count > 0;
-                count += 1;
                 let gate = gate.clone();
                 let waiting = waiting.clone();
                 let closed = closed.clone();
                 clients.spawn(async move {
                     let mut peer = PeerSession::new(stream);
                     peer.accept_handshake([0; 20], |_| true).await.unwrap();
-                    if gated {
-                        waiting.fetch_add(1, Ordering::Relaxed);
-                        gate.notified().await;
-                    }
+                    waiting.fetch_add(1, Ordering::Relaxed);
+                    gate.notified().await;
                     peer.send_extended_handshake(&OutgoingExtendedHandshake {
                         mi: Some(live_pos(7, 8)),
                         ace_metadata_version: 1,
@@ -1446,20 +1561,14 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
             }
         });
     }
-    // A discovered transport exists independently of the cap-two learned producers.
-    let PeerConnectAttempt::Connected(discovered) = connect_upstream(addrs[0], [0; 20]).await
-    else {
-        panic!("discovered positive control")
-    };
-    let (tx, mut rx) = mpsc::channel(2);
-    tx.send(PoolRefill::Discovered(discovered)).await.unwrap();
+    let (tx, rx) = mpsc::channel(2);
     let mut candidates = SessionCandidates::default();
-    for addr in addrs {
-        candidates.learn(addr, CandidateKind::Pex);
-    }
+    candidates.learn(addrs[0], CandidateKind::Source);
+    candidates.learn(addrs[1], CandidateKind::Discovered);
+    candidates.learn(addrs[2], CandidateKind::Discovered);
     let mut tasks = tokio::task::JoinSet::new();
     let mut pending = HashSet::new();
-    spawn_learned_connects(
+    spawn_candidate_connects(
         &mut candidates,
         &BTreeMap::new(),
         [0; 20],
@@ -1467,6 +1576,7 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
         &tx,
         &mut tasks,
         &mut pending,
+        true,
     );
     tokio::time::timeout(Duration::from_secs(1), async {
         while waiting.load(Ordering::Relaxed) != 2 {
@@ -1475,15 +1585,22 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
     })
     .await
     .unwrap();
-    let discovered =
-        receive_pool_refill(rx.recv().await.unwrap(), &mut pending, &mut candidates).unwrap();
+    // A duplicate discovered hint arrives while the source reservation still owns A.
+    let duplicate = completed_discovery(move |_| async move { vec![addrs[0]] });
+    let mut run = Some(DiscoveryRun::start(&duplicate, DiscoveryOptions::default()));
+    let learned = next_discovery_peer(&mut run).await.unwrap();
+    candidates.learn(learned, CandidateKind::Discovered);
+    assert!(
+        pending.contains(&addrs[0]),
+        "discovered hint cleared source reservation"
+    );
     gate.notify_waiters();
     while let Some(joined) = tasks.join_next().await {
         let (_, failure, queued) = joined.unwrap();
         assert!(failure.is_none() && queued);
     }
     assert_eq!(rx.len(), 2); // Both actual learned connections are ready and owned.
-    spawn_learned_connects(
+    spawn_candidate_connects(
         &mut candidates,
         &BTreeMap::new(),
         [0; 20],
@@ -1491,22 +1608,25 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
         &tx,
         &mut tasks,
         &mut pending,
+        true,
     );
     let unexpected = tokio::time::timeout(Duration::from_millis(100), c.accept()).await;
     let exceeds_cap = unexpected.is_ok();
     drop(unexpected);
     drop(tasks);
     drop(rx);
-    drop(discovered);
     tokio::time::timeout(Duration::from_secs(1), async {
-        while closed.load(Ordering::Relaxed) != 3 {
+        while closed.load(Ordering::Relaxed) != 2 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
     drop(servers);
-    assert!(!exceeds_cap,"discovered A receipt released distinct learned A, allowing learned C alongside ready A/B under cap2");
+    assert!(
+        !exceeds_cap,
+        "duplicate discovered A hint released source A, allowing C alongside ready A/B under cap2"
+    );
 }
 
 #[tokio::test]
@@ -1517,46 +1637,227 @@ async fn discovered_refill_reports_completed_transport_failure() {
     };
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        drop(socket); // TCP succeeds, but the real BT exchange fails.
+        drop(socket);
     });
-    let (tx, mut rx) = mpsc::channel(1);
-    let producer = tokio::spawn(refill_upstream_pool(
-        vec![addr],
+    let (tx, _rx) = mpsc::channel(1);
+    let mut candidates = SessionCandidates::default();
+    candidates.learn(addr, CandidateKind::Discovered);
+    let mut pending = HashSet::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    spawn_candidate_connects(
+        &mut candidates,
+        &BTreeMap::new(),
         [0; 20],
-        Arc::new(|_| Box::pin(async { vec![] })),
-        vec![addr],
-        default_live_recovery(),
-        tx,
-    ));
-    let receipt = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        1,
+        &tx,
+        &mut tasks,
+        &mut pending,
+        true,
+    );
+    assert!(pending.contains(&addr));
+    let completion = tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
         .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), producer)
-        .await
+        .unwrap()
         .unwrap()
         .unwrap();
     server.await.unwrap();
     assert!(
-        receipt.is_some(),
-        "completed discovered failure never reaches session exploration history"
+        completion.1.is_some(),
+        "real completed discovered failure required"
     );
-    let mut candidates = SessionCandidates::default();
-    let mut pending = HashSet::from([addr]);
-    assert!(receive_pool_refill(receipt.unwrap(), &mut pending, &mut candidates).is_none());
+    assert!(finish_candidate_connect(
+        completion,
+        &mut pending,
+        &mut candidates
+    ));
+    assert!(!pending.contains(&addr));
     assert_eq!(candidates.explorations(addr), 1);
     assert!(candidates.eligible(Instant::now()).is_empty());
-    assert!(
-        pending.contains(&addr),
-        "discovered failure released distinct learned ownership"
-    );
     candidates.learn(addr, CandidateKind::Source);
     assert_eq!(
         candidates.explorations(addr),
         1,
-        "announcement reset consumed opportunity"
+        "announcement reset completed opportunity"
     );
+}
+
+// Real pool/worker control for per-peer id=4 updates behind another peer's shared head.
+async fn retained_producer_window_control(producer_first: bool, head_only_max: u32) {
+    let mut upstreams = Vec::new();
+    let mut servers = tokio::task::JoinSet::new();
+    let mut commands = Vec::new();
+    let mut requested = Vec::new();
+    let mut requests = Vec::new();
+    for healthy in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        upstreams.push(ConnectedUpstream {
+            session: PeerSession::new(client),
+            addr,
+            window: live_pos(7, 8),
+            yourip: None,
+        });
+        let (command, mut control) = mpsc::channel::<()>(1);
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        requests.push(seen.clone());
+        commands.push(command);
+        requested.push(Some(request_rx));
+        servers.spawn(async move {
+            let mut session = PeerSession::new(stream);
+            let mut request_tx = Some(request_tx);
+            loop {
+                tokio::select! {
+                    command = control.recv() => {
+                        if command.is_none() { break; }
+                        let mut payload = vec![0; 8];
+                        payload[4..].copy_from_slice(&(if healthy { 10 } else { head_only_max }).to_be_bytes());
+                        session.send(&PeerMessage::Unknown { id: 4, payload }).await.unwrap();
+                        if !healthy {
+                            session.send(&PeerMessage::Unchoke).await.unwrap();
+                        }
+                    }
+                    message = session.read_message() => {
+                        let Ok(message) = message else { break; };
+                        if healthy && matches!(message, PeerMessage::Interested) {
+                            session.send(&PeerMessage::Unchoke).await.unwrap();
+                        }
+                        if let PeerMessage::Unknown { id: 6, payload } = message {
+                            let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                            seen.lock().unwrap().push(piece);
+                            if piece == 9 {
+                                if let Some(sender) = request_tx.take() {
+                                    let _ = sender.send(());
+                                }
+                                if !healthy {
+                                    // Head-only peer makes the ordering observable, then stops
+                                    // owning new requests. Its old reservation expires normally.
+                                    session.send(&PeerMessage::Choke).await.unwrap();
+                                }
+                            }
+                            if healthy {
+                                let marker = if piece <= 8 { 0x44 } else { 0x66 };
+                                let media: Vec<_> = (0..4).flat_map(|cc| {
+                                    let mut packet = vec![marker; 188];
+                                    packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | cc]);
+                                    packet
+                                }).collect();
+                                if session.send(&build_piece(0, piece, 0, [0; 8], &media)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let (info, mut seed) = cancellation_fixture();
+    seed.prefetch_pieces = u64::from(head_only_max - 9);
+    seed.live_recovery.max_active_upstreams = 2;
+    let (tx, mut rx) = mpsc::channel(16);
+    let addresses: Vec<_> = upstreams.iter().map(|peer| peer.addr).collect();
+    let pool = tokio::spawn(async move {
+        let mut candidates = SessionCandidates::default();
+        candidates.learn(addresses[0], CandidateKind::Pex);
+        candidates.learn(addresses[1], CandidateKind::Source);
+        let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(752, 752, 4096)));
+        let mut continuity = None;
+        let end = follow_peer_pool(
+            upstreams,
+            &info,
+            &Identity::generate(),
+            1,
+            &tx,
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU32::new(0)),
+            &seed,
+            &store,
+            &mut continuity,
+            vec![],
+            addresses,
+            completed_discovery(|_| Box::pin(async { panic!("no discovery required") })),
+            &mut candidates,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .await;
+        let continuity = continuity.unwrap();
+        (end, continuity.head, continuity.reasm.next_needed())
+    });
+    // Require both original pieces through the actual media path before advancing either head.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut bytes = 0;
+        while bytes < 7 * 188 {
+            let output = rx.recv().await.unwrap();
+            assert!(output.bytes.contains(&0x44));
+            bytes += output.bytes.len();
+        }
+    })
+    .await
+    .expect("healthy initial producer fixture");
+    let first = if producer_first { 0 } else { 1 };
+    commands[first].send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), requested[first].take().unwrap())
+        .await
+        .expect("first id=4 must actually schedule piece9")
+        .unwrap();
+    commands[1 - first].send(()).await.unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(output) = rx.recv().await {
+            if output.bytes.contains(&0x66) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    drop(rx);
+    let (end, head, cursor) = tokio::time::timeout(Duration::from_secs(1), pool)
+        .await
+        .unwrap()
+        .unwrap();
+    while let Some(server) = tokio::time::timeout(Duration::from_secs(1), servers.join_next())
+        .await
+        .unwrap()
+    {
+        server.unwrap();
+    }
+    assert!(matches!(end, FollowEnd::ConsumerGone));
     assert_eq!(
-        candidates.eligible(Instant::now() + Duration::from_secs(2)),
-        vec![addr]
+        head,
+        u64::from(head_only_max),
+        "shared head must stay monotonic"
     );
+    assert!(
+        cursor > 9,
+        "new producer media must advance the actual cursor"
+    );
+    eprintln!("window control: producer_first={producer_first} head={head} cursor={cursor} healthy_requests={:?} head_only_requests={:?}",
+        requests[0].lock().unwrap(), requests[1].lock().unwrap());
+    assert!(
+        matches!(output, Ok(true)),
+        "retained healthy producer's same-head id=4 must extend its request window"
+    );
+}
+
+#[tokio::test]
+async fn retained_producer_same_head_window_update_supplies_media() {
+    retained_producer_window_control(false, 10).await;
+}
+
+#[tokio::test]
+async fn retained_producer_first_window_update_positive_control() {
+    retained_producer_window_control(true, 10).await;
+}
+
+#[tokio::test]
+async fn retained_producer_lower_than_shared_head_window_update_supplies_media() {
+    // Shared head11/cursor9; producer head10 remains usable inside prefetch2.
+    retained_producer_window_control(false, 11).await;
 }

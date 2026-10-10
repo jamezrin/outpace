@@ -4,16 +4,20 @@
 //! (see `ace_engine::ace_provider`'s periodic self-announce), rather than baking a
 //! multi-second live network call into this module's fast, offline-testable functions.
 
-use crate::dht::dht_get_peers_with_target;
+use crate::dht::{dht_get_peers_incremental, dht_get_peers_with_target};
+use crate::resolver::Resolver;
 use ace_tracker::client::announce;
 use ace_tracker::codec::{AnnounceEvent, TransferState};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddrV4;
 use std::time::Duration;
-use tokio::net::lookup_host;
 
 const DISCOVERY_PEER_TARGET: usize = 8;
+const TRACKER_PARALLELISM: usize = 4;
+const TRACKER_DEADLINE: Duration = Duration::from_secs(2);
+/// Maximum unique addresses retained and queued by one incremental discovery run.
+pub const MAX_DISCOVERY_PEERS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryOptions {
@@ -79,6 +83,14 @@ pub async fn resolve_trackers_with_policy(
     trackers: &[String],
     policy: TrackerPolicy,
 ) -> Vec<SocketAddrV4> {
+    resolve_trackers_with_resolver(trackers, policy, &Resolver::global()).await
+}
+
+pub(crate) async fn resolve_trackers_with_resolver(
+    trackers: &[String],
+    policy: TrackerPolicy,
+    resolver: &Resolver,
+) -> Vec<SocketAddrV4> {
     let mut out = Vec::new();
     for t in trackers.iter().take(MAX_TRACKERS) {
         if t.len() > MAX_TRACKER_URL_LEN {
@@ -92,7 +104,7 @@ pub async fn resolve_trackers_with_policy(
         if hostport.is_empty() {
             continue;
         }
-        if let Ok(addrs) = lookup_host(hostport).await {
+        if let Ok(addrs) = resolver.lookup(hostport).await {
             for a in addrs {
                 if let std::net::SocketAddr::V4(v4) = a {
                     if policy.allow_non_global || !is_non_global_v4(v4.ip()) {
@@ -147,7 +159,7 @@ pub async fn discover_peers_with_options(
     port: u16,
     options: DiscoveryOptions,
 ) -> Vec<SocketAddrV4> {
-    first_peer_source_with_target(
+    discover_peers_from_sources(
         discover_tracker_peers(
             trackers,
             infohash,
@@ -170,21 +182,229 @@ async fn discover_tracker_peers(
     event: AnnounceEvent,
     left: u64,
 ) -> Vec<SocketAddrV4> {
-    let mut peers: BTreeSet<SocketAddrV4> = BTreeSet::new();
-    let transfer = TransferState {
-        downloaded: 0,
+    discover_tracker_peers_with_policy(
+        trackers,
+        infohash,
+        peer_id,
+        port,
+        event,
         left,
-        uploaded: 0,
-    };
-    for tracker in resolve_trackers_with_policy(trackers, TrackerPolicy::from_env()).await {
-        if let Ok(found) = announce(tracker, infohash, peer_id, port, 200, transfer, event).await {
-            peers.extend(found);
-        }
-    }
-    peers.into_iter().collect()
+        TrackerPolicy::from_env(),
+    )
+    .await
 }
 
-async fn first_peer_source_with_target<A, B>(a: A, b: B, peer_target: usize) -> Vec<SocketAddrV4>
+async fn discover_tracker_peers_with_policy(
+    trackers: &[String],
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    event: AnnounceEvent,
+    left: u64,
+    policy: TrackerPolicy,
+) -> Vec<SocketAddrV4> {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(MAX_DISCOVERY_PEERS);
+    let collect = async move {
+        let mut peers = BTreeSet::new();
+        while let Some(peer) = receiver.recv().await {
+            if peers.len() < MAX_DISCOVERY_PEERS {
+                peers.insert(peer);
+            }
+        }
+        peers.into_iter().collect()
+    };
+    let (_, peers) = tokio::join!(
+        stream_tracker_peers(trackers, infohash, peer_id, port, event, left, policy, sender),
+        collect,
+    );
+    peers
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_tracker_peers(
+    trackers: &[String],
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    event: AnnounceEvent,
+    left: u64,
+    policy: TrackerPolicy,
+    peers: tokio::sync::mpsc::Sender<SocketAddrV4>,
+) {
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut urls = trackers.iter().take(MAX_TRACKERS);
+    loop {
+        while jobs.len() < TRACKER_PARALLELISM {
+            let Some(url) = urls.next() else {
+                break;
+            };
+            if url.len() > MAX_TRACKER_URL_LEN {
+                continue;
+            }
+            let url = url.clone();
+            let infohash = *infohash;
+            let peer_id = *peer_id;
+            jobs.spawn(async move {
+                tracker_exchange(
+                    resolve_trackers_with_policy(&[url], policy),
+                    &infohash,
+                    &peer_id,
+                    port,
+                    event,
+                    left,
+                )
+                .await
+            });
+        }
+        let Some(result) = jobs.join_next().await else {
+            break;
+        };
+        if let Ok(found) = result {
+            for peer in found {
+                if peers.send(peer).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn tracker_exchange<F>(
+    resolution: F,
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    event: AnnounceEvent,
+    left: u64,
+) -> Vec<SocketAddrV4>
+where
+    F: Future<Output = Vec<SocketAddrV4>>,
+{
+    tokio::time::timeout(TRACKER_DEADLINE, async {
+        let addresses = resolution.await;
+        let Some(addr) = addresses.first() else {
+            return Vec::new();
+        };
+        announce(
+            *addr,
+            infohash,
+            peer_id,
+            port,
+            200,
+            TransferState {
+                downloaded: 0,
+                left,
+                uploaded: 0,
+            },
+            event,
+        )
+        .await
+        .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Stream first and later source results without cancelling useful discovery when another
+/// source reaches its target. The receiver owns backpressure; dropping it ends the run.
+pub async fn discover_peers_incremental(
+    trackers: &[String],
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    options: DiscoveryOptions,
+    peers: tokio::sync::mpsc::Sender<SocketAddrV4>,
+) {
+    let (source_tx, source_rx) = tokio::sync::mpsc::channel(MAX_DISCOVERY_PEERS);
+    let tracker_tx = source_tx.clone();
+    let tracker = stream_tracker_peers(
+        trackers,
+        infohash,
+        peer_id,
+        port,
+        AnnounceEvent::Started,
+        u64::MAX,
+        TrackerPolicy::from_env(),
+        tracker_tx,
+    );
+    let dht = async move {
+        dht_get_peers_incremental(
+            infohash,
+            options.dht_budget,
+            options.peer_target.max(1),
+            |peer| source_tx.try_send(peer).is_ok(),
+        )
+        .await;
+    };
+    forward_discovery_sources(tracker, dht, source_rx, peers).await;
+}
+
+// Both production UDP sources and injected source futures use this owning combiner.
+async fn forward_discovery_sources<A, B>(
+    a: A,
+    b: B,
+    mut source_rx: tokio::sync::mpsc::Receiver<SocketAddrV4>,
+    peers: tokio::sync::mpsc::Sender<SocketAddrV4>,
+) where
+    A: Future<Output = ()>,
+    B: Future<Output = ()>,
+{
+    let output = peers.clone();
+    let forward = async move {
+        let peers = output;
+        let mut seen = BTreeSet::new();
+        while let Some(peer) = source_rx.recv().await {
+            if seen.insert(peer) && peers.send(peer).await.is_err() {
+                return;
+            }
+            if seen.len() >= MAX_DISCOVERY_PEERS {
+                return;
+            }
+        }
+    };
+    tokio::pin!(a, b, forward);
+    tokio::select! {
+        _ = peers.closed() => {},
+        _ = &mut forward => {},
+        _ = async { tokio::join!(&mut a,&mut b); } => {forward.await;},
+    }
+}
+
+/// Offline source boundary for the production incremental combiner. Both complete-batch
+/// futures are adapted to its bounded source channel; dropping the sink cancels both.
+#[doc(hidden)]
+pub async fn discover_peers_from_sources_incremental<A, B>(
+    a: A,
+    b: B,
+    peers: tokio::sync::mpsc::Sender<SocketAddrV4>,
+) where
+    A: Future<Output = Vec<SocketAddrV4>>,
+    B: Future<Output = Vec<SocketAddrV4>>,
+{
+    let (sender, receiver) = tokio::sync::mpsc::channel(MAX_DISCOVERY_PEERS);
+    let second_sender = sender.clone();
+    let first = async move {
+        for peer in a.await {
+            if sender.send(peer).await.is_err() {
+                return;
+            }
+        }
+    };
+    let second = async move {
+        for peer in b.await {
+            if second_sender.send(peer).await.is_err() {
+                return;
+            }
+        }
+    };
+    forward_discovery_sources(first, second, receiver, peers).await;
+}
+
+/// Combine two discovery sources using the same target policy as tracker/DHT discovery.
+/// Sources return their complete candidate sets; a weaker first result retains the second
+/// future until completion. The generic boundary permits deterministic offline protocol tests.
+#[doc(hidden)]
+pub async fn discover_peers_from_sources<A, B>(a: A, b: B, peer_target: usize) -> Vec<SocketAddrV4>
 where
     A: Future<Output = Vec<SocketAddrV4>>,
     B: Future<Output = Vec<SocketAddrV4>>,
@@ -252,6 +472,202 @@ mod tests {
         TrackerPolicy {
             allow_non_global: true,
         }
+    }
+
+    #[tokio::test]
+    async fn tracker_after_silent_tracker_is_contacted_promptly() {
+        let dead = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let urls = vec![
+            format!("udp://{}", dead.local_addr().unwrap()),
+            format!("udp://{}", healthy.local_addr().unwrap()),
+        ];
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut packet = [0; 2048];
+            healthy.recv_from(&mut packet).await.unwrap();
+            seen_tx.send(()).unwrap();
+        });
+        let discover = tokio::spawn(async move {
+            discover_tracker_peers_with_policy(
+                &urls,
+                &[3; 20],
+                &[4; 20],
+                0,
+                AnnounceEvent::Started,
+                u64::MAX,
+                local_ok(),
+            )
+            .await
+        });
+        let contacted = tokio::time::timeout(Duration::from_millis(300), seen_rx).await;
+        discover.abort();
+        server.abort();
+        let _ = discover.await;
+        let _ = server.await;
+        let mut packet = [0; 2048];
+        assert!(
+            dead.try_recv_from(&mut packet).is_ok(),
+            "first real tracker must be contacted"
+        );
+        assert!(
+            contacted.is_ok(),
+            "silent tracker serialized the later tracker"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_cap_cancels_other_owned_source_without_waiting_for_budget() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(MAX_DISCOVERY_PEERS);
+        let first = async {
+            (0..MAX_DISCOVERY_PEERS as u16)
+                .map(|port| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port))
+                .collect()
+        };
+        let second = std::future::pending::<Vec<SocketAddrV4>>();
+        let run = tokio::spawn(discover_peers_from_sources_incremental(
+            first, second, sender,
+        ));
+        for _ in 0..MAX_DISCOVERY_PEERS {
+            assert!(receiver.recv().await.is_some());
+        }
+        let finished = tokio::time::timeout(Duration::from_millis(100), async {
+            while !run.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        run.abort();
+        let _ = run.await;
+        assert!(
+            finished.is_ok(),
+            "production combiner retained silent source after unique-peer cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_normal_completion_drains_final_buffer_and_retains_later_source() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let a = async { vec!["127.0.0.1:1".parse().unwrap()] };
+        let b = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            vec![
+                "127.0.0.1:1".parse().unwrap(),
+                "127.0.0.1:2".parse().unwrap(),
+                "127.0.0.1:3".parse().unwrap(),
+            ]
+        };
+        let run = tokio::spawn(discover_peers_from_sources_incremental(a, b, sender));
+        let mut peers = Vec::new();
+        while let Some(peer) = receiver.recv().await {
+            peers.push(peer);
+        }
+        run.await.unwrap();
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[2].port(), 3);
+    }
+    #[tokio::test]
+    async fn incremental_receiver_close_cancels_pending_sources() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let run = tokio::spawn(discover_peers_from_sources_incremental(
+            std::future::pending::<Vec<SocketAddrV4>>(),
+            std::future::pending::<Vec<SocketAddrV4>>(),
+            sender,
+        ));
+        drop(receiver);
+        tokio::time::timeout(Duration::from_millis(100), run)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn tracker_deadline_covers_resolution_and_both_actual_udp_exchanges() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(addr) = socket.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let server = tokio::spawn(async move {
+            let mut packet = [0; 2048];
+            let (_, peer) = socket.recv_from(&mut packet).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let mut response = 0u32.to_be_bytes().to_vec();
+            response.extend(&packet[12..16]);
+            response.extend(42u64.to_be_bytes());
+            socket.send_to(&response, peer).await.unwrap();
+            let (_, peer) = socket.recv_from(&mut packet).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let mut response = 1u32.to_be_bytes().to_vec();
+            response.extend(&packet[12..16]);
+            response.extend([0; 12]);
+            response.extend([127, 0, 0, 1, 0, 1]);
+            socket.send_to(&response, peer).await.unwrap();
+        });
+        let resolution = async {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            vec![addr]
+        };
+        let start = std::time::Instant::now();
+        let found = tracker_exchange(
+            resolution,
+            &[0; 20],
+            &[0; 20],
+            0,
+            AnnounceEvent::Started,
+            u64::MAX,
+        )
+        .await;
+        let elapsed = start.elapsed();
+        server.await.unwrap();
+        assert!(
+            found.is_empty(),
+            "2.1s combined exchange must miss the total 2s deadline"
+        );
+        assert!(elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_millis(2300));
+    }
+    #[tokio::test]
+    async fn tracker_jobs_never_exceed_four_and_release_at_total_deadline() {
+        let mut sockets = Vec::new();
+        for _ in 0..5 {
+            sockets.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        let urls = sockets
+            .iter()
+            .map(|socket| format!("udp://{}", socket.local_addr().unwrap()))
+            .collect::<Vec<_>>();
+        let run = tokio::spawn(async move {
+            discover_tracker_peers_with_policy(
+                &urls,
+                &[0; 20],
+                &[0; 20],
+                0,
+                AnnounceEvent::Started,
+                u64::MAX,
+                local_ok(),
+            )
+            .await
+        });
+        let start = std::time::Instant::now();
+        let mut packet = [0; 2048];
+        for socket in sockets.iter().take(4) {
+            tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            sockets[4].try_recv_from(&mut packet).is_err(),
+            "fifth tracker exceeded four running jobs"
+        );
+        tokio::time::timeout(
+            Duration::from_millis(2300),
+            sockets[4].recv_from(&mut packet),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(1900));
+        run.abort();
+        let _ = run.await;
     }
 
     #[tokio::test]
@@ -434,7 +850,7 @@ mod tests {
         };
 
         let start = std::time::Instant::now();
-        let peers = first_peer_source_with_target(slow, fast, 1).await;
+        let peers = discover_peers_from_sources(slow, fast, 1).await;
         assert_eq!(peers, vec!["10.0.0.1:1111".parse().unwrap()]);
         assert!(
             start.elapsed() < Duration::from_secs(1),
@@ -453,7 +869,7 @@ mod tests {
             ]
         };
 
-        let peers = first_peer_source_with_target(weak, strong, 2).await;
+        let peers = discover_peers_from_sources(weak, strong, 2).await;
         assert_eq!(
             peers,
             vec![

@@ -33,6 +33,7 @@ rand = "0.10"
 rtmp-rs = "0.6"
 base64ct = { version = "1.8", features = ["alloc"] }
 hex = "0.4"
+libc = "0.2"
 
 # jemalloc is the default global allocator on 64-bit non-MSVC targets (see main.rs). 32-bit targets
 # (e.g. armv7) are excluded: jemalloc's 64-bit `ffs` helper needs a `__ffsdi2` builtin that fails to
