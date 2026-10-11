@@ -25,7 +25,7 @@ dependencies = [
  "rtmp-rs",
  "serde",
  "serde_json",
- "sha1 0.11.0",
+ "sha1",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
@@ -71,7 +71,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha1 0.11.0",
+ "sha1",
  "tempfile",
  "tokio",
  "webpki-root-certs",
@@ -95,9 +95,9 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "pkcs8 0.11.0",
- "rand 0.8.8",
+ "rand 0.10.3",
  "rsa",
- "sha1 0.10.7",
+ "sha1",
  "sha2 0.11.0",
 ]
 
@@ -1097,9 +1097,9 @@ dependencies = [
 
 [[package]]
 name = "igd-next"
-version = "0.17.1"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de7238d487a9aff61f81b5ab41c0a841532a115a398b5fa92a2fadd0885e2581"
+checksum = "c71312255fdc5364bff7eec0adf68146bc4e72aba85075261af40d234c11be99"
 dependencies = [
  "attohttpc",
  "bytes",
@@ -1110,8 +1110,10 @@ dependencies = [
  "hyper-util",
  "log",
  "rand 0.10.3",
+ "thiserror",
  "tokio",
  "url",
+ "xml-rs",
  "xmltree",
 ]
 
@@ -1547,7 +1549,6 @@ version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
- "libc",
  "rand_chacha",
  "rand_core 0.6.4",
 ]
@@ -1883,9 +1884,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.152"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "1741ab7a6cc54a03a89b5d563ed60075c277d9e3cfa73ad0c1f23f23974703c6"
 dependencies = [
  "itoa",
  "memchr",
@@ -1928,17 +1929,6 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
-]
-
-[[package]]
-name = "sha1"
-version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
 ]
 
 [[package]]
