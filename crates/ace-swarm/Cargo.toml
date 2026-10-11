@@ -21,7 +21,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Retain bundled trust roots for portable binaries without a system CA store.
 webpki-root-certs = "1"
 hex = "0.4"
-igd-next = { version = "0.17", features = ["aio_tokio"] }
+igd-next = { version = "0.18", features = ["aio_tokio"] }
 crab_nat = "0.8"
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
