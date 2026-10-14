@@ -204,6 +204,11 @@ the Cargo version. The workflow:
 - creates a GitHub Release with generated release notes;
 - publishes `ghcr.io/jamezrin/outpace:<version>` and `ghcr.io/jamezrin/outpace:latest`.
 
+Pushes to `main` run `.github/workflows/edge.yml`, which publishes
+`ghcr.io/jamezrin/outpace:edge` and `ghcr.io/jamezrin/outpace:sha-<commit>` for
+`linux/amd64` only. `edge` moves with `main`. Keep production pinned to a
+release tag.
+
 ## Runtime Surfaces
 
 The supported integration contract is the native CLI and HTTP API. See the
