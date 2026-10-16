@@ -43,6 +43,69 @@ can contain identifiers, stream names, tokens or peer addresses. Do not commit o
 publish them. `summary.json` omits URLs, ids and stat payloads, but review any report
 before sharing it. Engine/candidate names are user-controlled in direct capture.
 
+## Compare deployed instances with VLC
+
+To investigate playback on existing servers, use the same route and decoder as
+the reported playback. This separate runner starts two **local VLC clients**;
+it does not start/reconfigure servers, Docker containers, WARP, or remote VLC.
+It requires Python 3.10+, a POSIX host, and VLC with its HTTP interface and dummy
+audio/video outputs (Debian/Ubuntu: `vlc`, including `vlc-plugin-base`). Run as an
+ordinary user; VLC refuses to run as root. Both servers must already support
+`/ace/getstream?id=…`; Outpace's compat API must already be enabled.
+
+Supply a current public content id privately in `ACE_CONTENT_ID` as described
+above. The runner never reads the registry. For example, with servers reachable
+through local port forwarding:
+
+```sh
+python3 tools/abcompare/vlc_compare.py \
+  --engine-url http://127.0.0.1:6878 \
+  --outpace-url http://127.0.0.1:16879 \
+  --seconds 600 --network-caching 1000 --poll-seconds 5 \
+  --client-warp off --server-warp unknown
+```
+
+WARP flags **record operator observations**, they do not detect or change VPN
+state. For a deployment reproduction, preserve and record the deployment's
+settings. For a controlled local baseline, keep WARP off. Record server builds,
+warm/cold cache state, and other viewers separately in private notes; the runner
+does not inspect remote build/configuration. Concurrent viewers can affect swarms.
+
+One command runs to completion without agent supervision and prints a fresh
+private `/tmp/outpace-vlc-*` artifact directory and a numeric summary. Artifacts
+include `comparison.txt`, `comparison.json`, `config.json`, VLC logs, playlists,
+and raw sampled status. The directory is mode 0700; raw artifacts can contain
+identifiers, URLs and stream names. Keep them private. Summaries omit source URLs,
+identifiers and raw metadata; review before sharing. Inputs go in private playlist
+files rather than VLC command arguments. The content-id environment variable is
+removed from child environments. Local VLC controls bind to loopback and use a
+random password; control requests bypass HTTP proxies.
+
+Ctrl-C/SIGTERM stops and reaps only the two client processes started by this run,
+then writes a partial report. A forced kill cannot clean up those clients.
+Exit 0 means the bounded observation finished and both clients had some audio or
+video decode progress; it is **not a playback quality pass**. Exit 2 means an
+incomplete observation, launch/control setup problem, or no observed decode;
+exit 130 means interrupted. Inspect control error counts, state counts, resets,
+and per-client sample counts even on exit 0. Initial HTTP-interface startup may
+produce control errors before the first successful sample.
+
+Both clients ignore saved VLC configuration, use the same network caching, and
+decode into dummy outputs. This exercises VLC demux/decode without a display or
+audio device. It cannot measure visual presentation, device drops, or the exact
+experience of a GUI player with different settings. Video-only/audio-only media
+are accepted; an absent track has null timing rather than an invented failure.
+
+`first_decode_observed_seconds` is the time a poll first sees a positive decode
+counter, measured from the start of the comparison. It is an upper bound, not
+precise startup latency; launch offsets are included in the JSON. The maximum
+sampled progress gap includes the final unsampled tail after the last observed
+counter change. Even smooth playback normally reports a gap near one polling
+interval. Polling/control failures increase uncertainty; brief stalls between
+polls may be missed. Counter resets are reported rather than silently adding
+incompatible epochs. Equal counters do not establish content identity or live
+position, and a completed run is not a full live acceptance matrix.
+
 ## Capture or analyze existing clients
 
 For clients you start yourself on separate ports:
