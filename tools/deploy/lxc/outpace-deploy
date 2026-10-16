@@ -1,0 +1,17 @@
+#!/bin/bash
+# Pull the moving edge image and restart the stack only when it changed.
+# Install as /usr/local/sbin/outpace-deploy; driven by outpace-deploy.timer.
+set -euo pipefail
+cd /opt/outpace
+image="$(grep -E '^OUTPACE_IMAGE=' .env | cut -d= -f2-)"
+if ! docker manifest inspect "$image" >/dev/null 2>&1; then
+  exit 0
+fi
+before="$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)"
+docker pull "$image"
+after="$(docker image inspect --format '{{.Id}}' "$image")"
+if [[ "$before" != "$after" ]]; then
+  docker compose up -d --wait --wait-timeout 90
+  docker image prune -f >/dev/null
+  echo "outpace updated to ${after}"
+fi

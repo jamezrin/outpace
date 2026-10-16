@@ -1,0 +1,8 @@
+[Unit]
+Description=Pull and restart outpace when the edge image changes
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/outpace-deploy

@@ -47,6 +47,10 @@ Inside a Compose bridge it sees the container network's gateway and cannot safel
 documented router-to-host mapping. Host networking also changes the isolation and port model, so
 it is not enabled by the checked-in deployment.
 
+Running in an LXC guest behind Cloudflare WARP, or tracking the moving `edge` image, has its own
+requirements; see [`deployment-lxc-warp.md`](deployment-lxc-warp.md). In particular, WARP's
+firewall blocks forwarded inbound peers unless the guest is told to let the peer port through.
+
 For a pure leecher, put this in `.env` and restart the service:
 
 ```dotenv

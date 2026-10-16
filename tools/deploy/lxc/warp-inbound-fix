@@ -1,0 +1,34 @@
+#!/bin/bash
+# Keep one inbound TCP peer port reachable on a LAN interface while Cloudflare WARP's
+# default-drop firewall and policy routing are active. See docs/deployment-lxc-warp.md.
+#
+# WARP drops public-source inbound packets and routes replies into its tunnel. This script
+# (1) opens PORT in WARP's own nft chains and (2) tags inbound connections with WARP's bypass
+# fwmark, read from its live "not from fwmark X" rule, so replies use the main table out IFACE.
+# tcp_fwmark_accept makes the SYN-ACK and the accepted socket inherit that mark, which is what
+# lets the route be chosen correctly the first time (rerouting afterwards does not help,
+# because nft's `oif` keeps matching the original device).
+#
+# Idempotent and re-applied every few seconds, so it survives WARP rebuilding its rules or
+# re-registering its policy rule at a different priority on reconnect.
+set -u
+. /etc/default/warp-inbound-fix   # PORT, IFACE
+while true; do
+  sysctl -qw net.ipv4.tcp_fwmark_accept=1
+  MARK=$(ip rule show | sed -n 's/.*not from all fwmark \(0x[0-9a-f]*\) lookup.*/\1/p' | head -1)
+  MARK=${MARK:-0x100cf}
+  MARKDEC=$((MARK))
+  if ! nft list table inet inbound_fix 2>/dev/null | grep -qE "meta mark set (0x0*$(printf '%x' "$MARKDEC")|$MARKDEC)\$"; then
+    nft delete table inet inbound_fix 2>/dev/null
+    nft add table inet inbound_fix
+    nft add chain inet inbound_fix pre '{ type filter hook prerouting priority -150; }'
+    nft add rule inet inbound_fix pre iifname "$IFACE" tcp dport "$PORT" meta mark set "$MARK"
+  fi
+  if nft list table inet cloudflare-warp >/dev/null 2>&1; then
+    nft list chain inet cloudflare-warp input  | grep -qF "iifname \"$IFACE\" tcp dport $PORT accept" ||
+      nft insert rule inet cloudflare-warp input  iifname "$IFACE" tcp dport "$PORT" accept
+    nft list chain inet cloudflare-warp output | grep -qF "oifname \"$IFACE\" tcp sport $PORT accept" ||
+      nft insert rule inet cloudflare-warp output oifname "$IFACE" tcp sport "$PORT" accept
+  fi
+  sleep 5
+done
