@@ -345,6 +345,8 @@ pub struct Config {
     /// experimental legacy adapter; outpace's native `/streams` and `/broadcast` API is the
     /// supported surface.
     pub experimental_ace_compat: bool,
+    /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
+    pub bep9_content_id_fallback: bool,
 }
 
 impl Default for Config {
@@ -377,6 +379,7 @@ impl Default for Config {
             port_map_backend: ace_swarm::portmap::PortMapBackend::Auto,
             port_map_external_port: None,
             experimental_ace_compat: false,
+            bep9_content_id_fallback: false,
         }
     }
 }

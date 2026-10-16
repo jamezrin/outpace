@@ -1,6 +1,7 @@
-//! End-to-end content-id resolution over an in-memory peer: BT handshake → extended
+//! End-to-end outpace raw-transport-hash resolution over an in-memory peer: BT handshake → extended
 //! handshake (advertising `ut_metadata` + `metadata_size`) → serve the `AceStreamTransport`
-//! blob via BEP-9 → decode to a `StreamInfo`. No network, no Acestream API.
+//! blob via BEP-9 → decode to a `StreamInfo`. No network, no Acestream API. These synthetic
+//! tests do not establish how public catalog content ids are derived.
 
 use ace_peer::session::PeerSession;
 use ace_swarm::resolve::{resolve_via_peer, ResolveError};
@@ -53,7 +54,7 @@ async fn resolve_via_peer_fetches_and_decodes_transport() {
         "want a multi-piece blob"
     );
 
-    // Content-id is SHA-1 of the raw transport file; handshake on that identity.
+    // Outpace's synthetic broadcast identifier is SHA-1 of the raw wrapped transport.
     let content_id = transport_file_hash(&transport);
     let transport_peer = transport.clone();
 

@@ -79,6 +79,25 @@ The descriptor title is authoritative for both `metadata.title` and `Icy-Name`; 
 invent a title.
 Live HLS media playlists are unchanged because they have no portable stream-title field.
 
+## Content-id resolution
+
+Live and VOD content-id inputs resolve through the catalog by default. Catalog failure
+returns an error; automatic BEP-9 peer fallback is disabled. The same daemon can resolve
+its own broadcast content ids using its trusted local broadcast registry.
+
+Set `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` on the receiving daemon or standalone `play`
+process to enable BEP-9 fallback after catalog failure. This supports the raw wrapped
+transport-file hash convention used by outpace broadcasts. The peer result must satisfy
+`SHA1(raw wrapped transport bytes) == requested identifier`; this is not an established
+public catalog content-id derivation. Peer results stay outside the catalog-provenance
+infohash index and do not authorize later bare-infohash playback.
+
+The broadcast Ace link needs this opt-in when used across daemons or by standalone `play`.
+Alternatively, use `http://<host>:<http-port>/broadcast/<name>` as a transport URL, subject
+to the receiver's transport-URL access policy. Same-daemon broadcast playback needs no
+opt-in. See [protocol note 63](protocol/notes/63-bep9-content-id-policy.md) for evidence,
+trust boundaries and migration details.
+
 ## Infohash inputs
 
 Catalog resolution verifies the response signature, request nonce and transport checksum.

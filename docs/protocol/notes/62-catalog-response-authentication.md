@@ -94,10 +94,12 @@ policy, bind address, cache path or environment setting changes here.
 The response nonce binds a reply to an outstanding request. It does **not** prove
 that the transport derives the requested content id. Public catalog content ids
 must not be assumed to equal the SHA-1 of the transport bytes; that unresolved
-question and the BEP-9 fallback remain in #177. Catalog failure can still lead a
-caller to its existing peer fallback, whose descriptors remain outside the shared
-catalog-provenance index. A stronger server trust anchor or verified content-id
-binding would be needed to remove the remaining forgery risk. The question of
+question is tracked in #177. As updated by [note 63](63-bep9-content-id-policy.md),
+catalog failure returns an error by default. Raw transport-hash BEP-9 fallback requires
+`OUTPACE_BEP9_CONTENT_ID_FALLBACK=1`, and its descriptors remain outside the shared
+catalog-provenance index. The daemon's own broadcast ids resolve through a separate
+trusted local broadcast registry without this opt-in. A stronger server trust anchor or
+verified content-id binding would be needed to remove the remaining forgery risk. The question of
 third-party catalog registration is also unresolved.
 
 Verification uses offline Rust regression tests, the workspace test suite,

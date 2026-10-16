@@ -37,8 +37,9 @@ behavior pending a broader official-engine error capture.
 
 An `infohash=` or `magnet=` selector is refused with an error envelope (HTTP 200,
 `response: null`) unless the daemon holds a verified transport descriptor for that infohash.
-That happens when it resolved the stream by content id earlier in this process,
-or originates the broadcast. outpace does not guess live geometry for a bare infohash.
+That happens when it resolved the stream through the signed catalog by content id earlier
+in this process, or originates the broadcast. A BEP-9 content-id result does not grant this
+permission. outpace does not guess live geometry for a bare infohash.
 
 Compatibility HLS is currently limited to public, unencrypted live inputs. Playlist/transcode
 parameters are accepted as inert compatibility hints: the adapter always exposes the existing raw
@@ -59,9 +60,18 @@ Dispatched on `?method=`; the response envelope is `{ "result": <value>, "error"
 | `get_version` | Supported | `version`, `code` | `version` is the crate version; `code` packs `MAJOR*10000 + MINOR*100 + PATCH`. |
 | `get_status` | Supported | `status`, `active_sessions` | `status` is `dl` when any session is active, else `idle`. |
 | `get_network_connection_status` | Supported | `status`, `connected`, `networks` | `connected` reflects whether any provider network is registered. |
-| `analyze_content` | Supported | `infohash`, `content_id`, `is_live`, `is_encrypted`, `status` | Resolves the content selector to its infohash. `infohash`/`magnet` selectors resolve offline; `content_id`/`url` need the live catalog/transport and are gated by the same switch as `/ace/getstream` content-id resolution. Resolving a `content_id` here also lets a later `infohash=` playback of the result succeed (a `url` does not); an offline `infohash`/`magnet` analysis does not make that infohash playable. |
+| `analyze_content` | Supported | `infohash`, `content_id`, `is_live`, `is_encrypted`, `status` | Resolves the content selector to its infohash. `infohash`/`magnet` selectors resolve offline; `content_id`/`url` need the live catalog/transport and are gated by the same switch as `/ace/getstream` content-id resolution. Resolving a `content_id` through the signed catalog here also lets a later `infohash=` playback of the result succeed (a BEP-9 result or `url` does not); an offline `infohash`/`magnet` analysis does not make that infohash playable. |
 | `get_content_id` | Supported (echo only) | `content_id` | Echoes a caller-supplied `content_id`/`query`. It cannot derive a content id from a bare infohash/url and returns an error envelope in that case. |
-| `get_media_files` | Supported (best-effort) | `infohash`, `files[]` | outpace transports are single-file, so one media file is reported, keyed by infohash. Resolving a `content_id` here also lets a later `infohash=` playback of the result succeed (a `url` does not). `dump_transport_file` is not supported. |
+| `get_media_files` | Supported (best-effort) | `infohash`, `files[]` | outpace transports are single-file, so one media file is reported, keyed by infohash. Resolving a `content_id` through the signed catalog here also lets a later `infohash=` playback of the result succeed (a BEP-9 result or `url` does not). `dump_transport_file` is not supported. |
+
+Content-id resolution for live and VOD is catalog-only by default, with a trusted local
+registry for the daemon's own broadcasts. `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` opts the
+receiving daemon into raw transport-hash BEP-9 fallback after catalog failure. It checks
+SHA-1 of the wrapped transport bytes against the requested identifier and does not populate
+the catalog-provenance infohash index. Cross-daemon outpace broadcast Ace links need this
+opt-in; a transport URL is an alternative. See [note 63](notes/63-bep9-content-id-policy.md).
+The `/server/api` content-analysis methods remain catalog-only; this opt-in applies to
+playback resolution, not content analysis.
 
 ### Selector parameters (`analyze_content`, `get_content_id`, `get_media_files`)
 

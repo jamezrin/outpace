@@ -2,8 +2,10 @@
 //!
 //! Every live [`StreamInfo`] comes from a decoded `AceStreamTransport` descriptor
 //! ([`stream_info_from_transport`]): the descriptor supplies the swarm infohash, geometry,
-//! trackers and source pubkey. The descriptor is located by content id (the signed catalog,
-//! then BEP-9 `ut_metadata` as a fallback) or fetched from a transport-file URL. A bare
+//! trackers and source pubkey. The descriptor is located by content id through the signed
+//! catalog or fetched from a transport-file URL. Explicitly opted-in callers may also use
+//! BEP-9 for the outpace raw-transport-hash namespace; this is not a verified derivation of
+//! public catalog content ids. A bare
 //! infohash carries no geometry, so it is never turned into a `StreamInfo` by guessing
 //! (issue #164); callers keep descriptors they have verified in an [`InfohashIndex`].
 
@@ -194,12 +196,13 @@ pub fn infohash_hex(infohash: &[u8; 20]) -> String {
     hex::encode(&infohash[..])
 }
 
-/// Resolve a content-id to a [`StreamInfo`] over an already-connected peer, by fetching the
-/// `AceStreamTransport` metadata via BEP-9 `ut_metadata` and decoding it.
+/// Resolve an outpace raw-transport-hash identifier to a [`StreamInfo`] over an
+/// already-connected peer, fetching `AceStreamTransport` metadata via BEP-9 `ut_metadata`.
 ///
-/// The content-id (`handshake_infohash`) is the metadata-swarm key used for the BT handshake;
-/// the returned `StreamInfo` carries the *real* infohash — `SHA1` of the fetched transport
-/// descriptor — plus geometry and trackers. No Acestream HTTP/index API is involved.
+/// `handshake_infohash` must be SHA-1 of the complete wrapped transport bytes. This convention
+/// is used by outpace broadcasts; public catalog content ids are not known to follow it.
+/// The returned `StreamInfo` carries the distinct descriptor-derived swarm infohash, geometry
+/// and trackers. This low-level function does not apply the daemon's opt-in policy.
 pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut PeerSession<S>,
     handshake_infohash: [u8; 20],
@@ -214,8 +217,9 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
 /// pure decode half is left to the caller ([`stream_info_from_transport`] for live,
 /// [`vod_info_from_transport`] for VOD).
 ///
-/// After the fetch, the blob is bound to `handshake_infohash`: content-id is SHA-1 of the raw
-/// transport file, so a peer that serves a well-formed but different blob is rejected.
+/// After the fetch, SHA-1 of the raw wrapped blob must equal `handshake_infohash`, rejecting
+/// substitution in the outpace raw-hash namespace. This does not implement a general public
+/// catalog content-id derivation, nor grant catalog provenance to peer-supplied trackers.
 pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut PeerSession<S>,
     handshake_infohash: [u8; 20],
@@ -509,7 +513,7 @@ fn checked_metadata_size(size: i64) -> Result<usize, ResolveError> {
 /// Whether `blob` is the transport file identified by `expected` (SHA-1 of the raw bytes).
 ///
 /// Catalog checksums identify the raw transport bytes, not necessarily the requested content
-/// id. The BEP-9 fallback's assumption that those identifiers coincide remains tracked in #177.
+/// id. BEP-9 callers deliberately opt into the outpace raw-hash namespace (protocol note 63).
 fn checked_transport_file_hash(blob: &[u8], expected: [u8; 20]) -> bool {
     transport_file_hash(blob) == expected
 }

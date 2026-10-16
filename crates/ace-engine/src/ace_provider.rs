@@ -4,10 +4,13 @@
 //!
 //! LIVE-GATED: the peer I/O path requires the real Acestream swarm and is verified in the
 //! operator's environment (it cannot run in CI/sandbox). Content-id → transport-file
-//! resolution first uses the official signed catalog path, with BEP-9 `ut_metadata` as a
-//! fallback (see [`ace_swarm::resolve`]). A bare infohash opens only from a transport descriptor
+//! resolution uses the signed catalog or a broadcast originated by this daemon. An opt-in
+//! BEP-9 fallback supports outpace's raw wrapped-transport hash namespace, not an established
+//! public content-id derivation (see [`ace_swarm::resolve`]). A bare infohash opens only from a transport descriptor
 //! this process has already verified, and otherwise fails closed (issue #164).
 
+#[cfg(test)]
+mod content_id_policy_tests;
 #[cfg(test)]
 mod discovery_tests;
 #[cfg(test)]
@@ -275,10 +278,12 @@ pub struct AceProvider {
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
     resolve_cache: ResolveCache,
-    /// Content ids resolved over BEP-9 peers. BEP-9 binds a blob only to the content id the
-    /// caller chose, and the infohash does not bind trackers/categories, so these results must
+    /// Raw wrapped-transport hashes resolved over BEP-9 peers with explicit opt-in. The raw
+    /// hash does not establish a public content-id binding, and the infohash does not bind
+    /// trackers/categories, so these results must
     /// never make an infohash openable (#164): they are never put into `infohash_index`.
     peer_resolve_cache: ResolveCache,
+    bep9_content_id_fallback: bool,
     /// Live descriptors keyed by swarm infohash. Filled only by signed-catalog content-id
     /// resolutions (never BEP-9 or a transport url; own broadcasts are read from the seed
     /// registry instead), so a later bare-infohash open uses the real geometry, pubkey and
@@ -316,6 +321,7 @@ impl AceProvider {
             bootstrap_peers: Vec::new(),
             resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
             peer_resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
+            bep9_content_id_fallback: false,
             infohash_index: InfohashIndex::new(INFOHASH_INDEX_CAPACITY),
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
@@ -329,6 +335,12 @@ impl AceProvider {
             warm_peers: WarmPeerCache::memory(),
             reachability: None,
         }
+    }
+
+    /// Opt into resolving content ids as raw wrapped-transport hashes over BEP-9.
+    pub fn with_bep9_content_id_fallback(mut self, enabled: bool) -> Self {
+        self.bep9_content_id_fallback = enabled;
+        self
     }
 
     /// Share a [`ReachabilityMonitor`] so `yourip` values peers echo on our outbound handshakes
@@ -490,32 +502,50 @@ impl AceProvider {
     }
 
     /// Resolve a content-id to a [`StreamInfo`] by fetching its `AceStreamTransport` metadata
-    /// from the signed catalog path, falling back to BEP-9 `ut_metadata` from a metadata-swarm
-    /// peer (cached with a TTL). The content-id itself is the metadata-swarm handshake key;
-    /// the result carries the real infohash. Only a signed-catalog result is recorded in the
+    /// from the signed catalog path or this daemon's own broadcast registry. With explicit
+    /// opt-in, BEP-9 peers can resolve raw wrapped-transport hashes (cached with a TTL).
+    /// Only a signed-catalog result is recorded in the
     /// infohash index; a BEP-9 result goes to `peer_resolve_cache` and never makes its infohash
     /// openable (#164).
     async fn resolve_content_id(&self, content_id: &str) -> Result<StreamInfo, ProviderError> {
+        self.resolve_content_id_with_catalog(content_id, resolve_via_catalog(content_id))
+            .await
+    }
+
+    async fn resolve_content_id_with_catalog(
+        &self,
+        content_id: &str,
+        catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>>,
+    ) -> Result<StreamInfo, ProviderError> {
         if let Some(info) = self.resolve_cache.get(content_id) {
             // Re-record: the bounded infohash index may have evicted it since (#164).
             self.infohash_index.put(info.clone());
             return Ok(info);
         }
-        if let Some(info) = self.peer_resolve_cache.get(content_id) {
-            return Ok(info);
-        }
         let key = hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
+        if let Some(bytes) = self.seed_registry.broadcast_transport_for_content_id(&key) {
+            return stream_info_from_transport(&bytes)
+                .map_err(|e| ProviderError::Backend(format!("local broadcast descriptor: {e:?}")));
+        }
+        if self.bep9_content_id_fallback {
+            if let Some(info) = self.peer_resolve_cache.get(content_id) {
+                return Ok(info);
+            }
+        }
 
-        match resolve_via_catalog(content_id).await {
+        let catalog_error = match catalog.await {
             Ok(info) => {
-                let ih = infohash_hex(&info.infohash);
-                crate::alog!("[ace] resolved cid:{content_id} via catalog -> infohash {ih}");
+                crate::alog!("[ace] resolved content id via catalog");
                 self.resolve_cache.put(content_id, info.clone());
                 self.infohash_index.put(info.clone());
                 return Ok(info);
             }
-            Err(e) => crate::alog!("[ace] resolve cid:{content_id}: catalog failed: {e:?}"),
+            Err(e) => e,
+        };
+        if !self.bep9_content_id_fallback {
+            return Err(disabled_content_id_fallback(catalog_error));
         }
+        crate::alog!("[ace] catalog resolution failed; trying opted-in raw-hash BEP-9 fallback");
 
         let all = if self.bootstrap_peers.is_empty() {
             discover_peers(
@@ -529,7 +559,7 @@ impl AceProvider {
             self.bootstrap_peers.clone()
         };
         crate::alog!(
-            "[ace] resolve cid:{content_id}: {} metadata peer(s)",
+            "[ace] raw-hash content-id fallback: {} metadata peer(s)",
             all.len()
         );
 
@@ -543,9 +573,8 @@ impl AceProvider {
             let mut session = session.with_timeout(RESOLVE_PEER_TIMEOUT);
             match resolve_via_peer(&mut session, key, &self.identity).await {
                 Ok(info) => {
-                    let ih = infohash_hex(&info.infohash);
-                    crate::alog!("[ace] resolved cid:{content_id} via {addr} -> infohash {ih}");
-                    // BEP-9 only binds the blob to the content id the caller chose: keep it
+                    crate::alog!("[ace] resolved raw-hash content id via metadata peer");
+                    // A raw transport hash is not catalog authentication: keep the descriptor
                     // out of the infohash index (#164).
                     self.peer_resolve_cache.put(content_id, info.clone());
                     return Ok(info);
@@ -563,7 +592,8 @@ impl AceProvider {
     /// entry point (native `/streams`, compat `/ace/getstream` + `/ace/manifest.m3u8`, and
     /// `outpace play`). See #164.
     ///
-    /// - `cid:<40hex>`: signed catalog, then BEP-9 peers ([`Self::resolve_content_id`]).
+    /// - `cid:<40hex>`: local broadcast or signed catalog; raw-hash BEP-9 peers require opt-in
+    ///   ([`Self::resolve_content_id`]).
     /// - a transport-url id: fetched under the SSRF guard; not recorded in the infohash index.
     /// - a bare 40-hex infohash: a broadcast this daemon originates, or a descriptor resolved
     ///   through the signed catalog and indexed ([`Self::verified_info_for_infohash`]);
@@ -660,19 +690,26 @@ impl AceProvider {
     }
 
     /// Fetch the VOD transport descriptor for `id` and decode it into a [`VodInfo`]. Accepts a
-    /// `cid:<40hex>` content-id (catalog, then metadata-swarm peer) or a transport-url id; a
+    /// `cid:<40hex>` content-id (local broadcast or catalog; raw-hash peers require opt-in)
+    /// or a transport-url id; a
     /// bare infohash is rejected (it carries no descriptor / piece hashes).
     async fn resolve_vod_info(&self, id: &str) -> Result<VodInfo, ProviderError> {
+        self.resolve_vod_info_with_catalog(
+            id,
+            catalog_transport_bytes(id.strip_prefix("cid:").unwrap_or_default()),
+        )
+        .await
+    }
+
+    async fn resolve_vod_info_with_catalog(
+        &self,
+        id: &str,
+        catalog: impl std::future::Future<Output = Result<Vec<u8>, ResolveError>>,
+    ) -> Result<VodInfo, ProviderError> {
         let bytes = if let Some(content_id) = id.strip_prefix("cid:") {
             let key =
                 hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
-            match catalog_transport_bytes(content_id).await {
-                Ok(b) => b,
-                Err(e) => {
-                    crate::alog!("[ace] vod resolve cid:{content_id}: catalog failed: {e:?}");
-                    self.vod_transport_via_peers(key).await?
-                }
-            }
+            self.content_id_transport_with_catalog(key, catalog).await?
         } else if let Some(url) = crate::transport_url::decode_transport_url(id) {
             transport_bytes_from_url(&url)
                 .await
@@ -688,6 +725,28 @@ impl AceProvider {
         };
         vod_info_from_transport(&bytes)
             .map_err(|e| ProviderError::Backend(format!("vod descriptor: {e:?}")))
+    }
+
+    async fn content_id_transport_with_catalog(
+        &self,
+        key: [u8; 20],
+        catalog: impl std::future::Future<Output = Result<Vec<u8>, ResolveError>>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        if let Some(bytes) = self.seed_registry.broadcast_transport_for_content_id(&key) {
+            return Ok(bytes.as_ref().clone());
+        }
+        match catalog.await {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if !self.bep9_content_id_fallback => {
+                Err(disabled_content_id_fallback(error))
+            }
+            Err(_) => {
+                crate::alog!(
+                    "[ace] VOD catalog resolution failed; trying opted-in raw-hash BEP-9 fallback"
+                );
+                self.vod_transport_via_peers(key).await
+            }
+        }
     }
 
     /// Fetch VOD transport bytes over a metadata-swarm peer (BEP-9 `ut_metadata`), trying each
@@ -721,6 +780,12 @@ impl AceProvider {
             "vod content-id resolution: no metadata peer responded".into(),
         ))
     }
+}
+
+fn disabled_content_id_fallback(catalog_error: ResolveError) -> ProviderError {
+    ProviderError::Backend(format!(
+        "content-id catalog resolution failed: {catalog_error:?}; raw-hash BEP-9 fallback is disabled (OUTPACE_BEP9_CONTENT_ID_FALLBACK=1 to opt in)"
+    ))
 }
 
 /// Whether `id` is a bare 40-hex string: a swarm infohash, or a content id missing its `cid:`
@@ -3958,6 +4023,10 @@ pub(crate) mod test_support {
     use ace_wire::bencode::Bencode;
     use std::collections::BTreeMap;
 
+    pub(crate) fn bep9_enabled(provider: &super::AceProvider) -> bool {
+        provider.bep9_content_id_fallback
+    }
+
     /// A synthetic live `AceStreamTransport` built with outpace's own encoder and a freshly
     /// generated RSA source key (#164). Nothing is derived from a real stream; callers compute
     /// its infohash at test time. Returns `(transport_bytes, pubkey_der)`.
@@ -4914,10 +4983,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_bep9_policy_does_not_read_peer_cache() {
+        let (transport, _) = test_support::synthetic_live_transport(524_288);
+        let info = stream_info_from_transport(&transport).unwrap();
+        let p = test_provider();
+        p.peer_resolve_cache.put(PLACEHOLDER_ID, info);
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            p.resolve_content_id_with_catalog(
+                PLACEHOLDER_ID,
+                std::future::ready(Err(ResolveError::Catalog("synthetic catalog failure"))),
+            ),
+        )
+        .await;
+        let error = result
+            .expect("disabled policy must fail before peer I/O")
+            .unwrap_err();
+        assert!(error.to_string().contains("fallback is disabled"));
+    }
+
+    #[tokio::test]
     async fn peer_resolved_content_id_does_not_make_its_infohash_openable() {
         let (transport, _) = test_support::synthetic_live_transport(524_288);
         let verified = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
-        let p = test_provider();
+        let p = test_provider().with_bep9_content_id_fallback(true);
         p.peer_resolve_cache.put(PLACEHOLDER_ID, verified.clone());
 
         // The caller who chose this content id gets its descriptor...

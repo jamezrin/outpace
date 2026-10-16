@@ -70,7 +70,8 @@ fn parse_broadcast_name(value: &str) -> Result<String, String> {
 pub struct PlayArgs {
     /// acestream://<content-id> URL or HTTP(S) transport-file URL. `acestream:?infohash=` and
     /// magnet inputs are accepted but fail closed: a one-shot play holds no verified transport
-    /// descriptor for a bare infohash.
+    /// descriptor for a bare infohash. Remote Outpace broadcast Ace links require
+    /// OUTPACE_BEP9_CONTENT_ID_FALLBACK=1; transport-file URLs are also supported.
     pub input: String,
     /// Bootstrap peer to try in addition to configured discovery (repeatable).
     #[arg(long = "peer")]
@@ -191,6 +192,8 @@ fn broadcast_output(
             "RTMP Ingest URL: {rtmp}\n",
             "Content ID: {content_id}\n",
             "Ace link: acestream://{content_id}\n",
+            "Remote Outpace consumers need OUTPACE_BEP9_CONTENT_ID_FALLBACK=1 for this raw-hash Ace link.\n",
+            "The Transport URL also supports remote playback.\n",
             "Infohash: {infohash}\n",
             "Transport URL: http://{transport_host}:{transport_port}/broadcast/{name}\n",
             "Peer listen: {peer_listen}\n"
@@ -221,6 +224,7 @@ fn play_provider_from_config(
         .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
         .with_cache(config.cache_type, config.cache_dir.clone())
         .with_seeding_enabled(config.enable_seeding)
+        .with_bep9_content_id_fallback(config.bep9_content_id_fallback)
         .with_prefetch_pieces(config.prefetch_pieces)
         .with_startup_buffer(config.startup_buffer)
         .with_live_recovery(config.live_recovery)
@@ -383,6 +387,26 @@ mod tests {
         assert_eq!(provider.prefetch_policy(), Some(17));
         assert_eq!(provider.startup_buffer_config(), config.startup_buffer);
         assert_eq!(provider.live_recovery_config(), config.live_recovery);
+    }
+
+    #[test]
+    fn play_provider_receives_bep9_policy_from_config() {
+        for enabled in [false, true] {
+            let config = crate::config::Config {
+                bep9_content_id_fallback: enabled,
+                ..Default::default()
+            };
+            let provider = play_provider_from_config(
+                std::sync::Arc::new(ace_wire::identity::Identity::generate()),
+                &config,
+                vec![],
+                ace_swarm::listen::SeedRegistry::new(),
+            );
+            assert_eq!(
+                crate::ace_provider::test_support::bep9_enabled(&provider),
+                enabled
+            );
+        }
     }
 
     #[test]
