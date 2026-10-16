@@ -394,6 +394,8 @@ Start with these durable docs instead of a session resume file:
 - [`docs/testing/interop-swarm.md`](docs/testing/interop-swarm.md) - the `swarmtest`
   engine<->outpace interop harness (on-demand, local-only; needs docker + the
   proprietary engine, so it is NOT run in CI).
+- [`docs/deployment-lxc-warp.md`](docs/deployment-lxc-warp.md) - LXC guest behind Cloudflare
+  WARP, `edge` auto-deploy, and the inbound-peer workaround (scripts in `tools/deploy/lxc/`).
 - `docs/superpowers/plans/` and `docs/superpowers/specs/` - implementation plans
   and design specs retained as historical project records.
 

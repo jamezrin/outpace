@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep an inbound peer port reachable through Cloudflare WARP's firewall
+After=network-online.target warp-svc.service
+Wants=warp-svc.service
+
+[Service]
+ExecStart=/usr/local/sbin/warp-inbound-fix
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

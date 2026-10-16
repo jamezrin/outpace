@@ -1,0 +1,10 @@
+[Unit]
+Description=Check GHCR for a new outpace edge image
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
