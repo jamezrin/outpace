@@ -81,6 +81,11 @@ Live HLS media playlists are unchanged because they have no portable stream-titl
 
 ## Infohash inputs
 
+Catalog resolution verifies the response signature, request nonce and transport checksum.
+The engine-compatible signature uses an embedded shared key rather than a server-only trust
+anchor; [protocol note 62](protocol/notes/62-catalog-response-authentication.md) describes the
+remaining forgery risk over plain HTTP.
+
 A bare infohash carries no piece geometry or source key, and outpace never guesses them. An
 infohash `<id>` plays only when this daemon already holds a verified transport descriptor for it:
 the stream was resolved earlier in this process through the signed catalog by native

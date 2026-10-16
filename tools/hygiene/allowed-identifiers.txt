@@ -37,3 +37,8 @@ ced69f36873ffbef9806f29321dbf9c68d4e52bf  git commit SHA referenced in a note
 # jemalloc's git-describe hash inside a Cargo.lock version string. Cargo.lock is
 # excluded from the scan, but list it so the value is documented as non-identifier.
 e13ca993e8ccb9ba9847cc330696e02839f328f7  jemalloc git-describe hash (tikv-jemalloc-sys version)
+
+# --- Synthetic catalog authentication fixtures (#178) ---
+fbda7c3c07e9526fbbf26b3c383c81de798c7ff0  signature/checksum of synthetic catalog fixture response.xml
+6f6c6a3de5d65944cf8328f0ae2059a200d99192  signature/checksum of synthetic catalog fixture response.xml
+f746d294bbe937dda3df6205e340700d81334f9f  signature/checksum of synthetic catalog fixture substituted.xml

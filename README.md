@@ -75,6 +75,10 @@ playback id, so playback works after a daemon restart without any server-side al
 
 ### Infohash inputs
 
+Catalog replies require the engine-compatible response signature, matching request nonce and
+transport checksum. The response key is embedded in clients, so this does not provide
+server-only authentication over plain HTTP; see [the protocol evidence and trust limits](docs/protocol/notes/62-catalog-response-authentication.md).
+
 A bare infohash identifies a swarm but carries no piece geometry or source key. outpace never
 guesses them. An infohash input (the native `/streams/ace/<40-hex>` form, compat `infohash=` or
 `magnet=`, CLI `acestream:?infohash=` or `magnet:`) plays only when the process already holds a

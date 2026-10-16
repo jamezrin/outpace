@@ -1,5 +1,8 @@
 # 45 - `content_id` now resolves through the signed catalog
 
+Response authentication was added later: see [note 62](62-catalog-response-authentication.md)
+for the engine's separate response signature, request nonce check and shared-key limitations.
+
 Date: 2026-07-02.
 
 Note 44 fixed the `/ace/getstream?content_id=` route shape but still depended on
