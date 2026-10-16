@@ -1103,12 +1103,12 @@ mod tests {
             walk.abort();
             servers.abort_all();
         }
-        if first.is_ok() {
+        if let Ok(first) = &first {
             let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            assert_ne!(first.as_ref().unwrap().as_ref().unwrap(), &second);
+            assert_ne!(first.as_ref().unwrap(), &second);
         }
         let _ = walk.await;
         while servers.join_next().await.is_some() {}
