@@ -103,3 +103,18 @@ This resolves the content-id startup blocker from note 44. It does not change th
 Synthetic Live Channel continuity limitation documented in notes 41-43: the currently reachable upstream
 still serves only the initial window and then advertises a stale window behind the next
 needed piece.
+
+## Current policy (2026-10-16, #177)
+
+The fallback and playback descriptions above record the implementation at the time.
+Content-id resolution for live and VOD now uses the catalog by default; catalog failure
+returns an error unless `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` explicitly enables raw
+transport-hash BEP-9 fallback. This validates SHA-1 of the complete wrapped transport
+against the requested identifier, not a public catalog content-id derivation. Peer results
+remain outside the catalog-provenance infohash index.
+
+The daemon resolves its own broadcast content ids through a trusted local broadcast
+registry without opting in. Cross-daemon broadcast Ace links and standalone `play` need
+the receiver's opt-in, or a transport URL instead. Metadata serving and the outpace
+broadcast raw-hash convention remain supported. See [note 63](63-bep9-content-id-policy.md)
+for current evidence and migration details.

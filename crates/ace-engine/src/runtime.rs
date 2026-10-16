@@ -152,6 +152,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_EXPERIMENTAL_ACE_COMPAT")? {
         config.experimental_ace_compat = v;
     }
+    if let Some(v) = bool_from_env("OUTPACE_BEP9_CONTENT_ID_FALLBACK")? {
+        config.bep9_content_id_fallback = v;
+    }
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
@@ -427,6 +430,7 @@ fn url_host_from_ip(ip: IpAddr) -> String {
 
 fn ace_provider_from_config(provider: AceProvider, config: &Config) -> AceProvider {
     provider
+        .with_bep9_content_id_fallback(config.bep9_content_id_fallback)
         .with_prefetch_pieces(config.prefetch_pieces)
         .with_startup_buffer(config.startup_buffer)
         .with_live_recovery(config.live_recovery)
@@ -848,6 +852,48 @@ mod tests {
     }
 
     #[test]
+    fn daemon_provider_receives_bep9_policy_from_config() {
+        for enabled in [false, true] {
+            let config = Config {
+                bep9_content_id_fallback: enabled,
+                ..Config::default()
+            };
+            let provider = ace_provider_from_config(
+                AceProvider::new(Arc::new(ace_wire::identity::Identity::generate()), 0),
+                &config,
+            );
+            assert_eq!(
+                crate::ace_provider::test_support::bep9_enabled(&provider),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn bep9_fallback_env_defaults_off_and_parses_strictly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_BEP9_CONTENT_ID_FALLBACK";
+        let old = std::env::var_os(name);
+        std::env::remove_var(name);
+        assert!(!config_from_env().unwrap().bep9_content_id_fallback);
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(name, value);
+            assert_eq!(
+                config_from_env().unwrap().bep9_content_id_fallback,
+                expected
+            );
+        }
+        for invalid in ["", "yes", "TRUE", " true", "1 "] {
+            std::env::set_var(name, invalid);
+            assert!(config_from_env().unwrap_err().to_string().contains(name));
+        }
+        match old {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    #[test]
     fn rtmp_bind_env_override_sets_config_rtmp_bind() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("OUTPACE_RTMP_BIND");
@@ -1130,6 +1176,7 @@ mod tests {
             "OUTPACE_ENABLE_INBOUND",
             "OUTPACE_ENABLE_PORT_MAPPING",
             "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+            "OUTPACE_BEP9_CONTENT_ID_FALLBACK",
         ];
         for name in names {
             std::env::remove_var(name);

@@ -236,6 +236,23 @@ impl SeedRegistry {
         self.stores.lock().unwrap().get(key)?.metadata.clone()
     }
 
+    /// The transport at an exact content-id key owned by a local broadcast. Verify the raw
+    /// wrapped transport hash before granting local trust; generic seeded metadata is excluded.
+    pub fn broadcast_transport_for_content_id(
+        &self,
+        content_id: &[u8; 20],
+    ) -> Option<Arc<Vec<u8>>> {
+        let metadata = {
+            let map = self.stores.lock().unwrap();
+            let entry = map.get(content_id)?;
+            if entry.kind != OwnerKind::Broadcast {
+                return None;
+            }
+            entry.metadata.clone()?
+        };
+        (ace_wire::infohash::transport_file_hash(&metadata) == *content_id).then_some(metadata)
+    }
+
     /// The transport descriptor of a broadcast this registry originates whose swarm infohash is
     /// `infohash`, if any (#164). Broadcast transports are registered under their content id
     /// (the BEP-9 metadata key), so this scans broadcast-owned metadata and keeps the descriptor
@@ -618,12 +635,18 @@ mod tests {
 
         let reg = SeedRegistry::new();
         assert!(reg.broadcast_transport_for_infohash(&ih).is_none());
+        assert!(reg.broadcast_transport_for_content_id(&cid).is_none());
         let (_store, lease) =
             reg.lease_broadcast(ih, cid, transport.clone(), || PieceStore::new(4, 4, 1024));
         assert_eq!(
             reg.broadcast_transport_for_infohash(&ih).as_deref(),
             Some(&transport)
         );
+        assert_eq!(
+            reg.broadcast_transport_for_content_id(&cid).as_deref(),
+            Some(&transport)
+        );
+        assert!(reg.broadcast_transport_for_content_id(&ih).is_none());
         assert!(
             reg.broadcast_transport_for_infohash(&cid).is_none(),
             "a content id is not a swarm infohash"
@@ -631,8 +654,20 @@ mod tests {
         drop(lease);
         assert!(reg.broadcast_transport_for_infohash(&ih).is_none());
         // Metadata registered outside a broadcast lease is not an originated broadcast.
-        reg.register_metadata(cid, transport);
+        reg.register_metadata(cid, transport.clone());
         assert!(reg.broadcast_transport_for_infohash(&ih).is_none());
+        assert!(reg.broadcast_transport_for_content_id(&cid).is_none());
+        let wrong_cid = [8; 20];
+        let (_, _lease) =
+            reg.lease_broadcast(ih, wrong_cid, transport, || PieceStore::new(4, 4, 1024));
+        assert!(
+            reg.broadcast_transport_for_content_id(&wrong_cid).is_none(),
+            "broadcast ownership cannot bypass raw hash verification"
+        );
+        assert!(
+            reg.broadcast_transport_for_content_id(&cid).is_none(),
+            "another key's broadcast owner cannot authorize generic metadata"
+        );
     }
 
     #[test]

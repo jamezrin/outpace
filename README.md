@@ -73,6 +73,19 @@ The `/ace/getstream` compatibility route accepts the same selectors plus legacy
 `content_id` > `infohash` > `id` > `url` > `magnet`. A `url=` selector uses a self-contained
 playback id, so playback works after a daemon restart without any server-side alias table.
 
+### Content-id resolution
+
+Live and VOD content-id inputs use the catalog by default. A catalog failure returns an
+error rather than automatically querying BEP-9 metadata peers. The daemon can also resolve
+its own broadcasts through its trusted local broadcast registry without a catalog lookup.
+
+`OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` explicitly enables the raw transport-hash convention
+used by outpace broadcasts, after catalog failure. This applies to both `serve` and standalone
+`play` (including `--vod`). Peer metadata is accepted only when the SHA-1 of the complete
+wrapped transport bytes equals the requested identifier. This check does not establish the
+binding of a public catalog content id; that derivation remains unresolved. See
+[the content-id policy](docs/protocol/notes/63-bep9-content-id-policy.md).
+
 ### Infohash inputs
 
 Catalog replies require the engine-compatible response signature, matching request nonce and
@@ -126,7 +139,14 @@ The broadcast command prints:
 
 - a raw MPEG-TS HTTP ingest URL;
 - an RTMP ingest URL at `rtmp://<host>:<rtmp-port>/live/<name>`;
-- an `acestream://<content_id>` link backed by BEP-9 `ut_metadata` serving.
+- an `acestream://<content_id>` link using the raw wrapped transport-file hash.
+
+The originating daemon resolves that link through its trusted local broadcast registry.
+A different receiving daemon or standalone `outpace play` needs
+`OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` to resolve it through BEP-9 `ut_metadata`; the default
+catalog policy does not automatically resolve these raw-hash links. Alternatively, pass the
+broadcast transport URL (`http://<host>:<http-port>/broadcast/<name>`) to `outpace play`
+or use the `url=` selector. The receiver's transport-URL access policy still applies.
 
 ## Installation
 
@@ -251,6 +271,10 @@ deferred work are documented in
 
 Environment variables parsed by the daemon include:
 
+- `OUTPACE_BEP9_CONTENT_ID_FALLBACK` - raw transport-hash BEP-9 fallback for content-id
+  resolution after catalog failure, default off. Set to `1` on the receiving daemon or
+  standalone `play` process for outpace broadcast Ace links from another daemon. Applies to
+  live and VOD; peer results do not populate the catalog-provenance infohash index.
 - `OUTPACE_BIND` - HTTP bind address, default `127.0.0.1:6878`.
 - `OUTPACE_RTMP_BIND` - RTMP ingest bind address, default `127.0.0.1:1935`.
 - `OUTPACE_DATA_DIR` - persistent identity/cache root, default platform data dir
