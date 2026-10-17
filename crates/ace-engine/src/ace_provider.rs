@@ -6,8 +6,8 @@
 //! operator's environment (it cannot run in CI/sandbox). Content-id → transport-file
 //! resolution uses the signed catalog or a broadcast originated by this daemon. An opt-in
 //! BEP-9 fallback supports outpace's raw wrapped-transport hash namespace, not an established
-//! public content-id derivation (see [`ace_swarm::resolve`]). A bare infohash opens only from a transport descriptor
-//! this process has already verified, and otherwise fails closed (issue #164).
+//! public content-id derivation (see [`ace_swarm::resolve`]). Cold infohashes use the
+//! authenticated catalog and require a descriptor whose computed hash matches the request.
 
 #[cfg(test)]
 mod content_id_policy_tests;
@@ -38,9 +38,10 @@ use ace_swarm::discover::{
 use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::reachability::ReachabilityMonitor;
 use ace_swarm::resolve::{
-    catalog_transport_bytes, hex20, infohash_hex, resolve_via_catalog, resolve_via_peer,
-    stream_info_from_transport, stream_info_from_transport_url, transport_bytes_from_url,
-    transport_bytes_via_peer, vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
+    catalog_transport_bytes, hex20, infohash_hex, resolve_infohash_via_catalog,
+    resolve_via_catalog, resolve_via_peer, stream_info_from_transport,
+    stream_info_from_transport_url, transport_bytes_from_url, transport_bytes_via_peer,
+    vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
 };
 use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
@@ -172,6 +173,8 @@ const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 /// How many verified live descriptors the infohash index keeps (#164). Each entry is a few KiB
 /// at most (geometry, trackers, pubkey, metadata).
 const INFOHASH_INDEX_CAPACITY: usize = 256;
+const INFOHASH_FAILURE_TTL: Duration = Duration::from_secs(5);
+const INFOHASH_FAILURE_CAPACITY: usize = 128;
 
 /// Byte ceiling for an infohash's shared reseed store. With `SEED_STORE_RETENTION` set this is a
 /// hard safety cap; the age bound is the primary limiter on a live stream.
@@ -290,6 +293,8 @@ pub struct AceProvider {
     /// registry instead), so a later bare-infohash open uses the real geometry, pubkey and
     /// trackers (#164). Separate from `resolve_cache`, which is keyed by the content-id string.
     infohash_index: InfohashIndex,
+    /// Bounded short-lived suppression of failed cold lookups; never a source of metadata.
+    infohash_failures: std::sync::Mutex<VecDeque<([u8; 20], Instant)>>,
     seed_registry: SeedRegistry,
     seed_store_bytes: u64,
     /// Age bound for live seed stores; `None` disables it (byte-only). Default `SEED_STORE_RETENTION`.
@@ -324,6 +329,7 @@ impl AceProvider {
             peer_resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
             bep9_content_id_fallback: false,
             infohash_index: InfohashIndex::new(INFOHASH_INDEX_CAPACITY),
+            infohash_failures: std::sync::Mutex::new(VecDeque::new()),
             seed_registry: SeedRegistry::new(),
             seed_store_bytes: SEED_STORE_BYTES,
             seed_store_retention: Some(SEED_STORE_RETENTION),
@@ -596,10 +602,9 @@ impl AceProvider {
     /// - `cid:<40hex>`: local broadcast or signed catalog; raw-hash BEP-9 peers require opt-in
     ///   ([`Self::resolve_content_id`]).
     /// - a transport-url id: fetched under the SSRF guard; not recorded in the infohash index.
-    /// - a bare 40-hex infohash: a broadcast this daemon originates, or a descriptor resolved
-    ///   through the signed catalog and indexed ([`Self::verified_info_for_infohash`]);
-    ///   otherwise [`ProviderError::Unresolvable`]. BEP-9 and transport-url descriptors never
-    ///   qualify.
+    /// - a bare 40-hex infohash: own broadcast, verified index, then authenticated catalog
+    ///   lookup with strict requested-hash binding. Unavailable metadata fails closed;
+    ///   BEP-9 and transport-url descriptors never qualify for this index.
     ///
     /// Every signed-catalog content-id descriptor resolved here is recorded in the infohash
     /// index, so the stream can later be opened by its infohash too (BEP-9 results are not). outpace never guesses live geometry.
@@ -615,16 +620,9 @@ impl AceProvider {
                 .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")));
         }
         if is_bare_hex40(id) {
-            return match self.verified_info_for_infohash(id) {
-                Ok(info) => {
-                    crate::alog!("[ace] open {id}: using a descriptor verified in this process");
-                    Ok(info)
-                }
-                Err(e) => {
-                    crate::alog!("[ace] open {id}: refused, no verified descriptor for it");
-                    Err(e)
-                }
-            };
+            return self
+                .resolve_infohash_with_catalog(id, resolve_infohash_via_catalog(id))
+                .await;
         }
         Err(ProviderError::Backend(
             "id must be a 40-hex infohash, cid:<40hex>, or a transport-url id".into(),
@@ -633,8 +631,7 @@ impl AceProvider {
 
     /// The verified live descriptor for a bare 40-hex infohash, or
     /// [`ProviderError::Unresolvable`] with a user-facing reason. Offline and synchronous, so
-    /// the compat routes can pre-check an id before minting playback URLs
-    /// ([`StreamProvider::check_openable`]).
+    /// local metadata can take precedence over asynchronous catalog lookup.
     ///
     /// A broadcast this daemon originates wins: its transport is self-minted. Otherwise the
     /// shared index serves a descriptor resolved through the signed catalog. BEP-9 and
@@ -657,6 +654,62 @@ impl AceProvider {
             return Ok(info);
         }
         Err(ProviderError::Unresolvable(unresolved_infohash_message(id)))
+    }
+
+    async fn resolve_infohash_with_catalog(
+        &self,
+        id: &str,
+        catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>>,
+    ) -> Result<StreamInfo, ProviderError> {
+        let requested = hex20(id).map_err(|_| ProviderError::Backend("bad infohash".into()))?;
+        if let Ok(info) = self.verified_info_for_infohash(id) {
+            return Ok(info);
+        }
+        if self
+            .infohash_failures
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(key, at)| *key == requested && at.elapsed() < INFOHASH_FAILURE_TTL)
+        {
+            return Err(ProviderError::Unresolvable(format!(
+                "{} Recent catalog lookup failed; retry shortly.",
+                unresolved_infohash_message(id)
+            )));
+        }
+        let info = match catalog.await {
+            Ok(info) => info,
+            Err(error) => {
+                self.remember_infohash_failure(requested);
+                return Err(ProviderError::Unresolvable(format!(
+                    "{} Catalog lookup failed: {error:?}",
+                    unresolved_infohash_message(id)
+                )));
+            }
+        };
+        if info.infohash != requested {
+            self.remember_infohash_failure(requested);
+            return Err(ProviderError::Unresolvable(
+                "catalog descriptor does not match the requested infohash".into(),
+            ));
+        }
+        self.infohash_index.put(info.clone());
+        crate::alog!("[ace] resolved infohash via authenticated catalog");
+        Ok(info)
+    }
+
+    fn remember_infohash_failure(&self, requested: [u8; 20]) {
+        let mut failures = self.infohash_failures.lock().unwrap();
+        failures.retain(|(key, at)| *key != requested && at.elapsed() < INFOHASH_FAILURE_TTL);
+        if failures.len() >= INFOHASH_FAILURE_CAPACITY {
+            failures.pop_front();
+        }
+        failures.push_back((requested, Instant::now()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_infohash_failure_for_test(&self, id: &str) {
+        self.remember_infohash_failure(hex20(id).expect("synthetic infohash"));
     }
 
     /// Resolve `id` to a single-file VOD, returning a handle that knows its total length and can
@@ -1120,12 +1173,10 @@ impl StreamProvider for AceProvider {
         self.resolve_vod_inner(id).await
     }
 
-    fn check_openable(&self, id: &str) -> Result<(), ProviderError> {
-        if is_bare_hex40(id) {
-            self.verified_info_for_infohash(id).map(|_| ())
-        } else {
-            Ok(())
-        }
+    fn check_openable(&self, _id: &str) -> Result<(), ProviderError> {
+        // Cold infohash lookup is asynchronous. Actual resolution still requires an
+        // authenticated descriptor bound to the requested infohash before discovery.
+        Ok(())
     }
 
     fn remember_live_descriptor(&self, info: &StreamInfo) {
@@ -4765,26 +4816,134 @@ mod tests {
         AceProvider::new(Arc::new(Identity::generate()), 0)
     }
 
-    #[tokio::test]
-    async fn bare_infohash_without_a_verified_descriptor_fails_closed() {
+    #[test]
+    fn cold_infohash_is_admitted_for_async_catalog_resolution() {
         let p = test_provider();
-        // No descriptor and no bootstrap peers: the refusal must come before any discovery, so
-        // the timeout only trips if open() regressed into tracker/DHT I/O.
-        let err = tokio::time::timeout(Duration::from_secs(2), p.open(PLACEHOLDER_ID))
+        assert!(
+            p.check_openable(PLACEHOLDER_ID).is_ok(),
+            "the synchronous pre-check must allow the asynchronous catalog lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_infohash_catalog_result_is_verified_and_indexed() {
+        let (transport, _) = test_support::synthetic_live_transport(524_288);
+        let expected = stream_info_from_transport(&transport).unwrap();
+        let id = infohash_hex(&expected.infohash).to_ascii_uppercase();
+        let p = test_provider();
+        let actual = p
+            .resolve_infohash_with_catalog(&id, std::future::ready(Ok(expected.clone())))
             .await
-            .expect("must fail before any network I/O")
-            .err()
-            .expect("a bare infohash with no verified descriptor must not stream");
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(p.verified_info_for_infohash(&id).unwrap(), expected);
+        assert_eq!(
+            p.resolve_infohash_with_catalog(&id, async {
+                panic!("verified index hit must not query the catalog again")
+            })
+            .await
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_infohash_rejects_mismatched_catalog_descriptor_without_indexing_it() {
+        let (transport, _) = test_support::synthetic_live_transport(524_288);
+        let foreign = stream_info_from_transport(&transport).unwrap();
+        let foreign_id = infohash_hex(&foreign.infohash);
+        let p = test_provider();
+        assert!(matches!(
+            p.resolve_infohash_with_catalog(PLACEHOLDER_ID, std::future::ready(Ok(foreign)))
+                .await,
+            Err(ProviderError::Unresolvable(_))
+        ));
+        assert!(p.verified_info_for_infohash(PLACEHOLDER_ID).is_err());
+        assert!(p.verified_info_for_infohash(&foreign_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn cold_infohash_failed_lookup_is_short_cached() {
+        let p = test_provider();
+        assert!(p
+            .resolve_infohash_with_catalog(
+                PLACEHOLDER_ID,
+                std::future::ready(Err(ResolveError::Catalog("not found"))),
+            )
+            .await
+            .is_err());
+        assert!(p
+            .resolve_infohash_with_catalog(PLACEHOLDER_ID, async {
+                panic!("a recent failure must suppress another catalog request")
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cold_infohash_failure_expires_and_verified_metadata_wins() {
+        let (transport, _) = test_support::synthetic_live_transport(524_288);
+        let expected = stream_info_from_transport(&transport).unwrap();
+        let id = infohash_hex(&expected.infohash);
+        let p = test_provider();
+        p.infohash_failures.lock().unwrap().push_back((
+            expected.infohash,
+            Instant::now() - INFOHASH_FAILURE_TTL - Duration::from_secs(1),
+        ));
+        assert_eq!(
+            p.resolve_infohash_with_catalog(&id, std::future::ready(Ok(expected.clone())))
+                .await
+                .unwrap(),
+            expected
+        );
+        p.remember_infohash_failure(expected.infohash);
+        assert_eq!(
+            p.resolve_infohash_with_catalog(&id, async {
+                panic!("a verified descriptor must win over an earlier failure")
+            })
+            .await
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn cold_infohash_failure_cache_is_bounded_and_deduplicated() {
+        let p = test_provider();
+        for n in 0..=INFOHASH_FAILURE_CAPACITY {
+            p.remember_infohash_failure([n as u8; 20]);
+        }
+        p.remember_infohash_failure([INFOHASH_FAILURE_CAPACITY as u8; 20]);
+        let entries = p.infohash_failures.lock().unwrap();
+        assert_eq!(entries.len(), INFOHASH_FAILURE_CAPACITY);
+        assert!(!entries.iter().any(|(key, _)| *key == [0; 20]));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(key, _)| *key == [INFOHASH_FAILURE_CAPACITY as u8; 20])
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_infohash_fails_closed_after_catalog_lookup() {
+        let p = test_provider();
+        let err = p
+            .resolve_infohash_with_catalog(
+                PLACEHOLDER_ID,
+                std::future::ready(Err(ResolveError::Catalog("not found"))),
+            )
+            .await
+            .expect_err("missing catalog metadata must not invent stream geometry");
         match err {
             ProviderError::Unresolvable(msg) => {
                 assert!(msg.contains(&format!("cid:{PLACEHOLDER_ID}")), "{msg}");
             }
             other => panic!("expected Unresolvable, got {other:?}"),
         }
-        assert!(matches!(
-            p.check_openable(PLACEHOLDER_ID),
-            Err(ProviderError::Unresolvable(_))
-        ));
+        assert!(p.check_openable(PLACEHOLDER_ID).is_ok());
+        assert!(p.verified_info_for_infohash(PLACEHOLDER_ID).is_err());
     }
 
     #[tokio::test]
@@ -5074,7 +5233,7 @@ mod tests {
         let verified = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
         let p = test_provider();
         let ih = infohash_hex(&verified.infohash);
-        assert!(p.check_openable(&ih).is_err());
+        assert!(p.verified_info_for_infohash(&ih).is_err());
 
         // A cached content-id resolution (no network) must also feed the infohash index.
         p.resolve_cache.put(PLACEHOLDER_ID, verified.clone());
@@ -5087,7 +5246,7 @@ mod tests {
 
         // The content id itself is not an infohash: the two namespaces stay separate (#165).
         assert!(matches!(
-            p.check_openable(PLACEHOLDER_ID),
+            p.verified_info_for_infohash(PLACEHOLDER_ID),
             Err(ProviderError::Unresolvable(_))
         ));
     }
@@ -5109,7 +5268,7 @@ mod tests {
 
         // A provider that does not share the broadcast's registry still refuses it.
         assert!(matches!(
-            test_provider().check_openable(&id),
+            test_provider().verified_info_for_infohash(&id),
             Err(ProviderError::Unresolvable(_))
         ));
 
@@ -5158,11 +5317,15 @@ mod tests {
         // ...but BEP-9 binds the blob only to that content id, so the infohash stays closed.
         let ih = infohash_hex(&verified.infohash);
         assert!(matches!(
-            p.check_openable(&ih),
+            p.verified_info_for_infohash(&ih),
             Err(ProviderError::Unresolvable(_))
         ));
         assert!(matches!(
-            p.resolve_live_info(&ih).await,
+            p.resolve_infohash_with_catalog(
+                &ih,
+                std::future::ready(Err(ResolveError::Catalog("not found")))
+            )
+            .await,
             Err(ProviderError::Unresolvable(_))
         ));
     }

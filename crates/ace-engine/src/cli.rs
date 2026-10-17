@@ -69,8 +69,8 @@ fn parse_broadcast_name(value: &str) -> Result<String, String> {
 #[derive(Debug, Args)]
 pub struct PlayArgs {
     /// acestream://<content-id> URL or HTTP(S) transport-file URL. `acestream:?infohash=` and
-    /// magnet inputs are accepted but fail closed: a one-shot play holds no verified transport
-    /// descriptor for a bare infohash. Remote Outpace broadcast Ace links require
+    /// magnet inputs resolve live descriptors through the authenticated catalog, requiring
+    /// the descriptor to match the requested infohash. Remote Outpace broadcast Ace links require
     /// OUTPACE_BEP9_CONTENT_ID_FALLBACK=1; transport-file URLs are also supported.
     pub input: String,
     /// Bootstrap peer to try in addition to configured discovery (repeatable).
@@ -425,12 +425,13 @@ mod tests {
             .to_string();
         let play_flat = play.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(play_flat.contains("acestream://<content-id> URL or HTTP(S) transport-file URL"));
-        assert!(play_flat.contains("fail closed"));
+        assert!(play_flat.contains("authenticated catalog"));
+        assert!(play_flat.contains("match the requested infohash"));
         assert!(play.contains("verified VOD"));
     }
 
     #[tokio::test]
-    async fn play_infohash_and_magnet_inputs_fail_closed_with_the_cid_hint() {
+    async fn play_unavailable_infohash_and_magnet_inputs_fail_closed_with_the_cid_hint() {
         use crate::provider::StreamProvider;
         let ih = "0123456789abcdef0123456789abcdef01234567";
         let provider = play_provider_from_config(
@@ -439,6 +440,7 @@ mod tests {
             vec![],
             ace_swarm::listen::SeedRegistry::new(),
         );
+        provider.cache_infohash_failure_for_test(ih);
         for input in [
             format!("acestream:?infohash={ih}"),
             format!("magnet:?xt=urn:btih:{ih}"),
@@ -448,7 +450,7 @@ mod tests {
                 .open(&target.provider_id)
                 .await
                 .err()
-                .expect("a one-shot play has no verified descriptor for a bare infohash");
+                .expect("unavailable catalog metadata must fail closed");
             assert!(
                 err.to_string().contains(&format!("cid:{ih}")),
                 "{input}: {err}"
