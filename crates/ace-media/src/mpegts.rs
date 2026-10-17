@@ -384,6 +384,8 @@ pub struct KeyframeGate {
     scanned: usize,
     max_scan_packets: usize,
     filter_sdt: bool,
+    // Belongs to this client's emitted PID, not the table cache or recovery run.
+    next_sdt_counter: u8,
     mark_discontinuity: bool,
 }
 
@@ -432,6 +434,7 @@ impl KeyframeGate {
             scanned: 0,
             max_scan_packets,
             filter_sdt: false,
+            next_sdt_counter: 0,
             mark_discontinuity: false,
         }
     }
@@ -449,6 +452,7 @@ impl KeyframeGate {
             scanned: 0,
             max_scan_packets: DEFAULT_MAX_SCAN_PACKETS,
             filter_sdt,
+            next_sdt_counter: 0,
             mark_discontinuity: false,
         }
     }
@@ -494,16 +498,21 @@ impl KeyframeGate {
         let mut i = 0;
         while i + TS_PACKET_LEN <= self.buf.len() {
             let pkt = &self.buf[i..i + TS_PACKET_LEN];
-            if self.locked {
-                if self.filter_sdt && ts_pid(pkt) == SDT_PID {
-                    i += TS_PACKET_LEN;
-                    continue;
+            if self.filter_sdt && ts_pid(pkt) == SDT_PID {
+                // Filter in both phases: even the scan-budget trigger must not
+                // publish upstream SDT into this gate's owned continuity sequence.
+                // Count it toward scanning, but resume only on a forwardable packet
+                // so the recovery marker is attached to media rather than discarded.
+                if !self.locked {
+                    self.scanned = self.scanned.saturating_add(1);
                 }
+                i += TS_PACKET_LEN;
+                continue;
+            }
+            if self.locked {
                 let access_point = self.access.observe(pkt);
                 if self.filter_sdt && access_point {
-                    if let Some(prefix) = self.access.table_prefix() {
-                        out.extend_from_slice(&prefix);
-                    }
+                    append_gate_tables(&self.access, &mut self.next_sdt_counter, &mut out);
                 }
                 out.extend_from_slice(pkt);
                 i += TS_PACKET_LEN;
@@ -512,9 +521,7 @@ impl KeyframeGate {
             self.scanned += 1;
             if self.access.observe(pkt) {
                 // Lock on the keyframe: hand the player the tables, then the keyframe.
-                if let Some(prefix) = self.access.table_prefix() {
-                    out.extend_from_slice(&prefix);
-                }
+                append_gate_tables(&self.access, &mut self.next_sdt_counter, &mut out);
                 append_resumed_packet(&mut self.mark_discontinuity, None, pkt, &mut out);
                 self.locked = true;
                 resumed = Some(GateResume::AccessPoint);
@@ -544,6 +551,25 @@ impl KeyframeGate {
             resumed,
         }
     }
+}
+
+/// Only emitted synthesized SDTs consume the gate's continuity sequence. Cached
+/// PAT/PMT packets retain their upstream headers, and filtering consumes no counter.
+fn append_gate_tables(
+    access: &VideoAccessPointState,
+    next_sdt_counter: &mut u8,
+    out: &mut Vec<u8>,
+) {
+    let Some(mut prefix) = access.table_prefix() else {
+        return;
+    };
+    for packet in prefix.chunks_exact_mut(TS_PACKET_LEN) {
+        if ts_pid(packet) == SDT_PID {
+            packet[3] = (packet[3] & 0xf0) | *next_sdt_counter;
+            *next_sdt_counter = (*next_sdt_counter + 1) & 0x0f;
+        }
+    }
+    out.extend_from_slice(&prefix);
 }
 
 fn append_resumed_packet(
@@ -754,8 +780,8 @@ pub fn mpeg_crc32(data: &[u8]) -> u32 {
 
 /// Build a single-packet SDT on PID 0x0011 advertising `service_name` for `service_id`, with
 /// `service_provider_name = "outpace"`. `service_name` must already be sanitized/bounded by
-/// [`sanitize_service_name`] so the section fits one packet. Continuity counter is 0 (PSI
-/// tolerates a repeated CC on an unchanged section).
+/// [`sanitize_service_name`] so the section fits one packet. Starts at continuity counter
+/// zero; an owner repeating the packet must assign its output continuity sequence.
 fn build_sdt(service_id: u16, service_name: &str) -> [u8; TS_PACKET_LEN] {
     let name = service_name.as_bytes();
 
@@ -1472,6 +1498,148 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn sdt_counters(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|packet| ts_pid(packet) == SDT_PID)
+            .map(|packet| packet[3] & 0x0f)
+            .collect()
+    }
+
+    #[test]
+    fn injected_sdt_counters_advance_and_wrap_without_changing_sections() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".into()));
+        let opening = [pat(PMT_PID), pmt(PMT_PID, VIDEO_PID)].concat();
+        assert!(gate.push(&opening).is_empty());
+        let mut output = Vec::new();
+        for _ in 0..20 {
+            output.extend(gate.push(&random_access_packet(VIDEO_PID)));
+        }
+        assert_eq!(
+            sdt_counters(&output),
+            (0..20).map(|n| n % 16).collect::<Vec<_>>()
+        );
+        let expected = build_sdt(1, "Titled");
+        for packet in output
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|p| ts_pid(p) == SDT_PID)
+        {
+            assert_eq!(&packet[..3], &expected[..3]);
+            assert_eq!(packet[3] & 0xf0, expected[3] & 0xf0);
+            assert_eq!(
+                &packet[4..],
+                &expected[4..],
+                "SDT section and CRC must stay unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_sdt_counter_survives_all_gate_resets() {
+        for reset in [
+            KeyframeGate::reset,
+            KeyframeGate::reset_for_discontinuity,
+            KeyframeGate::rearm_for_discontinuity,
+        ] {
+            let mut gate = KeyframeGate::with_service_name(Some("Titled".into()));
+            let opening = [
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat();
+            assert_eq!(sdt_counters(&gate.push(&opening)), vec![0]);
+            reset(&mut gate);
+            assert_eq!(sdt_counters(&gate.push(&opening)), vec![1]);
+        }
+    }
+
+    #[test]
+    fn injected_sdt_counter_excludes_upstream_sdt_at_scan_budget_fallback() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".into()));
+        let opening = [
+            pat(PMT_PID),
+            pmt(PMT_PID, VIDEO_PID),
+            random_access_packet(VIDEO_PID),
+        ]
+        .concat();
+        assert_eq!(sdt_counters(&gate.push(&opening)), vec![0]);
+        gate.rearm_for_discontinuity();
+        gate.max_scan_packets = 1;
+        let mut upstream = upstream_sdt();
+        upstream[3] = (upstream[3] & 0xf0) | 9;
+        let ordinary = ts(VIDEO_PID, false, false, &[0x11, 0x22]);
+        let fallback = gate.push_report(&[upstream, ordinary].concat());
+        assert_eq!(fallback.resumed, Some(GateResume::ScanBudget));
+        assert!(
+            sdt_counters(&fallback.bytes).is_empty(),
+            "fallback must not leak upstream SDT"
+        );
+        assert!(fallback
+            .bytes
+            .chunks_exact(TS_PACKET_LEN)
+            .any(|p| ts_pid(p) == VIDEO_PID && ts_timing(p.try_into().unwrap()).discontinuity));
+        assert_eq!(
+            sdt_counters(&gate.push(&random_access_packet(VIDEO_PID))),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn injected_sdt_counter_ignores_filtered_sdt_and_preserves_cached_psi() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".into()));
+        let mut pat_first = pat(PMT_PID);
+        let mut pmt_first = pmt(PMT_PID, VIDEO_PID);
+        pat_first[3] = (pat_first[3] & 0xf0) | 7;
+        pmt_first[3] = (pmt_first[3] & 0xf0) | 11;
+        let mut pat_next = pat_first.clone();
+        let mut pmt_next = pmt_first.clone();
+        pat_next[3] = (pat_next[3] & 0xf0) | 8;
+        pmt_next[3] = (pmt_next[3] & 0xf0) | 12;
+        let mut output = gate.push(
+            &[
+                pat_first.clone(),
+                pmt_first.clone(),
+                upstream_sdt(),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        output.extend(
+            gate.push(
+                &[
+                    upstream_sdt(),
+                    upstream_sdt(),
+                    pat_next.clone(),
+                    pmt_next.clone(),
+                    random_access_packet(VIDEO_PID),
+                ]
+                .concat(),
+            ),
+        );
+        assert_eq!(sdt_counters(&output), vec![0, 1]);
+        let psi: Vec<_> = output
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|p| ts_pid(p) == 0 || ts_pid(p) == PMT_PID)
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(
+            psi,
+            vec![
+                pat_first,
+                pmt_first,
+                pat_next.clone(),
+                pmt_next.clone(),
+                pat_next,
+                pmt_next
+            ]
+        );
+        assert!(output
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|p| ts_pid(p) == SDT_PID)
+            .all(|p| read_sdt_service_name(p).as_deref() == Some("Titled")));
     }
 
     #[test]
