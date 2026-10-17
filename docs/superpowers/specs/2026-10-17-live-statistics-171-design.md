@@ -1,6 +1,6 @@
 # Live statistics for issue #171
 
-Status: proposed specification; approach approved, implementation not started.
+Status: approved specification; implementation not started.
 Base: `main` after #228. Scope: native live status and the existing experimental
 Ace statistics endpoint. No playback, discovery, buffering-limit or listener
 defaults change.
