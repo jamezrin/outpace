@@ -86,3 +86,64 @@ binding, index reuse, case normalization, unavailable metadata, failure-cache
 expiry/capacity, local-metadata precedence, native failure responses, compat cold
 URL admission and HLS failure behavior. All test identifiers are synthetic;
 live identifiers and captures are not fixtures.
+
+The offline workspace suite passed 999 tests with seven ignored. Clippy with
+warnings denied, formatting, the optimized build, identifier hygiene, whitespace
+checks and all 34 comparison-harness tests passed. Independent code review found
+no actionable issues. Commands used the pinned Rust 1.99.1 toolchain explicitly.
+
+## Cold live validation
+
+The implementation at `36f076f` was validated with cid20 under controlled local
+WARP-off routing. A separate fresh daemon authenticated the current content-id
+descriptor and derived its swarm infohash, then stopped. A new candidate process
+started with empty state; no descriptor or index was copied to it. Original engine
+3.2.11 used the content-id selector while the candidate used compat `infohash=`.
+Both used defaults, fresh state and one capture client during the same 180-second
+window. The candidate logged authenticated infohash catalog resolution before
+source output, with zero logged dropped-piece rejections.
+
+| Observation | Content-id reference | Cold-infohash candidate |
+| --- | ---: | ---: |
+| Captured bytes | 64,475,516 | 78,153,480 |
+| First positive body read | 0.93 s | 2.15 s |
+| Captured PCR media span | 205.08 s | 248.36 s |
+| Frames decoded in a bounded 10-second check | 221 | 248 |
+| Decoder exit status | 0 | 0 |
+
+The reference decoder emitted 68 diagnostic lines; the candidate emitted none.
+These are diagnostics from the bounded check, not comparable frame-error rates.
+PCR spans describe captured media time and can include startup history; they
+are not wall-clock observation durations and do not measure live position.
+
+The analyzer found a 203.08-second shared PCR interval with 338,594 considered
+media packets in each capture and 100% directional packet membership. This is
+evidence of common source media in that interval, not whole-transport byte
+identity or packet ordering. Its separate order-mapping diagnostic matched
+299,354 of 370,502 considered candidate packets (80.8%), skipped 44,467 ambiguous
+candidate packets and identified 43,263 ambiguous reference packets. It reported
+186,494 reference holes and two backward/duplicate steps. These exclusions and
+the different captured prefixes limit any stronger equivalence claim.
+
+After the pair stopped, two separate fresh CLI processes ran for a predefined
+45 seconds each with empty state and the runtime-derived infohash:
+
+| Selector | Captured bytes | Frames in bounded decode | Decoder exit |
+| --- | ---: | ---: | ---: |
+| `acestream:?infohash=` | 35,644,612 | 204 | 0 |
+| `magnet:?xt=urn:btih:` | 36,168,756 | 238 | 0 |
+
+Both logged authenticated cold catalog resolution. Each decode examined ten
+seconds; both streaming processes were deliberately terminated at the capture
+deadline. Their termination is not a natural end-of-stream result. This validates
+the new cold selectors on one public live source, not all swarms, VOD, continuous
+180-second decode quality or real-player smoothness.
+
+The first validation controller stopped during setup because its metadata
+deriver lacked the experimental compatibility flag; no playback phase ran. The
+corrected controller enabled it for the deriver and candidate, then completed
+the predefined pair and CLI phases once. It made no playback-policy adjustments.
+WARP was restored, all owned daemons/CLI processes/reference containers stopped,
+and only the pre-existing BuildKit container remained. Private controller, logs,
+media and numeric records are under
+`/tmp/outpace-lookup-176-live-final-fpgfgpds`.
