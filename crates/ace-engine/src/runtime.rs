@@ -701,8 +701,15 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         "outpace: listening on http://{} networks={:?}",
         config.bind, networks
     );
-    eprintln!("  MPEG-TS: http://{}/streams/ace/<id>", config.bind);
-    eprintln!("  HLS:     http://{}/streams/ace/<id>.m3u8", config.bind);
+    eprintln!(
+        "  MPEG-TS: http://{}/streams/ace/cid:<content-id>",
+        config.bind
+    );
+    eprintln!(
+        "  HLS:     http://{}/streams/ace/cid:<content-id>.m3u8",
+        config.bind
+    );
+    eprintln!("  Live ids: bare hex or cid: selects a content id; ih: selects a verified infohash");
     eprintln!("  status:  http://{}/streams", config.bind);
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
