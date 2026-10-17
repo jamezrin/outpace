@@ -2187,6 +2187,7 @@ mod tests {
                 downloaded: self.pos as u64,
                 uploaded: 0,
                 peers_served: 0,
+                ..SourceStats::default()
             }
         }
         fn metadata(&self) -> StreamMetadata {

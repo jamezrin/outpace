@@ -1091,6 +1091,7 @@ impl TsSource for AceSource {
             downloaded: self.downloaded.load(Ordering::Relaxed),
             uploaded: self.uploaded.load(Ordering::Relaxed),
             peers_served: self.peers_served.load(Ordering::Relaxed),
+            ..SourceStats::default()
         }
     }
     fn metadata(&self) -> StreamMetadata {
