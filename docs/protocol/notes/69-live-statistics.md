@@ -90,3 +90,46 @@ offline tests do not substitute for that criterion.
 Cleanup restored the host WARP route and stopped owned processes/containers.
 Only the pre-existing BuildKit container remained. Private artifacts and the
 reviewed numeric report are under `/tmp/outpace-stats-171`.
+
+## Follow-up live acceptance with cid20
+
+On 2026-10-18 (Europe/Madrid), the merged implementation from PR #229 was tested
+with cid20 on the same controlled local setup: original engine 3.2.11, fresh state
+for both engines, default playback settings, compat playback/stat routes, one
+capture client per engine, and an auxiliary native status observer. The release
+build used Rust 1.99.1. WARP was off during the run and restored afterward.
+
+The simultaneous capture lasted 180 seconds. The comparison interval was fixed
+in advance at seconds 60 through 180, with one-second polling and all numeric
+samples retained, including zeros. Neither engine had a zero-speed sample in
+that interval.
+
+| Final 120-second observation | Reference | Candidate |
+| --- | ---: | ---: |
+| Speed samples / invalid samples | 120 / 0 | 120 / 0 |
+| Mean reported download speed, KiB/s | 778.842 | 748.297 |
+| Zero-speed samples | 0 | 0 |
+| Captured media bytes in that interval | 93,830,368 | 93,894,720 |
+| Captured media bytes in the full run | 148,346,176 | 161,490,872 |
+
+The candidate/reference mean reported rate ratio was 0.96078: the candidate was
+3.92% lower, satisfying the issue's ±20% live rate criterion for this observation.
+Both clients had usable media and status samples across the measurement window;
+the largest status-sample gap was below 1.004 seconds. This compares the interval
+means, not each instantaneous sample, byte identity, or exact live position.
+
+All 179 native status observations succeeded. The first positive bitrate was
+observed at approximately 3.002 seconds from capture start; the maximum observed
+buffer duration was 29,500 ms. Together with the deterministic startup-buffer and
+schema tests above, this completes the scoped acceptance for issue #171.
+
+Earlier follow-ups with cid9 and cid1 delivered no media on either engine. A
+cid17 attempt delivered media initially, but the candidate delivered none during
+the fixed comparison window. Those attempts remain invalid comparisons; their
+windows were not moved or their zero samples discarded. They do not identify the
+cause of those sessions' delivery failures. This successful run does not establish
+reliability across all sources or resolve the separate startup/recovery work.
+
+Cleanup stopped the owned candidate and reference container, restored the host
+WARP route, and left only the pre-existing BuildKit container running. Raw media,
+status, tokens and logs remain private under `/tmp/outpace-stats-171-cid20-wqa4__m3`.
