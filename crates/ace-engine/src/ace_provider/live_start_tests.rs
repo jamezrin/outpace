@@ -30,6 +30,13 @@ fn fixture(max_active: usize) -> (StreamInfo, SeedConfig) {
             source_pubkey: vec![],
         },
         SeedConfig {
+            metrics: Some(crate::live_stats::LiveMetrics::new(
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicU32::new(0)),
+            )),
             registry: SeedRegistry::new(),
             store_bytes: 4096,
             store_retention: None,
@@ -119,6 +126,7 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
         }
     });
     let (info, seed) = fixture(max_active);
+    let received = seed.metrics.as_ref().unwrap().received.clone();
     let (tx, mut rx) = mpsc::channel(16);
     let count = Arc::new(AtomicU32::new(1));
     let pool_count = count.clone();
@@ -171,6 +179,7 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
             .all(|packet| packet[4] == if matching_window {0x55} else {0x66}),
         "initial output must use the best-window transport and retain the healthy peer when windows match"
     );
+    assert!(received.load(Ordering::Relaxed) >= output.bytes.len() as u64);
     let requests = requests.lock().unwrap();
     assert!(!requests.is_empty());
     assert!(

@@ -1,10 +1,11 @@
 use crate::config::StartupBufferConfig;
-use crate::provider::{SourceStats, TsSource};
+use crate::provider::{SourceStats, StatsHandle, StatsReader, TsSource};
 use ace_media::mpegts::{ts_timing, ClockObservation, SelectedPcrClock, TS_PACKET_LEN};
 use ace_swarm::types::StreamMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -232,13 +233,37 @@ impl StartupReservoir {
         }
     }
 
+    #[cfg(test)]
     fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }
 }
 
+struct StartupObservation {
+    cached: SourceStats,
+    reservoir_ms: Option<u64>,
+}
+struct StartupStatsReader {
+    inner: Option<StatsHandle>,
+    observed: Mutex<StartupObservation>,
+}
+impl StatsReader for StartupStatsReader {
+    fn snapshot(&self) -> SourceStats {
+        let (cached, reservoir_ms) = {
+            let observed = self.observed.lock().unwrap();
+            (observed.cached.clone(), observed.reservoir_ms)
+        };
+        let mut stats = self.inner.as_ref().map_or(cached, |inner| inner.snapshot());
+        if let Some(duration) = reservoir_ms {
+            stats.buffer_ms = duration;
+        }
+        stats
+    }
+}
+
 pub struct StartupBufferedSource {
     inner: Box<dyn TsSource>,
+    stats: Arc<StartupStatsReader>,
     reservoir: StartupReservoir,
     pending_discontinuity: bool,
     released_chunk_discontinuity: bool,
@@ -251,17 +276,35 @@ impl StartupBufferedSource {
         config: StartupBufferConfig,
         bitrate: Option<u64>,
     ) -> Box<dyn TsSource> {
+        let stats = Arc::new(StartupStatsReader {
+            inner: inner.stats_handle(),
+            observed: Mutex::new(StartupObservation {
+                cached: inner.stats(),
+                reservoir_ms: Some(0),
+            }),
+        });
         Box::new(Self {
             inner,
+            stats,
             reservoir: StartupReservoir::new(config, bitrate),
             pending_discontinuity: false,
             released_chunk_discontinuity: false,
         })
     }
 
+    fn publish_stats(&self) {
+        let cached = self.inner.stats();
+        let reservoir_ms = (self.reservoir.phase != Phase::Released)
+            .then(|| self.reservoir.duration().as_millis().min(u64::MAX as u128) as u64);
+        *self.stats.observed.lock().unwrap() = StartupObservation {
+            cached,
+            reservoir_ms,
+        };
+    }
+
     async fn collect_next(&mut self) {
         let next = if let Some(deadline) = self.reservoir.deadline() {
-            tokio::select! { chunk = self.inner.next() => chunk, _ = tokio::time::sleep_until(deadline) => { self.reservoir.release(ReleaseReason::Deadline); return; } }
+            tokio::select! { chunk = self.inner.next() => chunk, _ = tokio::time::sleep_until(deadline) => { self.reservoir.release(ReleaseReason::Deadline); self.publish_stats(); return; } }
         } else {
             self.inner.next().await
         };
@@ -276,6 +319,7 @@ impl StartupBufferedSource {
             }
             None => self.reservoir.release(ReleaseReason::EndOfStream),
         }
+        self.publish_stats();
     }
 }
 
@@ -289,11 +333,17 @@ impl TsSource for StartupBufferedSource {
                     if let Some(chunk) = self.reservoir.pop_front() {
                         self.released_chunk_discontinuity =
                             std::mem::take(&mut self.pending_discontinuity);
+                        self.publish_stats();
                         return Some(chunk);
                     }
                     self.reservoir.finish_drain();
+                    self.publish_stats();
                 }
-                Phase::Released => return self.inner.next().await,
+                Phase::Released => {
+                    let next = self.inner.next().await;
+                    self.publish_stats();
+                    return next;
+                }
             }
         }
     }
@@ -307,11 +357,10 @@ impl TsSource for StartupBufferedSource {
     }
 
     fn stats(&self) -> SourceStats {
-        let mut stats = self.inner.stats();
-        if self.reservoir.queued_bytes() > 0 {
-            stats.buffer_ms = self.reservoir.duration().as_millis().min(u64::MAX as u128) as u64;
-        }
-        stats
+        self.stats.snapshot()
+    }
+    fn stats_handle(&self) -> Option<StatsHandle> {
+        Some(self.stats.clone())
     }
 
     fn metadata(&self) -> StreamMetadata {
@@ -372,9 +421,11 @@ mod tests {
         chunks: VecDeque<(Bytes, bool)>,
         last_gap: bool,
         stats: SourceStats,
+        live_stats: Option<Arc<std::sync::Mutex<SourceStats>>>,
         metadata: StreamMetadata,
         delay_after: Option<usize>,
         reads: usize,
+        count_reads: bool,
         dropped: Option<Arc<AtomicBool>>,
     }
 
@@ -384,9 +435,11 @@ mod tests {
                 chunks: chunks.into(),
                 last_gap: false,
                 stats: SourceStats::default(),
+                live_stats: None,
                 metadata: StreamMetadata::default(),
                 delay_after: None,
                 reads: 0,
+                count_reads: false,
                 dropped: None,
             }
         }
@@ -415,11 +468,112 @@ mod tests {
             std::mem::take(&mut self.last_gap)
         }
         fn stats(&self) -> SourceStats {
-            self.stats.clone()
+            let mut stats = self
+                .live_stats
+                .as_ref()
+                .map(|stats| stats.lock().unwrap().clone())
+                .unwrap_or_else(|| self.stats.clone());
+            if self.count_reads {
+                stats.downloaded += self.reads as u64;
+            }
+            stats
+        }
+        fn stats_handle(&self) -> Option<crate::provider::StatsHandle> {
+            self.live_stats
+                .as_ref()
+                .map(|stats| Arc::new(MutableStats(stats.clone())) as crate::provider::StatsHandle)
         }
         fn metadata(&self) -> StreamMetadata {
             self.metadata.clone()
         }
+    }
+
+    struct MutableStats(Arc<std::sync::Mutex<SourceStats>>);
+    impl crate::provider::StatsReader for MutableStats {
+        fn snapshot(&self) -> SourceStats {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_stats_are_visible_during_pending_startup_and_cancel_cleanly() {
+        let stats = Arc::new(std::sync::Mutex::new(SourceStats {
+            bitrate: 8192,
+            peers: 3,
+            ..SourceStats::default()
+        }));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut inner = FixtureSource::new(vec![
+            (packet(PID, Some(0), false, 1), false),
+            (packet(PID, Some(90000), false, 2), false),
+        ]);
+        inner.live_stats = Some(stats.clone());
+        inner.delay_after = Some(2);
+        inner.dropped = Some(dropped.clone());
+        let buffered =
+            StartupBufferedSource::new(Box::new(inner), config(10000, 4096, 30000), None);
+        let session = crate::session::StreamSession::start(buffered, 16);
+        let mut subscription = session.subscribe();
+        tokio::task::yield_now().await;
+        assert_eq!(session.stats().await.bitrate, 8192);
+        assert_eq!(session.stats().await.buffer_ms, 1000);
+        assert!(matches!(
+            subscription.rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        stats.lock().unwrap().peers = 4;
+        assert_eq!(session.stats().await.peers, 4);
+        drop(session);
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn released_wrapper_updates_sources_without_readers() {
+        let mut inner = FixtureSource::new(vec![(Bytes::from_static(b"x"), false)]);
+        inner.count_reads = true;
+        let mut buffered =
+            StartupBufferedSource::new(Box::new(inner), config(0, 4096, 30000), None);
+        let reader = buffered.stats_handle().unwrap();
+        assert!(buffered.next().await.is_some());
+        assert_eq!(reader.snapshot().downloaded, 1);
+    }
+
+    #[tokio::test]
+    async fn independent_reservoir_stats_decrease_while_draining_and_finish() {
+        let mut inner = FixtureSource::new(vec![
+            (packet(PID, Some(0), false, 1), false),
+            (packet(PID, Some(90000), false, 2), false),
+        ]);
+        inner.stats.buffer_ms = 19;
+        let mut buffered =
+            StartupBufferedSource::new(Box::new(inner), config(1000, 4096, 30000), None);
+        let reader = buffered
+            .stats_handle()
+            .expect("independent reservoir reader");
+        assert!(buffered.next().await.is_some());
+        assert_eq!(reader.snapshot().buffer_ms, 500);
+        assert!(buffered.next().await.is_some());
+        assert_eq!(reader.snapshot().buffer_ms, 0);
+        assert!(buffered.next().await.is_none());
+        assert_eq!(reader.snapshot().buffer_ms, 19);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_stats_discontinuity_removes_the_old_epoch() {
+        let mut inner = FixtureSource::new(vec![
+            (packet(PID, Some(0), false, 1), false),
+            (packet(PID, Some(90000), false, 2), false),
+            (packet(PID, Some(900000), false, 3), true),
+            (packet(PID, Some(990000), false, 4), false),
+        ]);
+        inner.delay_after = Some(4);
+        let session = crate::session::StreamSession::start(
+            StartupBufferedSource::new(Box::new(inner), config(20000, 4096, 30000), None),
+            16,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(session.stats().await.buffer_ms, 1000);
     }
 
     fn boxed(chunks: Vec<(Bytes, bool)>) -> Box<dyn TsSource> {

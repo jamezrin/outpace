@@ -35,6 +35,7 @@ impl TsSource for TestSource {
             downloaded: 0,
             uploaded: 0,
             peers_served: 0,
+            ..SourceStats::default()
         }
     }
 }

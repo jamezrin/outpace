@@ -252,6 +252,7 @@ fn disk_store_subdir(infohash: &[u8; 20]) -> String {
 /// budget, and whether reciprocal serving over THIS outbound connection is enabled at all.
 #[derive(Clone)]
 struct SeedConfig {
+    metrics: Option<Arc<crate::live_stats::LiveMetrics>>,
     registry: SeedRegistry,
     store_bytes: u64,
     /// Age bound for the live seed store (primary limiter; `store_bytes` is the hard ceiling).
@@ -1064,6 +1065,8 @@ struct LiveOutput {
 }
 
 struct AceSource {
+    metrics: Option<Arc<crate::live_stats::LiveMetrics>>,
+    _sampler: Option<crate::live_stats::MetricsSampler>,
     rx: mpsc::Receiver<LiveOutput>,
     discontinuity: bool,
     peers: Arc<AtomicU32>,
@@ -1084,6 +1087,9 @@ impl TsSource for AceSource {
         std::mem::take(&mut self.discontinuity)
     }
     fn stats(&self) -> SourceStats {
+        if let Some(metrics) = &self.metrics {
+            return crate::provider::StatsReader::snapshot(metrics.as_ref());
+        }
         SourceStats {
             peers: self.peers.load(Ordering::Relaxed),
             bitrate: 0,
@@ -1091,7 +1097,13 @@ impl TsSource for AceSource {
             downloaded: self.downloaded.load(Ordering::Relaxed),
             uploaded: self.uploaded.load(Ordering::Relaxed),
             peers_served: self.peers_served.load(Ordering::Relaxed),
+            ..SourceStats::default()
         }
+    }
+    fn stats_handle(&self) -> Option<crate::provider::StatsHandle> {
+        self.metrics
+            .as_ref()
+            .map(|metrics| metrics.clone() as crate::provider::StatsHandle)
     }
     fn metadata(&self) -> StreamMetadata {
         self.metadata.clone()
@@ -1204,10 +1216,19 @@ impl AceProvider {
         let stats_downloaded = downloaded.clone();
         let stats_uploaded = uploaded.clone();
         let stats_peers_served = peers_served.clone();
+        let metrics = crate::live_stats::LiveMetrics::new(
+            stats_downloaded.clone(),
+            Arc::new(AtomicU64::new(0)),
+            stats_uploaded.clone(),
+            stats_peers.clone(),
+            stats_peers_served.clone(),
+        );
+        let sampler = crate::live_stats::spawn_sampler(metrics.clone());
         let prefetch_pieces = self.prefetch_policy_for(&info);
         let startup_buffer = self.startup_buffer;
         let bitrate = info.metadata.bitrate;
         let seed = SeedConfig {
+            metrics: Some(metrics.clone()),
             registry: self.seed_registry.clone(),
             store_bytes: self.seed_store_bytes,
             store_retention: self.seed_store_retention,
@@ -1232,6 +1253,8 @@ impl AceProvider {
             }
         });
         let source = AceSource {
+            metrics: Some(metrics),
+            _sampler: Some(sampler),
             rx,
             discontinuity: false,
             peers: peer_count,
@@ -2483,6 +2506,7 @@ async fn follow_peer_pool_with_discovery(
     reachability: Option<&Arc<ReachabilityMonitor>>,
     discovery_run: &mut Option<DiscoveryRun>,
 ) -> FollowEnd {
+    let _stats_guard = LiveStatsGuard(seed.metrics.clone());
     debug_assert!(!upstreams.is_empty());
     let lone_fresh = continuity.is_none() && upstreams.len() == 1;
     let primary = upstreams[0].window;
@@ -2628,6 +2652,7 @@ async fn follow_peer_pool_with_discovery(
         }
         observed_capacity = (peers.len(), learned_pending.len());
         let now = Instant::now();
+        publish_live_stats(continuity, seed.metrics.as_ref(), info);
         if continuity
             .startup_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -2955,6 +2980,9 @@ async fn follow_peer_pool_with_discovery(
 
         let mut made_activity = false;
         let mut made_output = false;
+        if let PeerMessage::Extended { payload, .. } | PeerMessage::Unknown { payload, .. } = &msg {
+            observe_live_window(continuity, peer_id, payload);
+        }
         match msg {
             PeerMessage::Unchoke => {
                 continuity.set_peer_unchoked(peer_id, true);
@@ -3046,7 +3074,7 @@ async fn follow_peer_pool_with_discovery(
                         let _ = observer.send((piece, addr));
                     }
                     let before = continuity.reasm.next_needed();
-                    let ready = continuity.reasm.take_ready();
+                    let ready = take_ready_with_stats(continuity, seed.metrics.as_ref(), info);
                     let after = continuity.reasm.next_needed();
                     let productive: Vec<_> = continuity
                         .piece_producers
@@ -3527,6 +3555,102 @@ async fn advance_pool_requests(
         .collect()
 }
 
+fn observe_live_window(c: &mut Continuity, peer: u64, payload: &[u8]) {
+    let Ok((root, _)) = ace_wire::bencode::Bencode::parse_prefix(payload) else {
+        return;
+    };
+    let dict = if root.get(b"max_piece").is_some() {
+        &root
+    } else if let Some(dict) = root.get(b"mi") {
+        dict
+    } else {
+        return;
+    };
+    let value = |key: &[u8]| {
+        dict.get(key)
+            .and_then(ace_wire::bencode::Bencode::as_int)
+            .and_then(|value| u64::try_from(value).ok())
+    };
+    c.active_peers
+        .observe_window(peer, value(b"min_piece").zip(value(b"max_piece")));
+}
+
+fn ready_buffer_snapshot(continuity: &Continuity, bitrate: Option<u64>) -> (u64, u64) {
+    let mut clock = ace_media::mpegts::SelectedPcrClock::new();
+    let mut bytes = 0_u64;
+    let mut pieces = 0_u64;
+    for chunk in continuity.reasm.ready_chunks() {
+        pieces += 1;
+        bytes = bytes.saturating_add(chunk.len() as u64);
+        for packet in chunk.as_chunks::<{ ace_media::mpegts::TS_PACKET_LEN }>().0 {
+            clock.observe(ace_media::mpegts::ts_timing(packet));
+        }
+    }
+    let duration = clock
+        .elapsed()
+        .filter(|duration| !duration.is_zero())
+        .or_else(|| {
+            bitrate
+                .filter(|rate| *rate > 0)
+                .map(|rate| Duration::from_secs_f64(bytes as f64 / rate as f64))
+        })
+        .unwrap_or_default();
+    (duration.as_millis().min(u64::MAX as u128) as u64, pieces)
+}
+
+fn publish_live_stats(
+    c: &Continuity,
+    metrics: Option<&Arc<crate::live_stats::LiveMetrics>>,
+    info: &StreamInfo,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let (buffer_ms, buffer_pieces) = ready_buffer_snapshot(c, info.metadata.bitrate);
+    let bounds = c.active_peers.coverage_bounds();
+    metrics.publish_position(
+        Some(crate::provider::LivePositionStats {
+            pos: Some(c.reasm.next_needed()),
+            last: Some(c.head),
+            live_first: bounds.map(|(first, _)| first),
+            live_last: bounds.map(|(_, last)| last),
+            buffer_pieces,
+        }),
+        buffer_ms,
+    );
+}
+
+fn take_ready_with_stats(
+    c: &mut Continuity,
+    metrics: Option<&Arc<crate::live_stats::LiveMetrics>>,
+    info: &StreamInfo,
+) -> Vec<u8> {
+    publish_live_stats(c, metrics, info);
+    let ready = c.reasm.take_ready();
+    if let Some(metrics) = metrics {
+        metrics
+            .received
+            .fetch_add(ready.len() as u64, Ordering::Relaxed);
+    }
+    publish_live_stats(c, metrics, info);
+    ready
+}
+
+struct LiveStatsGuard(Option<Arc<crate::live_stats::LiveMetrics>>);
+impl Drop for LiveStatsGuard {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.0 {
+            let mut position = crate::provider::StatsReader::snapshot(metrics.as_ref()).livepos;
+            if let Some(position) = &mut position {
+                position.live_first = None;
+                position.live_last = None;
+                position.buffer_pieces = 0;
+            }
+            metrics.publish_position(position, 0);
+        }
+    }
+}
+
 /// Periodic self-heal for the request pipeline (runs on each pool loop tick): re-requeue any
 /// piece outstanding past the configured request timeout and skip a piece evicted from every
 /// upstream window, then re-issue requests. A timed-out piece is only requeued in the *scheduler* (its
@@ -3624,6 +3748,7 @@ async fn follow_one_peer(
     seed: &SeedConfig,
     continuity: &mut Option<Continuity>,
 ) -> FollowEnd {
+    let _stats_guard = LiveStatsGuard(seed.metrics.clone());
     // 1. Use the peer's advertised live window, already read during upstream selection.
     let min_piece = window.min_piece.max(0) as u64;
     let max_piece = window.max_piece.max(0) as u64;
@@ -3698,6 +3823,7 @@ async fn follow_one_peer(
     let mut seen_ids: HashSet<u8> = HashSet::new();
 
     loop {
+        publish_live_stats(continuity, seed.metrics.as_ref(), info);
         let Some(read_budget) = stale_upstream_budget(
             last_progress,
             Instant::now(),
@@ -3722,6 +3848,9 @@ async fn follow_one_peer(
         };
         let mut made_activity = false;
         let mut made_output = false;
+        if let PeerMessage::Extended { payload, .. } | PeerMessage::Unknown { payload, .. } = &msg {
+            observe_live_window(continuity, SINGLE_PEER_ID, payload);
+        }
         match msg {
             PeerMessage::Unchoke => {
                 unchoked = true;
@@ -3807,7 +3936,7 @@ async fn follow_one_peer(
                     }
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
                     made_activity = true;
-                    let ready = continuity.reasm.take_ready();
+                    let ready = take_ready_with_stats(continuity, seed.metrics.as_ref(), info);
                     if !ready.is_empty() {
                         for output in continuity.resync_output(&ready) {
                             let aligned = output.bytes;
@@ -4100,6 +4229,8 @@ mod tests {
         }
         drop(tx);
         let mut source = AceSource {
+            metrics: None,
+            _sampler: None,
             rx,
             discontinuity: false,
             peers: Arc::new(AtomicU32::new(0)),
@@ -4874,6 +5005,7 @@ mod tests {
             4096,
         )));
         let seed = SeedConfig {
+            metrics: None,
             registry: SeedRegistry::new(),
             store_bytes: 4096,
             store_retention: None,
@@ -6294,3 +6426,6 @@ mod tests {
         assert!(!prefer_window(&far, &near));
     }
 }
+
+#[cfg(test)]
+mod stats_tests;

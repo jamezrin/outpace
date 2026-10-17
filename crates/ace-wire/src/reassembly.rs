@@ -178,6 +178,16 @@ impl PieceReassembler {
         self.partial.remove(&index);
     }
 
+    /// Observe consecutive complete payloads at the cursor without consuming them.
+    pub fn ready_chunks(&self) -> impl Iterator<Item = &[u8]> {
+        let mut next = self.next_emit;
+        std::iter::from_fn(move || {
+            let bytes = self.complete.get(&next)?;
+            next = next.checked_add(1)?;
+            Some(&bytes[..bytes.len().saturating_sub(self.piece_trailer as usize)])
+        })
+    }
+
     /// Pull all contiguous completed pieces from `next_emit` onward as one byte buffer,
     /// advancing the emit cursor. Returns empty if the next needed piece isn't ready yet.
     pub fn take_ready(&mut self) -> Vec<u8> {
@@ -214,6 +224,24 @@ impl PieceReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_chunks_observe_only_contiguous_media_without_trailers() {
+        let mut r = PieceReassembler::new(8, 0).with_piece_trailer(4);
+        r.add_block(0, 0, b"ab").unwrap();
+        r.add_block(2, 0, b"ijklSIG!").unwrap();
+        assert_eq!(r.ready_chunks().count(), 0);
+        r.add_block(0, 2, b"cdSIG!").unwrap();
+        assert_eq!(
+            r.ready_chunks().collect::<Vec<_>>(),
+            vec![b"abcd".as_slice()]
+        );
+        assert_eq!(r.next_needed(), 0);
+        r.add_block(1, 0, b"efghSIG!").unwrap();
+        assert_eq!(r.ready_chunks().count(), 3);
+        assert_eq!(r.take_ready(), b"abcdefghijkl");
+        assert_eq!(r.ready_chunks().count(), 0);
+    }
 
     #[test]
     fn contribution_reports_partial_writes_and_preserves_completed_no_ops() {

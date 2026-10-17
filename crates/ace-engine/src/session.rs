@@ -1,7 +1,7 @@
 //! One shared download per stream, fanned out to many subscribers via a broadcast channel.
 //! Exactly one [`TsSource`] is pulled regardless of how many clients are attached.
 
-use crate::provider::{SourceStats, TsSource};
+use crate::provider::{SourceStats, StatsHandle, TsSource};
 use ace_swarm::types::StreamMetadata;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,7 @@ pub struct StreamSession {
     tx: broadcast::Sender<StreamEvent>,
     subscribers: Arc<AtomicU64>,
     stats: Arc<Mutex<SourceStats>>,
+    live_stats: Option<StatsHandle>,
     metadata: StreamMetadata,
     /// The background pull task; aborted when the session is dropped (last `Arc` gone, e.g.
     /// the manager's idle reaper or an explicit force-stop) so a live download doesn't keep
@@ -52,6 +53,7 @@ impl StreamSession {
         let (tx, _rx) = broadcast::channel(buffer);
         let stats = Arc::new(Mutex::new(SourceStats::default()));
         let metadata = source.metadata();
+        let live_stats = source.stats_handle();
         let pump_tx = tx.clone();
         let pump_stats = stats.clone();
         let pump = tokio::spawn(async move {
@@ -68,6 +70,7 @@ impl StreamSession {
             tx,
             subscribers: Arc::new(AtomicU64::new(0)),
             stats,
+            live_stats,
             metadata,
             pump,
         })
@@ -92,6 +95,9 @@ impl StreamSession {
     }
 
     pub async fn stats(&self) -> SourceStats {
+        if let Some(reader) = &self.live_stats {
+            return reader.snapshot();
+        }
         self.stats.lock().await.clone()
     }
 

@@ -16,6 +16,7 @@ pub mod cli;
 pub mod config;
 pub mod hls;
 pub mod http;
+mod live_stats;
 pub mod magnet;
 pub mod manager;
 pub mod provider;
