@@ -563,7 +563,7 @@ fn append_gate_tables(
     let Some(mut prefix) = access.table_prefix() else {
         return;
     };
-    for packet in prefix.chunks_exact_mut(TS_PACKET_LEN) {
+    for packet in prefix.as_chunks_mut::<TS_PACKET_LEN>().0 {
         if ts_pid(packet) == SDT_PID {
             packet[3] = (packet[3] & 0xf0) | *next_sdt_counter;
             *next_sdt_counter = (*next_sdt_counter + 1) & 0x0f;
@@ -1502,7 +1502,10 @@ mod tests {
 
     fn sdt_counters(bytes: &[u8]) -> Vec<u8> {
         bytes
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .filter(|packet| ts_pid(packet) == SDT_PID)
             .map(|packet| packet[3] & 0x0f)
             .collect()
@@ -1523,7 +1526,10 @@ mod tests {
         );
         let expected = build_sdt(1, "Titled");
         for packet in output
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .filter(|p| ts_pid(p) == SDT_PID)
         {
             assert_eq!(&packet[..3], &expected[..3]);
@@ -1579,7 +1585,10 @@ mod tests {
         );
         assert!(fallback
             .bytes
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .any(|p| ts_pid(p) == VIDEO_PID && ts_timing(p.try_into().unwrap()).discontinuity));
         assert_eq!(
             sdt_counters(&gate.push(&random_access_packet(VIDEO_PID))),
@@ -1621,7 +1630,10 @@ mod tests {
         );
         assert_eq!(sdt_counters(&output), vec![0, 1]);
         let psi: Vec<_> = output
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .filter(|p| ts_pid(p) == 0 || ts_pid(p) == PMT_PID)
             .map(<[u8]>::to_vec)
             .collect();
@@ -1637,7 +1649,10 @@ mod tests {
             ]
         );
         assert!(output
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .filter(|p| ts_pid(p) == SDT_PID)
             .all(|p| read_sdt_service_name(p).as_deref() == Some("Titled")));
     }

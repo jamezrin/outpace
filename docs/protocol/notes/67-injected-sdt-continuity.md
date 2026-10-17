@@ -46,7 +46,7 @@ tested and fixed; follow-up review found no remaining actionable issues.
 ## Controlled live validation
 
 A fresh-state simultaneous 180-second comparison used cid9 supplied manually
-through the environment, the optimized candidate built from this patch, and the
+through the environment, the optimized candidate built from this patch with Rust 1.96.0, and the
 original 3.2.11 engine with its default image command. Candidate playback used
 default settings and the native content-id direct-TS route; the reference used
 its compatibility route. Storage and listeners were isolated, with no other
@@ -87,9 +87,14 @@ or resolve the variable behavior remaining in #167.
 
 ## Final verification
 
-`cargo test --workspace --locked` passed 968 tests with seven ignored. The release
-build, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
-`cargo fmt --all --check`, identifier hygiene and `git diff --check` passed.
+The live capture used a Rust 1.96.0 release because an inherited environment
+overrode the repository toolchain. Final offline checks explicitly select the
+pinned Rust 1.99.1: `cargo +1.99.1 test --workspace --locked`,
+`cargo +1.99.1 clippy --workspace --all-targets --locked -- -D warnings`, and
+`cargo +1.99.1 fmt --all --check`. Fixed-size packet iteration uses `as_chunks`
+and `as_chunks_mut`; this preserves packet boundaries and output bytes. The
+workspace run passed 968 tests with seven ignored. Identifier hygiene and
+`git diff --check` passed.
 Raw media, logs, probe metadata and private source values remain outside the
 repository. This validates the direct-TS SDT fix, not the broader playback/soak
 acceptance in #1.
