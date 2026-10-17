@@ -217,6 +217,24 @@ mod tests {
         assert_eq!(metrics.snapshot().downloaded, 7);
     }
 
+    #[tokio::test]
+    async fn sampler_drop_releases_its_metrics() {
+        let metrics = LiveMetrics::new(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        );
+        let weak = Arc::downgrade(&metrics);
+        let sampler = spawn_sampler(metrics.clone());
+        tokio::task::yield_now().await;
+        drop(metrics);
+        drop(sampler);
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn upload_only_and_retained_reader_decay() {
         let downloaded = Arc::new(AtomicU64::new(81));
