@@ -46,6 +46,13 @@ cargo run -p ace-engine --bin outpace -- serve
 
 With no subcommand, `outpace` defaults to `serve`.
 
+For native live playback, use `/streams/ace/cid:<content-id>` (or a bare content
+id), adding `.m3u8` for HLS. Both forms share status and DELETE session keys.
+Infohash playback requires `/streams/ace/ih:<infohash>` and an already verified
+descriptor. **Migration:** bare hex ids on native live routes now mean content ids,
+matching compat `id=`; update older infohash URLs to include `ih:`. See the
+[native API](docs/native-api.md) for selector and session details.
+
 Play a known Acestream link to stdout:
 
 ```bash
@@ -93,7 +100,7 @@ transport checksum. The response key is embedded in clients, so this does not pr
 server-only authentication over plain HTTP; see [the protocol evidence and trust limits](docs/protocol/notes/62-catalog-response-authentication.md).
 
 A bare infohash identifies a swarm but carries no piece geometry or source key. outpace never
-guesses them. An infohash input (the native `/streams/ace/<40-hex>` form, compat `infohash=` or
+guesses them. An infohash input (the native `/streams/ace/ih:<40-hex>` form, compat `infohash=` or
 `magnet=`, CLI `acestream:?infohash=` or `magnet:`) plays only when the process already holds a
 verified transport descriptor for it:
 
@@ -106,8 +113,8 @@ The descriptor's infohash commits to its piece length, chunk length and pubkey, 
 uses the real geometry and verifies every piece's RSA signature. Otherwise the request fails
 closed: the native routes return `422` with the reason, compat routes return an error envelope,
 and `outpace play` exits with an error. The reason suggests `cid:<id>`, which also covers a content
-id pasted without its prefix. Prefer content ids. Transport-URL streams reopen by their `turl-`
-id, not by infohash. An infohash becomes playable only from a descriptor fetched through the signed
+id supplied as an explicit infohash by mistake. Prefer content ids. Transport-URL streams reopen
+by their `turl-` id, not by infohash. An infohash becomes playable only from a descriptor fetched through the signed
 catalog (a content-id resolution) or from the daemon's own broadcast; it then uses that
 descriptor's geometry, pubkey and trackers. A content id resolved from BEP-9 peers, or a
 transport URL, never makes an infohash playable: neither binds the descriptor's trackers to

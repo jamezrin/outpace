@@ -4,10 +4,22 @@ The native CLI and HTTP routes are outpace's supported integration surface. They
 players such as VLC, media servers such as Jellyfin, and playlist/proxy tools such as dispatcharr.
 Playback requests start and share sessions, while status routes observe sessions already active.
 
-Examples use `http://127.0.0.1:6878` and the built-in `ace` network. An `<id>` is
-`cid:<content-id>` (recommended), a transport-url id (`turl-…`), or a 40-character infohash.
-An infohash plays only when this daemon already holds a verified transport descriptor for it
-(see [Infohash inputs](#infohash-inputs)); otherwise the request fails closed.
+Examples use `http://127.0.0.1:6878` and the built-in `ace` network. On live
+`/streams/ace/` routes, a bare 40-character hex `<id>` is a **content id**, matching
+compat `id=`. `cid:<content-id>` is its explicit alias; `ih:<infohash>` explicitly
+selects a swarm with a verified descriptor (see [Infohash inputs](#infohash-inputs)).
+Transport-url ids (`turl-…`) remain supported. VOD requires `cid:` or a transport-url id.
+
+Hex values are normalized to lowercase. Bare content ids and their `cid:` aliases
+share one session across TS, HLS, segment, status and DELETE routes. Native session
+lists, status responses and HLS URLs return canonical `cid:` or `ih:` identifiers.
+Malformed explicit hex selectors return `400`; status and segment requests never
+start sessions. Other provider networks keep their own identifier semantics.
+
+**Migration:** native live bare hex ids previously meant infohashes. Existing
+infohash playlists must now use `ih:<infohash>`; there is no implicit infohash
+fallback after a content-id resolution failure. Compat `infohash=`/`magnet=` and
+CLI inputs retain their existing meanings.
 
 ## CLI
 
@@ -33,7 +45,7 @@ outpace broadcast sports --public-host stream.example
 | `GET /healthz` | `200 text/plain` (`ok`) | Process health probe; it does not prove swarm connectivity. |
 | `GET /networks` | `200 application/json`, `{"networks":["ace"]}` | Provider networks configured in this daemon. |
 | `GET /streams` | `200 application/json`, `{"streams":[...]}` | Active shared sessions. Entries have `network`, `id`, direct-client count `clients`, and descriptor `metadata`. |
-| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. A bare infohash without a verified descriptor returns `422` with a plain-text reason. |
+| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. An `ih:` selector without a verified descriptor returns `422` with a plain-text reason. Malformed `cid:`/`ih:` selectors return `400`. |
 | `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Explicit continuous MPEG-TS form; equivalent for dot-free ids, preserves dots within the provider id, and includes `Icy-Name` when the descriptor supplies a title. |
 | `GET /streams/<network>/<id>.m3u8` | `200 application/vnd.apple.mpegurl` | Starts or joins live HLS packaging and returns a sliding playlist. The same `422` applies. |
 | `GET /streams/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Retained live HLS segment. Missing, expired, or not-yet-produced segments return `404`; a segment request alone never starts a stream. |
@@ -106,7 +118,7 @@ anchor; [protocol note 62](protocol/notes/62-catalog-response-authentication.md)
 remaining forgery risk over plain HTTP.
 
 A bare infohash carries no piece geometry or source key, and outpace never guesses them. An
-infohash `<id>` plays only when this daemon already holds a verified transport descriptor for it:
+`ih:<infohash>` selector plays only when this daemon already holds a verified transport descriptor for it:
 the stream was resolved earlier in this process through the signed catalog by native
 `cid:<content-id>`, compat `content_id=`/`id=`, or `/server/api` `analyze_content` / `get_media_files` with a `content_id`,
 or it is a broadcast this daemon originates. Such a stream uses the descriptor's piece length
@@ -116,7 +128,7 @@ daemon's own broadcast; it then uses that descriptor's geometry, pubkey and trac
 id resolved from BEP-9 peers, or a transport URL, never makes an infohash playable: neither
 binds the descriptor's trackers to the infohash.
 Otherwise playback routes return `422 Unprocessable Content` with a plain-text reason that
-suggests `cid:<id>`. Prefer `cid:<content-id>` ids in playlists.
+suggests `cid:<id>`. Prefer content ids, bare or `cid:<content-id>`, in live playlists.
 
 ## Live startup buffering
 

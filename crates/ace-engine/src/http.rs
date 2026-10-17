@@ -17,6 +17,7 @@ use axum::{routing::get, routing::put, Json, Router};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1379,13 +1380,46 @@ async fn list_streams(State(s): State<AppState>) -> Json<serde_json::Value> {
         .map(|(network, id, clients, metadata)| {
             json!({
                 "network": network,
-                "id": id,
+                "id": native_public_stream_id(&network, &id),
                 "clients": clients,
                 "metadata": stream_metadata_json(&metadata),
             })
         })
         .collect();
     Json(json!({ "streams": streams }))
+}
+
+/// Normalize native Ace selectors once, before any session lookup. Provider-facing bare
+/// hashes remain infohash keys so compat and CLI semantics do not change.
+fn native_stream_id<'a>(network: &str, id: &'a str) -> Result<Cow<'a, str>, &'static str> {
+    if network != "ace" {
+        return Ok(Cow::Borrowed(id));
+    }
+    if let Some(hex) = id.strip_prefix("ih:") {
+        return ace_normalized_hex_id(hex)
+            .map(Cow::Owned)
+            .ok_or("ih: requires a 40-character hexadecimal infohash");
+    }
+    if let Some(hex) = id.strip_prefix("cid:") {
+        return ace_normalized_hex_id(hex)
+            .map(|hex| Cow::Owned(format!("cid:{hex}")))
+            .ok_or("cid: requires a 40-character hexadecimal content id");
+    }
+    Ok(match ace_normalized_hex_id(id) {
+        Some(hex) => Cow::Owned(format!("cid:{hex}")),
+        None => Cow::Borrowed(id),
+    })
+}
+
+/// Public native identifiers must round-trip through the native selector, including ids
+/// originating in compat sessions whose internal infohash key has no prefix.
+fn native_public_stream_id<'a>(network: &str, id: &'a str) -> Cow<'a, str> {
+    if network == "ace" {
+        if let Some(hex) = ace_normalized_hex_id(id) {
+            return Cow::Owned(format!("ih:{hex}"));
+        }
+    }
+    Cow::Borrowed(id)
 }
 
 /// `DELETE /streams/{network}/{id}` — force-stop a running session (admin). 204 if it was
@@ -1399,7 +1433,11 @@ async fn delete_stream(
         .strip_suffix(".ts")
         .or_else(|| file.strip_suffix(".m3u8"))
         .unwrap_or(&file);
-    if s.manager.stop(&network, id).await {
+    let id = match native_stream_id(&network, id) {
+        Ok(id) => id,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
+    if s.manager.stop(&network, &id).await {
         StatusCode::NO_CONTENT.into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
@@ -1411,12 +1449,16 @@ async fn stream_status(
     State(s): State<AppState>,
     Path((network, id)): Path<(String, String)>,
 ) -> Response {
+    let id = match native_stream_id(&network, &id) {
+        Ok(id) => id,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
     match s.manager.get(&network, &id).await {
         Some(session) => {
             let stats = session.stats().await;
             Json(json!({
                 "network": network,
-                "id": id,
+                "id": native_public_stream_id(&network, &id),
                 "clients": session.subscriber_count(),
                 "peers": stats.peers,
                 "bitrate": stats.bitrate,
@@ -1438,6 +1480,10 @@ async fn stream_segment(
 ) -> Response {
     let Some(seq) = seg.strip_suffix(".ts").and_then(|n| n.parse::<u64>().ok()) else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    let id = match native_stream_id(&network, &id) {
+        Ok(id) => id,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
     // Segment probes must NOT start a stream: only serve from an already-running packager
     // (started when the playlist was fetched). Unknown streams 404 without any provider work.
@@ -1478,7 +1524,11 @@ async fn stream_file_with_hls_timeout(
     timeout: Duration,
 ) -> Response {
     if let Some(id) = file.strip_suffix(".m3u8") {
-        return match s.manager.get_or_start_hls(&network, id).await {
+        let id = match native_stream_id(&network, id) {
+            Ok(id) => id,
+            Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+        };
+        return match s.manager.get_or_start_hls(&network, &id).await {
             Ok(pkg) => {
                 if let Err(response) = await_hls_ready(&pkg, timeout).await {
                     return *response;
@@ -1490,7 +1540,7 @@ async fn stream_file_with_hls_timeout(
                 // SDT `service_name` embedded in the segments themselves.
                 (
                     [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
-                    pkg.playlist(&network, id),
+                    pkg.playlist(&network, &native_public_stream_id(&network, &id)),
                 )
                     .into_response()
             }
@@ -1507,7 +1557,11 @@ async fn stream_file_with_hls_timeout(
     } else {
         &file
     };
-    let session = match s.manager.get_or_start(&network, id).await {
+    let id = match native_stream_id(&network, id) {
+        Ok(id) => id,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
+    let session = match s.manager.get_or_start(&network, &id).await {
         Ok(sess) => sess,
         Err(e) => return stream_start_error(e),
     };
@@ -4651,6 +4705,249 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    struct NativeAceFixture;
+
+    #[async_trait]
+    impl StreamProvider for NativeAceFixture {
+        fn network(&self) -> &'static str {
+            "ace"
+        }
+        async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            if id != UNRESOLVED_IH && id != format!("cid:{UNRESOLVED_IH}") {
+                return Err(ProviderError::NotFound);
+            }
+            Ok(Box::new(PacedFixtureSource { pos: 0 }))
+        }
+    }
+
+    fn native_ace_fixture_state() -> AppState {
+        let mut st = fixture_state(0);
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(NativeAceFixture));
+        st.manager = StreamManager::with_config(
+            registry,
+            256,
+            crate::config::HlsConfig {
+                startup_segments: 1,
+                segment_duration_ms: 1000,
+                ..crate::config::HlsConfig::default()
+            },
+        );
+        st.networks = vec!["ace".into()];
+        st
+    }
+
+    #[tokio::test]
+    async fn native_content_id_aliases_share_playback_status_and_delete() {
+        let st = native_ace_fixture_state();
+        let app = router(st.clone());
+        let upper = UNRESOLVED_IH.to_ascii_uppercase();
+        let canonical = format!("cid:{UNRESOLVED_IH}");
+        let mut responses = Vec::new();
+        for id in [upper.clone(), canonical.clone()] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/streams/ace/{id}.ts"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            responses.push(response);
+        }
+        assert_eq!(st.manager.list().await.len(), 1);
+        assert!(st.manager.get("ace", &canonical).await.is_some());
+        for id in [upper.clone(), format!("cid:{upper}")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/streams/ace/{id}/status"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let status: serde_json::Value =
+                serde_json::from_str(&body_text(response).await).unwrap();
+            assert_eq!(status["id"], canonical);
+            assert_eq!(status["clients"], 2);
+        }
+        let response = app
+            .oneshot(
+                Request::delete(format!("/streams/ace/{upper}.ts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(st.manager.get("ace", &canonical).await.is_none());
+        drop(responses);
+    }
+
+    #[tokio::test]
+    async fn native_content_id_hls_aliases_share_segments_and_delete() {
+        let st = native_ace_fixture_state();
+        let app = router(st.clone());
+        let upper = UNRESOLVED_IH.to_ascii_uppercase();
+        let canonical = format!("cid:{UNRESOLVED_IH}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/ace/{upper}.m3u8"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let playlist = body_text(response).await;
+        let segment = playlist_segment_path(&playlist);
+        assert!(segment.starts_with(&format!("/streams/ace/{canonical}/seg/")));
+        let alias_segment = segment.replace(&canonical, &upper);
+        let mut bodies = Vec::new();
+        for path in [segment, alias_segment.as_str()] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            bodies.push(response_bytes(response).await);
+        }
+        assert_eq!(bodies[0], bodies[1]);
+        let response = app
+            .oneshot(
+                Request::delete(format!("/streams/ace/cid:{upper}.m3u8"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(st.manager.get("ace", &canonical).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_infohash_hls_emits_roundtrippable_explicit_urls() {
+        let st = native_ace_fixture_state();
+        let app = router(st);
+        let explicit = format!("ih:{UNRESOLVED_IH}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/ace/{explicit}.m3u8"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let playlist = body_text(response).await;
+        let path = playlist_segment_path(&playlist);
+        assert!(path.starts_with(&format!("/streams/ace/{explicit}/seg/")));
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/ace/{explicit}/status"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(status["id"], explicit);
+        let response = app
+            .oneshot(Request::get("/streams").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(list["streams"][0]["id"], explicit);
+    }
+
+    #[tokio::test]
+    async fn native_malformed_explicit_identifiers_do_not_start_sessions() {
+        let st = native_ace_fixture_state();
+        let app = router(st.clone());
+        for id in ["cid:bad", "ih:bad"] {
+            for path in [
+                format!("/streams/ace/{id}"),
+                format!("/streams/ace/{id}.m3u8"),
+                format!("/streams/ace/{id}/status"),
+                format!("/streams/ace/{id}/seg/0.ts"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::delete(format!("/streams/ace/{id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(st.manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_explicit_infohash_uses_a_separate_session_key() {
+        let st = native_ace_fixture_state();
+        let app = router(st.clone());
+        let upper = UNRESOLVED_IH.to_ascii_uppercase();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/ace/ih:{upper}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(st.manager.get("ace", UNRESOLVED_IH).await.is_some());
+        assert!(st
+            .manager
+            .get("ace", &format!("cid:{UNRESOLVED_IH}"))
+            .await
+            .is_none());
+        let status = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/ace/ih:{upper}/status"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let deleted = app
+            .oneshot(
+                Request::delete(format!("/streams/ace/ih:{upper}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    }
+
     const UNRESOLVED_IH: &str = "0123456789abcdef0123456789abcdef01234567";
 
     /// An app whose `ace` network is a real `AceProvider` with no peers and an empty infohash
@@ -4679,11 +4976,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_routes_refuse_a_bare_infohash_without_a_descriptor() {
+    async fn native_routes_refuse_an_explicit_infohash_without_a_descriptor() {
         for path in [
-            format!("/streams/ace/{UNRESOLVED_IH}"),
-            format!("/streams/ace/{UNRESOLVED_IH}.ts"),
-            format!("/streams/ace/{UNRESOLVED_IH}.m3u8"),
+            format!("/streams/ace/ih:{UNRESOLVED_IH}"),
+            format!("/streams/ace/ih:{UNRESOLVED_IH}.ts"),
+            format!("/streams/ace/ih:{UNRESOLVED_IH}.m3u8"),
         ] {
             let resp = router(ace_provider_state())
                 .oneshot(Request::get(path.as_str()).body(Body::empty()).unwrap())

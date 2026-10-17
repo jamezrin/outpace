@@ -118,7 +118,7 @@ python3 tools/abcompare/ab_analyze.py /tmp/new-ab-run 180 engine outpace
 
 Engine specifications are `name=BASE` for `/ace/getstream?id=…&format=json`,
 `name=nativecid:BASE` for `/streams/ace/cid:…`, or `name=native:BASE` for
-`/streams/ace/…` using an **infohash**, not a content id. Outpace compat routes
+`/streams/ace/ih:…` using an **infohash**. Outpace compat routes
 require `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`; the runner uses native content-id
 routing so it needs no compat flag. Names must contain only letters, digits,
 underscores and hyphens, and must be unique. Playback follows up to five relative
@@ -199,8 +199,9 @@ public IP can compete for two or three peers. Keep Cloudflare WARP off. The runn
 does not change VPN services or stop other clients. Never use
 `pkill -f "outpace serve"`: it can kill unrelated daemons and the invoking shell.
 
-A bare 40-hex identifier on outpace's native route is an **infohash** (#165); use
-`nativecid:` or compat for content ids. Default outpace prebuffer/discovery can
+A bare 40-hex identifier on outpace's native live route is a **content id** (#165).
+Use `nativecid:` or compat for content ids; `native:` adds the explicit `ih:` prefix
+for verified infohash playback. Default outpace prebuffer/discovery can
 produce headers followed by more than 15 seconds without body data. Set
 `READ_TIMEOUT` above prebuffer timeout plus discovery (default here: 60 seconds).
 Too short a timeout triggers retries, changing startup behavior. The global capture
