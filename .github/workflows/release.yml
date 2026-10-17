@@ -17,7 +17,7 @@ env:
 jobs:
   release-metadata:
     name: Validate release tag against Cargo metadata
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       version: ${{ steps.release.outputs.version }}
 
@@ -138,7 +138,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs:
       - release-metadata
       - build-binaries
@@ -174,7 +174,7 @@ jobs:
 
   publish-container:
     name: Publish GHCR image
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Do not update the versioned image or `latest` unless every release archive, including
     # ARMv7 musl, built successfully. The PR portability workflow is intentionally not a tag-job
     # dependency; the release build itself remains the final artifact gate.

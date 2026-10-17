@@ -26,7 +26,7 @@ jobs:
   # so update the ruleset in the same change.
   lint:
     name: Rust lint
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -51,7 +51,7 @@ jobs:
 
   test:
     name: Rust test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -76,7 +76,7 @@ jobs:
 
   abcompare:
     name: A/B harness test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Checkout
