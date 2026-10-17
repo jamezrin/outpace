@@ -1,7 +1,7 @@
 # Live statistics for issue #171
 
 Status: approved; implementation and offline verification complete; live throughput
-acceptance remains unverified (see protocol note 69).
+acceptance passed with cid20 (see protocol note 69 for scope and earlier attempts).
 Base: `main` after #228. Scope: native live status and the existing experimental
 Ace statistics endpoint. No playback, discovery, buffering-limit or listener
 defaults change.
