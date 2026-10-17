@@ -330,6 +330,7 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         source_pubkey: vec![],
     };
     let seed = SeedConfig {
+        metrics: None,
         registry: SeedRegistry::new(),
         store_bytes: 4096,
         store_retention: None,
@@ -455,6 +456,7 @@ fn cancellation_fixture() -> (StreamInfo, SeedConfig) {
         source_pubkey: vec![],
     };
     let seed = SeedConfig {
+        metrics: None,
         registry: SeedRegistry::new(),
         store_bytes: 4096,
         store_retention: None,

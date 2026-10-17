@@ -1327,6 +1327,7 @@ async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
     };
     let first = make_provider();
     let seed = SeedConfig {
+        metrics: None,
         registry: SeedRegistry::new(),
         store_bytes: 16384,
         store_retention: None,

@@ -46,6 +46,7 @@ pub struct PeerAssignment {
 
 #[derive(Debug, Clone)]
 struct ActivePeer {
+    observed_bounds: Option<(u64, u64)>,
     min_piece: u64,
     max_piece: u64,
     unchoked: bool,
@@ -69,6 +70,10 @@ impl ActivePeers {
         self.peers.insert(
             id,
             ActivePeer {
+                observed_bounds: u64::try_from(window.min_piece)
+                    .ok()
+                    .zip(u64::try_from(window.max_piece).ok())
+                    .filter(|(min, max)| min <= max),
                 min_piece: window.min_piece.max(0) as u64,
                 max_piece: window.max_piece.max(0) as u64,
                 unchoked: false,
@@ -85,6 +90,7 @@ impl ActivePeers {
 
     pub fn update_window(&mut self, id: u64, min_piece: u64, max_piece: u64) {
         if let Some(peer) = self.peers.get_mut(&id) {
+            peer.observed_bounds = (min_piece <= max_piece).then_some((min_piece, max_piece));
             peer.min_piece = min_piece;
             peer.max_piece = max_piece.max(min_piece);
         }
@@ -158,6 +164,15 @@ impl ActivePeers {
         self.peers
             .values()
             .any(|p| p.unchoked && p.min_piece <= piece && piece <= p.max_piece)
+    }
+
+    /// Bounds advertised by currently unchoked peers; invalid signed windows stay unknown.
+    pub fn coverage_bounds(&self) -> Option<(u64, u64)> {
+        self.peers
+            .values()
+            .filter(|peer| peer.unchoked)
+            .filter_map(|peer| peer.observed_bounds)
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
     }
 
     /// The lowest piece index any unchoked peer can currently serve (min of their windows), or
