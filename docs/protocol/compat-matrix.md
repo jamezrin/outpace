@@ -93,3 +93,26 @@ These are **non-goals** for outpace (see the epic #46 non-goals) and are not pla
 - Legacy HLS VOD behavior (native `/vod` HLS exists).
 - `get_media_files&dump_transport_file=1` raw transport-file dumping.
 - Reverse `get_content_id` (deriving a content id from an infohash/transport). The official engine maps an infohash to its content id (observed during #164's spike; the request it uses was not captured), which is presumably how it plays a cold infohash; adopting it would let outpace play cold infohash inputs.
+
+
+## Live statistics units and limits
+
+`/ace/stat/<id>/<token>` includes `speed_down`, `speed_up` and `livepos` for active
+sessions. Speed units are KiB/s (1,024 bytes), including fractional values. Download
+speed measures contiguous reassembled media payload before output gating;
+`downloaded` retains its delivered-MPEG-TS total meaning. Upload speed follows the
+source's existing `uploaded` accounting. The nominal five-second measurement
+window is sampled once per second independently of HTTP requests and expires on
+inactivity. A status read neither starts a provider nor refreshes its lease.
+Idle valid leases report zero speeds and null `livepos`; invalid tokens retain
+the existing error envelope.
+
+The `livepos` object describes provider observations: `pos` is the next reassembly
+piece, `last` the last observed head, `live_first`/`live_last` the active advertised
+window bounds or null, `buffer_pieces` the complete contiguous ready pieces, and
+`is_live` is 1. `first_ts`/`last_ts` are null. Before any position is learned the
+whole object is null. These are not exact engine playhead/timestamp semantics;
+no client position or wall-clock timestamp is invented. Native status exposes the
+same optional object. See [native statistics](../native-api.md#live-statistics)
+for rate/buffer boundaries and sampling limits. Progress percentages, disk-cache
+statistics and selection-index fields remain outside this implementation.

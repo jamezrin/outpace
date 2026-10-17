@@ -1057,6 +1057,18 @@ async fn ace_playback(
     }
 }
 
+fn live_position_json(position: Option<&crate::provider::LivePositionStats>) -> serde_json::Value {
+    match position {
+        Some(pos) => json!({
+            "pos": pos.pos, "last": pos.last,
+            "live_first": pos.live_first, "live_last": pos.live_last,
+            "buffer_pieces": pos.buffer_pieces,
+            "first_ts": null, "last_ts": null, "is_live": 1,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
 async fn ace_stat(
     State(s): State<AppState>,
     Path((id, token)): Path<(String, String)>,
@@ -1072,6 +1084,7 @@ async fn ace_stat(
         return Json(json!({
             "response": {
                 "status": "idle",
+                "speed_down": 0, "speed_up": 0, "livepos": null,
                 "peers": 0,
                 "downloaded": 0,
                 "uploaded": 0,
@@ -1090,6 +1103,9 @@ async fn ace_stat(
     Json(json!({
         "response": {
             "status": "dl",
+            "speed_down": stats.download_rate as f64 / 1024.0,
+            "speed_up": stats.upload_rate as f64 / 1024.0,
+            "livepos": live_position_json(stats.livepos.as_ref()),
             "peers": stats.peers,
             "downloaded": stats.downloaded,
             "uploaded": stats.uploaded,
@@ -1462,7 +1478,7 @@ async fn stream_status(
                 "clients": session.subscriber_count(),
                 "peers": stats.peers,
                 "bitrate": stats.bitrate,
-                "buffer_ms": stats.buffer_ms,
+                "livepos": live_position_json(stats.livepos.as_ref()),                "buffer_ms": stats.buffer_ms,
                 "uploaded": stats.uploaded,
                 "peers_served": stats.peers_served,
                 "metadata": stream_metadata_json(session.metadata()),
@@ -4704,6 +4720,97 @@ mod tests {
         // fixture_state leaves the compat surface off, so /server/api is not routed at all.
         let (status, _) = server_api_json(fixture_state(0), "method=get_version").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[derive(Clone)]
+    struct MeasuredFixture(SourceStats);
+    impl crate::provider::StatsReader for MeasuredFixture {
+        fn snapshot(&self) -> SourceStats {
+            self.0.clone()
+        }
+    }
+    #[async_trait]
+    impl TsSource for MeasuredFixture {
+        async fn next(&mut self) -> Option<Bytes> {
+            std::future::pending().await
+        }
+        fn stats(&self) -> SourceStats {
+            self.0.clone()
+        }
+        fn stats_handle(&self) -> Option<crate::provider::StatsHandle> {
+            Some(Arc::new(self.clone()))
+        }
+    }
+    #[async_trait]
+    impl StreamProvider for MeasuredFixture {
+        fn network(&self) -> &'static str {
+            "fix"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+    fn measured_state(position: bool) -> AppState {
+        let mut st = ace_compat_state(0);
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(MeasuredFixture(SourceStats {
+            bitrate: 12288,
+            download_rate: 1536,
+            upload_rate: 512,
+            livepos: position.then_some(crate::provider::LivePositionStats {
+                pos: Some(5),
+                last: Some(9),
+                live_first: Some(2),
+                live_last: Some(9),
+                buffer_pieces: 1,
+            }),
+            ..SourceStats::default()
+        })));
+        st.manager = StreamManager::new(registry);
+        st
+    }
+
+    #[tokio::test]
+    async fn measured_stats_schema_reports_units_positions_and_null_timestamps() {
+        let st = measured_state(true);
+        let _session = st.manager.get_or_start("fix", "stats").await.unwrap();
+        let token = st.ace_sessions.mint("stats".into(), "stats".into());
+        let Json(json) = ace_stat(State(st.clone()), Path(("stats".into(), token))).await;
+        assert_eq!(json["response"]["speed_down"], 1.5);
+        assert_eq!(json["response"]["speed_up"], 0.5);
+        let pos = &json["response"]["livepos"];
+        assert_eq!(pos["pos"], 5);
+        assert_eq!(pos["last"], 9);
+        assert_eq!(pos["buffer_pieces"], 1);
+        assert_eq!(pos["is_live"], 1);
+        assert_eq!(pos.get("first_ts"), Some(&serde_json::Value::Null));
+        assert_eq!(pos.get("last_ts"), Some(&serde_json::Value::Null));
+        let response = stream_status(State(st), Path(("fix".into(), "stats".into()))).await;
+        let native: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(native["bitrate"], 12288);
+        assert_eq!(native["livepos"], *pos);
+    }
+
+    #[tokio::test]
+    async fn measured_stats_schema_idle_unknown_and_invalid_token_do_not_start() {
+        let st = measured_state(false);
+        let token = st.ace_sessions.mint("stats".into(), "stats".into());
+        let Json(idle) = ace_stat(State(st.clone()), Path(("stats".into(), token.clone()))).await;
+        assert_eq!(idle["response"]["speed_down"], 0);
+        assert_eq!(
+            idle["response"].get("livepos"),
+            Some(&serde_json::Value::Null)
+        );
+        let Json(error) =
+            ace_stat(State(st.clone()), Path(("stats".into(), "invalid".into()))).await;
+        assert!(error["error"].is_string());
+        assert!(st.manager.list().await.is_empty());
+        let _session = st.manager.get_or_start("fix", "stats").await.unwrap();
+        let Json(active) = ace_stat(State(st), Path(("stats".into(), token))).await;
+        assert_eq!(
+            active["response"].get("livepos"),
+            Some(&serde_json::Value::Null)
+        );
     }
 
     struct NativeAceFixture;

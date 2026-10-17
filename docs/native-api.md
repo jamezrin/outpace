@@ -130,6 +130,32 @@ binds the descriptor's trackers to the infohash.
 Otherwise playback routes return `422 Unprocessable Content` with a plain-text reason that
 suggests `cid:<id>`. Prefer content ids, bare or `cid:<content-id>`, in live playlists.
 
+## Live statistics
+
+Top-level `bitrate` measures contiguous reassembled media payload in bits/second,
+not the descriptor's advertised bitrate. A nominal five-second window is sampled
+once per second independently of status polling. Reads do not alter the rate;
+inactivity expires it even while source output is pending. Sampling limits
+boundary precision to about one second. Framing, signatures, duplicate blocks and
+injected tables are excluded. Existing `downloaded` totals, where exposed, still
+count delivered MPEG-TS, so their delta need not equal this incoming-payload rate.
+
+`buffer_ms` observes the startup reservoir while collecting/draining, using PCR
+or the existing descriptor-rate estimate. After release it observes contiguous
+complete media at the reassembler cursor; partial pieces and pieces beyond a
+hole do not count. It excludes the provider handoff channel, socket buffers,
+session broadcast backlog, HLS retention and all client buffers. It can correctly
+approach zero after draining and must not be interpreted as player lead.
+
+`livepos` is null until a position is known. Otherwise `pos` is the next piece
+needed by reassembly, `last` the last observed provider head, `live_first` and
+`live_last` the advertised active-window bounds (null when unavailable), and
+`buffer_pieces` the complete contiguous pieces ready at that cursor. `is_live` is
+1; `first_ts` and `last_ts` are null because no verified mapping to engine
+wall-clock timestamps is available. These observations are not a client's
+playhead or an authenticated source clock. Other providers without independent
+readers retain their existing post-output cached statistics behavior.
+
 ## Live startup buffering
 
 Direct MPEG-TS playback now defaults to a server-resident startup reservoir with a 30-second
