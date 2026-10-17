@@ -233,6 +233,7 @@ impl StartupReservoir {
         }
     }
 
+    #[cfg(test)]
     fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }

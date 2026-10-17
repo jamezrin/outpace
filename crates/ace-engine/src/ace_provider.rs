@@ -2980,6 +2980,9 @@ async fn follow_peer_pool_with_discovery(
 
         let mut made_activity = false;
         let mut made_output = false;
+        if let PeerMessage::Extended { payload, .. } | PeerMessage::Unknown { payload, .. } = &msg {
+            observe_live_window(continuity, peer_id, payload);
+        }
         match msg {
             PeerMessage::Unchoke => {
                 continuity.set_peer_unchoked(peer_id, true);
@@ -3552,6 +3555,26 @@ async fn advance_pool_requests(
         .collect()
 }
 
+fn observe_live_window(c: &mut Continuity, peer: u64, payload: &[u8]) {
+    let Ok((root, _)) = ace_wire::bencode::Bencode::parse_prefix(payload) else {
+        return;
+    };
+    let dict = if root.get(b"max_piece").is_some() {
+        &root
+    } else if let Some(dict) = root.get(b"mi") {
+        dict
+    } else {
+        return;
+    };
+    let value = |key: &[u8]| {
+        dict.get(key)
+            .and_then(ace_wire::bencode::Bencode::as_int)
+            .and_then(|value| u64::try_from(value).ok())
+    };
+    c.active_peers
+        .observe_window(peer, value(b"min_piece").zip(value(b"max_piece")));
+}
+
 fn ready_buffer_snapshot(continuity: &Continuity, bitrate: Option<u64>) -> (u64, u64) {
     let mut clock = ace_media::mpegts::SelectedPcrClock::new();
     let mut bytes = 0_u64;
@@ -3825,6 +3848,9 @@ async fn follow_one_peer(
         };
         let mut made_activity = false;
         let mut made_output = false;
+        if let PeerMessage::Extended { payload, .. } | PeerMessage::Unknown { payload, .. } = &msg {
+            observe_live_window(continuity, SINGLE_PEER_ID, payload);
+        }
         match msg {
             PeerMessage::Unchoke => {
                 unchoked = true;

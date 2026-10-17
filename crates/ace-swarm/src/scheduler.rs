@@ -90,7 +90,6 @@ impl ActivePeers {
 
     pub fn update_window(&mut self, id: u64, min_piece: u64, max_piece: u64) {
         if let Some(peer) = self.peers.get_mut(&id) {
-            peer.observed_bounds = (min_piece <= max_piece).then_some((min_piece, max_piece));
             peer.min_piece = min_piece;
             peer.max_piece = max_piece.max(min_piece);
         }
@@ -164,6 +163,13 @@ impl ActivePeers {
         self.peers
             .values()
             .any(|p| p.unchoked && p.min_piece <= piece && piece <= p.max_piece)
+    }
+
+    /// Record window observations independently of scheduler coverage and inferred heads.
+    pub fn observe_window(&mut self, id: u64, bounds: Option<(u64, u64)>) {
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.observed_bounds = bounds.filter(|(min, max)| min <= max);
+        }
     }
 
     /// Bounds advertised by currently unchoked peers; invalid signed windows stay unknown.
