@@ -1587,74 +1587,80 @@ fn background_discovery_options() -> DiscoveryOptions {
     }
 }
 
-/// Connect to and BT-handshake the peers **concurrently**, then briefly choose among peers
-/// that also advertised a live window. Dead/firewalled peers no longer serialize the time
-/// to first byte — a couple of unreachable peers at the front of the list used to cost
-/// `CONNECT_TIMEOUT` each before we ever reached a live one (the "slow to load" report).
-/// Candidate snapshots are ordered by learned-source priority and exclude cooling peers.
-/// Each snapshot is visited once. Peers with fewer prior admissions are tried in separate
-/// cohorts, so a fast but unproductive source cannot repeatedly cancel an unadmitted peer.
+/// Connect eligible peers concurrently, admitting discovery updates into spare slots.
+/// Finish an exploration cohort before retrying more explored peers, so fast but
+/// unproductive sources cannot repeatedly cancel an untouched alternative. Each address
+/// is attempted at most once per round; failed attempts retain their normal cooldown.
 async fn connect_pool(
-    peers: &[SocketAddrV4],
     infohash: [u8; 20],
     candidates: &mut SessionCandidates,
     live_recovery: LiveRecoveryConfig,
+    discovery: &mut Option<DiscoveryRun>,
 ) -> Vec<ConnectedUpstream> {
-    // Isolate completed exploration cohorts so fast peers cannot repeatedly abort an
-    // untouched alternative. Stale rejection and failure advance history; aborts do not.
-    let batches: Vec<Vec<_>> = peers
-        .chunk_by(|a, b| candidates.explorations(*a) == candidates.explorations(*b))
-        .flat_map(|cohort| cohort.chunks(live_recovery.max_parallel_connect))
-        .map(<[_]>::to_vec)
-        .collect();
+    let mut attempted = HashSet::new();
     let mut stats = PeerConnectStats::default();
-    for batch in batches {
+    loop {
+        drain_discovery(discovery, candidates);
+        let Some(cohort) = candidates
+            .eligible(Instant::now())
+            .into_iter()
+            .find(|addr| !attempted.contains(addr))
+            .map(|addr| candidates.explorations(addr))
+        else {
+            break;
+        };
         let mut set = tokio::task::JoinSet::new();
-        for &addr in &batch {
-            set.spawn(connect_upstream(addr, infohash));
-        }
         let mut connected: Vec<ConnectedUpstream> = Vec::new();
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok(PeerConnectAttempt::Connected(candidate)) => {
-                    stats.record_connected();
-                    connected.push(candidate);
+        let mut deadline = None;
+        loop {
+            drain_discovery(discovery, candidates);
+            // New, less-explored addresses may join this cohort. Already pending
+            // attempts keep their slot and are never restarted by a discovery update.
+            for addr in candidates.eligible(Instant::now()) {
+                if set.len() + connected.len() >= live_recovery.max_parallel_connect {
                     break;
                 }
-                Ok(PeerConnectAttempt::Failed(failure)) => {
-                    candidates.explored(failure.addr);
-                    candidates.failed(failure.addr, Instant::now());
-                    stats.record_failure(failure);
+                if candidates.explorations(addr) <= cohort && attempted.insert(addr) {
+                    set.spawn(connect_upstream(addr, infohash));
                 }
-                Err(_) => stats.record_task_failure(),
+            }
+            if set.is_empty() || connected.len() >= live_recovery.max_active_upstreams {
+                break;
+            }
+            tokio::select! {
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => break,
+                peer = next_discovery_peer(discovery), if discovery.is_some() => {
+                    if let Some(peer) = peer {
+                        candidates.learn(peer, CandidateKind::Discovered);
+                    }
+                }
+                joined = set.join_next() => {
+                    match joined {
+                        Some(Ok(PeerConnectAttempt::Connected(candidate))) => {
+                            stats.record_connected();
+                            connected.push(candidate);
+                            deadline.get_or_insert_with(|| {
+                                tokio::time::Instant::now() + UPSTREAM_SELECTION_GRACE
+                            });
+                        }
+                        Some(Ok(PeerConnectAttempt::Failed(failure))) => {
+                            candidates.explored(failure.addr);
+                            candidates.failed(failure.addr, Instant::now());
+                            stats.record_failure(failure);
+                        }
+                        Some(Err(_)) => stats.record_task_failure(),
+                        None => break,
+                    }
+                }
             }
         }
         if connected.is_empty() {
             continue;
-        }
-
-        let deadline = tokio::time::Instant::now() + UPSTREAM_SELECTION_GRACE;
-        loop {
-            if connected.len() >= live_recovery.max_active_upstreams {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, set.join_next()).await {
-                Ok(Some(Ok(PeerConnectAttempt::Connected(candidate)))) => {
-                    stats.record_connected();
-                    connected.push(candidate);
-                }
-                Ok(Some(Ok(PeerConnectAttempt::Failed(failure)))) => {
-                    candidates.explored(failure.addr);
-                    candidates.failed(failure.addr, Instant::now());
-                    stats.record_failure(failure);
-                }
-                Ok(Some(Err(_))) => stats.record_task_failure(),
-                Ok(None) | Err(_) => break,
-            }
         }
         connected.sort_by(|a, b| {
             if prefer_window(&a.window, &b.window) {
@@ -1669,7 +1675,8 @@ async fn connect_pool(
         if stats.has_observations() {
             crate::alog!("[ace] initial upstream selection: {}", stats.summary());
         }
-        // Dropping `set` aborts candidates beyond the selected pool.
+        // Dropping `set` aborts attempts beyond the selected pool. The caller's
+        // cancellation branch drops this entire future and its pending attempts.
         return connected;
     }
     if stats.has_observations() {
@@ -1800,7 +1807,7 @@ async fn follow_live_session_with_run(
         );
         let mut upstreams = tokio::select! {
             _ = tx.closed() => return,
-            connected = connect_pool(&ready,info.infohash,&mut candidates,seed.live_recovery) => connected,
+            connected = connect_pool(info.infohash,&mut candidates,seed.live_recovery,&mut rediscovery) => connected,
         };
         if let Some(c) = &continuity {
             let mut usable = Vec::new();

@@ -1492,3 +1492,167 @@ async fn retained_complete_signed_reconnect_ignores_duplicate_producer_credit() 
 async fn retained_single_producer_signed_reconnect_preserves_media_and_durable_credit() {
     retained_signed_resume_credit_control(ResumeCredit::SameProducer).await;
 }
+
+// Exercise the production resolved-open path before any upstream has a live window.
+async fn initial_silent_candidate_control(parallel: usize, cancel: bool) {
+    struct DiscoveryDropped(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DiscoveryDropped {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let healthy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = |listener: &tokio::net::TcpListener| match listener.local_addr().unwrap() {
+        std::net::SocketAddr::V4(addr) => addr,
+        _ => unreachable!(),
+    };
+    let silent_addr = addr(&silent);
+    let healthy_addr = addr(&healthy);
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let (healthy_tx, mut healthy_rx) = tokio::sync::oneshot::channel();
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(async move {
+        let (mut stream, _) = silent.accept().await.unwrap();
+        let _ = accepted_tx.send(());
+        tokio::select! {
+            _ = release_rx => {},
+            _ = async {
+                let mut bytes = [0; 1024];
+                while tokio::io::AsyncReadExt::read(&mut stream, &mut bytes).await.unwrap() != 0 {}
+                let _ = closed_tx.send(());
+            } => {},
+        }
+    });
+    servers.spawn(async move {
+        let (stream, _) = healthy.accept().await.unwrap();
+        let _ = healthy_tx.send(());
+        let mut session = PeerSession::new(stream);
+        session.accept_handshake([0; 20], |_| true).await.unwrap();
+        session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                mi: Some(LivePosition {
+                    min_piece: 7,
+                    max_piece: 10,
+                    position: -1,
+                    distance_from_source: 0,
+                }),
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .unwrap();
+        session.send(&PeerMessage::Unchoke).await.unwrap();
+        while let Ok(message) = session.read_message().await {
+            if let PeerMessage::Unknown { id: 6, payload } = message {
+                let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                if session
+                    .send(&build_piece(0, piece, 0, [0; 8], &media_piece(0x66)))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    let state = Arc::new(std::sync::Mutex::new(Some((
+        accepted_rx,
+        published_tx,
+        dropped_tx,
+    ))));
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let (accepted, published, dropped) = state.lock().unwrap().take().unwrap();
+        Box::pin(async move {
+            let _dropped = DiscoveryDropped(Some(dropped));
+            sender.send(silent_addr).await.unwrap();
+            accepted.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            sender.send(healthy_addr).await.unwrap();
+            sender.send(healthy_addr).await.unwrap(); // Repeated batches must not duplicate attempts.
+            let _ = published.send(Instant::now());
+            sender.closed().await;
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_prefetch_pieces(Some(1))
+        .with_live_recovery(LiveRecoveryConfig {
+            max_parallel_connect: parallel,
+            ..LiveRecoveryConfig::default()
+        })
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..StartupBufferConfig::default()
+        });
+    let mut source = provider
+        .open_resolved("synthetic", info(), discovery)
+        .await
+        .unwrap();
+    let published = tokio::time::timeout(Duration::from_secs(2), published_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    if cancel {
+        drop(source);
+        tokio::time::timeout(Duration::from_secs(1), closed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), healthy_rx)
+                .await
+                .is_err(),
+            "consumer cancellation must not admit the queued peer"
+        );
+        return;
+    }
+    if parallel == 1 {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut healthy_rx)
+                .await
+                .is_err(),
+            "late candidate must not exceed the occupied connection limit"
+        );
+        release_tx.send(()).unwrap();
+    }
+    let connected = tokio::time::timeout(Duration::from_secs(1), healthy_rx).await;
+    let output = tokio::time::timeout(Duration::from_secs(2), source.next()).await;
+    drop(source);
+    assert!(
+        matches!(connected, Ok(Ok(()))),
+        "late candidate did not use available capacity after {:?}",
+        published.elapsed()
+    );
+    assert!(
+        matches!(output, Ok(Some(ref bytes)) if bytes.contains(&0x66)),
+        "late initial candidate must deliver actual media"
+    );
+}
+
+#[tokio::test]
+async fn late_initial_candidate_uses_spare_slot_during_silent_handshake() {
+    initial_silent_candidate_control(2, false).await;
+}
+
+#[tokio::test]
+async fn late_initial_candidate_waits_for_full_connection_capacity() {
+    initial_silent_candidate_control(1, false).await;
+}
+
+#[tokio::test]
+async fn dropping_initial_connect_cancels_attempts_and_discovery() {
+    initial_silent_candidate_control(1, true).await;
+}

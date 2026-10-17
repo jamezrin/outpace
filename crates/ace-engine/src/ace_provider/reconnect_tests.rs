@@ -108,18 +108,17 @@ async fn slow_preferred_source_does_not_starve_working_pex_fallback() {
     // A repeat source announcement does not erase failure history. Its old cooldown
     // already expired; the connect snapshot still visits the healthy fallback once.
     candidates.learn(slow_addr, CandidateKind::Source);
-    let ready = candidates.eligible(Instant::now());
     let started = Instant::now();
     let pool = tokio::time::timeout(
         Duration::from_secs(5),
         connect_pool(
-            &ready,
             [0; 20],
             &mut candidates,
             LiveRecoveryConfig {
                 max_parallel_connect: 1,
                 ..default_live_recovery()
             },
+            &mut None,
         ),
     )
     .await
