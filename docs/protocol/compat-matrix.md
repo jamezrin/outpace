@@ -20,7 +20,7 @@ Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 
 | Route | Status | Notes |
 | --- | --- | --- |
-| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t` and emits `Icy-Name` when the descriptor has a title; `format=json` returns playback/stat/command URLs and nested descriptor metadata with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector, and it (like `magnet`) is accepted only when the daemon already holds a verified descriptor for that infohash. Otherwise the route returns an error envelope suggesting `cid:<id>`, and mints no lease. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
+| `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t` and emits `Icy-Name` when the descriptor has a title; `format=json` returns playback/stat/command URLs and nested descriptor metadata with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector, and it (like `magnet`) permits cold inputs. JSON URL creation mints a lease; authenticated catalog lookup and descriptor/hash verification occur when playback is opened. Unresolvable playback fails closed. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
 | `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a valid lease. Missing, invalid, expired, stopped, or wrong-content tokens return HTTP 404. |
 | `GET /ace/manifest.m3u8` | Supported (live) | Uses the same selectors and catalog resolution as `getstream`. The default and `format=redirect` return `302` to a stable `/ace/m/...` playlist; `format=json` returns documented playback/stat/command fields plus nested descriptor metadata. Each request owns one bounded HLS lease over the shared native packager. |
 | `GET /ace/m/<id>/<token>.m3u8` | Supported (live) | Token-authenticated media playlist over the native live HLS window. Missing, forged, expired, stopped, or evicted leases return `404`; responses are `no-store`. |
@@ -35,11 +35,15 @@ parameters are safely ignored. Missing/malformed selectors and unsupported forma
 HTTP 200 with `{ "response": null, "error": "..." }`; this is outpace's pinned compatibility
 behavior pending a broader official-engine error capture.
 
-An `infohash=` or `magnet=` selector is refused with an error envelope (HTTP 200,
-`response: null`) unless the daemon holds a verified transport descriptor for that infohash.
-That happens when it resolved the stream through the signed catalog by content id earlier
-in this process, or originates the broadcast. A BEP-9 content-id result does not grant this
-permission. outpace does not guess live geometry for a bare infohash.
+Cold `infohash=` and `magnet=` selectors may mint playback URLs. On playback open,
+the provider uses an owned broadcast or verified index entry, then the signed
+catalog. The authenticated descriptor must match the requested swarm hash before
+discovery. Failures are briefly cached; unavailable or mismatched metadata fails
+playback closed. JSON URL creation alone does not establish that playback will
+succeed. A BEP-9 result or transport URL does not seed the catalog-provenance index.
+HLS manifest creation starts resolution before minting its control URLs, including
+`format=json`; an unavailable descriptor returns HTTP 404 through the existing HLS
+start-failure path.
 
 Compatibility HLS is currently limited to public, unencrypted live inputs. Playlist/transcode
 parameters are accepted as inert compatibility hints: the adapter always exposes the existing raw

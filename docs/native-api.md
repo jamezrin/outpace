@@ -117,18 +117,16 @@ The engine-compatible signature uses an embedded shared key rather than a server
 anchor; [protocol note 62](protocol/notes/62-catalog-response-authentication.md) describes the
 remaining forgery risk over plain HTTP.
 
-A bare infohash carries no piece geometry or source key, and outpace never guesses them. An
-`ih:<infohash>` selector plays only when this daemon already holds a verified transport descriptor for it:
-the stream was resolved earlier in this process through the signed catalog by native
-`cid:<content-id>`, compat `content_id=`/`id=`, or `/server/api` `analyze_content` / `get_media_files` with a `content_id`,
-or it is a broadcast this daemon originates. Such a stream uses the descriptor's piece length
-and verifies each piece against the descriptor's pubkey. An infohash becomes playable only
-from a descriptor fetched through the signed catalog (a content-id resolution) or from the
-daemon's own broadcast; it then uses that descriptor's geometry, pubkey and trackers. A content
-id resolved from BEP-9 peers, or a transport URL, never makes an infohash playable: neither
-binds the descriptor's trackers to the infohash.
-Otherwise playback routes return `422 Unprocessable Content` with a plain-text reason that
-suggests `cid:<id>`. Prefer content ids, bare or `cid:<content-id>`, in live playlists.
+An `ih:<infohash>` selector first uses an owned broadcast or an indexed verified
+descriptor, then queries the signed catalog on a cold lookup. Authentication,
+nonce and checksum validation precede decoding; the descriptor's computed swarm
+infohash must equal the requested hash before its geometry, pubkey and trackers
+are used. The descriptor is indexed only after that check. Failed cold lookups
+are cached for five seconds in a separate bounded 128-entry cache; verified local
+metadata takes precedence. Unavailable or mismatched descriptors return
+`422 Unprocessable Content` with a plain-text reason. BEP-9 and transport-URL
+results do not populate this index. Native bare hex values still mean content ids;
+use `ih:` explicitly for swarm infohashes.
 
 ## Live statistics
 

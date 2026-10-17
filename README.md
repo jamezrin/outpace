@@ -48,8 +48,8 @@ With no subcommand, `outpace` defaults to `serve`.
 
 For native live playback, use `/streams/ace/cid:<content-id>` (or a bare content
 id), adding `.m3u8` for HLS. Both forms share status and DELETE session keys.
-Infohash playback requires `/streams/ace/ih:<infohash>` and an already verified
-descriptor. **Migration:** bare hex ids on native live routes now mean content ids,
+Infohash playback uses `/streams/ace/ih:<infohash>` and resolves a verified descriptor
+through the catalog when needed. **Migration:** bare hex ids on native live routes now mean content ids,
 matching compat `id=`; update older infohash URLs to include `ih:`. See the
 [native API](docs/native-api.md) for selector and session details.
 
@@ -63,8 +63,7 @@ cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
 `content_id` > `infohash` > `url` > `magnet`:
 
 - `acestream://<content_id>` or `acestream:?content_id=<40-hex>`;
-- `acestream:?infohash=<40-hex>` - accepted, but `play` fails closed with an error: a one-shot
-  process holds no verified transport descriptor for a bare infohash (see "Infohash inputs");
+- `acestream:?infohash=<40-hex>` - resolves the live descriptor through the signed catalog;
 - a transport-file URL - either passed bare (`play https://host/x.acelive?a=1&b=2`,
   which handles a URL carrying its own `&`-joined query) or as
   `acestream:?url=<https://…>` (in the `acestream:?` form the URL's own query must
@@ -73,7 +72,7 @@ cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
   size cap, disabled redirects, and a request timeout; unsafe, oversized, or
   non-transport responses fail closed;
 - `magnet:?xt=urn:btih:<40-hex-or-32-base32>` - a BitTorrent v1 magnet, reduced to
-  its infohash (v2 `urn:btmh:` magnets are rejected). Like `infohash=`, it fails closed in `play`.
+  its infohash (v2 `urn:btmh:` magnets are rejected), then resolved through the signed catalog.
 
 The `/ace/getstream` compatibility route accepts the same selectors plus legacy
 `id=<40-hex>`, which is an alias for `content_id` (not `infohash`). Its precedence is
@@ -99,26 +98,23 @@ Catalog replies require the engine-compatible response signature, matching reque
 transport checksum. The response key is embedded in clients, so this does not provide
 server-only authentication over plain HTTP; see [the protocol evidence and trust limits](docs/protocol/notes/62-catalog-response-authentication.md).
 
-A bare infohash identifies a swarm but carries no piece geometry or source key. outpace never
-guesses them. An infohash input (the native `/streams/ace/ih:<40-hex>` form, compat `infohash=` or
-`magnet=`, CLI `acestream:?infohash=` or `magnet:`) plays only when the process already holds a
-verified transport descriptor for it:
+A bare infohash identifies a swarm but carries no piece geometry or source key. For
+native `ih:`, compat `infohash=`/`magnet=`, and CLI infohash/magnet inputs, outpace
+first checks its own broadcasts and verified descriptor index, then queries the
+signed catalog directly by infohash. Catalog response authentication, request
+nonce and checksum checks precede decoding, and the descriptor's computed swarm
+infohash must match the requested value before discovery or indexing.
 
-- the same daemon resolved the stream earlier by content id through the signed catalog
-  (`cid:<content-id>`, `acestream://`, `content_id=`/`id=`), or answered `analyze_content` / `get_media_files` for
-  its content id; or
-- the daemon originates that broadcast itself.
+The verified descriptor supplies geometry, pubkey and trackers. Successful lookups
+populate the bounded in-process index; failures are suppressed for five seconds
+in a separate cache capped at 128 entries. A verified local descriptor takes
+precedence over a cached failure. Unavailable or mismatched descriptors fail
+closed without guessing geometry or falling back to BEP-9. Native playback returns
+`422` with a reason; compat JSON URL creation permits cold inputs, with resolution
+errors reported when playback is opened. CLI playback exits with an error.
 
-The descriptor's infohash commits to its piece length, chunk length and pubkey, so such a stream
-uses the real geometry and verifies every piece's RSA signature. Otherwise the request fails
-closed: the native routes return `422` with the reason, compat routes return an error envelope,
-and `outpace play` exits with an error. The reason suggests `cid:<id>`, which also covers a content
-id supplied as an explicit infohash by mistake. Prefer content ids. Transport-URL streams reopen
-by their `turl-` id, not by infohash. An infohash becomes playable only from a descriptor fetched through the signed
-catalog (a content-id resolution) or from the daemon's own broadcast; it then uses that
-descriptor's geometry, pubkey and trackers. A content id resolved from BEP-9 peers, or a
-transport URL, never makes an infohash playable: neither binds the descriptor's trackers to
-the infohash.
+A BEP-9 content-id result or caller-supplied transport URL does not populate the
+catalog-provenance index. Transport-URL streams reopen by their `turl-` id.
 
 ### VOD (single-file)
 

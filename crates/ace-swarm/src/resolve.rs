@@ -266,17 +266,32 @@ pub async fn resolve_via_catalog(content_id: &str) -> Result<StreamInfo, Resolve
     stream_info_from_transport(&catalog_transport_bytes(content_id).await?)
 }
 
+/// Resolve a swarm infohash using the engine's signed, padded-Base64 catalog query.
+/// Authentication precedes decoding; the returned descriptor must bind the requested hash.
+pub async fn resolve_infohash_via_catalog(infohash: &str) -> Result<StreamInfo, ResolveError> {
+    let requested = hex20(infohash)?;
+    let value = Base64::encode_string(&requested);
+    let bytes = catalog_transport_bytes_query("infohash", &value).await?;
+    catalog_infohash_info(&bytes, requested)
+}
+
 /// Fetch the raw (encrypted) `AceStreamTransport` bytes for `content_id` from the signed
 /// catalog, trying each catalog host in turn. The pure decode half is left to the caller
 /// ([`stream_info_from_transport`] for live, [`vod_info_from_transport`] for VOD).
 pub async fn catalog_transport_bytes(content_id: &str) -> Result<Vec<u8>, ResolveError> {
     hex20(content_id)?;
+    catalog_transport_bytes_query("pid", content_id).await
+}
 
+async fn catalog_transport_bytes_query(
+    parameter: &str,
+    value: &str,
+) -> Result<Vec<u8>, ResolveError> {
     let mut last = ResolveError::Catalog("catalog request failed");
     for &(host, port) in CATALOG_HOSTS {
         match tokio::time::timeout(
             CATALOG_HOST_TIMEOUT,
-            fetch_catalog_transport(host, port, content_id),
+            fetch_catalog_transport_query(host, port, parameter, value),
         )
         .await
         {
@@ -288,19 +303,38 @@ pub async fn catalog_transport_bytes(content_id: &str) -> Result<Vec<u8>, Resolv
     Err(last)
 }
 
+#[cfg(test)]
 async fn fetch_catalog_transport(
     host: &str,
     port: u16,
     content_id: &str,
 ) -> Result<Vec<u8>, ResolveError> {
+    fetch_catalog_transport_query(host, port, "pid", content_id).await
+}
+
+async fn fetch_catalog_transport_query(
+    host: &str,
+    port: u16,
+    parameter: &str,
+    value: &str,
+) -> Result<Vec<u8>, ResolveError> {
     let request_random = {
         let mut rng = rand::rng();
         rng.random_range(1..=i64::MAX as u64)
     };
-    let signature = catalog_signature(content_id, request_random);
-    let path = format!(
-        "/gettorrent?_n=3.2.11&_p=linux&_r={request_random}&_v=3021100&pid={content_id}&_s={signature}"
-    );
+    let signature = catalog_query_signature(parameter, value, request_random);
+    // Sign raw values, then form-encode them. In particular a Base64 '+' must not
+    // become a space when the server decodes the query.
+    let mut url = reqwest::Url::parse("http://catalog.example.invalid/gettorrent")
+        .expect("constant catalog URL");
+    url.query_pairs_mut()
+        .append_pair("_n", "3.2.11")
+        .append_pair("_p", "linux")
+        .append_pair("_r", &request_random.to_string())
+        .append_pair("_v", "3021100")
+        .append_pair(parameter, value)
+        .append_pair("_s", &signature);
+    let path = format!("{}?{}", url.path(), url.query().expect("catalog query"));
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: outpace/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
@@ -333,9 +367,22 @@ async fn fetch_catalog_transport(
     catalog_response_transport(&body, request_random)
 }
 
+fn catalog_infohash_info(bytes: &[u8], requested: [u8; 20]) -> Result<StreamInfo, ResolveError> {
+    let info = stream_info_from_transport(bytes)?;
+    if info.infohash != requested {
+        return Err(ResolveError::Catalog("catalog infohash mismatch"));
+    }
+    Ok(info)
+}
+
+#[cfg(test)]
 fn catalog_signature(content_id: &str, request_random: u64) -> String {
+    catalog_query_signature("pid", content_id, request_random)
+}
+
+fn catalog_query_signature(parameter: &str, value: &str, request_random: u64) -> String {
     let mut hasher = Sha1::new();
-    let signed = format!("_n=3.2.11#_p=linux#_r={request_random}#_v=3021100#pid={content_id}");
+    let signed = format!("_n=3.2.11#_p=linux#_r={request_random}#_v=3021100#{parameter}={value}");
     hasher.update(signed.as_bytes());
     hasher.update(CATALOG_SIGNING_SECRET);
     hex::encode(hasher.finalize())
@@ -1229,6 +1276,61 @@ mod tests {
         hasher.update(CATALOG_RESPONSE_KEY);
         let signature = hex::encode(hasher.finalize());
         unsigned.replacen("<response", &format!("<response sig=\"{signature}\""), 1)
+    }
+
+    #[test]
+    fn catalog_infohash_rejects_authenticated_descriptor_for_another_swarm() {
+        let body = include_bytes!("../../../tests/vectors/catalog/response.xml");
+        let bytes = catalog_response_transport(body, 123).unwrap();
+        let expected = stream_info_from_transport(&bytes).unwrap();
+        assert_eq!(
+            catalog_infohash_info(&bytes, expected.infohash).unwrap(),
+            expected
+        );
+        assert_eq!(
+            catalog_infohash_info(&bytes, [0; 20]),
+            Err(ResolveError::Catalog("catalog infohash mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_infohash_query_encodes_base64_but_signs_raw_value() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let value = Base64::encode_string(&[0xfb; 20]);
+        let _ = fetch_catalog_transport_query("127.0.0.1", port, "infohash", &value).await;
+        let request = server.await.unwrap();
+        let path = request.split_whitespace().nth(1).unwrap();
+        let url = reqwest::Url::parse(&format!("http://catalog.example.invalid{path}")).unwrap();
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params.get("infohash"), Some(&value));
+        assert!(!params.contains_key("pid"));
+        for escape in ["%2B", "%2F", "%3D"] {
+            assert!(path.contains(escape), "missing Base64 URL escape {escape}");
+        }
+        let signed = format!(
+            "_n=3.2.11#_p=linux#_r={}#_v=3021100#infohash={value}",
+            params["_r"]
+        );
+        let mut hasher = Sha1::new();
+        hasher.update(signed.as_bytes());
+        hasher.update(CATALOG_SIGNING_SECRET);
+        assert_eq!(params["_s"], hex::encode(hasher.finalize()));
     }
 
     #[test]

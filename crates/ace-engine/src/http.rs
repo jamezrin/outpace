@@ -1277,8 +1277,8 @@ async fn resolve_ace_selection(
             }
         }
     }
-    // A bare infohash (`infohash=` or `magnet=`) carries no descriptor: refuse it before minting
-    // playback URLs unless the provider already holds a verified one (#164).
+    // The provider may reject a selector synchronously. Cold Ace infohashes proceed to
+    // asynchronous authenticated catalog resolution when the playback URL is opened.
     if let Some(network) = network.as_deref() {
         if let Err(ProviderError::Unresolvable(reason)) =
             s.manager.check_openable(network, &selection.session_key)
@@ -5058,14 +5058,15 @@ mod tests {
 
     const UNRESOLVED_IH: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    /// An app whose `ace` network is a real `AceProvider` with no peers and an empty infohash
-    /// index, so bare-infohash requests exercise the #164 refusal without network I/O.
+    /// An empty index and cached synthetic lookup failure keep native error tests offline.
     fn ace_provider_state() -> AppState {
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(crate::ace_provider::AceProvider::new(
+        let provider = crate::ace_provider::AceProvider::new(
             Arc::new(ace_wire::identity::Identity::generate()),
             0,
-        )));
+        );
+        provider.cache_infohash_failure_for_test(UNRESOLVED_IH);
+        registry.register(Arc::new(provider));
         AppState {
             manager: StreamManager::new(registry),
             networks: vec!["ace".into()],
@@ -5109,17 +5110,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compat_routes_refuse_a_bare_infohash_before_minting_a_lease() {
+    async fn compat_routes_admit_cold_infohashes_for_resolution_at_playback_open() {
         let state = ace_provider_state();
         let sessions = state.ace_sessions.clone();
         let app = router(state);
         for query in [
             format!("/ace/getstream?format=json&infohash={UNRESOLVED_IH}"),
-            format!("/ace/getstream?infohash={UNRESOLVED_IH}"),
             format!(
                 "/ace/getstream?format=json&magnet=magnet%3A%3Fxt%3Durn%3Abtih%3A{UNRESOLVED_IH}"
             ),
-            format!("/ace/manifest.m3u8?format=json&infohash={UNRESOLVED_IH}"),
         ] {
             let resp = app
                 .clone()
@@ -5128,18 +5127,32 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{query}");
             let json: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
-            assert!(json["response"].is_null(), "{query}: {json}");
-            let error = json["error"].as_str().unwrap_or_default();
-            assert!(
-                error.contains(&format!("cid:{UNRESOLVED_IH}")),
-                "{query}: {error}"
-            );
+            assert!(json["error"].is_null(), "{query}: {json}");
+            assert_eq!(json["response"]["infohash"], UNRESOLVED_IH);
+            assert!(json["response"]["playback_url"].is_string());
         }
-        assert_eq!(
-            sessions.active_count(),
-            0,
-            "a refused selector mints no lease"
+        assert!(
+            sessions.active_count() > 0,
+            "cold selectors can mint playback leases"
         );
+    }
+
+    #[tokio::test]
+    async fn compat_manifest_requires_successful_cold_lookup_before_minting_urls() {
+        let state = ace_provider_state();
+        let sessions = state.ace_sessions.clone();
+        let response = router(state)
+            .oneshot(
+                Request::get(format!(
+                    "/ace/manifest.m3u8?format=json&infohash={UNRESOLVED_IH}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(sessions.active_count(), 0);
     }
 
     #[tokio::test]
