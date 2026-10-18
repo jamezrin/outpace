@@ -1,6 +1,6 @@
 //! Piece-request scheduling across a pool of peers (pure, no I/O).
 //!
-//! The async peer loop (connect → signed handshake → read/write) lives in the driver;
+//! The async peer loop (connect → signed handshake → read/write) lives in `live_session`;
 //! this is the decision core it consults: *given the pieces we still need and what each
 //! peer offers, which `(peer, piece)` requests should we issue right now?* It enforces a
 //! per-peer in-flight cap, never double-requests a piece, only targets pieces inside a

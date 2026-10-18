@@ -22,8 +22,8 @@ coordinator budget: it is eligible whenever seeding is enabled, including before
 the remote peer sends `Interested`. This extraction does not unify those policies.
 
 The prepared reply carries its media-byte count for caller accounting. The pool
-counts after successful command enqueue and records its current peer count; the
-legacy single-peer loop counts after successful socket send and records one peer.
+counts after successful command enqueue and records its current peer count.
 Inbound serving retains no upload counters. Coordinator join/watch/leave and
-public `SeederSession` APIs are unchanged. Older download-only driver/live APIs
-remain outside this shared core.
+public `SeederSession` APIs are unchanged. The legacy single-peer loop and older
+download-only driver/live Rust APIs were removed in #193; `live_session::follow_live`
+is the production live entrypoint.

@@ -24,6 +24,13 @@ The live byte path is built and proven against real public swarms:
 - live-network tests remain ignored by default because they need the public swarm
   and a suitable network.
 
+The single production Rust live entrypoint is
+`ace_swarm::live_session::follow_live(LiveSessionInputs)`. It emits authenticated
+media as `LiveOutput { bytes, discontinuity }` and reconnects until the consumer
+drops. Pre-1.0 Rust compatibility break (#193): `driver::download_from_peer`,
+`driver::DownloadParams`, `live::LiveSession`, `live::LiveConfig`, and
+`LiveSession::run` have been removed; Rust callers must migrate to `follow_live`.
+
 Run the normal local gate with:
 
 ```bash
