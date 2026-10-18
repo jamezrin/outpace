@@ -173,55 +173,12 @@ jobs:
             dist/SHA256SUMS
 
   publish-container:
-    name: Publish GHCR image
-    runs-on: ubuntu-24.04
-    # Do not update the versioned image or `latest` unless every release archive, including
-    # ARMv7 musl, built successfully. The PR portability workflow is intentionally not a tag-job
-    # dependency; the release build itself remains the final artifact gate.
-    needs:
-      - release-metadata
-      - build-binaries
+    name: Publish GHCR image from release archives
+    # publish-release depends on all seven binary builds succeeding.
+    needs: publish-release
     permissions:
       contents: read
       packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          labels: |
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
-          tags: |
-            type=raw,value=${{ needs.release-metadata.outputs.version }}
-            type=raw,value=latest
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+    uses: ./.github/workflows/publish-container.yml
+    with:
+      tag: ${{ github.ref_name }}
