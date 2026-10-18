@@ -619,6 +619,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
     // acceptance is live-proven (note 33). Opt out with `OUTPACE_ENABLE_INBOUND=0`.
     if config.enable_inbound {
         let peer_listener = tokio::net::TcpListener::bind(config.peer_listen).await?;
+        let bound_peer_port = peer_listener.local_addr()?.port();
         eprintln!(
             "outpace: inbound seeding ENABLED on {} (max {} peers)",
             config.peer_listen, config.max_inbound_peers
@@ -682,7 +683,11 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         // mapped-external-IP cross-check that flags double-NAT / CGNAT.
         if let Some(monitor) = reachability.clone() {
             let endpoint_rx = _port_map_handle.as_ref().map(|h| h.endpoint_receiver());
-            tokio::spawn(reachability_status_loop(monitor, endpoint_rx));
+            tokio::spawn(reachability_status_loop(
+                monitor,
+                endpoint_rx,
+                bound_peer_port,
+            ));
         }
     }
 
@@ -801,8 +806,10 @@ async fn propagate_mapped_announce_port(
 async fn reachability_status_loop(
     monitor: Arc<ace_swarm::reachability::ReachabilityMonitor>,
     endpoint_rx: Option<tokio::sync::watch::Receiver<Option<ace_swarm::portmap::MappedEndpoint>>>,
+    listener_port: u16,
 ) {
     use ace_swarm::reachability::CrossCheck;
+    let started = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(REACHABILITY_STATUS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -815,6 +822,14 @@ async fn reachability_status_loop(
             .as_ref()
             .and_then(|e| e.external_ip.map(|ip| (ip, e.external_port)));
         crate::alog!("[reachability] {}", monitor.status_line(external));
+        if monitor.take_troubleshooting_hint(started.elapsed()) {
+            let advertised_port = mapped
+                .as_ref()
+                .map_or(listener_port, |endpoint| endpoint.external_port);
+            crate::alog!(
+                "[reachability] HINT: after 10 minutes, no inbound peers or yourip observations; check advertised peer TCP port {advertised_port}: router port forwarding may be missing, a host/VPN/WARP firewall may block inbound connections, or UPnP/NAT-PMP may be disabled or unanswered"
+            );
+        }
         if let CrossCheck::Mismatch { observed, mapped } = monitor.cross_check(mapped_ip) {
             crate::alog!(
                 "[reachability] WARNING: observed public IP {observed} (from peer yourip) differs from the mapped external IP {mapped} — likely double-NAT / CGNAT (the gateway mapped a private upstream address); inbound dials to {mapped} may never reach us"
