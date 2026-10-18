@@ -22,16 +22,21 @@ concurrency:
   group: outpace-release-container-publication
   cancel-in-progress: false
 
+env:
+  IMAGE_NAME: ghcr.io/jamezrin/outpace
+
 jobs:
-  publish:
-    name: Publish verified release binaries to GHCR
+  prepare:
+    name: Verify release assets
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      revision: ${{ steps.release.outputs.revision }}
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      IMAGE_NAME: ghcr.io/jamezrin/outpace
     steps:
       # An existing release can predate this workflow. Publication tooling comes
       # from main; the requested tag determines assets, version and revision.
@@ -66,6 +71,140 @@ jobs:
           echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
+      - name: Download and verify the complete release archive set
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" --dir release-assets \
+            --pattern 'outpace-*' --pattern SHA256SUMS
+          python3 tools/release/prepare_container.py "$RELEASE_TAG" release-assets container-context
+          cp Dockerfile.release container-context/Dockerfile
+          cp LICENSE container-context/LICENSE
+
+      - name: Upload verified runtime context
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-container-context
+          path: container-context
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build runtime image (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          # GitHub has no hosted native ARMv7 runner. Only this platform uses
+          # QEMU, for the short Debian runtime package installation; no Rust.
+          - arch: arm-v7
+            platform: linux/arm/v7
+            runner: ubuntu-24.04
+    steps:
+      - name: Download verified runtime context
+        uses: actions/download-artifact@v8
+        with:
+          name: release-container-context
+          path: container-context
+
+      # Artifact downloads normalize permissions; restore the verified binaries.
+      - name: Restore executable permissions
+        run: chmod 755 container-context/amd64/outpace container-context/arm64/outpace container-context/arm-v7/outpace
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU for ARMv7 only
+        if: matrix.arch == 'arm-v7'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Push immutable image digests only. Public tags are created after every
+      # platform succeeds, so a failed platform cannot publish a partial index.
+      - name: Build and push runtime image by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: container-context
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.revision }}
+          cache-from: type=gha,scope=release-runtime-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-runtime-${{ matrix.arch }}
+
+      - name: Export image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Expected an immutable image digest'
+            exit 1
+          fi
+          mkdir digests
+          touch "digests/${IMAGE_DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-container-digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish complete three-platform index
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download all platform digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-container-digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Prevent an older release from replacing latest
         shell: bash
         run: |
@@ -82,46 +221,24 @@ jobs:
                   raise SystemExit('A newer stable release exists; refusing to replace latest')
           PY
 
-      - name: Download and verify the complete release archive set
+      - name: Publish version and latest as the same complete index
         shell: bash
         run: |
           set -euo pipefail
-          mkdir release-assets
-          gh release download "$RELEASE_TAG" --dir release-assets \
-            --pattern 'outpace-*' --pattern SHA256SUMS
-          python3 tools/release/prepare_container.py "$RELEASE_TAG" release-assets container-context
-          cp Dockerfile.release container-context/Dockerfile
-          cp LICENSE container-context/LICENSE
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Emulation covers only Debian package installation, never Rust compilation.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64,arm
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build and push runtime images
-        uses: docker/build-push-action@v7
-        with:
-          context: container-context
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.release.outputs.version }}
-            ${{ env.IMAGE_NAME }}:latest
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
-            org.opencontainers.image.version=${{ steps.release.outputs.version }}
-            org.opencontainers.image.revision=${{ steps.release.outputs.revision }}
-          cache-from: type=gha,scope=release-runtime
-          cache-to: type=gha,mode=max,scope=release-runtime
+          sources=()
+          for digest in digests/*; do
+            hash="${digest##*/}"
+            if [[ ! "$hash" =~ ^[0-9a-f]{64}$ || ! -f "$digest" ]]; then
+              echo '::error::Invalid platform image digest'
+              exit 1
+            fi
+            sources+=("${IMAGE_NAME}@sha256:${hash}")
+          done
+          if [[ "${#sources[@]}" != 3 ]]; then
+            echo '::error::Expected exactly three successful platform images'
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${RELEASE_VERSION}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${sources[@]}"
