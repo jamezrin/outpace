@@ -230,3 +230,85 @@ Synthetic TS fixtures and a loopback HTTP server test continuity, RAI, PCR wrap,
 stale-prefix detection, holes/duplicates, no-start/no-overlap handling, redirects
 and silent-reader deadlines. CI runs these without Docker, registry access or
 public-network streams. A live original-engine comparison remains an operator step.
+
+## Bounded release gate (#196)
+
+This optional offline gate supports the [v1.0 checklist (#208)](https://github.com/jamezrin/outpace/issues/208).
+It does not sign off a production replacement or multi-hour reliability; the
+long-soak work is separate (#210). Missing live prerequisites mean the operator
+records **skipped**, never pass; the evaluator itself has no skip outcome.
+
+For a release run, build the release binary above, manually supply `ACE_CONTENT_ID`
+from the registry, and verify WARP is off and the direct route is in use. Inspect
+other viewers first. Use the existing fresh candidate/container runner, simultaneous
+180-second capture and owned-process cleanup:
+
+```sh
+READ_TIMEOUT=60 python3 tools/abcompare/run.py \
+  --outpace "$PWD/target/release/outpace" --seconds 180 \
+  --outdir /tmp/outpace-196-release
+python3 tools/abcompare/evaluate.py /tmp/outpace-196-release/summary.json \
+  --policy /tmp/outpace-196-policy.json \
+  --output /tmp/outpace-196-release/gate.json
+```
+
+Create the policy privately **before interpreting results**. The explicit numbers
+below are illustrative operator choices, not accepted release thresholds. Timing
+allowance must be at least the model's 50-ms resolution; it is explicitly added
+to startup and excess modeled stall-time limits, with no hidden tolerance.
+
+```json
+{
+  "schema_version": 1,
+  "max_startup_delta_seconds": 1.0,
+  "max_excess_modeled_stall_count": 0,
+  "max_excess_modeled_stall_seconds": 0.5,
+  "min_byte_ratio": 0.95,
+  "timing_allowance_seconds": 0.05,
+  "attestation": {
+    "simultaneous": true,
+    "same_current_public_source": true,
+    "same_settings": true,
+    "same_routes": true,
+    "fresh_state": true,
+    "viewers_observed": true,
+    "warp_off": true,
+    "direct_route_verified": true,
+    "complete": true
+  },
+  "provenance": {
+    "candidate_build": "replace with verified candidate build identity",
+    "reference_version": "replace with observed reference version (baseline 3.2.11)",
+    "reference_image_digest": "replace with immutable image digest"
+  }
+}
+```
+
+Attest only after observing these conditions, including successful full capture,
+analysis and cleanup without interruption/setup failure. Keep actual build identity,
+observed engine version, immutable Docker image digest, run settings/routes, fresh
+state, viewers and completion evidence in private provenance. API readiness HTTP
+200 and a mutable image tag do not prove any 3.2.x version. The controlled baseline
+is 3.2.11; verify it independently rather than trusting the tag. Do not put content
+ids, infohashes, stream names or raw URLs in policy fields or shared reports.
+
+The evaluator consumes analyzer `schema_version: 1` without redoing analysis.
+Policy schema 1 requires every key shown, rejects unknown keys, non-finite numbers,
+booleans as numbers and ratios outside (0, 1]. It emits gate schema 1 with
+`outcome`, fixed diagnostic `reasons` and numeric `metrics`; it never copies
+provenance strings or stream names. Exit 0 is pass, 1 fail, 2 inconclusive/error.
+Pass requires complete comparable evidence and every explicit threshold met.
+Candidate zero delivery or modeled no-start against a usable reference fails;
+threshold breaches fail. Unusable reference, missing PCR overlap, suspect clocks
+or unestablished comparability are inconclusive. Malformed/incomplete artifacts,
+missing required metrics, interruption or setup failure are errors. Null modeled
+no-start metrics stay null, never zero. Gate JSON is evidence to review, not a
+release guarantee.
+
+Startup here is PCR-modeled startup. Modeled stalls are never decoder stalls;
+arrival gaps are reported separately and do not alone establish playback stalls.
+Byte ratio is delivery volume, not completeness. Integrity/overlap diagnostics
+remain in the analyzer summary for review; this gate adds no integrity thresholds.
+PCR jumps invalidate the timing model. Shared pauses do not prove a source-wide
+outage. Retain private summary/policy/gate links in release provenance and link that
+review from #208 after merge; follow #210 for longer observation requirements.
