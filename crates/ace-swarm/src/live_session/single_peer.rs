@@ -1,4 +1,5 @@
 use super::*;
+use crate::seed::protocol::{prepare_reply, ServeProfile};
 
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
@@ -233,17 +234,12 @@ async fn follow_one_peer(
                     unchoked_peer = true;
                 }
             }
-            PeerMessage::Unknown { id: 6, ref payload } if seed.enabled && payload.len() >= 10 => {
-                // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
-                let p = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                let c = u16::from_be_bytes([payload[8], payload[9]]);
-                if let Some((data, header)) = PieceStore::shared_chunk(&store, p as u64, c).await {
-                    if session
-                        .send(&build_piece(0, p, c, header, &data))
-                        .await
-                        .is_ok()
-                    {
-                        uploaded.fetch_add(data.len() as u64, Ordering::Relaxed);
+            request @ PeerMessage::Unknown { id: 6, .. } if seed.enabled => {
+                if let Some(reply) =
+                    prepare_reply(&request, Some(&store), ServeProfile::Reciprocal).await
+                {
+                    if session.send(&reply.message).await.is_ok() {
+                        uploaded.fetch_add(reply.media_bytes as u64, Ordering::Relaxed);
                         peers_served.store(1, Ordering::Relaxed); // single-peer follow; multi-peer aggregation is S2
                     }
                 }
@@ -416,3 +412,7 @@ pub(super) async fn read_peer_window(
     }
     None
 }
+
+#[cfg(test)]
+#[path = "tests/single_peer_seeding.rs"]
+mod seeding_tests;

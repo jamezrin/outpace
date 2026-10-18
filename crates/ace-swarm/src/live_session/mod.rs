@@ -33,7 +33,9 @@ use ace_wire::extended::{
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
 use ace_wire::live::LiveWindow;
-use ace_wire::live_codec::{build_piece, chunk_request, LiveChunk};
+#[cfg(test)]
+use ace_wire::live_codec::build_piece;
+use ace_wire::live_codec::{chunk_request, LiveChunk};
 use ace_wire::message::PeerMessage;
 use ace_wire::reassembly::PieceReassembler;
 use bytes::Bytes;

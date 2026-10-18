@@ -1,4 +1,5 @@
 use super::*;
+use crate::seed::protocol::{prepare_reply, ServeProfile};
 
 fn receive_pool_refill(
     refill: PoolRefill,
@@ -825,23 +826,16 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     }
                 }
             }
-            PeerMessage::Unknown { id: 6, ref payload } if seed.enabled && payload.len() >= 10 => {
-                // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
-                let p = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                let c = u16::from_be_bytes([payload[8], payload[9]]);
-                if let Some((data, header)) = PieceStore::shared_chunk(store, p as u64, c).await {
-                    let len = data.len();
-                    if let Some(lost) = send_peer_command(
-                        peer_id,
-                        build_piece(0, p, c, header, &data),
-                        &mut peers,
-                        continuity,
-                    )
-                    .await
+            request @ PeerMessage::Unknown { id: 6, .. } if seed.enabled => {
+                if let Some(reply) =
+                    prepare_reply(&request, Some(store), ServeProfile::Reciprocal).await
+                {
+                    if let Some(lost) =
+                        send_peer_command(peer_id, reply.message, &mut peers, continuity).await
                     {
                         record_pool_losses(candidates, &mut loss_count, [lost]);
                     } else {
-                        uploaded.fetch_add(len as u64, Ordering::Relaxed);
+                        uploaded.fetch_add(reply.media_bytes as u64, Ordering::Relaxed);
                         peers_served.store(peers.len() as u32, Ordering::Relaxed);
                     }
                 }
