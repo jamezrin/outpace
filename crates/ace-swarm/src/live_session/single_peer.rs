@@ -7,7 +7,7 @@ async fn follow_one_peer(
     info: &StreamInfo,
     identity: &Identity,
     addr: SocketAddrV4,
-    window: LivePosition,
+    window: WireLivePosition,
     chunks_per_piece: u16,
     tx: &mpsc::Sender<Bytes>,
     downloaded: &Arc<AtomicU64>,
@@ -49,7 +49,7 @@ async fn follow_one_peer(
     let hs = OutgoingExtendedHandshake {
         ace_metadata_version: 1,
         ut_metadata_id: 2,
-        mi: Some(LivePosition {
+        mi: Some(WireLivePosition {
             min_piece: start as i64,
             max_piece: continuity.head as i64,
             position: -1,
@@ -74,17 +74,9 @@ async fn follow_one_peer(
     let mut unchoked = false;
     let peer_min = min_piece;
     let mut peer_max = max_piece;
-    let store = seed.registry.get_or_create(info.infohash, || {
-        build_piece_store(
-            info.piece_length,
-            info.chunk_length,
-            seed.store_bytes,
-            seed.store_retention,
-            seed.cache_type,
-            &seed.cache_dir,
-            &info.infohash,
-        )
-    });
+    let store = seed
+        .registry
+        .get_or_create(info.infohash, || (seed.store_factory)(info.infohash));
     let mut unchoked_peer = false;
     let mut last_progress = Instant::now();
     // Diagnostic: surface each unmodelled Acestream message id once (note 22 follow-up).
@@ -319,12 +311,12 @@ async fn follow_one_peer(
 
 /// If `payload` carries a live-window (`myinfo`) update whose head is beyond `head`, return
 /// the new head; otherwise `None`. The single place window recognition feeds the loop.
-pub(in crate::ace_provider) fn advance_head_from_window(payload: &[u8], head: u64) -> Option<u64> {
+pub(super) fn advance_head_from_window(payload: &[u8], head: u64) -> Option<u64> {
     let w = LiveWindow::from_myinfo_payload(payload)?;
     (w.max_piece > head && w.max_piece <= u32::MAX as u64).then_some(w.max_piece)
 }
 
-pub(in crate::ace_provider) fn stale_upstream_budget(
+pub(super) fn stale_upstream_budget(
     last_progress: Instant,
     now: Instant,
     stale_upstream_timeout: Duration,
@@ -337,7 +329,7 @@ pub(in crate::ace_provider) fn stale_upstream_budget(
     }
 }
 
-pub(in crate::ace_provider) fn should_refresh_stale_deadline(
+pub(super) fn should_refresh_stale_deadline(
     emitted: u64,
     made_output: bool,
     made_activity: bool,
@@ -345,7 +337,7 @@ pub(in crate::ace_provider) fn should_refresh_stale_deadline(
     made_output || (emitted == 0 && made_activity)
 }
 
-pub(in crate::ace_provider) fn schedule_piece_requests(
+pub(super) fn schedule_piece_requests(
     scheduler: &mut Scheduler,
     active_peers: &mut ActivePeers,
     next_needed: u64,
@@ -357,7 +349,7 @@ pub(in crate::ace_provider) fn schedule_piece_requests(
         .collect()
 }
 
-pub(in crate::ace_provider) fn schedule_piece_assignments(
+pub(super) fn schedule_piece_assignments(
     scheduler: &mut Scheduler,
     active_peers: &mut ActivePeers,
     next_needed: u64,
@@ -389,16 +381,16 @@ async fn advance_requests(
 }
 
 /// Hex preview of a message prefix for diagnostics (avoids pulling in a hex crate).
-pub(in crate::ace_provider) fn hex_preview(bytes: &[u8]) -> String {
+pub(super) fn hex_preview(bytes: &[u8]) -> String {
     bytes.iter().take(24).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Read messages until the peer's extended handshake arrives; return its live `mi` window and
 /// the `yourip` public address it echoed to us (issue #22 — the swarm telling us how it sees us
 /// on this outbound connection; `None` when the peer sent no usable `yourip`).
-pub(in crate::ace_provider) async fn read_peer_window(
+pub(super) async fn read_peer_window(
     session: &mut PeerSession<TcpStream>,
-) -> Option<(LivePosition, Option<IpAddr>)> {
+) -> Option<(WireLivePosition, Option<IpAddr>)> {
     for _ in 0..32 {
         let msg = session.read_message().await.ok()?;
         if let PeerMessage::Extended { ext_id: 0, payload } = msg {
@@ -412,7 +404,7 @@ pub(in crate::ace_provider) async fn read_peer_window(
                 return None;
             }
             return Some((
-                LivePosition {
+                WireLivePosition {
                     min_piece,
                     max_piece,
                     position: get(b"position"),

@@ -1,6 +1,7 @@
 //! Real provider/discovery/BT cold-start regressions, synthetic loopback addresses only.
 use super::*;
 use ace_swarm::discover::discover_peers_from_sources_incremental;
+use ace_swarm::discover::MAX_DISCOVERY_PEERS;
 
 fn info() -> StreamInfo {
     StreamInfo {
@@ -982,5 +983,3 @@ async fn late_initial_candidate_waits_for_full_connection_capacity() {
 async fn dropping_initial_connect_cancels_attempts_and_discovery() {
     initial_silent_candidate_control(1, true).await;
 }
-
-mod credit;

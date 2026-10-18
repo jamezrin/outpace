@@ -69,3 +69,7 @@ async fn announce_infohash_once(
             peers.len(),
         );
 }
+
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes.iter().take(24).map(|b| format!("{b:02x}")).collect()
+}

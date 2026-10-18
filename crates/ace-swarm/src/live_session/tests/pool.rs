@@ -432,13 +432,13 @@ fn background_discovery_options_leave_stale_timer_margin() {
 
 #[test]
 fn upstream_selection_prefers_the_freshest_live_head() {
-    let stale = LivePosition {
+    let stale = WireLivePosition {
         min_piece: 100,
         max_piece: 120,
         position: 120,
         distance_from_source: 1,
     };
-    let fresh = LivePosition {
+    let fresh = WireLivePosition {
         min_piece: 105,
         max_piece: 124,
         position: 124,
@@ -454,13 +454,13 @@ fn upstream_selection_prefers_the_freshest_live_head() {
 
 #[test]
 fn upstream_selection_uses_distance_as_a_tiebreaker() {
-    let near = LivePosition {
+    let near = WireLivePosition {
         min_piece: 100,
         max_piece: 120,
         position: 120,
         distance_from_source: 1,
     };
-    let far = LivePosition {
+    let far = WireLivePosition {
         min_piece: 90,
         max_piece: 120,
         position: 120,
@@ -469,4 +469,19 @@ fn upstream_selection_uses_distance_as_a_tiebreaker() {
 
     assert!(prefer_window(&near, &far));
     assert!(!prefer_window(&far, &near));
+}
+
+#[test]
+fn recovery_channel_capacities_are_checked() {
+    let policy = LiveRecoveryConfig {
+        max_active_upstreams: 2,
+        ..LiveRecoveryConfig::default()
+    };
+    assert_eq!(recovery_channel_capacities(policy).unwrap(), (64, 2));
+
+    let invalid = LiveRecoveryConfig {
+        max_active_upstreams: usize::MAX,
+        ..LiveRecoveryConfig::default()
+    };
+    assert!(recovery_channel_capacities(invalid).is_err());
 }

@@ -1,14 +1,11 @@
 use super::*;
 
-pub(in crate::ace_provider) fn prefer_window(
-    candidate: &LivePosition,
-    current: &LivePosition,
-) -> bool {
-    let score = |w: &LivePosition| (w.max_piece, w.position, -w.distance_from_source);
+pub(super) fn prefer_window(candidate: &WireLivePosition, current: &WireLivePosition) -> bool {
+    let score = |w: &WireLivePosition| (w.max_piece, w.position, -w.distance_from_source);
     score(candidate) > score(current)
 }
 
-pub(in crate::ace_provider) async fn peer_worker<S>(
+pub(super) async fn peer_worker<S>(
     peer_id: u64,
     addr: SocketAddrV4,
     mut session: PeerSession<S>,
@@ -61,10 +58,7 @@ pub(in crate::ace_provider) async fn peer_worker<S>(
 
 // Bound the entire handshake/window exchange, not just TCP establishment: a silent
 // preferred source must not monopolize a reconnect batch for the peer I/O timeout.
-pub(in crate::ace_provider) async fn connect_upstream(
-    addr: SocketAddrV4,
-    infohash: [u8; 20],
-) -> PeerConnectAttempt {
+pub(super) async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnectAttempt {
     match tokio::time::timeout(CONNECT_TIMEOUT, connect_upstream_inner(addr, infohash)).await {
         Ok(result) => result,
         Err(_) => PeerConnectAttempt::Failed(PeerConnectFailure {
@@ -112,7 +106,7 @@ async fn connect_upstream_inner(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerC
     })
 }
 
-pub(in crate::ace_provider) fn pool_refill_candidates(
+pub(super) fn pool_refill_candidates(
     peers: &[SocketAddrV4],
     active: &HashSet<SocketAddrV4>,
 ) -> Vec<SocketAddrV4> {
@@ -123,7 +117,7 @@ pub(in crate::ace_provider) fn pool_refill_candidates(
         .collect()
 }
 
-pub(in crate::ace_provider) fn background_discovery_options() -> DiscoveryOptions {
+pub(super) fn background_discovery_options() -> DiscoveryOptions {
     DiscoveryOptions {
         peer_target: BACKGROUND_DISCOVERY_PEER_TARGET,
         dht_budget: BACKGROUND_DISCOVERY_BUDGET,
@@ -134,7 +128,7 @@ pub(in crate::ace_provider) fn background_discovery_options() -> DiscoveryOption
 /// Finish an exploration cohort before retrying more explored peers, so fast but
 /// unproductive sources cannot repeatedly cancel an untouched alternative. Each address
 /// is attempted at most once per round; failed attempts retain their normal cooldown.
-pub(in crate::ace_provider) async fn connect_pool(
+pub(super) async fn connect_pool(
     infohash: [u8; 20],
     candidates: &mut SessionCandidates,
     live_recovery: LiveRecoveryConfig,

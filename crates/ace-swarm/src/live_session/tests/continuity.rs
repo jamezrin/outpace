@@ -76,7 +76,7 @@ fn continuity_uses_configured_live_recovery_bounds() {
     c.register_active_peer(
         1,
         "127.0.0.1:1".parse().unwrap(),
-        LivePosition {
+        WireLivePosition {
             min_piece: 10,
             max_piece: 100,
             position: -1,
@@ -341,13 +341,13 @@ fn peer_window_must_cover_the_next_needed_piece_on_reconnect() {
         PREFETCH_PIECES,
         LiveRecoveryConfig::default(),
     );
-    let stale = LivePosition {
+    let stale = WireLivePosition {
         min_piece: 100,
         max_piece: (start - 1) as i64,
         position: (start - 1) as i64,
         distance_from_source: 1,
     };
-    let covering = LivePosition {
+    let covering = WireLivePosition {
         min_piece: 100,
         max_piece: start as i64,
         position: start as i64,
@@ -373,13 +373,13 @@ fn live_edge_peer_stays_usable_while_the_next_needed_piece_does_not_exist_yet() 
     assert_eq!(c.reasm.next_needed(), 150);
     assert_eq!(c.head, 149);
 
-    let at_live_edge = LivePosition {
+    let at_live_edge = WireLivePosition {
         min_piece: 100,
         max_piece: 149,
         position: 149,
         distance_from_source: 1,
     };
-    let lagging = LivePosition {
+    let lagging = WireLivePosition {
         min_piece: 100,
         max_piece: 120,
         position: 120,
@@ -525,4 +525,10 @@ fn resume_head_never_regresses() {
     let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
     c.resume(addr, 100, 150); // a new peer with a "smaller" (staler) window
     assert_eq!(c.head, 200, "head must not go backward");
+}
+
+#[test]
+fn prefetch_start_bounds_huge_depth_and_peer_window() {
+    assert_eq!(prefetch_start(180, 200, 64), 180);
+    assert_eq!(prefetch_start(0, 20, u64::MAX), 0);
 }

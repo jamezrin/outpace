@@ -14,36 +14,31 @@ mod announce;
 mod content_id_policy_tests;
 #[cfg(test)]
 mod discovery_tests;
-#[cfg(test)]
-mod live_start_tests;
 use announce::announce_seeder_periodically;
 pub use announce::{announce_infohash_periodically, announce_infohash_periodically_dynamic};
 mod live;
-use live::*;
-mod reconnect;
+#[cfg(test)]
+use live::AceSource;
 mod resolution;
 mod vod;
+use ace_swarm::live_session::{DiscoveryRun, LiveOutput, PeerDiscovery, WarmPeerCache};
 use vod::AceVodContent;
 #[cfg(test)]
 use vod::VodSource;
-mod warm_peers;
-use warm_peers::WarmPeerCache;
-#[cfg(test)]
-mod reconnect_tests;
 #[cfg(test)]
 mod resync_tests;
-use reconnect::{CandidateKind, SessionCandidates};
 
 use crate::config::{CacheType, LiveRecoveryConfig, StartupBufferConfig};
 use crate::provider::{
     ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource, VodContent,
 };
 use crate::startup_buffer::StartupBufferedSource;
-use ace_peer::session::{connect, PeerSession};
+use ace_peer::session::connect;
+#[cfg(test)]
+use ace_peer::session::PeerSession;
 use ace_swarm::dht::dht_announce_peer;
 use ace_swarm::discover::{
     announce_seeder, discover_peers, discover_peers_incremental, DiscoveryOptions,
-    MAX_DISCOVERY_PEERS,
 };
 use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::reachability::ReachabilityMonitor;
@@ -53,116 +48,35 @@ use ace_swarm::resolve::{
     stream_info_from_transport_url, transport_bytes_from_url, transport_bytes_via_peer,
     vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
 };
-use ace_swarm::scheduler::{ActivePeers, PeerAssignment, Scheduler};
 use ace_swarm::store::{BackendKind, PieceStore};
 use ace_swarm::types::{StreamInfo, StreamMetadata, VodInfo};
 use ace_swarm::vod::download_vod_pieces;
-use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
+#[cfg(test)]
+use ace_wire::extended::{LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
-use ace_wire::live::LiveWindow;
-use ace_wire::live_codec::{build_piece, chunk_request, LiveChunk};
+#[cfg(test)]
+use ace_wire::live_codec::build_piece;
+#[cfg(test)]
 use ace_wire::message::PeerMessage;
+#[cfg(test)]
 use ace_wire::reassembly::PieceReassembler;
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::future::Future;
-use std::net::{IpAddr, SocketAddrV4};
+use std::collections::VecDeque;
+use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 /// How many pieces behind the live edge to start, so we have buffer immediately.
 const PREFETCH_PIECES: u64 = 8;
-const UNKNOWN_BITRATE_BUFFER_PREFETCH_PIECES: u64 = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// Legacy single-peer helper handle. The production path now assigns real peer handles
-/// starting at 1, but the old helper is kept as a short-term bisect fallback.
-const SINGLE_PEER_ID: u64 = 0;
-/// One total deadline for gossip-only harvesting of a stale connected batch.
-const STALE_GOSSIP_BUDGET: Duration = Duration::from_millis(750);
-
-struct OwnedTask(tokio::task::JoinHandle<()>);
-impl Drop for OwnedTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-type PeerDiscovery = Arc<
-    dyn Fn(DiscoveryOptions, mpsc::Sender<SocketAddrV4>) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
-
-struct DiscoveryRun {
-    receiver: mpsc::Receiver<SocketAddrV4>,
-    _worker: OwnedTask,
-}
-impl DiscoveryRun {
-    fn start(discovery: &PeerDiscovery, options: DiscoveryOptions) -> Self {
-        let (sender, receiver) = mpsc::channel(MAX_DISCOVERY_PEERS);
-        Self {
-            receiver,
-            _worker: OwnedTask(tokio::spawn(discovery(options, sender))),
-        }
-    }
-}
-
-#[cfg(test)]
-fn completed_discovery<F, Fut>(factory: F) -> PeerDiscovery
-where
-    F: Fn(DiscoveryOptions) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Vec<SocketAddrV4>> + Send + 'static,
-{
-    Arc::new(move |options, sender| {
-        let future = factory(options);
-        Box::pin(async move {
-            for peer in future.await {
-                if sender.send(peer).await.is_err() {
-                    return;
-                }
-            }
-        })
-    })
-}
-
-fn drain_discovery(run: &mut Option<DiscoveryRun>, candidates: &mut SessionCandidates) {
-    let Some(discovery) = run.as_mut() else {
-        return;
-    };
-    loop {
-        match discovery.receiver.try_recv() {
-            Ok(peer) => candidates.learn(peer, CandidateKind::Discovered),
-            Err(mpsc::error::TryRecvError::Empty) => return,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                *run = None;
-                return;
-            }
-        }
-    }
-}
-async fn next_discovery_peer(run: &mut Option<DiscoveryRun>) -> Option<SocketAddrV4> {
-    let Some(discovery) = run.as_mut() else {
-        return std::future::pending().await;
-    };
-    let peer = discovery.receiver.recv().await;
-    if peer.is_none() {
-        *run = None;
-    }
-    peer
-}
-
-/// Briefly collect other near-complete candidates after the first live handshake.
-const UPSTREAM_SELECTION_GRACE: Duration = Duration::from_millis(250);
-/// Process gossip while withholding media from an uncorroborated first window.
-const LIVE_START_CORROBORATION: Duration = Duration::from_secs(1);
+const UNKNOWN_BITRATE_BUFFER_PREFETCH_PIECES: u64 = 32;
 /// How often an active session re-announces itself as a seeder to its trackers, so
 /// outpace becomes organically discoverable while it's serving (see
 /// `docs/protocol/notes/24-seeder-self-announce.md`). Doesn't yet honor a tracker's
@@ -174,12 +88,6 @@ const SEEDER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(4 * 60);
 const DHT_ANNOUNCE_BUDGET: Duration = Duration::from_secs(15);
 /// Per-peer read ceiling while resolving a content-id (a silent peer shouldn't stall us).
 const RESOLVE_PEER_TIMEOUT: Duration = Duration::from_secs(6);
-/// Background discovery can spend longer/deeper than startup discovery because it does not
-/// gate first byte. It should still finish before the stale-upstream timer fires, so a new
-/// peer can enter the pool before we reconnect.
-const BACKGROUND_DISCOVERY_BUDGET: Duration = Duration::from_secs(8);
-const BACKGROUND_DISCOVERY_PEER_TARGET: usize = 64;
-
 /// Acestream's hardcoded public UDP tracker (see `docs/protocol/notes/03`). Used for
 /// content-id/metadata discovery and as the fallback list where a descriptor has none. DHT
 /// discovery runs alongside this tracker in `discover_peers`.
@@ -267,26 +175,26 @@ fn disk_store_subdir(infohash: &[u8; 20]) -> String {
     format!("{}-{generation}", infohash_hex(infohash))
 }
 
-/// Seeding configuration threaded through the download loop: the shared per-infohash
-/// piece store (so downloaded data becomes servable to inbound peers too — T7), its size
-/// budget, and whether reciprocal serving over THIS outbound connection is enabled at all.
-#[derive(Clone)]
-struct SeedConfig {
-    metrics: Option<Arc<crate::live_stats::LiveMetrics>>,
-    registry: SeedRegistry,
-    store_bytes: u64,
-    /// Age bound for the live seed store (primary limiter; `store_bytes` is the hard ceiling).
-    store_retention: Option<Duration>,
-    enabled: bool,
-    /// Pieces behind the live edge the fresh follower starts at (playback cushion).
-    prefetch_pieces: u64,
-    /// Live lag-recovery policy and active upstream bounds.
-    live_recovery: LiveRecoveryConfig,
-    /// Backend the per-infohash seed store uses for piece data.
-    cache_type: CacheType,
-    /// Root dir for disk-mode piece files (per-infohash subdir derived from this).
-    cache_dir: PathBuf,
-    warm_peers: WarmPeerCache,
+impl AceProvider {
+    fn store_factory(&self, info: &StreamInfo) -> ace_swarm::live_session::StoreFactory {
+        let piece_length = info.piece_length;
+        let chunk_length = info.chunk_length;
+        let max_bytes = self.seed_store_bytes;
+        let retention = self.seed_store_retention;
+        let cache_type = self.cache_type;
+        let cache_dir = self.cache_dir.clone();
+        Arc::new(move |infohash| {
+            build_piece_store(
+                piece_length,
+                chunk_length,
+                max_bytes,
+                retention,
+                cache_type,
+                &cache_dir,
+                &infohash,
+            )
+        })
+    }
 }
 
 pub struct AceProvider {
@@ -457,13 +365,6 @@ impl AceProvider {
     pub fn with_cache(mut self, cache_type: CacheType, cache_dir: PathBuf) -> Self {
         self.cache_type = cache_type;
         self.warm_peers = WarmPeerCache::new(&cache_dir, false);
-        self.cache_dir = cache_dir;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_warm_cache_loopback_policy(mut self, cache_dir: PathBuf) -> Self {
-        self.warm_peers = WarmPeerCache::new(&cache_dir, true);
         self.cache_dir = cache_dir;
         self
     }
@@ -640,6 +541,3 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod stats_tests;

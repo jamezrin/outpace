@@ -1,8 +1,8 @@
 //! Production live-start protocol regressions with entirely synthetic loopback media.
 use super::*;
 
-fn window(min: i64, max: i64) -> LivePosition {
-    LivePosition {
+fn window(min: i64, max: i64) -> WireLivePosition {
+    WireLivePosition {
         min_piece: min,
         max_piece: max,
         position: -1,
@@ -30,7 +30,7 @@ fn fixture(max_active: usize) -> (StreamInfo, SeedConfig) {
             source_pubkey: vec![],
         },
         SeedConfig {
-            metrics: Some(crate::live_stats::LiveMetrics::new(
+            metrics: Some(TestObserver::new(
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
@@ -38,8 +38,7 @@ fn fixture(max_active: usize) -> (StreamInfo, SeedConfig) {
                 Arc::new(AtomicU32::new(0)),
             )),
             registry: SeedRegistry::new(),
-            store_bytes: 4096,
-            store_retention: None,
+            store_factory: test_store_factory(4096, None),
             enabled: false,
             prefetch_pieces: 1,
             live_recovery: LiveRecoveryConfig {
@@ -47,8 +46,7 @@ fn fixture(max_active: usize) -> (StreamInfo, SeedConfig) {
                 request_check_interval_ms: 10,
                 ..LiveRecoveryConfig::default()
             },
-            cache_type: CacheType::Memory,
-            cache_dir: PathBuf::new(),
+
             warm_peers: WarmPeerCache::memory(),
         },
     )
@@ -126,7 +124,15 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
         }
     });
     let (info, seed) = fixture(max_active);
-    let received = seed.metrics.as_ref().unwrap().received.clone();
+    let received = Arc::new(AtomicU64::new(0));
+    let mut seed = seed;
+    seed.metrics = Some(TestObserver::new(
+        Arc::new(AtomicU64::new(0)),
+        received.clone(),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    ));
     let (tx, mut rx) = mpsc::channel(16);
     let count = Arc::new(AtomicU32::new(1));
     let pool_count = count.clone();

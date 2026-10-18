@@ -65,7 +65,7 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
                 }
                 if session
                     .send_extended_handshake(&OutgoingExtendedHandshake {
-                        mi: Some(LivePosition {
+                        mi: Some(WireLivePosition {
                             min_piece: 7,
                             max_piece: 10,
                             position: -1,
@@ -121,7 +121,7 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
         session.accept_handshake([0; 20], |_| true).await.unwrap();
         session
             .send_extended_handshake(&OutgoingExtendedHandshake {
-                mi: Some(LivePosition {
+                mi: Some(WireLivePosition {
                     min_piece: 7,
                     max_piece: 10,
                     position: -1,
@@ -173,24 +173,14 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
         std::process::id(),
         NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
     ));
-    let make_provider = || {
-        AceProvider::new(Arc::new(Identity::generate()), 0)
-            .with_warm_cache_loopback_policy(cache_dir.clone())
-            .with_prefetch_pieces(Some(1))
-            .with_startup_buffer(StartupBufferConfig {
-                target_ms: 0,
-                ..StartupBufferConfig::default()
-            })
-    };
-    let first = make_provider();
-    let mut source = first
-        .open_resolved(
-            "synthetic",
-            descriptor.clone(),
-            completed_discovery(move |_| async move { vec![relay_addr] }),
-        )
-        .await
-        .unwrap();
+    let make_cache = || WarmPeerCache::new(&cache_dir, true);
+    let first = make_cache();
+    let mut source = open_cached_session(
+        first.clone(),
+        descriptor.clone(),
+        completed_discovery(move |_| async move { vec![relay_addr] }),
+    )
+    .await;
     let output = tokio::time::timeout(
         Duration::from_secs(if mode == CacheProducer::Mixed { 5 } else { 3 }),
         source.next(),
@@ -212,19 +202,19 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
     }
     if mode == CacheProducer::Authenticated {
         assert!(
-            first.warm_peers.hints(&[0; 20]) == vec![(source_addr, CandidateKind::Source)],
+            first.hints(&[0; 20]) == vec![(source_addr, CandidateKind::Source)],
             "credit belongs to the complete authenticated source, not its announcing relay"
         );
     } else {
         assert!(
-            first.warm_peers.hints(&[0; 20]).is_empty(),
+            first.hints(&[0; 20]).is_empty(),
             "unverified or mixed producer acquired productive cache credit"
         );
     }
     let before = attempts.load(Ordering::Relaxed);
     assert!(before > 0);
     assert!(
-        first.warm_peers.flush().await,
+        first.flush().await,
         "normal productive cache revision must actually persist"
     );
     drop(source);
@@ -233,15 +223,11 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
         warm_peers::retired_terminal(&cache_dir).await,
         "old cache owner/writer must be terminal before fresh reconstruction"
     );
-    let fresh = make_provider();
-    fresh.warm_peers.initialized().await;
-    assert!(
-        fresh.open(&infohash_hex(&[0; 20])).await.is_err(),
-        "peer hints must never grant bare-infohash descriptor authority"
-    );
+    let fresh = make_cache();
+    fresh.initialized().await;
     if mode != CacheProducer::Authenticated {
         assert!(
-            fresh.warm_peers.hints(&[0; 20]).is_empty(),
+            fresh.hints(&[0; 20]).is_empty(),
             "negative credit persisted across provider restart"
         );
         drop(fresh);
@@ -255,8 +241,7 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
         tokio::time::sleep(Duration::from_secs(5)).await;
         Vec::new()
     });
-    let open =
-        tokio::spawn(async move { fresh.open_resolved("synthetic", descriptor, slow).await });
+    let open = tokio::spawn(async move { open_cached_session(fresh, descriptor, slow).await });
     let warm_attempt = tokio::time::timeout(Duration::from_secs(2), async {
         while attempts.load(Ordering::Relaxed) == before {
             tokio::task::yield_now().await;
@@ -264,7 +249,7 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
     })
     .await;
     open.abort();
-    if let Ok(Ok(source)) = open.await {
+    if let Ok(source) = open.await {
         drop(source);
     }
     servers.abort_all();
@@ -367,7 +352,7 @@ async fn signed_resume_session(
     session.accept_handshake([0; 20], |_| true).await.unwrap();
     session
         .send_extended_handshake(&OutgoingExtendedHandshake {
-            mi: Some(LivePosition {
+            mi: Some(WireLivePosition {
                 min_piece: 7,
                 max_piece: 8,
                 position: -1,
@@ -502,16 +487,12 @@ async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
         std::process::id(),
         SERIAL.fetch_add(1, Ordering::Relaxed)
     ));
-    let make_provider = || {
-        AceProvider::new(Arc::new(Identity::generate()), 0)
-            .with_warm_cache_loopback_policy(cache_dir.clone())
-    };
-    let first = make_provider();
+    let make_cache = || WarmPeerCache::new(&cache_dir, true);
+    let first = make_cache();
     let seed = SeedConfig {
         metrics: None,
         registry: SeedRegistry::new(),
-        store_bytes: 16384,
-        store_retention: None,
+        store_factory: test_store_factory(16384, None),
         enabled: false,
         prefetch_pieces: 1,
         live_recovery: LiveRecoveryConfig {
@@ -519,9 +500,8 @@ async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
             max_parallel_connect: 2,
             ..LiveRecoveryConfig::default()
         },
-        cache_type: CacheType::Memory,
-        cache_dir: PathBuf::new(),
-        warm_peers: first.warm_peers.clone(),
+
+        warm_peers: first.clone(),
     };
     let mut fixture = SignedResumePool {
         info: descriptor.clone(),
@@ -621,16 +601,16 @@ async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
         server.unwrap();
     }
     let cursor = fixture.continuity.as_ref().unwrap().reasm.next_needed();
-    assert!(first.warm_peers.flush().await);
+    assert!(first.flush().await);
     drop(fixture);
     drop(first);
     assert!(
         warm_peers::retired_terminal(&cache_dir).await,
         "prior cache writer must actually terminate before reconstruction"
     );
-    let fresh = make_provider();
-    fresh.warm_peers.initialized().await;
-    let hints = fresh.warm_peers.hints(&descriptor.infohash);
+    let fresh = make_cache();
+    fresh.initialized().await;
+    let hints = fresh.hints(&descriptor.infohash);
     drop(fresh);
     assert!(warm_peers::retired_terminal(&cache_dir).await);
     std::fs::remove_dir_all(cache_dir).unwrap();
@@ -673,4 +653,73 @@ async fn retained_complete_signed_reconnect_ignores_duplicate_producer_credit() 
 #[tokio::test]
 async fn retained_single_producer_signed_reconnect_preserves_media_and_durable_credit() {
     retained_signed_resume_credit_control(ResumeCredit::SameProducer).await;
+}
+
+fn media_piece(marker: u8) -> Vec<u8> {
+    (0..4)
+        .flat_map(|cc| {
+            let mut packet = vec![marker; 188];
+            packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | cc]);
+            packet
+        })
+        .collect()
+}
+struct CachedSource {
+    rx: mpsc::Receiver<LiveOutput>,
+    _task: OwnedTask,
+}
+impl CachedSource {
+    async fn next(&mut self) -> Option<Bytes> {
+        self.rx.recv().await.map(|output| output.bytes)
+    }
+}
+async fn open_cached_session(
+    cache: WarmPeerCache,
+    info: StreamInfo,
+    discovery: PeerDiscovery,
+) -> CachedSource {
+    let mut run = DiscoveryRun::start(&discovery, crate::discover::DiscoveryOptions::default());
+    cache.initialized().await;
+    let mut peers = cache.candidate_addresses(&info.infohash);
+    if peers.is_empty() {
+        peers.extend(run.next_candidate().await);
+    }
+    while let Ok(peer) = run.try_next_candidate() {
+        peers.push(peer);
+    }
+    let piece_length = info.piece_length;
+    let chunk_length = info.chunk_length;
+    let seed = LiveSeedOptions {
+        metrics: None,
+        registry: SeedRegistry::new(),
+        store_factory: Arc::new(move |_| {
+            PieceStore::new(piece_length, chunk_length, 128 * 1024 * 1024)
+                .with_retention(Duration::from_secs(45))
+        }),
+        enabled: true,
+        prefetch_pieces: 1,
+        live_recovery: LiveRecoveryOptions::default(),
+        warm_peers: cache,
+    };
+    let (output, rx) = mpsc::channel(256);
+    let task = tokio::spawn(follow_live(LiveSessionInputs {
+        info,
+        peers,
+        identity: Arc::new(Identity::generate()),
+        output,
+        counters: LiveCounters {
+            peers: Arc::new(AtomicU32::new(0)),
+            downloaded: Arc::new(AtomicU64::new(0)),
+            uploaded: Arc::new(AtomicU64::new(0)),
+            peers_served: Arc::new(AtomicU32::new(0)),
+        },
+        seed,
+        discovery,
+        reachability: None,
+        initial_run: Some(run),
+    }));
+    CachedSource {
+        rx,
+        _task: OwnedTask(task),
+    }
 }

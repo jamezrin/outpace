@@ -13,7 +13,7 @@ fn received_payload_is_counted_once_before_output_gating() {
     };
     let (mut continuity, _) = Continuity::fresh(&info, 0, 0, 0, LiveRecoveryConfig::default());
     let received = Arc::new(AtomicU64::new(0));
-    let metrics = crate::live_stats::LiveMetrics::new(
+    let metrics = TestObserver::new(
         Arc::new(AtomicU64::new(0)),
         received.clone(),
         Arc::new(AtomicU64::new(0)),
@@ -26,17 +26,23 @@ fn received_payload_is_counted_once_before_output_gating() {
     continuity.reasm.add_block(0, 2, b"cd").unwrap();
     assert_eq!(ready_buffer_snapshot(&continuity, Some(2)), (2000, 1));
     assert_eq!(
-        take_ready_with_stats(&mut continuity, Some(&metrics), &info),
+        take_ready_with_stats(
+            &mut continuity,
+            Some(&(metrics.clone() as Arc<dyn LiveObserver>)),
+            &info
+        ),
         b"abcd"
     );
     // Duplicate old blocks cannot become new received media.
     continuity.reasm.add_block(0, 0, b"abcd").unwrap();
-    assert!(take_ready_with_stats(&mut continuity, Some(&metrics), &info).is_empty());
+    assert!(take_ready_with_stats(
+        &mut continuity,
+        Some(&(metrics.clone() as Arc<dyn LiveObserver>)),
+        &info
+    )
+    .is_empty());
     assert_eq!(received.load(Ordering::Relaxed), 4);
-    assert_eq!(
-        crate::provider::StatsReader::snapshot(metrics.as_ref()).downloaded,
-        0
-    );
+    assert_eq!(metrics.snapshot().downloaded, 0);
 }
 
 #[test]
@@ -51,7 +57,7 @@ fn positions_clear_active_bounds_on_reconnect_and_reject_negative_windows() {
         metadata: StreamMetadata::default(),
     };
     let (mut c, _) = Continuity::fresh(&info, 0, 0, 0, LiveRecoveryConfig::default());
-    let metrics = crate::live_stats::LiveMetrics::new(
+    let metrics = TestObserver::new(
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
@@ -61,7 +67,7 @@ fn positions_clear_active_bounds_on_reconnect_and_reject_negative_windows() {
     c.register_active_peer(
         1,
         SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1),
-        LivePosition {
+        WireLivePosition {
             min_piece: -1,
             max_piece: -1,
             position: -1,
@@ -69,25 +75,13 @@ fn positions_clear_active_bounds_on_reconnect_and_reject_negative_windows() {
         },
     );
     c.set_peer_unchoked(1, true);
-    publish_live_stats(&c, Some(&metrics), &info);
-    assert_eq!(
-        crate::provider::StatsReader::snapshot(metrics.as_ref())
-            .livepos
-            .unwrap()
-            .live_first,
-        None
-    );
+    publish_live_stats(&c, Some(&(metrics.clone() as Arc<dyn LiveObserver>)), &info);
+    assert_eq!(metrics.snapshot().livepos.unwrap().live_first, None);
     c.active_peers.observe_window(1, Some((2, 7)));
-    publish_live_stats(&c, Some(&metrics), &info);
-    assert_eq!(
-        crate::provider::StatsReader::snapshot(metrics.as_ref())
-            .livepos
-            .unwrap()
-            .live_last,
-        Some(7)
-    );
+    publish_live_stats(&c, Some(&(metrics.clone() as Arc<dyn LiveObserver>)), &info);
+    assert_eq!(metrics.snapshot().livepos.unwrap().live_last, Some(7));
     drop(LiveStatsGuard(Some(metrics.clone())));
-    let snapshot = crate::provider::StatsReader::snapshot(metrics.as_ref());
+    let snapshot = metrics.snapshot();
     assert_eq!(snapshot.livepos.unwrap().live_last, None);
     assert_eq!(snapshot.buffer_ms, 0);
 }
@@ -107,7 +101,7 @@ fn sliding_window_observations_do_not_change_scheduler_coverage() {
     c.register_active_peer(
         1,
         SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1),
-        LivePosition {
+        WireLivePosition {
             min_piece: 100,
             max_piece: 200,
             position: -1,

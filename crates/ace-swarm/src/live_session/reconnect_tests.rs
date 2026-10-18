@@ -4,8 +4,8 @@ use super::*;
 fn default_live_recovery() -> LiveRecoveryConfig {
     LiveRecoveryConfig::default()
 }
-fn live_pos(min_piece: i64, max_piece: i64) -> LivePosition {
-    LivePosition {
+fn live_pos(min_piece: i64, max_piece: i64) -> WireLivePosition {
+    WireLivePosition {
         min_piece,
         max_piece,
         position: -1,
@@ -329,11 +329,14 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         sig_len: 0,
         source_pubkey: vec![],
     };
-    let seed = SeedConfig {
+    let mut seed = SeedConfig {
         metrics: None,
         registry: SeedRegistry::new(),
-        store_bytes: 4096,
-        store_retention: None,
+        store_factory: {
+            let piece_length = info.piece_length;
+            let chunk_length = info.chunk_length;
+            Arc::new(move |_| PieceStore::new(piece_length, chunk_length, 4096))
+        },
         enabled: false,
         // The fixture emits piece7 before its advertised head8.
         prefetch_pieces: 1,
@@ -345,10 +348,18 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
             max_active_upstreams: if full_pool { 1 } else { 4 },
             ..default_live_recovery()
         },
-        cache_type: CacheType::Memory,
-        cache_dir: PathBuf::new(),
+
         warm_peers: WarmPeerCache::memory(),
     };
+    let registry = seed.registry.clone();
+    let infohash = info.infohash;
+    let creations = Arc::new(AtomicU32::new(0));
+    let factory = seed.store_factory.clone();
+    let created = creations.clone();
+    seed.store_factory = Arc::new(move |hash| {
+        created.fetch_add(1, Ordering::Relaxed);
+        factory(hash)
+    });
     let (tx, mut rx) = mpsc::channel(16);
     let peer_count = Arc::new(AtomicU32::new(0));
     let count = peer_count.clone();
@@ -373,7 +384,21 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
     let result = tokio::time::timeout(Duration::from_secs(8), async {
         let first = rx.recv().await.expect("initial source output");
         assert_eq!(first.bytes.as_ref(), &payload[..564]);
+        let inbound_store = registry
+            .get(&infohash)
+            .expect("producer store visible to inbound consumers");
         let resumed = rx.recv().await.expect("resumed source output");
+        assert!(Arc::ptr_eq(
+            &inbound_store,
+            &registry
+                .get(&infohash)
+                .expect("same store remains published after reconnect")
+        ));
+        assert_eq!(
+            creations.load(Ordering::Relaxed),
+            1,
+            "one producer store for the whole session"
+        );
         assert!(
             resumed.bytes.contains(&0x66),
             "resumption must deliver new media, not replay the old piece"
@@ -382,6 +407,11 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
     .await;
     drop(rx);
     let stopped = tokio::time::timeout(Duration::from_secs(1), session).await;
+    assert!(
+        !registry.serves(&infohash),
+        "session teardown releases its producer lease"
+    );
+    assert_eq!(creations.load(Ordering::Relaxed), 1);
     source.abort();
     relay.abort();
     let _ = source.await;
@@ -458,13 +488,11 @@ fn cancellation_fixture() -> (StreamInfo, SeedConfig) {
     let seed = SeedConfig {
         metrics: None,
         registry: SeedRegistry::new(),
-        store_bytes: 4096,
-        store_retention: None,
+        store_factory: test_store_factory(4096, None),
         enabled: false,
         prefetch_pieces: 0,
         live_recovery: LiveRecoveryConfig::default(),
-        cache_type: CacheType::Memory,
-        cache_dir: PathBuf::new(),
+
         warm_peers: WarmPeerCache::memory(),
     };
     (info, seed)

@@ -74,8 +74,6 @@ fn prefetch_bounds_huge_rates_payload_and_peer_window() {
         AceProvider::new(Arc::new(Identity::generate()), 6878).with_live_recovery(recovery);
     let depth = provider.prefetch_policy_for(&descriptor);
     assert_eq!(depth, 64);
-    assert_eq!(prefetch_start(180, 200, depth), 180);
-    assert_eq!(prefetch_start(0, 20, u64::MAX), 0);
 }
 
 #[test]
@@ -378,7 +376,11 @@ async fn warm_infohash_continuity_authenticates_pieces_before_emitting() {
         .resolve_live_info(&infohash_hex(&verified.infohash))
         .await
         .unwrap();
-    let (mut continuity, start) = Continuity::fresh(&info, 7, 7, 0, default_live_recovery());
+    let start = 7;
+    let mut reasm = PieceReassembler::new(info.piece_length, start)
+        .with_piece_trailer(info.sig_len as u64)
+        .with_source_pubkey(info.source_pubkey.clone())
+        .with_max_pieces_ahead(default_live_recovery().max_reasm_pieces_ahead);
     let payload = vec![0x47; info.piece_length as usize - auth.signature_len()];
     let mut piece = payload.clone();
     piece.extend(auth.sign(&payload));
@@ -386,203 +388,23 @@ async fn warm_infohash_continuity_authenticates_pieces_before_emitting() {
     corrupt[0] ^= 1;
     let chunk_length = info.chunk_length as usize;
     for (index, block) in corrupt.chunks(chunk_length).enumerate() {
-        let result = continuity
-            .reasm
-            .add_block(start, (index * chunk_length) as u64, block);
+        let result = reasm.add_block(start, (index * chunk_length) as u64, block);
         if index + 1 == info.chunks_per_piece() as usize {
             assert!(result.is_err(), "bad RSA signature must reject the piece");
         } else {
             result.unwrap();
         }
     }
-    assert!(continuity.reasm.take_ready().is_empty());
-    assert_eq!(continuity.reasm.next_needed(), start);
+    assert!(reasm.take_ready().is_empty());
+    assert_eq!(reasm.next_needed(), start);
 
     for (index, block) in piece.chunks(chunk_length).enumerate() {
-        continuity
-            .reasm
+        reasm
             .add_block(start, (index * chunk_length) as u64, block)
             .unwrap();
     }
-    assert_eq!(continuity.reasm.take_ready(), payload);
-    assert_eq!(continuity.reasm.next_needed(), start + 1);
-}
-
-#[tokio::test]
-async fn rejected_signed_piece_retries_through_full_peer_pool() {
-    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
-    let payload: Vec<u8> = (0..4)
-        .flat_map(|cc| {
-            let mut packet = vec![0x55; 188];
-            packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | cc]);
-            packet
-        })
-        .collect();
-    let mut authentic = payload.clone();
-    authentic.extend(auth.sign(&payload));
-    let mut corrupt = authentic.clone();
-    corrupt[0] ^= 1;
-    let info = StreamInfo {
-        infohash: [0; 20],
-        piece_length: authentic.len() as u64,
-        chunk_length: authentic.len() as u64 / 2,
-        trackers: vec![],
-        metadata: StreamMetadata::default(),
-        sig_len: auth.signature_len(),
-        source_pubkey: auth.pubkey_der(),
-    };
-    let policy = LiveRecoveryConfig {
-        max_active_upstreams: 1,
-        max_piece_advance: 1,
-        request_timeout_ms: 5_000,
-        request_check_interval_ms: 10,
-        ..default_live_recovery()
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = match listener.local_addr().unwrap() {
-        std::net::SocketAddr::V4(addr) => addr,
-        _ => unreachable!(),
-    };
-    let client = TcpStream::connect(addr).await.unwrap();
-    let (server, _) = listener.accept().await.unwrap();
-    let (retry_tx, retry_rx) = tokio::sync::oneshot::channel();
-    let (allow_tx, allow_rx) = tokio::sync::oneshot::channel();
-    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
-    let chunk_length = info.chunk_length as usize;
-    let server = tokio::spawn(async move {
-        let mut retry_tx = Some(retry_tx);
-        let mut allow_rx = Some(allow_rx);
-        let mut finish_rx = Some(finish_rx);
-        let mut session = PeerSession::new(server);
-        session.send(&PeerMessage::Unchoke).await.unwrap();
-        for attempt in 0..2 {
-            let mut chunks = Vec::new();
-            while chunks.len() < 2 {
-                let msg = session.read_message().await.unwrap();
-                if let PeerMessage::Unknown { id: 6, payload } = msg {
-                    assert_eq!(u32::from_be_bytes(payload[4..8].try_into().unwrap()), 7);
-                    chunks.push(u16::from_be_bytes(payload[8..10].try_into().unwrap()));
-                }
-            }
-            assert_eq!(chunks, vec![0, 1]);
-            if attempt == 0 {
-                for chunk in [0, 0, 1] {
-                    let begin = chunk as usize * chunk_length;
-                    session
-                        .send(&build_piece(
-                            0,
-                            7,
-                            chunk,
-                            [0; 8],
-                            &corrupt[begin..begin + chunk_length],
-                        ))
-                        .await
-                        .unwrap();
-                }
-            } else {
-                retry_tx.take().unwrap().send(()).unwrap();
-                allow_rx.take().unwrap().await.unwrap();
-                // Deliver the previously rejected last chunk first. Stale chunk counts
-                // must not free the slot and start a third request before completion.
-                session
-                    .send(&build_piece(0, 7, 1, [0; 8], &authentic[chunk_length..]))
-                    .await
-                    .unwrap();
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(100), session.read_message())
-                        .await
-                        .is_err(),
-                    "partial retry must stay in flight"
-                );
-                session
-                    .send(&build_piece(0, 7, 0, [0; 8], &authentic[..chunk_length]))
-                    .await
-                    .unwrap();
-                // Late copies must not emit the authenticated piece twice.
-                for chunk in 0..2 {
-                    let begin = chunk as usize * chunk_length;
-                    session
-                        .send(&build_piece(
-                            0,
-                            7,
-                            chunk,
-                            [0; 8],
-                            &authentic[begin..begin + chunk_length],
-                        ))
-                        .await
-                        .unwrap();
-                }
-                finish_rx.take().unwrap().await.unwrap();
-            }
-        }
-    });
-    let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(
-        info.piece_length,
-        info.chunk_length,
-        4096,
-    )));
-    let seed = SeedConfig {
-        metrics: None,
-        registry: SeedRegistry::new(),
-        store_bytes: 4096,
-        store_retention: None,
-        enabled: false,
-        prefetch_pieces: 0,
-        live_recovery: policy,
-        cache_type: CacheType::Memory,
-        cache_dir: PathBuf::new(),
-        warm_peers: WarmPeerCache::memory(),
-    };
-    let (tx, mut rx) = mpsc::channel(4);
-    let pool = tokio::spawn(async move {
-        let mut continuity = None;
-        follow_peer_pool(
-            vec![ConnectedUpstream {
-                session: PeerSession::new(client),
-                addr,
-                window: live_pos(7, 7),
-                yourip: None,
-            }],
-            &info,
-            &Identity::generate(),
-            2,
-            &tx,
-            &Arc::new(AtomicU64::new(0)),
-            &Arc::new(AtomicU64::new(0)),
-            &Arc::new(AtomicU32::new(0)),
-            &seed,
-            &store,
-            &mut continuity,
-            vec![],
-            vec![],
-            completed_discovery(|_| Box::pin(async { vec![] })),
-            &mut SessionCandidates::default(),
-            &Arc::new(AtomicU32::new(0)),
-            None,
-        )
-        .await;
-    });
-    tokio::time::timeout(Duration::from_secs(2), retry_rx)
-        .await
-        .expect("pool must re-request the rejected piece without waiting for timeout")
-        .unwrap();
-    assert!(rx.try_recv().is_err(), "corrupt piece must emit nothing");
-    allow_tx.send(()).unwrap();
-    let output = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    // The existing TS resynchronizer retains one packet for its next-sync check.
-    assert_eq!(output.bytes.as_ref(), &payload[..564]);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), rx.recv())
-            .await
-            .is_err(),
-        "late duplicate blocks must not emit another piece"
-    );
-    finish_tx.send(()).unwrap();
-    server.await.unwrap();
-    pool.await.unwrap();
+    assert_eq!(reasm.take_ready(), payload);
+    assert_eq!(reasm.next_needed(), start + 1);
 }
 
 #[tokio::test]
@@ -780,4 +602,62 @@ async fn open_rejects_transport_url_id_with_bad_scheme() {
         ProviderError::Backend(msg) => assert!(msg.contains("transport url"), "{msg}"),
         other => panic!("expected Backend error, got {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn warm_peer_hints_never_grant_descriptor_authority() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = std::env::temp_dir().join(format!(
+        "outpace-190-authority-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let path = dir.join("recent-peers-v1");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        &path,
+        format!("OUTPACE-WARM-1\n{PLACEHOLDER_ID} {now} S 1.2.3.4 23456\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_cache(CacheType::Memory, dir.clone());
+    provider.warm_peers.initialized().await;
+    let hash = hex20(PLACEHOLDER_ID).unwrap();
+    assert_eq!(
+        provider.warm_peers.candidate_addresses(&hash),
+        vec!["1.2.3.4:23456".parse::<SocketAddrV4>().unwrap()]
+    );
+    assert!(provider.verified_info_for_infohash(PLACEHOLDER_ID).is_err());
+    assert!(provider
+        .resolve_infohash_with_catalog(
+            PLACEHOLDER_ID,
+            std::future::ready(Err(ResolveError::Catalog("synthetic catalog miss")))
+        )
+        .await
+        .is_err());
+    drop(provider);
+    // Cache drop requests the owned writer to stop without blocking the async caller.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => panic!("temporary cache cleanup failed: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
 }
