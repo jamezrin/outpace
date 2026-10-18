@@ -1,32 +1,40 @@
 use super::*;
 
 mod peer;
+#[cfg(test)]
+pub(super) use peer::prefer_window;
 pub(super) use peer::{
     background_discovery_options, connect_pool, connect_upstream, peer_worker,
-    pool_refill_candidates, prefer_window,
+    pool_refill_candidates,
 };
 mod continuity;
+#[cfg(test)]
 pub(super) use continuity::prefetch_start;
 mod pool;
 #[cfg(test)]
 pub(super) use pool::follow_peer_pool;
-pub(super) use pool::{
-    activate_upstream_peer, follow_peer_pool_with_discovery, recovery_channel_capacities,
-};
+pub(super) use pool::follow_peer_pool_with_discovery;
+#[cfg(test)]
+pub(super) use pool::{activate_upstream_peer, recovery_channel_capacities};
 mod pool_support;
+#[cfg(test)]
+pub(super) use pool_support::ready_buffer_snapshot;
 #[cfg(test)]
 pub(super) use pool_support::spawn_learned_connects;
 use pool_support::*;
 pub(super) use pool_support::{
     advance_pool_requests, drop_peer_runtime, finish_candidate_connect, harvest_stale_gossip,
-    observe_live_window, publish_live_stats, ready_buffer_snapshot, retransmit_stalled_requests,
-    shutdown_peer_runtimes, spawn_candidate_connects, take_ready_with_stats,
+    observe_live_window, publish_live_stats, retransmit_stalled_requests, shutdown_peer_runtimes,
+    spawn_candidate_connects, take_ready_with_stats,
 };
 mod single_peer;
 pub(super) use single_peer::{
     advance_head_from_window, hex_preview, read_peer_window, schedule_piece_assignments,
-    schedule_piece_requests, should_refresh_stale_deadline, stale_upstream_budget,
+    should_refresh_stale_deadline, stale_upstream_budget,
 };
+
+#[cfg(test)]
+pub(super) use single_peer::schedule_piece_requests;
 
 pub(super) struct LiveOutput {
     pub(super) bytes: Bytes,
