@@ -11,6 +11,8 @@ ATTESTATIONS = {'simultaneous', 'same_current_public_source', 'same_settings',
                 'same_routes', 'fresh_state', 'viewers_observed', 'warp_off',
                 'direct_route_verified', 'complete'}
 PROVENANCE = {'candidate_build', 'reference_version', 'reference_image_digest'}
+# Arithmetic noise only: much smaller than the player's 50-ms model step.
+MODEL_EPSILON = 1e-9
 
 
 def number(value, *, positive=False, integer=False):
@@ -90,15 +92,31 @@ def evaluate(summary, policy):
                 if player['start'] is not None:
                     if number(player['start']) > duration:
                         raise ValueError('startup outside observation')
+                    if type(player['stalls']) is not int:
+                        raise ValueError('invalid stall count')
                     number(player['stalls'], integer=True)
-                    number(player['stall_time'])
+                    total = number(player['stall_time'])
+                    if total > duration - player['start'] + MODEL_EPSILON:
+                        raise ValueError('stall time outside playable window')
                     if not isinstance(player['stall_list'], list):
                         raise ValueError('missing stall events')
+                    if player['stalls'] != len(player['stall_list']):
+                        raise ValueError('inconsistent stall count')
+                    end = player['start']
+                    durations = []
                     for pair in player['stall_list']:
                         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
                             raise ValueError('invalid stall event')
                         for value in pair:
                             number(value)
+                        start, length = pair
+                        if start < end - MODEL_EPSILON or start + length > duration + MODEL_EPSILON:
+                            raise ValueError('stall event outside modeled window')
+                        end = start + length
+                        durations.append(length)
+                    if not math.isclose(total, math.fsum(durations), rel_tol=0,
+                                        abs_tol=MODEL_EPSILON):
+                        raise ValueError('inconsistent stall total')
         overlap = comparison['identity_in_overlap']
         if overlap is not None:
             number(overlap['window_seconds'], positive=True)

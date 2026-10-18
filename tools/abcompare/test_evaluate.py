@@ -85,6 +85,13 @@ def summary(**updates):
     return result
 
 
+def set_candidate_stalls(data, events):
+    player = data["streams"]["candidate"]["player"]
+    player["stall_list"] = events
+    player["stalls"] = len(events)
+    player["stall_time"] = sum(length for _, length in events)
+
+
 class EvaluateTests(unittest.TestCase):
     _default = object()
 
@@ -102,8 +109,7 @@ class EvaluateTests(unittest.TestCase):
     def test_inclusive_thresholds_include_explicit_timing_allowance(self):
         data = summary()
         data["streams"]["candidate"]["player"]["start"] = 7.05
-        data["streams"]["candidate"]["player"]["stall_time"] = 7.05
-        data["streams"]["candidate"]["player"]["stalls"] = 3
+        set_candidate_stalls(data, [[10.5, 2.0], [20.5, 2.0], [25.0, 3.05]])
         self.assertEqual(self.result(data)["outcome"], "pass")
 
     def test_threshold_breaches_fail(self):
@@ -115,14 +121,86 @@ class EvaluateTests(unittest.TestCase):
         data["streams"]["candidate"]["player"]["start"] = 7.051
         cases.append((data, policy()))
         data = summary()
-        data["streams"]["candidate"]["player"]["stalls"] = 4
+        set_candidate_stalls(data, [[10.5, 1.0], [14.0, 1.0], [18.0, 1.0], [22.0, 1.0]])
         cases.append((data, policy()))
         data = summary()
-        data["streams"]["candidate"]["player"]["stall_time"] = 7.051
+        set_candidate_stalls(data, [[10.5, 2.0], [20.5, 2.0], [25.0, 3.051]])
         cases.append((data, policy()))
         for data, config in cases:
             with self.subTest(data=data):
                 self.assertEqual(self.result(data, config)["outcome"], "fail")
+
+    def test_inconsistent_reference_stall_total_is_an_error(self):
+        data = summary()
+        data["streams"]["reference"]["player"]["stall_time"] = 1000.0
+        set_candidate_stalls(data, [[6.0, 10.0], [18.0, 10.0]])
+        self.assertEqual(self.result(data)["outcome"], "error")
+
+    def test_in_window_reference_total_must_match_events(self):
+        data = summary()
+        data["streams"]["reference"]["player"]["stall_time"] = 5.0
+        self.assertEqual(self.result(data)["outcome"], "error")
+
+    def test_stall_count_must_be_an_exact_integer_matching_events(self):
+        for bad_count in (1.5, True, 2.0):
+            data = summary()
+            data["streams"]["candidate"]["player"]["stalls"] = bad_count
+            with self.subTest(count=bad_count):
+                self.assertEqual(self.result(data)["outcome"], "error")
+
+        data = summary()
+        data["streams"]["candidate"]["player"]["stalls"] = 1
+        self.assertEqual(self.result(data)["outcome"], "error")
+
+    def test_stall_total_and_playable_window_are_validated(self):
+        data = summary()
+        data["streams"]["candidate"]["player"]["stall_time"] = 4.01
+        self.assertEqual(self.result(data)["outcome"], "error")
+        data = summary()
+        data["streams"]["candidate"]["player"].update(
+            stalls=1, stall_time=26.0, stall_list=[[5.0, 26.0]])
+        self.assertEqual(self.result(data)["outcome"], "error")
+
+    def test_stall_events_must_be_in_order_and_inside_capture(self):
+        invalid_lists = (
+            [[4.99, 1.0], [20.0, 3.0]],
+            [[10.0, 2.0], [11.0, 2.0]],
+            [[20.0, 2.0], [10.0, 2.0]],
+            [[29.0, 2.0], [31.0, 0.0]],
+        )
+        for events in invalid_lists:
+            data = summary()
+            player = data["streams"]["candidate"]["player"]
+            player.update(stalls=len(events), stall_list=events,
+                          stall_time=sum(length for _, length in events))
+            with self.subTest(events=events):
+                self.assertEqual(self.result(data)["outcome"], "error")
+
+    def test_stall_events_must_be_finite_and_nonnegative(self):
+        for event in ((10.0, -1.0), (-1.0, 1.0), (float("nan"), 1.0),
+                      (10.0, float("inf"))):
+            data = summary()
+            data["streams"]["candidate"]["player"].update(
+                stalls=1, stall_time=event[1], stall_list=[list(event)])
+            with self.subTest(event=event):
+                self.assertEqual(self.result(data)["outcome"], "error")
+
+    def test_terminal_zero_length_event_and_floating_sum_noise_are_valid(self):
+        data = summary()
+        player = data["streams"]["candidate"]["player"]
+        player.update(stalls=1, stall_time=0.0, stall_list=[[30.0, 0.0]])
+        self.assertEqual(self.result(data)["outcome"], "pass")
+
+        data = summary()
+        player = data["streams"]["candidate"]["player"]
+        player["stall_time"] = 4.0 + 5e-10
+        self.assertEqual(self.result(data)["outcome"], "pass")
+
+    def test_large_policy_allowance_does_not_mask_material_total_mismatch(self):
+        data = summary()
+        data["streams"]["candidate"]["player"]["stall_time"] = 4.01
+        self.assertEqual(self.result(data, policy(timing_allowance_seconds=1000.0))["outcome"],
+                         "error")
 
     def test_zero_candidate_bytes_and_missing_start_with_usable_reference_fail(self):
         data = summary()
@@ -141,6 +219,14 @@ class EvaluateTests(unittest.TestCase):
         data["streams"]["reference"]["player"]["start"] = None
         data["streams"]["reference"]["player"]["stalls"] = None
         data["streams"]["reference"]["player"]["stall_time"] = None
+        self.assertEqual(self.result(data)["outcome"], "inconclusive")
+
+    def test_null_player_model_outcomes_are_unchanged(self):
+        data = summary()
+        data["streams"]["reference"]["player"] = None
+        self.assertEqual(self.result(data)["outcome"], "inconclusive")
+        data = summary()
+        data["streams"]["candidate"]["player"] = None
         self.assertEqual(self.result(data)["outcome"], "inconclusive")
 
     def test_missing_overlap_and_clock_discontinuities_are_inconclusive(self):
