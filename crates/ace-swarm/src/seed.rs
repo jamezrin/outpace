@@ -1,12 +1,16 @@
 //! Serving peers: a pure unchoke policy (`Choker`) and the `SeederSession` serve loop.
+pub(crate) mod protocol;
+#[cfg(test)]
+mod protocol_tests;
 use crate::store::PieceStore;
 use ace_peer::session::PeerSession;
 use ace_peer::Result;
 use ace_wire::bencode::Bencode;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::identity::Identity;
-use ace_wire::live_codec::{build_piece, live_bitfield, live_have};
+use ace_wire::live_codec::{live_bitfield, live_have};
 use ace_wire::message::PeerMessage;
+use protocol::{prepare_reply, ServeProfile};
 use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -39,9 +43,8 @@ impl SeederSession {
     /// `piece_header` is the fallback 8-byte per-piece timestamp header used only when the store
     /// has no header for that piece (note 33). Returns on close.
     ///
-    /// Upload accounting (bytes/peers served) is not tracked here; the S1 reciprocal seeder in
-    /// `ace_provider::follow_one_peer` inlines this loop and counts via atomics. A standalone
-    /// seeder built on this method (S2) will need its own counters.
+    /// Upload accounting (bytes/peers served) is not tracked here. Reciprocal serving in
+    /// `live_session` shares reply preparation but retains its own connection loops and counters.
     #[allow(clippy::too_many_arguments)]
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         session: &mut PeerSession<S>,
@@ -55,7 +58,7 @@ impl SeederSession {
         let debug = std::env::var_os("OUTPACE_SEED_DEBUG").is_some();
         // Advertise our identity + current live window using the profile observed from an
         // official local source node (note 32). SeederSession backs the standalone inbound
-        // listener (S2) today; S1's reciprocal path inlines its own serve loop instead.
+        // listener (S2) today; S1's reciprocal path retains its own connection loop.
         let (min, max) = if let Some(store) = &store {
             let guard = store.lock().await;
             complete_piece_window(&guard).unwrap_or((0, 0))
@@ -201,56 +204,33 @@ impl SeederSession {
                         c.set_interested(id, false);
                     }
                 }
-                PeerMessage::Unknown { id: 6, payload } if payload.len() >= 10 && unchoked => {
-                    // payload: [stream u32 @0..4][piece u32 @4..8][chunk u16 @8..10]
-                    let stream =
-                        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                    let piece =
-                        u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                    let chunk = u16::from_be_bytes([payload[8], payload[9]]);
-                    let found = if let Some(store) = &store {
-                        PieceStore::shared_chunk(store, piece as u64, chunk)
-                            .await
-                            .map(|(data, header)| {
-                                let header = if header == [0; 8] {
-                                    piece_header
-                                } else {
-                                    header
-                                };
-                                (data, header)
-                            })
-                    } else {
-                        None
-                    };
-                    if let Some((data, header)) = found {
-                        let reply = build_piece(stream, piece, chunk, header, &data);
-                        session.send(&reply).await?;
-                        if debug {
-                            crate::alog!(
-                                "[seed-session] -> Piece stream={stream} piece={piece} chunk={chunk} bytes={}",
-                                data.len()
-                            );
-                        }
-                    }
-                }
-                PeerMessage::Request {
-                    index,
-                    begin,
-                    length,
-                } if unchoked => {
-                    let found = if let Some(store) = &store {
-                        PieceStore::shared_block(store, index as u64, begin, length).await
-                    } else {
-                        None
-                    };
-                    if let Some(block) = found {
-                        session
-                            .send(&PeerMessage::Piece {
-                                index,
-                                begin,
+                request @ (PeerMessage::Unknown { id: 6, .. } | PeerMessage::Request { .. })
+                    if unchoked =>
+                {
+                    if let Some(reply) = prepare_reply(
+                        &request,
+                        store.as_ref(),
+                        ServeProfile::Inbound {
+                            fallback_header: piece_header,
+                        },
+                    )
+                    .await
+                    {
+                        session.send(&reply.message).await?;
+                        if debug && matches!(request, PeerMessage::Unknown { id: 6, .. }) {
+                            if let PeerMessage::Piece {
+                                index: stream,
+                                begin: piece,
                                 block,
-                            })
-                            .await?;
+                            } = &reply.message
+                            {
+                                let chunk = u16::from_be_bytes([block[8], block[9]]);
+                                crate::alog!(
+                                    "[seed-session] -> Piece stream={stream} piece={piece} chunk={chunk} bytes={}",
+                                    reply.media_bytes
+                                );
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -1258,3 +1238,6 @@ mod tests {
         serve_task.abort();
     }
 }
+
+#[cfg(test)]
+mod session_tests;
