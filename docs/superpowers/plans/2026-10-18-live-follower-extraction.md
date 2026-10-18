@@ -1,5 +1,9 @@
 # Production Live Follower Extraction Implementation Plan
 
+> Superseded live API references: #193 removed the legacy driver/live Rust APIs and
+> single-peer fallback. Use `ace_swarm::live_session::follow_live` and `LiveOutput`;
+> the implementation details below are historical.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Move the production live session into `ace-swarm` while preserving behavior and engine API compatibility.

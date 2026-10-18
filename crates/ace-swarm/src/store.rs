@@ -348,7 +348,7 @@ impl PieceStore {
         (self.piece_length / self.chunk_length) as u16
     }
 
-    /// Store a chunk's TS payload. Replacing an existing chunk adjusts the byte total. After the
+    /// Store a chunk's wire data, including any source-signature trailer. Replacing an existing chunk adjusts the byte total. After the
     /// insert, evict the lowest-index pieces until within `max_bytes`. If `max_bytes` is smaller
     /// than `data.len()`, the chunk is evicted immediately after insertion (a no-op write).
     pub fn put_chunk(&mut self, piece: u64, chunk: u16, data: &[u8]) {
@@ -357,8 +357,7 @@ impl PieceStore {
 
     /// Store a chunk plus the piece-scoped 8-byte live header observed on the wire. The header is
     /// stable for every chunk in a piece; a later nonzero header replaces an earlier zero
-    /// placeholder so old call sites remain compatible while relay/source paths preserve real
-    /// headers.
+    /// placeholder; relay and source paths preserve the observed headers.
     pub fn put_chunk_with_header(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) {
         self.put_chunk_with_header_at(Instant::now(), piece, chunk, header, data);
     }

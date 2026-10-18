@@ -68,8 +68,9 @@ made_output || (emitted == 0 && made_activity)
 
 Before first output, handshake/window/chunk activity can keep startup alive. After the first
 MPEG-TS bytes have been emitted, only a successful send of contiguous, TS-aligned output
-refreshes the stale deadline. This is applied in both the production multi-upstream
-`follow_peer_pool` coordinator and the legacy `follow_one_peer` fallback.
+refreshes the stale deadline. This is applied in the production multi-upstream
+`follow_peer_pool` coordinator. The legacy `follow_one_peer` fallback that originally
+shared this policy was removed in #193; the shared deadline helpers remain unchanged.
 
 ## Verification
 

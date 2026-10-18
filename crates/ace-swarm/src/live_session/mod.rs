@@ -1,5 +1,5 @@
-//! Production multi-upstream live follower;
-//! legacy single-peer entrypoints remain in [`crate::live`] and [`crate::driver`].
+//! Production live follower: [`follow_live`] accepts [`LiveSessionInputs`] and emits
+//! authenticated, contiguous media as [`LiveOutput`], including discontinuity markers.
 mod observation;
 mod options;
 
@@ -52,9 +52,6 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// Legacy single-peer helper handle. The production path now assigns real peer handles
-/// starting at 1, but the old helper is kept as a short-term bisect fallback.
-const SINGLE_PEER_ID: u64 = 0;
 /// One total deadline for gossip-only harvesting of a stale connected batch.
 const STALE_GOSSIP_BUDGET: Duration = Duration::from_millis(750);
 
@@ -161,14 +158,11 @@ use pool_support::{
     observe_live_window, publish_live_stats, retransmit_stalled_requests, shutdown_peer_runtimes,
     spawn_candidate_connects, take_ready_with_stats,
 };
-mod single_peer;
-use single_peer::{
+mod support;
+use support::{
     advance_head_from_window, hex_preview, read_peer_window, schedule_piece_assignments,
     should_refresh_stale_deadline, stale_upstream_budget,
 };
-
-#[cfg(test)]
-use single_peer::schedule_piece_requests;
 
 mod reconnect;
 use reconnect::{CandidateKind, SessionCandidates};

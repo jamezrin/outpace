@@ -1,5 +1,9 @@
 # Inbound Seeding Lifecycle & Policy — Design
 
+> Superseded live API references: #193 removed the legacy driver/live Rust APIs and
+> single-peer fallback. Use `ace_swarm::live_session::follow_live` and `LiveOutput`;
+> the implementation details below are historical.
+
 **Date:** 2026-07-06
 **Status:** Draft for review
 **Issues:** #4 (productize inbound seeding lifecycle and policy), folds in #36 (disk cache

@@ -61,3 +61,18 @@ fn single_active_peer(min_piece: i64, max_piece: i64) -> ActivePeers {
 mod authentication;
 
 mod credit;
+
+// A synthetic peer handle used only by scheduler fixtures.
+const SINGLE_PEER_ID: u64 = 0;
+
+fn schedule_piece_requests(
+    scheduler: &mut Scheduler,
+    active_peers: &mut ActivePeers,
+    next_needed: u64,
+    head: u64,
+) -> Vec<u64> {
+    schedule_piece_assignments(scheduler, active_peers, next_needed, head)
+        .into_iter()
+        .filter_map(|assignment| (assignment.peer_id == SINGLE_PEER_ID).then_some(assignment.piece))
+        .collect()
+}

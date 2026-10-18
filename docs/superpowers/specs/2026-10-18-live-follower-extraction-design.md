@@ -1,5 +1,9 @@
 # Production live follower extraction (#190)
 
+> Superseded live API references: #193 removed the legacy driver/live Rust APIs and
+> single-peer fallback. Use `ace_swarm::live_session::follow_live` and `LiveOutput`;
+> the implementation details below are historical.
+
 ## Intent and scope
 
 Move the existing production multi-upstream live follower from `ace-engine`

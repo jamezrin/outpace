@@ -1,5 +1,9 @@
 # outpace daemon — productization design (v1)
 
+> Superseded live API references: #193 removed the legacy driver/live Rust APIs and
+> single-peer fallback. Use `ace_swarm::live_session::follow_live` and `LiveOutput`;
+> the implementation details below are historical.
+
 **Date:** 2026-06-29
 **Status:** DRAFT — awaiting user review
 **Supersedes nothing; builds on** `2026-06-28-acestream-engine-reimplementation-design.md`
