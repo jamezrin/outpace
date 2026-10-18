@@ -78,7 +78,7 @@ impl Drop for Owner {
     }
 }
 #[derive(Clone)]
-pub(super) struct WarmPeerCache(Arc<Owner>);
+pub struct WarmPeerCache(Arc<Owner>);
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -143,10 +143,10 @@ fn sweep(slots: &mut HashMap<PathBuf, Slot>) {
     });
 }
 impl WarmPeerCache {
-    pub(super) fn memory() -> Self {
+    pub fn memory() -> Self {
         Self::new(Path::new(""), false)
     }
-    pub(super) fn new(path: &Path, allow_loopback: bool) -> Self {
+    pub fn new(path: &Path, allow_loopback: bool) -> Self {
         Self::new_inner(
             path,
             allow_loopback,
@@ -231,7 +231,7 @@ impl WarmPeerCache {
             }
         }
     }
-    pub(super) async fn initialized(&self) {
+    pub async fn initialized(&self) {
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             loop {
                 let notified = self.0.shared.changed.notified();
@@ -245,6 +245,10 @@ impl WarmPeerCache {
         })
         .await;
     }
+    pub fn candidate_addresses(&self, hash: &[u8; 20]) -> Vec<SocketAddrV4> {
+        self.hints(hash).into_iter().map(|(addr, _)| addr).collect()
+    }
+
     pub(super) fn hints(&self, hash: &[u8; 20]) -> Vec<(SocketAddrV4, CandidateKind)> {
         let mut state = self.0.shared.state.lock().unwrap();
         prune(&mut state.entries, now());

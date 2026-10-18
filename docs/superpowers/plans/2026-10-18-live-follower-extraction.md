@@ -67,14 +67,14 @@ Task 1 sequencing: defer `LiveSeedOptions` construction to Task 2, when its conc
 
 `PeerDiscovery` keeps its existing Arc callback signature. `DiscoveryRun` exposes construction, next-candidate reception, and nonblocking drain needed by engine bootstrap; it owns and aborts its worker. `WarmPeerCache` exposes only existing construction/initialization/hints operations needed by provider setup; candidate policy remains private.
 
-- [ ] Before relocation, have Luna save the workspace test inventory (`cargo test --workspace --offline -- --list`) for post-move comparison.
-- [ ] Move production peer/pool/continuity/session, discovery, reconnect and warm-cache machinery into the planned swarm files. Keep algorithms, event order, timeouts, constants, worker guards, and protocol checks unchanged.
-- [ ] Replace engine-specific metrics/config/store dependencies with Task 1 adapters. Retain the single session-wide seed lease and existing cache-flush guards. Move legacy engine single-peer helper intact with its tests; leave existing swarm legacy APIs intact.
-- [ ] Move direct machinery tests with implementation. Split mixed test files so engine policy/startup-buffer/source/statistics adaptation tests remain in engine. Replace old private access paths rather than exporting internals for tests.
-- [ ] Ensure moved tests cover cancellation, candidate admission during initial connection, fairness, reconnect continuity, and lease/store lifetime; add focused missing ownership regressions only where existing tests do not exercise those paths.
-- [ ] Replace engine runner invocation with `ace_swarm::live_session::follow_live(LiveSessionInputs { ... })`; retain source channel capacity 256, startup-buffer wrapper, announce select, and provider error conversion.
-- [ ] Export module and promote `ace-media` dependency. Document production versus legacy live entrypoints in crate/module docs.
-- [ ] Have Luna run affected crate tests, then full offline workspace suite. Compare inventories, accounting for moved/renamed tests; expect no lost behavioral coverage or new failures. Commit `refactor(ace-swarm): own production multi-upstream live follower`.
+- [x] Before relocation, have Luna save the workspace test inventory (`cargo test --workspace --offline -- --list`) for post-move comparison.
+- [x] Move production peer/pool/continuity/session, discovery, reconnect and warm-cache machinery into the planned swarm files. Keep algorithms, event order, timeouts, constants, worker guards, and protocol checks unchanged.
+- [x] Replace engine-specific metrics/config/store dependencies with Task 1 adapters. Retain the single session-wide seed lease and existing cache-flush guards. Move legacy engine single-peer helper intact with its tests; leave existing swarm legacy APIs intact.
+- [x] Move direct machinery tests with implementation. Split mixed test files so engine policy/startup-buffer/source/statistics adaptation tests remain in engine. Replace old private access paths rather than exporting internals for tests.
+- [x] Ensure moved tests cover cancellation, candidate admission during initial connection, fairness, reconnect continuity, and lease/store lifetime; add focused missing ownership regressions only where existing tests do not exercise those paths.
+- [x] Replace engine runner invocation with `ace_swarm::live_session::follow_live(LiveSessionInputs { ... })`; retain source channel capacity 256, startup-buffer wrapper, announce select, and provider error conversion.
+- [x] Export module and promote `ace-media` dependency. Document production versus legacy live entrypoints in crate/module docs.
+- [x] Have Luna run affected crate tests, then full offline workspace suite. Compare inventories, accounting for moved/renamed tests; expect no lost behavioral coverage or new failures. Commit `refactor(ace-swarm): own production multi-upstream live follower`.
 
 ## Task 3: Review, validate, and integrate
 
@@ -90,3 +90,23 @@ Task 1 sequencing: defer `LiveSeedOptions` construction to Task 2, when its conc
 ## Execution
 
 Use the user's established subagent workflow: GPT-6.1 Sol implementation and independent review, GPT-6 Luna validation. Tasks 1 and 2 are sequential because the relocation consumes the boundary; avoid parallel edits to shared modules. Preserve the existing clean baseline result: 1,002 passed, zero failed, seven ignored.
+
+### Task 2 offline completion (2026-10-18)
+
+GPT-6-Luna ran the affected crates (723 passed, zero failed, three ignored)
+and the full offline workspace suite (1,006 passed, zero failed, seven
+ignored), including doc tests. Clippy with warnings denied, formatting,
+identifier hygiene, and staged/unstaged whitespace checks passed. Debug
+symbols and incremental compilation were disabled for validation after the
+worktree's build artifacts exhausted the filesystem; no runtime settings
+changed.
+
+The pre/post inventories contain 1,011 and 1,013 tests. All prior leaf test
+names are retained, accounting for module/crate relocation. The additions
+are `prefetch_start_bounds_huge_depth_and_peer_window` and
+`warm_peer_hints_never_grant_descriptor_authority`. Reconnect controls also
+add store identity/construction/lease assertions without renaming tests.
+Private evidence remains under `/tmp/outpace-190*`.
+
+Task 3 independent review and bounded live validation remain with the root
+agent. Task 2 does not create a PR, merge, or change host networking.

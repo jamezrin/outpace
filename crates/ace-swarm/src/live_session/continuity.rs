@@ -1,17 +1,13 @@
 use super::*;
 
 /// First piece to request given a peer window and a configured prefetch depth.
-pub(in crate::ace_provider) fn prefetch_start(
-    min_piece: u64,
-    max_piece: u64,
-    prefetch: u64,
-) -> u64 {
+pub(super) fn prefetch_start(min_piece: u64, max_piece: u64, prefetch: u64) -> u64 {
     max_piece.saturating_sub(prefetch).max(min_piece)
 }
 
 impl Continuity {
     /// The very first peer connection for this stream: bootstrap from its window.
-    pub(in crate::ace_provider) fn fresh(
+    pub(super) fn fresh(
         info: &StreamInfo,
         min_piece: u64,
         max_piece: u64,
@@ -62,12 +58,7 @@ impl Continuity {
     /// logged gap — if the new peer's window has already evicted the piece we still needed
     /// (we were disconnected longer than the live window covers). Returns the piece index
     /// to advertise as our position in the outgoing handshake.
-    pub(in crate::ace_provider) fn resume(
-        &mut self,
-        addr: SocketAddrV4,
-        min_piece: u64,
-        max_piece: u64,
-    ) -> u64 {
+    pub(super) fn resume(&mut self, addr: SocketAddrV4, min_piece: u64, max_piece: u64) -> u64 {
         self.head = self.head.max(max_piece);
         self.scheduler.clear_in_flight();
         self.active_peers = ActivePeers::new();
@@ -99,7 +90,7 @@ impl Continuity {
     /// A peer that is current with the live edge is precisely the one to wait on: it delivers the
     /// piece via a live HAVE as soon as the source produces it. A peer whose window ends short of
     /// the edge is genuinely behind and still rejected.
-    pub(in crate::ace_provider) fn window_can_resume(&self, window: &LivePosition) -> bool {
+    pub(super) fn window_can_resume(&self, window: &WireLivePosition) -> bool {
         let needed = i64::try_from(self.reasm.next_needed()).unwrap_or(i64::MAX);
         if window.max_piece >= needed {
             return true;
@@ -110,7 +101,7 @@ impl Continuity {
 
     /// Rejected bytes cannot complete a request. Forget the partial chunk count and all
     /// outstanding copies, including requests assigned before a retransmission to another peer.
-    pub(in crate::ace_provider) fn release_rejected_piece(&mut self, piece: u64) {
+    pub(super) fn release_rejected_piece(&mut self, piece: u64) {
         self.reasm.discard_partial(piece);
         self.received_chunks.remove(&piece);
         self.piece_producers.remove(&piece);
@@ -119,12 +110,7 @@ impl Continuity {
         self.requested_at.remove(&piece);
     }
 
-    pub(in crate::ace_provider) fn note_chunk(
-        &mut self,
-        piece: u64,
-        chunk: u16,
-        chunks_per_piece: u16,
-    ) -> bool {
+    pub(super) fn note_chunk(&mut self, piece: u64, chunk: u16, chunks_per_piece: u16) -> bool {
         let chunks_per_piece = chunks_per_piece.max(1) as usize;
         let chunks = self.received_chunks.entry(piece).or_default();
         chunks.insert(chunk);
@@ -143,7 +129,7 @@ impl Continuity {
 
     /// Pieces still outstanding past the configured request timeout — candidates to re-request.
     /// Also prunes timer bookkeeping for pieces the cursor has already advanced past.
-    pub(in crate::ace_provider) fn timed_out_requests(&mut self, now: Instant) -> Vec<u64> {
+    pub(super) fn timed_out_requests(&mut self, now: Instant) -> Vec<u64> {
         let next = self.reasm.next_needed();
         self.requested_at.retain(|&p, _| p >= next);
         self.requested_at
@@ -157,7 +143,7 @@ impl Continuity {
     /// upstream can still serve (evicted from every window), skip forward to the lowest piece some peer
     /// does have. Returns the skip target if it skipped. This is the mid-session analogue of
     /// [`resume`](Self::resume)'s reconnect-gap skip — recovering without a full teardown.
-    pub(in crate::ace_provider) fn skip_evicted_gap(&mut self, now: Instant) -> Option<u64> {
+    pub(super) fn skip_evicted_gap(&mut self, now: Instant) -> Option<u64> {
         let next = self.reasm.next_needed();
         if now.duration_since(self.next_needed_since) < self.live_recovery.request_timeout()
             || self.active_peers.any_unchoked_covers(next)
@@ -183,7 +169,7 @@ impl Continuity {
     /// a newly learned head outruns the cursor. Once output exists, a forward skip uses
     /// the same fresh discontinuity gate as an unknown whole-piece loss (issue #169).
     /// Provisional startup positioning has no previously published stream to interrupt.
-    pub(in crate::ace_provider) fn skip_far_behind_live(&mut self, now: Instant) -> Option<u64> {
+    pub(super) fn skip_far_behind_live(&mut self, now: Instant) -> Option<u64> {
         self.request_floor
             .fetch_max(self.head.saturating_sub(self.prefetch), Ordering::Relaxed);
         let next = self.reasm.next_needed();
@@ -206,7 +192,7 @@ impl Continuity {
         Some(target)
     }
 
-    pub(in crate::ace_provider) fn arm_output_gate(&mut self) {
+    pub(super) fn arm_output_gate(&mut self) {
         if let Some(recovery) = self.transport_recovery.take() {
             crate::alog!(
                 "[mpegts] transport recovery superseded by piece skip: discarded_bytes={} withheld_bytes={} duration_ms={} loss_events={}",
@@ -243,7 +229,7 @@ impl Continuity {
         })
     }
 
-    pub(in crate::ace_provider) fn resync_output(&mut self, bytes: &[u8]) -> Vec<LiveOutput> {
+    pub(super) fn resync_output(&mut self, bytes: &[u8]) -> Vec<LiveOutput> {
         let output = self.resync.push_report(bytes);
         let mut chunks = Vec::new();
         let mut start = 0;
@@ -281,34 +267,29 @@ impl Continuity {
         chunks
     }
 
-    pub(in crate::ace_provider) fn take_discontinuity(&mut self) -> bool {
+    pub(super) fn take_discontinuity(&mut self) -> bool {
         std::mem::take(&mut self.discontinuity_pending)
     }
 
     #[cfg(test)]
-    pub(in crate::ace_provider) fn output_gate_armed(&self) -> bool {
+    pub(super) fn output_gate_armed(&self) -> bool {
         !self.output_gate.is_locked()
     }
 
-    pub(in crate::ace_provider) fn register_active_peer(
+    pub(super) fn register_active_peer(
         &mut self,
         id: u64,
         addr: SocketAddrV4,
-        window: LivePosition,
+        window: WireLivePosition,
     ) {
         self.active_peers.insert(id, addr, window);
     }
 
-    pub(in crate::ace_provider) fn set_peer_unchoked(&mut self, id: u64, unchoked: bool) {
+    pub(super) fn set_peer_unchoked(&mut self, id: u64, unchoked: bool) {
         self.active_peers.set_unchoked(id, unchoked);
     }
 
-    pub(in crate::ace_provider) fn update_peer_window(
-        &mut self,
-        id: u64,
-        min_piece: u64,
-        max_piece: u64,
-    ) {
+    pub(super) fn update_peer_window(&mut self, id: u64, min_piece: u64, max_piece: u64) {
         self.active_peers.update_window(id, min_piece, max_piece);
     }
 }

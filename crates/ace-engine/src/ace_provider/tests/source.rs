@@ -1,20 +1,5 @@
 use super::*;
 
-#[test]
-fn recovery_channel_capacities_are_checked() {
-    let policy = LiveRecoveryConfig {
-        max_active_upstreams: 2,
-        ..LiveRecoveryConfig::default()
-    };
-    assert_eq!(recovery_channel_capacities(policy).unwrap(), (64, 2));
-
-    let invalid = LiveRecoveryConfig {
-        max_active_upstreams: usize::MAX,
-        ..LiveRecoveryConfig::default()
-    };
-    assert!(recovery_channel_capacities(invalid).is_err());
-}
-
 #[tokio::test]
 async fn queued_live_outputs_keep_each_discontinuity_with_its_chunk() {
     let (tx, rx) = mpsc::channel(8);

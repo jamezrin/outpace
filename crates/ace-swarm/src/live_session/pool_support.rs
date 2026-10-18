@@ -38,7 +38,7 @@ pub(super) async fn send_peer_command(
 }
 
 #[cfg(test)]
-pub(in crate::ace_provider) fn spawn_learned_connects(
+pub(super) fn spawn_learned_connects(
     candidates: &mut SessionCandidates,
     peers: &BTreeMap<u64, PeerRuntime>,
     infohash: [u8; 20],
@@ -59,7 +59,7 @@ pub(in crate::ace_provider) fn spawn_learned_connects(
     );
 }
 
-pub(in crate::ace_provider) fn finish_candidate_connect(
+pub(super) fn finish_candidate_connect(
     (addr, failure, queued): (SocketAddrV4, Option<PeerConnectFailure>, bool),
     pending: &mut HashSet<SocketAddrV4>,
     candidates: &mut SessionCandidates,
@@ -76,7 +76,7 @@ pub(in crate::ace_provider) fn finish_candidate_connect(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::ace_provider) fn spawn_candidate_connects(
+pub(super) fn spawn_candidate_connects(
     candidates: &mut SessionCandidates,
     peers: &BTreeMap<u64, PeerRuntime>,
     infohash: [u8; 20],
@@ -132,7 +132,7 @@ pub(in crate::ace_provider) fn spawn_candidate_connects(
 
 // Stale peers are gossip transports only. One deadline covers the whole batch,
 // including our handshake writes; no Interested, media requests or continuity updates.
-pub(in crate::ace_provider) async fn harvest_stale_gossip(
+pub(super) async fn harvest_stale_gossip(
     upstreams: Vec<ConnectedUpstream>,
     identity: &Identity,
     candidates: &mut SessionCandidates,
@@ -199,7 +199,7 @@ pub(super) async fn harvest_stale_gossip_with_budget(
     }
 }
 
-pub(in crate::ace_provider) async fn advance_pool_requests(
+pub(super) async fn advance_pool_requests(
     peers: &mut BTreeMap<u64, PeerRuntime>,
     continuity: &mut Continuity,
     chunks_per_piece: u16,
@@ -250,7 +250,7 @@ pub(in crate::ace_provider) async fn advance_pool_requests(
         .collect()
 }
 
-pub(in crate::ace_provider) fn observe_live_window(c: &mut Continuity, peer: u64, payload: &[u8]) {
+pub(super) fn observe_live_window(c: &mut Continuity, peer: u64, payload: &[u8]) {
     let Ok((root, _)) = ace_wire::bencode::Bencode::parse_prefix(payload) else {
         return;
     };
@@ -270,10 +270,7 @@ pub(in crate::ace_provider) fn observe_live_window(c: &mut Continuity, peer: u64
         .observe_window(peer, value(b"min_piece").zip(value(b"max_piece")));
 }
 
-pub(in crate::ace_provider) fn ready_buffer_snapshot(
-    continuity: &Continuity,
-    bitrate: Option<u64>,
-) -> (u64, u64) {
+pub(super) fn ready_buffer_snapshot(continuity: &Continuity, bitrate: Option<u64>) -> (u64, u64) {
     let mut clock = ace_media::mpegts::SelectedPcrClock::new();
     let mut bytes = 0_u64;
     let mut pieces = 0_u64;
@@ -296,9 +293,9 @@ pub(in crate::ace_provider) fn ready_buffer_snapshot(
     (duration.as_millis().min(u64::MAX as u128) as u64, pieces)
 }
 
-pub(in crate::ace_provider) fn publish_live_stats(
+pub(super) fn publish_live_stats(
     c: &Continuity,
-    metrics: Option<&Arc<crate::live_stats::LiveMetrics>>,
+    metrics: Option<&Arc<dyn LiveObserver>>,
     info: &StreamInfo,
 ) {
     let Some(metrics) = metrics else {
@@ -307,7 +304,7 @@ pub(in crate::ace_provider) fn publish_live_stats(
     let (buffer_ms, buffer_pieces) = ready_buffer_snapshot(c, info.metadata.bitrate);
     let bounds = c.active_peers.coverage_bounds();
     metrics.publish_position(
-        Some(crate::provider::LivePositionStats {
+        Some(LivePosition {
             pos: Some(c.reasm.next_needed()),
             last: Some(c.head),
             live_first: bounds.map(|(first, _)| first),
@@ -318,17 +315,15 @@ pub(in crate::ace_provider) fn publish_live_stats(
     );
 }
 
-pub(in crate::ace_provider) fn take_ready_with_stats(
+pub(super) fn take_ready_with_stats(
     c: &mut Continuity,
-    metrics: Option<&Arc<crate::live_stats::LiveMetrics>>,
+    metrics: Option<&Arc<dyn LiveObserver>>,
     info: &StreamInfo,
 ) -> Vec<u8> {
     publish_live_stats(c, metrics, info);
     let ready = c.reasm.take_ready();
     if let Some(metrics) = metrics {
-        metrics
-            .received
-            .fetch_add(ready.len() as u64, Ordering::Relaxed);
+        metrics.received_bytes(ready.len() as u64);
     }
     publish_live_stats(c, metrics, info);
     ready
@@ -341,7 +336,7 @@ pub(in crate::ace_provider) fn take_ready_with_stats(
 /// peer with more spare capacity — i.e. a different, faster one when available. If no retry
 /// was assigned, release the old slots for that piece so full capacity cannot prevent retrying.
 /// Returns any peers dropped while re-issuing requests.
-pub(in crate::ace_provider) async fn retransmit_stalled_requests(
+pub(super) async fn retransmit_stalled_requests(
     peers: &mut BTreeMap<u64, PeerRuntime>,
     continuity: &mut Continuity,
     chunks_per_piece: u16,
@@ -394,7 +389,7 @@ pub(in crate::ace_provider) async fn retransmit_stalled_requests(
     }
 }
 
-pub(in crate::ace_provider) fn drop_peer_runtime(
+pub(super) fn drop_peer_runtime(
     peer_id: u64,
     peers: &mut BTreeMap<u64, PeerRuntime>,
     continuity: &mut Continuity,
@@ -408,7 +403,7 @@ pub(in crate::ace_provider) fn drop_peer_runtime(
     Some(peer.addr)
 }
 
-pub(in crate::ace_provider) fn shutdown_peer_runtimes(peers: &mut BTreeMap<u64, PeerRuntime>) {
+pub(super) fn shutdown_peer_runtimes(peers: &mut BTreeMap<u64, PeerRuntime>) {
     for (_, peer) in std::mem::take(peers) {
         let _ = peer.commands.try_send(PeerCommand::Stop);
         peer.worker.abort();

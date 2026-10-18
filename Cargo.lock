@@ -66,6 +66,7 @@ dependencies = [
  "crab_nat",
  "hex",
  "igd-next",
+ "libc",
  "rand 0.10.3",
  "reqwest",
  "roxmltree",

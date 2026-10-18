@@ -140,3 +140,33 @@ the engine calls its documented entrypoint through a small adapter. Existing
 behavioral coverage survives the move, all required checks pass, a live smoke
 confirms output, and an independently reviewed PR is merged. Follow-up issues
 #191–#193 keep their separate remaining scope.
+
+## Task 2 implementation notes
+
+The engine now builds `LiveSeedOptions` directly and supplies its existing
+store factory closure. The temporary engine `SeedConfig` is removed. The
+swarm runner groups its inputs in `LiveSessionInputs`; its private helpers
+retain the prior signatures through local recovery/seed aliases.
+
+`DiscoveryRun` exposes candidate reception and nonblocking draining while
+retaining its abort-on-drop worker. `WarmPeerCache` exposes initialization
+and candidate addresses; source/PEX classifications and credit policy stay
+private. The cache's existing Unix filesystem hardening requires a normal
+Unix-only `libc` dependency in swarm. `ace-media` is promoted from a test
+dependency for the unchanged resync/keyframe helpers.
+
+Private continuity, pool, reconnect, credit and cache tests move to swarm.
+Provider discovery/bootstrap, geometry, startup buffering and source tests
+remain in engine. Mixed statistics tests now exercise a recording observer
+in swarm; engine observer mapping remains covered by the Task 1 adapter
+tests. Startup-buffer tests consume explicit `LiveOutput` boundaries, with
+raw transport recovery still covered by the relocated resync tests. Durable
+credit tests construct the runner with a private test bootstrap adapter;
+descriptor authority remains asserted through engine catalog/index tests.
+Reconnect controls additionally assert one store construction, shared store
+identity for inbound consumers, and producer lease release on teardown.
+
+Engine production defaults remain authoritative. Relocated fixtures use a
+test-only `Default` implementation for recovery options with their original
+values; the public swarm boundary requires explicit production settings.
+No seed-serving consolidation or legacy entrypoint retirement is included.

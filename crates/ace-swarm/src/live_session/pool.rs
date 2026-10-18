@@ -13,7 +13,7 @@ fn receive_pool_refill(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::ace_provider) async fn activate_upstream_peer(
+pub(super) async fn activate_upstream_peer(
     peer_id: u64,
     mut upstream: ConnectedUpstream,
     start: u64,
@@ -34,7 +34,7 @@ pub(in crate::ace_provider) async fn activate_upstream_peer(
     let hs = OutgoingExtendedHandshake {
         ace_metadata_version: 1,
         ut_metadata_id: 2,
-        mi: Some(LivePosition {
+        mi: Some(WireLivePosition {
             min_piece: start as i64,
             max_piece: continuity.head as i64,
             position: -1,
@@ -88,7 +88,7 @@ pub(in crate::ace_provider) async fn activate_upstream_peer(
     ))
 }
 
-pub(in crate::ace_provider) fn recovery_channel_capacities(
+pub(super) fn recovery_channel_capacities(
     live_recovery: LiveRecoveryConfig,
 ) -> Result<(usize, usize), String> {
     live_recovery.validate()?;
@@ -103,7 +103,7 @@ pub(in crate::ace_provider) fn recovery_channel_capacities(
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-pub(in crate::ace_provider) async fn follow_peer_pool(
+pub(super) async fn follow_peer_pool(
     upstreams: Vec<ConnectedUpstream>,
     info: &StreamInfo,
     identity: &Identity,
@@ -146,7 +146,7 @@ pub(in crate::ace_provider) async fn follow_peer_pool(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::ace_provider) async fn follow_peer_pool_with_discovery(
+pub(super) async fn follow_peer_pool_with_discovery(
     upstreams: Vec<ConnectedUpstream>,
     info: &StreamInfo,
     identity: &Identity,

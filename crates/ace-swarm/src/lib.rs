@@ -6,6 +6,10 @@
 //! layer. The piece-distribution decision core is [`scheduler::Scheduler`] (pure and
 //! tested); the async peer I/O loop wraps it.
 //!
+//! [`live_session::follow_live`] owns the production multi-upstream follower, discovery,
+//! recovery and session-wide seed lease. [`live::LiveSession`] and [`driver`] retain
+//! the older compatibility entrypoints.
+//!
 //! The async driver is validated against a live channel that is actually delivering data
 //! (see `README.md` and `docs/protocol/notes/20-vlc-playback.md`); the scheduler is
 //! validated here.

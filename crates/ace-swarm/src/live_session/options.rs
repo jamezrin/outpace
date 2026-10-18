@@ -87,3 +87,19 @@ impl LiveRecoveryOptions {
         Ok(())
     }
 }
+
+// Engine owns production defaults. Relocated fixtures preserve their original settings.
+#[cfg(test)]
+impl Default for LiveRecoveryOptions {
+    fn default() -> Self {
+        Self {
+            request_timeout_ms: 1500,
+            stale_upstream_timeout_ms: 12000,
+            request_check_interval_ms: 1000,
+            max_active_upstreams: 4,
+            max_parallel_connect: 12,
+            max_piece_advance: 256,
+            max_reasm_pieces_ahead: 512,
+        }
+    }
+}
