@@ -1,0 +1,127 @@
+name: Publish release container
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag (vX.Y.Z)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+# Versioned tags and latest are published together; publishers never overlap.
+concurrency:
+  group: outpace-release-container-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish verified release binaries to GHCR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      IMAGE_NAME: ghcr.io/jamezrin/outpace
+    steps:
+      # An existing release can predate this workflow. Publication tooling comes
+      # from main; the requested tag determines assets, version and revision.
+      - name: Checkout publication tooling
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Validate stable release and resolve its commit
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo '::error::Expected a stable release tag vX.Y.Z'
+            exit 1
+          fi
+          gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease > release.json
+          python3 - <<'PY'
+          import json, os
+          release = json.load(open('release.json'))
+          if release['tagName'] != os.environ['RELEASE_TAG'] or release['isDraft'] or release['isPrerelease']:
+              raise SystemExit('Expected the exact published stable release')
+          PY
+          # The commits endpoint dereferences both lightweight and annotated tags.
+          revision="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Could not resolve the release commit'
+            exit 1
+          fi
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Prevent an older release from replacing latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' > stable-tags.txt
+          python3 - <<'PY'
+          import os, re
+          def version(tag):
+              return tuple(map(int, tag[1:].split('.')))
+          requested = version(os.environ['RELEASE_TAG'])
+          for tag in open('stable-tags.txt').read().splitlines():
+              if re.fullmatch(r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', tag) and version(tag) > requested:
+                  raise SystemExit('A newer stable release exists; refusing to replace latest')
+          PY
+
+      - name: Download and verify the complete release archive set
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" --dir release-assets \
+            --pattern 'outpace-*' --pattern SHA256SUMS
+          python3 tools/release/prepare_container.py "$RELEASE_TAG" release-assets container-context
+          cp Dockerfile.release container-context/Dockerfile
+          cp LICENSE container-context/LICENSE
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Emulation covers only Debian package installation, never Rust compilation.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64,arm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push runtime images
+        uses: docker/build-push-action@v7
+        with:
+          context: container-context
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.release.outputs.version }}
+            ${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.revision }}
+          cache-from: type=gha,scope=release-runtime
+          cache-to: type=gha,mode=max,scope=release-runtime
