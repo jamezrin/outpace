@@ -2,6 +2,13 @@
 //! one shared live MPEG-TS download out to many HTTP clients, behind a clean
 //! `/streams/{network}/{id}` API. All network-specific protocol lives behind the
 //! [`provider::StreamProvider`] adapter (see the v1 design spec).
+//!
+//! [`ace_media`] supplies pure MPEG-TS alignment, timing, keyframe/access-point, and
+//! segment helpers without I/O. This crate owns their live integration: [`session`]
+//! broadcasts source data and discontinuities, [`manager`] manages sessions and shared
+//! packagers, and [`hls`] maintains the live segment window, readiness, and playlists.
+//! [`http`] handles playlist and segment requests; [`routes`] parses the compatibility
+//! HTTP routes rather than serving them.
 
 // The workspace's one logging macro, re-exported so `crate::alog!` resolves here.
 // Operational events use it; user-facing CLI/banner lines stay plain `eprintln!`

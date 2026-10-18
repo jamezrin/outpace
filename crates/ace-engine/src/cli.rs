@@ -68,6 +68,8 @@ fn parse_broadcast_name(value: &str) -> Result<String, String> {
 
 #[derive(Debug, Args)]
 pub struct PlayArgs {
+    // Clap uses this text verbatim for CLI help; preserve the angle-bracket placeholder.
+    #[allow(rustdoc::invalid_html_tags)]
     /// acestream://<content-id> URL or HTTP(S) transport-file URL. `acestream:?infohash=` and
     /// magnet inputs resolve live descriptors through the authenticated catalog, requiring
     /// the descriptor to match the requested infohash. Remote Outpace broadcast Ace links require

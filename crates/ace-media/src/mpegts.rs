@@ -130,7 +130,7 @@ const MAX_SERVICE_NAME_BYTES: usize = TS_PACKET_LEN - 4 - 1 - 25 - SERVICE_PROVI
 const PROBE_PACKETS: usize = 4;
 
 /// Find the smallest offset `0..188` at which `buf` is TS-packet-aligned — i.e. the sync
-/// byte `0x47` recurs every 188 bytes for up to [`PROBE_PACKETS`] packets. Returns `None`
+/// byte `0x47` recurs every 188 bytes for up to `PROBE_PACKETS` packets. Returns `None`
 /// if no alignment is found (not a TS stream / too short).
 pub fn find_sync_offset(buf: &[u8]) -> Option<usize> {
     for off in 0..TS_PACKET_LEN {
@@ -183,7 +183,7 @@ const MAX_UNSYNCED_TAIL: usize = 2 * TS_PACKET_LEN - 1;
 /// regions (e.g. Acestream live pieces, which are each internally 188-aligned but don't
 /// byte-chain — ~one partial packet of junk at each piece boundary). Feed arbitrary byte
 /// runs; it emits only sync-locked 188-byte packets, discarding bytes as needed to re-lock,
-/// and buffers the unconfirmed tail (bounded to [`MAX_UNSYNCED_TAIL`]) until more data arrives.
+/// and buffers the unconfirmed tail (bounded to `MAX_UNSYNCED_TAIL`) until more data arrives.
 #[derive(Default)]
 pub struct TsResync {
     buf: Vec<u8>,
