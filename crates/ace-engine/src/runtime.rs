@@ -296,11 +296,11 @@ pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
 
 /// Resolve the tracker list minted into broadcast descriptors and used for broadcast
 /// self-announce. `OUTPACE_TRACKERS` — comma-separated `scheme://…` (typically
-/// `udp://host:port/announce`) URLs — FULLY REPLACES [`DEFAULT_BROADCAST_TRACKERS`] when set
+/// `udp://host:port/announce`) URLs — FULLY REPLACES `DEFAULT_BROADCAST_TRACKERS` when set
 /// (non-empty after trimming); unset or blank leaves the public default in place so behavior is
 /// byte-identical to before.
 ///
-/// Per-entry handling (see [`classify_tracker_entry`]):
+/// Per-entry handling (see `classify_tracker_entry`):
 /// - No `scheme://` prefix: obviously unusable — a broadcast pointed only at such entries would
 ///   be undiscoverable — so it is dropped with a warning rather than minted into a broken
 ///   descriptor. Ditto entries longer than the announce path's

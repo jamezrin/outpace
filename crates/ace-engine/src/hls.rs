@@ -1,6 +1,16 @@
-//! Live HLS packaging over a session's TS broadcast. PCR is used as the media clock and segments
-//! start only at PMT-declared video access points, prefixed with the latest PAT and PMT. Runs that
-//! cannot reach another clean boundary within the configured packet ceiling are discarded.
+//! Live HLS packaging and playlist state over a session's TS broadcast.
+//!
+//! [`HlsPackager`] consumes [`crate::session::StreamSession`] events in a background task,
+//! tracks PCR timing and discontinuities, and owns startup readiness, the retained segment
+//! window, and live playlist rendering. It uses [`ace_media::mpegts::SelectedPcrClock`] and
+//! [`ace_media::mpegts::VideoAccessPointState`] for pure media analysis. Segments carry cached
+//! PAT/PMT tables and prefer video access-point boundaries; the packet ceiling can force a
+//! mid-GOP continuation once the target duration is reached, or discard an incomplete run.
+//!
+//! [`crate::manager`] manages shared packagers and session lifecycle. [`crate::http`] handles
+//! HTTP playlist and segment requests, using this module's readiness and media accessors;
+//! [`crate::routes`] only parses compatibility routes. [`VodHlsLayout`] separately describes
+//! the static segment geometry and playlist for VOD.
 
 use crate::config::HlsConfig;
 use crate::session::{StreamEvent, StreamSession};

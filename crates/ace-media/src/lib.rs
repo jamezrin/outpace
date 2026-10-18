@@ -1,8 +1,12 @@
-//! ace-media: turn an ordered byte stream into MPEG-TS / HLS for player consumption.
+//! Pure MPEG-TS alignment, timing, keyframe/access-point, and HLS segment helpers.
 //!
 //! Acestream live content is already an MPEG-TS stream chopped into pieces; the
-//! reassembled byte stream (see `ace_wire::reassembly`) is therefore MPEG-TS. This crate
-//! provides the pure logic to validate/align TS and segment it for HLS. No I/O.
+//! reassembled byte stream is therefore MPEG-TS. [`mpegts`] provides packet alignment,
+//! resynchronization, PCR tracking, and keyframe/access-point detection; [`hls`] provides
+//! packet-count segmentation and a basic media-playlist renderer. This crate performs no I/O.
+//!
+//! The daemon's `ace-engine` crate owns live packaging tasks, session lifecycle, retained
+//! segment windows, live playlists, and HTTP serving. Those policies are outside this crate.
 
 pub mod hls;
 pub mod mpegts;

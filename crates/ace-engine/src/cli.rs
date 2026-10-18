@@ -68,7 +68,7 @@ fn parse_broadcast_name(value: &str) -> Result<String, String> {
 
 #[derive(Debug, Args)]
 pub struct PlayArgs {
-    /// acestream://<content-id> URL or HTTP(S) transport-file URL. `acestream:?infohash=` and
+    /// `acestream://<content-id>` URL or HTTP(S) transport-file URL. `acestream:?infohash=` and
     /// magnet inputs resolve live descriptors through the authenticated catalog, requiring
     /// the descriptor to match the requested infohash. Remote Outpace broadcast Ace links require
     /// OUTPACE_BEP9_CONTENT_ID_FALLBACK=1; transport-file URLs are also supported.
