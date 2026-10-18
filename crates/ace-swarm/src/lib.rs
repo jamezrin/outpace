@@ -20,6 +20,7 @@ pub mod discover;
 pub mod driver;
 pub mod listen;
 pub mod live;
+pub mod live_session;
 pub mod portmap;
 pub mod reachability;
 pub mod resolve;

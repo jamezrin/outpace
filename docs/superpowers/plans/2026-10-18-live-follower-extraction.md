@@ -57,6 +57,8 @@
 - [ ] Implement boundary types, explicit engine mapping, metrics adapter, and store closure using current validation and construction logic. Keep existing production runner active until Task 2.
 - [ ] Have Luna run affected crate tests and formatting; expect all pass. Commit `refactor(ace-swarm): define production live session boundary`.
 
+Task 1 sequencing: defer `LiveSeedOptions` construction to Task 2, when its concrete warm-cache type moves into swarm; avoid a temporary generic or duplicate warm-cache implementation.
+
 ## Task 2: Relocate and connect the production follower
 
 **Consumes:** Task 1 boundary, unchanged peer/wire/scheduler/store APIs.

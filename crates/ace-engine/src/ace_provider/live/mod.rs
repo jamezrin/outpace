@@ -36,10 +36,7 @@ pub(super) use single_peer::{
 #[cfg(test)]
 pub(super) use single_peer::schedule_piece_requests;
 
-pub(super) struct LiveOutput {
-    pub(super) bytes: Bytes,
-    pub(super) discontinuity: bool,
-}
+pub(super) use ace_swarm::live_session::LiveOutput;
 
 pub(super) struct AceSource {
     pub(super) metrics: Option<Arc<crate::live_stats::LiveMetrics>>,
@@ -436,17 +433,10 @@ async fn follow_live_session_with_run(
     // reused across every reconnect (preserving buffered pieces, exactly like the old idempotent
     // `get_or_create`); `_seed_lease` lives for the entire `follow_live` body and drops on return
     // (including any early return), evicting the registry entry once no producer holds it.
-    let (store, _seed_lease) = seed.registry.lease_store(info.infohash, || {
-        build_piece_store(
-            info.piece_length,
-            info.chunk_length,
-            seed.store_bytes,
-            seed.store_retention,
-            seed.cache_type,
-            &seed.cache_dir,
-            &info.infohash,
-        )
-    });
+    let store_factory = seed.store_factory(&info);
+    let (store, _seed_lease) = seed
+        .registry
+        .lease_store(info.infohash, || store_factory(info.infohash));
     loop {
         if tx.is_closed() {
             return;
@@ -679,13 +669,7 @@ pub(super) struct LiveStatsGuard(pub(super) Option<Arc<crate::live_stats::LiveMe
 impl Drop for LiveStatsGuard {
     fn drop(&mut self) {
         if let Some(metrics) = &self.0 {
-            let mut position = crate::provider::StatsReader::snapshot(metrics.as_ref()).livepos;
-            if let Some(position) = &mut position {
-                position.live_first = None;
-                position.live_last = None;
-                position.buffer_pieces = 0;
-            }
-            metrics.publish_position(position, 0);
+            ace_swarm::live_session::LiveObserver::clear_active_coverage(metrics.as_ref());
         }
     }
 }

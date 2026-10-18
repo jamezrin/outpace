@@ -289,6 +289,28 @@ struct SeedConfig {
     warm_peers: WarmPeerCache,
 }
 
+impl SeedConfig {
+    fn store_factory(&self, info: &StreamInfo) -> ace_swarm::live_session::StoreFactory {
+        let piece_length = info.piece_length;
+        let chunk_length = info.chunk_length;
+        let max_bytes = self.store_bytes;
+        let retention = self.store_retention;
+        let cache_type = self.cache_type;
+        let cache_dir = self.cache_dir.clone();
+        Arc::new(move |infohash| {
+            build_piece_store(
+                piece_length,
+                chunk_length,
+                max_bytes,
+                retention,
+                cache_type,
+                &cache_dir,
+                &infohash,
+            )
+        })
+    }
+}
+
 pub struct AceProvider {
     identity: Arc<Identity>,
     /// External inbound endpoint to advertise as a dial-able seeder on the periodic tracker +

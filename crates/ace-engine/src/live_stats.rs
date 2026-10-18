@@ -114,6 +114,39 @@ impl LiveMetrics {
             .observe(now, self.uploaded.load(Ordering::Relaxed));
     }
 }
+impl ace_swarm::live_session::LiveObserver for LiveMetrics {
+    fn received_bytes(&self, count: u64) {
+        self.received.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn publish_position(
+        &self,
+        position: Option<ace_swarm::live_session::LivePosition>,
+        buffer_ms: u64,
+    ) {
+        self.publish_position(
+            position.map(|position| LivePositionStats {
+                pos: position.pos,
+                last: position.last,
+                live_first: position.live_first,
+                live_last: position.live_last,
+                buffer_pieces: position.buffer_pieces,
+            }),
+            buffer_ms,
+        );
+    }
+
+    fn clear_active_coverage(&self) {
+        let mut measured = self.measured.lock().unwrap();
+        if let Some(position) = &mut measured.position {
+            position.live_first = None;
+            position.live_last = None;
+            position.buffer_pieces = 0;
+        }
+        measured.buffer_ms = 0;
+    }
+}
+
 impl StatsReader for LiveMetrics {
     fn snapshot(&self) -> SourceStats {
         let now = Instant::now();
@@ -161,6 +194,61 @@ pub(crate) fn spawn_sampler(metrics: Arc<LiveMetrics>) -> MetricsSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_observer_adapter_preserves_history_and_counters() {
+        use ace_swarm::live_session::{LiveObserver, LivePosition};
+        let metrics = LiveMetrics::new(
+            Arc::new(AtomicU64::new(11)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(13)),
+            Arc::new(AtomicU32::new(3)),
+            Arc::new(AtomicU32::new(5)),
+        );
+        LiveObserver::received_bytes(metrics.as_ref(), 17);
+        assert_eq!(metrics.received.load(Ordering::Relaxed), 17);
+        let position = LivePosition {
+            pos: Some(19),
+            last: Some(23),
+            live_first: Some(29),
+            live_last: Some(31),
+            buffer_pieces: 37,
+        };
+        LiveObserver::publish_position(metrics.as_ref(), Some(position), 41);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.downloaded, 11);
+        assert_eq!(snapshot.uploaded, 13);
+        assert_eq!(snapshot.peers, 3);
+        assert_eq!(snapshot.peers_served, 5);
+        assert_eq!(snapshot.buffer_ms, 41);
+        let position = snapshot.livepos.unwrap();
+        assert_eq!(
+            (
+                position.pos,
+                position.last,
+                position.live_first,
+                position.live_last,
+                position.buffer_pieces
+            ),
+            (Some(19), Some(23), Some(29), Some(31), 37)
+        );
+        LiveObserver::clear_active_coverage(metrics.as_ref());
+        let snapshot = metrics.snapshot();
+        let position = snapshot.livepos.unwrap();
+        assert_eq!((position.pos, position.last), (Some(19), Some(23)));
+        assert_eq!(
+            (
+                position.live_first,
+                position.live_last,
+                position.buffer_pieces,
+                snapshot.buffer_ms
+            ),
+            (None, None, 0, 0)
+        );
+        LiveObserver::publish_position(metrics.as_ref(), None, 0);
+        LiveObserver::clear_active_coverage(metrics.as_ref());
+        assert!(metrics.snapshot().livepos.is_none());
+    }
 
     #[test]
     fn rate_measures_flow_and_expires() {
