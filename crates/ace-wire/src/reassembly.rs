@@ -156,15 +156,11 @@ impl PieceReassembler {
                 // already removed from `partial` above, so returning an error simply drops it —
                 // the cursor doesn't advance and the caller re-requests, rather than serving
                 // unauthenticated bytes to the consumer (see the module docs / B0/note 27).
-                let verified =
+                let (payload, sig) =
                     crate::live_auth::split_piece(&done.buf, self.piece_trailer as usize)
-                        .is_some_and(|(payload, sig)| {
-                            crate::live_auth::verify_piece(pubkey, payload, sig)
-                        });
-                if !verified {
-                    return Err(WireError::Invalid(
-                        "live-source piece signature verification failed",
-                    ));
+                        .ok_or(WireError::Invalid("live-source piece trailer split failed"))?;
+                if !crate::live_auth::verify_piece(pubkey, payload, sig) {
+                    return Err(WireError::SignatureRejected);
                 }
             }
             self.complete.insert(index, done.buf);
@@ -319,7 +315,10 @@ mod tests {
     #[test]
     fn rejects_block_past_piece_length() {
         let mut r = PieceReassembler::new(4, 0);
-        assert!(r.add_block(0, 2, &[1, 2, 3]).is_err());
+        assert!(matches!(
+            r.add_block(0, 2, &[1, 2, 3]),
+            Err(WireError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -449,8 +448,12 @@ mod tests {
         r.add_block(0, 0, &piece[..64]).unwrap();
         let err = r.add_block(0, 64, &piece[64..]).unwrap_err();
         assert!(
-            matches!(err, WireError::Invalid(_)),
-            "the block completing a forged piece is rejected"
+            matches!(err, WireError::SignatureRejected),
+            "only a complete piece with a failed source signature uses the distinct rejection"
+        );
+        assert!(
+            matches!(r.add_block(0, 0, &piece), Err(WireError::SignatureRejected)),
+            "a repeated failed assembled signature remains a signature rejection"
         );
         assert_eq!(
             r.take_ready(),

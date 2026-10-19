@@ -147,8 +147,14 @@ fn skip_evicted_gap_jumps_to_lowest_covered_when_cursor_is_stranded() {
     assert_eq!(c.skip_evicted_gap(c.next_needed_since), None);
     // Stuck past the timeout with no peer covering 102 -> skip to 105.
     let now = c.next_needed_since + default_live_recovery().request_timeout();
+    let observer = continuity_test_observer();
+    c.observer = Some(observer.clone());
     assert_eq!(c.skip_evicted_gap(now), Some(105));
     assert_eq!(c.reasm.next_needed(), 105);
+    assert_eq!(
+        observer.snapshot().recovery_events,
+        vec![RecoveryEvent::SkippedEvictedGap]
+    );
 }
 
 #[test]
@@ -293,6 +299,8 @@ fn resume_continues_seamlessly_when_the_new_window_still_covers_our_position() {
     }
     assert_eq!(c.reasm.take_ready().len(), ((150 - start + 1) * 4) as usize);
     assert_eq!(c.reasm.next_needed(), 151);
+    let observer = continuity_test_observer();
+    c.observer = Some(observer.clone());
     let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
     let resume = c.resume(addr, 100, 160);
     assert_eq!(
@@ -301,6 +309,7 @@ fn resume_continues_seamlessly_when_the_new_window_still_covers_our_position() {
     );
     assert_eq!(c.head, 160);
     assert_eq!(c.reasm.next_needed(), 151);
+    assert!(observer.snapshot().recovery_events.is_empty());
 }
 
 #[test]
@@ -407,6 +416,8 @@ fn resume_skips_forward_over_an_unrecoverable_eviction_gap() {
         PREFETCH_PIECES,
         LiveRecoveryConfig::default(),
     );
+    let observer = continuity_test_observer();
+    c.observer = Some(observer.clone());
     let addr: SocketAddrV4 = "1.2.3.4:8621".parse().unwrap();
     let resume = c.resume(addr, 500, 600); // min_piece way ahead of 151
     assert_eq!(resume, 500);
@@ -416,6 +427,44 @@ fn resume_skips_forward_over_an_unrecoverable_eviction_gap() {
         "reassembler cursor jumped past the gap"
     );
     assert_eq!(c.scheduler.in_flight_count(), 0);
+    assert_eq!(
+        observer.snapshot().recovery_events,
+        vec![RecoveryEvent::SkippedEvictedGap]
+    );
+}
+
+fn continuity_test_observer() -> Arc<TestObserver> {
+    TestObserver::new(
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    )
+}
+
+#[test]
+fn fresh_and_head_catchup_do_not_count_evicted_gap_recovery() {
+    let (mut c, _) = Continuity::fresh(
+        &info(),
+        100,
+        110,
+        PREFETCH_PIECES,
+        LiveRecoveryConfig::default(),
+    );
+    let observer = continuity_test_observer();
+    c.observer = Some(observer.clone());
+    assert_eq!(c.skip_evicted_gap(c.next_needed_since), None);
+    c.register_active_peer(1, test_addr(), win(100, 120));
+    c.set_peer_unchoked(1, true);
+    assert_eq!(
+        c.skip_evicted_gap(c.next_needed_since + default_live_recovery().request_timeout()),
+        None
+    );
+    c.head = 150;
+    assert_eq!(c.skip_far_behind_live(c.next_needed_since), Some(142));
+    assert_eq!(c.reasm.next_needed(), 142);
+    assert!(observer.snapshot().recovery_events.is_empty());
 }
 
 #[test]

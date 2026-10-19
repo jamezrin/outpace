@@ -22,6 +22,8 @@ pub mod ut_metadata;
 pub enum WireError {
     /// Buffer ended before a complete structure was parsed.
     Truncated,
+    /// An assembled live piece split successfully but its source signature did not verify.
+    SignatureRejected,
     /// Bytes did not match the expected format.
     Invalid(&'static str),
 }

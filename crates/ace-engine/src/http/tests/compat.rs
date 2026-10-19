@@ -833,6 +833,13 @@ fn measured_state(position: bool) -> AppState {
             live_last: Some(9),
             buffer_pieces: 1,
         }),
+        recovery: Some(crate::provider::LiveRecoveryStats {
+            upstream_reconnects: 2,
+            stale_teardowns: 3,
+            skipped_evicted_gaps: 4,
+            signature_rejects: 5,
+            active_upstreams: 1,
+        }),
         ..SourceStats::default()
     })));
     st.manager = StreamManager::new(registry);
@@ -858,6 +865,24 @@ async fn measured_stats_schema_reports_units_positions_and_null_timestamps() {
     let native: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
     assert_eq!(native["bitrate"], 12288);
     assert_eq!(native["livepos"], *pos);
+    assert_eq!(native["recovery"]["upstream_reconnects"], 2);
+    assert_eq!(native["recovery"]["stale_teardowns"], 3);
+    assert_eq!(native["recovery"]["skipped_evicted_gaps"], 4);
+    assert_eq!(native["recovery"]["signature_rejects"], 5);
+    assert_eq!(native["recovery"]["active_upstreams"], 1);
+    assert!(json["response"].get("recovery").is_none());
+}
+
+#[tokio::test]
+async fn native_stats_serializes_missing_recovery_as_null() {
+    let mut st = ace_compat_state(0);
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MeasuredFixture(SourceStats::default())));
+    st.manager = StreamManager::new(registry);
+    let _session = st.manager.get_or_start("fix", "stats").await.unwrap();
+    let response = stream_status(State(st), Path(("fix".into(), "stats".into()))).await;
+    let native: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(native.get("recovery"), Some(&serde_json::Value::Null));
 }
 
 #[tokio::test]

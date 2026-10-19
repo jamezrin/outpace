@@ -11,8 +11,19 @@ pub struct LivePosition {
     pub buffer_pieces: u64,
 }
 
+/// Source-session recovery occurrences, independent of presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryEvent {
+    UpstreamReconnect,
+    StaleTeardown,
+    SkippedEvictedGap,
+    SignatureReject,
+}
+
 /// Observation sink independent of engine statistics presentation.
 pub trait LiveObserver: Send + Sync {
+    fn recovery_event(&self, _event: RecoveryEvent) {}
+    fn active_upstreams(&self, _count: u32) {}
     fn received_bytes(&self, count: u64);
     fn publish_position(&self, position: Option<LivePosition>, buffer_ms: u64);
     /// Clear active coverage while preserving historical position fields.

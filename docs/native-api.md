@@ -70,6 +70,13 @@ An active stream status response has stable field names and numeric counters:
   "buffer_ms": 6200,
   "uploaded": 1048576,
   "peers_served": 2,
+  "recovery": {
+    "upstream_reconnects": 0,
+    "stale_teardowns": 0,
+    "skipped_evicted_gaps": 0,
+    "signature_rejects": 0,
+    "active_upstreams": 4
+  },
   "metadata": {
     "title": "Example Sports",
     "bitrate": 2450000,
@@ -153,6 +160,31 @@ needed by reassembly, `last` the last observed provider head, `live_first` and
 wall-clock timestamps is available. These observations are not a client's
 playhead or an authenticated source clock. Other providers without independent
 readers retain their existing post-output cached statistics behavior.
+
+`recovery` is null for providers without recovery observations. Observed live
+sources expose all five numeric fields from session creation, initially zero.
+Counters last for one source session, survive upstream pool rebuilds, and reset
+for a new source. Teardown clears active coverage and `active_upstreams` while
+retained snapshots preserve historical counters.
+
+- `upstream_reconnects`: successful runtime admissions after the first admitted
+  pool has ended, once per admitted transport, including reuse of an address.
+  Initial admissions, ordinary expansion of the initial pool, failed attempts,
+  gossip-only transports and provisional startup replacement do not count.
+- `stale_teardowns`: actual stale-budget pool shutdowns returning `PoolStale`,
+  once per shutdown; individual peer losses do not count.
+- `skipped_evicted_gaps`: actual forward cursor jumps in reconnect resume or
+  evicted-gap recovery, once per gap regardless of piece count. Initial prefetch
+  and live-head catchup pruning do not count.
+- `signature_rejects`: assembled pieces whose source signature verification
+  returns false. A retried piece can fail again. Malformed blocks, trailer split
+  failures, invalid keys, stale/future pieces and duplicates do not count.
+- `active_upstreams`: currently admitted peer runtimes, including choked and
+  provisional runtimes; connecting, queued and gossip-only transports are excluded.
+  Every pool exit, cancellation and source teardown clears this gauge.
+
+Compatibility `/ace/stat` keeps its established fields and mappings unchanged;
+these recovery observations are exposed only by native status.
 
 ## Live startup buffering
 

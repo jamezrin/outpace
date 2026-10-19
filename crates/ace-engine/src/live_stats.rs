@@ -64,6 +64,7 @@ struct Measurement {
     up: RateMeter,
     position: Option<LivePositionStats>,
     buffer_ms: u64,
+    recovery: crate::provider::LiveRecoveryStats,
 }
 
 pub(crate) struct LiveMetrics {
@@ -88,6 +89,7 @@ impl LiveMetrics {
             up: RateMeter::new(now, uploaded.load(Ordering::Relaxed)),
             position: None,
             buffer_ms: 0,
+            recovery: Default::default(),
         });
         Arc::new(Self {
             downloaded,
@@ -115,6 +117,22 @@ impl LiveMetrics {
     }
 }
 impl ace_swarm::live_session::LiveObserver for LiveMetrics {
+    fn recovery_event(&self, event: ace_swarm::live_session::RecoveryEvent) {
+        use ace_swarm::live_session::RecoveryEvent;
+        let mut measured = self.measured.lock().unwrap();
+        let counter = match event {
+            RecoveryEvent::UpstreamReconnect => &mut measured.recovery.upstream_reconnects,
+            RecoveryEvent::StaleTeardown => &mut measured.recovery.stale_teardowns,
+            RecoveryEvent::SkippedEvictedGap => &mut measured.recovery.skipped_evicted_gaps,
+            RecoveryEvent::SignatureReject => &mut measured.recovery.signature_rejects,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    fn active_upstreams(&self, count: u32) {
+        self.measured.lock().unwrap().recovery.active_upstreams = count;
+    }
+
     fn received_bytes(&self, count: u64) {
         self.received.fetch_add(count, Ordering::Relaxed);
     }
@@ -144,6 +162,7 @@ impl ace_swarm::live_session::LiveObserver for LiveMetrics {
             position.buffer_pieces = 0;
         }
         measured.buffer_ms = 0;
+        measured.recovery.active_upstreams = 0;
     }
 }
 
@@ -164,6 +183,7 @@ impl StatsReader for LiveMetrics {
             download_rate,
             upload_rate: measured.up.rate(now, self.uploaded.load(Ordering::Relaxed)),
             livepos: measured.position.clone(),
+            recovery: Some(measured.recovery.clone()),
         }
     }
 }
@@ -197,13 +217,18 @@ mod tests {
 
     #[test]
     fn live_observer_adapter_preserves_history_and_counters() {
-        use ace_swarm::live_session::{LiveObserver, LivePosition};
+        use ace_swarm::live_session::{LiveObserver, LivePosition, RecoveryEvent};
         let metrics = LiveMetrics::new(
             Arc::new(AtomicU64::new(11)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(13)),
             Arc::new(AtomicU32::new(3)),
             Arc::new(AtomicU32::new(5)),
+        );
+        assert_eq!(
+            metrics.snapshot().recovery,
+            Some(crate::provider::LiveRecoveryStats::default()),
+            "a newly created source starts with zero recovery history and gauge"
         );
         LiveObserver::received_bytes(metrics.as_ref(), 17);
         assert_eq!(metrics.received.load(Ordering::Relaxed), 17);
@@ -215,9 +240,29 @@ mod tests {
             buffer_pieces: 37,
         };
         LiveObserver::publish_position(metrics.as_ref(), Some(position), 41);
+        for event in [
+            RecoveryEvent::UpstreamReconnect,
+            RecoveryEvent::StaleTeardown,
+            RecoveryEvent::SkippedEvictedGap,
+            RecoveryEvent::SignatureReject,
+        ] {
+            metrics.recovery_event(event);
+        }
+        metrics.active_upstreams(3);
+        metrics.active_upstreams(0);
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.downloaded, 11);
         assert_eq!(snapshot.uploaded, 13);
+        assert_eq!(
+            snapshot.recovery,
+            Some(crate::provider::LiveRecoveryStats {
+                upstream_reconnects: 1,
+                stale_teardowns: 1,
+                skipped_evicted_gaps: 1,
+                signature_rejects: 1,
+                active_upstreams: 0,
+            })
+        );
         assert_eq!(snapshot.peers, 3);
         assert_eq!(snapshot.peers_served, 5);
         assert_eq!(snapshot.buffer_ms, 41);
@@ -234,6 +279,16 @@ mod tests {
         );
         LiveObserver::clear_active_coverage(metrics.as_ref());
         let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.recovery,
+            Some(crate::provider::LiveRecoveryStats {
+                upstream_reconnects: 1,
+                stale_teardowns: 1,
+                skipped_evicted_gaps: 1,
+                signature_rejects: 1,
+                active_upstreams: 0,
+            })
+        );
         let position = snapshot.livepos.unwrap();
         assert_eq!((position.pos, position.last), (Some(19), Some(23)));
         assert_eq!(
