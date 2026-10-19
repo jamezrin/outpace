@@ -289,7 +289,7 @@ impl TsResync {
     }
 }
 
-/// Tracks the MPEG-TS tables and video PID needed to identify a decodable access point.
+/// Tracks the MPEG-TS tables and video PID needed to identify a candidate access point.
 #[derive(Default)]
 pub struct VideoAccessPointState {
     pmt_pid: Option<u16>,
@@ -367,8 +367,9 @@ impl VideoAccessPointState {
     }
 }
 
-/// Per-client gate that drops a stream's opening packets until the first clean keyframe, so a
-/// player joining a live MPEG-TS mid-GOP starts on a decodable picture instead of garbage.
+/// Per-client gate that drops a stream's opening packets until a candidate video access point.
+/// RAI and packet-local NAL detection are heuristics: without parsing the complete access unit
+/// and its dependencies, they do not guarantee an independently decodable picture.
 ///
 /// Feed it sync-locked, 188-aligned TS packets (e.g. [`TsResync`] output). Until it locks it
 /// emits nothing; on the first random-access point it emits the most-recent PAT and PMT
@@ -391,7 +392,9 @@ pub struct KeyframeGate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateResume {
+    /// A video PUSI with RAI or a packet-local IDR/IRAP NAL; not a decodability guarantee.
     AccessPoint,
+    /// Explicit bounded passthrough fallback, without an observed access point.
     ScanBudget,
 }
 
@@ -639,9 +642,9 @@ fn ts_payload_offset(pkt: &[u8]) -> Option<usize> {
     (start < TS_PACKET_LEN).then_some(start)
 }
 
-/// A random-access point: the start of a video access unit (PUSI) that is also a keyframe —
-/// flagged either by the adaptation field's random_access_indicator or by an H.264 IDR/SPS
-/// NAL in the payload (belt-and-suspenders across encoders).
+/// Candidate access point: video PES start (PUSI) with random_access_indicator or a
+/// packet-local H.264 IDR / HEVC IRAP NAL. RAI is trusted as a heuristic; neither path
+/// parses a complete picture or proves that its decoding dependencies are available.
 fn is_random_access_point(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     if !ts_pusi(pkt) {
         return false;
@@ -659,10 +662,11 @@ fn ts_random_access_indicator(pkt: &[u8]) -> bool {
 }
 
 /// Scan the packet payload for an Annex-B start code `00 00 01` followed by a keyframe NAL for
-/// the stream's `codec`: H.264 IDR (5) / SPS (7), or HEVC IRAP (16..=21) / VPS/SPS/PPS (32..=34).
+/// the stream's `codec`: H.264 IDR (5), or HEVC IRAP (16..=21). Parameter sets alone
+/// do not contain a picture and must not open the gate.
 /// The scan is codec-gated because the two codecs read the NAL-type bits differently (H.264 uses
 /// `byte & 0x1F`, HEVC uses `(byte >> 1) & 0x3F`), so an H.264 slice type would otherwise be
-/// misread as an HEVC parameter set (and vice versa). Without a resolved codec, returns false and
+/// interpreted under the wrong codec. Without a resolved codec, returns false and
 /// leaves keyframe detection to the codec-agnostic random_access_indicator.
 fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     let Some(codec) = codec else {
@@ -677,8 +681,8 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
             return false;
         }
         match codec {
-            VideoCodec::H264 => matches!(w[3] & 0x1F, 5 | 7),
-            VideoCodec::Hevc => matches!((w[3] >> 1) & 0x3F, 16..=21 | 32..=34),
+            VideoCodec::H264 => matches!(w[3] & 0x1F, 5),
+            VideoCodec::Hevc => matches!((w[3] >> 1) & 0x3F, 16..=21),
         }
     })
 }
@@ -1015,6 +1019,40 @@ mod tests {
         psi(pmt_pid, &s)
     }
 
+    /// Return a PSI packet with the MPEG-2 CRC filled in, for tests that exercise table parsing.
+    fn with_valid_psi_crc(mut packet: Vec<u8>) -> Vec<u8> {
+        let section_start = 5; // TS header + pointer_field
+        let section_len = 3
+            + (((packet[section_start + 1] as usize & 0x0F) << 8)
+                | packet[section_start + 2] as usize);
+        let crc_at = section_start + section_len - 4;
+        let crc = mpeg_crc32(&packet[section_start..crc_at]);
+        packet[crc_at..crc_at + 4].copy_from_slice(&crc.to_be_bytes());
+        packet
+    }
+
+    fn valid_pat(pmt_pid: u16) -> Vec<u8> {
+        with_valid_psi_crc(pat(pmt_pid))
+    }
+
+    fn valid_pmt_codec(pmt_pid: u16, video_pid: u16, stream_type: u8) -> Vec<u8> {
+        with_valid_psi_crc(pmt_codec(pmt_pid, video_pid, stream_type))
+    }
+
+    fn pes_nal(nal: &[u8]) -> Vec<u8> {
+        let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        pes.extend_from_slice(&[0x00, 0x00, 0x01]);
+        pes.extend_from_slice(nal);
+        pes
+    }
+
+    fn gate_with_valid_video(stream_type: u8) -> KeyframeGate {
+        let mut gate = KeyframeGate::new();
+        gate.push(&valid_pat(PMT_PID));
+        gate.push(&valid_pmt_codec(PMT_PID, VIDEO_PID, stream_type));
+        gate
+    }
+
     /// True iff `pkt` is on `pid` (single-packet helper for assertions).
     fn pid_of(pkt: &[u8]) -> u16 {
         (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16
@@ -1215,6 +1253,92 @@ mod tests {
         ];
         let out = g.push(&ts(VIDEO_PID, true, false, &pes));
         assert_eq!(packet_count(&out), 3, "HEVC IRAP NAL should lock the gate");
+    }
+
+    #[test]
+    fn gate_h264_sps_only_pusi_does_not_open_but_idr_does() {
+        let mut gate = gate_with_valid_video(0x1B);
+        let sps = gate.push(&ts(
+            VIDEO_PID,
+            true,
+            false,
+            &pes_nal(&[0x67, 0x42, 0x00, 0x1E]),
+        ));
+        assert!(sps.is_empty(), "SPS alone must not open the gate");
+
+        let wrong_pid = gate.push(&ts(AUDIO_PID, true, false, &pes_nal(&[0x65, 0x88])));
+        assert!(
+            wrong_pid.is_empty(),
+            "an IDR on the wrong PID must not open the gate"
+        );
+        let no_pusi = gate.push(&ts(VIDEO_PID, false, false, &pes_nal(&[0x65, 0x88])));
+        assert!(
+            no_pusi.is_empty(),
+            "an IDR without PUSI must not open the gate"
+        );
+
+        let idr = gate.push(&ts(VIDEO_PID, true, false, &pes_nal(&[0x65, 0x88])));
+        assert_eq!(packet_count(&idr), 3, "an actual IDR opens the gate");
+        assert_eq!(pid_of(&idr[2 * TS_PACKET_LEN..]), VIDEO_PID);
+    }
+
+    #[test]
+    fn gate_hevc_parameter_sets_do_not_open_but_irap_does() {
+        for nal in [&[0x40, 0x01][..], &[0x42, 0x01][..], &[0x44, 0x01][..]] {
+            let mut gate = gate_with_valid_video(0x24);
+            let held = gate.push(&ts(VIDEO_PID, true, false, &pes_nal(nal)));
+            assert!(held.is_empty(), "HEVC VPS/SPS/PPS alone must not open");
+            let wrong_pid = gate.push(&ts(AUDIO_PID, true, false, &pes_nal(&[0x26, 0x01, 0x80])));
+            assert!(
+                wrong_pid.is_empty(),
+                "an IRAP on the wrong PID must not open the gate"
+            );
+            let no_pusi = gate.push(&ts(VIDEO_PID, false, false, &pes_nal(&[0x26, 0x01, 0x80])));
+            assert!(
+                no_pusi.is_empty(),
+                "an IRAP without PUSI must not open the gate"
+            );
+            let irap = gate.push(&ts(VIDEO_PID, true, false, &pes_nal(&[0x26, 0x01, 0x80])));
+            assert_eq!(packet_count(&irap), 3, "HEVC IRAP opens the gate");
+        }
+    }
+
+    #[test]
+    fn gate_rai_with_parameter_sets_still_opens() {
+        let mut gate = gate_with_valid_video(0x1B);
+        let out = gate.push(&ts(
+            VIDEO_PID,
+            true,
+            true,
+            &pes_nal(&[0x67, 0x42, 0x00, 0x1E]),
+        ));
+        assert_eq!(packet_count(&out), 3, "RAI remains an opening signal");
+    }
+
+    #[test]
+    fn gate_parameter_only_scan_exhaustion_reports_scan_budget() {
+        let mut gate = KeyframeGate::with_max_scan_packets(4);
+        gate.push(&valid_pat(PMT_PID));
+        gate.push(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x1B));
+        let sps = gate.push_report(&ts(
+            VIDEO_PID,
+            true,
+            false,
+            &pes_nal(&[0x67, 0x42, 0x00, 0x1E]),
+        ));
+        assert!(sps.bytes.is_empty(), "SPS alone must stay held");
+        assert_eq!(
+            sps.resumed, None,
+            "PAT, PMT, and SPS do not exhaust budget 4"
+        );
+
+        let ordinary = gate.push_report(&ts(VIDEO_PID, false, false, &[0x11]));
+        assert_eq!(ordinary.resumed, Some(GateResume::ScanBudget));
+        assert_eq!(
+            packet_count(&ordinary.bytes),
+            1,
+            "only the ordinary packet resumes output"
+        );
     }
 
     #[test]
