@@ -126,13 +126,14 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
     let (info, seed) = fixture(max_active);
     let received = Arc::new(AtomicU64::new(0));
     let mut seed = seed;
-    seed.metrics = Some(TestObserver::new(
+    let recovery_observer = TestObserver::new(
         Arc::new(AtomicU64::new(0)),
         received.clone(),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU32::new(0)),
         Arc::new(AtomicU32::new(0)),
-    ));
+    );
+    seed.metrics = Some(recovery_observer.clone());
     let (tx, mut rx) = mpsc::channel(16);
     let count = Arc::new(AtomicU32::new(1));
     let pool_count = count.clone();
@@ -195,6 +196,10 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
         "no piece below live head minus prefetch may be requested: {requests:?}"
     );
     assert!(count.load(Ordering::Relaxed) <= max_active as u32);
+    assert!(
+        recovery_observer.snapshot().recovery_events.is_empty(),
+        "startup replacement/provisional admission is not a reconnect"
+    );
 }
 
 #[tokio::test]

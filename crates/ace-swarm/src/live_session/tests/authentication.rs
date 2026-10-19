@@ -112,8 +112,15 @@ async fn rejected_signed_piece_retries_through_full_peer_pool() {
         info.chunk_length,
         4096,
     )));
+    let recovery_observer = TestObserver::new(
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    );
     let seed = SeedConfig {
-        metrics: None,
+        metrics: Some(recovery_observer.clone()),
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),
         enabled: false,
@@ -172,4 +179,9 @@ async fn rejected_signed_piece_retries_through_full_peer_pool() {
     finish_tx.send(()).unwrap();
     server.await.unwrap();
     pool.await.unwrap();
+    assert_eq!(
+        recovery_observer.snapshot().recovery_events,
+        vec![RecoveryEvent::SignatureReject],
+        "one assembled piece failing source verification counts once; the valid retry does not"
+    );
 }

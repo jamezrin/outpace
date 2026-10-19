@@ -80,10 +80,47 @@ fn positions_clear_active_bounds_on_reconnect_and_reject_negative_windows() {
     c.active_peers.observe_window(1, Some((2, 7)));
     publish_live_stats(&c, Some(&(metrics.clone() as Arc<dyn LiveObserver>)), &info);
     assert_eq!(metrics.snapshot().livepos.unwrap().live_last, Some(7));
+    metrics.active_upstreams(2);
+    metrics.recovery_event(RecoveryEvent::UpstreamReconnect);
     drop(LiveStatsGuard(Some(metrics.clone())));
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.livepos.unwrap().live_last, None);
     assert_eq!(snapshot.buffer_ms, 0);
+    assert_eq!(snapshot.active_upstreams, 0);
+    assert_eq!(
+        snapshot.recovery_events,
+        vec![RecoveryEvent::UpstreamReconnect]
+    );
+}
+
+#[tokio::test]
+async fn aborting_live_session_retains_recovery_history_and_clears_active_gauge() {
+    let metrics = TestObserver::new(
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    );
+    let observer: Arc<dyn LiveObserver> = metrics.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _guard = LiveStatsGuard(Some(observer.clone()));
+        observer.recovery_event(RecoveryEvent::UpstreamReconnect);
+        observer.active_upstreams(2);
+        let _ = ready_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    ready_rx.await.unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.recovery_events,
+        vec![RecoveryEvent::UpstreamReconnect]
+    );
+    assert_eq!(snapshot.active_upstreams, 0);
 }
 
 #[test]

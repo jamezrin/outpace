@@ -329,8 +329,15 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         sig_len: 0,
         source_pubkey: vec![],
     };
+    let recovery_observer = TestObserver::new(
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    );
     let mut seed = SeedConfig {
-        metrics: None,
+        metrics: Some(recovery_observer.clone()),
         registry: SeedRegistry::new(),
         store_factory: {
             let piece_length = info.piece_length;
@@ -424,6 +431,23 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         peer_count.load(Ordering::Relaxed),
         0,
         "shutdown must clear active-peer statistics"
+    );
+    let observed = recovery_observer.snapshot();
+    assert_eq!(
+        observed.active_upstreams, 0,
+        "teardown clears the upstream gauge"
+    );
+    let expected_events = if disconnect {
+        vec![RecoveryEvent::UpstreamReconnect]
+    } else {
+        vec![
+            RecoveryEvent::StaleTeardown,
+            RecoveryEvent::UpstreamReconnect,
+        ]
+    };
+    assert_eq!(
+        observed.recovery_events, expected_events,
+        "pool loss is counted once, and the successful learned retry is counted once"
     );
     assert!(
         result.is_ok(),

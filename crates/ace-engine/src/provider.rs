@@ -17,12 +17,24 @@ pub struct SourceStats {
     pub download_rate: u64, // measured reassembled payload bytes/sec
     pub upload_rate: u64,   // measured uploaded bytes/sec
     pub livepos: Option<LivePositionStats>,
+    /// Source-session recovery observations; None for unsupported providers.
+    pub recovery: Option<LiveRecoveryStats>,
     /// Bytes downloaded from the source and emitted as MPEG-TS.
     pub downloaded: u64,
     /// Bytes we have uploaded (served to peers) on this source.
     pub uploaded: u64,
     /// Distinct peers we have served at least one chunk to.
     pub peers_served: u32,
+}
+
+/// Historical recovery occurrences and the current admitted transport gauge.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LiveRecoveryStats {
+    pub upstream_reconnects: u64,
+    pub stale_teardowns: u64,
+    pub skipped_evicted_gaps: u64,
+    pub signature_rejects: u64,
+    pub active_upstreams: u32,
 }
 
 /// Provider piece observations, not a client's playhead or wall-clock timestamps.

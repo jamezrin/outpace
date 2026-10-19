@@ -395,6 +395,8 @@ pub(super) fn drop_peer_runtime(
     continuity: &mut Continuity,
 ) -> Option<SocketAddrV4> {
     let peer = peers.remove(&peer_id)?;
+    continuity.admitted_upstreams = peers.len() as u32;
+    continuity.publish_upstreams();
     for piece in continuity.active_peers.remove(peer_id) {
         continuity.scheduler.on_drop(piece);
     }

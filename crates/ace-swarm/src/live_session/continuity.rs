@@ -6,6 +6,18 @@ pub(super) fn prefetch_start(min_piece: u64, max_piece: u64, prefetch: u64) -> u
 }
 
 impl Continuity {
+    pub(super) fn recovery_event(&self, event: RecoveryEvent) {
+        if let Some(observer) = &self.observer {
+            observer.recovery_event(event);
+        }
+    }
+
+    pub(super) fn publish_upstreams(&self) {
+        if let Some(observer) = &self.observer {
+            observer.active_upstreams(self.admitted_upstreams);
+        }
+    }
+
     /// The very first peer connection for this stream: bootstrap from its window.
     pub(super) fn fresh(
         info: &StreamInfo,
@@ -26,6 +38,10 @@ impl Continuity {
             .with_max_pieces_ahead(live_recovery.max_reasm_pieces_ahead);
         (
             Continuity {
+                observer: None,
+                has_admitted_pool: false,
+                reconnect_pool: false,
+                admitted_upstreams: 0,
                 live_recovery,
                 reasm,
                 resync: ace_media::mpegts::TsResync::new(),
@@ -73,6 +89,7 @@ impl Continuity {
                 "[ace] {addr}: reconnect gap — peer's window already evicted pieces {next}..{}; skipping ahead",
                 resume - 1
             );
+            self.recovery_event(RecoveryEvent::SkippedEvictedGap);
             self.reasm.skip_to(resume);
             self.arm_output_gate();
         }
@@ -154,6 +171,7 @@ impl Continuity {
         if floor <= next {
             return None;
         }
+        self.recovery_event(RecoveryEvent::SkippedEvictedGap);
         self.reasm.skip_to(floor);
         self.arm_output_gate();
         self.active_peers.prune_below(floor);

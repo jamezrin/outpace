@@ -65,6 +65,12 @@ pub(super) async fn activate_upstream_peer(
     // leaves its runtime, gossip reader, and request slots intact.
     let replaced = replacing.and_then(|(peers, id)| drop_peer_runtime(id, peers, continuity));
     continuity.register_active_peer(peer_id, upstream.addr, upstream.window);
+    if continuity.reconnect_pool {
+        continuity.recovery_event(RecoveryEvent::UpstreamReconnect);
+    }
+    continuity.has_admitted_pool = true;
+    continuity.admitted_upstreams += 1;
+    continuity.publish_upstreams();
     let (command_tx, command_rx) = mpsc::channel(64);
     let worker = tokio::spawn(peer_worker(
         peer_id,
@@ -183,6 +189,8 @@ pub(super) async fn follow_peer_pool_with_discovery(
                 seed.prefetch_pieces,
                 seed.live_recovery,
             );
+            let mut c = c;
+            c.observer = seed.metrics.clone();
             *continuity = Some(c);
             crate::alog!(
                 "[ace] {primary_addr}: window min={min_piece} max={max_piece} -> start={start} head={max_piece}"
@@ -190,6 +198,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
             start
         }
         Some(c) => {
+            c.observer = seed.metrics.clone();
+            c.reconnect_pool = c.has_admitted_pool;
+            c.admitted_upstreams = 0;
             let start = c.resume(primary_addr, min_piece, max_piece);
             crate::alog!(
                 "[ace] {primary_addr}: reconnected; window min={min_piece} max={max_piece} -> resuming from {start} head={}",
@@ -339,6 +350,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
                 stalled.len()
             );
             shutdown_peer_runtimes(&mut peers);
+            continuity.recovery_event(RecoveryEvent::StaleTeardown);
             return FollowEnd::PoolStale {
                 stalled,
                 lost: loss_count,
@@ -703,6 +715,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     {
                         Ok(contribution) => contribution,
                         Err(e) => {
+                            if e == ace_wire::WireError::SignatureRejected {
+                                continuity.recovery_event(RecoveryEvent::SignatureReject);
+                            }
                             // A malformed block, or a completed piece whose live-source signature
                             // didn't verify (#10): drop it rather than emit unauthenticated bytes.
                             // The piece stays incomplete, so it's re-requested from the pool.

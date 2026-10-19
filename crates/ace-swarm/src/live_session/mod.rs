@@ -3,7 +3,7 @@
 mod observation;
 mod options;
 
-pub use observation::{LiveCounters, LiveObserver, LivePosition};
+pub use observation::{LiveCounters, LiveObserver, LivePosition, RecoveryEvent};
 pub use options::{
     LiveRecoveryOptions, MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS, MAX_LIVE_RECOVERY_PARALLEL_CONNECT,
     MAX_LIVE_RECOVERY_PIECE_ADVANCE, MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD,
@@ -406,6 +406,7 @@ async fn follow_live_session_with_run(
     reachability: Option<Arc<ReachabilityMonitor>>,
     mut rediscovery: Option<DiscoveryRun>,
 ) {
+    let _stats_guard = LiveStatsGuard(seed.metrics.clone());
     let _peer_count_guard = SessionPeerCount(peer_count.clone());
     let _warm_flush = WarmFlush(seed.warm_peers.clone());
     let chunks_per_piece = info.chunks_per_piece();
@@ -598,6 +599,10 @@ impl Drop for WarmFlush {
 }
 
 pub(super) struct Continuity {
+    observer: Option<Arc<dyn LiveObserver>>,
+    has_admitted_pool: bool,
+    reconnect_pool: bool,
+    admitted_upstreams: u32,
     pub(super) live_recovery: LiveRecoveryConfig,
     pub(super) reasm: PieceReassembler,
     pub(super) resync: ace_media::mpegts::TsResync,
@@ -658,6 +663,7 @@ pub(super) struct LiveStatsGuard(pub(super) Option<Arc<dyn LiveObserver>>);
 impl Drop for LiveStatsGuard {
     fn drop(&mut self) {
         if let Some(metrics) = &self.0 {
+            metrics.active_upstreams(0);
             metrics.clear_active_coverage();
         }
     }
@@ -690,12 +696,16 @@ struct TestObserver {
     received: Arc<AtomicU64>,
     downloaded: Arc<AtomicU64>,
     position: std::sync::Mutex<(Option<LivePosition>, u64)>,
+    recovery_events: std::sync::Mutex<Vec<RecoveryEvent>>,
+    active_upstreams: AtomicU32,
 }
 #[cfg(test)]
 struct TestSnapshot {
     downloaded: u64,
     livepos: Option<LivePosition>,
     buffer_ms: u64,
+    recovery_events: Vec<RecoveryEvent>,
+    active_upstreams: u32,
 }
 #[cfg(test)]
 impl TestObserver {
@@ -710,6 +720,8 @@ impl TestObserver {
             received,
             downloaded,
             position: std::sync::Mutex::new((None, 0)),
+            recovery_events: std::sync::Mutex::new(Vec::new()),
+            active_upstreams: AtomicU32::new(0),
         })
     }
     fn snapshot(&self) -> TestSnapshot {
@@ -718,6 +730,8 @@ impl TestObserver {
             downloaded: self.downloaded.load(Ordering::Relaxed),
             livepos: position.0.clone(),
             buffer_ms: position.1,
+            recovery_events: self.recovery_events.lock().unwrap().clone(),
+            active_upstreams: self.active_upstreams.load(Ordering::Relaxed),
         }
     }
 }
@@ -737,5 +751,13 @@ impl LiveObserver for TestObserver {
             p.buffer_pieces = 0;
         }
         position.1 = 0;
+    }
+
+    fn recovery_event(&self, event: RecoveryEvent) {
+        self.recovery_events.lock().unwrap().push(event);
+    }
+
+    fn active_upstreams(&self, count: u32) {
+        self.active_upstreams.store(count, Ordering::Relaxed);
     }
 }
