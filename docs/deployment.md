@@ -163,3 +163,6 @@ services:
 ```
 
 The checked-in log rotation bounds Docker JSON logs independently of the piece-cache budget.
+
+For bounded playback validation and the limits of soak evidence, use the
+[live gateway checklist](testing/live-gateway-checklist.md).
