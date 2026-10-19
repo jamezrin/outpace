@@ -259,6 +259,210 @@ class FakeApiTests(unittest.TestCase):
         finally:
             server.shutdown(); thread.join(timeout=2); server.server_close()
 
+    def test_ts_delayed_headers_use_overall_deadline_then_full_active_duration(self):
+        class Source(BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(.04)  # Startup is within the configured timeout.
+                self.send_response(200); self.end_headers()
+                while True:
+                    try:
+                        self.wfile.write(b"chunk"); self.wfile.flush(); time.sleep(.01)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            def log_message(self, *_): pass
+        server = HTTPServer(("127.0.0.1", 0), Source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            started = time.monotonic()
+            count = soak.play_ts(f"http://127.0.0.1:{server.server_port}/", started + .7,
+                                 None, .1, .1)
+            self.assertGreater(count, 0)
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, .14)
+            self.assertLess(elapsed, .3)
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_ts_late_first_byte_starts_active_clock_at_first_byte(self):
+        class Source(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers()
+                time.sleep(.02)
+                while True:
+                    try:
+                        self.wfile.write(b"chunk"); self.wfile.flush(); time.sleep(.01)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            def log_message(self, *_): pass
+        server = HTTPServer(("127.0.0.1", 0), Source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            started = time.monotonic()
+            count = soak.play_ts(f"http://127.0.0.1:{server.server_port}/", started + .5,
+                                 None, .1, .1)
+            self.assertGreater(count, 0)
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, .12)
+            self.assertLess(elapsed, .3)
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_ts_two_brief_chunks_do_not_satisfy_full_active_duration(self):
+        class Source(BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(.08)
+                self.send_response(200); self.end_headers()
+                for _ in range(2):
+                    try:
+                        self.wfile.write(b"chunk"); self.wfile.flush(); time.sleep(.01)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                time.sleep(.15)  # Keep the response open beyond the overall deadline.
+            def log_message(self, *_): pass
+        server = HTTPServer(("127.0.0.1", 0), Source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with self.assertRaises(soak.Inconclusive):
+                soak.play_ts(f"http://127.0.0.1:{server.server_port}/", time.monotonic() + .12,
+                             None, .2, .1)
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_playback_duration_that_cannot_fit_overall_deadline_is_inconclusive(self):
+        class Source(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers()
+                end = time.monotonic() + .08
+                while time.monotonic() < end:
+                    try:
+                        self.wfile.write(b"chunk"); self.wfile.flush(); time.sleep(.005)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            def log_message(self, *_): pass
+        server = HTTPServer(("127.0.0.1", 0), Source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with self.assertRaises(soak.Inconclusive):
+                soak.play_ts(f"http://127.0.0.1:{server.server_port}/", time.monotonic() + .04,
+                             None, .1, .1)
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_hls_startup_delay_does_not_consume_active_duration(self):
+        class Source(BaseHTTPRequestHandler):
+            calls = 0
+            def do_GET(self):
+                if self.path.endswith(".m3u8"):
+                    type(self).calls += 1
+                    seq = type(self).calls
+                    body = f"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{seq}\n#EXTINF:1,\n/streams/ace/cid:x/seg/{seq}.ts\n".encode()
+                else:
+                    if type(self).calls == 1:
+                        time.sleep(.02)
+                    body = b"segment"
+                self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            def log_message(self, *_): pass
+        server = HTTPServer(("127.0.0.1", 0), Source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            started = time.monotonic()
+            count = soak.play_hls(f"http://127.0.0.1:{server.server_port}", "/streams/ace/cid:x",
+                                  started + .6, None, .3, .1)
+            self.assertGreater(count, 0)
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, .12)
+            self.assertLess(elapsed, .4)
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_ts_headers_and_first_byte_share_startup_timeout(self):
+        class Source(BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(.06)
+                self.send_response(200); self.end_headers()
+                time.sleep(.06)
+                end = time.monotonic() + .4
+                while time.monotonic() < end:
+                    try:
+                        self.wfile.write(b"late"); self.wfile.flush(); time.sleep(.01)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            def log_message(self, *_): pass
+        server = HTTPServer(("127.0.0.1", 0), Source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with self.assertRaises(soak.Inconclusive):
+                soak.play_ts(f"http://127.0.0.1:{server.server_port}/", time.monotonic() + .5,
+                             None, .1, .1)
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_hls_playback_that_cannot_fit_overall_deadline_is_inconclusive(self):
+        with self.assertRaises(soak.Inconclusive):
+            soak.play_hls(self.base, "/streams/ace/cid:x", time.monotonic() + .04,
+                          None, .1, .1)
+
+    def test_ts_first_byte_after_startup_timeout_is_inconclusive(self):
+        class Source(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers()
+                time.sleep(.08)
+                self.wfile.write(b"late"); self.wfile.flush()
+            def log_message(self, *_): pass
+        server = HTTPServer(("127.0.0.1", 0), Source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with self.assertRaises(soak.Inconclusive):
+                soak.play_ts(f"http://127.0.0.1:{server.server_port}/", time.monotonic() + .5,
+                             None, .04, .1)
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_hls_startup_after_progress_timeout_is_inconclusive(self):
+        class Source(BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(.08)
+                body = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,\n/streams/ace/cid:x/seg/1.ts\n"
+                self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            def log_message(self, *_): pass
+        server = HTTPServer(("127.0.0.1", 0), Source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with self.assertRaises(soak.Inconclusive):
+                soak.play_hls(f"http://127.0.0.1:{server.server_port}", "/streams/ace/cid:x",
+                              time.monotonic() + .5, None, .04, .1)
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_interrupt_during_ts_open_propagates(self):
+        with mock.patch.object(soak.OPENER, "open", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                soak.play_ts("http://127.0.0.1:1/", time.monotonic() + 1,
+                             None, .1, .1)
+
+    def test_interrupt_during_ts_read_propagates(self):
+        response = mock.Mock()
+        response.status = 200
+        response.isclosed.return_value = False
+        response.fp.raw._sock.settimeout = mock.Mock()
+        response.read1.side_effect = KeyboardInterrupt
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.object(soak.OPENER, "open", return_value=response):
+            with self.assertRaises(KeyboardInterrupt):
+                soak.play_ts("http://127.0.0.1:1/", time.monotonic() + 1,
+                             None, .1, .1)
+
     def test_hls_stall_after_initial_advancement_is_inconclusive(self):
         real_sleep = time.sleep
         class Stalling(BaseHTTPRequestHandler):

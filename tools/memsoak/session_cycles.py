@@ -67,7 +67,7 @@ def validate_count(value, name, maximum):
 
 
 @contextmanager
-def deadline_watch(deadline):
+def deadline_watch(deadline, expiry=Inconclusive):
     main_thread = threading_is_main_thread()
     if not main_thread:
         yield
@@ -75,7 +75,7 @@ def deadline_watch(deadline):
     prior = signal.getsignal(signal.SIGALRM)
     old_timer = signal.getitimer(signal.ITIMER_REAL)
     def expired(_sig, _frame):
-        raise Inconclusive("HTTP operation deadline expired")
+        raise expiry("HTTP operation deadline expired")
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, remaining(deadline))
     try:
@@ -332,66 +332,110 @@ def _same_loopback_route(base, candidate, prefix):
     return urllib.parse.urlunsplit(("http", b.netloc, c.path, c.query, ""))
 
 
-def play_ts(url, deadline, guard=None, operation_timeout=5):
+class PlaybackIntervalComplete(Exception):
+    pass
+
+
+class PlaybackWindow:
+    """Startup is bounded separately; media progress must span the active window."""
+    def __init__(self, deadline, timeout, duration):
+        self.overall = deadline
+        self.timeout = timeout
+        self.duration = duration
+        self.explicit_duration = duration is not None
+        self.started = None
+        self.last = None
+        self.end = deadline if duration is None else None
+        self.startup = min(deadline, time.monotonic() + timeout)
+        if duration is not None and time.monotonic() + duration >= deadline:
+            raise Inconclusive("full playback interval cannot fit overall deadline")
+
+    def operation_deadline(self):
+        if self.started is None:
+            return self.startup
+        return min(self.overall, self.end, self.last + self.timeout)
+
+    def progress(self):
+        now = time.monotonic()
+        if now >= self.operation_deadline():
+            raise Inconclusive("media progress exceeded deadline")
+        if self.started is None:
+            self.started = now
+            if self.duration is not None:
+                self.end = now + self.duration
+                if self.end >= self.overall:
+                    raise Inconclusive("full playback interval cannot fit overall deadline")
+            else:
+                self.duration = self.end - now
+        self.last = now
+
+    def complete(self):
+        if self.explicit_duration:
+            remaining(self.overall)
+        now = time.monotonic()
+        if self.started is None:
+            remaining(self.startup)
+            return False
+        if now < self.end:
+            remaining(min(self.overall, self.last + self.timeout))
+            return False
+        if (self.last - self.started < self.duration / 2
+                or self.end - self.last > self.timeout):
+            raise Inconclusive("media progress did not span playback interval")
+        return True
+
+
+def play_ts(url, deadline, guard=None, operation_timeout=5, playback_duration=None):
+    window = PlaybackWindow(deadline, operation_timeout, playback_duration)
     total = 0
-    reads = 0
-    first_read = last_read = None
-    with deadline_watch(deadline):
-        response = OPENER.open(urllib.request.Request(url), timeout=remaining(deadline))
+    # Header acquisition shares the startup budget with the first media read.
+    with deadline_watch(window.startup):
+        response = OPENER.open(urllib.request.Request(url), timeout=remaining(window.startup))
     with response:
         if response.status != 200:
             raise Inconclusive("TS playback HTTP status")
-        while True:
-            timeout = deadline - time.monotonic()
-            if timeout <= 0:
-                if reads >= 2 and first_read is not None and last_read > first_read:
-                    return total
-                raise Inconclusive("TS playback made insufficient progress")
+        while not window.complete():
             if guard:
                 guard()
             if response.isclosed():
                 raise Inconclusive("TS source ended before playback duration")
-            response.fp.raw._sock.settimeout(min(operation_timeout, timeout))
+            read_deadline = window.operation_deadline()
+            response.fp.raw._sock.settimeout(remaining(read_deadline))
             try:
-                with deadline_watch(min(deadline, time.monotonic() + operation_timeout)):
+                with deadline_watch(read_deadline, PlaybackIntervalComplete if read_deadline == window.end else Inconclusive):
                     block = response.read1(64 * 1024)
-            except (socket.timeout, TimeoutError, Inconclusive):
-                if reads >= 2 and first_read is not None and last_read > first_read and time.monotonic() >= deadline:
+            except PlaybackIntervalComplete:
+                # Only the active-window timer can finish a healthy observation.
+                if read_deadline == window.end and window.complete():
                     return total
-                raise Inconclusive("TS source stalled before playback duration")
+                raise
+            except (socket.timeout, TimeoutError) as exc:
+                raise Inconclusive("TS source stalled before playback duration") from exc
             if not block:
-                if reads >= 2 and time.monotonic() >= deadline:
-                    return total
                 raise Inconclusive("TS source ended before playback duration")
+            window.progress()
             total += len(block)
-            reads += 1
-            now = time.monotonic()
-            first_read = first_read or now
-            last_read = now
+    return total
 
 
-def play_hls(base, prefix, deadline, guard=None, progress_timeout=5):
+def play_hls(base, prefix, deadline, guard=None, progress_timeout=5, playback_duration=None):
+    window = PlaybackWindow(deadline, progress_timeout, playback_duration)
     prior = set()
     total = 0
     sequences = []
-    last_progress = time.monotonic()
     advanced_with_segment = False
-    while True:
-        if time.monotonic() >= deadline:
-            break
-        if time.monotonic() - last_progress > progress_timeout:
-            raise Inconclusive("HLS source stalled")
+    while not window.complete():
         if guard:
             guard()
-        rem = remaining(deadline)
-        req_deadline = min(deadline, time.monotonic() + progress_timeout)
-        status, body = http(base + prefix + ".m3u8", req_deadline)
+        status, body = http(base + prefix + ".m3u8", window.operation_deadline())
         if status != 200:
             raise Inconclusive("HLS playlist HTTP status")
         try:
             lines = body.decode("utf-8", "strict").splitlines()
         except UnicodeDecodeError as exc:
             raise Inconclusive("invalid HLS playlist") from exc
+        if "#EXT-X-ENDLIST" in lines:
+            raise Inconclusive("HLS source ended before playback duration")
         seqline = next((line for line in lines if line.startswith("#EXT-X-MEDIA-SEQUENCE:")), None)
         if seqline is None or not seqline.split(":", 1)[1].isdigit():
             raise Inconclusive("HLS sequence missing or invalid")
@@ -412,22 +456,19 @@ def play_hls(base, prefix, deadline, guard=None, progress_timeout=5):
                 continue
             if not urllib.parse.urlsplit(url).path.endswith(".ts"):
                 raise Inconclusive("unsupported HLS segment URI")
-            code, data = http(url, min(deadline, time.monotonic() + progress_timeout, time.monotonic() + remaining(deadline)))
+            code, data = http(url, window.operation_deadline())
             if code != 200 or not data:
                 raise Inconclusive("HLS segment did not progress")
+            window.progress()
             total += len(data)
             prior.add(url)
             new_segment = True
-            last_progress = time.monotonic()
         if prior_sequence is not None and sequence > prior_sequence and new_segment:
             advanced_with_segment = True
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(min(0.2, remaining(deadline)))
+        if not window.complete():
+            time.sleep(min(0.2, progress_timeout / 4, remaining(window.operation_deadline())))
     if total == 0 or len(prior) < 2 or not advanced_with_segment:
         raise Inconclusive("HLS sequence and segment set did not advance")
-    if time.monotonic() - last_progress > progress_timeout:
-        raise Inconclusive("HLS source stalled")
     return total
 
 
@@ -491,13 +532,12 @@ def run_workload(base, stream, selector, args, proc, expected, requested, deadli
         check_identity(proc, expected, requested)
         if not all(owns_listener(proc.pid, p) for p in ports[:2]):
             raise Inconclusive("daemon HTTP or RTMP listener ownership changed during workload")
-    playback_deadline = min(deadline, time.monotonic() + args.playback_duration)
     def probe_deadline():
-        return min(deadline, playback_deadline, time.monotonic() + args.timeout)
+        return min(deadline, time.monotonic() + args.timeout)
     if args.media == "ts":
-        play_ts(base + stream + ".ts", playback_deadline, lambda: (guard(), _observe_target(base, selector, probe_deadline(), observed)), args.timeout)
+        play_ts(base + stream + ".ts", deadline, lambda: (guard(), _observe_target(base, selector, probe_deadline(), observed)), args.timeout, args.playback_duration)
     else:
-        play_hls(base, stream, playback_deadline, lambda: (guard(), _observe_target(base, selector, probe_deadline(), observed)), args.timeout)
+        play_hls(base, stream, deadline, lambda: (guard(), _observe_target(base, selector, probe_deadline(), observed)), args.timeout, args.playback_duration)
     if not observed[0]:
         raise Inconclusive("target session not observed during playback")
     check_identity(proc, expected, requested)

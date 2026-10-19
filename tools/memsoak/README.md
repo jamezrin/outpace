@@ -77,7 +77,14 @@ The 32 MiB value above is an illustrative operator choice, not an accepted thres
 recommendation. Select a budget for the workload and build under investigation.
 
 Choose `--media ts` or `hls`, and `--teardown idle` or `delete`. Playback duration and teardown
-grace are separate. Both media modes require a fixed idle grace of at least 65 seconds; it always
+grace are separate. `--timeout` bounds total startup (through the first TS bytes or first HLS
+segment bytes), each HTTP open/request, and the maximum gap between media progress.
+`--playback-duration` is a full active interval starting at those first media bytes; startup
+does not consume it. Progress must span at least half that interval, with no gap exceeding
+`--timeout`, including the final gap. HLS additionally requires sequence advancement with new
+segment bytes. The absolute `--overall-timeout` is never extended: an active interval that
+cannot finish before it is inconclusive. Early EOF, request errors, stalls, and incomplete
+intervals are inconclusive, even when some bytes arrived. Both media modes require a fixed idle grace of at least 65 seconds; it always
 runs to completion before the harness checks session absence. Delete teardown requires a 204
 response and subsequent validated session absence. Both teardown paths, including warmups, receive
 the fixed `--postclose-grace` (seconds; 5 by default), followed by absence validation and measurement.
