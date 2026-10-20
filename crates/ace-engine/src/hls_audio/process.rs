@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-#[cfg(test)]
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::Command;
@@ -20,13 +19,26 @@ use tokio::time::Instant;
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../../tests/support/hls_audio.rs"]
-mod test_fixtures;
+pub(crate) mod test_fixtures;
 
 pub const INPUT_BYTES: usize = 1_048_576;
 const STDOUT_READ: usize = 32_768;
 const STDERR_TAIL: usize = 8_192;
 const TS: usize = 188;
 const STALL: Duration = Duration::from_secs(45);
+
+#[cfg(test)]
+static PROBE_TEST_COUNTS: (
+    std::sync::atomic::AtomicUsize,
+    std::sync::atomic::AtomicUsize,
+    std::sync::atomic::AtomicUsize,
+    std::sync::atomic::AtomicUsize,
+) = (
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+);
 
 #[derive(Clone, Debug)]
 pub struct PreparedNormalizer {
@@ -222,7 +234,7 @@ impl BudgetedInput {
     }
 }
 
-async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+pub(super) async fn cancelled(cancel: &mut watch::Receiver<bool>) {
     loop {
         if *cancel.borrow_and_update() {
             return;
@@ -355,15 +367,15 @@ pub async fn run_child(
         media.fail_generation(generation, HlsFailure::Unsupported);
         return Err(HlsFailure::Unsupported);
     }
+    #[cfg(test)]
+    let (command, observer) = test_support::command_for(&prepared)
+        .unwrap_or_else(|| (build_command(&prepared, &layout), Observer::default()));
+    #[cfg(not(test))]
+    let command = build_command(&prepared, &layout);
+    #[cfg(not(test))]
+    let observer = Observer::default();
     run_command(
-        build_command(&prepared, &layout),
-        layout,
-        generation,
-        media,
-        input,
-        cancel,
-        deadline,
-        Observer::default(),
+        command, layout, generation, media, input, cancel, deadline, observer,
     )
     .await
 }
@@ -687,10 +699,12 @@ struct OutputValidator {
 }
 impl OutputValidator {
     fn new(source: TransportLayout) -> Self {
+        let mut access = VideoAccessPointState::new();
+        access.enable_mpeg2();
         Self {
             source,
             selector: LiveAudioSelection::default(),
-            access: VideoAccessPointState::new(),
+            access,
             pat: None,
             pmt: None,
             opened: false,
@@ -921,7 +935,13 @@ async fn stdout_pump<R: AsyncRead + Unpin>(
 #[allow(dead_code)]
 pub(crate) mod test_support {
     use super::*;
+    use std::collections::HashMap;
     use std::process::{Command as StdCommand, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    type FakeFactory = Mutex<HashMap<PathBuf, (ChildMode, Arc<Mutex<TestCounters>>)>>;
+    static FACTORIES: OnceLock<FakeFactory> = OnceLock::new();
+    static FACTORY_ID: AtomicU64 = AtomicU64::new(1);
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum ChildMode {
@@ -936,6 +956,8 @@ pub(crate) mod test_support {
         EchoValidTs,
         ReadyThenStall,
         EchoReadyIdle,
+        StdoutFlood,
+        CapabilityListing,
     }
     #[derive(Clone, Copy, Debug)]
     pub enum PumpFault {
@@ -954,6 +976,7 @@ pub(crate) mod test_support {
         InputReceive,
     }
 
+    #[derive(Clone)]
     pub struct Counters(Arc<Mutex<TestCounters>>);
     static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     pub async fn process_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
@@ -1024,6 +1047,104 @@ pub(crate) mod test_support {
                 stdout_read_waits: c.stdout_read_waits,
                 stderr_read_waits: c.stderr_read_waits,
             }
+        }
+    }
+
+    /// Install a per-test executable sentinel. Only cfg(test) run_child consults it;
+    /// production PreparedNormalizer values and command construction are untouched.
+    pub fn fake_prepared_child(mode: ChildMode) -> (PreparedNormalizer, Counters) {
+        let id = FACTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let executable = PathBuf::from(format!("__outpace_test_child_{id}"));
+        let counters = Counters::default();
+        FACTORIES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(executable.clone(), (mode, counters.0.clone()));
+        (PreparedNormalizer { executable }, counters)
+    }
+
+    pub(super) fn command_for(prepared: &PreparedNormalizer) -> Option<(Command, Observer)> {
+        let entry = FACTORIES
+            .get()?
+            .lock()
+            .unwrap()
+            .get(&prepared.executable)
+            .cloned()?;
+        let (mode, counters) = entry;
+        Some((
+            Command::from(fake_child_unit(mode, &[])),
+            Observer {
+                counters,
+                harness_prefix: true,
+                ..Observer::default()
+            },
+        ))
+    }
+
+    fn fake_child_unit(mode: ChildMode, extra_args: &[&str]) -> StdCommand {
+        let mode_name = match mode {
+            ChildMode::ExitZero => "exit-zero",
+            ChildMode::ExitFailure => "exit-failure",
+            ChildMode::RefuseStdin => "refuse-stdin",
+            ChildMode::BlockStdin => "block-stdin",
+            ChildMode::NoStdout => "no-stdout",
+            ChildMode::PartialStdout => "partial-stdout",
+            ChildMode::MalformedStdout => "malformed-stdout",
+            ChildMode::StderrFlood => "stderr-flood",
+            ChildMode::EchoValidTs => "echo-valid-ts",
+            ChildMode::ReadyThenStall => "ready-then-stall",
+            ChildMode::EchoReadyIdle => "echo-ready-idle",
+            ChildMode::StdoutFlood => "stdout-flood",
+            ChildMode::CapabilityListing => "capability-listing",
+        };
+        let executable = std::env::current_exe().expect("test executable");
+        // This source is also compiled into the fault integration target, whose
+        // portable fake-child entry is at crate root rather than this unit path.
+        let child_test = if executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("hls_audio_faults-"))
+        {
+            "fake_child_entry"
+        } else {
+            "hls_audio::process::test_support::fake_child_entry"
+        };
+        let mut command = StdCommand::new(executable);
+        command
+            .args(["--format", "terse", "--exact", child_test, "--nocapture"])
+            .arg("--")
+            .args(extra_args)
+            .env("OUTPACE_TEST_HLS_AUDIO_CHILD", mode_name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    pub(super) fn probe_command_for(
+        prepared: &PreparedNormalizer,
+        args: &[&str],
+    ) -> Option<Command> {
+        let (mode, _) = FACTORIES
+            .get()?
+            .lock()
+            .unwrap()
+            .get(&prepared.executable)
+            .cloned()?;
+        Some(Command::from(fake_child_unit(mode, args)))
+    }
+
+    #[test]
+    fn fake_child_entry() {
+        let Some(mode) = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_CHILD") else {
+            return;
+        };
+        if let Some(mode) = mode
+            .to_str()
+            .and_then(test_fixtures::child::ChildMode::parse)
+        {
+            test_fixtures::child::run(mode);
         }
     }
 
@@ -1843,6 +1964,8 @@ pub(crate) mod test_support {
             ChildMode::EchoValidTs => "echo-valid-ts",
             ChildMode::ReadyThenStall => "ready-then-stall",
             ChildMode::EchoReadyIdle => "echo-ready-idle",
+            ChildMode::StdoutFlood => "stdout-flood",
+            ChildMode::CapabilityListing => "capability-listing",
         };
         let mut command = StdCommand::new(std::env::current_exe().expect("test executable"));
         command
@@ -1935,4 +2058,652 @@ pub(crate) mod test_support {
         pump.abort();
         let _ = pump.await;
     }
+}
+
+/// Public failures contain only fixed categories, never executable paths or output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HlsPreflightError {
+    Configuration,
+    Executable,
+    Capability(&'static str),
+    Timeout,
+    Capture,
+    Process,
+    Smoke,
+    Cancelled,
+}
+impl std::fmt::Display for HlsPreflightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HLS normalization preflight: {self:?}")
+    }
+}
+impl std::error::Error for HlsPreflightError {}
+
+/// A dropped startup caller signals the runtime-owned preflight supervisor; it
+/// never drops a live Child future. Normal success/error awaits its full cleanup.
+pub async fn preflight(
+    config: &crate::config::HlsAudioConfig,
+) -> Result<Option<PreparedNormalizer>, HlsPreflightError> {
+    if !config.normalize {
+        return Ok(None);
+    }
+    config
+        .validate()
+        .map_err(|_| HlsPreflightError::Configuration)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let path = config.ffmpeg_path.clone();
+    let (cancel, rx) = watch::channel(false);
+    struct CancelOnDrop(watch::Sender<bool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.send_replace(true);
+        }
+    }
+    let guard = CancelOnDrop(cancel);
+    let task = tokio::spawn(async move {
+        let prepared = PreparedNormalizer {
+            executable: resolve_executable(&path)?,
+        };
+        preflight_prepared(&prepared, rx, deadline).await?;
+        Ok(Some(prepared))
+    });
+    let result = task.await.map_err(|_| HlsPreflightError::Process)?;
+    drop(guard);
+    result
+}
+fn resolve_executable(path: &std::path::Path) -> Result<PathBuf, HlsPreflightError> {
+    fn executable(path: &std::path::Path) -> bool {
+        let Ok(metadata) = path.metadata() else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+    let found = if path.components().count() == 1 && !path.is_absolute() {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|p| p.join(path))
+                .find(|p| executable(p))
+        })
+    } else {
+        executable(path).then(|| path.to_path_buf())
+    };
+    found
+        .and_then(|p| p.canonicalize().ok())
+        .ok_or(HlsPreflightError::Executable)
+}
+async fn preflight_prepared(
+    prepared: &PreparedNormalizer,
+    mut cancel: watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<(), HlsPreflightError> {
+    let probes: &[(&str, &[&str])] = &[
+        ("-demuxers", &["mpegts"]),
+        ("-muxers", &["mpegts"]),
+        ("-encoders", &["aac"]),
+        ("-decoders", &["mp1", "mp2", "mp3", "ac3"]),
+        ("-protocols", &["pipe"]),
+    ];
+    for (argument, required) in probes {
+        let mut command = Command::new(&prepared.executable);
+        command.args(["-hide_banner", argument]);
+        #[cfg(test)]
+        if let Some(fake) = test_support::probe_command_for(prepared, &["-hide_banner", argument]) {
+            command = fake;
+        }
+        let capture = probe(command, Vec::new(), &mut cancel, deadline).await?;
+        let output =
+            std::str::from_utf8(&capture).map_err(|_| HlsPreflightError::Capability("listing"))?;
+        for capability in *required {
+            let present = if *argument == "-protocols" {
+                output.lines().any(|l| l.trim() == *capability)
+            } else {
+                output.lines().any(|l| {
+                    l.split_whitespace()
+                        .nth(1)
+                        .is_some_and(|names| names.split(',').any(|n| n == *capability))
+                })
+            };
+            if !present {
+                return Err(HlsPreflightError::Capability(capability));
+            }
+        }
+    }
+    let (input, layout) = smoke_input();
+    #[cfg(test)]
+    let smoke_command = test_support::probe_command_for(prepared, &[])
+        .unwrap_or_else(|| build_command(prepared, &layout));
+    #[cfg(not(test))]
+    let smoke_command = build_command(prepared, &layout);
+    let output = probe(smoke_command, input, &mut cancel, deadline).await?;
+    validate_smoke(&output, layout)
+}
+fn validate_smoke(output: &[u8], layout: TransportLayout) -> Result<(), HlsPreflightError> {
+    if output.is_empty() || !output.len().is_multiple_of(TS) {
+        return Err(HlsPreflightError::Smoke);
+    }
+    let mut validator = OutputValidator::new(layout);
+    let mut audio = false;
+    for packet in output.as_chunks::<TS>().0 {
+        validator
+            .packet(packet, |_| {})
+            .map_err(|_| HlsPreflightError::Smoke)?;
+        if ts_pid(packet) == 257 && packet[3] & 0x10 != 0 {
+            let start = if packet[3] & 0x20 != 0 {
+                5 + packet[4] as usize
+            } else {
+                4
+            };
+            let payload = &packet[start..];
+            // The smoke must carry an actual AAC ADTS frame, not just output PSI.
+            audio |= payload
+                .windows(2)
+                .any(|w| w[0] == 0xff && w[1] & 0xf6 == 0xf0);
+        }
+    }
+    if !validator.opened || !audio {
+        return Err(HlsPreflightError::Smoke);
+    }
+    Ok(())
+}
+
+const PROBE_CAPTURE: usize = 256 * 1024;
+/// Exactly three owned pumps, fixed reads and bounded capture. Finite preflight
+/// exit is expected; streaming run_child deliberately treats the same exit as fatal.
+async fn probe(
+    mut command: Command,
+    input: Vec<u8>,
+    cancel: &mut watch::Receiver<bool>,
+    aggregate: Instant,
+) -> Result<Vec<u8>, HlsPreflightError> {
+    if *cancel.borrow() {
+        return Err(HlsPreflightError::Cancelled);
+    }
+    let deadline = aggregate.min(Instant::now() + Duration::from_secs(5));
+    if Instant::now() >= deadline {
+        return Err(HlsPreflightError::Timeout);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| HlsPreflightError::Executable)?;
+    #[cfg(test)]
+    PROBE_TEST_COUNTS
+        .0
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let handles = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let mut pumps = JoinSet::new();
+    let result = AssertUnwindSafe(async {
+        let (Some(mut stdin),Some(mut stdout),Some(mut stderr)) = handles else { return Err(HlsPreflightError::Process); };
+        let mut stdin_cancel = cancel.clone();
+        let mut stdout_cancel = cancel.clone();
+        let mut stderr_cancel = cancel.clone();
+        pumps.spawn(async move {
+            tokio::select! { biased;
+                _ = cancelled(&mut stdin_cancel) => return Err(HlsPreflightError::Cancelled),
+                result = stdin.write_all(&input) => result.map_err(|_|HlsPreflightError::Process)?,
+            }
+            drop(stdin);
+            Ok(None)
+        });
+        pumps.spawn(async move {
+            let mut output = Vec::with_capacity(PROBE_CAPTURE); let mut read = [0;STDOUT_READ];
+            loop { let n = tokio::select! { biased;
+                _ = cancelled(&mut stdout_cancel) => return Err(HlsPreflightError::Cancelled),
+                result = stdout.read(&mut read) => result.map_err(|_|HlsPreflightError::Process)?,
+            };
+                if n == 0 { return Ok(Some(output)); }
+                if n > PROBE_CAPTURE-output.len() { return Err(HlsPreflightError::Capture); }
+                output.extend_from_slice(&read[..n]);
+            }
+        });
+        #[cfg(test)]
+        PROBE_TEST_COUNTS.2.fetch_add(3, std::sync::atomic::Ordering::SeqCst);
+        pumps.spawn(async move {
+            let mut read = [0;4096]; let mut tail = [0;STDERR_TAIL]; let mut len = 0;
+            loop { let n = tokio::select! { biased;
+                _ = cancelled(&mut stderr_cancel) => return Err(HlsPreflightError::Cancelled),
+                result = stderr.read(&mut read) => result.map_err(|_|HlsPreflightError::Process)?,
+            };
+                if n == 0 { return Ok(None); }
+                let keep = len.min(STDERR_TAIL-n); tail.copy_within(len-keep..len,0);
+                tail[keep..keep+n].copy_from_slice(&read[..n]); len=keep+n;
+            }
+        });
+        let mut status = None; let mut output = None;
+        while status.is_none() || !pumps.is_empty() {
+            tokio::select! { biased;
+                _ = cancelled(cancel) => return Err(HlsPreflightError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(HlsPreflightError::Timeout),
+                exit = child.wait(), if status.is_none() => {
+                    let exit = exit.map_err(|_|HlsPreflightError::Process)?;
+                    if !exit.success() { return Err(HlsPreflightError::Process); }
+                    status = Some(exit);
+                }
+                pump = pumps.join_next(), if !pumps.is_empty() => {
+                    if let Some(bytes) = pump.ok_or(HlsPreflightError::Process)?.map_err(|_|HlsPreflightError::Process)?? { output=Some(bytes); }
+                }
+            }
+        }
+        output.ok_or(HlsPreflightError::Process)
+    }).catch_unwind().await.unwrap_or(Err(HlsPreflightError::Process));
+    pumps.abort_all();
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        let _ = child.start_kill();
+        while child.wait().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    while pumps.join_next().await.is_some() {}
+    #[cfg(test)]
+    {
+        PROBE_TEST_COUNTS
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PROBE_TEST_COUNTS
+            .3
+            .fetch_add(3, std::sync::atomic::Ordering::SeqCst);
+    }
+    result
+}
+
+#[cfg(test)]
+fn probe_test_counts() -> (usize, usize, usize, usize) {
+    use std::sync::atomic::Ordering::SeqCst;
+    (
+        PROBE_TEST_COUNTS.0.load(SeqCst),
+        PROBE_TEST_COUNTS.1.load(SeqCst),
+        PROBE_TEST_COUNTS.2.load(SeqCst),
+        PROBE_TEST_COUNTS.3.load(SeqCst),
+    )
+}
+
+#[cfg(test)]
+fn reset_probe_test_counts() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for count in [
+        &PROBE_TEST_COUNTS.0,
+        &PROBE_TEST_COUNTS.1,
+        &PROBE_TEST_COUNTS.2,
+        &PROBE_TEST_COUNTS.3,
+    ] {
+        count.store(0, SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod task4_preflight_tests {
+    use super::*;
+    use test_support::{fake_prepared_child, process_test_lock, ChildMode};
+
+    #[tokio::test]
+    async fn preflight_path_resolution_is_canonical_and_survives_path_mutation() {
+        let _serial = process_test_lock().await;
+        let old_path = std::env::var_os("PATH");
+        let unique = format!(
+            "outpace-hls-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let executable = first.join("ffmpeg-test");
+        std::fs::write(&executable, b"synthetic executable placeholder").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("PATH", &first);
+        let prepared = PreparedNormalizer {
+            executable: resolve_executable(std::path::Path::new("ffmpeg-test")).unwrap(),
+        };
+        assert_eq!(prepared.executable, executable.canonicalize().unwrap());
+
+        std::env::set_var("PATH", &second);
+        let command = build_command(&prepared, &smoke_input().1);
+        assert_eq!(
+            command.as_std().get_program(),
+            prepared.executable.as_os_str(),
+            "subsequent child construction must retain the canonical preflight result"
+        );
+        assert!(
+            resolve_executable(std::path::Path::new("ffmpeg-test")).is_err(),
+            "the mutated PATH no longer contains the binary name"
+        );
+
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn run_fake_probe(prepared: &PreparedNormalizer) -> Result<Vec<u8>, HlsPreflightError> {
+        let command = test_support::probe_command_for(prepared, &[]).expect("fake child factory");
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        probe(
+            command,
+            Vec::new(),
+            &mut cancel,
+            Instant::now() + Duration::from_secs(15),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn preflight_probe_rejects_nonzero_exit_and_capture_overflow_and_reaps() {
+        let _serial = process_test_lock().await;
+        reset_probe_test_counts();
+        let (nonzero, _) = fake_prepared_child(ChildMode::ExitFailure);
+        assert_eq!(
+            run_fake_probe(&nonzero).await,
+            Err(HlsPreflightError::Process)
+        );
+        let (flood, _) = fake_prepared_child(ChildMode::StdoutFlood);
+        assert_eq!(
+            run_fake_probe(&flood).await,
+            Err(HlsPreflightError::Capture)
+        );
+        let (started, reaped, pumps, joined) = probe_test_counts();
+        assert_eq!((started, reaped, pumps, joined), (2, 2, 6, 6));
+    }
+
+    #[tokio::test]
+    async fn preflight_requires_each_mpeg_audio_decoder_capability() {
+        let _serial = process_test_lock().await;
+        let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
+        for missing in ["mp1", "mp2", "mp3", "ac3"] {
+            std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", missing);
+            let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
+            let (_cancel_tx, cancel) = watch::channel(false);
+            let result =
+                preflight_prepared(&prepared, cancel, Instant::now() + Duration::from_secs(10))
+                    .await;
+            assert!(
+                matches!(result, Err(HlsPreflightError::Capability(cap)) if cap == missing),
+                "missing required decoder {missing} should be reported exactly"
+            );
+        }
+        match old {
+            Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", value),
+            None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_runs_all_capability_probes_sequentially_before_smoke() {
+        let _serial = process_test_lock().await;
+        reset_probe_test_counts();
+        let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
+        std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
+        let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        assert_eq!(
+            preflight_prepared(&prepared, cancel, Instant::now() + Duration::from_secs(10)).await,
+            Err(HlsPreflightError::Smoke),
+            "all five capability listings pass before the fake empty smoke output is rejected",
+        );
+        let (started, reaped, pumps, joined) = probe_test_counts();
+        assert_eq!((started, reaped, pumps, joined), (6, 6, 18, 18));
+        match old {
+            Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", value),
+            None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_capability_sequence_obeys_one_ten_second_aggregate_deadline() {
+        let _serial = process_test_lock().await;
+        reset_probe_test_counts();
+        let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS");
+        std::env::set_var("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS", "2000");
+        let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let start = Instant::now();
+        let result = preflight_prepared(&prepared, cancel, start + Duration::from_secs(10)).await;
+        assert_eq!(result, Err(HlsPreflightError::Timeout));
+        let elapsed = Instant::now().duration_since(start);
+        assert!(
+            elapsed >= Duration::from_secs(9),
+            "aggregate deadline should outlast four sequential probes: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(12),
+            "aggregate timeout should bound the full sequence: {elapsed:?}"
+        );
+        let (started, reaped, pumps, joined) = probe_test_counts();
+        assert_eq!((started, reaped, pumps, joined), (5, 5, 15, 15));
+        match old {
+            Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS", value),
+            None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_probe_cancellation_kills_reaps_child_and_joins_pumps() {
+        let _serial = process_test_lock().await;
+        reset_probe_test_counts();
+        let (prepared, _) = fake_prepared_child(ChildMode::BlockStdin);
+        let command = test_support::probe_command_for(&prepared, &[]).unwrap();
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            probe(
+                command,
+                Vec::new(),
+                &mut cancel_rx,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_tx.send_replace(true);
+        assert_eq!(task.await.unwrap(), Err(HlsPreflightError::Cancelled));
+        let (started, reaped, pumps, joined) = probe_test_counts();
+        assert_eq!((started, reaped, pumps, joined), (1, 1, 3, 3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preflight_probe_enforces_five_second_per_probe_deadline() {
+        let _serial = process_test_lock().await;
+        reset_probe_test_counts();
+        let (prepared, _) = fake_prepared_child(ChildMode::BlockStdin);
+        let command = test_support::probe_command_for(&prepared, &[]).unwrap();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            probe(
+                command,
+                Vec::new(),
+                &mut cancel_rx,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(task.await.unwrap(), Err(HlsPreflightError::Timeout));
+        let (started, reaped, pumps, joined) = probe_test_counts();
+        assert_eq!((started, reaped, pumps, joined), (1, 1, 3, 3));
+    }
+}
+
+/// Entirely synthetic elementary samples: FFmpeg-generated black 16x16 MPEG-2
+/// I picture and one stereo 48 kHz/128 kbit AC3 silence frame. The runtime builds
+/// PSI, PES timestamps, PCR and packet framing in memory; it needs no generators.
+fn smoke_input() -> (Vec<u8>, TransportLayout) {
+    const VIDEO: &[u8] = &[
+        0x00, 0x00, 0x01, 0xb3, 0x01, 0x00, 0x10, 0x12, 0xff, 0xff, 0xe0, 0x18, 0x00, 0x00, 0x01,
+        0xb5, 0x14, 0x8a, 0x00, 0x01, 0x00, 0x17, 0x00, 0x00, 0x01, 0xb8, 0x00, 0x08, 0x00, 0x40,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x0f, 0xff, 0xf8, 0x00, 0x00, 0x01, 0xb5, 0x8f, 0xff, 0xf3,
+        0x41, 0x80, 0x00, 0x00, 0x01, 0x01, 0x13, 0xf8, 0x7d, 0x29, 0x48, 0x88,
+    ];
+    const AUDIO: &[u8] = &[
+        0x0b, 0x77, 0x79, 0xf3, 0x10, 0x40, 0x43, 0xe1, 0x06, 0xf0, 0xb0, 0x18, 0x40, 0x40, 0x40,
+        0x40, 0x40, 0x40, 0x41, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x21, 0x5c, 0x7c, 0xf9,
+        0xf3, 0xe7, 0xcf, 0x9f, 0x3e, 0x7c, 0xf9, 0xf3, 0xe7, 0xcf, 0x9f, 0x3e, 0x7c, 0xf9, 0xf3,
+        0xe7, 0xcf, 0x9f, 0x3e, 0x7c, 0xf9, 0xf3, 0xe7, 0xcf, 0x9f, 0x3e, 0xff, 0x9d, 0x5f, 0x3e,
+        0x7c, 0xf9, 0xf3, 0xe7, 0xcf, 0x9f, 0x3e, 0x7c, 0xf9, 0xf3, 0xe3, 0xfe, 0x75, 0x7c, 0xf9,
+        0xf3, 0xe7, 0xcf, 0x9f, 0x3e, 0x7c, 0xf9, 0xf3, 0xe7, 0xcf, 0x8c, 0xbf, 0xc6, 0x10, 0x20,
+        0x48, 0x00, 0x00, 0x00, 0x00, 0x07, 0x6f, 0x1e, 0x3c, 0x78, 0xf1, 0xe3, 0xbb, 0xbb, 0xbb,
+        0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x6b, 0x5a, 0xd6, 0xb5, 0xad, 0x6b, 0x5a, 0xd6, 0xb5, 0xad, 0x00, 0x00, 0x00, 0x00, 0xed,
+        0xe3, 0xc7, 0x8f, 0x1e, 0x3c, 0x77, 0x77, 0x77, 0x77, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0xdb, 0xc7, 0x8f, 0x1e, 0x3c, 0x78, 0xee, 0xee, 0xee, 0xee, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0xd6, 0xb5, 0xad, 0x6b, 0x5a,
+        0xd6, 0xb5, 0xad, 0x6b, 0x40, 0x00, 0x00, 0x00, 0x3b, 0x78, 0xf1, 0xe3, 0xc7, 0x8f, 0x1d,
+        0xdd, 0xdd, 0xdd, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0xf1, 0xe3, 0xc7, 0x8f, 0x1e,
+        0x3b, 0xbb, 0xbb, 0xbb, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x06, 0xb5, 0xad, 0x6b, 0x5a, 0xd6, 0xb5, 0xad, 0x6b, 0x5a, 0xd0, 0x00,
+        0x00, 0x00, 0x0e, 0xde, 0x3c, 0x78, 0xf1, 0xe3, 0xc7, 0x77, 0x77, 0x77, 0x70, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x1d, 0xbc, 0x78, 0xf1, 0xe3, 0xc7, 0x8e, 0xee, 0xee, 0xee, 0xe0, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xad, 0x6b,
+        0x5a, 0xd6, 0xb5, 0xad, 0x6b, 0x5a, 0xd6, 0xb4, 0x00, 0x00, 0x00, 0x03, 0xb7, 0x8f, 0x1e,
+        0x3c, 0x78, 0xf1, 0xdd, 0xdd, 0xdd, 0xdc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x6f, 0x1e,
+        0x3c, 0x78, 0xf1, 0xe3, 0xbb, 0xbb, 0xbb, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x5a, 0xd6, 0xb5, 0xad, 0x6b, 0x5a, 0xd6,
+        0xb5, 0xad, 0x00, 0x00, 0x00, 0x00, 0xed, 0xe3, 0xc7, 0x8f, 0x1e, 0x3c, 0x77, 0x77, 0x77,
+        0x77, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xdb, 0xc7, 0x8f, 0x1e, 0x3c, 0x78, 0xee, 0xee,
+        0xee, 0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x1a, 0xd6, 0xb5, 0xad, 0x6b, 0x5a, 0xd6, 0xb5, 0xad, 0x6b, 0x40, 0x00, 0x00, 0x00,
+        0x3b, 0x78, 0xf1, 0xe3, 0xc7, 0x8f, 0x1d, 0xdd, 0xdd, 0xdd, 0xc0, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x22, 0x2a,
+    ];
+    fn table(pid: u16, mut section: Vec<u8>) -> [u8; TS] {
+        let length = section.len() + 1;
+        section[1] = 0xb0 | ((length >> 8) as u8 & 15);
+        section[2] = length as u8;
+        let crc = mpeg_crc32(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
+        let mut packet = [0xff; TS];
+        packet[..5].copy_from_slice(&[0x47, 0x40 | ((pid >> 8) as u8), pid as u8, 0x10, 0]);
+        packet[5..5 + section.len()].copy_from_slice(&section);
+        packet
+    }
+    fn pes(out: &mut Vec<u8>, pid: u16, stream: u8, pts: u64, es: &[u8], cc: &mut u8, video: bool) {
+        let mut data = vec![0, 0, 1, stream];
+        let len = if video { 0 } else { es.len() + 8 };
+        data.extend_from_slice(&(len as u16).to_be_bytes());
+        data.extend_from_slice(&[
+            0x80,
+            0x80,
+            5,
+            0x21 | (((pts >> 30) as u8 & 7) << 1),
+            (pts >> 22) as u8,
+            (((pts >> 15) as u8 & 127) << 1) | 1,
+            (pts >> 7) as u8,
+            ((pts as u8 & 127) << 1) | 1,
+        ]);
+        data.extend_from_slice(es);
+        let mut offset = 0;
+        while offset < data.len() {
+            let first = offset == 0;
+            let max = if first && video { 176 } else { 184 };
+            let n = max.min(data.len() - offset);
+            let adaptation = 184 - n;
+            let mut packet = [0xff; TS];
+            packet[..4].copy_from_slice(&[
+                0x47,
+                ((pid >> 8) as u8) | if first { 0x40 } else { 0 },
+                pid as u8,
+                (if adaptation > 0 { 0x30 } else { 0x10 }) | *cc,
+            ]);
+            *cc = (*cc + 1) & 15;
+            if adaptation > 0 {
+                packet[4] = (adaptation - 1) as u8;
+                if adaptation > 1 {
+                    packet[5] = if first && video { 0x50 } else { 0 };
+                }
+                if first && video {
+                    packet[6] = (pts >> 25) as u8;
+                    packet[7] = (pts >> 17) as u8;
+                    packet[8] = (pts >> 9) as u8;
+                    packet[9] = (pts >> 1) as u8;
+                    packet[10] = ((pts as u8 & 1) << 7) | 0x7e;
+                    packet[11] = 0;
+                }
+            }
+            packet[TS - n..].copy_from_slice(&data[offset..offset + n]);
+            offset += n;
+            out.extend_from_slice(&packet);
+        }
+    }
+    let pat = table(0, vec![0, 0xb0, 0, 0, 7, 0xc1, 0, 0, 0, 9, 0xf0, 0]);
+    let pmt = table(
+        4096,
+        vec![
+            2, 0xb0, 0, 0, 9, 0xc1, 0, 0, 0xe1, 0, 0xf0, 0, 2, 0xe1, 0, 0xf0, 0, 6, 0xe1, 1, 0xf0,
+            6, 5, 4, b'A', b'C', b'-', b'3',
+        ],
+    );
+    let mut out = Vec::new();
+    let mut video = 0;
+    let mut audio = 0;
+    let mut vcc = 0;
+    let mut acc = 0;
+    while video < 25 || audio < 32 {
+        if video < 25 && (audio == 32 || video * 3600 <= audio * 2880) {
+            out.extend_from_slice(&pat);
+            out.extend_from_slice(&pmt);
+            pes(
+                &mut out,
+                256,
+                0xe0,
+                90_000 + video * 3600,
+                VIDEO,
+                &mut vcc,
+                true,
+            );
+            video += 1;
+        } else {
+            pes(
+                &mut out,
+                257,
+                0xbd,
+                90_000 + audio * 2880,
+                AUDIO,
+                &mut acc,
+                false,
+            );
+            audio += 1;
+        }
+    }
+    let mut selector = LiveAudioSelection::default();
+    selector.observe(pat);
+    selector.observe(pmt);
+    let LayoutDecision::Supported(layout) = selector.layout() else {
+        unreachable!("fixed synthetic PSI")
+    };
+    (out, layout)
+}
+
+#[cfg(test)]
+pub(super) fn test_smoke_input() -> (Vec<u8>, TransportLayout) {
+    smoke_input()
 }

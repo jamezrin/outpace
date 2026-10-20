@@ -19,6 +19,8 @@ pub enum ChildMode {
     EchoValidTs,
     ReadyThenStall,
     EchoReadyIdle,
+    StdoutFlood,
+    CapabilityListing,
 }
 
 impl ChildMode {
@@ -35,6 +37,8 @@ impl ChildMode {
             "echo-valid-ts" => Self::EchoValidTs,
             "ready-then-stall" => Self::ReadyThenStall,
             "echo-ready-idle" => Self::EchoReadyIdle,
+            "stdout-flood" => Self::StdoutFlood,
+            "capability-listing" => Self::CapabilityListing,
             _ => return None,
         })
     }
@@ -116,6 +120,46 @@ pub fn run(mode: ChildMode) {
                 let _ = output.flush();
             }
             std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+        ChildMode::StdoutFlood => {
+            let mut output = io::stdout().lock();
+            let block = [b'x'; 8192];
+            for _ in 0..40 {
+                if output.write_all(&block).is_err() {
+                    break;
+                }
+            }
+            let _ = output.flush();
+        }
+        ChildMode::CapabilityListing => {
+            let args: Vec<_> = std::env::args().collect();
+            let missing =
+                std::env::var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY").unwrap_or_default();
+            if let Ok(delay) = std::env::var("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS") {
+                if let Ok(delay) = delay.parse::<u64>() {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+            }
+            let listing = if args.iter().any(|a| a == "-demuxers") {
+                " D mpegts\n"
+            } else if args.iter().any(|a| a == "-muxers") {
+                " E mpegts\n"
+            } else if args.iter().any(|a| a == "-encoders") {
+                " V..... aac\n"
+            } else if args.iter().any(|a| a == "-decoders") {
+                " A mp1\n A mp2\n A mp3\n A ac3\n"
+            } else if args.iter().any(|a| a == "-protocols") {
+                "pipe\n"
+            } else {
+                ""
+            };
+            for line in listing.lines() {
+                // Omit the selected capability name, following FFmpeg's
+                // flag/name listing format rather than comparing the whole row.
+                if line.split_whitespace().last() != Some(missing.as_str()) {
+                    let _ = writeln!(io::stdout(), "{line}");
+                }
+            }
         }
     }
     // The test harness writes a completion trailer to stdout after this function

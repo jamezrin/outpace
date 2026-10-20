@@ -76,6 +76,9 @@ struct HlsState {
     deadline: Option<tokio::time::Instant>,
     strict: bool,
     generation_segments: usize,
+    // The owner already announced this generation. An opening mux marker must
+    // not discard its freshly validated prefix; expire at accepted access point.
+    generation_opening: bool,
     audio: LiveAudioSelection,
     /// One source packet staged before filtering, outside the bounded segment buffer.
     input: Vec<u8>,
@@ -133,6 +136,7 @@ impl HlsPackager {
                 deadline: None,
                 strict: false,
                 generation_segments: 0,
+                generation_opening: false,
                 audio: LiveAudioSelection::default(),
                 input: Vec::with_capacity(TS_PACKET),
                 media_seq: 0,
@@ -165,6 +169,11 @@ impl HlsPackager {
         {
             let mut st = media.state.lock().unwrap();
             st.strict = strict;
+            st.generation_opening = strict;
+            if strict {
+                st.access.enable_mpeg2();
+                st.access.preserve_transport_identity();
+            }
             st.deadline = Some(tokio::time::Instant::now() + media.startup_timeout);
         }
         media
@@ -185,6 +194,8 @@ impl HlsPackager {
         }
         st.generation = generation;
         st.strict = true;
+        st.access.enable_mpeg2();
+        st.access.preserve_transport_identity();
         st.deadline = Some(deadline);
         st.status = if recovering {
             HlsStatus::Recovering
@@ -193,6 +204,7 @@ impl HlsPackager {
         };
         st.generation_segments = 0;
         Self::reset_partial(&mut st, false);
+        st.generation_opening = true;
         st.discontinuity_pending = recovering;
         self.ready.notify_waiters();
     }
@@ -318,6 +330,7 @@ impl HlsPackager {
     }
 
     fn reset_partial(st: &mut HlsState, deduplicate_source_marker: bool) {
+        st.generation_opening = false;
         st.cur.clear();
         st.scanned_packets = 0;
         st.clock.reset();
@@ -352,8 +365,13 @@ impl HlsPackager {
             if st.input.len() != TS_PACKET {
                 continue;
             }
-            let packet: [u8; TS_PACKET] = st.input.as_slice().try_into().unwrap();
+            let mut packet: [u8; TS_PACKET] = st.input.as_slice().try_into().unwrap();
             st.input.clear();
+            if st.strict && st.generation_opening && packet[3] & 0x20 != 0 && packet[4] > 0 {
+                // Enabled owners fence source markers before publication. A new
+                // mux's opening marker belongs to the same announced boundary.
+                packet[5] &= !0x80;
+            }
             // Transport markers must reset state before an excluded PID can be filtered.
             if ts_timing(&packet).discontinuity && !st.deduplicate_source_marker {
                 st.audio.reset();
@@ -463,6 +481,7 @@ impl HlsPackager {
                 st.cur.extend_from_slice(&trailing);
                 st.scanned_packets = prefix.len() / TS_PACKET;
                 st.awaiting_access_point = false;
+                st.generation_opening = false;
                 continue;
             }
 
@@ -1816,6 +1835,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn strict_generation_opening_discontinuity_marker_does_not_reset_fresh_prefix() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 12,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 1);
+        assert_eq!(p.status(), HlsStatus::Ready);
+        let old = p.segment(0).expect("old generation segment");
+
+        p.begin_generation(
+            GenerationId(2),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            true,
+        );
+        let fresh_pat = pat(PMT_PID);
+        let fresh_pmt = pmt(PMT_PID, VIDEO_PID);
+        let marked_opening = pcr_packet(VIDEO_PID, 2_000_000, true, true, 17);
+        p.feed_generation(GenerationId(2), &fresh_pat);
+        p.feed_generation(GenerationId(2), &fresh_pmt);
+        p.feed_generation(GenerationId(2), &marked_opening);
+        p.feed_generation(GenerationId(2), &video_access_packet(VIDEO_PID, 2_108_000));
+
+        assert_eq!(
+            p.status(),
+            HlsStatus::Ready,
+            "marked opening is already fenced by generation 2"
+        );
+        assert_eq!(
+            p.segment(0).as_deref(),
+            Some(old.as_ref()),
+            "old segment remains retrievable"
+        );
+        let replacement = p
+            .segment(1)
+            .expect("fresh prefix and marked opening form a segment");
+        assert_eq!(&replacement[..TS_PACKET], fresh_pat.as_slice());
+        assert_eq!(&replacement[TS_PACKET..TS_PACKET * 2], fresh_pmt.as_slice());
+        let mut accepted_opening = marked_opening;
+        accepted_opening[5] &= !0x80; // consume only the mux discontinuity framing bit
+        assert_eq!(
+            &replacement[TS_PACKET * 2..TS_PACKET * 3],
+            accepted_opening.as_slice()
+        );
+        let st = p.state.lock().unwrap();
+        assert_eq!(
+            st.segments
+                .iter()
+                .filter(|segment| segment.discontinuity)
+                .count(),
+            1
+        );
+        assert!(
+            st.segments[1].discontinuity,
+            "only the first replacement boundary is marked"
+        );
+    }
+
     #[test]
     fn hls_generation_stale_feed_cannot_publish_segments() {
         let p = HlsPackager::new(
@@ -2461,6 +2544,111 @@ mod tests {
             })
             .count();
         assert_eq!(sdt_packets, 1);
+    }
+
+    #[test]
+    fn strict_titled_sdt_matches_output_pat_identity_and_suppresses_source_sdt() {
+        fn pat_with_identity(tsid: u16, program: u16, pmt_pid: u16) -> Vec<u8> {
+            let mut section = vec![
+                0x00,
+                0xb0,
+                13,
+                (tsid >> 8) as u8,
+                tsid as u8,
+                0xc1,
+                0,
+                0,
+                (program >> 8) as u8,
+                program as u8,
+                0xe0 | ((pmt_pid >> 8) as u8 & 0x1f),
+                pmt_pid as u8,
+            ];
+            section.extend_from_slice(&[0; 4]);
+            psi(0, &section)
+        }
+
+        fn pmt_with_identity(program: u16, pid: u16) -> Vec<u8> {
+            let mut section = vec![
+                0x02,
+                0xb0,
+                18,
+                (program >> 8) as u8,
+                program as u8,
+                0xc1,
+                0,
+                0,
+                0xe0 | ((pid >> 8) as u8 & 0x1f),
+                pid as u8,
+                0xf0,
+                0,
+                0x1b,
+                0xe0 | ((pid >> 8) as u8 & 0x1f),
+                pid as u8,
+                0xf0,
+                0,
+            ];
+            section.extend_from_slice(&[0; 4]);
+            psi(PMT_PID, &section)
+        }
+
+        let tsid = 7;
+        let program = 9;
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 100,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            Some("Synthetic Service".to_string()),
+        );
+        p.begin_generation(
+            GenerationId(1),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            false,
+        );
+        p.feed_generation(GenerationId(1), &pat_with_identity(tsid, program, PMT_PID));
+        p.feed_generation(GenerationId(1), &pmt_with_identity(program, VIDEO_PID));
+        p.feed_generation(GenerationId(1), &with_pid(packets(1), 0x0011)); // competing source SDT
+        p.feed_generation(GenerationId(1), &video_access_packet(VIDEO_PID, 0));
+        p.feed_generation(GenerationId(1), &video_access_packet(VIDEO_PID, 108_000));
+
+        let segment = p
+            .segment(0)
+            .expect("strict titled generation emitted a segment");
+        let (packets, remainder) = segment.as_chunks::<TS_PACKET>();
+        assert!(remainder.is_empty(), "emitted TS segment is packet aligned");
+        let pat_packet = packets
+            .iter()
+            .find(|packet| ace_media::mpegts::ts_pid(*packet) == 0)
+            .expect("output PAT is present");
+        let pat_section = &pat_packet[5..];
+        assert_eq!(u16::from_be_bytes([pat_section[3], pat_section[4]]), tsid);
+        assert_eq!(
+            u16::from_be_bytes([pat_section[8], pat_section[9]]),
+            program
+        );
+
+        let sdt_packets: Vec<_> = packets
+            .iter()
+            .filter(|packet| ace_media::mpegts::ts_pid(*packet) == 0x0011)
+            .collect();
+        assert_eq!(
+            sdt_packets.len(),
+            1,
+            "source SDT is suppressed; only synthesized SDT remains"
+        );
+        let sdt_section = &sdt_packets[0][5..];
+        assert_eq!(sdt_section[0], 0x42);
+        assert_eq!(u16::from_be_bytes([sdt_section[3], sdt_section[4]]), tsid);
+        assert_eq!(
+            u16::from_be_bytes([sdt_section[11], sdt_section[12]]),
+            program
+        );
+        assert_eq!(
+            ace_media::mpegts::read_sdt_service_name(&segment).as_deref(),
+            Some("Synthetic Service"),
+        );
     }
 
     #[test]

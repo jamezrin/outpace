@@ -216,13 +216,14 @@ fn output_validator_rejects_extra_audio_and_copied_descriptors() {
     // An AAC stream descriptor is forbidden even when its elementary PID/type
     // otherwise match the required output mapping.
     let mut described = section[..section.len() - 4].to_vec();
-    described[3] |= 0x20;
-    described[4] |= 0x03; // program_info_length = 3
-    described.splice(12..12, [0x0a, 0x01, b'e']);
-    let audio = described.len() - 5;
-    described[audio + 3] |= 0x20;
-    described[audio + 4] |= 0x03;
-    described.splice(audio + 5..audio + 5, [0x0a, 0x01, b'e']);
+    // Keep program_number (9) and the empty program descriptor loop unchanged.
+    // The AAC ES entry starts after the five-byte video entry at offset 17;
+    // its descriptor loop length is at offsets 20..22.
+    assert_eq!(&described[3..5], &[0, 9]);
+    assert_eq!(&described[10..12], &[0xf0, 0]);
+    described[20] = 0xf0;
+    described[21] = 3;
+    described.splice(22..22, [0x0a, 0x01, b'e']);
     fixture = good;
     fixture[188..376].copy_from_slice(&support::pmt_packet_with_section(described));
     assert_eq!(

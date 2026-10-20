@@ -277,6 +277,7 @@ pub struct StreamManager {
     vod_resolve_lock: Mutex<()>,
     buffer: usize,
     hls: HlsConfig,
+    normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     grace: Duration,
     cleanup: CleanupTracker,
     reaper: StdMutex<Option<WorkerControl>>,
@@ -297,6 +298,15 @@ impl StreamManager {
         buffer: usize,
         hls: HlsConfig,
     ) -> Arc<StreamManager> {
+        Self::with_normalizer(registry, buffer, hls, None)
+    }
+
+    pub fn with_normalizer(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+    ) -> Arc<StreamManager> {
         Arc::new(StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
@@ -308,6 +318,7 @@ impl StreamManager {
             vod_resolve_lock: Mutex::new(()),
             buffer,
             hls,
+            normalizer,
             grace: Duration::from_secs(30),
             cleanup: CleanupTracker::default(),
             reaper: StdMutex::new(None),
@@ -523,12 +534,14 @@ impl StreamManager {
             packagers
                 .entry(key)
                 .or_insert_with(|| {
-                    let media = HlsPackager::create(&session, self.hls, false);
-                    let worker_media = media.clone();
-                    let rx = session.raw_receiver();
-                    let control = self
-                        .cleanup
-                        .spawn(move |cancel| worker_media.run_native(rx, cancel));
+                    let media = HlsPackager::create(&session, self.hls, self.normalizer.is_some());
+                    let control = crate::hls_audio::spawn_worker(
+                        &session,
+                        media.clone(),
+                        self.hls,
+                        self.normalizer.clone(),
+                        &self.cleanup,
+                    );
                     HlsEntry { media, control }
                 })
                 .media
@@ -773,6 +786,516 @@ mod tests {
         let mut r = ProviderRegistry::new();
         r.register(Arc::new(TestProvider { chunks: 1000 }));
         r
+    }
+
+    struct FeedSource {
+        rx: tokio::sync::mpsc::UnboundedReceiver<(bool, bytes::Bytes)>,
+        discontinuity: bool,
+    }
+
+    #[async_trait]
+    impl TsSource for FeedSource {
+        async fn next(&mut self) -> Option<bytes::Bytes> {
+            let (discontinuity, bytes) = self.rx.recv().await?;
+            self.discontinuity = discontinuity;
+            Some(bytes)
+        }
+        fn take_discontinuity(&mut self) -> bool {
+            std::mem::take(&mut self.discontinuity)
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+
+    struct FeedProvider(
+        StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<(bool, bytes::Bytes)>>>,
+    );
+
+    #[async_trait]
+    impl StreamProvider for FeedProvider {
+        fn network(&self) -> &'static str {
+            "normalization-test"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(FeedSource {
+                rx: self.0.lock().unwrap().take().expect("one source open"),
+                discontinuity: false,
+            }))
+        }
+    }
+
+    fn task4_input(video_only: bool) -> Vec<u8> {
+        let fixture = crate::hls_audio::process::test_fixtures::transport_prefix();
+        let mut input = fixture[..2 * 188].to_vec();
+        if video_only {
+            let mut pmt = vec![
+                0x02, 0xb0, 0x00, 0x00, 0x09, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0, 0x1b, 0xe1, 0x00,
+                0xf0, 0,
+            ];
+            let section_length = pmt.len() - 3 + 4;
+            pmt[1] = 0xb0 | ((section_length >> 8) as u8 & 0x0f);
+            pmt[2] = section_length as u8;
+            let crc = ace_media::mpegts::mpeg_crc32(&pmt);
+            pmt.extend_from_slice(&crc.to_be_bytes());
+            input[188..376].copy_from_slice(&crate::hls_audio::process::test_fixtures::psi_packet(
+                4096, 2, &pmt,
+            ));
+        }
+        input
+            .extend_from_slice(&crate::hls_audio::process::test_fixtures::video_access_packet(256));
+        for pcr in [0, 108_000] {
+            input.extend_from_slice(&crate::hls_audio::process::test_fixtures::pcr_packet(
+                256, pcr,
+            ));
+        }
+        input
+    }
+
+    fn task4_mpeg_audio_input() -> Vec<u8> {
+        let mut input = crate::hls_audio::process::test_fixtures::transport_prefix();
+        let section =
+            crate::hls_audio::process::test_fixtures::pmt_section(9, 256, 256, 0x1b, 257, 0x03);
+        input[188..376].copy_from_slice(&crate::hls_audio::process::test_fixtures::psi_packet(
+            4096, 2, &section,
+        ));
+        for pcr in [0, 108_000, 216_000] {
+            input.extend_from_slice(&crate::hls_audio::process::test_fixtures::pcr_packet(
+                256, pcr,
+            ));
+        }
+        input
+    }
+
+    #[tokio::test]
+    async fn hls_audio_native_aac_and_video_only_skip_child_even_with_invalid_prepared_path() {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        for (id, video_only) in [("native-aac", false), ("video-only", true)] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut providers = ProviderRegistry::new();
+            providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+            let hls = HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            };
+            let manager = StreamManager::with_normalizer(
+                providers,
+                32,
+                hls,
+                Some(crate::hls_audio::PreparedNormalizer {
+                    executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+                }),
+            );
+            let media = manager
+                .get_or_start_hls("normalization-test", id)
+                .await
+                .unwrap();
+            tx.send((false, bytes::Bytes::from(task4_input(video_only))))
+                .unwrap();
+            let status = tokio::time::timeout(
+                Duration::from_secs(4),
+                media.wait_available(Duration::from_secs(4)),
+            )
+            .await
+            .expect("native source should become ready without invoking FFmpeg");
+            assert_eq!(status, crate::hls::HlsStatus::Ready, "case {id}");
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn hls_audio_manager_source_recovery_retains_old_segment_and_emits_one_new_boundary() {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+            }),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "recovering")
+            .await
+            .unwrap();
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(4),
+                media.wait_available(Duration::from_secs(4))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+            "first native segment is available",
+        );
+        let old = media.segment(0).expect("segment retained before recovery");
+
+        let mut marker = [0xff; 188];
+        marker[..6].copy_from_slice(&[0x47, 0x40, 0x11, 0x30, 1, 0x80]);
+        tx.send((true, bytes::Bytes::copy_from_slice(&marker)))
+            .unwrap(); // paired marker on filtered SDT PID before opening
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while media.status() != crate::hls::HlsStatus::Recovering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("source discontinuity reaches the worker before resumed packets");
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(4),
+                media.wait_available(Duration::from_secs(4))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+            "recovered generation becomes ready",
+        );
+        assert_eq!(
+            media.segment(0).as_deref(),
+            Some(old.as_ref()),
+            "old retained sequence remains byte-identical"
+        );
+        let new = media.segment(1).expect("new generation segment");
+        assert_eq!(
+            ace_media::mpegts::ts_pid(&new[..188]),
+            0,
+            "new segment starts with fresh PAT"
+        );
+        assert_eq!(
+            ace_media::mpegts::ts_pid(&new[188..376]),
+            4096,
+            "new segment follows with fresh PMT"
+        );
+        let playlist = media.playlist_with_segment_prefix("/segments");
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY\n").count(), 1);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hls_audio_enabled_worker_ignores_version_repeat_then_recovers_semantic_layout_change()
+    {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+            }),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "layout-worker")
+            .await
+            .unwrap();
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                media.wait_available(Duration::from_secs(3))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+        );
+
+        let mut version_repeat = task4_input(false);
+        version_repeat[188 + 10] = 0xc3; // PMT version 1; selected streams unchanged.
+        let pmt_packet: &mut [u8; 188] = (&mut version_repeat[188..376]).try_into().unwrap();
+        crate::hls_audio::process::test_fixtures::set_psi_crc(pmt_packet);
+        tx.send((false, bytes::Bytes::from(version_repeat)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            media.status(),
+            crate::hls::HlsStatus::Ready,
+            "version-only PAT repeat must not invalidate the active worker generation"
+        );
+
+        let mut semantic_change = crate::hls_audio::process::test_fixtures::transport_prefix();
+        let changed_pmt =
+            crate::hls_audio::process::test_fixtures::pmt_section(9, 256, 256, 0x1b, 258, 0x0f);
+        semantic_change[188..376].copy_from_slice(
+            &crate::hls_audio::process::test_fixtures::psi_packet(4096, 2, &changed_pmt),
+        );
+        tx.send((false, bytes::Bytes::from(semantic_change)))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while media.status() != crate::hls::HlsStatus::Recovering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("semantic selected-audio PID change invalidates the active generation");
+        assert_eq!(media.status(), crate::hls::HlsStatus::Recovering);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hls_audio_post_opening_filtered_pid_marker_is_independent_after_paired_source_recovery(
+    ) {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+            }),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "post-opening-marker")
+            .await
+            .unwrap();
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                media.wait_available(Duration::from_secs(3))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+        );
+        let old = media.segment(0).expect("first generation segment");
+
+        let marker = filtered_sdt_discontinuity_packet();
+        tx.send((true, bytes::Bytes::copy_from_slice(&marker)))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while media.status() != crate::hls::HlsStatus::Recovering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("paired source event begins one replacement generation");
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                media.wait_available(Duration::from_secs(3))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+        );
+        assert_eq!(media.segment(0).as_deref(), Some(old.as_ref()));
+
+        // The paired marker token is consumed at the accepted opening point.
+        // A later marker on filtered SDT PID 0x11 must independently invalidate.
+        let marker = filtered_sdt_discontinuity_packet();
+        tx.send((false, bytes::Bytes::copy_from_slice(&marker)))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while media.status() != crate::hls::HlsStatus::Recovering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("post-opening filtered-PID marker is independent");
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                media.wait_available(Duration::from_secs(3))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+        );
+        assert_eq!(media.segment(0).as_deref(), Some(old.as_ref()));
+        assert!(
+            media.segment(2).is_some(),
+            "independent post-opening recovery publishes a third generation segment"
+        );
+        assert_eq!(
+            media
+                .playlist_with_segment_prefix("/segments")
+                .matches("#EXT-X-DISCONTINUITY\n")
+                .count(),
+            2
+        );
+        manager.shutdown().await;
+    }
+
+    fn filtered_sdt_discontinuity_packet() -> [u8; 188] {
+        let mut marker = [0xff; 188];
+        marker[..6].copy_from_slice(&[0x47, 0x40, 0x11, 0x30, 1, 0x80]);
+        marker
+    }
+
+    #[tokio::test]
+    async fn hls_audio_transform_recovery_limit_fences_before_fourth_child_reap() {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let (prepared, counters) = crate::hls_audio::process::test_support::fake_prepared_child(
+            crate::hls_audio::process::test_support::ChildMode::ReadyThenStall,
+        );
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            Some(prepared),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "live-transform-recovery-limit")
+            .await
+            .unwrap();
+        let input = bytes::Bytes::from(task4_mpeg_audio_input());
+        tx.send((false, input.clone())).unwrap();
+        let wait_ready = || async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if media.status() == crate::hls::HlsStatus::Ready {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("fake transform generation becomes Ready");
+        };
+        wait_ready().await;
+        assert_eq!(counters.snapshot().children_started, 1);
+
+        for generation_child in 2..=4 {
+            tx.send((true, bytes::Bytes::new())).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while counters.snapshot().children_reaped < generation_child - 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("previous transform child is reaped before replacement");
+            assert_eq!(counters.snapshot().children_started, generation_child - 1);
+            tx.send((false, input.clone())).unwrap();
+            wait_ready().await;
+            assert_eq!(counters.snapshot().children_started, generation_child);
+        }
+
+        // This is the fourth invalidation (the initial generation is not counted).
+        // The fourth child is held in ReadyThenStall while Failed must publish before
+        // its cancellation/reap completes.
+        tx.send((true, bytes::Bytes::new())).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = counters.snapshot();
+                if media.status()
+                    == crate::hls::HlsStatus::Failed(crate::hls::HlsFailure::RecoveryLimit)
+                    && snapshot.children_started == 4
+                    && snapshot.children_reaped == 3
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("fourth recovery fences Ready media before old child reap");
+        manager.shutdown().await;
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.children_started, 4);
+        assert_eq!(snapshot.children_reaped, 4);
+        assert_eq!(snapshot.pumps_started, snapshot.pumps_joined);
+        assert_eq!(snapshot.active_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn hls_audio_manager_terminal_transform_failure_is_not_restarted_by_retry() {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                startup_timeout_ms: 5000,
+                ..HlsConfig::default()
+            },
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+            }),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "transform")
+            .await
+            .unwrap();
+        tx.send((false, bytes::Bytes::from(task4_mpeg_audio_input())))
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = media.status();
+                if matches!(status, crate::hls::HlsStatus::Failed(_)) {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("invalid transform executable should fail terminally");
+        assert!(matches!(status, crate::hls::HlsStatus::Failed(_)));
+        let retry = manager
+            .get_or_start_hls("normalization-test", "transform")
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&media, &retry),
+            "retry shares the terminal manager entry"
+        );
+        assert_eq!(
+            retry.status(),
+            status,
+            "an HTTP-style retry cannot restart a failed worker"
+        );
+        manager.shutdown().await;
     }
 
     async fn manager_with_blocking_worker_for_test(
