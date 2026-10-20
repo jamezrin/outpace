@@ -136,10 +136,14 @@ pub fn resolve_offline(sel: &Selector) -> Option<Result<ResolvedContent, String>
     }
 }
 
-/// `get_version` result: the crate version plus a monotonic integer code some clients compare.
+/// `get_version` result: the crate version, a monotonic integer code, and the target OS.
 pub fn version_result() -> Value {
     let version = env!("CARGO_PKG_VERSION");
-    json!({ "version": version, "code": version_code(version) })
+    json!({
+        "version": version,
+        "code": version_code(version),
+        "platform": std::env::consts::OS,
+    })
 }
 
 /// Encode `MAJOR.MINOR.PATCH` as `MAJOR*10000 + MINOR*100 + PATCH` for clients that gate on an
