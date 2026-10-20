@@ -8,6 +8,7 @@
 //! The daemon's `ace-engine` crate owns live packaging tasks, session lifecycle, retained
 //! segment windows, live playlists, and HTTP serving. Those policies are outside this crate.
 
+pub mod audio;
 pub mod hls;
 pub mod mpegts;
 
