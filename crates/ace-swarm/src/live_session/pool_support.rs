@@ -113,7 +113,7 @@ pub(super) fn spawn_candidate_connects(
         let tx = tx.clone();
         tasks.spawn(async move {
             let (failure, queued) = match connect_upstream(addr, infohash).await {
-                PeerConnectAttempt::Connected(upstream) => {
+                PeerConnectAttempt::Connected(upstream, _) => {
                     let receipt = if discovered {
                         PoolRefill::ReservedDiscovered(upstream)
                     } else {

@@ -59,46 +59,68 @@ pub(super) async fn peer_worker<S>(
 // Bound the entire handshake/window exchange, not just TCP establishment: a silent
 // preferred source must not monopolize a reconnect batch for the peer I/O timeout.
 pub(super) async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnectAttempt {
-    match tokio::time::timeout(CONNECT_TIMEOUT, connect_upstream_inner(addr, infohash)).await {
+    let mut progress = PeerConnectProgress::new();
+    let result = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_upstream_inner(addr, infohash, &mut progress),
+    )
+    .await
+    {
         Ok(result) => result,
-        Err(_) => PeerConnectAttempt::Failed(PeerConnectFailure {
+        Err(_) => Err(PeerConnectStage::TotalTimeout),
+    };
+    let timing = progress.finish();
+    let outcome = match &result {
+        Ok(_) => "connected",
+        Err(PeerConnectStage::Tcp) => "tcp",
+        Err(PeerConnectStage::Handshake) => "handshake",
+        Err(PeerConnectStage::Window) => "window",
+        Err(PeerConnectStage::TotalTimeout) => "total_timeout",
+    };
+    crate::alog!(
+        "[ace] upstream attempt: result={outcome} {}",
+        timing.summary()
+    );
+    match result {
+        Ok(upstream) => PeerConnectAttempt::Connected(upstream, timing),
+        Err(stage) => PeerConnectAttempt::Failed(PeerConnectFailure {
             addr,
-            stage: PeerConnectStage::TotalTimeout,
+            stage,
+            timing,
         }),
     }
 }
 
-async fn connect_upstream_inner(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnectAttempt {
+async fn connect_upstream_inner(
+    addr: SocketAddrV4,
+    infohash: [u8; 20],
+    progress: &mut PeerConnectProgress,
+) -> Result<ConnectedUpstream, PeerConnectStage> {
     crate::alog!("[ace] discovery stage=tcp-attempt");
     let mut session = match tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
     {
         Ok(Ok(session)) => session,
         Ok(Err(_)) | Err(_) => {
-            return PeerConnectAttempt::Failed(PeerConnectFailure {
-                addr,
-                stage: PeerConnectStage::Tcp,
-            });
+            return Err(PeerConnectStage::Tcp);
         }
     };
+    progress.advance(ConnectPhase::HandshakeSend);
     crate::alog!("[ace] discovery stage=tcp-connected");
     if session
-        .perform_handshake(infohash, random_peer_id())
+        .perform_handshake_with_observer(infohash, random_peer_id(), || {
+            progress.advance(ConnectPhase::HandshakeReply);
+        })
         .await
         .is_err()
     {
-        return PeerConnectAttempt::Failed(PeerConnectFailure {
-            addr,
-            stage: PeerConnectStage::Handshake,
-        });
+        return Err(PeerConnectStage::Handshake);
     }
+    progress.advance(ConnectPhase::Window);
     crate::alog!("[ace] discovery stage=bt-handshake");
     let Some((window, yourip)) = read_peer_window(&mut session).await else {
-        return PeerConnectAttempt::Failed(PeerConnectFailure {
-            addr,
-            stage: PeerConnectStage::Window,
-        });
+        return Err(PeerConnectStage::Window);
     };
-    PeerConnectAttempt::Connected(ConnectedUpstream {
+    Ok(ConnectedUpstream {
         session,
         addr,
         window,
@@ -178,8 +200,8 @@ pub(super) async fn connect_pool(
                 }
                 joined = set.join_next() => {
                     match joined {
-                        Some(Ok(PeerConnectAttempt::Connected(candidate))) => {
-                            stats.record_connected();
+                        Some(Ok(PeerConnectAttempt::Connected(candidate, timing))) => {
+                            stats.record_connected(timing);
                             connected.push(candidate);
                             deadline.get_or_insert_with(|| {
                                 tokio::time::Instant::now() + UPSTREAM_SELECTION_GRACE

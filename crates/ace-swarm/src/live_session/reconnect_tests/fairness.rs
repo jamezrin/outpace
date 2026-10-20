@@ -387,6 +387,8 @@ async fn silent_bt_total_deadline_is_not_a_window_failure() {
     let mut stats = PeerConnectStats::default();
     stats.record_failure(failure);
     assert!(stats.summary().contains("total_timeout=1"));
+    assert!(stats.summary().contains("timeout_handshake_reply=1"));
+    assert!(!stats.summary().contains("timeout_connect="));
 }
 
 async fn failed_round_discovery_control(healthy_delay: Duration, output_bound: Duration) {

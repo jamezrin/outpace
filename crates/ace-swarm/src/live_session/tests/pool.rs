@@ -384,18 +384,22 @@ fn peer_connect_stats_reports_failure_classes() {
     stats.record_failure(PeerConnectFailure {
         addr: addrs(&[1])[0],
         stage: PeerConnectStage::Tcp,
+        timing: PeerConnectTiming::default(),
     });
     stats.record_failure(PeerConnectFailure {
         addr: addrs(&[2])[0],
         stage: PeerConnectStage::Handshake,
+        timing: PeerConnectTiming::default(),
     });
     stats.record_failure(PeerConnectFailure {
         addr: addrs(&[3])[0],
         stage: PeerConnectStage::Window,
+        timing: PeerConnectTiming::default(),
     });
     stats.record_failure(PeerConnectFailure {
         addr: addrs(&[4])[0],
         stage: PeerConnectStage::Window,
+        timing: PeerConnectTiming::default(),
     });
 
     assert_eq!(stats.summary(), "attempted=4 tcp=1 handshake=1 window=2");

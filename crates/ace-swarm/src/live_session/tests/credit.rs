@@ -312,7 +312,7 @@ impl SignedResumePool {
         let mut upstreams = Vec::new();
         for addr in addresses {
             match connect_upstream(addr, self.info.infohash).await {
-                PeerConnectAttempt::Connected(upstream) => upstreams.push(upstream),
+                PeerConnectAttempt::Connected(upstream, _) => upstreams.push(upstream),
                 PeerConnectAttempt::Failed(_) => panic!("signed reconnect fixture must connect"),
             }
         }
