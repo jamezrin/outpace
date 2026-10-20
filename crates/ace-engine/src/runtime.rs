@@ -167,7 +167,7 @@ fn bool_from_env(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>>
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(format!("{name} must be valid UTF-8 and one of: 1, true, 0, false").into())
+            return Err(format!("{name} must be valid UTF-8 and one of: 1, true, 0, false").into());
         }
     };
     match value.as_str() {
@@ -576,6 +576,14 @@ pub async fn build_runtime(
 }
 
 pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = runtime.manager.clone();
+    let result = serve_http_inner(runtime).await;
+    // Both listener/startup errors and normal HTTP draining must finish HLS cleanup.
+    manager.shutdown().await;
+    result
+}
+
+async fn serve_http_inner(runtime: EngineRuntime) -> Result<(), Box<dyn std::error::Error>> {
     let EngineRuntime {
         config,
         networks,
