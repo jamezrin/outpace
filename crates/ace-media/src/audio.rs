@@ -42,13 +42,21 @@ pub struct TransportLayout {
     pub semantic_identity: Vec<u8>,
 }
 
-/// Descriptor loops must be validated even when their contents are not interpreted.
-fn descriptors(mut bytes: &[u8]) -> Option<Option<AudioCodec>> {
+#[derive(Default)]
+struct DescriptorCodecs {
+    // Native selection historically uses the first recognized signal.
+    first: Option<AudioCodec>,
+    conflicting: bool,
+}
+
+/// Validate once, retaining both legacy first-match and strict ambiguity evidence.
+fn descriptors(mut bytes: &[u8]) -> Option<DescriptorCodecs> {
     let mut codec = None;
+    let mut conflicting = false;
     while !bytes.is_empty() {
         let len = *bytes.get(1)? as usize;
         let body = bytes.get(2..2 + len)?;
-        codec = codec.or(match bytes[0] {
+        let signal = match bytes[0] {
             0x6a if body
                 .first()
                 .is_some_and(|flags| body.len() > (flags & 0xf0).count_ones() as usize) =>
@@ -69,21 +77,29 @@ fn descriptors(mut bytes: &[u8]) -> Option<Option<AudioCodec>> {
                 _ => None,
             },
             _ => None,
-        });
+        };
+        if let Some(signal) = signal {
+            conflicting |= codec.is_some_and(|first| first != signal);
+            codec = codec.or(Some(signal));
+        }
         bytes = &bytes[2 + len..];
     }
-    Some(codec)
+    Some(DescriptorCodecs {
+        first: codec,
+        conflicting,
+    })
 }
 
-fn audio_codec(ty: u8, desc: &[u8]) -> Option<Option<AudioCodec>> {
-    let private = descriptors(desc)?;
-    Some(match ty {
+fn audio_codec(ty: u8, desc: &[u8]) -> Option<DescriptorCodecs> {
+    let mut private = descriptors(desc)?;
+    private.first = match ty {
         0x0f => Some(AudioCodec::AdtsAac),
         0x11 => Some(AudioCodec::LatmAac),
         0x03 | 0x04 => Some(AudioCodec::MpegAudio),
-        0x06 => private,
+        0x06 => private.first,
         _ => None,
-    })
+    };
+    Some(private)
 }
 
 #[derive(Debug)]
@@ -318,7 +334,9 @@ impl LiveAudioSelection {
         if begin > end {
             return Err(Invalid);
         }
-        descriptors(s.get(12..begin).ok_or(Invalid)?).ok_or(Invalid)?;
+        let mut conflicting = descriptors(s.get(12..begin).ok_or(Invalid)?)
+            .ok_or(Invalid)?
+            .conflicting;
         let mut pos = begin;
         let mut entries = Vec::new();
         while pos < end {
@@ -332,14 +350,19 @@ impl LiveAudioSelection {
                 return Err(Invalid);
             }
             let codec = audio_codec(h[0], &s[pos + 5..next]).ok_or(Invalid)?;
+            conflicting |= codec.conflicting;
             let es_pid = pid(&h[1..]);
             if entries.iter().any(|(_, _, p, _)| *p == es_pid) {
                 return Err(Unsupported);
             }
-            entries.push((pos, next, es_pid, codec));
+            entries.push((pos, next, es_pid, codec.first));
             pos = next;
         }
-        self.layout = self.decide_layout(s, &entries);
+        self.layout = if conflicting {
+            LayoutDecision::Unsupported
+        } else {
+            self.decide_layout(s, &entries)
+        };
         let selected = entries
             .iter()
             .find(|e| e.3 == Some(AudioCodec::AdtsAac))
@@ -424,8 +447,11 @@ impl LiveAudioSelection {
                 if video.replace((es_pid, ty)).is_some() {
                     return Unsupported;
                 }
-            } else if matches!(ty, 0x01 | 0x10 | 0x42) || ty >= 0x80 {
-                // Unsupported video/private stream types cannot masquerade as data.
+            } else if !matches!(ty, 0x03 | 0x04 | 0x06 | 0x0f | 0x11
+                | 0x05 | 0x0a..=0x0e | 0x15..=0x19)
+            {
+                // Only known audio or data (private sections, DSM-CC, auxiliary,
+                // metadata) may accompany video. Unknown types can contain A/V.
                 return Unsupported;
             }
             if ty == 0x06 && codec.is_none() {
@@ -1009,6 +1035,93 @@ mod tests {
     }
 
     #[test]
+    fn normalization_policy_rejects_unsupported_audio_stream_type() {
+        // The fixture retains declared video PCR; 0x1c is MPEG-4 audio.
+        assert_eq!(
+            normalization_policy_layout(&[(0x1b, 257, &[]), (0x1c, 258, &[])]),
+            LayoutDecision::Unsupported,
+            "unsupported MPEG-4 audio must not be mistaken for video-only input"
+        );
+    }
+
+    #[test]
+    fn normalization_policy_rejects_additional_unsupported_video_stream_type() {
+        // The fixture retains declared video PCR; 0x20 is an additional MVC video.
+        assert_eq!(
+            normalization_policy_layout(&[(0x1b, 257, &[]), (0x20, 258, &[])]),
+            LayoutDecision::Unsupported,
+            "additional MVC video must not be mistaken for data"
+        );
+    }
+
+    #[test]
+    fn normalization_policy_allows_known_private_sections_as_data() {
+        // Private sections (0x05) are a known non-audio/data stream type.
+        assert!(matches!(
+            normalization_policy_layout(&[(0x1b, 257, &[]), (0x05, 258, &[])]),
+            LayoutDecision::Supported(_)
+        ));
+        assert!(matches!(
+            normalization_policy_layout(&[(0x1b, 257, &[]), (0x05, 258, &[]), (15, 259, &[])]),
+            LayoutDecision::Supported(_)
+        ));
+        assert_eq!(
+            normalization_policy_layout(&[(0x1b, 257, &[]), (0x05, 258, &[]), (0x1c, 259, &[]),]),
+            LayoutDecision::Unsupported,
+            "unclassified audio alongside known private sections must still reject"
+        );
+    }
+
+    #[test]
+    fn normalization_policy_rejects_conflicting_private_codec_signals_in_any_order() {
+        let ac3 = [0x6a, 1, 0];
+        let eac3 = [0x7a, 1, 0];
+        let dts = [0x7b, 5, 0, 0, 0, 0, 0];
+        let ac3_registration = [0x05, 4, b'A', b'C', b'-', b'3'];
+        let eac3_registration = [0x05, 4, b'E', b'A', b'C', b'3'];
+
+        let contradictory_descriptors = [
+            [ac3.as_slice(), eac3.as_slice()].concat(),
+            [eac3.as_slice(), ac3.as_slice()].concat(),
+            [ac3.as_slice(), dts.as_slice()].concat(),
+            [dts.as_slice(), ac3.as_slice()].concat(),
+            [ac3.as_slice(), eac3_registration.as_slice()].concat(),
+            [eac3_registration.as_slice(), ac3.as_slice()].concat(),
+        ];
+        let mut accepted_conflicts = Vec::new();
+        for desc in &contradictory_descriptors {
+            let without_aac = normalization_policy_layout(&[(0x1b, 257, &[]), (6, 258, desc)]);
+            if without_aac != LayoutDecision::Unsupported {
+                accepted_conflicts.push(format!("without AAC: {desc:?} => {without_aac:?}"));
+            }
+            let with_aac =
+                normalization_policy_layout(&[(0x1b, 257, &[]), (15, 259, &[]), (6, 258, desc)]);
+            if with_aac != LayoutDecision::Unsupported {
+                accepted_conflicts.push(format!("with preferred AAC: {desc:?} => {with_aac:?}"));
+            }
+        }
+        assert!(
+            accepted_conflicts.is_empty(),
+            "conflicting descriptor and registration signals must reject in every order: {accepted_conflicts:?}"
+        );
+
+        // Identical AC3 evidence from a registration and AC3 descriptor agrees.
+        let agreeing = [ac3_registration.as_slice(), ac3.as_slice()].concat();
+        let LayoutDecision::Supported(layout) =
+            normalization_policy_layout(&[(0x1b, 257, &[]), (6, 258, &agreeing)])
+        else {
+            panic!("agreeing AC3 descriptor and registration should be accepted");
+        };
+        assert_eq!(
+            layout.audio,
+            Some(SelectedAudio {
+                pid: 258,
+                codec: AudioCodec::Ac3,
+            })
+        );
+    }
+
+    #[test]
     fn normalization_policy_rejects_fragmented_current_psi() {
         let mut st = LiveAudioSelection::default();
         st.observe(pat(1, 256));
@@ -1131,6 +1244,49 @@ mod tests {
         let legacy = pmt(3, &[(0x1b, 257, &[]), (0x11, 258, &[]), (6, 260, &[])]);
         let passthrough = st.observe(legacy).packet.unwrap();
         assert_eq!(passthrough, legacy);
+        for pid in [258, 260] {
+            let packet = elementary(pid);
+            assert_eq!(st.observe(packet).packet, Some(packet));
+        }
+    }
+
+    #[test]
+    fn normalization_policy_disabled_conflicts_and_unknown_types_keep_legacy_filtering() {
+        let ac3 = [0x6a, 1, 0];
+        let eac3 = [0x7a, 1, 0];
+        for descriptors in [
+            [ac3.as_slice(), eac3.as_slice()].concat(),
+            [eac3.as_slice(), ac3.as_slice()].concat(),
+        ] {
+            // Without AAC, legacy selection leaves the source PMT byte-for-byte intact.
+            let mut st = LiveAudioSelection::default();
+            let program = pat(1, 256);
+            assert_eq!(st.observe(program).packet, Some(program));
+            let source_pmt = pmt(3, &[(0x1b, 257, &[]), (0x06, 258, &descriptors)]);
+            assert_eq!(st.observe(source_pmt).packet, Some(source_pmt));
+
+            // With AAC present, the legacy native filter removes the recognized competitor.
+            let mut st = LiveAudioSelection::default();
+            st.observe(pat(1, 256));
+            let source_pmt = pmt(
+                3,
+                &[
+                    (0x1b, 257, &[]),
+                    (0x06, 258, &descriptors),
+                    (0x0f, 259, &[]),
+                ],
+            );
+            let rewritten = st.observe(source_pmt).packet.unwrap();
+            assert_eq!(es_pids(&rewritten), vec![257, 259]);
+            assert!(st.observe(elementary(258)).packet.is_none());
+            assert_eq!(st.observe(elementary(259)).packet, Some(elementary(259)));
+        }
+
+        // Stream types that strict policy cannot classify remain legacy passthrough bytes.
+        let mut st = LiveAudioSelection::default();
+        st.observe(pat(1, 256));
+        let unknown_types = pmt(3, &[(0x1b, 257, &[]), (0x1c, 258, &[]), (0x20, 260, &[])]);
+        assert_eq!(st.observe(unknown_types).packet, Some(unknown_types));
         for pid in [258, 260] {
             let packet = elementary(pid);
             assert_eq!(st.observe(packet).packet, Some(packet));
