@@ -1,9 +1,9 @@
 # Acestream HTTP compatibility matrix
 
 outpace keeps a **thin, opt-in** Acestream-compatible HTTP surface. The native `/streams` and
-`/broadcast` APIs are the supported primary surface; the legacy `/ace/*`, `/server/api`, and `/webui/api/service` routes
-exist only to interoperate with existing Acestream middleware. This document is the contract: what
-is supported, what is intentionally rejected, and what is deferred.
+`/broadcast` APIs are the supported primary surface; the legacy `/ace/*`, `/server/api`, and
+`/webui/api/service` routes exist only to interoperate with existing Acestream middleware. This
+document is the contract: what is supported, what is intentionally rejected, and what is deferred.
 
 The whole compatibility surface is gated behind `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`
 (`experimental_ace_compat`) and is disabled by default. When the gate is off, every route below
@@ -12,8 +12,9 @@ returns `404`.
 Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 
 - `/ace/*` playback routes wrap their payload under a **`response`** key.
-- `/server/api` and its `/webui/api/service` alias wrap their payload under a **`result`** key, always with HTTP `200` and any error
-  reported in-band under `error` (see `docs/protocol/notes/10-interop.md`, which proves
+- `/server/api` and its `/webui/api/service` alias wrap their payload under a **`result`** key,
+  always with HTTP `200` and any error reported in-band under `error` (see
+  `docs/protocol/notes/10-interop.md`, which proves
   `analyze_content` → `.result.infohash`).
 
 ## `/ace/*` playback routes

@@ -111,11 +111,16 @@ async fn server_api_get_network_connection_status_reports_connected() {
 
 #[tokio::test]
 async fn server_api_unknown_method_returns_error_with_http_200() {
-    let (status, json) =
-        server_api_json(ace_compat_state(0), "method=get_available_channels").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["result"], serde_json::Value::Null);
-    assert!(json["error"].as_str().unwrap().contains("unknown method"));
+    for path in ["/server/api", "/webui/api/service"] {
+        let (status, json) =
+            control_api_json(ace_compat_state(0), path, "method=get_available_channels").await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(json["result"], serde_json::Value::Null, "{path}");
+        assert!(
+            json["error"].as_str().unwrap().contains("unknown method"),
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]

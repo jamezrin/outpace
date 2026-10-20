@@ -266,8 +266,9 @@ The supported integration contract is the native CLI and HTTP API. See the
 route table, response shapes, and VLC/Jellyfin/dispatcharr examples in
 [`docs/native-api.md`](docs/native-api.md).
 
-Legacy Acestream-compatible routes such as `/ace/*` and `/server/api` are
-experimental and disabled by default. Enable them only when needed:
+Legacy Acestream-compatible routes such as `/ace/*`, `/server/api`, and its
+`/webui/api/service` alias are experimental and disabled by default under the same
+compatibility gate. Enable them only when needed:
 
 ```bash
 OUTPACE_EXPERIMENTAL_ACE_COMPAT=1 cargo run -p ace-engine --bin outpace -- serve
@@ -286,9 +287,10 @@ resolution; `infohash=` is an explicit swarm key and plays only under the rules 
 inputs". All hash selectors must be 40 hexadecimal characters. The route also accepts `url=` (transport-file URL) and `magnet=`;
 see the compatibility matrix for exact precedence and error behavior.
 
-`/server/api` serves a targeted subset of the engine's JSON control API, dispatched
-on `?method=` and wrapped in a `{ "result", "error" }` envelope (note the `result`
-key, distinct from `/ace/*`'s `response`): `get_version`, `get_status`,
+`/server/api`, also served at `/webui/api/service` under the same compatibility gate,
+serves a targeted subset of the engine's JSON control API, dispatched on `?method=`
+and wrapped in a `{ "result", "error" }` envelope (note the `result` key, distinct
+from `/ace/*`'s `response`): `get_version`, `get_status`,
 `get_network_connection_status`, `analyze_content`, `get_content_id`, and
 `get_media_files`. The supported routes/methods, intentionally rejected surface, and
 deferred work are documented in
