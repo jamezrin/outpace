@@ -1,8 +1,10 @@
 //! HLS segmentation (pure): split a TS-packet-aligned byte stream into segments at
 //! packet boundaries and render the `.m3u8` media playlist.
 //!
-//! MVP segments by packet count (a coarse size-based proxy for duration); a later pass
-//! can cut on PCR / keyframe boundaries. Segment naming/serving is the engine's job.
+//! [`segment`] cuts by packet count, without consulting PCR or keyframes;
+//! [`media_playlist`] renders caller-supplied durations with simple segment names.
+//! These helpers perform no I/O and do not maintain a live segment window. The daemon's
+//! `ace-engine` crate owns the live packager, playlist state, and HTTP serving.
 
 use crate::mpegts::{is_aligned, TS_PACKET_LEN};
 use crate::{MediaError, Result};

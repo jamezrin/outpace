@@ -12,8 +12,13 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceStats {
     pub peers: u32,
-    pub bitrate: u64,   // bits/sec
-    pub buffer_ms: u64, // buffered duration estimate
+    pub bitrate: u64,       // bits/sec
+    pub buffer_ms: u64,     // buffered duration estimate
+    pub download_rate: u64, // measured reassembled payload bytes/sec
+    pub upload_rate: u64,   // measured uploaded bytes/sec
+    pub livepos: Option<LivePositionStats>,
+    /// Source-session recovery observations; None for unsupported providers.
+    pub recovery: Option<LiveRecoveryStats>,
     /// Bytes downloaded from the source and emitted as MPEG-TS.
     pub downloaded: u64,
     /// Bytes we have uploaded (served to peers) on this source.
@@ -21,6 +26,32 @@ pub struct SourceStats {
     /// Distinct peers we have served at least one chunk to.
     pub peers_served: u32,
 }
+
+/// Historical recovery occurrences and the current admitted transport gauge.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LiveRecoveryStats {
+    pub upstream_reconnects: u64,
+    pub stale_teardowns: u64,
+    pub skipped_evicted_gaps: u64,
+    pub signature_rejects: u64,
+    pub active_upstreams: u32,
+}
+
+/// Provider piece observations, not a client's playhead or wall-clock timestamps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LivePositionStats {
+    pub pos: Option<u64>,
+    pub last: Option<u64>,
+    pub live_first: Option<u64>,
+    pub live_last: Option<u64>,
+    pub buffer_pieces: u64,
+}
+
+/// Independently readable; implementations must never lock the source across an await.
+pub trait StatsReader: Send + Sync {
+    fn snapshot(&self) -> SourceStats;
+}
+pub type StatsHandle = Arc<dyn StatsReader>;
 
 /// A live MPEG-TS byte source for one stream. Source decorators may buffer chunks, but must
 /// preserve metadata, statistics, and the discontinuity associated with each returned chunk.
@@ -34,6 +65,9 @@ pub trait TsSource: Send {
         false
     }
     fn stats(&self) -> SourceStats;
+    fn stats_handle(&self) -> Option<StatsHandle> {
+        None
+    }
     /// Descriptor metadata resolved alongside this exact source, if any.
     fn metadata(&self) -> StreamMetadata {
         StreamMetadata::default()
@@ -195,6 +229,7 @@ mod tests {
             downloaded: 8192,
             uploaded: 4096,
             peers_served: 2,
+            ..SourceStats::default()
         };
         assert_eq!(s.downloaded, 8192);
         assert_eq!(s.uploaded, 4096);

@@ -24,6 +24,13 @@ Use the pinned Rust toolchain in `rust-toolchain.toml` and `rustfmt`. Follow Rus
 
 Use `#[tokio::test]` for async behavior and regular unit tests for pure parsing or scheduling logic. Keep live-network tests marked `#[ignore]` and document required environment variables, as existing tests do for `ACE_INFOHASH`, `ACE_PEER`, and `ACE_TRANSPORT_FILE`. For live validation, keep Cloudflare WARP off and pass a current public content id from the gitignored `acestream-ids.txt` registry via the environment; live infohashes rotate, so resolve them at runtime rather than recording them. Never hardcode a content id, infohash, or stream name into a test — see AceStream Identifier Hygiene below. Update `tests/vectors/` when fixing wire-format, identity, transport, or media parsing.
 
+### Live comparison workflow
+
+- Establish whether the question concerns deployed instances or fresh local builds. Record server versions/builds, warm/cold state, existing viewers, routing, and client/server WARP states in private run notes. For an explicitly requested deployment comparison, preserve that deployment's network settings; the WARP-off baseline above applies to controlled local validation.
+- Use the same current public source, simultaneous observation window, API route, player, and buffering settings. For deployed VLC playback, use `tools/abcompare/vlc_compare.py` (see its README). A local FFmpeg watchdog result does not establish how a different deployed build behaves in VLC.
+- Run a bounded unattended command and inspect its final report. Do not spend agent turns polling logs, repeating runs, or expanding the matrix unless a specific unresolved question requires it. Keep raw logs/status/media private and respect identifier hygiene.
+- Report observed decode progress, errors, and measurement limits. Sampled counters do not prove sub-poll smoothness, exact startup, byte identity, or live position. Shared failures or repeated payloads alone do not prove a source-wide outage. Reconcile a harness failure with a working real player before attributing it to the engine.
+
 ## Commit & Pull Request Guidelines
 
 Keep the root checkout on `main`; do feature work in separate worktrees that track topic branches, for example `git worktree add ../outpace-fix-dht -b fix/dht-correlation main`. Use conventional branch prefixes such as `feat/`, `fix/`, `docs/`, `test/`, or `chore/`, and commit subjects such as `fix(ace-swarm): correlate dht responses`. Keep PR titles brief and concise. PR descriptions should summarize behavior, list commands run, call out network, Docker, release, or env-var impact, and include logs or CLI/API examples. Release tags are `vX.Y.Z`; update crate versions before tagging.

@@ -43,6 +43,69 @@ can contain identifiers, stream names, tokens or peer addresses. Do not commit o
 publish them. `summary.json` omits URLs, ids and stat payloads, but review any report
 before sharing it. Engine/candidate names are user-controlled in direct capture.
 
+## Compare deployed instances with VLC
+
+To investigate playback on existing servers, use the same route and decoder as
+the reported playback. This separate runner starts two **local VLC clients**;
+it does not start/reconfigure servers, Docker containers, WARP, or remote VLC.
+It requires Python 3.10+, a POSIX host, and VLC with its HTTP interface and dummy
+audio/video outputs (Debian/Ubuntu: `vlc`, including `vlc-plugin-base`). Run as an
+ordinary user; VLC refuses to run as root. Both servers must already support
+`/ace/getstream?id=…`; Outpace's compat API must already be enabled.
+
+Supply a current public content id privately in `ACE_CONTENT_ID` as described
+above. The runner never reads the registry. For example, with servers reachable
+through local port forwarding:
+
+```sh
+python3 tools/abcompare/vlc_compare.py \
+  --engine-url http://127.0.0.1:6878 \
+  --outpace-url http://127.0.0.1:16879 \
+  --seconds 600 --network-caching 1000 --poll-seconds 5 \
+  --client-warp off --server-warp unknown
+```
+
+WARP flags **record operator observations**, they do not detect or change VPN
+state. For a deployment reproduction, preserve and record the deployment's
+settings. For a controlled local baseline, keep WARP off. Record server builds,
+warm/cold cache state, and other viewers separately in private notes; the runner
+does not inspect remote build/configuration. Concurrent viewers can affect swarms.
+
+One command runs to completion without agent supervision and prints a fresh
+private `/tmp/outpace-vlc-*` artifact directory and a numeric summary. Artifacts
+include `comparison.txt`, `comparison.json`, `config.json`, VLC logs, playlists,
+and raw sampled status. The directory is mode 0700; raw artifacts can contain
+identifiers, URLs and stream names. Keep them private. Summaries omit source URLs,
+identifiers and raw metadata; review before sharing. Inputs go in private playlist
+files rather than VLC command arguments. The content-id environment variable is
+removed from child environments. Local VLC controls bind to loopback and use a
+random password; control requests bypass HTTP proxies.
+
+Ctrl-C/SIGTERM stops and reaps only the two client processes started by this run,
+then writes a partial report. A forced kill cannot clean up those clients.
+Exit 0 means the bounded observation finished and both clients had some audio or
+video decode progress; it is **not a playback quality pass**. Exit 2 means an
+incomplete observation, launch/control setup problem, or no observed decode;
+exit 130 means interrupted. Inspect control error counts, state counts, resets,
+and per-client sample counts even on exit 0. Initial HTTP-interface startup may
+produce control errors before the first successful sample.
+
+Both clients ignore saved VLC configuration, use the same network caching, and
+decode into dummy outputs. This exercises VLC demux/decode without a display or
+audio device. It cannot measure visual presentation, device drops, or the exact
+experience of a GUI player with different settings. Video-only/audio-only media
+are accepted; an absent track has null timing rather than an invented failure.
+
+`first_decode_observed_seconds` is the time a poll first sees a positive decode
+counter, measured from the start of the comparison. It is an upper bound, not
+precise startup latency; launch offsets are included in the JSON. The maximum
+sampled progress gap includes the final unsampled tail after the last observed
+counter change. Even smooth playback normally reports a gap near one polling
+interval. Polling/control failures increase uncertainty; brief stalls between
+polls may be missed. Counter resets are reported rather than silently adding
+incompatible epochs. Equal counters do not establish content identity or live
+position, and a completed run is not a full live acceptance matrix.
+
 ## Capture or analyze existing clients
 
 For clients you start yourself on separate ports:
@@ -55,7 +118,7 @@ python3 tools/abcompare/ab_analyze.py /tmp/new-ab-run 180 engine outpace
 
 Engine specifications are `name=BASE` for `/ace/getstream?id=…&format=json`,
 `name=nativecid:BASE` for `/streams/ace/cid:…`, or `name=native:BASE` for
-`/streams/ace/…` using an **infohash**, not a content id. Outpace compat routes
+`/streams/ace/ih:…` using an **infohash**. Outpace compat routes
 require `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`; the runner uses native content-id
 routing so it needs no compat flag. Names must contain only letters, digits,
 underscores and hyphens, and must be unique. Playback follows up to five relative
@@ -136,8 +199,9 @@ public IP can compete for two or three peers. Keep Cloudflare WARP off. The runn
 does not change VPN services or stop other clients. Never use
 `pkill -f "outpace serve"`: it can kill unrelated daemons and the invoking shell.
 
-A bare 40-hex identifier on outpace's native route is an **infohash** (#165); use
-`nativecid:` or compat for content ids. Default outpace prebuffer/discovery can
+A bare 40-hex identifier on outpace's native live route is a **content id** (#165).
+Use `nativecid:` or compat for content ids; `native:` adds the explicit `ih:` prefix
+for verified infohash playback. Default outpace prebuffer/discovery can
 produce headers followed by more than 15 seconds without body data. Set
 `READ_TIMEOUT` above prebuffer timeout plus discovery (default here: 60 seconds).
 Too short a timeout triggers retries, changing startup behavior. The global capture
@@ -166,3 +230,85 @@ Synthetic TS fixtures and a loopback HTTP server test continuity, RAI, PCR wrap,
 stale-prefix detection, holes/duplicates, no-start/no-overlap handling, redirects
 and silent-reader deadlines. CI runs these without Docker, registry access or
 public-network streams. A live original-engine comparison remains an operator step.
+
+## Bounded release gate (#196)
+
+This optional offline gate supports the [v1.0 checklist (#208)](https://github.com/jamezrin/outpace/issues/208).
+It does not sign off a production replacement or multi-hour reliability; the
+long-soak work is separate (#210). Missing live prerequisites mean the operator
+records **skipped**, never pass; the evaluator itself has no skip outcome.
+
+For a release run, build the release binary above, manually supply `ACE_CONTENT_ID`
+from the registry, and verify WARP is off and the direct route is in use. Inspect
+other viewers first. Use the existing fresh candidate/container runner, simultaneous
+180-second capture and owned-process cleanup:
+
+```sh
+READ_TIMEOUT=60 python3 tools/abcompare/run.py \
+  --outpace "$PWD/target/release/outpace" --seconds 180 \
+  --outdir /tmp/outpace-196-release
+python3 tools/abcompare/evaluate.py /tmp/outpace-196-release/summary.json \
+  --policy /tmp/outpace-196-policy.json \
+  --output /tmp/outpace-196-release/gate.json
+```
+
+Create the policy privately **before interpreting results**. The explicit numbers
+below are illustrative operator choices, not accepted release thresholds. Timing
+allowance must be at least the model's 50-ms resolution; it is explicitly added
+to startup and excess modeled stall-time limits, with no hidden tolerance.
+
+```json
+{
+  "schema_version": 1,
+  "max_startup_delta_seconds": 1.0,
+  "max_excess_modeled_stall_count": 0,
+  "max_excess_modeled_stall_seconds": 0.5,
+  "min_byte_ratio": 0.95,
+  "timing_allowance_seconds": 0.05,
+  "attestation": {
+    "simultaneous": true,
+    "same_current_public_source": true,
+    "same_settings": true,
+    "same_routes": true,
+    "fresh_state": true,
+    "viewers_observed": true,
+    "warp_off": true,
+    "direct_route_verified": true,
+    "complete": true
+  },
+  "provenance": {
+    "candidate_build": "replace with verified candidate build identity",
+    "reference_version": "replace with observed reference version (baseline 3.2.11)",
+    "reference_image_digest": "replace with immutable image digest"
+  }
+}
+```
+
+Attest only after observing these conditions, including successful full capture,
+analysis and cleanup without interruption/setup failure. Keep actual build identity,
+observed engine version, immutable Docker image digest, run settings/routes, fresh
+state, viewers and completion evidence in private provenance. API readiness HTTP
+200 and a mutable image tag do not prove any 3.2.x version. The controlled baseline
+is 3.2.11; verify it independently rather than trusting the tag. Do not put content
+ids, infohashes, stream names or raw URLs in policy fields or shared reports.
+
+The evaluator consumes analyzer `schema_version: 1` without redoing analysis.
+Policy schema 1 requires every key shown, rejects unknown keys, non-finite numbers,
+booleans as numbers and ratios outside (0, 1]. It emits gate schema 1 with
+`outcome`, fixed diagnostic `reasons` and numeric `metrics`; it never copies
+provenance strings or stream names. Exit 0 is pass, 1 fail, 2 inconclusive/error.
+Pass requires complete comparable evidence and every explicit threshold met.
+Candidate zero delivery or modeled no-start against a usable reference fails;
+threshold breaches fail. Unusable reference, missing PCR overlap, suspect clocks
+or unestablished comparability are inconclusive. Malformed/incomplete artifacts,
+missing required metrics, interruption or setup failure are errors. Null modeled
+no-start metrics stay null, never zero. Gate JSON is evidence to review, not a
+release guarantee.
+
+Startup here is PCR-modeled startup. Modeled stalls are never decoder stalls;
+arrival gaps are reported separately and do not alone establish playback stalls.
+Byte ratio is delivery volume, not completeness. Integrity/overlap diagnostics
+remain in the analyzer summary for review; this gate adds no integrity thresholds.
+PCR jumps invalidate the timing model. Shared pauses do not prove a source-wide
+outage. Retain private summary/policy/gate links in release provenance and link that
+review from #208 after merge; follow #210 for longer observation requirements.

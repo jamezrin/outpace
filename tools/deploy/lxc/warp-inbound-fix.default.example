@@ -1,0 +1,4 @@
+# Install as /etc/default/warp-inbound-fix.
+# PORT must equal OUTPACE_PEER_LISTEN's port (the port outpace listens on and announces).
+PORT=8621
+IFACE=eth0

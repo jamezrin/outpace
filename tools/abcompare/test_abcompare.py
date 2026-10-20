@@ -177,6 +177,13 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_native_infohash_capture_uses_explicit_prefix(self):
+        identifier = '0123456789abcdef0123456789abcdef01234567'
+        client = capture.Capture(identifier, 1, '/unused', [])
+        playback, status = client.getstream('x', 'native', 'http://localhost')
+        self.assertEqual(playback, f'http://localhost/streams/ace/ih:{identifier}')
+        self.assertEqual(status, playback + '/status')
+
     def capture_cli(self, outdir):
         # Change umask inside the subprocess, avoiding process-global test state
         # and preexec_fn while HTTP tests may have background handler threads.

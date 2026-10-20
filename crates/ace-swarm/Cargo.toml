@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ace-media = { path = "../ace-media" }
 ace-log = { path = "../ace-log" }
 ace-wire = { path = "../ace-wire" }
 ace-peer = { path = "../ace-peer" }
@@ -21,13 +22,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Retain bundled trust roots for portable binaries without a system CA store.
 webpki-root-certs = "1"
 hex = "0.4"
+roxmltree = "0.21"
 igd-next = { version = "0.17", features = ["aio_tokio"] }
 crab_nat = "0.8"
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-ace-media = { path = "../ace-media" }
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }

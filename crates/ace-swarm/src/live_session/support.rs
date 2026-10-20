@@ -1,0 +1,75 @@
+use super::*;
+
+/// If `payload` carries a live-window (`myinfo`) update whose head is beyond `head`, return
+/// the new head; otherwise `None`. The single place window recognition feeds the loop.
+pub(super) fn advance_head_from_window(payload: &[u8], head: u64) -> Option<u64> {
+    let w = LiveWindow::from_myinfo_payload(payload)?;
+    (w.max_piece > head && w.max_piece <= u32::MAX as u64).then_some(w.max_piece)
+}
+
+pub(super) fn stale_upstream_budget(
+    last_progress: Instant,
+    now: Instant,
+    stale_upstream_timeout: Duration,
+) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(last_progress);
+    if elapsed >= stale_upstream_timeout {
+        None
+    } else {
+        Some(stale_upstream_timeout - elapsed)
+    }
+}
+
+pub(super) fn should_refresh_stale_deadline(
+    emitted: u64,
+    made_output: bool,
+    made_activity: bool,
+) -> bool {
+    made_output || (emitted == 0 && made_activity)
+}
+
+pub(super) fn schedule_piece_assignments(
+    scheduler: &mut Scheduler,
+    active_peers: &mut ActivePeers,
+    next_needed: u64,
+    head: u64,
+) -> Vec<PeerAssignment> {
+    active_peers.assign(scheduler, next_needed, head)
+}
+
+/// Hex preview of a message prefix for diagnostics (avoids pulling in a hex crate).
+pub(super) fn hex_preview(bytes: &[u8]) -> String {
+    bytes.iter().take(24).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Read messages until the peer's extended handshake arrives; return its live `mi` window and
+/// the `yourip` public address it echoed to us (issue #22 — the swarm telling us how it sees us
+/// on this outbound connection; `None` when the peer sent no usable `yourip`).
+pub(super) async fn read_peer_window(
+    session: &mut PeerSession<TcpStream>,
+) -> Option<(WireLivePosition, Option<IpAddr>)> {
+    for _ in 0..32 {
+        let msg = session.read_message().await.ok()?;
+        if let PeerMessage::Extended { ext_id: 0, payload } = msg {
+            let eh = ExtendedHandshake::parse(&payload).ok()?;
+            let yourip = eh.yourip();
+            let mi = eh.raw.get(b"mi")?;
+            let get = |k: &[u8]| mi.get(k).and_then(|v| v.as_int()).unwrap_or(-1);
+            let min_piece = get(b"min_piece");
+            let max_piece = get(b"max_piece");
+            if min_piece < 0 || max_piece < min_piece || max_piece > u32::MAX as i64 {
+                return None;
+            }
+            return Some((
+                WireLivePosition {
+                    min_piece,
+                    max_piece,
+                    position: get(b"position"),
+                    distance_from_source: get(b"distance_from_source"),
+                },
+                yourip,
+            ));
+        }
+    }
+    None
+}

@@ -79,21 +79,28 @@ handshakes:
 - `tests/vectors/transport-02.bin` → transport-file hash =
   `ed2c05b3b022e9cc7b7c1ca46d20f10839dc4108`
 
-## content_id — PARTIAL
-- The engine maps content_id ⇄ infohash (verified): content_id
-  `cid1` → infohash
-  `50e93529d3eb46a50506b14464185a15292d6e47`; infohash
-  `685edf209ccfdf88977c0d317e1407baca486067` → content_id
-  `cid4`.
-- For live broadcasts the content_id is stable while the infohash rotates, so
-  content_id is almost certainly derived from the broadcaster **`pubkey`** in the
-  descriptor (now decodable — see above), but the exact preimage is not simple
-  `SHA1(pubkey)`: for `transport-01.bin`, `SHA1(pubkey)` is
-  `3fe25f036fa7d30550a2c0e566a6c1005ac86906`, not the official content_id
-  `cid1`. Common DER-prefix / modulus-like slices
-  checked in note 35 also did not match.
-- `OPEN:` confirm the exact content_id algorithm from the decoded `pubkey`.
-  `get_content_id` (HTTP API) resolves it today, so it is not an MVP blocker.
+## content_id — OPEN
+
+The engine can resolve public content ids to descriptors and expose a content id for
+some existing infohashes. Historical observations of stable content ids alongside rotating
+live infohashes motivated a broadcaster-key derivation conjecture; neither that conjecture
+nor a general derivation algorithm has been established. The candidate key hashes examined
+in note 35 did not establish such a binding.
+
+An offline synthetic probe of engine 3.2.11 found that `TransportFile.dump()` preserves the
+raw wrapped bytes, while `get_hash()`, `get_infohash()` and `get_def().get_hash()` agree on
+a value different from SHA-1 of those bytes. A live `TransportDescriptorBT` has no
+`get_content_id` method; `TorrentDef.get_content_id()` initially returns `None`, and an
+explicitly set synthetic id roundtrips. The engine's transport-creation wrapper has a
+separate content-id acquisition path through `_update_torrent`; that path has not been
+fully traced. These observations establish neither a deterministic public derivation nor
+arbitrary server assignment.
+
+Outpace-originated broadcasts deliberately use `SHA1(raw wrapped transport bytes)` as
+their content id. This convention must not be imposed on public catalog responses.
+Content-id resolution is catalog-only by default (plus the daemon's trusted local broadcast
+registry); raw-hash BEP-9 fallback requires `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1`.
+See [note 63](notes/63-bep9-content-id-policy.md) for the evidence and trust boundaries.
 
 ## VOD piece-hash list and file layout (implemented #47)
 Both captured fixtures are **live** (no `pieces`). A **VOD** transport carries `pieces`

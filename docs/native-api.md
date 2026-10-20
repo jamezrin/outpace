@@ -4,10 +4,22 @@ The native CLI and HTTP routes are outpace's supported integration surface. They
 players such as VLC, media servers such as Jellyfin, and playlist/proxy tools such as dispatcharr.
 Playback requests start and share sessions, while status routes observe sessions already active.
 
-Examples use `http://127.0.0.1:6878` and the built-in `ace` network. An `<id>` is
-`cid:<content-id>` (recommended), a transport-url id (`turl-…`), or a 40-character infohash.
-An infohash plays only when this daemon already holds a verified transport descriptor for it
-(see [Infohash inputs](#infohash-inputs)); otherwise the request fails closed.
+Examples use `http://127.0.0.1:6878` and the built-in `ace` network. On live
+`/streams/ace/` routes, a bare 40-character hex `<id>` is a **content id**, matching
+compat `id=`. `cid:<content-id>` is its explicit alias; `ih:<infohash>` explicitly
+selects a swarm with a verified descriptor (see [Infohash inputs](#infohash-inputs)).
+Transport-url ids (`turl-…`) remain supported. VOD requires `cid:` or a transport-url id.
+
+Hex values are normalized to lowercase. Bare content ids and their `cid:` aliases
+share one session across TS, HLS, segment, status and DELETE routes. Native session
+lists, status responses and HLS URLs return canonical `cid:` or `ih:` identifiers.
+Malformed explicit hex selectors return `400`; status and segment requests never
+start sessions. Other provider networks keep their own identifier semantics.
+
+**Migration:** native live bare hex ids previously meant infohashes. Existing
+infohash playlists must now use `ih:<infohash>`; there is no implicit infohash
+fallback after a content-id resolution failure. Compat `infohash=`/`magnet=` and
+CLI inputs retain their existing meanings.
 
 ## CLI
 
@@ -33,7 +45,7 @@ outpace broadcast sports --public-host stream.example
 | `GET /healthz` | `200 text/plain` (`ok`) | Process health probe; it does not prove swarm connectivity. |
 | `GET /networks` | `200 application/json`, `{"networks":["ace"]}` | Provider networks configured in this daemon. |
 | `GET /streams` | `200 application/json`, `{"streams":[...]}` | Active shared sessions. Entries have `network`, `id`, direct-client count `clients`, and descriptor `metadata`. |
-| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. A bare infohash without a verified descriptor returns `422` with a plain-text reason. |
+| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. An `ih:` selector without a verified descriptor returns `422` with a plain-text reason. Malformed `cid:`/`ih:` selectors return `400`. |
 | `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Explicit continuous MPEG-TS form; equivalent for dot-free ids, preserves dots within the provider id, and includes `Icy-Name` when the descriptor supplies a title. |
 | `GET /streams/<network>/<id>.m3u8` | `200 application/vnd.apple.mpegurl` | Starts or joins live HLS packaging and returns a sliding playlist. The same `422` applies. |
 | `GET /streams/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Retained live HLS segment. Missing, expired, or not-yet-produced segments return `404`; a segment request alone never starts a stream. |
@@ -58,6 +70,13 @@ An active stream status response has stable field names and numeric counters:
   "buffer_ms": 6200,
   "uploaded": 1048576,
   "peers_served": 2,
+  "recovery": {
+    "upstream_reconnects": 0,
+    "stale_teardowns": 0,
+    "skipped_evicted_gaps": 0,
+    "signature_rejects": 0,
+    "active_upstreams": 4
+  },
   "metadata": {
     "title": "Example Sports",
     "bitrate": 2450000,
@@ -79,20 +98,93 @@ The descriptor title is authoritative for both `metadata.title` and `Icy-Name`; 
 invent a title.
 Live HLS media playlists are unchanged because they have no portable stream-title field.
 
+## Content-id resolution
+
+Live and VOD content-id inputs resolve through the catalog by default. Catalog failure
+returns an error; automatic BEP-9 peer fallback is disabled. The same daemon can resolve
+its own broadcast content ids using its trusted local broadcast registry.
+
+Set `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` on the receiving daemon or standalone `play`
+process to enable BEP-9 fallback after catalog failure. This supports the raw wrapped
+transport-file hash convention used by outpace broadcasts. The peer result must satisfy
+`SHA1(raw wrapped transport bytes) == requested identifier`; this is not an established
+public catalog content-id derivation. Peer results stay outside the catalog-provenance
+infohash index and do not authorize later bare-infohash playback.
+
+The broadcast Ace link needs this opt-in when used across daemons or by standalone `play`.
+Alternatively, use `http://<host>:<http-port>/broadcast/<name>` as a transport URL, subject
+to the receiver's transport-URL access policy. Same-daemon broadcast playback needs no
+opt-in. See [protocol note 63](protocol/notes/63-bep9-content-id-policy.md) for evidence,
+trust boundaries and migration details.
+
 ## Infohash inputs
 
-A bare infohash carries no piece geometry or source key, and outpace never guesses them. An
-infohash `<id>` plays only when this daemon already holds a verified transport descriptor for it:
-the stream was resolved earlier in this process through the signed catalog by native
-`cid:<content-id>`, compat `content_id=`/`id=`, or `/server/api` `analyze_content` / `get_media_files` with a `content_id`,
-or it is a broadcast this daemon originates. Such a stream uses the descriptor's piece length
-and verifies each piece against the descriptor's pubkey. An infohash becomes playable only
-from a descriptor fetched through the signed catalog (a content-id resolution) or from the
-daemon's own broadcast; it then uses that descriptor's geometry, pubkey and trackers. A content
-id resolved from BEP-9 peers, or a transport URL, never makes an infohash playable: neither
-binds the descriptor's trackers to the infohash.
-Otherwise playback routes return `422 Unprocessable Content` with a plain-text reason that
-suggests `cid:<id>`. Prefer `cid:<content-id>` ids in playlists.
+Catalog resolution verifies the response signature, request nonce and transport checksum.
+The engine-compatible signature uses an embedded shared key rather than a server-only trust
+anchor; [protocol note 62](protocol/notes/62-catalog-response-authentication.md) describes the
+remaining forgery risk over plain HTTP.
+
+An `ih:<infohash>` selector first uses an owned broadcast or an indexed verified
+descriptor, then queries the signed catalog on a cold lookup. Authentication,
+nonce and checksum validation precede decoding; the descriptor's computed swarm
+infohash must equal the requested hash before its geometry, pubkey and trackers
+are used. The descriptor is indexed only after that check. Failed cold lookups
+are cached for five seconds in a separate bounded 128-entry cache; verified local
+metadata takes precedence. Unavailable or mismatched descriptors return
+`422 Unprocessable Content` with a plain-text reason. BEP-9 and transport-URL
+results do not populate this index. Native bare hex values still mean content ids;
+use `ih:` explicitly for swarm infohashes.
+
+## Live statistics
+
+Top-level `bitrate` measures contiguous reassembled media payload in bits/second,
+not the descriptor's advertised bitrate. A nominal five-second window is sampled
+once per second independently of status polling. Reads do not alter the rate;
+inactivity expires it even while source output is pending. Sampling limits
+boundary precision to about one second. Framing, signatures, duplicate blocks and
+injected tables are excluded. Existing `downloaded` totals, where exposed, still
+count delivered MPEG-TS, so their delta need not equal this incoming-payload rate.
+
+`buffer_ms` observes the startup reservoir while collecting/draining, using PCR
+or the existing descriptor-rate estimate. After release it observes contiguous
+complete media at the reassembler cursor; partial pieces and pieces beyond a
+hole do not count. It excludes the provider handoff channel, socket buffers,
+session broadcast backlog, HLS retention and all client buffers. It can correctly
+approach zero after draining and must not be interpreted as player lead.
+
+`livepos` is null until a position is known. Otherwise `pos` is the next piece
+needed by reassembly, `last` the last observed provider head, `live_first` and
+`live_last` the advertised active-window bounds (null when unavailable), and
+`buffer_pieces` the complete contiguous pieces ready at that cursor. `is_live` is
+1; `first_ts` and `last_ts` are null because no verified mapping to engine
+wall-clock timestamps is available. These observations are not a client's
+playhead or an authenticated source clock. Other providers without independent
+readers retain their existing post-output cached statistics behavior.
+
+`recovery` is null for providers without recovery observations. Observed live
+sources expose all five numeric fields from session creation, initially zero.
+Counters last for one source session, survive upstream pool rebuilds, and reset
+for a new source. Teardown clears active coverage and `active_upstreams` while
+retained snapshots preserve historical counters.
+
+- `upstream_reconnects`: successful runtime admissions after the first admitted
+  pool has ended, once per admitted transport, including reuse of an address.
+  Initial admissions, ordinary expansion of the initial pool, failed attempts,
+  gossip-only transports and provisional startup replacement do not count.
+- `stale_teardowns`: actual stale-budget pool shutdowns returning `PoolStale`,
+  once per shutdown; individual peer losses do not count.
+- `skipped_evicted_gaps`: actual forward cursor jumps in reconnect resume or
+  evicted-gap recovery, once per gap regardless of piece count. Initial prefetch
+  and live-head catchup pruning do not count.
+- `signature_rejects`: assembled pieces whose source signature verification
+  returns false. A retried piece can fail again. Malformed blocks, trailer split
+  failures, invalid keys, stale/future pieces and duplicates do not count.
+- `active_upstreams`: currently admitted peer runtimes, including choked and
+  provisional runtimes; connecting, queued and gossip-only transports are excluded.
+  Every pool exit, cancellation and source teardown clears this gauge.
+
+Compatibility `/ace/stat` keeps its established fields and mappings unchanged;
+these recovery observations are exposed only by native status.
 
 ## Live startup buffering
 

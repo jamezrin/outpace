@@ -152,6 +152,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_EXPERIMENTAL_ACE_COMPAT")? {
         config.experimental_ace_compat = v;
     }
+    if let Some(v) = bool_from_env("OUTPACE_BEP9_CONTENT_ID_FALLBACK")? {
+        config.bep9_content_id_fallback = v;
+    }
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
@@ -293,11 +296,11 @@ pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
 
 /// Resolve the tracker list minted into broadcast descriptors and used for broadcast
 /// self-announce. `OUTPACE_TRACKERS` — comma-separated `scheme://…` (typically
-/// `udp://host:port/announce`) URLs — FULLY REPLACES [`DEFAULT_BROADCAST_TRACKERS`] when set
+/// `udp://host:port/announce`) URLs — FULLY REPLACES `DEFAULT_BROADCAST_TRACKERS` when set
 /// (non-empty after trimming); unset or blank leaves the public default in place so behavior is
 /// byte-identical to before.
 ///
-/// Per-entry handling (see [`classify_tracker_entry`]):
+/// Per-entry handling (see `classify_tracker_entry`):
 /// - No `scheme://` prefix: obviously unusable — a broadcast pointed only at such entries would
 ///   be undiscoverable — so it is dropped with a warning rather than minted into a broken
 ///   descriptor. Ditto entries longer than the announce path's
@@ -427,6 +430,7 @@ fn url_host_from_ip(ip: IpAddr) -> String {
 
 fn ace_provider_from_config(provider: AceProvider, config: &Config) -> AceProvider {
     provider
+        .with_bep9_content_id_fallback(config.bep9_content_id_fallback)
         .with_prefetch_pieces(config.prefetch_pieces)
         .with_startup_buffer(config.startup_buffer)
         .with_live_recovery(config.live_recovery)
@@ -615,6 +619,7 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
     // acceptance is live-proven (note 33). Opt out with `OUTPACE_ENABLE_INBOUND=0`.
     if config.enable_inbound {
         let peer_listener = tokio::net::TcpListener::bind(config.peer_listen).await?;
+        let bound_peer_port = peer_listener.local_addr()?.port();
         eprintln!(
             "outpace: inbound seeding ENABLED on {} (max {} peers)",
             config.peer_listen, config.max_inbound_peers
@@ -678,7 +683,11 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         // mapped-external-IP cross-check that flags double-NAT / CGNAT.
         if let Some(monitor) = reachability.clone() {
             let endpoint_rx = _port_map_handle.as_ref().map(|h| h.endpoint_receiver());
-            tokio::spawn(reachability_status_loop(monitor, endpoint_rx));
+            tokio::spawn(reachability_status_loop(
+                monitor,
+                endpoint_rx,
+                bound_peer_port,
+            ));
         }
     }
 
@@ -697,8 +706,15 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
         "outpace: listening on http://{} networks={:?}",
         config.bind, networks
     );
-    eprintln!("  MPEG-TS: http://{}/streams/ace/<id>", config.bind);
-    eprintln!("  HLS:     http://{}/streams/ace/<id>.m3u8", config.bind);
+    eprintln!(
+        "  MPEG-TS: http://{}/streams/ace/cid:<content-id>",
+        config.bind
+    );
+    eprintln!(
+        "  HLS:     http://{}/streams/ace/cid:<content-id>.m3u8",
+        config.bind
+    );
+    eprintln!("  Live ids: bare hex or cid: selects a content id; ih: selects a verified infohash");
     eprintln!("  status:  http://{}/streams", config.bind);
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -790,8 +806,10 @@ async fn propagate_mapped_announce_port(
 async fn reachability_status_loop(
     monitor: Arc<ace_swarm::reachability::ReachabilityMonitor>,
     endpoint_rx: Option<tokio::sync::watch::Receiver<Option<ace_swarm::portmap::MappedEndpoint>>>,
+    listener_port: u16,
 ) {
     use ace_swarm::reachability::CrossCheck;
+    let started = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(REACHABILITY_STATUS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -804,6 +822,14 @@ async fn reachability_status_loop(
             .as_ref()
             .and_then(|e| e.external_ip.map(|ip| (ip, e.external_port)));
         crate::alog!("[reachability] {}", monitor.status_line(external));
+        if monitor.take_troubleshooting_hint(started.elapsed()) {
+            let advertised_port = mapped
+                .as_ref()
+                .map_or(listener_port, |endpoint| endpoint.external_port);
+            crate::alog!(
+                "[reachability] HINT: after 10 minutes, no inbound peers or yourip observations; check advertised peer TCP port {advertised_port}: router port forwarding may be missing, a host/VPN/WARP firewall may block inbound connections, or UPnP/NAT-PMP may be disabled or unanswered"
+            );
+        }
         if let CrossCheck::Mismatch { observed, mapped } = monitor.cross_check(mapped_ip) {
             crate::alog!(
                 "[reachability] WARNING: observed public IP {observed} (from peer yourip) differs from the mapped external IP {mapped} — likely double-NAT / CGNAT (the gateway mapped a private upstream address); inbound dials to {mapped} may never reach us"
@@ -845,6 +871,48 @@ mod tests {
         );
 
         assert_eq!(provider.startup_buffer_config(), config.startup_buffer);
+    }
+
+    #[test]
+    fn daemon_provider_receives_bep9_policy_from_config() {
+        for enabled in [false, true] {
+            let config = Config {
+                bep9_content_id_fallback: enabled,
+                ..Config::default()
+            };
+            let provider = ace_provider_from_config(
+                AceProvider::new(Arc::new(ace_wire::identity::Identity::generate()), 0),
+                &config,
+            );
+            assert_eq!(
+                crate::ace_provider::test_support::bep9_enabled(&provider),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn bep9_fallback_env_defaults_off_and_parses_strictly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_BEP9_CONTENT_ID_FALLBACK";
+        let old = std::env::var_os(name);
+        std::env::remove_var(name);
+        assert!(!config_from_env().unwrap().bep9_content_id_fallback);
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(name, value);
+            assert_eq!(
+                config_from_env().unwrap().bep9_content_id_fallback,
+                expected
+            );
+        }
+        for invalid in ["", "yes", "TRUE", " true", "1 "] {
+            std::env::set_var(name, invalid);
+            assert!(config_from_env().unwrap_err().to_string().contains(name));
+        }
+        match old {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
     }
 
     #[test]
@@ -1130,6 +1198,7 @@ mod tests {
             "OUTPACE_ENABLE_INBOUND",
             "OUTPACE_ENABLE_PORT_MAPPING",
             "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+            "OUTPACE_BEP9_CONTENT_ID_FALLBACK",
         ];
         for name in names {
             std::env::remove_var(name);

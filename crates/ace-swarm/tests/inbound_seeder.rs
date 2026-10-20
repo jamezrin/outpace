@@ -1,6 +1,6 @@
 //! Real-TCP loopback proof: a client connects to our PeerListener, handshakes, requests a
 //! chunk we hold, and receives it back via SeederSession — the inbound half of reciprocal
-//! seeding (S1 proved the outbound half).
+//! seeding (production live-session seeding tests cover the outbound half).
 use ace_peer::session::PeerSession;
 use ace_swarm::listen::{PeerListener, SeedRegistry};
 use ace_swarm::store::PieceStore;

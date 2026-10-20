@@ -6,7 +6,15 @@
 //! layer. The piece-distribution decision core is [`scheduler::Scheduler`] (pure and
 //! tested); the async peer I/O loop wraps it.
 //!
-//! The async driver is validated against a live channel that is actually delivering data
+//! [`live_session::follow_live`] owns the production multi-upstream follower, discovery,
+//! recovery and session-wide seed lease, emitting [`live_session::LiveOutput`]. It is
+//! the single production live entrypoint.
+//!
+//! Pre-1.0 Rust compatibility break (#193): removed `driver::download_from_peer`,
+//! `driver::DownloadParams`, `live::LiveSession`, `live::LiveConfig` and `LiveSession::run`.
+//! Callers must migrate to [`live_session::follow_live`] with [`live_session::LiveSessionInputs`].
+//!
+//! The production follower is validated against a live channel that is actually delivering data
 //! (see `README.md` and `docs/protocol/notes/20-vlc-playback.md`); the scheduler is
 //! validated here.
 
@@ -17,9 +25,8 @@ pub use ace_log::alog;
 
 pub mod dht;
 pub mod discover;
-pub mod driver;
 pub mod listen;
-pub mod live;
+pub mod live_session;
 pub mod portmap;
 pub mod reachability;
 pub mod resolve;

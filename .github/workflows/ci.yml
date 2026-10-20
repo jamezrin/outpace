@@ -87,3 +87,6 @@ jobs:
       # Standard-library fixtures and loopback HTTP only; no public stream or Docker.
       - name: Test A/B capture and analysis
         run: python3 -m unittest discover -s tools/abcompare -v
+
+      - name: Test release archive verification
+        run: python3 -m unittest discover -s tools/release -v

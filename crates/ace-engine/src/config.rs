@@ -6,10 +6,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS: usize = 256;
-pub const MAX_LIVE_RECOVERY_PARALLEL_CONNECT: usize = 1024;
-pub const MAX_LIVE_RECOVERY_PIECE_ADVANCE: u64 = 16_384;
-pub const MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD: u64 = 65_536;
+pub use ace_swarm::live_session::{
+    MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS, MAX_LIVE_RECOVERY_PARALLEL_CONNECT,
+    MAX_LIVE_RECOVERY_PIECE_ADVANCE, MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD,
+};
 
 /// Absolute ceiling for one configured in-memory retention pool. The address-space-relative
 /// limit below is stricter on 32-bit targets; this ceiling keeps a single pool bounded on 64-bit
@@ -48,6 +48,20 @@ pub struct LiveRecoveryConfig {
     pub max_reasm_pieces_ahead: u64,
 }
 
+impl From<LiveRecoveryConfig> for ace_swarm::live_session::LiveRecoveryOptions {
+    fn from(config: LiveRecoveryConfig) -> Self {
+        Self {
+            request_timeout_ms: config.request_timeout_ms,
+            stale_upstream_timeout_ms: config.stale_upstream_timeout_ms,
+            request_check_interval_ms: config.request_check_interval_ms,
+            max_active_upstreams: config.max_active_upstreams,
+            max_parallel_connect: config.max_parallel_connect,
+            max_piece_advance: config.max_piece_advance,
+            max_reasm_pieces_ahead: config.max_reasm_pieces_ahead,
+        }
+    }
+}
+
 impl Default for LiveRecoveryConfig {
     fn default() -> Self {
         Self {
@@ -83,60 +97,7 @@ impl LiveRecoveryConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.request_timeout_ms == 0 {
-            return Err("OUTPACE_REQUEST_TIMEOUT_MS must be >= 1".into());
-        }
-        if self.stale_upstream_timeout_ms == 0 {
-            return Err("OUTPACE_STALE_UPSTREAM_TIMEOUT_MS must be >= 1".into());
-        }
-        if self.request_check_interval_ms == 0 {
-            return Err("OUTPACE_REQUEST_CHECK_INTERVAL_MS must be >= 1".into());
-        }
-        if self.request_timeout_ms >= self.stale_upstream_timeout_ms {
-            return Err(
-                "OUTPACE_REQUEST_TIMEOUT_MS must be < OUTPACE_STALE_UPSTREAM_TIMEOUT_MS".into(),
-            );
-        }
-        if self.request_check_interval_ms > self.request_timeout_ms {
-            return Err(
-                "OUTPACE_REQUEST_CHECK_INTERVAL_MS must be <= OUTPACE_REQUEST_TIMEOUT_MS".into(),
-            );
-        }
-        if self.max_active_upstreams == 0 {
-            return Err("OUTPACE_MAX_ACTIVE_UPSTREAMS must be >= 1".into());
-        }
-        if self.max_parallel_connect == 0 {
-            return Err("OUTPACE_MAX_PARALLEL_CONNECT must be >= 1".into());
-        }
-        if self.max_piece_advance == 0 {
-            return Err("OUTPACE_MAX_PIECE_ADVANCE must be >= 1".into());
-        }
-        if self.max_active_upstreams > MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS {
-            return Err(format!(
-                "OUTPACE_MAX_ACTIVE_UPSTREAMS must be <= {MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS}"
-            ));
-        }
-        if self.max_parallel_connect > MAX_LIVE_RECOVERY_PARALLEL_CONNECT {
-            return Err(format!(
-                "OUTPACE_MAX_PARALLEL_CONNECT must be <= {MAX_LIVE_RECOVERY_PARALLEL_CONNECT}"
-            ));
-        }
-        if self.max_piece_advance > MAX_LIVE_RECOVERY_PIECE_ADVANCE {
-            return Err(format!(
-                "OUTPACE_MAX_PIECE_ADVANCE must be <= {MAX_LIVE_RECOVERY_PIECE_ADVANCE}"
-            ));
-        }
-        if self.max_reasm_pieces_ahead > MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD {
-            return Err(format!(
-                "OUTPACE_MAX_REASM_PIECES_AHEAD must be <= {MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD}"
-            ));
-        }
-        if self.max_reasm_pieces_ahead < self.max_piece_advance {
-            return Err(
-                "OUTPACE_MAX_REASM_PIECES_AHEAD must be >= OUTPACE_MAX_PIECE_ADVANCE".into(),
-            );
-        }
-        Ok(())
+        ace_swarm::live_session::LiveRecoveryOptions::from(*self).validate()
     }
 }
 
@@ -345,6 +306,8 @@ pub struct Config {
     /// experimental legacy adapter; outpace's native `/streams` and `/broadcast` API is the
     /// supported surface.
     pub experimental_ace_compat: bool,
+    /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
+    pub bep9_content_id_fallback: bool,
 }
 
 impl Default for Config {
@@ -377,6 +340,7 @@ impl Default for Config {
             port_map_backend: ace_swarm::portmap::PortMapBackend::Auto,
             port_map_external_port: None,
             experimental_ace_compat: false,
+            bep9_content_id_fallback: false,
         }
     }
 }
@@ -649,6 +613,55 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.cache_type, CacheType::Memory);
         assert_eq!(c.cache_dir, c.data_dir.join("cache"));
+    }
+
+    #[test]
+    fn live_recovery_adapter_preserves_every_field() {
+        let config = LiveRecoveryConfig {
+            request_timeout_ms: 1701,
+            stale_upstream_timeout_ms: 13002,
+            request_check_interval_ms: 903,
+            max_active_upstreams: 5,
+            max_parallel_connect: 13,
+            max_piece_advance: 257,
+            max_reasm_pieces_ahead: 513,
+        };
+        for config in [config, LiveRecoveryConfig::default()] {
+            let mapped = ace_swarm::live_session::LiveRecoveryOptions::from(config);
+            assert_eq!(mapped.request_timeout_ms, config.request_timeout_ms);
+            assert_eq!(
+                mapped.stale_upstream_timeout_ms,
+                config.stale_upstream_timeout_ms
+            );
+            assert_eq!(
+                mapped.request_check_interval_ms,
+                config.request_check_interval_ms
+            );
+            assert_eq!(mapped.max_active_upstreams, config.max_active_upstreams);
+            assert_eq!(mapped.max_parallel_connect, config.max_parallel_connect);
+            assert_eq!(mapped.max_piece_advance, config.max_piece_advance);
+            assert_eq!(mapped.max_reasm_pieces_ahead, config.max_reasm_pieces_ahead);
+            assert_eq!(mapped.validate(), config.validate());
+        }
+        let defaults =
+            ace_swarm::live_session::LiveRecoveryOptions::from(LiveRecoveryConfig::default());
+        assert_eq!(
+            (
+                defaults.request_timeout_ms,
+                defaults.stale_upstream_timeout_ms,
+                defaults.request_check_interval_ms
+            ),
+            (1500, 12000, 1000)
+        );
+        assert_eq!(
+            (
+                defaults.max_active_upstreams,
+                defaults.max_parallel_connect,
+                defaults.max_piece_advance,
+                defaults.max_reasm_pieces_ahead
+            ),
+            (4, 12, 256, 512)
+        );
     }
 
     #[test]

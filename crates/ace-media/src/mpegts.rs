@@ -130,7 +130,7 @@ const MAX_SERVICE_NAME_BYTES: usize = TS_PACKET_LEN - 4 - 1 - 25 - SERVICE_PROVI
 const PROBE_PACKETS: usize = 4;
 
 /// Find the smallest offset `0..188` at which `buf` is TS-packet-aligned — i.e. the sync
-/// byte `0x47` recurs every 188 bytes for up to [`PROBE_PACKETS`] packets. Returns `None`
+/// byte `0x47` recurs every 188 bytes for up to `PROBE_PACKETS` packets. Returns `None`
 /// if no alignment is found (not a TS stream / too short).
 pub fn find_sync_offset(buf: &[u8]) -> Option<usize> {
     for off in 0..TS_PACKET_LEN {
@@ -183,7 +183,7 @@ const MAX_UNSYNCED_TAIL: usize = 2 * TS_PACKET_LEN - 1;
 /// regions (e.g. Acestream live pieces, which are each internally 188-aligned but don't
 /// byte-chain — ~one partial packet of junk at each piece boundary). Feed arbitrary byte
 /// runs; it emits only sync-locked 188-byte packets, discarding bytes as needed to re-lock,
-/// and buffers the unconfirmed tail (bounded to [`MAX_UNSYNCED_TAIL`]) until more data arrives.
+/// and buffers the unconfirmed tail (bounded to `MAX_UNSYNCED_TAIL`) until more data arrives.
 #[derive(Default)]
 pub struct TsResync {
     buf: Vec<u8>,
@@ -289,7 +289,7 @@ impl TsResync {
     }
 }
 
-/// Tracks the MPEG-TS tables and video PID needed to identify a decodable access point.
+/// Tracks the MPEG-TS tables and video PID needed to identify a candidate access point.
 #[derive(Default)]
 pub struct VideoAccessPointState {
     pmt_pid: Option<u16>,
@@ -367,8 +367,9 @@ impl VideoAccessPointState {
     }
 }
 
-/// Per-client gate that drops a stream's opening packets until the first clean keyframe, so a
-/// player joining a live MPEG-TS mid-GOP starts on a decodable picture instead of garbage.
+/// Per-client gate that drops a stream's opening packets until a candidate video access point.
+/// RAI and packet-local NAL detection are heuristics: without parsing the complete access unit
+/// and its dependencies, they do not guarantee an independently decodable picture.
 ///
 /// Feed it sync-locked, 188-aligned TS packets (e.g. [`TsResync`] output). Until it locks it
 /// emits nothing; on the first random-access point it emits the most-recent PAT and PMT
@@ -384,12 +385,16 @@ pub struct KeyframeGate {
     scanned: usize,
     max_scan_packets: usize,
     filter_sdt: bool,
+    // Belongs to this client's emitted PID, not the table cache or recovery run.
+    next_sdt_counter: u8,
     mark_discontinuity: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateResume {
+    /// A video PUSI with RAI or a packet-local IDR/IRAP NAL; not a decodability guarantee.
     AccessPoint,
+    /// Explicit bounded passthrough fallback, without an observed access point.
     ScanBudget,
 }
 
@@ -432,6 +437,7 @@ impl KeyframeGate {
             scanned: 0,
             max_scan_packets,
             filter_sdt: false,
+            next_sdt_counter: 0,
             mark_discontinuity: false,
         }
     }
@@ -449,6 +455,7 @@ impl KeyframeGate {
             scanned: 0,
             max_scan_packets: DEFAULT_MAX_SCAN_PACKETS,
             filter_sdt,
+            next_sdt_counter: 0,
             mark_discontinuity: false,
         }
     }
@@ -494,16 +501,21 @@ impl KeyframeGate {
         let mut i = 0;
         while i + TS_PACKET_LEN <= self.buf.len() {
             let pkt = &self.buf[i..i + TS_PACKET_LEN];
-            if self.locked {
-                if self.filter_sdt && ts_pid(pkt) == SDT_PID {
-                    i += TS_PACKET_LEN;
-                    continue;
+            if self.filter_sdt && ts_pid(pkt) == SDT_PID {
+                // Filter in both phases: even the scan-budget trigger must not
+                // publish upstream SDT into this gate's owned continuity sequence.
+                // Count it toward scanning, but resume only on a forwardable packet
+                // so the recovery marker is attached to media rather than discarded.
+                if !self.locked {
+                    self.scanned = self.scanned.saturating_add(1);
                 }
+                i += TS_PACKET_LEN;
+                continue;
+            }
+            if self.locked {
                 let access_point = self.access.observe(pkt);
                 if self.filter_sdt && access_point {
-                    if let Some(prefix) = self.access.table_prefix() {
-                        out.extend_from_slice(&prefix);
-                    }
+                    append_gate_tables(&self.access, &mut self.next_sdt_counter, &mut out);
                 }
                 out.extend_from_slice(pkt);
                 i += TS_PACKET_LEN;
@@ -512,9 +524,7 @@ impl KeyframeGate {
             self.scanned += 1;
             if self.access.observe(pkt) {
                 // Lock on the keyframe: hand the player the tables, then the keyframe.
-                if let Some(prefix) = self.access.table_prefix() {
-                    out.extend_from_slice(&prefix);
-                }
+                append_gate_tables(&self.access, &mut self.next_sdt_counter, &mut out);
                 append_resumed_packet(&mut self.mark_discontinuity, None, pkt, &mut out);
                 self.locked = true;
                 resumed = Some(GateResume::AccessPoint);
@@ -544,6 +554,25 @@ impl KeyframeGate {
             resumed,
         }
     }
+}
+
+/// Only emitted synthesized SDTs consume the gate's continuity sequence. Cached
+/// PAT/PMT packets retain their upstream headers, and filtering consumes no counter.
+fn append_gate_tables(
+    access: &VideoAccessPointState,
+    next_sdt_counter: &mut u8,
+    out: &mut Vec<u8>,
+) {
+    let Some(mut prefix) = access.table_prefix() else {
+        return;
+    };
+    for packet in prefix.as_chunks_mut::<TS_PACKET_LEN>().0 {
+        if ts_pid(packet) == SDT_PID {
+            packet[3] = (packet[3] & 0xf0) | *next_sdt_counter;
+            *next_sdt_counter = (*next_sdt_counter + 1) & 0x0f;
+        }
+    }
+    out.extend_from_slice(&prefix);
 }
 
 fn append_resumed_packet(
@@ -613,9 +642,9 @@ fn ts_payload_offset(pkt: &[u8]) -> Option<usize> {
     (start < TS_PACKET_LEN).then_some(start)
 }
 
-/// A random-access point: the start of a video access unit (PUSI) that is also a keyframe —
-/// flagged either by the adaptation field's random_access_indicator or by an H.264 IDR/SPS
-/// NAL in the payload (belt-and-suspenders across encoders).
+/// Candidate access point: video PES start (PUSI) with random_access_indicator or a
+/// packet-local H.264 IDR / HEVC IRAP NAL. RAI is trusted as a heuristic; neither path
+/// parses a complete picture or proves that its decoding dependencies are available.
 fn is_random_access_point(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     if !ts_pusi(pkt) {
         return false;
@@ -633,10 +662,11 @@ fn ts_random_access_indicator(pkt: &[u8]) -> bool {
 }
 
 /// Scan the packet payload for an Annex-B start code `00 00 01` followed by a keyframe NAL for
-/// the stream's `codec`: H.264 IDR (5) / SPS (7), or HEVC IRAP (16..=21) / VPS/SPS/PPS (32..=34).
+/// the stream's `codec`: H.264 IDR (5), or HEVC IRAP (16..=21). Parameter sets alone
+/// do not contain a picture and must not open the gate.
 /// The scan is codec-gated because the two codecs read the NAL-type bits differently (H.264 uses
 /// `byte & 0x1F`, HEVC uses `(byte >> 1) & 0x3F`), so an H.264 slice type would otherwise be
-/// misread as an HEVC parameter set (and vice versa). Without a resolved codec, returns false and
+/// interpreted under the wrong codec. Without a resolved codec, returns false and
 /// leaves keyframe detection to the codec-agnostic random_access_indicator.
 fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     let Some(codec) = codec else {
@@ -651,8 +681,8 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
             return false;
         }
         match codec {
-            VideoCodec::H264 => matches!(w[3] & 0x1F, 5 | 7),
-            VideoCodec::Hevc => matches!((w[3] >> 1) & 0x3F, 16..=21 | 32..=34),
+            VideoCodec::H264 => matches!(w[3] & 0x1F, 5),
+            VideoCodec::Hevc => matches!((w[3] >> 1) & 0x3F, 16..=21),
         }
     })
 }
@@ -754,8 +784,8 @@ pub fn mpeg_crc32(data: &[u8]) -> u32 {
 
 /// Build a single-packet SDT on PID 0x0011 advertising `service_name` for `service_id`, with
 /// `service_provider_name = "outpace"`. `service_name` must already be sanitized/bounded by
-/// [`sanitize_service_name`] so the section fits one packet. Continuity counter is 0 (PSI
-/// tolerates a repeated CC on an unchanged section).
+/// [`sanitize_service_name`] so the section fits one packet. Starts at continuity counter
+/// zero; an owner repeating the packet must assign its output continuity sequence.
 fn build_sdt(service_id: u16, service_name: &str) -> [u8; TS_PACKET_LEN] {
     let name = service_name.as_bytes();
 
@@ -989,6 +1019,40 @@ mod tests {
         psi(pmt_pid, &s)
     }
 
+    /// Return a PSI packet with the MPEG-2 CRC filled in, for tests that exercise table parsing.
+    fn with_valid_psi_crc(mut packet: Vec<u8>) -> Vec<u8> {
+        let section_start = 5; // TS header + pointer_field
+        let section_len = 3
+            + (((packet[section_start + 1] as usize & 0x0F) << 8)
+                | packet[section_start + 2] as usize);
+        let crc_at = section_start + section_len - 4;
+        let crc = mpeg_crc32(&packet[section_start..crc_at]);
+        packet[crc_at..crc_at + 4].copy_from_slice(&crc.to_be_bytes());
+        packet
+    }
+
+    fn valid_pat(pmt_pid: u16) -> Vec<u8> {
+        with_valid_psi_crc(pat(pmt_pid))
+    }
+
+    fn valid_pmt_codec(pmt_pid: u16, video_pid: u16, stream_type: u8) -> Vec<u8> {
+        with_valid_psi_crc(pmt_codec(pmt_pid, video_pid, stream_type))
+    }
+
+    fn pes_nal(nal: &[u8]) -> Vec<u8> {
+        let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        pes.extend_from_slice(&[0x00, 0x00, 0x01]);
+        pes.extend_from_slice(nal);
+        pes
+    }
+
+    fn gate_with_valid_video(stream_type: u8) -> KeyframeGate {
+        let mut gate = KeyframeGate::new();
+        gate.push(&valid_pat(PMT_PID));
+        gate.push(&valid_pmt_codec(PMT_PID, VIDEO_PID, stream_type));
+        gate
+    }
+
     /// True iff `pkt` is on `pid` (single-packet helper for assertions).
     fn pid_of(pkt: &[u8]) -> u16 {
         (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16
@@ -1189,6 +1253,92 @@ mod tests {
         ];
         let out = g.push(&ts(VIDEO_PID, true, false, &pes));
         assert_eq!(packet_count(&out), 3, "HEVC IRAP NAL should lock the gate");
+    }
+
+    #[test]
+    fn gate_h264_sps_only_pusi_does_not_open_but_idr_does() {
+        let mut gate = gate_with_valid_video(0x1B);
+        let sps = gate.push(&ts(
+            VIDEO_PID,
+            true,
+            false,
+            &pes_nal(&[0x67, 0x42, 0x00, 0x1E]),
+        ));
+        assert!(sps.is_empty(), "SPS alone must not open the gate");
+
+        let wrong_pid = gate.push(&ts(AUDIO_PID, true, false, &pes_nal(&[0x65, 0x88])));
+        assert!(
+            wrong_pid.is_empty(),
+            "an IDR on the wrong PID must not open the gate"
+        );
+        let no_pusi = gate.push(&ts(VIDEO_PID, false, false, &pes_nal(&[0x65, 0x88])));
+        assert!(
+            no_pusi.is_empty(),
+            "an IDR without PUSI must not open the gate"
+        );
+
+        let idr = gate.push(&ts(VIDEO_PID, true, false, &pes_nal(&[0x65, 0x88])));
+        assert_eq!(packet_count(&idr), 3, "an actual IDR opens the gate");
+        assert_eq!(pid_of(&idr[2 * TS_PACKET_LEN..]), VIDEO_PID);
+    }
+
+    #[test]
+    fn gate_hevc_parameter_sets_do_not_open_but_irap_does() {
+        for nal in [&[0x40, 0x01][..], &[0x42, 0x01][..], &[0x44, 0x01][..]] {
+            let mut gate = gate_with_valid_video(0x24);
+            let held = gate.push(&ts(VIDEO_PID, true, false, &pes_nal(nal)));
+            assert!(held.is_empty(), "HEVC VPS/SPS/PPS alone must not open");
+            let wrong_pid = gate.push(&ts(AUDIO_PID, true, false, &pes_nal(&[0x26, 0x01, 0x80])));
+            assert!(
+                wrong_pid.is_empty(),
+                "an IRAP on the wrong PID must not open the gate"
+            );
+            let no_pusi = gate.push(&ts(VIDEO_PID, false, false, &pes_nal(&[0x26, 0x01, 0x80])));
+            assert!(
+                no_pusi.is_empty(),
+                "an IRAP without PUSI must not open the gate"
+            );
+            let irap = gate.push(&ts(VIDEO_PID, true, false, &pes_nal(&[0x26, 0x01, 0x80])));
+            assert_eq!(packet_count(&irap), 3, "HEVC IRAP opens the gate");
+        }
+    }
+
+    #[test]
+    fn gate_rai_with_parameter_sets_still_opens() {
+        let mut gate = gate_with_valid_video(0x1B);
+        let out = gate.push(&ts(
+            VIDEO_PID,
+            true,
+            true,
+            &pes_nal(&[0x67, 0x42, 0x00, 0x1E]),
+        ));
+        assert_eq!(packet_count(&out), 3, "RAI remains an opening signal");
+    }
+
+    #[test]
+    fn gate_parameter_only_scan_exhaustion_reports_scan_budget() {
+        let mut gate = KeyframeGate::with_max_scan_packets(4);
+        gate.push(&valid_pat(PMT_PID));
+        gate.push(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x1B));
+        let sps = gate.push_report(&ts(
+            VIDEO_PID,
+            true,
+            false,
+            &pes_nal(&[0x67, 0x42, 0x00, 0x1E]),
+        ));
+        assert!(sps.bytes.is_empty(), "SPS alone must stay held");
+        assert_eq!(
+            sps.resumed, None,
+            "PAT, PMT, and SPS do not exhaust budget 4"
+        );
+
+        let ordinary = gate.push_report(&ts(VIDEO_PID, false, false, &[0x11]));
+        assert_eq!(ordinary.resumed, Some(GateResume::ScanBudget));
+        assert_eq!(
+            packet_count(&ordinary.bytes),
+            1,
+            "only the ordinary packet resumes output"
+        );
     }
 
     #[test]
@@ -1472,6 +1622,163 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn sdt_counters(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .filter(|packet| ts_pid(packet) == SDT_PID)
+            .map(|packet| packet[3] & 0x0f)
+            .collect()
+    }
+
+    #[test]
+    fn injected_sdt_counters_advance_and_wrap_without_changing_sections() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".into()));
+        let opening = [pat(PMT_PID), pmt(PMT_PID, VIDEO_PID)].concat();
+        assert!(gate.push(&opening).is_empty());
+        let mut output = Vec::new();
+        for _ in 0..20 {
+            output.extend(gate.push(&random_access_packet(VIDEO_PID)));
+        }
+        assert_eq!(
+            sdt_counters(&output),
+            (0..20).map(|n| n % 16).collect::<Vec<_>>()
+        );
+        let expected = build_sdt(1, "Titled");
+        for packet in output
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .filter(|p| ts_pid(p) == SDT_PID)
+        {
+            assert_eq!(&packet[..3], &expected[..3]);
+            assert_eq!(packet[3] & 0xf0, expected[3] & 0xf0);
+            assert_eq!(
+                &packet[4..],
+                &expected[4..],
+                "SDT section and CRC must stay unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_sdt_counter_survives_all_gate_resets() {
+        for reset in [
+            KeyframeGate::reset,
+            KeyframeGate::reset_for_discontinuity,
+            KeyframeGate::rearm_for_discontinuity,
+        ] {
+            let mut gate = KeyframeGate::with_service_name(Some("Titled".into()));
+            let opening = [
+                pat(PMT_PID),
+                pmt(PMT_PID, VIDEO_PID),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat();
+            assert_eq!(sdt_counters(&gate.push(&opening)), vec![0]);
+            reset(&mut gate);
+            assert_eq!(sdt_counters(&gate.push(&opening)), vec![1]);
+        }
+    }
+
+    #[test]
+    fn injected_sdt_counter_excludes_upstream_sdt_at_scan_budget_fallback() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".into()));
+        let opening = [
+            pat(PMT_PID),
+            pmt(PMT_PID, VIDEO_PID),
+            random_access_packet(VIDEO_PID),
+        ]
+        .concat();
+        assert_eq!(sdt_counters(&gate.push(&opening)), vec![0]);
+        gate.rearm_for_discontinuity();
+        gate.max_scan_packets = 1;
+        let mut upstream = upstream_sdt();
+        upstream[3] = (upstream[3] & 0xf0) | 9;
+        let ordinary = ts(VIDEO_PID, false, false, &[0x11, 0x22]);
+        let fallback = gate.push_report(&[upstream, ordinary].concat());
+        assert_eq!(fallback.resumed, Some(GateResume::ScanBudget));
+        assert!(
+            sdt_counters(&fallback.bytes).is_empty(),
+            "fallback must not leak upstream SDT"
+        );
+        assert!(fallback
+            .bytes
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .any(|p| ts_pid(p) == VIDEO_PID && ts_timing(p.try_into().unwrap()).discontinuity));
+        assert_eq!(
+            sdt_counters(&gate.push(&random_access_packet(VIDEO_PID))),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn injected_sdt_counter_ignores_filtered_sdt_and_preserves_cached_psi() {
+        let mut gate = KeyframeGate::with_service_name(Some("Titled".into()));
+        let mut pat_first = pat(PMT_PID);
+        let mut pmt_first = pmt(PMT_PID, VIDEO_PID);
+        pat_first[3] = (pat_first[3] & 0xf0) | 7;
+        pmt_first[3] = (pmt_first[3] & 0xf0) | 11;
+        let mut pat_next = pat_first.clone();
+        let mut pmt_next = pmt_first.clone();
+        pat_next[3] = (pat_next[3] & 0xf0) | 8;
+        pmt_next[3] = (pmt_next[3] & 0xf0) | 12;
+        let mut output = gate.push(
+            &[
+                pat_first.clone(),
+                pmt_first.clone(),
+                upstream_sdt(),
+                random_access_packet(VIDEO_PID),
+            ]
+            .concat(),
+        );
+        output.extend(
+            gate.push(
+                &[
+                    upstream_sdt(),
+                    upstream_sdt(),
+                    pat_next.clone(),
+                    pmt_next.clone(),
+                    random_access_packet(VIDEO_PID),
+                ]
+                .concat(),
+            ),
+        );
+        assert_eq!(sdt_counters(&output), vec![0, 1]);
+        let psi: Vec<_> = output
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .filter(|p| ts_pid(p) == 0 || ts_pid(p) == PMT_PID)
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(
+            psi,
+            vec![
+                pat_first,
+                pmt_first,
+                pat_next.clone(),
+                pmt_next.clone(),
+                pat_next,
+                pmt_next
+            ]
+        );
+        assert!(output
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .filter(|p| ts_pid(p) == SDT_PID)
+            .all(|p| read_sdt_service_name(p).as_deref() == Some("Titled")));
     }
 
     #[test]

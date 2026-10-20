@@ -24,6 +24,13 @@ The live byte path is built and proven against real public swarms:
 - live-network tests remain ignored by default because they need the public swarm
   and a suitable network.
 
+The single production Rust live entrypoint is
+`ace_swarm::live_session::follow_live(LiveSessionInputs)`. It emits authenticated
+media as `LiveOutput { bytes, discontinuity }` and reconnects until the consumer
+drops. Pre-1.0 Rust compatibility break (#193): `driver::download_from_peer`,
+`driver::DownloadParams`, `live::LiveSession`, `live::LiveConfig`, and
+`LiveSession::run` have been removed; Rust callers must migrate to `follow_live`.
+
 Run the normal local gate with:
 
 ```bash
@@ -46,6 +53,13 @@ cargo run -p ace-engine --bin outpace -- serve
 
 With no subcommand, `outpace` defaults to `serve`.
 
+For native live playback, use `/streams/ace/cid:<content-id>` (or a bare content
+id), adding `.m3u8` for HLS. Both forms share status and DELETE session keys.
+Infohash playback uses `/streams/ace/ih:<infohash>` and resolves a verified descriptor
+through the catalog when needed. **Migration:** bare hex ids on native live routes now mean content ids,
+matching compat `id=`; update older infohash URLs to include `ih:`. See the
+[native API](docs/native-api.md) for selector and session details.
+
 Play a known Acestream link to stdout:
 
 ```bash
@@ -56,8 +70,7 @@ cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
 `content_id` > `infohash` > `url` > `magnet`:
 
 - `acestream://<content_id>` or `acestream:?content_id=<40-hex>`;
-- `acestream:?infohash=<40-hex>` - accepted, but `play` fails closed with an error: a one-shot
-  process holds no verified transport descriptor for a bare infohash (see "Infohash inputs");
+- `acestream:?infohash=<40-hex>` - resolves the live descriptor through the signed catalog;
 - a transport-file URL - either passed bare (`play https://host/x.acelive?a=1&b=2`,
   which handles a URL carrying its own `&`-joined query) or as
   `acestream:?url=<https://…>` (in the `acestream:?` form the URL's own query must
@@ -66,35 +79,49 @@ cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
   size cap, disabled redirects, and a request timeout; unsafe, oversized, or
   non-transport responses fail closed;
 - `magnet:?xt=urn:btih:<40-hex-or-32-base32>` - a BitTorrent v1 magnet, reduced to
-  its infohash (v2 `urn:btmh:` magnets are rejected). Like `infohash=`, it fails closed in `play`.
+  its infohash (v2 `urn:btmh:` magnets are rejected), then resolved through the signed catalog.
 
 The `/ace/getstream` compatibility route accepts the same selectors plus legacy
 `id=<40-hex>`, which is an alias for `content_id` (not `infohash`). Its precedence is
 `content_id` > `infohash` > `id` > `url` > `magnet`. A `url=` selector uses a self-contained
 playback id, so playback works after a daemon restart without any server-side alias table.
 
+### Content-id resolution
+
+Live and VOD content-id inputs use the catalog by default. A catalog failure returns an
+error rather than automatically querying BEP-9 metadata peers. The daemon can also resolve
+its own broadcasts through its trusted local broadcast registry without a catalog lookup.
+
+`OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` explicitly enables the raw transport-hash convention
+used by outpace broadcasts, after catalog failure. This applies to both `serve` and standalone
+`play` (including `--vod`). Peer metadata is accepted only when the SHA-1 of the complete
+wrapped transport bytes equals the requested identifier. This check does not establish the
+binding of a public catalog content id; that derivation remains unresolved. See
+[the content-id policy](docs/protocol/notes/63-bep9-content-id-policy.md).
+
 ### Infohash inputs
 
-A bare infohash identifies a swarm but carries no piece geometry or source key. outpace never
-guesses them. An infohash input (the native `/streams/ace/<40-hex>` form, compat `infohash=` or
-`magnet=`, CLI `acestream:?infohash=` or `magnet:`) plays only when the process already holds a
-verified transport descriptor for it:
+Catalog replies require the engine-compatible response signature, matching request nonce and
+transport checksum. The response key is embedded in clients, so this does not provide
+server-only authentication over plain HTTP; see [the protocol evidence and trust limits](docs/protocol/notes/62-catalog-response-authentication.md).
 
-- the same daemon resolved the stream earlier by content id through the signed catalog
-  (`cid:<content-id>`, `acestream://`, `content_id=`/`id=`), or answered `analyze_content` / `get_media_files` for
-  its content id; or
-- the daemon originates that broadcast itself.
+A bare infohash identifies a swarm but carries no piece geometry or source key. For
+native `ih:`, compat `infohash=`/`magnet=`, and CLI infohash/magnet inputs, outpace
+first checks its own broadcasts and verified descriptor index, then queries the
+signed catalog directly by infohash. Catalog response authentication, request
+nonce and checksum checks precede decoding, and the descriptor's computed swarm
+infohash must match the requested value before discovery or indexing.
 
-The descriptor's infohash commits to its piece length, chunk length and pubkey, so such a stream
-uses the real geometry and verifies every piece's RSA signature. Otherwise the request fails
-closed: the native routes return `422` with the reason, compat routes return an error envelope,
-and `outpace play` exits with an error. The reason suggests `cid:<id>`, which also covers a content
-id pasted without its prefix. Prefer content ids. Transport-URL streams reopen by their `turl-`
-id, not by infohash. An infohash becomes playable only from a descriptor fetched through the signed
-catalog (a content-id resolution) or from the daemon's own broadcast; it then uses that
-descriptor's geometry, pubkey and trackers. A content id resolved from BEP-9 peers, or a
-transport URL, never makes an infohash playable: neither binds the descriptor's trackers to
-the infohash.
+The verified descriptor supplies geometry, pubkey and trackers. Successful lookups
+populate the bounded in-process index; failures are suppressed for five seconds
+in a separate cache capped at 128 entries. A verified local descriptor takes
+precedence over a cached failure. Unavailable or mismatched descriptors fail
+closed without guessing geometry or falling back to BEP-9. Native playback returns
+`422` with a reason; compat JSON URL creation permits cold inputs, with resolution
+errors reported when playback is opened. CLI playback exits with an error.
+
+A BEP-9 content-id result or caller-supplied transport URL does not populate the
+catalog-provenance index. Transport-URL streams reopen by their `turl-` id.
 
 ### Live HLS audio
 
@@ -139,7 +166,14 @@ The broadcast command prints:
 
 - a raw MPEG-TS HTTP ingest URL;
 - an RTMP ingest URL at `rtmp://<host>:<rtmp-port>/live/<name>`;
-- an `acestream://<content_id>` link backed by BEP-9 `ut_metadata` serving.
+- an `acestream://<content_id>` link using the raw wrapped transport-file hash.
+
+The originating daemon resolves that link through its trusted local broadcast registry.
+A different receiving daemon or standalone `outpace play` needs
+`OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` to resolve it through BEP-9 `ut_metadata`; the default
+catalog policy does not automatically resolve these raw-hash links. Alternatively, pass the
+broadcast transport URL (`http://<host>:<http-port>/broadcast/<name>`) to `outpace play`
+or use the `url=` selector. The receiver's transport-URL access policy still applies.
 
 ## Installation
 
@@ -221,6 +255,11 @@ the Cargo version. The workflow:
 - creates a GitHub Release with generated release notes;
 - publishes `ghcr.io/jamezrin/outpace:<version>` and `ghcr.io/jamezrin/outpace:latest`.
 
+Pushes to `main` run `.github/workflows/edge.yml`, which publishes
+`ghcr.io/jamezrin/outpace:edge` and `ghcr.io/jamezrin/outpace:sha-<commit>` for
+`linux/amd64` only. `edge` moves with `main`. Keep production pinned to a
+release tag.
+
 ## Runtime Surfaces
 
 The supported integration contract is the native CLI and HTTP API. See the
@@ -259,6 +298,10 @@ deferred work are documented in
 
 Environment variables parsed by the daemon include:
 
+- `OUTPACE_BEP9_CONTENT_ID_FALLBACK` - raw transport-hash BEP-9 fallback for content-id
+  resolution after catalog failure, default off. Set to `1` on the receiving daemon or
+  standalone `play` process for outpace broadcast Ace links from another daemon. Applies to
+  live and VOD; peer results do not populate the catalog-provenance infohash index.
 - `OUTPACE_BIND` - HTTP bind address, default `127.0.0.1:6878`.
 - `OUTPACE_RTMP_BIND` - RTMP ingest bind address, default `127.0.0.1:1935`.
 - `OUTPACE_DATA_DIR` - persistent identity/cache root, default platform data dir
@@ -406,6 +449,8 @@ Start with these durable docs instead of a session resume file:
 - [`docs/testing/interop-swarm.md`](docs/testing/interop-swarm.md) - the `swarmtest`
   engine<->outpace interop harness (on-demand, local-only; needs docker + the
   proprietary engine, so it is NOT run in CI).
+- [`docs/deployment-lxc-warp.md`](docs/deployment-lxc-warp.md) - LXC guest behind Cloudflare
+  WARP, `edge` auto-deploy, and the inbound-peer workaround (scripts in `tools/deploy/lxc/`).
 - `docs/superpowers/plans/` and `docs/superpowers/specs/` - implementation plans
   and design specs retained as historical project records.
 

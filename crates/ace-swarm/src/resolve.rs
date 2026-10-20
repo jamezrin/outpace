@@ -2,8 +2,10 @@
 //!
 //! Every live [`StreamInfo`] comes from a decoded `AceStreamTransport` descriptor
 //! ([`stream_info_from_transport`]): the descriptor supplies the swarm infohash, geometry,
-//! trackers and source pubkey. The descriptor is located by content id (the signed catalog,
-//! then BEP-9 `ut_metadata` as a fallback) or fetched from a transport-file URL. A bare
+//! trackers and source pubkey. The descriptor is located by content id through the signed
+//! catalog or fetched from a transport-file URL. Explicitly opted-in callers may also use
+//! BEP-9 for the outpace raw-transport-hash namespace; this is not a verified derivation of
+//! public catalog content ids. A bare
 //! infohash carries no geometry, so it is never turned into a `StreamInfo` by guessing
 //! (issue #164); callers keep descriptors they have verified in an [`InfohashIndex`].
 
@@ -64,6 +66,10 @@ const CATALOG_HOST_TIMEOUT: Duration = Duration::from_secs(4);
 const CATALOG_RESPONSE_LIMIT: usize = 1024 * 1024;
 const CATALOG_SIGNING_SECRET: &[u8] =
     b"H!+:H1NnvvX\\x0bS'(;0/A\\nR{${\\n/3%1\\x0b*[r0o>QzNGKkXT@v\\x0b3DN;gx_66L2 {`F0,\\tKm>XoG~iY(\\x0bu]6E}\\t~07&H;9qE1d?d-A7S(";
+
+// TSService.get_key(2), the response counterpart of get_key(1) above.
+// Public protocol interoperability constant, not a private server credential.
+const CATALOG_RESPONSE_KEY: &[u8] = b"CNVU\\\\w5S/HGg\"pSzY&O\"`uGCD18\\x0cfS|h2H4eJBihWumSD7zSv;8,=z2?<\\tl6ka\\n\\x0c*O<3dzOZ|MT11]f0 Xuc| R\"$D;SsYm\\rw*..8h7d4k";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResolveError {
@@ -190,12 +196,13 @@ pub fn infohash_hex(infohash: &[u8; 20]) -> String {
     hex::encode(&infohash[..])
 }
 
-/// Resolve a content-id to a [`StreamInfo`] over an already-connected peer, by fetching the
-/// `AceStreamTransport` metadata via BEP-9 `ut_metadata` and decoding it.
+/// Resolve an outpace raw-transport-hash identifier to a [`StreamInfo`] over an
+/// already-connected peer, fetching `AceStreamTransport` metadata via BEP-9 `ut_metadata`.
 ///
-/// The content-id (`handshake_infohash`) is the metadata-swarm key used for the BT handshake;
-/// the returned `StreamInfo` carries the *real* infohash — `SHA1` of the fetched transport
-/// descriptor — plus geometry and trackers. No Acestream HTTP/index API is involved.
+/// `handshake_infohash` must be SHA-1 of the complete wrapped transport bytes. This convention
+/// is used by outpace broadcasts; public catalog content ids are not known to follow it.
+/// The returned `StreamInfo` carries the distinct descriptor-derived swarm infohash, geometry
+/// and trackers. This low-level function does not apply the daemon's opt-in policy.
 pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut PeerSession<S>,
     handshake_infohash: [u8; 20],
@@ -210,8 +217,9 @@ pub async fn resolve_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
 /// pure decode half is left to the caller ([`stream_info_from_transport`] for live,
 /// [`vod_info_from_transport`] for VOD).
 ///
-/// After the fetch, the blob is bound to `handshake_infohash`: content-id is SHA-1 of the raw
-/// transport file, so a peer that serves a well-formed but different blob is rejected.
+/// After the fetch, SHA-1 of the raw wrapped blob must equal `handshake_infohash`, rejecting
+/// substitution in the outpace raw-hash namespace. This does not implement a general public
+/// catalog content-id derivation, nor grant catalog provenance to peer-supplied trackers.
 pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut PeerSession<S>,
     handshake_infohash: [u8; 20],
@@ -251,23 +259,39 @@ pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Resolve a content-id through the official signed transport catalog.
 ///
-/// The catalog returns the encrypted `AceStreamTransport` bytes; checksum validation happens
-/// before the existing pure transport decoder computes the real live swarm infohash.
+/// The catalog returns encrypted `AceStreamTransport` bytes. Response signature, request
+/// nonce and checksum checks precede transport decoding. The embedded shared key matches
+/// engine verification but does not establish server-only authenticity; see protocol note 62.
 pub async fn resolve_via_catalog(content_id: &str) -> Result<StreamInfo, ResolveError> {
     stream_info_from_transport(&catalog_transport_bytes(content_id).await?)
 }
 
-/// Fetch the raw (decrypted) `AceStreamTransport` bytes for `content_id` from the signed
+/// Resolve a swarm infohash using the engine's signed, padded-Base64 catalog query.
+/// Authentication precedes decoding; the returned descriptor must bind the requested hash.
+pub async fn resolve_infohash_via_catalog(infohash: &str) -> Result<StreamInfo, ResolveError> {
+    let requested = hex20(infohash)?;
+    let value = Base64::encode_string(&requested);
+    let bytes = catalog_transport_bytes_query("infohash", &value).await?;
+    catalog_infohash_info(&bytes, requested)
+}
+
+/// Fetch the raw (encrypted) `AceStreamTransport` bytes for `content_id` from the signed
 /// catalog, trying each catalog host in turn. The pure decode half is left to the caller
 /// ([`stream_info_from_transport`] for live, [`vod_info_from_transport`] for VOD).
 pub async fn catalog_transport_bytes(content_id: &str) -> Result<Vec<u8>, ResolveError> {
     hex20(content_id)?;
+    catalog_transport_bytes_query("pid", content_id).await
+}
 
+async fn catalog_transport_bytes_query(
+    parameter: &str,
+    value: &str,
+) -> Result<Vec<u8>, ResolveError> {
     let mut last = ResolveError::Catalog("catalog request failed");
     for &(host, port) in CATALOG_HOSTS {
         match tokio::time::timeout(
             CATALOG_HOST_TIMEOUT,
-            fetch_catalog_transport(host, port, content_id),
+            fetch_catalog_transport_query(host, port, parameter, value),
         )
         .await
         {
@@ -279,19 +303,38 @@ pub async fn catalog_transport_bytes(content_id: &str) -> Result<Vec<u8>, Resolv
     Err(last)
 }
 
+#[cfg(test)]
 async fn fetch_catalog_transport(
     host: &str,
     port: u16,
     content_id: &str,
 ) -> Result<Vec<u8>, ResolveError> {
+    fetch_catalog_transport_query(host, port, "pid", content_id).await
+}
+
+async fn fetch_catalog_transport_query(
+    host: &str,
+    port: u16,
+    parameter: &str,
+    value: &str,
+) -> Result<Vec<u8>, ResolveError> {
     let request_random = {
         let mut rng = rand::rng();
         rng.random_range(1..=i64::MAX as u64)
     };
-    let signature = catalog_signature(content_id, request_random);
-    let path = format!(
-        "/gettorrent?_n=3.2.11&_p=linux&_r={request_random}&_v=3021100&pid={content_id}&_s={signature}"
-    );
+    let signature = catalog_query_signature(parameter, value, request_random);
+    // Sign raw values, then form-encode them. In particular a Base64 '+' must not
+    // become a space when the server decodes the query.
+    let mut url = reqwest::Url::parse("http://catalog.example.invalid/gettorrent")
+        .expect("constant catalog URL");
+    url.query_pairs_mut()
+        .append_pair("_n", "3.2.11")
+        .append_pair("_p", "linux")
+        .append_pair("_r", &request_random.to_string())
+        .append_pair("_v", "3021100")
+        .append_pair(parameter, value)
+        .append_pair("_s", &signature);
+    let path = format!("{}?{}", url.path(), url.query().expect("catalog query"));
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: outpace/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
@@ -321,21 +364,96 @@ async fn fetch_catalog_transport(
     }
 
     let body = http_response_body(&response)?;
-    catalog_response_transport(&body)
+    catalog_response_transport(&body, request_random)
 }
 
+fn catalog_infohash_info(bytes: &[u8], requested: [u8; 20]) -> Result<StreamInfo, ResolveError> {
+    let info = stream_info_from_transport(bytes)?;
+    if info.infohash != requested {
+        return Err(ResolveError::Catalog("catalog infohash mismatch"));
+    }
+    Ok(info)
+}
+
+#[cfg(test)]
 fn catalog_signature(content_id: &str, request_random: u64) -> String {
+    catalog_query_signature("pid", content_id, request_random)
+}
+
+fn catalog_query_signature(parameter: &str, value: &str, request_random: u64) -> String {
     let mut hasher = Sha1::new();
-    let signed = format!("_n=3.2.11#_p=linux#_r={request_random}#_v=3021100#pid={content_id}");
+    let signed = format!("_n=3.2.11#_p=linux#_r={request_random}#_v=3021100#{parameter}={value}");
     hasher.update(signed.as_bytes());
     hasher.update(CATALOG_SIGNING_SECRET);
     hex::encode(hasher.finalize())
 }
 
-fn catalog_response_transport(body: &[u8]) -> Result<Vec<u8>, ResolveError> {
+fn catalog_response_transport(body: &[u8], request_random: u64) -> Result<Vec<u8>, ResolveError> {
+    if body.len() > CATALOG_RESPONSE_LIMIT {
+        return Err(ResolveError::Catalog("catalog response too large"));
+    }
     let xml = std::str::from_utf8(body).map_err(|_| ResolveError::Catalog("bad catalog utf-8"))?;
-    let torrent = extract_xml_tag(xml, "torrent")?.trim();
-    let checksum = extract_xml_tag(xml, "checksum")?.trim();
+    // Parse the whole document: substring searches can mistake comments, nested elements,
+    // duplicate attributes or a second root for the response being authenticated.
+    let document = roxmltree::Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 4096,
+            ..Default::default()
+        },
+    )
+    .map_err(|_| ResolveError::Catalog("bad catalog xml"))?;
+    let root = document.root_element();
+    if !root.has_tag_name("response") {
+        return Err(ResolveError::Catalog("bad catalog response root"));
+    }
+    let signature = root
+        .attribute_node("sig")
+        .ok_or(ResolveError::Catalog("missing catalog signature"))?;
+    let expected_signature = signature.value();
+    if expected_signature.len() != 40
+        || !expected_signature
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(ResolveError::Catalog("bad catalog signature"));
+    }
+    // The engine signs the original response text, removing the literal ` sig="..."`.
+    // Never reserialize XML or normalize whitespace: those bytes are signed too.
+    let attribute = format!(" sig=\"{expected_signature}\"");
+    let range = signature.range();
+    if range.start == 0 || xml.get(range.start - 1..range.end) != Some(attribute.as_str()) {
+        return Err(ResolveError::Catalog("bad catalog signature attribute"));
+    }
+    let unsigned = xml.replace(&attribute, "");
+    let mut hasher = Sha1::new();
+    hasher.update(unsigned.as_bytes());
+    hasher.update(CATALOG_RESPONSE_KEY);
+    if hex::encode(hasher.finalize()) != expected_signature {
+        return Err(ResolveError::Catalog("catalog signature mismatch"));
+    }
+    let response_random = root
+        .attribute("r")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(ResolveError::Catalog("bad catalog random"))?;
+    if response_random != request_random {
+        return Err(ResolveError::Catalog("catalog random mismatch"));
+    }
+    let field = |tag| {
+        let mut elements = root.children().filter(|child| child.has_tag_name(tag));
+        let element = elements
+            .next()
+            .ok_or(ResolveError::Catalog("missing catalog tag"))?;
+        if elements.next().is_some() || element.children().any(|child| child.is_element()) {
+            return Err(ResolveError::Catalog("ambiguous catalog tag"));
+        }
+        element
+            .text()
+            .ok_or(ResolveError::Catalog("empty catalog tag"))
+    };
+    let torrent = field("torrent")?.trim();
+    let checksum = field("checksum")?.trim();
     let expected = decode_hex20(checksum).ok_or(ResolveError::Catalog("bad checksum"))?;
     let transport = Base64::decode_vec(torrent)
         .map_err(|_| ResolveError::Catalog("bad catalog torrent base64"))?;
@@ -396,20 +514,6 @@ fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, ResolveError> {
     }
 }
 
-fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Result<&'a str, ResolveError> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml
-        .find(&open)
-        .ok_or(ResolveError::Catalog("missing catalog tag"))?
-        + open.len();
-    let end = xml[start..]
-        .find(&close)
-        .ok_or(ResolveError::Catalog("missing catalog tag"))?
-        + start;
-    Ok(&xml[start..end])
-}
-
 fn find_crlf(bytes: &[u8]) -> Option<usize> {
     bytes.windows(2).position(|w| w == b"\r\n")
 }
@@ -455,8 +559,8 @@ fn checked_metadata_size(size: i64) -> Result<usize, ResolveError> {
 
 /// Whether `blob` is the transport file identified by `expected` (SHA-1 of the raw bytes).
 ///
-/// Content-id **is** that hash. Catalog XML checksums and BEP-9 handshake keys must both bind
-/// the fetched blob to it; otherwise a peer can substitute any well-formed AceStreamTransport.
+/// Catalog checksums identify the raw transport bytes, not necessarily the requested content
+/// id. BEP-9 callers deliberately opt into the outpace raw-hash namespace (protocol note 63).
 fn checked_transport_file_hash(blob: &[u8], expected: [u8; 20]) -> bool {
     transport_file_hash(blob) == expected
 }
@@ -1130,17 +1234,205 @@ mod tests {
     }
 
     #[test]
-    fn catalog_response_extracts_transport_and_checks_checksum() {
-        let body = br#"<?xml version="1.0"?>
-<response sig="abc" r="1"><torrent>YWJj</torrent><checksum>a9993e364706816aba3e25717850c26c9cd0d89d</checksum></response>
-"#;
-        assert_eq!(catalog_response_transport(body).unwrap(), b"abc");
+    fn catalog_response_rejects_substitution_even_with_updated_checksum() {
+        let body = include_bytes!("../../../tests/vectors/catalog/substituted.xml");
+        assert!(catalog_response_transport(body, 123).is_err());
+    }
 
-        let bad_checksum = br#"<response><torrent>YWJj</torrent><checksum>0000000000000000000000000000000000000000</checksum></response>"#;
+    #[test]
+    fn catalog_response_rejects_missing_or_invalid_signature() {
+        let body = include_str!("../../../tests/vectors/catalog/response.xml");
+        let sig_start = body.find(" sig=\"").unwrap();
+        let sig_end = sig_start + " sig=\"".len() + 40 + 1;
+        let mut unsigned = body.to_string();
+        unsigned.replace_range(sig_start..sig_end, "");
+        assert!(catalog_response_transport(unsigned.as_bytes(), 123).is_err());
+        let mut invalid = body.to_string();
+        invalid.replace_range(sig_start + 6..sig_end - 1, &"0".repeat(40));
+        assert!(catalog_response_transport(invalid.as_bytes(), 123).is_err());
+    }
+
+    #[test]
+    fn catalog_response_accepts_engine_verified_synthetic_descriptor() {
+        let body = include_bytes!("../../../tests/vectors/catalog/response.xml");
+        let transport = catalog_response_transport(body, 123).unwrap();
+        let info = stream_info_from_transport(&transport).unwrap();
+        assert_eq!(info.piece_length, 65_536);
+        assert_eq!(info.trackers, ["http://tracker.example.invalid/announce"]);
+    }
+
+    #[test]
+    fn catalog_response_rejects_replay_for_a_different_request() {
+        let body = include_bytes!("../../../tests/vectors/catalog/response.xml");
         assert_eq!(
-            catalog_response_transport(bad_checksum),
+            catalog_response_transport(body, 124),
+            Err(ResolveError::Catalog("catalog random mismatch"))
+        );
+    }
+
+    fn signed_catalog_response(unsigned: &str) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(unsigned.as_bytes());
+        hasher.update(CATALOG_RESPONSE_KEY);
+        let signature = hex::encode(hasher.finalize());
+        unsigned.replacen("<response", &format!("<response sig=\"{signature}\""), 1)
+    }
+
+    #[test]
+    fn catalog_infohash_rejects_authenticated_descriptor_for_another_swarm() {
+        let body = include_bytes!("../../../tests/vectors/catalog/response.xml");
+        let bytes = catalog_response_transport(body, 123).unwrap();
+        let expected = stream_info_from_transport(&bytes).unwrap();
+        assert_eq!(
+            catalog_infohash_info(&bytes, expected.infohash).unwrap(),
+            expected
+        );
+        assert_eq!(
+            catalog_infohash_info(&bytes, [0; 20]),
+            Err(ResolveError::Catalog("catalog infohash mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_infohash_query_encodes_base64_but_signs_raw_value() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let value = Base64::encode_string(&[0xfb; 20]);
+        let _ = fetch_catalog_transport_query("127.0.0.1", port, "infohash", &value).await;
+        let request = server.await.unwrap();
+        let path = request.split_whitespace().nth(1).unwrap();
+        let url = reqwest::Url::parse(&format!("http://catalog.example.invalid{path}")).unwrap();
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params.get("infohash"), Some(&value));
+        assert!(!params.contains_key("pid"));
+        for escape in ["%2B", "%2F", "%3D"] {
+            assert!(path.contains(escape), "missing Base64 URL escape {escape}");
+        }
+        let signed = format!(
+            "_n=3.2.11#_p=linux#_r={}#_v=3021100#infohash={value}",
+            params["_r"]
+        );
+        let mut hasher = Sha1::new();
+        hasher.update(signed.as_bytes());
+        hasher.update(CATALOG_SIGNING_SECRET);
+        assert_eq!(params["_s"], hex::encode(hasher.finalize()));
+    }
+
+    #[test]
+    fn catalog_response_still_requires_checksum_after_authentication() {
+        let body = signed_catalog_response(
+            "<response r=\"123\"><torrent>YWJj</torrent><checksum>0000000000000000000000000000000000000000</checksum></response>",
+        );
+        assert_eq!(
+            catalog_response_transport(body.as_bytes(), 123),
             Err(ResolveError::Catalog("checksum mismatch"))
         );
+    }
+
+    #[test]
+    fn catalog_response_rejects_malformed_or_ambiguous_xml() {
+        for unsigned in [
+            "<wrapper><response r=\"123\"/></wrapper>",
+            "<response r=\"123\"/><response r=\"123\"/>",
+            "<response r=\"123\" r=\"124\"/>",
+            "<response sig=\"abc\" r=\"123\"/>",
+            "<!DOCTYPE response [<!ENTITY nonce '123'>]><response r=\"&nonce;\"/>",
+            "<response/>",
+            "<response r=\"not-a-number\"/>",
+            "<response r=\"123\"><wrapper><torrent>YWJj</torrent></wrapper></response>",
+            "<response r=\"123\"><torrent>YWJj</torrent><torrent>ZGVm</torrent></response>",
+            "<response r=\"123\"><torrent><nested/></torrent></response>",
+        ] {
+            let body = signed_catalog_response(unsigned);
+            assert!(
+                catalog_response_transport(body.as_bytes(), 123).is_err(),
+                "{unsigned}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_response_authenticates_original_bytes_and_bounds_input() {
+        let body = include_str!("../../../tests/vectors/catalog/response.xml");
+        // XML-equivalent whitespace changes must invalidate a signature over the raw text.
+        let modified = body.replace("</torrent>", "</torrent>\n");
+        assert_eq!(
+            catalog_response_transport(modified.as_bytes(), 123),
+            Err(ResolveError::Catalog("catalog signature mismatch"))
+        );
+        assert!(catalog_response_transport(&[0xff], 123).is_err());
+        assert!(catalog_response_transport(&vec![b' '; CATALOG_RESPONSE_LIMIT + 1], 123).is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_http_fetch_binds_response_to_its_generated_nonce() {
+        use tokio::net::TcpListener;
+
+        for replay in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                let random: u64 = request
+                    .split("_r=")
+                    .nth(1)
+                    .unwrap()
+                    .split('&')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let response_random = if replay { random + 1 } else { random };
+                let body = signed_catalog_response(&format!(
+                    "<response r=\"{response_random}\"><torrent>YWJj</torrent><checksum>a9993e364706816aba3e25717850c26c9cd0d89d</checksum></response>",
+                ));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_catalog_transport(
+                    "127.0.0.1",
+                    port,
+                    "0123456789abcdef0123456789abcdef01234567",
+                ),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            if replay {
+                assert_eq!(
+                    result,
+                    Err(ResolveError::Catalog("catalog random mismatch"))
+                );
+            } else {
+                assert_eq!(result.unwrap(), b"abc");
+            }
+        }
     }
 
     #[test]

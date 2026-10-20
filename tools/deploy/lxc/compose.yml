@@ -1,0 +1,44 @@
+# Host-networked outpace for an LXC guest. Install as /opt/outpace/compose.yml with an .env
+# containing OUTPACE_IMAGE=ghcr.io/jamezrin/outpace:edge (or a pinned release tag).
+# Host networking means the listeners bind the guest's own addresses, so WARP and the guest
+# firewall apply to the daemon directly. The peer port is published by the router, not Docker.
+name: outpace
+
+services:
+  outpace:
+    image: ${OUTPACE_IMAGE:-ghcr.io/jamezrin/outpace:edge}
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      OUTPACE_BIND: 0.0.0.0:6878
+      OUTPACE_RTMP_BIND: 127.0.0.1:1935
+      # Listen port == announced port == router's external port. Change all three together.
+      OUTPACE_PEER_LISTEN: 0.0.0.0:8621
+      OUTPACE_DATA_DIR: /var/lib/outpace
+      OUTPACE_ENABLE_INBOUND: "1"
+      OUTPACE_ENABLE_SEEDING: "1"
+      # UPnP/NAT-PMP is appropriate here (host-networked) but off in this guide: a static
+      # router forward is predictable and avoids mappings competing with it.
+      OUTPACE_ENABLE_PORT_MAPPING: "0"
+      OUTPACE_CACHE_TYPE: memory
+      OUTPACE_CACHE_DIR: /var/lib/outpace/cache
+      OUTPACE_SEED_STORE_BYTES: "134217728"
+      # Serves the legacy /ace/getstream routes for existing media stacks. Drop if unused.
+      OUTPACE_EXPERIMENTAL_ACE_COMPAT: "1"
+    volumes:
+      - outpace-data:/var/lib/outpace
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:6878/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  outpace-data:

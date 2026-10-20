@@ -129,7 +129,7 @@ class Capture:
     def getstream(self, name, mode, base):
         identifier = urllib.parse.quote(self.identifier, safe='')
         if mode in ('native', 'nativecid'):
-            route = 'cid:' + identifier if mode == 'nativecid' else identifier
+            route = ('cid:' if mode == 'nativecid' else 'ih:') + identifier
             return f'{base}/streams/ace/{route}', f'{base}/streams/ace/{route}/status'
         url = f'{base}/ace/getstream?' + urllib.parse.urlencode({'id': self.identifier, 'format': 'json'})
         while not self.stop.is_set() and self.now() < self.duration:

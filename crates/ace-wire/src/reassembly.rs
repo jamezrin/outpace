@@ -156,15 +156,11 @@ impl PieceReassembler {
                 // already removed from `partial` above, so returning an error simply drops it —
                 // the cursor doesn't advance and the caller re-requests, rather than serving
                 // unauthenticated bytes to the consumer (see the module docs / B0/note 27).
-                let verified =
+                let (payload, sig) =
                     crate::live_auth::split_piece(&done.buf, self.piece_trailer as usize)
-                        .is_some_and(|(payload, sig)| {
-                            crate::live_auth::verify_piece(pubkey, payload, sig)
-                        });
-                if !verified {
-                    return Err(WireError::Invalid(
-                        "live-source piece signature verification failed",
-                    ));
+                        .ok_or(WireError::Invalid("live-source piece trailer split failed"))?;
+                if !crate::live_auth::verify_piece(pubkey, payload, sig) {
+                    return Err(WireError::SignatureRejected);
                 }
             }
             self.complete.insert(index, done.buf);
@@ -176,6 +172,16 @@ impl PieceReassembler {
     /// The emit cursor and completed, authenticated pieces remain unchanged.
     pub fn discard_partial(&mut self, index: u64) {
         self.partial.remove(&index);
+    }
+
+    /// Observe consecutive complete payloads at the cursor without consuming them.
+    pub fn ready_chunks(&self) -> impl Iterator<Item = &[u8]> {
+        let mut next = self.next_emit;
+        std::iter::from_fn(move || {
+            let bytes = self.complete.get(&next)?;
+            next = next.checked_add(1)?;
+            Some(&bytes[..bytes.len().saturating_sub(self.piece_trailer as usize)])
+        })
     }
 
     /// Pull all contiguous completed pieces from `next_emit` onward as one byte buffer,
@@ -214,6 +220,24 @@ impl PieceReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_chunks_observe_only_contiguous_media_without_trailers() {
+        let mut r = PieceReassembler::new(8, 0).with_piece_trailer(4);
+        r.add_block(0, 0, b"ab").unwrap();
+        r.add_block(2, 0, b"ijklSIG!").unwrap();
+        assert_eq!(r.ready_chunks().count(), 0);
+        r.add_block(0, 2, b"cdSIG!").unwrap();
+        assert_eq!(
+            r.ready_chunks().collect::<Vec<_>>(),
+            vec![b"abcd".as_slice()]
+        );
+        assert_eq!(r.next_needed(), 0);
+        r.add_block(1, 0, b"efghSIG!").unwrap();
+        assert_eq!(r.ready_chunks().count(), 3);
+        assert_eq!(r.take_ready(), b"abcdefghijkl");
+        assert_eq!(r.ready_chunks().count(), 0);
+    }
 
     #[test]
     fn contribution_reports_partial_writes_and_preserves_completed_no_ops() {
@@ -291,7 +315,10 @@ mod tests {
     #[test]
     fn rejects_block_past_piece_length() {
         let mut r = PieceReassembler::new(4, 0);
-        assert!(r.add_block(0, 2, &[1, 2, 3]).is_err());
+        assert!(matches!(
+            r.add_block(0, 2, &[1, 2, 3]),
+            Err(WireError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -421,8 +448,12 @@ mod tests {
         r.add_block(0, 0, &piece[..64]).unwrap();
         let err = r.add_block(0, 64, &piece[64..]).unwrap_err();
         assert!(
-            matches!(err, WireError::Invalid(_)),
-            "the block completing a forged piece is rejected"
+            matches!(err, WireError::SignatureRejected),
+            "only a complete piece with a failed source signature uses the distinct rejection"
+        );
+        assert!(
+            matches!(r.add_block(0, 0, &piece), Err(WireError::SignatureRejected)),
+            "a repeated failed assembled signature remains a signature rejection"
         );
         assert_eq!(
             r.take_ready(),

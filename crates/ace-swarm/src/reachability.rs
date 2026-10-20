@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Aggregates `yourip` observations and counts inbound peers. Cheap to share (`Arc`) across the
@@ -34,6 +34,8 @@ pub struct ReachabilityMonitor {
     inbound_peers: AtomicU64,
     /// Tally of every public IP a peer has echoed to us in `yourip`.
     yourip: Mutex<YourIpTally>,
+    /// Whether the daemon-lifetime troubleshooting hint has already been claimed.
+    troubleshooting_hint_emitted: AtomicBool,
 }
 
 /// A snapshot of what we've observed about our public IP.
@@ -105,6 +107,20 @@ impl ReachabilityMonitor {
         ReachabilityMonitor::default()
     }
 
+    /// Claim the single troubleshooting hint after ten minutes without reachability evidence.
+    /// `elapsed` is measured from the start of the daemon's reachability status task.
+    pub fn take_troubleshooting_hint(&self, elapsed: std::time::Duration) -> bool {
+        if elapsed < std::time::Duration::from_secs(600)
+            || self.inbound_peers() != 0
+            || self.observed_ip().is_some()
+        {
+            return false;
+        }
+        !self
+            .troubleshooting_hint_emitted
+            .swap(true, Ordering::Relaxed)
+    }
+
     /// Record a public IP a peer echoed to us in `yourip` (from an outbound handshake).
     pub fn observe_yourip(&self, ip: IpAddr) {
         self.yourip.lock().unwrap().observe(ip);
@@ -171,6 +187,33 @@ mod tests {
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn troubleshooting_hint_waits_ten_minutes_and_is_emitted_only_once() {
+        let m = ReachabilityMonitor::new();
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_millis(599_999)));
+        assert!(m.take_troubleshooting_hint(std::time::Duration::from_secs(600)));
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_secs(600)));
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_secs(1_200)));
+    }
+
+    #[test]
+    fn troubleshooting_hint_is_suppressed_after_any_inbound_peer() {
+        let m = ReachabilityMonitor::new();
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_secs(599)));
+        m.note_inbound_peer();
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_secs(600)));
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_secs(1_200)));
+    }
+
+    #[test]
+    fn troubleshooting_hint_is_suppressed_after_yourip_observation() {
+        let m = ReachabilityMonitor::new();
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_secs(599)));
+        m.observe_yourip(ip(203, 0, 113, 7));
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_secs(600)));
+        assert!(!m.take_troubleshooting_hint(std::time::Duration::from_secs(1_200)));
     }
 
     #[test]
