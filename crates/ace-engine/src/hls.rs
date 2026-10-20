@@ -931,6 +931,93 @@ mod tests {
     }
 
     #[test]
+    fn live_hls_pat_transport_switch_requires_fresh_prefix_and_discontinuity() {
+        let p = timed_pkg(1000);
+        let old_pat = valid_crc(pat(PMT_PID));
+        p.feed(&old_pat);
+        p.feed(&audio_pmt(&[3, 15], VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&with_pid(packets(1), 777));
+        let mut version_repeat = old_pat.clone();
+        version_repeat[10] = 0xc7;
+        p.feed(&valid_crc(version_repeat.clone()));
+        assert!(!p.state.lock().unwrap().awaiting_access_point);
+        let mut switched = version_repeat;
+        switched[9] = 2;
+        let switched = valid_crc(switched);
+        p.feed(&switched);
+        {
+            let st = p.state.lock().unwrap();
+            assert!(st.awaiting_access_point);
+            assert!(st.access.table_prefix().is_none());
+        }
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        assert!(p.segment(0).is_none()); // no old PMT may unlock the new transport
+        let fresh = audio_pmt(&[3, 0x11], VIDEO_PID);
+        p.feed(&fresh);
+        p.feed(&video_access_packet(VIDEO_PID, 216_000));
+        let audio = with_pid(packets(1), AUDIO_PID);
+        p.feed(&audio);
+        p.feed(&video_access_packet(VIDEO_PID, 324_000));
+        let segment = p.segment(0).unwrap();
+        assert_eq!(&segment[..TS_PACKET], switched.as_slice());
+        assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], fresh.as_slice());
+        assert!(segment.chunks_exact(TS_PACKET).any(|pkt| pkt == audio));
+        assert!(!segment
+            .chunks_exact(TS_PACKET)
+            .any(|pkt| ts_pid(pkt) == 777));
+        assert!(p
+            .playlist("test", "synthetic")
+            .contains("#EXT-X-DISCONTINUITY"));
+    }
+
+    #[test]
+    fn live_hls_losing_adts_restores_original_prefix_and_marks_fresh_run() {
+        let p = timed_pkg(1000);
+        let pat = valid_crc(pat(PMT_PID));
+        p.feed(&pat);
+        p.feed(&audio_pmt(&[3, 15], VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&with_pid(packets(1), 777));
+        let mut plain = audio_pmt(&[3, 0x11, 6], VIDEO_PID);
+        plain[10] = 0xc1 | (17 << 1);
+        let plain = valid_crc(plain);
+        let mut original = vec![0xff; TS_PACKET];
+        original[..4].copy_from_slice(&plain[..4]);
+        original[3] = 0x39;
+        original[4] = 2;
+        original[5] = 0;
+        original[7..].copy_from_slice(&plain[4..TS_PACKET - 3]);
+        p.feed(&original);
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        p.feed(&original); // upstream repetition must remain unchanged too
+        for i in 0..3 {
+            p.feed(&with_pid(packets(1), AUDIO_PID + i));
+        }
+        p.feed(&video_access_packet(VIDEO_PID, 216_000));
+        let segment = p.segment(0).unwrap();
+        assert_eq!(&segment[..TS_PACKET], pat.as_slice());
+        assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], original.as_slice());
+        let pmts: Vec<_> = segment
+            .chunks_exact(TS_PACKET)
+            .filter(|pkt| ts_pid(pkt) == PMT_PID)
+            .collect();
+        assert_eq!(pmts.len(), 2);
+        assert!(pmts.iter().all(|pkt| *pkt == original));
+        for i in 0..3 {
+            assert!(segment
+                .chunks_exact(TS_PACKET)
+                .any(|pkt| ts_pid(pkt) == AUDIO_PID + i));
+        }
+        assert!(!segment
+            .chunks_exact(TS_PACKET)
+            .any(|pkt| ts_pid(pkt) == 777));
+        assert!(p
+            .playlist("test", "synthetic")
+            .contains("#EXT-X-DISCONTINUITY"));
+    }
+
+    #[test]
     fn live_hls_table_change_discards_unfinished_run() {
         let p = timed_pkg(1000);
         p.feed(&valid_crc(pat(PMT_PID)));

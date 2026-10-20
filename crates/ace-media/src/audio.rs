@@ -126,6 +126,7 @@ pub struct AudioPacket {
 #[derive(Default)]
 pub struct LiveAudioSelection {
     mapping: Option<(u16, u16)>,
+    transport_stream_id: Option<u16>,
     pat: Option<[u8; N]>,
     pmt: Option<[u8; N]>,
     source_pmt: Option<Vec<u8>>,
@@ -182,11 +183,16 @@ impl LiveAudioSelection {
                     if programs.len() != 1 {
                         changed = self.disable();
                         self.mapping = None;
+                        self.transport_stream_id = None;
                         self.pat = None;
                     } else {
-                        if self.mapping != Some(programs[0]) {
+                        let transport_stream_id = u16::from_be_bytes([s[3], s[4]]);
+                        if self.mapping != Some(programs[0])
+                            || self.transport_stream_id != Some(transport_stream_id)
+                        {
                             changed = self.disable();
                             self.mapping = Some(programs[0]);
+                            self.transport_stream_id = Some(transport_stream_id);
                         }
                         self.pat = Some(packet);
                     }
@@ -194,6 +200,7 @@ impl LiveAudioSelection {
                 Err(PsiError::Unsupported) => {
                     changed = self.disable();
                     self.mapping = None;
+                    self.transport_stream_id = None;
                     self.pat = None;
                 }
                 Err(PsiError::Invalid) => {
@@ -314,7 +321,11 @@ impl LiveAudioSelection {
             };
         }
         self.effective = Some(out.clone());
-        self.rewrite |= selected.is_some();
+        self.rewrite = selected.is_some();
+        if !self.rewrite {
+            // Passthrough restores the source version too; use it as the baseline if AAC returns.
+            self.version = upstream_version;
+        }
         out[5] |= self.version << 1;
         let crc = mpeg_crc32(&out);
         out.extend_from_slice(&crc.to_be_bytes());
@@ -443,6 +454,66 @@ mod tests {
         let crc = mpeg_crc32(&p[5..end - 4]);
         p[end - 4..end].copy_from_slice(&crc.to_be_bytes());
         p
+    }
+
+    #[test]
+    fn pat_transport_switch_invalidates_selection_but_version_repeat_does_not() {
+        let mut st = state();
+        let cached = st.pmt;
+        let mut repeated = pat(1, 256);
+        repeated[10] = 0xc7;
+        repeated = repair(repeated);
+        assert!(!st.observe(repeated).changed);
+        assert_eq!(st.pmt, cached);
+        let mut switched = repeated;
+        switched[9] = 2; // same program/PMT mapping, different transport_stream_id
+        switched = repair(switched);
+        assert!(st.observe(switched).changed);
+        assert!(st.pmt.is_none());
+        assert_eq!(st.pcr_pid(), None);
+        assert_eq!(st.tables().copied().collect::<Vec<_>>(), vec![switched]);
+        let audio = elementary(258);
+        assert_eq!(st.observe(audio).packet, Some(audio));
+        let fresh = pmt(17, &[(0x1b, 257, &[]), (3, 258, &[])]);
+        assert_eq!(st.observe(fresh).packet, Some(fresh));
+        assert_eq!(
+            st.tables().copied().collect::<Vec<_>>(),
+            vec![switched, fresh]
+        );
+    }
+
+    #[test]
+    fn losing_adts_restores_original_pmt_adaptation_version_and_es_passthrough() {
+        let mut st = state();
+        let plain = pmt(
+            17,
+            &[
+                (0x1b, 257, &[]),
+                (3, 258, &[]),
+                (0x11, 259, &[]),
+                (6, 260, &[]),
+            ],
+        );
+        let mut original = [0xff; N];
+        original[..4].copy_from_slice(&plain[..4]);
+        original[3] = 0x39;
+        original[4] = 2;
+        original[5] = 0;
+        original[7..].copy_from_slice(&plain[4..N - 3]);
+        let result = st.observe(original);
+        assert!(result.changed);
+        assert_eq!(result.packet, Some(original));
+        assert_eq!(st.pmt, Some(original));
+        let mut emitted = original;
+        st.emitted(&mut emitted);
+        assert_eq!(emitted, original);
+        let repeat = st.observe(original);
+        assert!(!repeat.changed);
+        assert_eq!(repeat.packet, Some(original));
+        for pid in [258, 259, 260] {
+            let audio = elementary(pid);
+            assert_eq!(st.observe(audio).packet, Some(audio));
+        }
     }
 
     #[test]
