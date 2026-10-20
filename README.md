@@ -96,6 +96,23 @@ descriptor's geometry, pubkey and trackers. A content id resolved from BEP-9 pee
 transport URL, never makes an infohash playable: neither binds the descriptor's trackers to
 the infohash.
 
+### Live HLS audio
+
+Live HLS prefers the first PMT-declared ADTS AAC track (`stream_type 0x0f`). When
+one is present, HLS removes other confidently identified audio tracks from both
+the PMT and media packets. LATM AAC (`0x11`) is distinct from ADTS; MPEG audio
+(`0x03`/`0x04`) does not imply MP3. Private streams (`0x06`) count as audio only
+with bounded AC-3, E-AC-3, DTS or matching registration descriptors; unknown
+private streams remain intact. Without ADTS AAC, audio passes through unchanged.
+
+Selection requires current, CRC-valid, single-program, single-section PAT/PMT
+metadata fitting one TS packet per table. Fragmented or multiple-section/program
+PSI disables selection. Table changes restart HLS at a fresh access point with
+matching tables and a discontinuity. A removed audio PID carrying the declared
+program PCR retains adaptation-only clock packets. Direct TS/raw sessions,
+keyframe gating and VOD keep their existing behavior. This does not transcode,
+add an FFmpeg dependency, or guarantee Safari playback.
+
 ### VOD (single-file)
 
 For a **VOD** transport (a descriptor carrying a `pieces` SHA1 list), add `--vod` to

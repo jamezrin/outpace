@@ -4,6 +4,7 @@
 //! reassembled byte stream (see `ace_wire::reassembly`) is therefore MPEG-TS. This crate
 //! provides the pure logic to validate/align TS and segment it for HLS. No I/O.
 
+pub mod audio;
 pub mod hls;
 pub mod mpegts;
 

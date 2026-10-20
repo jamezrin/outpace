@@ -4,6 +4,7 @@
 
 use crate::config::HlsConfig;
 use crate::session::{StreamEvent, StreamSession};
+use ace_media::audio::LiveAudioSelection;
 use ace_media::mpegts::{
     ts_pid, ts_timing, ClockObservation, SelectedPcrClock, TsTiming, VideoAccessPointState,
 };
@@ -33,6 +34,9 @@ pub struct HlsPackager {
 }
 
 struct HlsState {
+    audio: LiveAudioSelection,
+    /// One source packet staged before filtering, outside the bounded segment buffer.
+    input: Vec<u8>,
     /// Sequence number of the first retained segment.
     media_seq: u64,
     discontinuity_sequence: u64,
@@ -53,10 +57,6 @@ struct HlsState {
     /// Set when `access` carries a title, so upstream SDT-PID packets must be dropped from
     /// segment bodies to avoid duplicating (or conflicting with) our synthesized SDT.
     filter_sdt: bool,
-    /// One packet outside the configured segment buffer, used only to classify a full segment's
-    /// next boundary without appending past `max_segment_bytes`.
-    lookahead: [u8; TS_PACKET],
-    lookahead_len: usize,
 }
 
 struct HlsSegment {
@@ -86,6 +86,8 @@ impl HlsPackager {
         }
         Arc::new(HlsPackager {
             state: Mutex::new(HlsState {
+                audio: LiveAudioSelection::default(),
+                input: Vec::with_capacity(TS_PACKET),
                 media_seq: 0,
                 discontinuity_sequence: 0,
                 segments: VecDeque::new(),
@@ -100,8 +102,6 @@ impl HlsPackager {
                 access,
                 awaiting_access_point: true,
                 filter_sdt,
-                lookahead: [0; TS_PACKET],
-                lookahead_len: 0,
             }),
             ready: tokio::sync::Notify::new(),
             max_segment_bytes,
@@ -151,8 +151,9 @@ impl HlsPackager {
         st.discontinuity_pending = true;
         st.deduplicate_source_marker = deduplicate_source_marker;
         st.access.reset();
+        st.audio.reset();
+        st.input.clear();
         st.awaiting_access_point = true;
-        st.lookahead_len = 0;
     }
 
     /// Append contiguous TS bytes, emitting PCR-timed, preferably random-access-aligned segments.
@@ -160,25 +161,46 @@ impl HlsPackager {
         let mut st = self.state.lock().unwrap();
         let mut remaining = data;
         while !remaining.is_empty() {
-            if st.cur.len() == self.max_segment_bytes {
-                let take = (TS_PACKET - st.lookahead_len).min(remaining.len());
-                let start = st.lookahead_len;
-                st.lookahead[start..start + take].copy_from_slice(&remaining[..take]);
-                st.lookahead_len += take;
-                remaining = &remaining[take..];
-                if st.lookahead_len == TS_PACKET {
-                    let packet = st.lookahead;
-                    st.lookahead_len = 0;
-                    self.scan_lookahead(&mut st, &packet);
-                }
+            let take = (TS_PACKET - st.input.len()).min(remaining.len());
+            st.input.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if st.input.len() != TS_PACKET {
                 continue;
             }
-            let room = self.max_segment_bytes - st.cur.len();
-            let packet_room = TS_PACKET - st.cur.len() % TS_PACKET;
-            let take = room.min(packet_room).min(remaining.len());
-            st.cur.extend_from_slice(&remaining[..take]);
-            remaining = &remaining[take..];
-            self.scan(&mut st);
+            let packet: [u8; TS_PACKET] = st.input.as_slice().try_into().unwrap();
+            st.input.clear();
+            // Transport markers must reset state before an excluded PID can be filtered.
+            if ts_timing(&packet).discontinuity && !st.deduplicate_source_marker {
+                st.audio.reset();
+                st.access.reset();
+                self.discard_incomplete_run(&mut st);
+                continue;
+            }
+            let result = st.audio.observe(packet);
+            if result.changed {
+                let pending = st.discontinuity_pending || !st.awaiting_access_point;
+                st.access.reset();
+                self.discard_incomplete_run(&mut st);
+                st.discontinuity_pending = pending;
+                let tables: Vec<_> = st.audio.tables().copied().collect();
+                for table in tables {
+                    st.access.observe(&table);
+                }
+            }
+            if let Some(packet) = result.packet {
+                self.feed_packet(&mut st, &packet);
+            } else if ts_timing(&packet).discontinuity {
+                st.deduplicate_source_marker = false;
+            }
+        }
+    }
+
+    fn feed_packet(&self, st: &mut HlsState, packet: &[u8; TS_PACKET]) {
+        if st.cur.len() == self.max_segment_bytes {
+            self.scan_lookahead(st, packet);
+        } else {
+            st.cur.extend_from_slice(packet);
+            self.scan(st);
         }
     }
 
@@ -262,6 +284,7 @@ impl HlsPackager {
             let observation = Self::observe_clock(st, timing);
             if observation == ClockObservation::Reset {
                 st.access.reset();
+                st.audio.reset();
                 st.cur.drain(..packet_offset + TS_PACKET);
                 st.scanned_packets = 0;
                 st.discontinuity_pending = true;
@@ -309,13 +332,14 @@ impl HlsPackager {
 
         if Self::observe_clock(st, timing) == ClockObservation::Reset {
             st.access.reset();
+            st.audio.reset();
             self.discard_incomplete_run(st);
             return;
         }
 
         // Drop a titled stream's upstream SDT lookahead packet only after the discontinuity and
         // PCR-regression safety checks above (both PID-agnostic), so a flagged SDT still forces a
-        // reset. `feed` already zeroed `lookahead_len`, so returning here refills cleanly.
+        // reset. `feed` already consumed the source packet, so returning here refills cleanly.
         if st.filter_sdt && ts_pid(packet) == SDT_PID {
             return;
         }
@@ -382,10 +406,12 @@ impl HlsPackager {
         st.discontinuity_pending = true;
         st.deduplicate_source_marker = false;
         st.awaiting_access_point = true;
-        st.lookahead_len = 0;
     }
 
-    fn observe_clock(st: &mut HlsState, timing: TsTiming) -> ClockObservation {
+    fn observe_clock(st: &mut HlsState, mut timing: TsTiming) -> ClockObservation {
+        if st.audio.pcr_pid().is_some_and(|pid| pid != timing.pid) {
+            timing.pcr = None;
+        }
         let observation = st.clock.observe(timing);
         match observation {
             ClockObservation::Advanced(_) => st.boundary_timing = Some(timing),
@@ -411,7 +437,8 @@ impl HlsPackager {
             st.media_seq += 1;
         }
         let rest = st.cur.split_off(end);
-        let seg = std::mem::replace(&mut st.cur, rest);
+        let mut seg = std::mem::replace(&mut st.cur, rest);
+        st.audio.emitted(&mut seg);
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
         st.segments.push_back(HlsSegment {
             bytes: Bytes::from(seg),
@@ -793,6 +820,231 @@ mod tests {
                 start_pcr + i as u64 * 108_000,
             ));
         }
+    }
+
+    fn valid_crc(mut packet: Vec<u8>) -> Vec<u8> {
+        let end = 5 + 3 + (((packet[6] & 15) as usize) << 8 | packet[7] as usize);
+        let crc = ace_media::mpegts::mpeg_crc32(&packet[5..end - 4]);
+        packet[end - 4..end].copy_from_slice(&crc.to_be_bytes());
+        packet
+    }
+
+    fn audio_pmt(types: &[u8], pcr_pid: u16) -> Vec<u8> {
+        let mut section = vec![
+            2,
+            0xb0,
+            0,
+            0,
+            1,
+            0xc1,
+            0,
+            0,
+            0xe0 | (pcr_pid >> 8) as u8,
+            pcr_pid as u8,
+            0xf0,
+            0,
+            0x1b,
+            0xe1,
+            1,
+            0xf0,
+            0,
+        ];
+        for (i, ty) in types.iter().enumerate() {
+            section.extend_from_slice(&[*ty, 0xe1, 2 + i as u8, 0xf0, 0]);
+        }
+        section.extend_from_slice(&[0; 4]);
+        section[2] = (section.len() - 3) as u8;
+        valid_crc(psi(PMT_PID, &section))
+    }
+
+    #[test]
+    fn live_hls_prefers_first_adts_and_removes_competing_audio() {
+        for types in [&[0x03, 0x0f, 0x0f][..], &[0x0f, 0x04, 0x11][..]] {
+            let p = timed_pkg(1000);
+            p.feed(&valid_crc(pat(PMT_PID)));
+            p.feed(&audio_pmt(types, VIDEO_PID));
+            p.feed(&video_access_packet(VIDEO_PID, 0));
+            for i in 0..3 {
+                p.feed(&with_pid(packets(1), AUDIO_PID + i));
+            }
+            p.feed(&audio_pmt(types, VIDEO_PID));
+            p.feed(&video_access_packet(VIDEO_PID, 108_000));
+            let seg = p.segment(0).unwrap();
+            let selected = AUDIO_PID + types.iter().position(|ty| *ty == 0x0f).unwrap() as u16;
+            for i in 0..3 {
+                assert_eq!(
+                    seg.chunks_exact(TS_PACKET)
+                        .any(|pkt| ts_pid(pkt) == AUDIO_PID + i),
+                    AUDIO_PID + i == selected,
+                    "competing audio leaked"
+                );
+            }
+            for pkt in seg
+                .chunks_exact(TS_PACKET)
+                .filter(|pkt| ts_pid(pkt) == PMT_PID)
+            {
+                let end = 8 + pkt[7] as usize;
+                assert_eq!(ace_media::mpegts::mpeg_crc32(&pkt[5..end]), 0);
+                assert_eq!(pkt[7], 23); // fixed PMT + video + one audio + CRC
+            }
+        }
+    }
+
+    #[test]
+    fn live_hls_without_adts_preserves_audio_and_tables() {
+        let p = timed_pkg(1000);
+        let table = audio_pmt(&[0x03, 0x11, 0x06], VIDEO_PID);
+        p.feed(&valid_crc(pat(PMT_PID)));
+        p.feed(&table);
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        for i in 0..3 {
+            p.feed(&with_pid(packets(1), AUDIO_PID + i));
+        }
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        let seg = p.segment(0).unwrap();
+        assert_eq!(&seg[TS_PACKET..2 * TS_PACKET], &table);
+        for i in 0..3 {
+            assert!(seg
+                .chunks_exact(TS_PACKET)
+                .any(|pkt| ts_pid(pkt) == AUDIO_PID + i));
+        }
+    }
+
+    #[test]
+    fn live_hls_retains_removed_audio_pcr_without_pes_and_uses_declared_clock() {
+        let p = timed_pkg(1000);
+        p.feed(&valid_crc(pat(PMT_PID)));
+        p.feed(&audio_pmt(&[0x03, 0x0f], AUDIO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 900_000));
+        p.feed(&pcr_packet(AUDIO_PID, 0, false, false, 0x55));
+        p.feed(&pcr_packet(AUDIO_PID, 108_000, false, false, 0x56));
+        p.feed(&video_access_packet(VIDEO_PID, 1)); // unrelated backwards clock
+        let seg = p.segment(0).expect("declared audio PCR controls boundary");
+        let clock = seg
+            .chunks_exact(TS_PACKET)
+            .find(|pkt| ts_pid(pkt) == AUDIO_PID)
+            .unwrap();
+        assert_eq!(clock[3] & 0x30, 0x20);
+        assert_eq!(clock[4], 183);
+        assert_eq!(clock[1] & 0x40, 0);
+        assert!(clock[12..].iter().all(|byte| *byte == 0xff));
+    }
+
+    #[test]
+    fn live_hls_table_change_discards_unfinished_run() {
+        let p = timed_pkg(1000);
+        p.feed(&valid_crc(pat(PMT_PID)));
+        p.feed(&audio_pmt(&[0x03, 0x0f], VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&with_pid(packets(1), 777));
+        p.feed(&audio_pmt(&[0x0f, 0x03], VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        p.feed(&video_access_packet(VIDEO_PID, 216_000));
+        let seg = p.segment(0).unwrap();
+        assert!(!seg.chunks_exact(TS_PACKET).any(|pkt| ts_pid(pkt) == 777));
+        assert!(p
+            .playlist("test", "synthetic")
+            .contains("#EXT-X-DISCONTINUITY"));
+    }
+
+    #[test]
+    fn live_hls_late_validated_selection_discards_old_audio_and_cached_tables() {
+        let p = timed_pkg(1000);
+        p.feed(&pat(PMT_PID)); // legacy non-validated video metadata
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&with_pid(packets(1), AUDIO_PID));
+        p.feed(&valid_crc(pat(PMT_PID)));
+        p.feed(&audio_pmt(&[3, 15], VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        p.feed(&video_access_packet(VIDEO_PID, 216_000));
+        let seg = p.segment(0).unwrap();
+        assert!(!seg
+            .chunks_exact(TS_PACKET)
+            .any(|pkt| ts_pid(pkt) == AUDIO_PID));
+        assert!(p
+            .playlist("test", "synthetic")
+            .contains("#EXT-X-DISCONTINUITY"));
+    }
+
+    #[test]
+    fn live_hls_selection_filters_ceiling_lookahead_and_counts_prefix_pmt_continuity() {
+        let p = clean_pkg(4);
+        let table = audio_pmt(&[3, 15], VIDEO_PID);
+        p.feed(&valid_crc(pat(PMT_PID)));
+        p.feed(&table);
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&table); // fills ceiling with a repeated PMT
+        p.feed(&with_pid(packets(1), AUDIO_PID)); // must not force a ceiling cut
+        p.feed(&video_access_packet(VIDEO_PID, 108_000));
+        p.feed(&table);
+        p.feed(&video_access_packet(VIDEO_PID, 216_000));
+        let mut counters = Vec::new();
+        for seq in 0..2 {
+            let seg = p.segment(seq).unwrap();
+            assert!(seg.len() <= 4 * TS_PACKET);
+            assert!(!seg
+                .chunks_exact(TS_PACKET)
+                .any(|pkt| ts_pid(pkt) == AUDIO_PID));
+            for pkt in seg
+                .chunks_exact(TS_PACKET)
+                .filter(|pkt| ts_pid(pkt) == PMT_PID)
+            {
+                counters.push(pkt[3] & 15);
+                assert_eq!(
+                    ace_media::mpegts::mpeg_crc32(&pkt[5..8 + pkt[7] as usize]),
+                    0
+                );
+            }
+        }
+        assert_eq!(counters, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn live_hls_gap_and_lag_clear_selection_and_partial_source_packet() {
+        for lag in [false, true] {
+            let p = timed_pkg(1000);
+            p.feed(&valid_crc(pat(PMT_PID)));
+            p.feed(&audio_pmt(&[3, 15], VIDEO_PID));
+            p.feed(&video_access_packet(VIDEO_PID, 0));
+            p.feed(&audio_pmt(&[3, 15], VIDEO_PID)[..37]);
+            if lag {
+                p.receiver_lag();
+            } else {
+                p.discontinuity();
+            }
+            p.feed(&valid_crc(pat(PMT_PID)));
+            p.feed(&audio_pmt(&[0x11, 3], VIDEO_PID)); // no ADTS: old filter must be gone
+            p.feed(&video_access_packet(VIDEO_PID, 900_000));
+            p.feed(&with_pid(packets(1), AUDIO_PID));
+            p.feed(&video_access_packet(VIDEO_PID, 1_008_000));
+            let seg = p.segment(0).unwrap();
+            assert!(seg
+                .chunks_exact(TS_PACKET)
+                .any(|pkt| ts_pid(pkt) == AUDIO_PID));
+            assert!(p
+                .playlist("test", "synthetic")
+                .contains("#EXT-X-DISCONTINUITY"));
+        }
+    }
+
+    #[test]
+    fn live_hls_excluded_audio_discontinuity_is_processed_before_filtering() {
+        let p = timed_pkg(1000);
+        p.feed(&valid_crc(pat(PMT_PID)));
+        p.feed(&audio_pmt(&[3, 15], VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&with_pid(packets(1), 777));
+        p.feed(&pcr_packet(AUDIO_PID, 0, false, true, 0));
+        p.feed(&valid_crc(pat(PMT_PID)));
+        p.feed(&audio_pmt(&[3, 15], VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 900_000));
+        p.feed(&video_access_packet(VIDEO_PID, 1_008_000));
+        let seg = p.segment(0).unwrap();
+        assert!(!seg.chunks_exact(TS_PACKET).any(|pkt| ts_pid(pkt) == 777));
+        assert!(p
+            .playlist("test", "synthetic")
+            .contains("#EXT-X-DISCONTINUITY"));
     }
 
     #[test]
