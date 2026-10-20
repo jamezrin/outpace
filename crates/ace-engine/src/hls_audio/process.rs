@@ -186,8 +186,23 @@ impl InputBudget {
         Ok(BudgetedInput { bytes, permit })
     }
 
-    /// The borrowed broadcast allocation remains session-owned until permits are
-    /// available. Copy only the bounded view, so no retained tiny slice pins it.
+    /// Reserve before detaching a broadcast view. This must not wait while the
+    /// caller owns an unaccounted backing allocation, even for a tiny view.
+    pub fn try_copy(&self, bytes: &[u8]) -> Result<BudgetedInput, HlsFailure> {
+        if bytes.len() > INPUT_BYTES {
+            return Err(HlsFailure::InputOverflow);
+        }
+        let permit = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(bytes.len() as u32)
+            .map_err(|_| HlsFailure::InputOverflow)?;
+        let bytes = bytes.to_vec().into_boxed_slice().into_vec();
+        Ok(BudgetedInput { bytes, permit })
+    }
+
+    /// Reserve before copying a borrowed slice whose backing storage is already
+    /// bounded/accounted by the caller throughout the wait.
     pub async fn acquire_copy(
         &self,
         bytes: &[u8],

@@ -206,14 +206,22 @@ pub(crate) fn spawn_worker(
 enum SourceItem {
     Packet([u8; 188]),
     Recovery(RecoveryReason),
+    Failed(HlsFailure),
     Closed,
 }
 struct PacketSource {
     rx: broadcast::Receiver<StreamEvent>,
-    chunk: Option<bytes::Bytes>,
+    chunk: Option<BudgetedInput>,
     offset: usize,
     partial: [u8; 188],
     staged: usize,
+    #[cfg(test)]
+    probe: Arc<PacketSourceProbe>,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct PacketSourceProbe {
+    retained_bytes: std::sync::atomic::AtomicUsize,
 }
 impl PacketSource {
     fn new(rx: broadcast::Receiver<StreamEvent>) -> Self {
@@ -223,32 +231,60 @@ impl PacketSource {
             offset: 0,
             partial: [0; 188],
             staged: 0,
+            #[cfg(test)]
+            probe: Arc::new(PacketSourceProbe::default()),
         }
     }
     fn discard_partial(&mut self) {
         self.staged = 0;
+        #[cfg(test)]
+        self.update_probe();
     }
-    async fn next(&mut self) -> SourceItem {
+    #[cfg(test)]
+    fn update_probe(&self) {
+        let retained = self
+            .chunk
+            .as_ref()
+            .map_or(0, |chunk| chunk.len().saturating_sub(self.offset));
+        self.probe
+            .retained_bytes
+            .store(retained + self.staged, std::sync::atomic::Ordering::Relaxed);
+    }
+    async fn next(&mut self, budget: &InputBudget) -> SourceItem {
         loop {
             if let Some(chunk) = &self.chunk {
                 let n = (188 - self.staged).min(chunk.len() - self.offset);
                 self.partial[self.staged..self.staged + n]
-                    .copy_from_slice(&chunk[self.offset..self.offset + n]);
+                    .copy_from_slice(&chunk.as_slice()[self.offset..self.offset + n]);
                 self.offset += n;
                 self.staged += n;
                 if self.offset == chunk.len() {
                     self.chunk = None;
                     self.offset = 0;
                 }
+                #[cfg(test)]
+                self.update_probe();
                 if self.staged == 188 {
                     self.staged = 0;
+                    #[cfg(test)]
+                    self.update_probe();
                     return SourceItem::Packet(self.partial);
                 }
             } else {
                 match self.rx.recv().await {
                     Ok(StreamEvent::Data(chunk)) => {
-                        self.chunk = Some(chunk);
+                        // Bytes may be a tiny view of an arbitrarily large owner.
+                        // Reserve and detach synchronously, then drop that owner
+                        // before returning a packet or reaching any await.
+                        let detached = budget.try_copy(&chunk);
+                        drop(chunk);
+                        self.chunk = match detached {
+                            Ok(chunk) => Some(chunk),
+                            Err(reason) => return SourceItem::Failed(reason),
+                        };
                         self.offset = 0;
+                        #[cfg(test)]
+                        self.update_probe();
                     }
                     Ok(StreamEvent::Discontinuity) => {
                         self.discard_partial();
@@ -321,10 +357,11 @@ impl EnabledWorker {
                     tokio::select! { biased;
                         _ = process::cancelled(&mut cancel) => return Ok(()),
                         _ = tokio::time::sleep_until(self.deadline) => return Err(HlsFailure::Deadline),
-                        item = self.source.next() => item,
+                        item = self.source.next(&self.budget) => item,
                     }
                 };
                 match item {
+                    SourceItem::Failed(reason) => return Err(reason),
                     SourceItem::Closed => return Ok(()),
                     SourceItem::Recovery(reason) => {
                         self.invalidate(reason, None)?;
@@ -460,9 +497,10 @@ impl EnabledWorker {
             let item = tokio::select! { biased;
                 _ = process::cancelled(cancel) => return Ok(Turn::Stop),
                 _ = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => return Err(HlsFailure::Deadline),
-                item = self.source.next() => item,
+                item = self.source.next(&self.budget) => item,
             };
             match item {
+                SourceItem::Failed(reason) => return Err(reason),
                 SourceItem::Closed => return Ok(Turn::Stop),
                 SourceItem::Recovery(reason) => return Ok(Turn::Recover(reason, None)),
                 SourceItem::Packet(mut packet) => {
@@ -480,7 +518,10 @@ impl EnabledWorker {
                     }
                     clear_marker(&mut packet);
                     if let Some(sender) = sender {
-                        let input = self.budget.acquire_copy(&packet, cancel).await?;
+                        // Source storage is still fully charged until its entire
+                        // allocation is dropped. Never await permits that only
+                        // this producer could release by consuming that tail.
+                        let input = self.budget.try_copy(&packet)?;
                         tokio::select! { biased;
                             _ = process::cancelled(cancel) => return Ok(Turn::Stop),
                             sent = sender.send(input) => sent.map_err(|_|HlsFailure::Pipe)?,
@@ -508,6 +549,7 @@ mod task4_tests {
     use super::process::test_fixtures as fixtures;
     use crate::provider::{SourceStats, TsSource};
     use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct OneChunkSource(Option<Bytes>);
     #[async_trait::async_trait]
@@ -553,6 +595,296 @@ mod task4_tests {
             budget: InputBudget::new(),
         };
         (worker, session, counters)
+    }
+
+    struct TrackedBacking {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl AsRef<[u8]> for TrackedBacking {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    impl Drop for TrackedBacking {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn valid_mpeg_audio_source(minimum_len: usize) -> Vec<u8> {
+        let mut input = fixtures::transport_prefix();
+        let pmt = fixtures::pmt_section(9, 256, 256, 0x1b, 257, 0x03);
+        input[188..376].copy_from_slice(&fixtures::psi_packet(4096, 2, &pmt));
+        for pcr in [0, 108_000, 216_000] {
+            input.extend_from_slice(&fixtures::pcr_packet(256, pcr));
+        }
+        let pad = fixtures::pcr_packet(256, 216_000);
+        while input.len() < minimum_len {
+            input.extend_from_slice(&pad);
+        }
+        input
+    }
+
+    fn worker_for_receiver(
+        rx: broadcast::Receiver<StreamEvent>,
+    ) -> (
+        EnabledWorker,
+        Arc<StreamSession>,
+        process::test_support::Counters,
+        Arc<PacketSourceProbe>,
+    ) {
+        let session = StreamSession::start(Box::new(OneChunkSource(None)), 2);
+        let config = HlsConfig {
+            segment_packets: 128,
+            window_segments: 4,
+            segment_duration_ms: 1000,
+            startup_segments: 1,
+            startup_timeout_ms: 15_000,
+        };
+        let media = HlsPackager::create(&session, config, true);
+        let (prepared, counters) = process::test_support::fake_prepared_child(
+            process::test_support::ChildMode::ReadyThenStall,
+        );
+        let source = PacketSource::new(rx);
+        let probe = source.probe.clone();
+        let worker = EnabledWorker {
+            media,
+            prepared,
+            source,
+            recovery: RecoveryWindow::new(),
+            config,
+            deadline: Instant::now() + Duration::from_secs(15),
+            seed: None,
+            budget: InputBudget::new(),
+        };
+        (worker, session, counters, probe)
+    }
+
+    async fn wait_for_blocked_transform(
+        task: &tokio::task::JoinHandle<Result<(), HlsFailure>>,
+        counters: &process::test_support::Counters,
+        probe: &PacketSourceProbe,
+    ) -> bool {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let child = counters.snapshot();
+                let retained = probe.retained_bytes.load(Ordering::Relaxed);
+                if task.is_finished() {
+                    return false;
+                }
+                if child.children_started == 1 && child.stdin_write_waits > 0 && retained > 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn hls_audio_packet_source_budget_oversized_logical_chunk_fails_before_retention_escape()
+    {
+        let _serial = process::test_support::process_test_lock().await;
+        let (tx, rx) = broadcast::channel(1);
+        let mut eviction_observer = tx.subscribe();
+        let (mut worker, _session, counters, probe) = worker_for_receiver(rx);
+        let budget = worker.budget.clone();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(cancel_rx).await });
+
+        const LOGICAL_BYTES: usize = 9 * 1024 * 1024;
+        let mut large = valid_mpeg_audio_source(LOGICAL_BYTES);
+        assert!(large.len() > 8 * 1024 * 1024);
+        assert_eq!(large.len() % 188, 0);
+        let allocation_bytes = large.capacity();
+        let drops = Arc::new(AtomicUsize::new(0));
+        tx.send(StreamEvent::Data(Bytes::from_owner(TrackedBacking {
+            bytes: std::mem::take(&mut large),
+            drops: drops.clone(),
+        })))
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .expect("oversized source input terminates worker")
+            .expect("worker task joins");
+        let eviction_packet = fixtures::pcr_packet(256, 216_000);
+        for _ in 0..4 {
+            let _ = tx.send(StreamEvent::Data(Bytes::copy_from_slice(&eviction_packet)));
+        }
+        assert!(matches!(
+            eviction_observer.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(n)) if n > 0
+        ));
+        drop(eviction_observer);
+        drop(tx);
+
+        let retained_tail = probe.retained_bytes.load(Ordering::Relaxed);
+        let charged = budget.charged();
+        let owner_drops_before_cancel = drops.load(Ordering::SeqCst);
+        let child_starts = counters.snapshot().children_started;
+        println!(
+            "oversized source rejected: logical={} backing_capacity={} charged={} retained_tail={} owner_drops={} child_starts={}",
+            LOGICAL_BYTES,
+            allocation_bytes,
+            charged,
+            retained_tail,
+            owner_drops_before_cancel,
+            child_starts
+        );
+
+        assert_eq!(result, Err(HlsFailure::InputOverflow));
+        assert_eq!(
+            child_starts, 0,
+            "reject oversized input before child admission"
+        );
+        assert_eq!(owner_drops_before_cancel, 1);
+        assert_eq!(charged, 0);
+        assert_eq!(retained_tail, 0);
+        let cleanup = counters.snapshot();
+        assert_eq!(cleanup.children_started, cleanup.children_reaped);
+        assert_eq!(cleanup.active_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn hls_audio_packet_source_budget_full_chunk_rejects_without_waiting_for_replay_permit() {
+        let _serial = process::test_support::process_test_lock().await;
+        let (tx, rx) = broadcast::channel(1);
+        let (mut worker, _session, counters, _probe) = worker_for_receiver(rx);
+        let budget = worker.budget.clone();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(cancel_rx).await });
+
+        const LOGICAL_BYTES: usize = process::INPUT_BYTES / 188 * 188;
+        let source = valid_mpeg_audio_source(LOGICAL_BYTES);
+        assert_eq!(source.len(), LOGICAL_BYTES);
+        let allocation_bytes = source.capacity();
+        let drops = Arc::new(AtomicUsize::new(0));
+        tx.send(StreamEvent::Data(Bytes::from_owner(TrackedBacking {
+            bytes: source,
+            drops: drops.clone(),
+        })))
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .expect("full-budget source must not wait on permits it already owns")
+            .expect("worker task joins");
+        let cleanup = counters.snapshot();
+        println!(
+            "full-budget source rejected promptly: logical={} backing_capacity={} owner_drops={} child_starts={} charged_after_join={}",
+            LOGICAL_BYTES,
+            allocation_bytes,
+            drops.load(Ordering::SeqCst),
+            cleanup.children_started,
+            budget.charged()
+        );
+        assert_eq!(result, Err(HlsFailure::InputOverflow));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup.children_started, 0);
+        assert_eq!(cleanup.children_reaped, 0);
+        assert_eq!(cleanup.active_tasks, 0);
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn hls_audio_packet_source_budget_tiny_view_drops_oversized_backing_before_backpressure()
+    {
+        let _serial = process::test_support::process_test_lock().await;
+        let (tx, rx) = broadcast::channel(1);
+        let mut eviction_observer = tx.subscribe();
+        let (mut worker, _session, counters, probe) = worker_for_receiver(rx);
+        let media = worker.media.clone();
+        let budget = worker.budget.clone();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(cancel_rx).await });
+
+        let opening = valid_mpeg_audio_source(0);
+        tx.send(StreamEvent::Data(Bytes::from(opening))).unwrap();
+        assert!(matches!(
+            eviction_observer.try_recv(),
+            Ok(StreamEvent::Data(_))
+        ));
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if counters.snapshot().children_started == 1 && media.status() == HlsStatus::Ready {
+                    break;
+                }
+                if task.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("initial MPEG-audio opening either starts transform or fails closed");
+
+        const BACKING_BYTES: usize = 16 * 1024 * 1024;
+        const LOGICAL_BYTES: usize = 512 * 1024;
+        let logical = valid_mpeg_audio_source(LOGICAL_BYTES);
+        let logical_len = logical.len();
+        assert!(logical_len <= LOGICAL_BYTES + 187 && logical_len > 400 * 1024);
+        let mut backing = vec![0; BACKING_BYTES];
+        backing[..logical_len].copy_from_slice(&logical);
+        let allocation_bytes = backing.capacity();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Bytes::from_owner(TrackedBacking {
+            bytes: backing,
+            drops: drops.clone(),
+        });
+        let view = owner.slice(0..logical_len);
+        drop(owner);
+        tx.send(StreamEvent::Data(view)).unwrap();
+
+        let blocked = wait_for_blocked_transform(&task, &counters, &probe).await;
+        let eviction_packet = fixtures::pcr_packet(256, 216_000);
+        for _ in 0..4 {
+            let _ = tx.send(StreamEvent::Data(Bytes::copy_from_slice(&eviction_packet)));
+        }
+        assert!(matches!(
+            eviction_observer.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(n)) if n > 0
+        ));
+        drop(eviction_observer);
+        drop(tx);
+
+        let retained_tail = probe.retained_bytes.load(Ordering::Relaxed);
+        let charged = budget.charged();
+        let owner_drops_before_cancel = drops.load(Ordering::SeqCst);
+        println!(
+            "tiny view while child blocked after eviction: logical={} backing_capacity={} charged={} retained_tail={} owner_drops={} blocked={}",
+            logical_len,
+            allocation_bytes,
+            charged,
+            retained_tail,
+            owner_drops_before_cancel,
+            blocked
+        );
+        cancel_tx.send_replace(true);
+        let _ = tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .expect("worker cancellation completes child cleanup")
+            .expect("worker task joins");
+
+        assert!(
+            blocked,
+            "fake child stdin must be blocked while source tail is retained"
+        );
+        assert_eq!(
+            owner_drops_before_cancel, 1,
+            "the original {allocation_bytes}-byte owner must be released before backpressure; charged={charged}, source_tail={retained_tail}"
+        );
+        assert!(
+            charged >= retained_tail,
+            "budget charges {charged} bytes while PacketSource retains {retained_tail} logical tail bytes"
+        );
+        assert!(charged <= process::INPUT_BYTES);
+        let cleanup = counters.snapshot();
+        assert_eq!(cleanup.children_started, 1);
+        assert_eq!(cleanup.children_reaped, 1);
+        assert_eq!(cleanup.pumps_joined, 3);
+        assert_eq!(cleanup.active_tasks, 0);
     }
 
     #[test]
@@ -712,6 +1044,7 @@ mod task4_tests {
     async fn hls_audio_packet_source_discards_partial_chunk_on_source_recovery() {
         let (tx, rx) = broadcast::channel(8);
         let mut source = PacketSource::new(rx);
+        let budget = InputBudget::new();
         tx.send(StreamEvent::Data(Bytes::from(vec![0x11; 100])))
             .unwrap();
         tx.send(StreamEvent::Discontinuity).unwrap();
@@ -719,10 +1052,12 @@ mod task4_tests {
         tx.send(StreamEvent::Data(Bytes::copy_from_slice(&fresh)))
             .unwrap();
         assert!(matches!(
-            source.next().await,
+            source.next(&budget).await,
             SourceItem::Recovery(RecoveryReason::Source)
         ));
-        assert!(matches!(source.next().await, SourceItem::Packet(packet) if packet == fresh));
+        assert!(
+            matches!(source.next(&budget).await, SourceItem::Packet(packet) if packet == fresh)
+        );
     }
 
     #[tokio::test]
