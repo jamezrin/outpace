@@ -176,7 +176,9 @@ impl LiveAudioSelection {
                         };
                     }
                     let programs: Vec<_> = entries
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .filter(|e| e[0] != 0 || e[1] != 0)
                         .map(|e| (u16::from_be_bytes([e[0], e[1]]), pid(&e[2..])))
                         .collect();
@@ -346,7 +348,7 @@ impl LiveAudioSelection {
         if !self.rewrite {
             return;
         }
-        for packet in bytes.chunks_exact_mut(N) {
+        for packet in bytes.as_chunks_mut::<N>().0 {
             if self.mapping.is_some_and(|(_, p)| p == ts_pid(packet)) {
                 let cc = if packet[3] & 0x10 != 0 {
                     let cc = self.output_cc;
@@ -730,7 +732,7 @@ mod tests {
         let p = st.pmt.unwrap();
         let mut out = p.repeat(18);
         st.emitted(&mut out);
-        let cc: Vec<_> = out.chunks_exact(N).map(|p| p[3] & 15).collect();
+        let cc: Vec<_> = out.as_chunks::<N>().0.iter().map(|p| p[3] & 15).collect();
         assert_eq!(
             cc,
             vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1]

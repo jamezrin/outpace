@@ -873,14 +873,20 @@ mod tests {
             let selected = AUDIO_PID + types.iter().position(|ty| *ty == 0x0f).unwrap() as u16;
             for i in 0..3 {
                 assert_eq!(
-                    seg.chunks_exact(TS_PACKET)
+                    seg.as_chunks::<TS_PACKET>()
+                        .0
+                        .iter()
+                        .map(|packet| packet.as_slice())
                         .any(|pkt| ts_pid(pkt) == AUDIO_PID + i),
                     AUDIO_PID + i == selected,
                     "competing audio leaked"
                 );
             }
             for pkt in seg
-                .chunks_exact(TS_PACKET)
+                .as_chunks::<TS_PACKET>()
+                .0
+                .iter()
+                .map(|packet| packet.as_slice())
                 .filter(|pkt| ts_pid(pkt) == PMT_PID)
             {
                 let end = 8 + pkt[7] as usize;
@@ -905,7 +911,10 @@ mod tests {
         assert_eq!(&seg[TS_PACKET..2 * TS_PACKET], &table);
         for i in 0..3 {
             assert!(seg
-                .chunks_exact(TS_PACKET)
+                .as_chunks::<TS_PACKET>()
+                .0
+                .iter()
+                .map(|packet| packet.as_slice())
                 .any(|pkt| ts_pid(pkt) == AUDIO_PID + i));
         }
     }
@@ -921,7 +930,10 @@ mod tests {
         p.feed(&video_access_packet(VIDEO_PID, 1)); // unrelated backwards clock
         let seg = p.segment(0).expect("declared audio PCR controls boundary");
         let clock = seg
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .find(|pkt| ts_pid(pkt) == AUDIO_PID)
             .unwrap();
         assert_eq!(clock[3] & 0x30, 0x20);
@@ -962,9 +974,17 @@ mod tests {
         let segment = p.segment(0).unwrap();
         assert_eq!(&segment[..TS_PACKET], switched.as_slice());
         assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], fresh.as_slice());
-        assert!(segment.chunks_exact(TS_PACKET).any(|pkt| pkt == audio));
+        assert!(segment
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .any(|pkt| pkt == audio));
         assert!(!segment
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .any(|pkt| ts_pid(pkt) == 777));
         assert!(p
             .playlist("test", "synthetic")
@@ -999,18 +1019,27 @@ mod tests {
         assert_eq!(&segment[..TS_PACKET], pat.as_slice());
         assert_eq!(&segment[TS_PACKET..TS_PACKET * 2], original.as_slice());
         let pmts: Vec<_> = segment
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .filter(|pkt| ts_pid(pkt) == PMT_PID)
             .collect();
         assert_eq!(pmts.len(), 2);
         assert!(pmts.iter().all(|pkt| *pkt == original));
         for i in 0..3 {
             assert!(segment
-                .chunks_exact(TS_PACKET)
+                .as_chunks::<TS_PACKET>()
+                .0
+                .iter()
+                .map(|packet| packet.as_slice())
                 .any(|pkt| ts_pid(pkt) == AUDIO_PID + i));
         }
         assert!(!segment
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .any(|pkt| ts_pid(pkt) == 777));
         assert!(p
             .playlist("test", "synthetic")
@@ -1028,7 +1057,12 @@ mod tests {
         p.feed(&video_access_packet(VIDEO_PID, 108_000));
         p.feed(&video_access_packet(VIDEO_PID, 216_000));
         let seg = p.segment(0).unwrap();
-        assert!(!seg.chunks_exact(TS_PACKET).any(|pkt| ts_pid(pkt) == 777));
+        assert!(!seg
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .any(|pkt| ts_pid(pkt) == 777));
         assert!(p
             .playlist("test", "synthetic")
             .contains("#EXT-X-DISCONTINUITY"));
@@ -1047,7 +1081,10 @@ mod tests {
         p.feed(&video_access_packet(VIDEO_PID, 216_000));
         let seg = p.segment(0).unwrap();
         assert!(!seg
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
             .any(|pkt| ts_pid(pkt) == AUDIO_PID));
         assert!(p
             .playlist("test", "synthetic")
@@ -1071,10 +1108,16 @@ mod tests {
             let seg = p.segment(seq).unwrap();
             assert!(seg.len() <= 4 * TS_PACKET);
             assert!(!seg
-                .chunks_exact(TS_PACKET)
+                .as_chunks::<TS_PACKET>()
+                .0
+                .iter()
+                .map(|packet| packet.as_slice())
                 .any(|pkt| ts_pid(pkt) == AUDIO_PID));
             for pkt in seg
-                .chunks_exact(TS_PACKET)
+                .as_chunks::<TS_PACKET>()
+                .0
+                .iter()
+                .map(|packet| packet.as_slice())
                 .filter(|pkt| ts_pid(pkt) == PMT_PID)
             {
                 counters.push(pkt[3] & 15);
@@ -1107,7 +1150,10 @@ mod tests {
             p.feed(&video_access_packet(VIDEO_PID, 1_008_000));
             let seg = p.segment(0).unwrap();
             assert!(seg
-                .chunks_exact(TS_PACKET)
+                .as_chunks::<TS_PACKET>()
+                .0
+                .iter()
+                .map(|packet| packet.as_slice())
                 .any(|pkt| ts_pid(pkt) == AUDIO_PID));
             assert!(p
                 .playlist("test", "synthetic")
@@ -1128,7 +1174,12 @@ mod tests {
         p.feed(&video_access_packet(VIDEO_PID, 900_000));
         p.feed(&video_access_packet(VIDEO_PID, 1_008_000));
         let seg = p.segment(0).unwrap();
-        assert!(!seg.chunks_exact(TS_PACKET).any(|pkt| ts_pid(pkt) == 777));
+        assert!(!seg
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
+            .map(|packet| packet.as_slice())
+            .any(|pkt| ts_pid(pkt) == 777));
         assert!(p
             .playlist("test", "synthetic")
             .contains("#EXT-X-DISCONTINUITY"));
