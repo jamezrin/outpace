@@ -464,6 +464,116 @@ async fn ace_direct_start_failure_revokes_its_hidden_lease() {
 }
 
 #[tokio::test]
+async fn ace_playback_start_failures_are_distinct_from_missing_content() {
+    struct FailingProvider;
+
+    #[async_trait]
+    impl StreamProvider for FailingProvider {
+        fn network(&self) -> &'static str {
+            "fix"
+        }
+
+        async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            match id {
+                "no-peers" => Err(ProviderError::Backend(
+                    "no peers (no trackers/bootstrap)".into(),
+                )),
+                "timeout" => Err(ProviderError::Backend(
+                    "upstream handshake timed out".into(),
+                )),
+                "unresolvable" => Err(ProviderError::Unresolvable("no verified metadata".into())),
+                _ => Err(ProviderError::NotFound),
+            }
+        }
+    }
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(FailingProvider));
+    let mut state = ace_compat_state(0);
+    state.manager = StreamManager::new(registry);
+    let sessions = state.ace_sessions.clone();
+    let app = router(state);
+
+    for (key, status, reason) in [
+        ("no-peers", StatusCode::BAD_GATEWAY, "stream start failed"),
+        ("timeout", StatusCode::BAD_GATEWAY, "stream start failed"),
+        (
+            "unresolvable",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "stream metadata unavailable",
+        ),
+        ("missing", StatusCode::NOT_FOUND, ""),
+    ] {
+        let token = sessions.mint(
+            "0123456789abcdef0123456789abcdef01234567".into(),
+            key.into(),
+        );
+        let path = format!("/ace/r/0123456789abcdef0123456789abcdef01234567/{token}");
+        // A failed start must preserve the lease so the same playback URL can be retried.
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{key}");
+            if !reason.is_empty() {
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "text/plain; charset=utf-8"
+                );
+            }
+            assert_eq!(response_text(response).await, reason, "{key}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ace_playback_unknown_or_expired_tokens_and_networks_still_return_404() {
+    let mut state = ace_compat_state(0);
+    state.ace_sessions = Arc::new(AceSessionStore::new(Duration::from_secs(1), 8));
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    state.ace_sessions.insert_at(
+        "expired".into(),
+        id.into(),
+        id.into(),
+        Instant::now() - Duration::from_secs(2),
+    );
+    let token = state.ace_sessions.mint(id.into(), id.into());
+    let app = router(state.clone());
+    for path in [
+        format!("/ace/r/{id}/unknown"),
+        format!("/ace/r/{id}/expired"),
+        format!("/ace/r/89abcdef0123456789abcdef0123456789abcdef/{token}"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response_bytes(response).await.is_empty());
+    }
+    assert!(state.manager.list().await.is_empty());
+
+    // Cover both network selection failure and an unregistered provider in the manager.
+    for networks in [vec![], vec!["fix".into()]] {
+        state.networks = networks;
+        state.manager = StreamManager::new(ProviderRegistry::new());
+        let response = router(state.clone())
+            .oneshot(
+                Request::get(format!("/ace/r/{id}/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response_bytes(response).await.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn ace_getstream_mints_distinct_enforced_tokens() {
     let content_id = "2123456789abcdef0123456789abcdef01234567";
     let app = router(ace_compat_state(0));
