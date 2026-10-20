@@ -464,7 +464,7 @@ async fn ace_direct_start_failure_revokes_its_hidden_lease() {
 }
 
 #[tokio::test]
-async fn ace_playback_start_failures_are_distinct_from_missing_content() {
+async fn ace_playback_start_failures_are_distinct_from_unregistered_network() {
     struct FailingProvider;
 
     #[async_trait]
@@ -478,10 +478,17 @@ async fn ace_playback_start_failures_are_distinct_from_missing_content() {
                 "no-peers" => Err(ProviderError::Backend(
                     "no peers (no trackers/bootstrap)".into(),
                 )),
-                "timeout" => Err(ProviderError::Backend(
-                    "upstream handshake timed out".into(),
+                "catalog-timeout" => Err(ProviderError::Backend(
+                    concat!(
+                        "content-id catalog resolution failed: Catalog(\"catalog timeout\"); ",
+                        "raw-hash BEP-9 fallback is disabled ",
+                        "(OUTPACE_BEP9_CONTENT_ID_FALLBACK=1 to opt in)"
+                    )
+                    .into(),
                 )),
                 "unresolvable" => Err(ProviderError::Unresolvable("no verified metadata".into())),
+                // Models the manager's unregistered-network error. AceProvider itself
+                // never returns NotFound, even for unknown or unpublished content ids.
                 _ => Err(ProviderError::NotFound),
             }
         }
@@ -496,13 +503,17 @@ async fn ace_playback_start_failures_are_distinct_from_missing_content() {
 
     for (key, status, reason) in [
         ("no-peers", StatusCode::BAD_GATEWAY, "stream start failed"),
-        ("timeout", StatusCode::BAD_GATEWAY, "stream start failed"),
+        (
+            "catalog-timeout",
+            StatusCode::BAD_GATEWAY,
+            "stream start failed",
+        ),
         (
             "unresolvable",
             StatusCode::UNPROCESSABLE_ENTITY,
             "stream metadata unavailable",
         ),
-        ("missing", StatusCode::NOT_FOUND, ""),
+        ("unregistered-network", StatusCode::NOT_FOUND, ""),
     ] {
         let token = sessions.mint(
             "0123456789abcdef0123456789abcdef01234567".into(),
