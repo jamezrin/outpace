@@ -859,6 +859,12 @@ mod tests {
         input[188..376].copy_from_slice(&crate::hls_audio::process::test_fixtures::psi_packet(
             4096, 2, &section,
         ));
+        input.truncate(2 * 188);
+        for packet in crate::hls_audio::process::test_fixtures::mpeg_layer2_audio_packets(257) {
+            input.extend_from_slice(&packet);
+        }
+        input
+            .extend_from_slice(&crate::hls_audio::process::test_fixtures::video_access_packet(256));
         for pcr in [0, 108_000, 216_000] {
             input.extend_from_slice(&crate::hls_audio::process::test_fixtures::pcr_packet(
                 256, pcr,
@@ -1027,9 +1033,14 @@ mod tests {
         );
 
         let mut version_repeat = task4_input(false);
+        version_repeat[10] = 0xc3; // PAT version 1; selected program unchanged.
+        let pat_packet: &mut [u8; 188] = (&mut version_repeat[..188]).try_into().unwrap();
+        crate::hls_audio::process::test_fixtures::set_psi_crc(pat_packet);
         version_repeat[188 + 10] = 0xc3; // PMT version 1; selected streams unchanged.
         let pmt_packet: &mut [u8; 188] = (&mut version_repeat[188..376]).try_into().unwrap();
         crate::hls_audio::process::test_fixtures::set_psi_crc(pmt_packet);
+        let before_repeat = media.playlist_with_segment_prefix("/segments");
+        let before_discontinuities = before_repeat.matches("#EXT-X-DISCONTINUITY\n").count();
         tx.send((false, bytes::Bytes::from(version_repeat)))
             .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1037,6 +1048,12 @@ mod tests {
             media.status(),
             crate::hls::HlsStatus::Ready,
             "version-only PAT repeat must not invalidate the active worker generation"
+        );
+        let after_repeat = media.playlist_with_segment_prefix("/segments");
+        assert_eq!(
+            after_repeat.matches("#EXT-X-DISCONTINUITY\n").count(),
+            before_discontinuities,
+            "version-only PAT/PMT updates do not create a media boundary"
         );
 
         let mut semantic_change = crate::hls_audio::process::test_fixtures::transport_prefix();

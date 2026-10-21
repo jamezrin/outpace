@@ -2166,7 +2166,7 @@ async fn preflight_prepared(
         ("-demuxers", &["mpegts"]),
         ("-muxers", &["mpegts"]),
         ("-encoders", &["aac"]),
-        ("-decoders", &["mp1", "mp2", "mp3", "ac3"]),
+        ("-decoders", &["mp2", "mp3", "ac3"]),
         ("-protocols", &["pipe"]),
     ];
     for (argument, required) in probes {
@@ -2449,7 +2449,7 @@ mod task4_preflight_tests {
     async fn preflight_requires_each_mpeg_audio_decoder_capability() {
         let _serial = process_test_lock().await;
         let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
-        for missing in ["mp1", "mp2", "mp3", "ac3"] {
+        for missing in ["mp2", "mp3", "ac3"] {
             std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", missing);
             let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
             let (_cancel_tx, cancel) = watch::channel(false);
@@ -2461,6 +2461,26 @@ mod task4_preflight_tests {
                 "missing required decoder {missing} should be reported exactly"
             );
         }
+        match old {
+            Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", value),
+            None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_accepts_missing_layer_one_decoder_when_required_codecs_exist() {
+        let _serial = process_test_lock().await;
+        let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
+        std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", "mp1");
+        let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let result =
+            preflight_prepared(&prepared, cancel, Instant::now() + Duration::from_secs(10)).await;
+        assert_eq!(
+            result,
+            Err(HlsPreflightError::Smoke),
+            "Layer I absence is not a capability failure; the fake smoke output still fails later"
+        );
         match old {
             Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", value),
             None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY"),

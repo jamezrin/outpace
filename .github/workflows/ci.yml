@@ -90,3 +90,26 @@ jobs:
 
       - name: Test release archive verification
         run: python3 -m unittest discover -s tools/release -v
+
+  hls-audio-synthetic:
+    name: HLS audio synthetic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install synthetic media tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      # The opted-in suite verifies every required encoder/generator and ffprobe;
+      # missing tools or capabilities are failures, never successful skips.
+      - name: Synthetic codec and lifecycle acceptance
+        env:
+          OUTPACE_TEST_HLS_AUDIO_FFMPEG: "1"
+        run: cargo test -p ace-engine --test hls_audio_ffmpeg --locked -- --nocapture

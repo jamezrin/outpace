@@ -2,6 +2,7 @@
 #![allow(clippy::duplicate_mod)]
 
 #[path = "support/hls_audio.rs"]
+#[allow(dead_code)]
 mod support;
 
 // Compile the exact production pump/validator source with integration-test cfg so its

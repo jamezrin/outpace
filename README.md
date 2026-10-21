@@ -125,20 +125,49 @@ catalog-provenance index. Transport-URL streams reopen by their `turl-` id.
 
 ### Live HLS audio
 
-Live HLS prefers the first PMT-declared ADTS AAC track (`stream_type 0x0f`). When
-one is present, HLS removes other confidently identified audio tracks from both
-the PMT and media packets. LATM AAC (`0x11`) is distinct from ADTS; MPEG audio
-(`0x03`/`0x04`) does not imply MP3. Private streams (`0x06`) count as audio only
-with bounded AC-3, E-AC-3, DTS or matching registration descriptors; unknown
-private streams remain intact. Without ADTS AAC, audio passes through unchanged.
+Live HLS uses its existing native selection by default: the first ADTS AAC
+track wins; without ADTS AAC, audio passes through unchanged. Direct/raw TS and
+VOD retain their existing behavior.
 
-Selection requires current, CRC-valid, single-program, single-section PAT/PMT
-metadata fitting one TS packet per table. Fragmented or multiple-section/program
-PSI disables selection. Table changes restart HLS at a fresh access point with
-matching tables and a discontinuity. A removed audio PID carrying the declared
-program PCR retains adaptation-only clock packets. Direct TS/raw sessions,
-keyframe gating and VOD keep their existing behavior. This does not transcode,
-add an FFmpeg dependency, or guarantee Safari playback.
+Set `OUTPACE_HLS_AUDIO_NORMALIZE=true` (default `false`; accepts `true`/`false`
+or `1`/`0`) to convert selected AC3 or MPEG Layer II/III audio into AAC-LC stereo,
+48 kHz, 128 kbit/s. `OUTPACE_FFMPEG_PATH` selects a direct FFmpeg executable
+(default `ffmpeg`, resolved through PATH); it must be nonempty when enabled.
+These are the only normalization options. Disabled mode never looks up or probes
+FFmpeg. Native ADTS AAC and video-only streams start no conversion process.
+
+Enabled mode requires unencrypted 188-byte TS, one program, one MPEG-2/H.264/HEVC
+video stream, valid PCR and current CRC-valid single-packet PAT/PMT sections.
+Audio-only, multiple video/programs, fragmented PSI, unidentified private streams
+and unsupported selected codecs fail closed. MPEG PMT types do not identify a
+layer: bounded elementary-stream frame checks admit Layers II/III and reject
+Layer I, malformed, free-format or unaligned MPEG framing. LATM, EAC3 and DTS
+cannot be selected. The first ADTS AAC wins, otherwise the first recognized
+MPEG audio or AC3 wins; this does not search for a different track after rejection.
+Enabled strictness can reject inputs that disabled mode historically passes through.
+
+Conversion copies video without encoding it; player compatibility (including
+Safari) is not guaranteed. Stereo conversion can discard surround channels and
+lossy re-encoding reduces quality. At most four conversion children run globally;
+this is a process bound, not an RSS/CPU capacity promise. Recovery retains completed
+segments but playlists wait for fresh-generation readiness. A process, codec,
+resource or output failure is terminal for that session: HTTP 503 with
+`Retry-After: 1` does not restart a failed worker. Stop/idle teardown and a fresh
+session are required. Authorization and expiry still take precedence.
+
+Operators supply and maintain FFmpeg with MPEG-TS mux/demux, native AAC encoding,
+MP2/MP3/AC3 decoding and pipe support. Startup checks capabilities and performs a
+bounded AC3 conversion before opening listeners. Enabled containers need an
+operator-built image containing this binary; the base Docker/compose setup does
+not install it. Wrappers launching descendants are unsupported. Embedders must
+await manager shutdown before destroying the runtime so children and pumps are
+reaped; Drop only signals cancellation.
+
+Synthetic codec acceptance is optional locally: run
+`OUTPACE_TEST_HLS_AUDIO_FFMPEG=1 cargo test -p ace-engine --test hls_audio_ffmpeg -- --nocapture`.
+Without opt-in it prints an explicit skip. Opt-in requires FFmpeg/ffprobe,
+synthetic video/sine inputs and AC3/MP2/MP3/AAC encoders; a missing prerequisite
+fails the suite. The designated CI job always opts in. No public media is used.
 
 ### VOD (single-file)
 

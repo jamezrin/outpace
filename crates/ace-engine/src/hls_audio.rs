@@ -24,6 +24,178 @@ use tokio::time::Instant;
 static PANIC_NEXT_PRODUCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Constant-space selected MPEG ES validator. PES headers are bounded by their
+/// one-byte optional-header length; frame boundaries are computed, never searched.
+/// Two consecutive headers establish evidence before child admission. The same
+/// state continues checking all subsequent frames while the generation runs.
+pub struct MpegAudioProbe {
+    pid: u16,
+    pes: [u8; 9],
+    pes_used: usize,
+    optional: usize,
+    in_pes: bool,
+    payload_left: Option<usize>,
+    header: [u8; 4],
+    header_used: usize,
+    frame_left: usize,
+    headers: u8,
+    signature: Option<(u8, u8, u8)>,
+    failed: bool,
+}
+impl MpegAudioProbe {
+    pub fn new(pid: u16) -> Self {
+        Self {
+            pid,
+            pes: [0; 9],
+            pes_used: 0,
+            optional: 0,
+            in_pes: false,
+            payload_left: None,
+            header: [0; 4],
+            header_used: 0,
+            frame_left: 0,
+            headers: 0,
+            signature: None,
+            failed: false,
+        }
+    }
+    pub fn observe(&mut self, packet: &[u8; 188]) -> Result<bool, HlsFailure> {
+        if self.failed {
+            return Err(HlsFailure::Unsupported);
+        }
+        let result = self.observe_inner(packet);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn observe_inner(&mut self, packet: &[u8; 188]) -> Result<bool, HlsFailure> {
+        if ace_media::mpegts::ts_pid(packet) != self.pid {
+            return Ok(self.headers >= 2);
+        }
+        if !validate_packet(packet)? || packet[3] & 0x10 == 0 {
+            return Ok(self.headers >= 2);
+        }
+        let offset = if packet[3] & 0x20 != 0 {
+            5 + usize::from(packet[4])
+        } else {
+            4
+        };
+        if packet[1] & 0x40 != 0 {
+            if self.in_pes
+                && (self.pes_used < 9
+                    || self.optional != 0
+                    || self.payload_left.is_some_and(|n| n != 0))
+            {
+                return Err(HlsFailure::Unsupported);
+            }
+            self.in_pes = true;
+            self.pes_used = 0;
+            self.optional = 0;
+            self.payload_left = None;
+        }
+        if !self.in_pes {
+            return Ok(false);
+        }
+        for &byte in &packet[offset..] {
+            if self.pes_used < 9 {
+                self.pes[self.pes_used] = byte;
+                self.pes_used += 1;
+                if self.pes_used == 9 {
+                    if self.pes[..3] != [0, 0, 1]
+                        || !(0xc0..=0xdf).contains(&self.pes[3])
+                        || self.pes[6] & 0xc0 != 0x80
+                        || self.pes[6] & 0x30 != 0
+                        || self.pes[7] & 0xc0 == 0x40
+                    {
+                        return Err(HlsFailure::Unsupported);
+                    }
+                    self.optional = usize::from(self.pes[8]);
+                    let length = usize::from(u16::from_be_bytes([self.pes[4], self.pes[5]]));
+                    if length != 0 {
+                        self.payload_left = Some(
+                            length
+                                .checked_sub(3 + self.optional)
+                                .ok_or(HlsFailure::Unsupported)?,
+                        );
+                    }
+                }
+            } else if self.optional != 0 {
+                self.optional -= 1;
+            } else if self.payload_left == Some(0) {
+                if byte != 0xff {
+                    return Err(HlsFailure::Unsupported);
+                }
+            } else {
+                if let Some(left) = &mut self.payload_left {
+                    *left -= 1;
+                }
+                if self.frame_left != 0 {
+                    self.frame_left -= 1;
+                    continue;
+                }
+                self.header[self.header_used] = byte;
+                self.header_used += 1;
+                if self.header_used == 4 {
+                    let (size, signature) = mpeg_frame_size(self.header)?;
+                    if self.signature.is_some_and(|previous| previous != signature) {
+                        return Err(HlsFailure::Unsupported);
+                    }
+                    self.signature = Some(signature);
+                    self.headers = self.headers.saturating_add(1).min(2);
+                    self.header_used = 0;
+                    self.frame_left = size - 4;
+                }
+            }
+        }
+        Ok(self.headers >= 2)
+    }
+}
+
+fn mpeg_frame_size(h: [u8; 4]) -> Result<(usize, (u8, u8, u8)), HlsFailure> {
+    let version = (h[1] >> 3) & 3;
+    let layer = (h[1] >> 1) & 3;
+    let bitrate_index = usize::from(h[2] >> 4);
+    let rate_index = (h[2] >> 2) & 3;
+    if h[0] != 0xff
+        || h[1] & 0xe0 != 0xe0
+        || version == 1
+        || !matches!(layer, 1 | 2)
+        || !(1..15).contains(&bitrate_index)
+        || rate_index == 3
+        || h[3] & 3 == 2
+    {
+        return Err(HlsFailure::Unsupported);
+    }
+    const MPEG1_L2: [usize; 14] = [
+        32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+    ];
+    const MPEG1_L3: [usize; 14] = [
+        32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    const MPEG2: [usize; 14] = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let kbps = if version != 3 {
+        MPEG2[bitrate_index - 1]
+    } else if layer == 2 {
+        MPEG1_L2[bitrate_index - 1]
+    } else {
+        MPEG1_L3[bitrate_index - 1]
+    };
+    let rate = [44100, 48000, 32000][usize::from(rate_index)]
+        >> match version {
+            3 => 0,
+            2 => 1,
+            _ => 2,
+        };
+    let coefficient = if layer == 1 && version != 3 {
+        72000
+    } else {
+        144000
+    };
+    let size = coefficient * kbps / rate + usize::from((h[2] >> 1) & 1);
+    Ok((size, (version, layer, rate_index)))
+}
+
 pub struct ClassifiedOpening {
     pub layout: TransportLayout,
     pub tables: Vec<[u8; 188]>,
@@ -37,6 +209,8 @@ pub struct Classifier {
     selector: LiveAudioSelection,
     access: VideoAccessPointState,
     scanned: usize,
+    mpeg: Option<MpegAudioProbe>,
+    mpeg_layout: Option<TransportLayout>,
 }
 impl Default for Classifier {
     fn default() -> Self {
@@ -46,6 +220,8 @@ impl Default for Classifier {
             selector: LiveAudioSelection::default(),
             access,
             scanned: 0,
+            mpeg: None,
+            mpeg_layout: None,
         }
     }
 }
@@ -70,6 +246,19 @@ impl Classifier {
                 Ok(None)
             }
             LayoutDecision::Supported(layout) => {
+                if self.mpeg_layout.as_ref() != Some(&layout) {
+                    self.mpeg = layout
+                        .audio
+                        .as_ref()
+                        .filter(|a| a.codec == AudioCodec::MpegAudio)
+                        .map(|a| MpegAudioProbe::new(a.pid));
+                    self.mpeg_layout = Some(layout.clone());
+                }
+                if let Some(probe) = &mut self.mpeg {
+                    if !probe.observe(&packet)? {
+                        return Ok(None);
+                    }
+                }
                 // Only validated matching PSI enters the access detector; malformed
                 // tables cannot overwrite its last-good state independently.
                 let tables: Vec<_> = self.selector.tables().copied().collect();
@@ -387,6 +576,7 @@ impl EnabledWorker {
                 .audio
                 .as_ref()
                 .is_some_and(|a| matches!(a.codec, AudioCodec::Ac3 | AudioCodec::MpegAudio));
+            let mut mpeg = classifier.mpeg;
             let mut selector = classifier.selector;
             let layout = opening.layout;
             let mut initial = opening.tables;
@@ -396,10 +586,16 @@ impl EnabledWorker {
                     self.media
                         .feed_generation(self.recovery.generation, &packet);
                 }
-                match AssertUnwindSafe(self.produce(&mut selector, &layout, None, &mut cancel))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or(Err(HlsFailure::Pump))?
+                match AssertUnwindSafe(self.produce(
+                    &mut selector,
+                    &layout,
+                    &mut mpeg,
+                    None,
+                    &mut cancel,
+                ))
+                .catch_unwind()
+                .await
+                .unwrap_or(Err(HlsFailure::Pump))?
                 {
                     Turn::Stop => return Ok(()),
                     Turn::Recover(reason, seed) => self.invalidate(reason, seed)?,
@@ -434,7 +630,7 @@ impl EnabledWorker {
                             _ = process::cancelled(&mut cancel) => return Ok(Turn::Stop),
                             sent = tx.send(replay) => sent.map_err(|_|HlsFailure::Pipe)?,
                         }
-                        self.produce(&mut selector, &layout, Some(&tx), &mut cancel)
+                        self.produce(&mut selector, &layout, &mut mpeg, Some(&tx), &mut cancel)
                             .await
                     })
                     .catch_unwind();
@@ -481,6 +677,7 @@ impl EnabledWorker {
         &mut self,
         selector: &mut LiveAudioSelection,
         layout: &TransportLayout,
+        mpeg: &mut Option<MpegAudioProbe>,
         sender: Option<&mpsc::Sender<BudgetedInput>>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<Turn, HlsFailure> {
@@ -515,6 +712,9 @@ impl EnabledWorker {
                         LayoutDecision::Unsupported => return Err(HlsFailure::Unsupported),
                         LayoutDecision::Supported(current) if current == *layout => {}
                         _ => return Ok(Turn::Recover(RecoveryReason::Layout, Some(packet))),
+                    }
+                    if let Some(probe) = mpeg {
+                        probe.observe(&packet)?;
                     }
                     clear_marker(&mut packet);
                     if let Some(sender) = sender {
@@ -616,6 +816,11 @@ mod task4_tests {
         let mut input = fixtures::transport_prefix();
         let pmt = fixtures::pmt_section(9, 256, 256, 0x1b, 257, 0x03);
         input[188..376].copy_from_slice(&fixtures::psi_packet(4096, 2, &pmt));
+        input.truncate(2 * 188);
+        for packet in fixtures::mpeg_layer2_audio_packets(257) {
+            input.extend_from_slice(&packet);
+        }
+        input.extend_from_slice(&fixtures::video_access_packet(256));
         for pcr in [0, 108_000, 216_000] {
             input.extend_from_slice(&fixtures::pcr_packet(256, pcr));
         }
@@ -1216,5 +1421,250 @@ mod task4_tests {
             .await
             .expect("installed FFmpeg capability and smoke preflight");
         assert!(prepared.is_some());
+    }
+}
+
+#[cfg(test)]
+mod mpeg_probe_tests {
+    use super::process::test_fixtures as fixtures;
+    use super::*;
+
+    const AUDIO_PID: u16 = 257;
+
+    fn header(version: u8, layer: u8, bitrate: u8, sample_rate: u8) -> [u8; 4] {
+        let bits = 0x7ff_u32 << 21
+            | (u32::from(version) << 19)
+            | (u32::from(layer) << 17)
+            | (1 << 16)
+            | (u32::from(bitrate) << 12)
+            | (u32::from(sample_rate) << 10);
+        bits.to_be_bytes()
+    }
+
+    fn ts_payload(pid: u16, start: bool, payload: &[u8], cc: u8) -> [u8; 188] {
+        assert!(payload.len() <= 184);
+        let mut packet = [0xff; 188];
+        packet[0] = 0x47;
+        packet[1] = ((pid >> 8) as u8 & 0x1f) | if start { 0x40 } else { 0 };
+        packet[2] = pid as u8;
+        if payload.len() == 184 {
+            packet[3] = 0x10 | (cc & 0x0f);
+            packet[4..].copy_from_slice(payload);
+        } else {
+            packet[3] = 0x30 | (cc & 0x0f);
+            let adaptation_len = 183 - payload.len();
+            packet[4] = adaptation_len as u8;
+            if adaptation_len > 0 {
+                packet[5] = 0;
+            }
+            let offset = 5 + adaptation_len;
+            packet[offset..offset + payload.len()].copy_from_slice(payload);
+        }
+        packet
+    }
+
+    fn pes_frames(frame_header: [u8; 4], frame_len: usize) -> Vec<[u8; 188]> {
+        let mut payload = vec![0, 0, 1, 0xc0, 0, 0, 0x80, 0, 0];
+        for _ in 0..2 {
+            payload.extend_from_slice(&frame_header);
+            payload.resize(payload.len() + frame_len - 4, 0x55);
+        }
+        payload
+            .chunks(184)
+            .enumerate()
+            .map(|(i, chunk)| ts_payload(AUDIO_PID, i == 0, chunk, i as u8))
+            .collect()
+    }
+
+    fn confirm(header: [u8; 4], len: usize) -> Result<bool, HlsFailure> {
+        let mut probe = MpegAudioProbe::new(AUDIO_PID);
+        let mut accepted = false;
+        for packet in pes_frames(header, len) {
+            accepted |= probe.observe(&packet)?;
+        }
+        Ok(accepted)
+    }
+
+    #[test]
+    fn mpeg_probe_confirms_layer_two_and_three_at_computed_frame_boundaries() {
+        // MPEG-1 Layer II, 128 kbit/s at 44.1 kHz: 417-byte frame.
+        assert!(confirm(header(3, 2, 8, 0), 417).unwrap());
+        // MPEG-1 Layer III, 128 kbit/s at 44.1 kHz: bitrate index 9, 417-byte frame.
+        assert!(confirm(header(3, 1, 9, 0), 417).unwrap());
+        // MPEG-2 Layer III, 64 kbit/s at 22.05 kHz: 208-byte frame.
+        assert!(confirm(header(2, 1, 8, 0), 208).unwrap());
+    }
+
+    #[test]
+    fn mpeg_probe_rejects_layer_one_and_reserved_or_free_format_headers() {
+        assert_eq!(
+            confirm(header(3, 3, 8, 0), 417),
+            Err(HlsFailure::Unsupported)
+        );
+        for invalid in [
+            header(1, 2, 8, 0),
+            header(3, 2, 15, 0),
+            header(3, 2, 8, 3),
+            header(3, 2, 0, 0),
+        ] {
+            assert_eq!(confirm(invalid, 417), Err(HlsFailure::Unsupported));
+        }
+    }
+
+    #[test]
+    fn mpeg_probe_does_not_scan_for_sync_or_accept_incomplete_or_unselected_data() {
+        let valid = header(3, 2, 8, 0);
+        let mut probe = MpegAudioProbe::new(AUDIO_PID);
+        let mut payload = vec![0, 0, 1, 0xc0, 0, 0, 0x80, 0, 0];
+        payload.extend_from_slice(&[0x11; 9]); // Sync is off the PES ES boundary.
+        payload.extend_from_slice(&valid);
+        payload.resize(9 + 9 + 2 * 417, 0x55);
+        let mut rejected = false;
+        for (i, chunk) in payload.chunks(184).enumerate() {
+            match probe.observe(&ts_payload(AUDIO_PID, i == 0, chunk, i as u8)) {
+                Ok(false) => {}
+                Ok(true) => panic!("a later sync candidate must not be scanned"),
+                Err(HlsFailure::Unsupported) => rejected = true,
+                Err(other) => panic!("unexpected probe error: {other:?}"),
+            }
+        }
+        assert!(rejected, "invalid ES boundary header must be rejected");
+
+        let mut incomplete = MpegAudioProbe::new(AUDIO_PID);
+        let mut pes = vec![0, 0, 1, 0xc0, 0, 0, 0x80, 0, 0];
+        pes.extend_from_slice(&valid[..2]);
+        assert!(!incomplete
+            .observe(&ts_payload(AUDIO_PID, true, &pes, 0))
+            .unwrap());
+        assert!(!incomplete
+            .observe(&ts_payload(AUDIO_PID + 1, true, &[0; 184], 0))
+            .unwrap());
+    }
+
+    #[test]
+    fn mpeg_probe_tracks_split_pes_and_es_headers_without_accepting_false_sync() {
+        let h = header(3, 2, 8, 0);
+        let mut probe = MpegAudioProbe::new(AUDIO_PID);
+        let mut pes = vec![0, 0, 1, 0xc0, 0, 0, 0x80, 0, 0];
+        pes.extend_from_slice(&h[..2]);
+        assert!(!probe
+            .observe(&ts_payload(AUDIO_PID, true, &pes, 0))
+            .unwrap());
+        assert!(!probe
+            .observe(&ts_payload(AUDIO_PID, false, &h[2..], 1))
+            .unwrap());
+        let mut rest = vec![0x33; 413];
+        // Header for frame two starts exactly after the first frame's remaining bytes.
+        rest.extend_from_slice(&h);
+        rest.resize(rest.len() + 413, 0x44);
+        let mut confirmed = false;
+        for (i, chunk) in rest.chunks(184).enumerate() {
+            confirmed |= probe
+                .observe(&ts_payload(AUDIO_PID, false, chunk, (i + 2) as u8))
+                .unwrap();
+        }
+        assert!(confirmed);
+    }
+
+    #[test]
+    fn mpeg_probe_parses_optional_pes_header_split_across_transport_packets() {
+        let h = header(3, 2, 8, 0);
+        let mut probe = MpegAudioProbe::new(AUDIO_PID);
+        let mut pes = vec![0, 0, 1, 0xc0, 0, 0, 0x80, 0, 5, 0x11, 0x22];
+        assert!(!probe
+            .observe(&ts_payload(AUDIO_PID, true, &pes, 0))
+            .unwrap());
+        pes.clear();
+        pes.extend_from_slice(&[0x33, 0x44, 0x55]);
+        pes.extend_from_slice(&h[..1]);
+        assert!(!probe
+            .observe(&ts_payload(AUDIO_PID, false, &pes, 1))
+            .unwrap());
+        let mut es = vec![h[1], h[2], h[3]];
+        es.resize(3 + 413, 0x55);
+        es.extend_from_slice(&h);
+        es.resize(es.len() + 413, 0x66);
+        let mut confirmed = false;
+        for (i, chunk) in es.chunks(184).enumerate() {
+            confirmed |= probe
+                .observe(&ts_payload(AUDIO_PID, false, chunk, (i + 2) as u8))
+                .unwrap();
+        }
+        assert!(confirmed);
+    }
+
+    #[test]
+    fn classifier_gates_video_opening_on_supported_mpeg_layer_probe() {
+        for (stream_type, layer, expected) in [
+            (0x03, 2, true),
+            (0x03, 1, true),
+            (0x04, 1, true),
+            (0x04, 3, false),
+        ] {
+            let mut classifier = Classifier::new();
+            let pat = fixtures::psi_packet(0, 0, &fixtures::pat_section(7, 9, 4096));
+            let pmt = fixtures::psi_packet(
+                4096,
+                2,
+                &fixtures::pmt_section(9, 256, 256, 0x1b, AUDIO_PID, stream_type),
+            );
+            classifier.observe(pat).unwrap();
+            classifier.observe(pmt).unwrap();
+            assert!(classifier
+                .observe(fixtures::video_access_packet(256))
+                .unwrap()
+                .is_none());
+            let bitrate = if layer == 1 { 9 } else { 8 };
+            let audio = pes_frames(header(3, layer, bitrate, 0), 417);
+            let mut rejected = false;
+            for packet in audio {
+                match classifier.observe(packet) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => panic!("audio packets cannot be video openings"),
+                    Err(HlsFailure::Unsupported) => rejected = true,
+                    Err(other) => panic!("unexpected classifier error: {other:?}"),
+                }
+            }
+            assert_eq!(
+                rejected, !expected,
+                "PMT type 0x{stream_type:02x}, MPEG layer bits {layer}"
+            );
+            let video_open = classifier.observe(fixtures::video_access_packet(256));
+            if expected {
+                assert!(video_open.unwrap().is_some());
+            } else {
+                assert!(matches!(video_open, Err(HlsFailure::Unsupported)));
+            }
+        }
+
+        let mut classifier = Classifier::new();
+        classifier
+            .observe(fixtures::psi_packet(
+                0,
+                0,
+                &fixtures::pat_section(7, 9, 4096),
+            ))
+            .unwrap();
+        classifier
+            .observe(fixtures::psi_packet(
+                4096,
+                2,
+                &fixtures::pmt_section(9, 256, 256, 0x1b, AUDIO_PID, 0x03),
+            ))
+            .unwrap();
+        for packet in pes_frames(header(3, 2, 8, 0), 417) {
+            classifier.observe(packet).unwrap();
+        }
+        assert!(classifier
+            .observe(fixtures::video_access_packet(256))
+            .unwrap()
+            .is_some());
+        assert!(
+            matches!(
+                classifier.observe(pes_frames(header(3, 3, 8, 0), 417)[0]),
+                Err(HlsFailure::Unsupported)
+            ),
+            "a later Layer-I PES on the selected PID is rejected"
+        );
     }
 }
