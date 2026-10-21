@@ -2127,6 +2127,18 @@ pub async fn preflight(
     result
 }
 fn resolve_executable(path: &std::path::Path) -> Result<PathBuf, HlsPreflightError> {
+    resolve_executable_with(path, std::env::var_os("PATH").as_deref(), cfg!(windows))
+        .and_then(|p| p.canonicalize().ok())
+        .ok_or(HlsPreflightError::Executable)
+}
+
+// Keep filename resolution separate from PATH acquisition so platform naming
+// rules do not introduce implicit application, system, or current-dir searches.
+fn resolve_executable_with(
+    path: &std::path::Path,
+    search_path: Option<&std::ffi::OsStr>,
+    windows: bool,
+) -> Option<PathBuf> {
     fn executable(path: &std::path::Path) -> bool {
         let Ok(metadata) = path.metadata() else {
             return false;
@@ -2144,19 +2156,40 @@ fn resolve_executable(path: &std::path::Path) -> Result<PathBuf, HlsPreflightErr
             true
         }
     }
-    let found = if path.components().count() == 1 && !path.is_absolute() {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|p| p.join(path))
+    let bare = path.components().count() == 1 && !path.is_absolute();
+    if bare {
+        let mut name = path.as_os_str().to_os_string();
+        // Like Command on Windows, bare names containing a dot are exact;
+        // otherwise only the native .exe suffix is searched (never PATHEXT).
+        if windows && !name.as_encoded_bytes().contains(&b'.') {
+            name.push(".exe");
+        }
+        search_path.and_then(|paths| {
+            std::env::split_paths(paths)
+                .filter(|p| !windows || !p.as_os_str().is_empty())
+                .map(|p| p.join(&name))
                 .find(|p| executable(p))
         })
     } else {
+        let has_exe_suffix = path
+            .as_os_str()
+            .as_encoded_bytes()
+            .get(path.as_os_str().len().saturating_sub(4)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".exe"));
+        if windows && !has_exe_suffix {
+            // Explicit paths try an appended .exe first, even when another
+            // extension is present, then fall back to the supplied path.
+            let mut suffixed = path.as_os_str().to_os_string();
+            suffixed.push(".exe");
+            let candidate = PathBuf::from(suffixed);
+            if executable(&candidate) {
+                return Some(candidate);
+            }
+        }
         executable(path).then(|| path.to_path_buf())
-    };
-    found
-        .and_then(|p| p.canonicalize().ok())
-        .ok_or(HlsPreflightError::Executable)
+    }
 }
+
 async fn preflight_prepared(
     prepared: &PreparedNormalizer,
     mut cancel: watch::Receiver<bool>,
@@ -2580,6 +2613,235 @@ mod task4_preflight_tests {
         assert_eq!(task.await.unwrap(), Err(HlsPreflightError::Timeout));
         let (started, reaped, pumps, joined) = probe_test_counts();
         assert_eq!((started, reaped, pumps, joined), (1, 1, 3, 3));
+    }
+}
+
+#[cfg(test)]
+mod executable_resolution_tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let unique = format!(
+            "outpace-executable-resolution-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn make_executable(path: &std::path::Path) {
+        std::fs::write(path, b"synthetic executable placeholder").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn windows_bare_name_finds_exe_from_search_path() {
+        let root = temp_dir();
+        let binary = root.join("ffmpeg.exe");
+        make_executable(&binary);
+
+        assert_eq!(
+            resolve_executable_with(std::path::Path::new("ffmpeg"), Some(root.as_os_str()), true,),
+            Some(binary)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_explicit_path_accepts_missing_exe_suffix_and_preserves_existing_suffix() {
+        let root = temp_dir();
+        let binary = root.join("ffmpeg.exe");
+        make_executable(&binary);
+
+        assert_eq!(
+            resolve_executable_with(&root.join("ffmpeg"), None, true),
+            Some(binary.clone())
+        );
+        assert_eq!(resolve_executable_with(&binary, None, true), Some(binary));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_bare_exe_name_matches_without_appending_another_suffix() {
+        let root = temp_dir();
+        let binary = root.join("ffmpeg.exe");
+        make_executable(&binary);
+        let search_path = root.as_os_str().to_owned();
+
+        assert_eq!(
+            resolve_executable_with(std::path::Path::new("ffmpeg.exe"), Some(&search_path), true,),
+            Some(binary)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_bare_dotted_name_is_exact_and_extensionless_file_does_not_beat_exe() {
+        let root = temp_dir();
+        let dotted_exact = root.join("ffmpeg.custom");
+        let dotted_exe = root.join("ffmpeg.custom.exe");
+        make_executable(&dotted_exact);
+        make_executable(&dotted_exe);
+        let dotted_search_path = root.as_os_str().to_owned();
+        assert_eq!(
+            resolve_executable_with(
+                std::path::Path::new("ffmpeg.custom"),
+                Some(&dotted_search_path),
+                true,
+            ),
+            Some(dotted_exact),
+            "a dotted bare name must resolve the exact file, not its .exe sibling"
+        );
+
+        let extensionless = root.join("ffmpeg");
+        make_executable(&extensionless);
+        let binary = root.join("ffmpeg.exe");
+        make_executable(&binary);
+        assert_eq!(
+            resolve_executable_with(
+                std::path::Path::new("ffmpeg"),
+                Some(&dotted_search_path),
+                true,
+            ),
+            Some(binary),
+            "Windows bare names must choose .exe, never an extensionless file"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_explicit_path_prefers_appended_exe_then_falls_back_to_original() {
+        let root = temp_dir();
+        let original = root.join("ffmpeg.bin");
+        let appended = root.join("ffmpeg.bin.exe");
+        make_executable(&original);
+        make_executable(&appended);
+        assert_eq!(
+            resolve_executable_with(&original, None, true),
+            Some(appended)
+        );
+
+        std::fs::remove_file(root.join("ffmpeg.bin.exe")).unwrap();
+        assert_eq!(
+            resolve_executable_with(&original, None, true),
+            Some(original)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unix_explicit_path_does_not_add_exe() {
+        let root = temp_dir();
+        let original = root.join("ffmpeg");
+        let appended = root.join("ffmpeg.exe");
+        make_executable(&appended);
+        assert_eq!(resolve_executable_with(&original, None, false), None);
+
+        make_executable(&original);
+        assert_eq!(
+            resolve_executable_with(&original, None, false),
+            Some(original)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_search_path_does_not_search_the_current_directory() {
+        let name = format!(
+            "outpace-executable-resolution-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let binary = std::env::current_dir().unwrap().join(&name);
+        make_executable(&binary);
+        assert_eq!(
+            resolve_executable_with(std::path::Path::new(&name), None, false),
+            None,
+            "a missing PATH must not cause an implicit cwd search"
+        );
+        std::fs::remove_file(binary).unwrap();
+    }
+
+    #[test]
+    fn windows_empty_search_path_entries_are_skipped() {
+        let root = temp_dir();
+        let name = format!(
+            "outpace-empty-path-{}-{}.exe",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let binary = root.join(&name);
+        make_executable(&binary);
+        let cwd_binary = std::env::current_dir().unwrap().join(&name);
+        make_executable(&cwd_binary);
+        let paths = std::env::join_paths([std::ffi::OsStr::new(""), root.as_os_str()]).unwrap();
+        assert_eq!(
+            resolve_executable_with(std::path::Path::new(&name), Some(&paths), true),
+            Some(binary)
+        );
+        std::fs::remove_file(cwd_binary).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_explicit_path_is_canonical_and_retained_for_children() {
+        let root = temp_dir();
+        let binary = root.join("ffmpeg-test.exe");
+        make_executable(&binary);
+
+        let prepared = PreparedNormalizer {
+            executable: resolve_executable(&binary).unwrap(),
+        };
+        assert_eq!(prepared.executable, binary.canonicalize().unwrap());
+        let command = build_command(&prepared, &smoke_input().1);
+        assert_eq!(
+            command.as_std().get_program(),
+            prepared.executable.as_os_str()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unix_name_resolution_does_not_add_exe() {
+        let root = temp_dir();
+        let exe_only = root.join("ffmpeg.exe");
+        make_executable(&exe_only);
+        let search_path = root.as_os_str().to_owned();
+
+        assert_eq!(
+            resolve_executable_with(std::path::Path::new("ffmpeg"), Some(&search_path), false,),
+            None
+        );
+
+        let extensionless = root.join("ffmpeg");
+        make_executable(&extensionless);
+        assert_eq!(
+            resolve_executable_with(std::path::Path::new("ffmpeg"), Some(&search_path), false,),
+            Some(extensionless)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
