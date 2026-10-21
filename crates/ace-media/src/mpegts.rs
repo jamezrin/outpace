@@ -318,7 +318,7 @@ impl VideoAccessPointState {
         }
     }
 
-    /// Enable the normalized-HLS MPEG-2 contract. Legacy/raw gates retain their
+    /// Enable packet-local MPEG-2 picture access detection. Legacy/raw gates retain their
     /// previous H.264/HEVC-only policy unless their owner explicitly opts in.
     pub fn enable_mpeg2(&mut self) {
         self.allow_mpeg2 = true;
@@ -673,8 +673,8 @@ fn ts_payload_offset(pkt: &[u8]) -> Option<usize> {
 }
 
 /// Candidate access point: video PES start (PUSI) with random_access_indicator or a
-/// packet-local H.264 IDR / HEVC IRAP NAL. RAI is trusted as a heuristic; neither path
-/// parses a complete picture or proves that its decoding dependencies are available.
+/// packet-local H.264 IDR / HEVC IRAP NAL or MPEG-2 I-picture header. These heuristics
+/// do not parse a complete picture or prove that its decoding dependencies are available.
 fn is_random_access_point(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     if !ts_pusi(pkt) {
         return false;
@@ -698,6 +698,7 @@ fn ts_random_access_indicator(pkt: &[u8]) -> bool {
 /// `byte & 0x1F`, HEVC uses `(byte >> 1) & 0x3F`), so an H.264 slice type would otherwise be
 /// interpreted under the wrong codec. Without a resolved codec, returns false and
 /// leaves keyframe detection to the codec-agnostic random_access_indicator.
+/// MPEG-2 instead requires a bounded video PES and its first complete picture header.
 fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     let Some(codec) = codec else {
         return false;
@@ -706,6 +707,9 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
         return false;
     };
     let p = &pkt[off..];
+    if codec == VideoCodec::Mpeg2 {
+        return mpeg2_pes_has_i_picture(p);
+    }
     p.windows(4).any(|w| {
         if w[0] != 0 || w[1] != 0 || w[2] != 1 {
             return false;
@@ -716,6 +720,41 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
             VideoCodec::Hevc => matches!((w[3] >> 1) & 0x3F, 16..=21),
         }
     })
+}
+
+/// Inspect only elementary bytes in a packet-local MPEG-2 video PES header's bounds.
+/// Split PES/picture headers deliberately remain false negatives: reporting access on
+/// their continuation would discard the earlier PES-start packet needed by the decoder.
+/// An I-picture header is evidence of intra coding, not complete decoding independence.
+fn mpeg2_pes_has_i_picture(payload: &[u8]) -> bool {
+    if payload.len() < 9
+        || payload[..3] != [0, 0, 1]
+        || !(0xe0..=0xef).contains(&payload[3])
+        || payload[6] & 0xc0 != 0x80
+    {
+        return false;
+    }
+    let declared_length = u16::from_be_bytes([payload[4], payload[5]]) as usize;
+    let end = if declared_length == 0 {
+        payload.len()
+    } else {
+        (6 + declared_length).min(payload.len())
+    };
+    let start = 9 + payload[8] as usize;
+    if start > end {
+        return false;
+    }
+    let elementary = &payload[start..end];
+    for (offset, code) in elementary.windows(4).enumerate() {
+        if code == [0, 0, 1, 0] {
+            // The first picture alone decides: a later I cannot make an earlier P/B
+            // safe to include when cutting at the start of this PES packet.
+            return elementary
+                .get(offset + 4..offset + 8)
+                .is_some_and(|header| (header[1] >> 3) & 7 == 1);
+        }
+    }
+    false
 }
 
 /// Only complete, current single-packet tables may replace the cached metadata. Multi-packet
@@ -1091,6 +1130,43 @@ mod tests {
         pes
     }
 
+    // Synthetic MPEG-2 video PES carrying one picture header. `picture_type` is
+    // encoded after the 10-bit temporal_reference, as specified by MPEG-2 video.
+    fn mpeg2_picture_pes(picture_type: u8, temporal_reference: u16) -> Vec<u8> {
+        let mut pes = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0, 0];
+        pes.extend_from_slice(&[
+            0,
+            0,
+            1,
+            0x00,
+            ((temporal_reference >> 2) & 0xff) as u8,
+            (((temporal_reference & 3) << 6) as u8) | ((picture_type & 7) << 3),
+            0x55,
+            0x66,
+        ]);
+        pes
+    }
+
+    fn mpeg2_packet(payload: &[u8]) -> Vec<u8> {
+        ts(VIDEO_PID, true, false, payload)
+    }
+
+    fn mpeg2_packet_exact(payload: &[u8], pusi: bool, pid: u16) -> Vec<u8> {
+        assert!(payload.len() <= TS_PACKET_LEN - 5);
+        let mut packet = vec![0xff; TS_PACKET_LEN];
+        packet[0] = TS_SYNC;
+        packet[1] = ((pid >> 8) as u8 & 0x1f) | if pusi { 0x40 } else { 0 };
+        packet[2] = pid as u8;
+        packet[3] = 0x30;
+        packet[4] = (TS_PACKET_LEN - 5 - payload.len()) as u8;
+        if packet[4] > 0 {
+            packet[5] = 0;
+        }
+        let start = 5 + packet[4] as usize;
+        packet[start..start + payload.len()].copy_from_slice(payload);
+        packet
+    }
+
     fn gate_with_valid_video(stream_type: u8) -> KeyframeGate {
         let mut gate = KeyframeGate::new();
         gate.push(&valid_pat(PMT_PID));
@@ -1128,24 +1204,176 @@ mod tests {
         let pat = pat(PMT_PID);
         let mpeg2_pmt = pmt_codec(PMT_PID, VIDEO_PID, 0x02);
 
-        // Existing raw/native callers retain the old H.264/HEVC-only policy.
+        // The default/raw policy remains H.264/HEVC-only; a no-RAI MPEG-2 I is refused.
         let mut default_state = VideoAccessPointState::new();
         default_state.observe(&pat);
         default_state.observe(&mpeg2_pmt);
         assert!(!default_state.observe(&random_access_packet(VIDEO_PID)));
+        assert!(!default_state.observe(&mpeg2_packet(&mpeg2_picture_pes(1, 0x2ab))));
 
-        // Strict normalization explicitly enables MPEG-2 picture access detection;
+        // Strict normalization is opt-in and enables MPEG-2 picture access detection;
         // a discontinuity reset clears tables but must retain that policy bit.
         let mut enabled_state = VideoAccessPointState::new();
         enabled_state.enable_mpeg2();
         enabled_state.observe(&pat);
         enabled_state.observe(&mpeg2_pmt);
+        assert!(enabled_state.observe(&mpeg2_packet(&mpeg2_picture_pes(1, 0x2ab))));
         assert!(enabled_state.observe(&random_access_packet(VIDEO_PID)));
         enabled_state.reset();
-        assert!(!enabled_state.observe(&random_access_packet(VIDEO_PID)));
+        assert!(!enabled_state.observe(&mpeg2_packet(&mpeg2_picture_pes(1, 0x2ab))));
         enabled_state.observe(&pat);
         enabled_state.observe(&mpeg2_pmt);
-        assert!(enabled_state.observe(&random_access_packet(VIDEO_PID)));
+        assert!(enabled_state.observe(&mpeg2_packet(&mpeg2_picture_pes(1, 0x2ab))));
+    }
+
+    #[test]
+    fn mpeg2_picture_access_requires_the_first_complete_i_picture_header() {
+        for (picture_type, expected) in [
+            (1, true),
+            (2, false),
+            (3, false),
+            (0, false),
+            (4, false),
+            (7, false),
+        ] {
+            let mut state = VideoAccessPointState::new();
+            state.enable_mpeg2();
+            state.observe(&pat(PMT_PID));
+            state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x02));
+            assert_eq!(
+                state.observe(&mpeg2_packet(&mpeg2_picture_pes(picture_type, 0x2ab))),
+                expected,
+                "picture coding type {picture_type}, including nonzero temporal_reference"
+            );
+        }
+
+        for prefix in [
+            vec![0, 0, 1, 0xB3],
+            vec![0, 0, 1, 0xB8],
+            vec![0, 0, 1, 0xB5],
+            [vec![0, 0, 1, 0xB3], mpeg2_picture_pes(2, 4)[9..].to_vec()].concat(),
+            [vec![0, 0, 1, 0xB3], mpeg2_picture_pes(3, 4)[9..].to_vec()].concat(),
+            [
+                mpeg2_picture_pes(2, 4)[9..].to_vec(),
+                mpeg2_picture_pes(1, 4)[9..].to_vec(),
+            ]
+            .concat(),
+        ] {
+            let mut pes = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0, 0];
+            pes.extend(prefix);
+            let mut state = VideoAccessPointState::new();
+            state.enable_mpeg2();
+            state.observe(&pat(PMT_PID));
+            state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x02));
+            assert!(!state.observe(&mpeg2_packet(&pes)));
+        }
+
+        // Each short length of the picture code/base header is genuinely payload-
+        // truncated; adaptation stuffing must not provide extra scan bytes.
+        let picture = mpeg2_picture_pes(1, 7);
+        for len in 0..8 {
+            let packet = mpeg2_packet_exact(&picture[..9 + len], true, VIDEO_PID);
+            let mut state = VideoAccessPointState::new();
+            state.enable_mpeg2();
+            state.observe(&pat(PMT_PID));
+            state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x02));
+            assert!(!state.observe(&packet), "truncated picture bytes: {len}");
+        }
+    }
+
+    #[test]
+    fn mpeg2_pes_header_and_declared_length_bound_picture_search() {
+        // Missing prefix, wrong stream id, bad MPEG-2 marker, truncated fixed header,
+        // and optional-header length larger than bytes declared by PES_packet_length.
+        let mut malformed = vec![
+            vec![0, 0, 2, 0xE0, 0, 0, 0x80, 0, 0],
+            vec![0, 0, 1, 0xC0, 0, 0, 0x80, 0, 0],
+            vec![0, 0, 1, 0xE0, 0, 0, 0, 0, 0],
+            vec![0, 0, 1, 0xE0, 0, 0, 0x80],
+        ];
+        let mut optional = vec![0, 0, 1, 0xE0, 0, 3, 0x80, 0, 8];
+        optional.extend(mpeg2_picture_pes(1, 1)[9..].iter().copied());
+        malformed.push(optional);
+
+        for pes in malformed {
+            let mut state = VideoAccessPointState::new();
+            state.enable_mpeg2();
+            state.observe(&pat(PMT_PID));
+            state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x02));
+            assert!(!state.observe(&mpeg2_packet(&pes)));
+        }
+
+        // PES_packet_length ends before a fake I picture in TS stuffing/trailing bytes.
+        let mut pes = mpeg2_picture_pes(2, 9);
+        pes[4..6].copy_from_slice(&[0, 4]); // 3 optional bytes + one elementary byte
+        pes.extend_from_slice(&mpeg2_picture_pes(1, 9)[9..]);
+        let mut state = VideoAccessPointState::new();
+        state.enable_mpeg2();
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x02));
+        assert!(!state.observe(&mpeg2_packet(&pes)));
+
+        // A fake complete I picture in PES optional data is ignored.
+        let pes = [
+            vec![0, 0, 1, 0xE0, 0, 0, 0x80, 8, 8],
+            mpeg2_picture_pes(1, 5)[9..].to_vec(),
+        ]
+        .concat();
+        assert!(!state.observe(&mpeg2_packet(&pes)));
+
+        // A valid PTS-bearing MPEG-2 PES skips its five optional-header bytes.
+        let mut pts_pes = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5];
+        pts_pes.extend_from_slice(&[0x21, 0, 1, 0, 1]);
+        pts_pes.extend_from_slice(&mpeg2_picture_pes(1, 1)[9..]);
+        assert!(state.observe(&mpeg2_packet(&pts_pes)));
+
+        // A plausible picture code in adaptation bytes is outside the TS payload.
+        let pes = mpeg2_picture_pes(1, 1);
+        let mut packet = mpeg2_packet_exact(&pes[..9], true, VIDEO_PID);
+        packet[6..15].copy_from_slice(&[0, 0, 1, 0, 0, 0, 8, 0x55, 0x66]);
+        assert!(!state.observe(&packet));
+    }
+
+    #[test]
+    fn mpeg2_access_respects_pid_pusi_codec_and_pmt_replacement() {
+        let pes = mpeg2_picture_pes(1, 3);
+        let mut state = VideoAccessPointState::new();
+        state.enable_mpeg2();
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x02));
+        assert!(!state.observe(&mpeg2_packet_exact(&pes, true, AUDIO_PID)));
+        assert!(!state.observe(&mpeg2_packet_exact(&pes, false, VIDEO_PID)));
+        assert!(!state.observe(&mpeg2_packet_exact(&pes, true, VIDEO_PID + 1)));
+
+        state.observe(&pmt_codec(PMT_PID, AUDIO_PID, 0x02));
+        assert!(!state.observe(&mpeg2_packet(&pes)));
+        state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x1b));
+        assert!(!state.observe(&mpeg2_packet(&pes)));
+
+        // Removing the selected MPEG-2 elementary stream invalidates the old PID.
+        let mut removed = pmt_codec(PMT_PID, VIDEO_PID, 0x02);
+        // Shrink section_length to PAT-like fixed PMT fields plus CRC, no ES entries.
+        removed[7] = 13;
+        state.observe(&removed);
+        assert!(!state.observe(&mpeg2_packet(&pes)));
+    }
+
+    #[test]
+    fn mpeg2_packet_local_split_headers_reject_then_recover() {
+        let mut state = VideoAccessPointState::new();
+        state.enable_mpeg2();
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x02));
+        let pes = mpeg2_picture_pes(1, 2);
+        for split in [1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15] {
+            assert!(!state.observe(&mpeg2_packet_exact(&pes[..split], true, VIDEO_PID))); // bounded by this TS packet, never reassembled
+            assert!(!state.observe(&mpeg2_packet_exact(&pes[split..], false, VIDEO_PID)));
+        }
+        state.reset();
+        assert!(!state.observe(&mpeg2_packet(&pes)));
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x02));
+        assert!(state.observe(&mpeg2_packet(&pes)));
     }
 
     #[test]
@@ -1308,6 +1536,15 @@ mod tests {
         assert!(
             state.observe(&random_access_packet(VIDEO_PID)),
             "a RAI packet on the HEVC video PID is a random-access point"
+        );
+
+        let mut mpeg2_looking = VideoAccessPointState::new();
+        mpeg2_looking.enable_mpeg2();
+        mpeg2_looking.observe(&pat(PMT_PID));
+        mpeg2_looking.observe(&pmt_codec(PMT_PID, VIDEO_PID, 0x24));
+        assert!(
+            !mpeg2_looking.observe(&mpeg2_packet(&mpeg2_picture_pes(1, 0x2ab))),
+            "MPEG-2-looking payload must not be accepted under HEVC"
         );
     }
 
