@@ -292,6 +292,8 @@ impl TsResync {
 /// Tracks the MPEG-TS tables and video PID needed to identify a candidate access point.
 #[derive(Default)]
 pub struct VideoAccessPointState {
+    allow_mpeg2: bool,
+    preserve_transport_identity: bool,
     pmt_pid: Option<u16>,
     video_pid: Option<u16>,
     video_codec: Option<VideoCodec>,
@@ -316,14 +318,30 @@ impl VideoAccessPointState {
         }
     }
 
+    /// Enable the normalized-HLS MPEG-2 contract. Legacy/raw gates retain their
+    /// previous H.264/HEVC-only policy unless their owner explicitly opts in.
+    pub fn enable_mpeg2(&mut self) {
+        self.allow_mpeg2 = true;
+    }
+
+    /// Match synthesized service metadata to the current validated HLS transport.
+    /// Legacy/raw consumers retain their historical SDT identity by default.
+    pub fn preserve_transport_identity(&mut self) {
+        self.preserve_transport_identity = true;
+    }
+
     pub fn has_service_name(&self) -> bool {
         self.service_name.is_some()
     }
 
     pub fn reset(&mut self) {
         let name = self.service_name.take();
+        let allow_mpeg2 = self.allow_mpeg2;
+        let preserve_transport_identity = self.preserve_transport_identity;
         *self = Self {
             service_name: name,
+            allow_mpeg2,
+            preserve_transport_identity,
             ..Self::default()
         };
     }
@@ -347,7 +365,7 @@ impl VideoAccessPointState {
                 self.pmt_pid = pmt_pid;
             }
         } else if Some(pid) == self.pmt_pid {
-            if let Some(video) = parse_pmt_video(packet, self.program_number) {
+            if let Some(video) = parse_pmt_video(packet, self.program_number, self.allow_mpeg2) {
                 self.cached_pmt = Some(packet.to_vec());
                 self.video_pid = video.map(|(pid, _)| pid);
                 self.video_codec = video.map(|(_, codec)| codec);
@@ -361,7 +379,19 @@ impl VideoAccessPointState {
         prefix.extend_from_slice(self.cached_pat.as_ref()?);
         prefix.extend_from_slice(self.cached_pmt.as_ref()?);
         if let (Some(name), Some(program)) = (self.service_name.as_deref(), self.program_number) {
-            prefix.extend_from_slice(&build_sdt(program, name));
+            let sdt = if self.preserve_transport_identity {
+                let pat = self.cached_pat.as_ref()?;
+                let start = psi_section_start(pat)?;
+                let identity = pat.get(start + 3..start + 5)?;
+                build_sdt_with_transport(
+                    program,
+                    name,
+                    u16::from_be_bytes([identity[0], identity[1]]),
+                )
+            } else {
+                build_sdt(program, name)
+            };
+            prefix.extend_from_slice(&sdt);
         }
         Some(prefix)
     }
@@ -681,6 +711,7 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
             return false;
         }
         match codec {
+            VideoCodec::Mpeg2 => false,
             VideoCodec::H264 => matches!(w[3] & 0x1F, 5),
             VideoCodec::Hevc => matches!((w[3] >> 1) & 0x3F, 16..=21),
         }
@@ -724,13 +755,18 @@ fn parse_pat_first_program(pkt: &[u8]) -> Option<Option<(u16, u16)>> {
 /// Annex-B NAL layout [`payload_has_irap`] scans for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum VideoCodec {
+    Mpeg2,
     H264,
     Hevc,
 }
 
 /// Parse a PMT packet, returning the elementary PID and codec of the first recognized video
 /// stream: H.264 (`stream_type 0x1B`) or HEVC (`0x24`).
-fn parse_pmt_video(pkt: &[u8], program: Option<u16>) -> Option<Option<(u16, VideoCodec)>> {
+fn parse_pmt_video(
+    pkt: &[u8],
+    program: Option<u16>,
+    allow_mpeg2: bool,
+) -> Option<Option<(u16, VideoCodec)>> {
     let (sec, end) = current_psi_section(pkt, 0x02, 13)?;
     let table_program = u16::from_be_bytes([pkt[sec + 3], pkt[sec + 4]]);
     if program != Some(table_program) {
@@ -746,6 +782,7 @@ fn parse_pmt_video(pkt: &[u8], program: Option<u16>) -> Option<Option<(u16, Vide
         let es_info_length = ((pkt[pos + 3] & 0x0F) as usize) << 8 | pkt[pos + 4] as usize;
         if video.is_none() {
             video = match stream_type {
+                0x02 if allow_mpeg2 => Some((epid, VideoCodec::Mpeg2)),
                 0x1B => Some((epid, VideoCodec::H264)),
                 0x24 => Some((epid, VideoCodec::Hevc)),
                 _ => None,
@@ -787,6 +824,14 @@ pub fn mpeg_crc32(data: &[u8]) -> u32 {
 /// [`sanitize_service_name`] so the section fits one packet. Starts at continuity counter
 /// zero; an owner repeating the packet must assign its output continuity sequence.
 fn build_sdt(service_id: u16, service_name: &str) -> [u8; TS_PACKET_LEN] {
+    build_sdt_with_transport(service_id, service_name, 1)
+}
+
+fn build_sdt_with_transport(
+    service_id: u16,
+    service_name: &str,
+    transport_stream_id: u16,
+) -> [u8; TS_PACKET_LEN] {
     let name = service_name.as_bytes();
 
     // Service descriptor (0x48): service_type + provider + service_name.
@@ -806,7 +851,7 @@ fn build_sdt(service_id: u16, service_name: &str) -> [u8; TS_PACKET_LEN] {
     let section_length = 8 + 5 + desc.len() + 4; // tsid..reserved, loop header, descriptors, CRC
     sec.push(0xF0 | ((section_length >> 8) as u8 & 0x0F)); // syntax=1 + reserved bits + len hi
     sec.push((section_length & 0xFF) as u8);
-    sec.extend_from_slice(&[0x00, 0x01]); // transport_stream_id
+    sec.extend_from_slice(&transport_stream_id.to_be_bytes());
     sec.push(0xC1); // version 0, current_next_indicator = 1
     sec.push(0x00); // section_number
     sec.push(0x00); // last_section_number
@@ -1076,6 +1121,31 @@ mod tests {
         assert!(!state.observe(&random_access_packet(AUDIO_PID)));
         assert!(state.observe(&random_access_packet(VIDEO_PID)));
         assert_eq!(state.table_prefix().unwrap(), [pat, pmt].concat());
+    }
+
+    #[test]
+    fn video_access_point_state_mpeg2_random_access_is_opt_in_and_survives_reset() {
+        let pat = pat(PMT_PID);
+        let mpeg2_pmt = pmt_codec(PMT_PID, VIDEO_PID, 0x02);
+
+        // Existing raw/native callers retain the old H.264/HEVC-only policy.
+        let mut default_state = VideoAccessPointState::new();
+        default_state.observe(&pat);
+        default_state.observe(&mpeg2_pmt);
+        assert!(!default_state.observe(&random_access_packet(VIDEO_PID)));
+
+        // Strict normalization explicitly enables MPEG-2 picture access detection;
+        // a discontinuity reset clears tables but must retain that policy bit.
+        let mut enabled_state = VideoAccessPointState::new();
+        enabled_state.enable_mpeg2();
+        enabled_state.observe(&pat);
+        enabled_state.observe(&mpeg2_pmt);
+        assert!(enabled_state.observe(&random_access_packet(VIDEO_PID)));
+        enabled_state.reset();
+        assert!(!enabled_state.observe(&random_access_packet(VIDEO_PID)));
+        enabled_state.observe(&pat);
+        enabled_state.observe(&mpeg2_pmt);
+        assert!(enabled_state.observe(&random_access_packet(VIDEO_PID)));
     }
 
     #[test]

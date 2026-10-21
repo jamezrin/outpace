@@ -110,6 +110,12 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_MAX_REASM_PIECES_AHEAD") {
         config.live_recovery.max_reasm_pieces_ahead = v.parse()?;
     }
+    if let Some(v) = bool_from_env("OUTPACE_HLS_AUDIO_NORMALIZE")? {
+        config.hls_audio.normalize = v;
+    }
+    if let Some(v) = std::env::var_os("OUTPACE_FFMPEG_PATH") {
+        config.hls_audio.ffmpeg_path = v.into();
+    }
     if let Ok(v) = std::env::var("OUTPACE_HLS_SEGMENT_PACKETS") {
         config.hls.segment_packets = v.parse()?;
     }
@@ -158,6 +164,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
+    config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
     Ok(config)
 }
@@ -167,7 +174,7 @@ fn bool_from_env(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>>
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(format!("{name} must be valid UTF-8 and one of: 1, true, 0, false").into())
+            return Err(format!("{name} must be valid UTF-8 and one of: 1, true, 0, false").into());
         }
     };
     match value.as_str() {
@@ -442,7 +449,9 @@ pub async fn build_runtime(
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
     config.live_recovery.validate()?;
     config.hls.validate()?;
+    config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
+    let normalizer = crate::hls_audio::preflight(&config.hls_audio).await?;
 
     // This must precede identity creation and, critically, the disk cache's remove_dir_all.
     // `build_runtime` is the single validation boundary for both env-derived Config and direct
@@ -503,7 +512,8 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager = StreamManager::with_config(registry, config.session_buffer, config.hls);
+    let manager =
+        StreamManager::with_normalizer(registry, config.session_buffer, config.hls, normalizer);
     manager.spawn_reaper();
     if config.seed_ttl_secs > 0 {
         let seed_registry_reap = seed_registry.clone();
@@ -576,6 +586,14 @@ pub async fn build_runtime(
 }
 
 pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = runtime.manager.clone();
+    let result = serve_http_inner(runtime).await;
+    // Both listener/startup errors and normal HTTP draining must finish HLS cleanup.
+    manager.shutdown().await;
+    result
+}
+
+async fn serve_http_inner(runtime: EngineRuntime) -> Result<(), Box<dyn std::error::Error>> {
     let EngineRuntime {
         config,
         networks,
@@ -912,6 +930,44 @@ mod tests {
         match old {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
+        }
+    }
+
+    #[test]
+    fn hls_audio_normalization_env_defaults_off_and_parses_only_exact_booleans() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let normalize = "OUTPACE_HLS_AUDIO_NORMALIZE";
+        let ffmpeg = "OUTPACE_FFMPEG_PATH";
+        let old_normalize = std::env::var_os(normalize);
+        let old_ffmpeg = std::env::var_os(ffmpeg);
+        std::env::remove_var(normalize);
+        std::env::remove_var(ffmpeg);
+        assert!(!config_from_env().unwrap().hls_audio.normalize);
+        assert_eq!(
+            config_from_env().unwrap().hls_audio.ffmpeg_path,
+            std::path::Path::new("ffmpeg")
+        );
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(normalize, value);
+            assert_eq!(config_from_env().unwrap().hls_audio.normalize, expected);
+        }
+        for invalid in ["", "yes", "TRUE", " true", "1 "] {
+            std::env::set_var(normalize, invalid);
+            assert!(config_from_env()
+                .unwrap_err()
+                .to_string()
+                .contains(normalize));
+        }
+        std::env::set_var(normalize, "true");
+        std::env::set_var(ffmpeg, "");
+        assert!(config_from_env().unwrap_err().to_string().contains(ffmpeg));
+        match old_normalize {
+            Some(value) => std::env::set_var(normalize, value),
+            None => std::env::remove_var(normalize),
+        }
+        match old_ffmpeg {
+            Some(value) => std::env::set_var(ffmpeg, value),
+            None => std::env::remove_var(ffmpeg),
         }
     }
 

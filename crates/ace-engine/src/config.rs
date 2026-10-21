@@ -231,6 +231,34 @@ impl HlsConfig {
     }
 }
 
+/// Optional live-HLS audio conversion; disabled mode never resolves the executable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HlsAudioConfig {
+    pub normalize: bool,
+    pub ffmpeg_path: PathBuf,
+}
+
+impl Default for HlsAudioConfig {
+    fn default() -> Self {
+        Self {
+            normalize: false,
+            ffmpeg_path: PathBuf::from("ffmpeg"),
+        }
+    }
+}
+
+impl HlsAudioConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.normalize && self.ffmpeg_path.as_os_str().is_empty() {
+            return Err(
+                "OUTPACE_FFMPEG_PATH must not be empty when normalization is enabled".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -268,6 +296,7 @@ pub struct Config {
     pub startup_buffer: StartupBufferConfig,
     /// HLS byte-segment packaging policy.
     pub hls: HlsConfig,
+    pub hls_audio: HlsAudioConfig,
     /// Max simultaneously-unchoked peers per served stream (S2). Wired into the inbound serve
     /// path via the per-infohash `ServeCoordinator`: each stream unchokes up to this many
     /// interested peers plus one rotating optimistic slot (rotated by the daemon's rechoke ticker).
@@ -331,6 +360,7 @@ impl Default for Config {
             live_recovery: LiveRecoveryConfig::default(),
             startup_buffer: StartupBufferConfig::default(),
             hls: HlsConfig::default(),
+            hls_audio: HlsAudioConfig::default(),
             max_unchoked: 8,
             max_inbound_peers: 64,
             seed_ttl_secs: 300,
@@ -382,6 +412,26 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hls_audio_config_defaults_disabled_and_rejects_empty_enabled_path_only() {
+        let default = HlsAudioConfig::default();
+        assert!(!default.normalize);
+        assert_eq!(default.ffmpeg_path, PathBuf::from("ffmpeg"));
+        assert!(HlsAudioConfig {
+            normalize: false,
+            ffmpeg_path: PathBuf::new()
+        }
+        .validate()
+        .is_ok());
+        assert!(HlsAudioConfig {
+            normalize: true,
+            ffmpeg_path: PathBuf::new()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("OUTPACE_FFMPEG_PATH"));
+    }
 
     #[test]
     fn live_recovery_rejects_oversized_allocation_bounds() {
