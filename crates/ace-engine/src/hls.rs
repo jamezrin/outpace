@@ -2887,6 +2887,33 @@ mod tests {
     }
 
     #[test]
+    fn malformed_pes_timestamps_cannot_start_or_cut_normal_hls() {
+        let p = clean_pkg(20);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt_codec_mpeg2(PMT_PID, VIDEO_PID));
+
+        let mut malformed_start = mpeg2_pes_packet(0, 1);
+        // PTS is declared, but optional-header data length is zero.
+        malformed_start[19] = 0x80;
+        p.feed(&malformed_start);
+        assert!(p.segment(0).is_none(), "missing PTS cannot start a segment");
+
+        p.feed(&mpeg2_pes_packet(90_000, 1));
+        p.feed(&mpeg2_b3_packet(108_000));
+        let mut malformed_cut = mpeg2_pes_packet(180_000, 1);
+        // Forbidden PTS_DTS_flags = 01 must not provide cut evidence.
+        malformed_cut[19] = 0x40;
+        p.feed(&malformed_cut);
+        assert!(p.segment(0).is_none(), "malformed PES cannot cut a segment");
+
+        p.feed(&mpeg2_pes_packet(270_000, 1));
+        assert!(
+            p.segment(0).is_some(),
+            "a later valid I can start and cut HLS"
+        );
+    }
+
+    #[test]
     fn strict_mpeg2_hls_title_fallback_and_non_i_rejection() {
         let p = HlsPackager::new(
             HlsConfig {
