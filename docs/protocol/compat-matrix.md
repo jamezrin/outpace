@@ -1,9 +1,9 @@
 # Acestream HTTP compatibility matrix
 
 outpace keeps a **thin, opt-in** Acestream-compatible HTTP surface. The native `/streams` and
-`/broadcast` APIs are the supported primary surface; the legacy `/ace/*` and `/server/api` routes
-exist only to interoperate with existing Acestream middleware. This document is the contract: what
-is supported, what is intentionally rejected, and what is deferred.
+`/broadcast` APIs are the supported primary surface; the legacy `/ace/*`, `/server/api`, and
+`/webui/api/service` routes exist only to interoperate with existing Acestream middleware. This
+document is the contract: what is supported, what is intentionally rejected, and what is deferred.
 
 The whole compatibility surface is gated behind `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`
 (`experimental_ace_compat`) and is disabled by default. When the gate is off, every route below
@@ -12,8 +12,9 @@ returns `404`.
 Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 
 - `/ace/*` playback routes wrap their payload under a **`response`** key.
-- `/server/api` wraps its payload under a **`result`** key, always with HTTP `200` and any error
-  reported in-band under `error` (see `docs/protocol/notes/10-interop.md`, which proves
+- `/server/api` and its `/webui/api/service` alias wrap their payload under a **`result`** key,
+  always with HTTP `200` and any error reported in-band under `error` (see
+  `docs/protocol/notes/10-interop.md`, which proves
   `analyze_content` → `.result.infohash`).
 
 ## `/ace/*` playback routes
@@ -57,11 +58,12 @@ titles are exposed in the control JSON rather than encoded into a non-portable p
 
 ## `/server/api` control methods
 
+`GET /webui/api/service` is an alias of `GET /server/api`, behind the same compatibility gate.
 Dispatched on `?method=`; the response envelope is `{ "result": <value>, "error": <null|message> }`.
 
 | Method | Status | Result fields | Notes |
 | --- | --- | --- | --- |
-| `get_version` | Supported | `version`, `code` | `version` is the crate version; `code` packs `MAJOR*10000 + MINOR*100 + PATCH`. |
+| `get_version` | Supported | `version`, `code`, `platform` | `version` is the crate version; `code` packs `MAJOR*10000 + MINOR*100 + PATCH`; `platform` is `std::env::consts::OS` (`linux` on Linux). |
 | `get_status` | Supported | `status`, `active_sessions` | `status` is `dl` when any session is active, else `idle`. |
 | `get_network_connection_status` | Supported | `status`, `connected`, `networks` | `connected` reflects whether any provider network is registered. |
 | `analyze_content` | Supported | `infohash`, `content_id`, `is_live`, `is_encrypted`, `status` | Resolves the content selector to its infohash. `infohash`/`magnet` selectors resolve offline; `content_id`/`url` need the live catalog/transport and are gated by the same switch as `/ace/getstream` content-id resolution. Resolving a `content_id` through the signed catalog here also lets a later `infohash=` playback of the result succeed (a BEP-9 result or `url` does not); an offline `infohash`/`magnet` analysis does not make that infohash playable. |

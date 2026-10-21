@@ -199,7 +199,8 @@ pub fn router(state: AppState) -> Router {
             .route("/ace/c/{session}/{segment}", get(ace_hls_segment))
             .route("/ace/stat/{id}/{token}", get(ace_stat))
             .route("/ace/cmd/{id}/{token}", get(ace_command))
-            .route("/server/api", get(server_api));
+            .route("/server/api", get(server_api))
+            .route("/webui/api/service", get(server_api));
     }
     router.with_state(state)
 }
