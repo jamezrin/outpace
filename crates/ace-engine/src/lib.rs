@@ -22,6 +22,7 @@ pub mod broadcast_persist;
 pub mod cli;
 pub mod config;
 pub mod hls;
+pub mod hls_audio;
 pub mod http;
 mod live_stats;
 pub mod magnet;

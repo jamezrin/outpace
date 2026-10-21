@@ -169,29 +169,35 @@ pub(super) async fn ace_hls_playback_with_timeout(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let ready = tokio::select! {
-        ready = pkg.wait_ready(timeout) => ready,
+    let prefix = format!("/ace/c/{token}");
+    let playlist = tokio::select! {
+        biased;
         _ = cancel.changed() => return StatusCode::NOT_FOUND.into_response(),
         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
             return StatusCode::NOT_FOUND.into_response();
         }
+        playlist = await_hls_playlist(&pkg, timeout, &prefix, false) => playlist,
     };
-    if s.ace_sessions.validate(&id, token).as_deref() != Some(session_key.as_str()) {
+    // Removal/replacement and authorization take precedence over both snapshots and 503s.
+    // Revalidate the lease after the asynchronous manager lookup as well.
+    let current = s.manager.get_hls(&network, &session_key).await;
+    if !current.is_some_and(|current| Arc::ptr_eq(&current, &pkg))
+        || *cancel.borrow()
+        || Instant::now() >= expires_at
+        || s.ace_sessions.validate(&id, token).as_deref() != Some(session_key.as_str())
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if !ready {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, "1")],
-        )
-            .into_response();
-    }
+    let playlist = match playlist {
+        Ok(playlist) => playlist,
+        Err(response) => return *response,
+    };
     (
         [
             (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        pkg.compatibility_playlist_with_segment_prefix(&format!("/ace/c/{token}")),
+        playlist,
     )
         .into_response()
 }
@@ -216,6 +222,14 @@ pub(super) async fn ace_hls_segment(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if s.ace_sessions
+        .validate_token(&token)
+        .map(|(_, key)| key)
+        .as_deref()
+        != Some(session_key.as_str())
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match pkg.compatibility_segment(seq) {
         Some(bytes) => (
             [
@@ -241,7 +255,30 @@ pub(super) async fn ace_playback(
     };
     match s.manager.get_or_start(&network, &session_key).await {
         Ok(session) => ace_stream_session_response(session, expires_at, cancel, None),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            // Provider messages may embed identifiers or credentials. Log only the typed
+            // category, and keep both logs and response bodies independent of that text.
+            let (status, category, reason) = match error {
+                ProviderError::NotFound => (StatusCode::NOT_FOUND, "NotFound", ""),
+                ProviderError::Backend(_) => {
+                    (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
+                }
+                ProviderError::Unresolvable(_) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Unresolvable",
+                    "stream metadata unavailable",
+                ),
+            };
+            crate::alog!(
+                "[ace-compat] playback start failed: error={category} status={}",
+                status.as_u16()
+            );
+            if status == StatusCode::NOT_FOUND {
+                status.into_response()
+            } else {
+                (status, reason).into_response()
+            }
+        }
     }
 }
 
