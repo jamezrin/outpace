@@ -7,9 +7,11 @@ use crate::provider::{ProviderError, ProviderRegistry, TsSource, VodContent};
 use crate::session::{StreamSession, Subscription};
 use ace_swarm::types::{StreamInfo, StreamMetadata};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
+use tokio::task::JoinHandle;
 
 /// A resolved VOD plus its last-access time (for idle expiry), keyed by `(network, id)`.
 type VodCacheEntry = (Arc<dyn VodContent>, Instant);
@@ -96,10 +98,167 @@ impl Drop for HlsTransition {
     }
 }
 
+/// Readable media never owns the cancellation or join lifetime.
+struct HlsEntry {
+    media: Arc<HlsPackager>,
+    control: WorkerControl,
+}
+
+#[derive(Debug)]
+enum CleanupJob {
+    Join(JoinHandle<()>, watch::Sender<bool>),
+    Close,
+}
+
+struct CleanupCoordinator {
+    sender: tokio::sync::mpsc::UnboundedSender<CleanupJob>,
+    // Shared polling keeps the coordinator join owned if a shutdown caller is cancelled.
+    join: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
+}
+
+pub(crate) struct WorkerControl {
+    cancel: watch::Sender<bool>,
+    join: Option<JoinHandle<()>>,
+    completed: watch::Receiver<bool>,
+    done: Option<watch::Sender<bool>>,
+    cleanup: tokio::sync::mpsc::UnboundedSender<CleanupJob>,
+}
+
+impl WorkerControl {
+    fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
+
+    fn transfer(&mut self) {
+        if let Some(join) = self.join.take() {
+            // The coordinator is runtime-owned and exits only after every sender closes and
+            // every transferred join completes. Neither HTTP cancellation nor Drop aborts it.
+            self.cleanup
+                .send(CleanupJob::Join(join, self.done.take().unwrap()))
+                .expect("cleanup coordinator must live while controls exist");
+        }
+    }
+
+    async fn join(mut self) {
+        self.transfer();
+        while !*self.completed.borrow_and_update() {
+            if self.completed.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for WorkerControl {
+    fn drop(&mut self) {
+        self.cancel();
+        self.transfer();
+    }
+}
+
+/// Completion is registered synchronously before spawn/publication. A single coordinator per
+/// manager owns transferred joins, rather than adding a monitor task to every worker. Draining
+/// borrows registered completion receivers, so cancelling its caller never abandons cleanup.
+#[derive(Default)]
+pub(crate) struct CleanupTracker {
+    pending: StdMutex<Vec<watch::Receiver<bool>>>,
+    coordinator: StdMutex<Option<CleanupCoordinator>>,
+}
+
+impl CleanupTracker {
+    fn coordinator(&self) -> tokio::sync::mpsc::UnboundedSender<CleanupJob> {
+        use futures::future::BoxFuture;
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use futures::FutureExt;
+        let mut coordinator = self.coordinator.lock().unwrap();
+        coordinator
+            .get_or_insert_with(|| {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CleanupJob>();
+                let task = tokio::spawn(async move {
+                    let mut joins: FuturesUnordered<BoxFuture<'static, ()>> =
+                        FuturesUnordered::new();
+                    let mut closed = false;
+                    loop {
+                        tokio::select! {
+                            job = rx.recv(), if !closed => match job {
+                                Some(CleanupJob::Join(join, done)) => joins.push(Box::pin(async move {
+                                    let _ = join.await;
+                                    done.send_replace(true);
+                                })),
+                                Some(CleanupJob::Close) => rx.close(),
+                                None => closed = true,
+                            },
+                            _ = joins.next(), if !joins.is_empty() => {},
+                            else => break,
+                        }
+                    }
+                });
+                CleanupCoordinator {
+                    sender: tx,
+                    join: async move { let _ = task.await; }.boxed().shared(),
+                }
+            })
+            .sender.clone()
+    }
+
+    pub(crate) fn spawn<F, Fut>(&self, run: F) -> WorkerControl
+    where
+        F: FnOnce(watch::Receiver<bool>) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let cleanup = self.coordinator();
+        let (cancel, rx) = watch::channel(false);
+        let (done, completed) = watch::channel(false);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.retain(|rx| !*rx.borrow());
+            pending.push(completed.clone());
+        }
+        let join = Some(tokio::spawn(run(rx)));
+        WorkerControl {
+            cancel,
+            join,
+            done: Some(done),
+            completed,
+            cleanup,
+        }
+    }
+
+    pub(crate) async fn drain(&self) {
+        loop {
+            let pending = self.pending.lock().unwrap().clone();
+            for mut done in pending {
+                while !*done.borrow_and_update() {
+                    if done.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            let mut pending = self.pending.lock().unwrap();
+            pending.retain(|done| !*done.borrow() && done.has_changed().is_ok());
+            if pending.is_empty() {
+                break;
+            }
+        }
+        let join = self
+            .coordinator
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|coordinator| {
+                let _ = coordinator.sender.send(CleanupJob::Close);
+                coordinator.join.clone()
+            });
+        if let Some(join) = join {
+            join.await;
+        }
+    }
+}
+
 pub struct StreamManager {
     registry: ProviderRegistry,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
-    packagers: Mutex<HashMap<(String, String), Arc<HlsPackager>>>,
+    packagers: Mutex<HashMap<(String, String), HlsEntry>>,
     /// Synchronous pending/cancellation bookkeeping so a dropped future cleans up in `Drop`.
     hls_transitions: Arc<StdMutex<HlsLifecycleState>>,
     /// Serializes only short HLS publication/reap/stop map operations, never provider work.
@@ -118,7 +277,11 @@ pub struct StreamManager {
     vod_resolve_lock: Mutex<()>,
     buffer: usize,
     hls: HlsConfig,
+    normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     grace: Duration,
+    cleanup: CleanupTracker,
+    reaper: StdMutex<Option<WorkerControl>>,
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl StreamManager {
@@ -135,6 +298,15 @@ impl StreamManager {
         buffer: usize,
         hls: HlsConfig,
     ) -> Arc<StreamManager> {
+        Self::with_normalizer(registry, buffer, hls, None)
+    }
+
+    pub fn with_normalizer(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+    ) -> Arc<StreamManager> {
         Arc::new(StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
@@ -146,7 +318,11 @@ impl StreamManager {
             vod_resolve_lock: Mutex::new(()),
             buffer,
             hls,
+            normalizer,
             grace: Duration::from_secs(30),
+            cleanup: CleanupTracker::default(),
+            reaper: StdMutex::new(None),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -304,6 +480,12 @@ impl StreamManager {
         native: bool,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
         let key = (network.to_string(), id.to_string());
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
         let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
         let start_lock = self.session_start_lock(&key);
 
@@ -323,7 +505,11 @@ impl StreamManager {
 
         // Finalization is atomic with reap/stop, but contains no provider or other long I/O.
         let _finalizing = self.hls_finalization.lock().await;
-        if transition.finish() {
+        if transition.finish()
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(ProviderError::NotFound);
         }
 
@@ -347,7 +533,18 @@ impl StreamManager {
             let mut packagers = self.packagers.lock().await;
             packagers
                 .entry(key)
-                .or_insert_with(|| HlsPackager::start(&session, self.hls))
+                .or_insert_with(|| {
+                    let media = HlsPackager::create(&session, self.hls, self.normalizer.is_some());
+                    let control = crate::hls_audio::spawn_worker(
+                        &session,
+                        media.clone(),
+                        self.hls,
+                        self.normalizer.clone(),
+                        &self.cleanup,
+                    );
+                    HlsEntry { media, control }
+                })
+                .media
                 .clone()
         };
         if native {
@@ -362,7 +559,7 @@ impl StreamManager {
             .lock()
             .await
             .get(&(network.to_string(), id.to_string()))
-            .cloned()
+            .map(|entry| entry.media.clone())
     }
 
     /// Force-stop a session: remove it (and any HLS packager) so the shared download is torn
@@ -370,22 +567,33 @@ impl StreamManager {
     /// for `(network, id)` existed. Connected clients see the stream end.
     pub async fn stop(&self, network: &str, id: &str) -> bool {
         let key = (network.to_string(), id.to_string());
-        let _finalizing = self.hls_finalization.lock().await;
-        {
-            let mut lifecycle = self.hls_transitions.lock().unwrap();
-            let pending = lifecycle
-                .pending
-                .get(&key)
-                .into_iter()
-                .flatten()
-                .copied()
-                .collect::<Vec<_>>();
-            for generation in pending {
-                lifecycle.cancelled.insert((key.clone(), generation));
+        let (entry, existed) = {
+            let _finalizing = self.hls_finalization.lock().await;
+            {
+                let mut lifecycle = self.hls_transitions.lock().unwrap();
+                let pending = lifecycle
+                    .pending
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>();
+                for generation in pending {
+                    lifecycle.cancelled.insert((key.clone(), generation));
+                }
             }
+            let entry = self.packagers.lock().await.remove(&key);
+            if let Some(entry) = &entry {
+                entry.media.stop();
+                entry.control.cancel();
+            }
+            let existed = self.sessions.lock().await.remove(&key).is_some();
+            (entry, existed)
+        };
+        if let Some(entry) = entry {
+            entry.control.join().await;
         }
-        self.packagers.lock().await.remove(&key);
-        self.sessions.lock().await.remove(&key).is_some()
+        existed
     }
 
     /// Active sessions as `(network, id, subscriber_count, metadata)`.
@@ -406,50 +614,118 @@ impl StreamManager {
     }
 
     async fn reap_idle_at(&self, now: Instant) {
-        let _finalizing = self.hls_finalization.lock().await;
-        let pending_hls: HashSet<_> = self
-            .hls_transitions
-            .lock()
-            .unwrap()
-            .pending
-            .keys()
-            .cloned()
-            .collect();
-        let active_hls: HashSet<_> = {
-            let packagers = self.packagers.lock().await;
-            packagers
-                .iter()
-                .filter(|(_, pkg)| pkg.was_accessed_within(now, self.grace))
-                .map(|(key, _)| key.clone())
-                .collect()
-        };
+        let controls = {
+            let _finalizing = self.hls_finalization.lock().await;
+            let pending_hls: HashSet<_> = self
+                .hls_transitions
+                .lock()
+                .unwrap()
+                .pending
+                .keys()
+                .cloned()
+                .collect();
+            let active_hls: HashSet<_> = {
+                let packagers = self.packagers.lock().await;
+                packagers
+                    .iter()
+                    .filter(|(_, pkg)| pkg.media.was_accessed_within(now, self.grace))
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            };
 
-        let retained_sessions: HashSet<_> = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.retain(|key, session| {
-                session.subscriber_count() > 0
-                    || active_hls.contains(key)
-                    || pending_hls.contains(key)
-            });
-            sessions.keys().cloned().collect()
-        };
+            let retained_sessions: HashSet<_> = {
+                let mut sessions = self.sessions.lock().await;
+                sessions.retain(|key, session| {
+                    session.subscriber_count() > 0
+                        || active_hls.contains(key)
+                        || pending_hls.contains(key)
+                });
+                sessions.keys().cloned().collect()
+            };
 
-        self.packagers
-            .lock()
-            .await
-            .retain(|key, _| retained_sessions.contains(key));
+            let mut entries = self.packagers.lock().await;
+            let removed: Vec<_> = entries
+                .keys()
+                .filter(|key| !retained_sessions.contains(*key))
+                .cloned()
+                .collect();
+            let mut controls = Vec::new();
+            for key in removed {
+                if let Some(entry) = entries.remove(&key) {
+                    entry.media.stop();
+                    entry.control.cancel();
+                    controls.push(entry.control);
+                }
+            }
+            controls
+        };
+        for control in controls {
+            control.join().await;
+        }
     }
 
-    /// Spawn the idle-teardown watcher: drops sessions with 0 subscribers after `grace`, while
-    /// recent native HLS activity retains a zero-subscriber session during that grace period.
+    /// The reaper holds only a Weak manager, including while sleeping.
     pub fn spawn_reaper(self: &Arc<Self>) {
-        let me = self.clone();
-        tokio::spawn(async move {
+        let mut reaper = self.reaper.lock().unwrap();
+        if reaper.is_some()
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let manager = Arc::downgrade(self);
+        let grace = self.grace;
+        *reaper = Some(self.cleanup.spawn(move |mut cancel| async move {
             loop {
-                tokio::time::sleep(me.grace).await;
-                me.reap_idle_at(Instant::now()).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.changed() => break,
+                    _ = tokio::time::sleep(grace) => {}
+                }
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager.reap_idle_at(Instant::now()).await;
             }
-        });
+        }));
+    }
+
+    /// Fence publication and transfer cancellation under locks; join outside every lifecycle lock.
+    pub async fn shutdown(&self) {
+        let mut controls = Vec::new();
+        {
+            let _finalizing = self.hls_finalization.lock().await;
+            self.shutting_down
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(reaper) = self.reaper.lock().unwrap().take() {
+                reaper.cancel();
+                controls.push(reaper);
+            }
+            let mut entries = self.packagers.lock().await;
+            for entry in entries.values() {
+                entry.media.stop();
+                entry.control.cancel();
+            }
+            controls.extend(entries.drain().map(|(_, entry)| entry.control));
+            self.sessions.lock().await.clear();
+        }
+        for control in controls {
+            control.join().await;
+        }
+        self.cleanup.drain().await;
+    }
+}
+
+impl Drop for StreamManager {
+    fn drop(&mut self) {
+        if let Some(reaper) = self.reaper.get_mut().unwrap().as_ref() {
+            reaper.cancel();
+        }
+        for entry in self.packagers.get_mut().values() {
+            entry.media.stop();
+            entry.control.cancel();
+        }
     }
 }
 
@@ -510,6 +786,558 @@ mod tests {
         let mut r = ProviderRegistry::new();
         r.register(Arc::new(TestProvider { chunks: 1000 }));
         r
+    }
+
+    struct FeedSource {
+        rx: tokio::sync::mpsc::UnboundedReceiver<(bool, bytes::Bytes)>,
+        discontinuity: bool,
+    }
+
+    #[async_trait]
+    impl TsSource for FeedSource {
+        async fn next(&mut self) -> Option<bytes::Bytes> {
+            let (discontinuity, bytes) = self.rx.recv().await?;
+            self.discontinuity = discontinuity;
+            Some(bytes)
+        }
+        fn take_discontinuity(&mut self) -> bool {
+            std::mem::take(&mut self.discontinuity)
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+
+    struct FeedProvider(
+        StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<(bool, bytes::Bytes)>>>,
+    );
+
+    #[async_trait]
+    impl StreamProvider for FeedProvider {
+        fn network(&self) -> &'static str {
+            "normalization-test"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(FeedSource {
+                rx: self.0.lock().unwrap().take().expect("one source open"),
+                discontinuity: false,
+            }))
+        }
+    }
+
+    fn task4_input(video_only: bool) -> Vec<u8> {
+        let fixture = crate::hls_audio::process::test_fixtures::transport_prefix();
+        let mut input = fixture[..2 * 188].to_vec();
+        if video_only {
+            let mut pmt = vec![
+                0x02, 0xb0, 0x00, 0x00, 0x09, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0, 0x1b, 0xe1, 0x00,
+                0xf0, 0,
+            ];
+            let section_length = pmt.len() - 3 + 4;
+            pmt[1] = 0xb0 | ((section_length >> 8) as u8 & 0x0f);
+            pmt[2] = section_length as u8;
+            let crc = ace_media::mpegts::mpeg_crc32(&pmt);
+            pmt.extend_from_slice(&crc.to_be_bytes());
+            input[188..376].copy_from_slice(&crate::hls_audio::process::test_fixtures::psi_packet(
+                4096, 2, &pmt,
+            ));
+        }
+        input
+            .extend_from_slice(&crate::hls_audio::process::test_fixtures::video_access_packet(256));
+        for pcr in [0, 108_000] {
+            input.extend_from_slice(&crate::hls_audio::process::test_fixtures::pcr_packet(
+                256, pcr,
+            ));
+        }
+        input
+    }
+
+    fn task4_mpeg_audio_input() -> Vec<u8> {
+        let mut input = crate::hls_audio::process::test_fixtures::transport_prefix();
+        let section =
+            crate::hls_audio::process::test_fixtures::pmt_section(9, 256, 256, 0x1b, 257, 0x03);
+        input[188..376].copy_from_slice(&crate::hls_audio::process::test_fixtures::psi_packet(
+            4096, 2, &section,
+        ));
+        input.truncate(2 * 188);
+        for packet in crate::hls_audio::process::test_fixtures::mpeg_layer2_audio_packets(257) {
+            input.extend_from_slice(&packet);
+        }
+        input
+            .extend_from_slice(&crate::hls_audio::process::test_fixtures::video_access_packet(256));
+        for pcr in [0, 108_000, 216_000] {
+            input.extend_from_slice(&crate::hls_audio::process::test_fixtures::pcr_packet(
+                256, pcr,
+            ));
+        }
+        input
+    }
+
+    #[tokio::test]
+    async fn hls_audio_native_aac_and_video_only_skip_child_even_with_invalid_prepared_path() {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        for (id, video_only) in [("native-aac", false), ("video-only", true)] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut providers = ProviderRegistry::new();
+            providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+            let hls = HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            };
+            let manager = StreamManager::with_normalizer(
+                providers,
+                32,
+                hls,
+                Some(crate::hls_audio::PreparedNormalizer {
+                    executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+                }),
+            );
+            let media = manager
+                .get_or_start_hls("normalization-test", id)
+                .await
+                .unwrap();
+            tx.send((false, bytes::Bytes::from(task4_input(video_only))))
+                .unwrap();
+            let status = tokio::time::timeout(
+                Duration::from_secs(4),
+                media.wait_available(Duration::from_secs(4)),
+            )
+            .await
+            .expect("native source should become ready without invoking FFmpeg");
+            assert_eq!(status, crate::hls::HlsStatus::Ready, "case {id}");
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn hls_audio_manager_source_recovery_retains_old_segment_and_emits_one_new_boundary() {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+            }),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "recovering")
+            .await
+            .unwrap();
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(4),
+                media.wait_available(Duration::from_secs(4))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+            "first native segment is available",
+        );
+        let old = media.segment(0).expect("segment retained before recovery");
+
+        let mut marker = [0xff; 188];
+        marker[..6].copy_from_slice(&[0x47, 0x40, 0x11, 0x30, 1, 0x80]);
+        tx.send((true, bytes::Bytes::copy_from_slice(&marker)))
+            .unwrap(); // paired marker on filtered SDT PID before opening
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while media.status() != crate::hls::HlsStatus::Recovering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("source discontinuity reaches the worker before resumed packets");
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(4),
+                media.wait_available(Duration::from_secs(4))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+            "recovered generation becomes ready",
+        );
+        assert_eq!(
+            media.segment(0).as_deref(),
+            Some(old.as_ref()),
+            "old retained sequence remains byte-identical"
+        );
+        let new = media.segment(1).expect("new generation segment");
+        assert_eq!(
+            ace_media::mpegts::ts_pid(&new[..188]),
+            0,
+            "new segment starts with fresh PAT"
+        );
+        assert_eq!(
+            ace_media::mpegts::ts_pid(&new[188..376]),
+            4096,
+            "new segment follows with fresh PMT"
+        );
+        let playlist = media.playlist_with_segment_prefix("/segments");
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY\n").count(), 1);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hls_audio_enabled_worker_ignores_version_repeat_then_recovers_semantic_layout_change()
+    {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+            }),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "layout-worker")
+            .await
+            .unwrap();
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                media.wait_available(Duration::from_secs(3))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+        );
+
+        let mut version_repeat = task4_input(false);
+        version_repeat[10] = 0xc3; // PAT version 1; selected program unchanged.
+        let pat_packet: &mut [u8; 188] = (&mut version_repeat[..188]).try_into().unwrap();
+        crate::hls_audio::process::test_fixtures::set_psi_crc(pat_packet);
+        version_repeat[188 + 10] = 0xc3; // PMT version 1; selected streams unchanged.
+        let pmt_packet: &mut [u8; 188] = (&mut version_repeat[188..376]).try_into().unwrap();
+        crate::hls_audio::process::test_fixtures::set_psi_crc(pmt_packet);
+        let before_repeat = media.playlist_with_segment_prefix("/segments");
+        let before_discontinuities = before_repeat.matches("#EXT-X-DISCONTINUITY\n").count();
+        tx.send((false, bytes::Bytes::from(version_repeat)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            media.status(),
+            crate::hls::HlsStatus::Ready,
+            "version-only PAT repeat must not invalidate the active worker generation"
+        );
+        let after_repeat = media.playlist_with_segment_prefix("/segments");
+        assert_eq!(
+            after_repeat.matches("#EXT-X-DISCONTINUITY\n").count(),
+            before_discontinuities,
+            "version-only PAT/PMT updates do not create a media boundary"
+        );
+
+        let mut semantic_change = crate::hls_audio::process::test_fixtures::transport_prefix();
+        let changed_pmt =
+            crate::hls_audio::process::test_fixtures::pmt_section(9, 256, 256, 0x1b, 258, 0x0f);
+        semantic_change[188..376].copy_from_slice(
+            &crate::hls_audio::process::test_fixtures::psi_packet(4096, 2, &changed_pmt),
+        );
+        tx.send((false, bytes::Bytes::from(semantic_change)))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while media.status() != crate::hls::HlsStatus::Recovering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("semantic selected-audio PID change invalidates the active generation");
+        assert_eq!(media.status(), crate::hls::HlsStatus::Recovering);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hls_audio_post_opening_filtered_pid_marker_is_independent_after_paired_source_recovery(
+    ) {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+            }),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "post-opening-marker")
+            .await
+            .unwrap();
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                media.wait_available(Duration::from_secs(3))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+        );
+        let old = media.segment(0).expect("first generation segment");
+
+        let marker = filtered_sdt_discontinuity_packet();
+        tx.send((true, bytes::Bytes::copy_from_slice(&marker)))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while media.status() != crate::hls::HlsStatus::Recovering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("paired source event begins one replacement generation");
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                media.wait_available(Duration::from_secs(3))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+        );
+        assert_eq!(media.segment(0).as_deref(), Some(old.as_ref()));
+
+        // The paired marker token is consumed at the accepted opening point.
+        // A later marker on filtered SDT PID 0x11 must independently invalidate.
+        let marker = filtered_sdt_discontinuity_packet();
+        tx.send((false, bytes::Bytes::copy_from_slice(&marker)))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while media.status() != crate::hls::HlsStatus::Recovering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("post-opening filtered-PID marker is independent");
+        tx.send((false, bytes::Bytes::from(task4_input(false))))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                media.wait_available(Duration::from_secs(3))
+            )
+            .await
+            .unwrap(),
+            crate::hls::HlsStatus::Ready,
+        );
+        assert_eq!(media.segment(0).as_deref(), Some(old.as_ref()));
+        assert!(
+            media.segment(2).is_some(),
+            "independent post-opening recovery publishes a third generation segment"
+        );
+        assert_eq!(
+            media
+                .playlist_with_segment_prefix("/segments")
+                .matches("#EXT-X-DISCONTINUITY\n")
+                .count(),
+            2
+        );
+        manager.shutdown().await;
+    }
+
+    fn filtered_sdt_discontinuity_packet() -> [u8; 188] {
+        let mut marker = [0xff; 188];
+        marker[..6].copy_from_slice(&[0x47, 0x40, 0x11, 0x30, 1, 0x80]);
+        marker
+    }
+
+    #[tokio::test]
+    async fn hls_audio_transform_recovery_limit_fences_before_fourth_child_reap() {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let (prepared, counters) = crate::hls_audio::process::test_support::fake_prepared_child(
+            crate::hls_audio::process::test_support::ChildMode::ReadyThenStall,
+        );
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+            Some(prepared),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "live-transform-recovery-limit")
+            .await
+            .unwrap();
+        let input = bytes::Bytes::from(task4_mpeg_audio_input());
+        tx.send((false, input.clone())).unwrap();
+        let wait_ready = || async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if media.status() == crate::hls::HlsStatus::Ready {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("fake transform generation becomes Ready");
+        };
+        wait_ready().await;
+        assert_eq!(counters.snapshot().children_started, 1);
+
+        for generation_child in 2..=4 {
+            tx.send((true, bytes::Bytes::new())).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while counters.snapshot().children_reaped < generation_child - 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("previous transform child is reaped before replacement");
+            assert_eq!(counters.snapshot().children_started, generation_child - 1);
+            tx.send((false, input.clone())).unwrap();
+            wait_ready().await;
+            assert_eq!(counters.snapshot().children_started, generation_child);
+        }
+
+        // This is the fourth invalidation (the initial generation is not counted).
+        // The fourth child is held in ReadyThenStall while Failed must publish before
+        // its cancellation/reap completes.
+        tx.send((true, bytes::Bytes::new())).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = counters.snapshot();
+                if media.status()
+                    == crate::hls::HlsStatus::Failed(crate::hls::HlsFailure::RecoveryLimit)
+                    && snapshot.children_started == 4
+                    && snapshot.children_reaped == 3
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("fourth recovery fences Ready media before old child reap");
+        manager.shutdown().await;
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.children_started, 4);
+        assert_eq!(snapshot.children_reaped, 4);
+        assert_eq!(snapshot.pumps_started, snapshot.pumps_joined);
+        assert_eq!(snapshot.active_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn hls_audio_manager_terminal_transform_failure_is_not_restarted_by_retry() {
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_normalizer(
+            providers,
+            32,
+            HlsConfig {
+                startup_timeout_ms: 5000,
+                ..HlsConfig::default()
+            },
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: std::path::PathBuf::from("__missing_task4_ffmpeg_binary__"),
+            }),
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "transform")
+            .await
+            .unwrap();
+        tx.send((false, bytes::Bytes::from(task4_mpeg_audio_input())))
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = media.status();
+                if matches!(status, crate::hls::HlsStatus::Failed(_)) {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("invalid transform executable should fail terminally");
+        assert!(matches!(status, crate::hls::HlsStatus::Failed(_)));
+        let retry = manager
+            .get_or_start_hls("normalization-test", "transform")
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&media, &retry),
+            "retry shares the terminal manager entry"
+        );
+        assert_eq!(
+            retry.status(),
+            status,
+            "an HTTP-style retry cannot restart a failed worker"
+        );
+        manager.shutdown().await;
+    }
+
+    async fn manager_with_blocking_worker_for_test(
+    ) -> (Arc<StreamManager>, Arc<Notify>, Arc<Notify>) {
+        let manager = StreamManager::new(registry());
+        manager
+            .get_or_start_hls("test", "slow-cleanup")
+            .await
+            .unwrap();
+        let cleanup_started = Arc::new(Notify::new());
+        let release_cleanup = Arc::new(Notify::new());
+        let started = cleanup_started.clone();
+        let release = release_cleanup.clone();
+        let control = manager.cleanup.spawn(move |mut cancel| async move {
+            while cancel.changed().await.is_ok() && !*cancel.borrow() {}
+            started.notify_one();
+            release.notified().await;
+        });
+        let media = manager.get_hls("test", "slow-cleanup").await.unwrap();
+        let old = manager.packagers.lock().await.insert(
+            ("test".into(), "slow-cleanup".into()),
+            HlsEntry { media, control },
+        );
+        drop(old);
+        (manager, cleanup_started, release_cleanup)
     }
 
     #[test]
@@ -708,6 +1536,202 @@ mod tests {
         assert!(list.iter().any(|(n, i, _, metadata)| {
             n == "test" && i == "a" && metadata == &ace_swarm::types::StreamMetadata::default()
         }));
+    }
+
+    #[tokio::test]
+    async fn hls_owned_stale_media_arc_does_not_keep_worker_alive_after_stop_and_reap() {
+        let manager = StreamManager::new(registry());
+        let stale_media = manager
+            .get_or_start_hls("test", "owned-stale")
+            .await
+            .unwrap();
+        manager.stop("test", "owned-stale").await;
+
+        assert_eq!(stale_media.status(), crate::hls::HlsStatus::Stopped);
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("stale media references must not own worker cleanup");
+        assert!(manager.get_hls("test", "owned-stale").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_owned_reap_detaches_worker_even_with_stale_media_arc() {
+        let manager = StreamManager::new(registry());
+        let stale_media = manager
+            .get_or_start_hls("test", "reap-stale")
+            .await
+            .unwrap();
+        manager
+            .reap_idle_at(Instant::now() + manager.grace + Duration::from_secs(1))
+            .await;
+        assert_eq!(stale_media.status(), crate::hls::HlsStatus::Stopped);
+        assert!(manager.get_hls("test", "reap-stale").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_owned_drop_releases_weak_reaper_reference() {
+        let manager = StreamManager::new(registry());
+        manager.spawn_reaper();
+        let weak = Arc::downgrade(&manager);
+        drop(manager);
+        tokio::task::yield_now().await;
+        assert!(
+            weak.upgrade().is_none(),
+            "reaper must not keep manager alive while sleeping"
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_owned_shutdown_fences_pending_initializer_before_publication() {
+        let (manager, started, release) = blocking_manager();
+        let initializing = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .get_or_start_hls("blocking", "shutdown-pending")
+                    .await
+            })
+        };
+        started.notified().await;
+        manager.shutdown().await;
+        release.notify_one();
+        assert!(initializing.await.unwrap().is_err());
+        assert!(manager
+            .get_hls("blocking", "shutdown-pending")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_owned_native_and_compatibility_starts_share_one_entry() {
+        let manager = StreamManager::new(registry());
+        let native_start = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_or_start_hls("test", "shared-hls").await })
+        };
+        let compatibility_start = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .get_or_start_compatibility_hls("test", "shared-hls")
+                    .await
+            })
+        };
+        let native = native_start.await.unwrap().unwrap();
+        let (compat, _session, _pin) = compatibility_start.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&native, &compat));
+    }
+
+    #[tokio::test]
+    async fn hls_owned_stop_during_delayed_initialization_never_publishes_entry() {
+        let (manager, started, release) = blocking_manager();
+        let initializing = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_or_start_hls("blocking", "delayed").await })
+        };
+        started.notified().await;
+        assert!(!manager.stop("blocking", "delayed").await);
+        release.notify_one();
+        assert!(initializing.await.unwrap().is_err());
+        assert!(manager.get_hls("blocking", "delayed").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_owned_aborted_initializer_transfers_cleanup_to_manager_tracker() {
+        let (manager, started, release) = blocking_manager();
+        let initializing = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_or_start_hls("blocking", "abort-owned").await })
+        };
+        started.notified().await;
+        initializing.abort();
+        assert!(matches!(initializing.await, Err(error) if error.is_cancelled()));
+        release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("shutdown must drain cleanup transferred from an aborted initializer");
+        assert!(manager.get_hls("blocking", "abort-owned").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_owned_shutdown_joins_reaper_and_workers_before_returning() {
+        let manager = StreamManager::new(registry());
+        manager.spawn_reaper();
+        manager
+            .get_or_start_hls("test", "shutdown-worker")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("shutdown must join the reaper and all owned workers");
+        assert!(manager.get_hls("test", "shutdown-worker").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_owned_shutdown_closes_cleanup_coordinator() {
+        let manager = StreamManager::new(registry());
+        manager
+            .get_or_start_hls("test", "shutdown-coordinator")
+            .await
+            .unwrap();
+        manager.spawn_reaper();
+        let coordinator = manager.cleanup.coordinator();
+
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("shutdown must finish before checking coordinator closure");
+
+        assert!(
+            coordinator.is_closed(),
+            "cleanup coordinator channel must close after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_owned_unrelated_start_progresses_while_cleanup_waits() {
+        let (manager, cleanup_started, release_cleanup) =
+            manager_with_blocking_worker_for_test().await;
+        let stopping = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.stop("test", "slow-cleanup").await })
+        };
+        cleanup_started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !stopping.is_finished(),
+            "stop must await the detached worker join"
+        );
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.get_or_start_hls("test", "unrelated-fast"),
+        )
+        .await
+        .expect("unrelated-key start must proceed outside cleanup waits")
+        .unwrap();
+        release_cleanup.notify_one();
+        stopping.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_owned_aborted_stop_leaves_join_with_manager_tracker() {
+        let (manager, cleanup_started, release_cleanup) =
+            manager_with_blocking_worker_for_test().await;
+        let stopping = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.stop("test", "slow-cleanup").await })
+        };
+        cleanup_started.notified().await;
+        assert!(
+            !stopping.is_finished(),
+            "stop should still be joining cleanup"
+        );
+        stopping.abort();
+        assert!(matches!(stopping.await, Err(error) if error.is_cancelled()));
+        release_cleanup.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("aborting stop must not abandon the manager-tracked join");
     }
 
     #[tokio::test]

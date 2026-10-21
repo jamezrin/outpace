@@ -2,7 +2,7 @@
 //! compatibility `/ace/...` playback surface.
 
 use crate::broadcast::BroadcastRegistry;
-use crate::hls::HlsPackager;
+use crate::hls::{HlsPackager, HlsStatus};
 use crate::manager::StreamManager;
 use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::{StreamEvent, StreamSession};
@@ -21,6 +21,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+tokio::task_local! {
+    static HLS_AFTER_READY: Box<dyn Fn(&HlsPackager) + Send + Sync>;
+}
 use tokio::sync::broadcast::error::RecvError;
 
 mod broadcast;
@@ -47,18 +52,35 @@ fn stream_metadata_json(metadata: &StreamMetadata) -> serde_json::Value {
     })
 }
 
-async fn await_hls_ready(pkg: &HlsPackager, timeout: Duration) -> Result<(), Box<Response>> {
-    if pkg.wait_ready(timeout).await {
-        Ok(())
-    } else {
-        Err(Box::new(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "1")],
-            )
-                .into_response(),
-        ))
+/// Read readiness and render under the same media lock. A recovery between a readiness
+/// wake and the snapshot must spend only the remainder of this request's original budget.
+async fn await_hls_playlist(
+    pkg: &HlsPackager,
+    timeout: Duration,
+    prefix: &str,
+    native_access: bool,
+) -> Result<String, Box<Response>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match pkg.playlist_snapshot(prefix, native_access) {
+            Ok(playlist) => return Ok(playlist),
+            Err(HlsStatus::Starting | HlsStatus::Recovering) => {}
+            Err(_) => break,
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() || pkg.wait_available(remaining).await != HlsStatus::Ready {
+            break;
+        }
+        #[cfg(test)]
+        let _ = HLS_AFTER_READY.try_with(|hook| hook(pkg));
     }
+    Err(Box::new(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+        )
+            .into_response(),
+    ))
 }
 
 #[derive(Clone)]
