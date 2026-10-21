@@ -255,7 +255,30 @@ pub(super) async fn ace_playback(
     };
     match s.manager.get_or_start(&network, &session_key).await {
         Ok(session) => ace_stream_session_response(session, expires_at, cancel, None),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            // Provider messages may embed identifiers or credentials. Log only the typed
+            // category, and keep both logs and response bodies independent of that text.
+            let (status, category, reason) = match error {
+                ProviderError::NotFound => (StatusCode::NOT_FOUND, "NotFound", ""),
+                ProviderError::Backend(_) => {
+                    (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
+                }
+                ProviderError::Unresolvable(_) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Unresolvable",
+                    "stream metadata unavailable",
+                ),
+            };
+            crate::alog!(
+                "[ace-compat] playback start failed: error={category} status={}",
+                status.as_u16()
+            );
+            if status == StatusCode::NOT_FOUND {
+                status.into_response()
+            } else {
+                (status, reason).into_response()
+            }
+        }
     }
 }
 

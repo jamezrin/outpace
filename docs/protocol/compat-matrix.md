@@ -22,7 +22,7 @@ Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 | Route | Status | Notes |
 | --- | --- | --- |
 | `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t` and emits `Icy-Name` when the descriptor has a title; `format=json` returns playback/stat/command URLs and nested descriptor metadata with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector, and it (like `magnet`) permits cold inputs. JSON URL creation mints a lease; authenticated catalog lookup and descriptor/hash verification occur when playback is opened. Unresolvable playback fails closed. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
-| `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a valid lease. Missing, invalid, expired, stopped, or wrong-content tokens return HTTP 404. |
+| `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a valid lease. Missing, invalid, expired, stopped, or wrong-content tokens and `ProviderError::NotFound` (unregistered network only) return HTTP 404. Start errors return plain-text HTTP 502 (`Backend`) or 422 (`Unresolvable`); the lease remains usable for retry until expiry or revocation. |
 | `GET /ace/manifest.m3u8` | Supported (live) | Uses the same selectors and catalog resolution as `getstream`. The default and `format=redirect` return `302` to a stable `/ace/m/...` playlist; `format=json` returns documented playback/stat/command fields plus nested descriptor metadata. Each request owns one bounded HLS lease over the shared native packager. |
 | `GET /ace/m/<id>/<token>.m3u8` | Supported (live) | Token-authenticated media playlist over the native live HLS window. Missing, forged, expired, stopped, or evicted leases return `404`; responses are `no-store`. |
 | `GET /ace/c/<session>/<seq>.ts` | Supported (live) | `session` is the unpredictable HLS lease token emitted in the playlist. Retained native bytes are returned as `video/mp2t`; forged tokens and evicted, future, or malformed sequence numbers return `404`. Segment probes never start a stream. |
@@ -35,6 +35,29 @@ through to another selector. Compatibility hints such as `use_api_events` and ot
 parameters are safely ignored. Missing/malformed selectors and unsupported formats currently use
 HTTP 200 with `{ "response": null, "error": "..." }`; this is outpace's pinned compatibility
 behavior pending a broader official-engine error capture.
+
+Playback start failures are logged by error category without provider text, which can contain
+identifiers or tokens. `NotFound` means an unregistered network only; `AceProvider` never returns
+it for unknown content. `Backend` includes content-id catalog timeouts and discovery finding
+zero peers; there is no typed timeout variant, so the handler uses 502 rather than guessing 504
+from message text. Unknown or unpublished content ids also return 502 because catalog lookup
+does not distinguish "not found" from other failures, so retrying clients may retry a dead id.
+A `url=` transport fetch rejected by the SSRF guard also becomes `Backend` (502), although
+retrying the same blocked URL cannot succeed.
+
+`Unresolvable` means verified metadata could not be obtained or did not match; 422 follows the
+native stream route. On `infohash=`/`magnet=` selector paths this currently includes transient
+catalog timeouts and connect failures (including the cached "Recent catalog lookup failed;
+retry shortly" refusal). Content-id selections retain a `cid:` session key and return 502 for
+those catalog failures instead. Reclassifying transient catalog failures as `Backend` in the
+infohash resolver is deferred; it would also change native `/streams` behavior. Bodies are
+short generic reasons, without provider details. This is an Outpace contract:
+[note 30](notes/30-official-consumer-proof-after-infohash-fix.md#playback-still-fails-at-zero-peers)
+observed official-engine playback stay in prebuffer with zero peers and no HTTP response before
+the client's 45-second timeout, not a server error status. [Note 55](notes/55-legacy-getstream-direct-mode.md#evidence-boundary)
+also records the missing official error-response matrix. Direct `/ace/getstream` and
+`/ace/manifest.m3u8` start failures still return a silent 404; a follow-up is warranted at least
+to log those failures.
 
 Cold `infohash=` and `magnet=` selectors may mint playback URLs. On playback open,
 the provider uses an owned broadcast or verified index entry, then the signed
