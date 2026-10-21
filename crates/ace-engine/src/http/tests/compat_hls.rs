@@ -97,16 +97,67 @@ async fn ace_hls_stalled_playlist_returns_retryable_503() {
 }
 
 #[tokio::test]
+async fn normalization_http_compat_terminal_failure_is_retryable_and_private() {
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let state = ace_hls_state(Duration::from_secs(60), 8);
+    let manager = state.manager.clone();
+    let request_state = state.clone();
+    let app = router(state);
+    let (playback_id, manifest, _) = mint_stalled_hls(&app, id).await;
+    // Fail the same media entry returned to the authenticated compatibility route.
+    let pkg = manager.get_hls("hlsfix", id).await.unwrap();
+    pkg.begin_generation(
+        crate::hls::GenerationId(1),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
+    );
+    pkg.fail_generation(
+        crate::hls::GenerationId(1),
+        crate::hls::HlsFailure::OutputInvalid,
+    );
+
+    let response = ace_hls_playback_with_timeout(
+        State(request_state),
+        Path((playback_id, manifest)),
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert!(body.is_empty(), "failure category must not be exposed");
+    let retry = manager.get_or_start_hls("hlsfix", id).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&pkg, &retry),
+        "compatibility retry must reuse the failed shared entry"
+    );
+}
+
+#[tokio::test]
 async fn ace_hls_stop_cancels_a_stalled_playlist_wait_with_404() {
     let id = "0123456789abcdef0123456789abcdef01234567";
     let state = stalled_hls_state();
     let app = router(state.clone());
     let (playback_id, manifest, stop_path) = mint_stalled_hls(&app, id).await;
-    let request = spawn_stalled_hls_request(state, playback_id, manifest);
+    let manager = state.manager.clone();
+    let request = spawn_stalled_hls_request(state.clone(), playback_id, manifest);
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(
         !request.is_finished(),
         "playlist request must be waiting for readiness"
+    );
+    let (_, key, _, _) = manager.list().await.into_iter().next().unwrap();
+    let pkg = manager.get_hls("stalled", &key).await.unwrap();
+    pkg.begin_generation(
+        crate::hls::GenerationId(1),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
+    );
+    pkg.fail_generation(
+        crate::hls::GenerationId(1),
+        crate::hls::HlsFailure::ChildExit,
     );
 
     let stopped = app
@@ -124,20 +175,76 @@ async fn ace_hls_stop_cancels_a_stalled_playlist_wait_with_404() {
 #[tokio::test]
 async fn ace_hls_expiry_cancels_a_stalled_playlist_wait_with_404() {
     let id = "0123456789abcdef0123456789abcdef01234567";
-    let state = stalled_hls_state_with(Duration::from_millis(40), 8);
+    let state = stalled_hls_state_with(Duration::from_millis(100), 8);
     let app = router(state.clone());
     let (playback_id, manifest, _) = mint_stalled_hls(&app, id).await;
-    let request = spawn_stalled_hls_request(state, playback_id, manifest);
+    let request = spawn_stalled_hls_request(state.clone(), playback_id, manifest);
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(
         !request.is_finished(),
         "playlist request must be waiting for readiness"
     );
-
     let response = tokio::time::timeout(Duration::from_millis(100), request)
         .await
         .expect("expiry must wake the playlist wait")
         .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ace_hls_expiry_wins_when_terminal_failure_is_due_before_waiter_resumes() {
+    let id = "2123456789abcdef0123456789abcdef01234567";
+    let state = stalled_hls_state_with(Duration::from_millis(30), 8);
+    let app = router(state.clone());
+    let (playback_id, manifest, _) = mint_stalled_hls(&app, id).await;
+    let request = spawn_stalled_hls_request(state.clone(), playback_id, manifest);
+    tokio::task::yield_now().await;
+    assert!(!request.is_finished(), "playlist request must be pending");
+
+    // Keep the current-thread executor from polling the waiter while both the lease expiry
+    // and the failure transition become due. On resumption the request must revalidate its
+    // expired authorization before it can expose the packager's 503.
+    std::thread::sleep(Duration::from_millis(45));
+    let (_, key, _, _) = state.manager.list().await.into_iter().next().unwrap();
+    let pkg = state.manager.get_hls("stalled", &key).await.unwrap();
+    pkg.begin_generation(
+        crate::hls::GenerationId(1),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
+    );
+    pkg.fail_generation(
+        crate::hls::GenerationId(1),
+        crate::hls::HlsFailure::ChildExit,
+    );
+
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ace_hls_manager_removal_wins_over_terminal_failure_with_valid_lease() {
+    let id = "3123456789abcdef0123456789abcdef01234567";
+    let state = stalled_hls_state_with(Duration::from_secs(60), 8);
+    let app = router(state.clone());
+    let (playback_id, manifest, _) = mint_stalled_hls(&app, id).await;
+    let request = spawn_stalled_hls_request(state.clone(), playback_id, manifest);
+    tokio::task::yield_now().await;
+    assert!(!request.is_finished(), "playlist waiter must be pending");
+
+    let (_, key, _, _) = state.manager.list().await.into_iter().next().unwrap();
+    let pkg = state.manager.get_hls("stalled", &key).await.unwrap();
+    pkg.begin_generation(
+        crate::hls::GenerationId(1),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
+    );
+    pkg.fail_generation(
+        crate::hls::GenerationId(1),
+        crate::hls::HlsFailure::ChildExit,
+    );
+    assert!(state.manager.stop("stalled", &key).await);
+
+    let response = request.await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -148,11 +255,23 @@ async fn ace_hls_capacity_eviction_cancels_a_stalled_playlist_wait_with_404() {
     let state = stalled_hls_state_with(Duration::from_secs(60), 1);
     let app = router(state.clone());
     let (playback_id, manifest, _) = mint_stalled_hls(&app, first_id).await;
-    let request = spawn_stalled_hls_request(state, playback_id, manifest);
+    let manager = state.manager.clone();
+    let request = spawn_stalled_hls_request(state.clone(), playback_id, manifest);
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(
         !request.is_finished(),
         "playlist request must be waiting for readiness"
+    );
+    let (_, key, _, _) = manager.list().await.into_iter().next().unwrap();
+    let pkg = manager.get_hls("stalled", &key).await.unwrap();
+    pkg.begin_generation(
+        crate::hls::GenerationId(1),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
+    );
+    pkg.fail_generation(
+        crate::hls::GenerationId(1),
+        crate::hls::HlsFailure::ChildExit,
     );
 
     let _newer_lease = mint_stalled_hls(&app, second_id).await;
@@ -360,7 +479,34 @@ async fn ace_and_native_hls_return_the_same_retained_segment_bytes() {
         .unwrap();
     assert_eq!(compat.status(), StatusCode::OK);
     assert_eq!(native.status(), StatusCode::OK);
-    assert_eq!(response_bytes(compat).await, response_bytes(native).await);
+    let retained = response_bytes(compat).await;
+    assert_eq!(retained, response_bytes(native).await);
+
+    // A generation fence suppresses playlist availability while completed segments remain
+    // retrievable until normal window eviction or teardown.
+    compat_packager.begin_generation(
+        crate::hls::GenerationId(1),
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        true,
+    );
+    let recovering_segment = app
+        .clone()
+        .oneshot(Request::get(compat_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(recovering_segment.status(), StatusCode::OK);
+    assert_eq!(response_bytes(recovering_segment).await, retained);
+    compat_packager.fail_generation(
+        crate::hls::GenerationId(1),
+        crate::hls::HlsFailure::ChildExit,
+    );
+    let failed_segment = app
+        .clone()
+        .oneshot(Request::get(compat_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(failed_segment.status(), StatusCode::OK);
+    assert_eq!(response_bytes(failed_segment).await, retained);
     assert_eq!(manager.list().await.len(), 1);
     assert!(manager.get_hls("hlsfix", id).await.is_some());
 }

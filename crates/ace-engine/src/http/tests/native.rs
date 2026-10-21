@@ -361,6 +361,229 @@ async fn m3u8_stalled_playlist_returns_retryable_503() {
 }
 
 #[tokio::test]
+async fn normalization_http_native_terminal_failure_is_retryable_and_private() {
+    let st = fixture_state(0);
+    let app = router(st.clone());
+    // Create the ordinary native entry, then place its media into a terminal enabled-mode
+    // state to exercise the HTTP boundary without an FFmpeg dependency.
+    let pkg = st
+        .manager
+        .get_or_start_hls("fix", "terminal")
+        .await
+        .unwrap();
+    pkg.begin_generation(
+        crate::hls::GenerationId(1),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
+    );
+    pkg.fail_generation(
+        crate::hls::GenerationId(1),
+        crate::hls::HlsFailure::ChildExit,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/streams/fix/terminal.m3u8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert!(
+        body.is_empty(),
+        "terminal details must not reach HTTP clients"
+    );
+    let retry = st
+        .manager
+        .get_or_start_hls("fix", "terminal")
+        .await
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&pkg, &retry),
+        "HTTP retry must reuse the failed shared entry"
+    );
+}
+
+#[tokio::test]
+async fn normalization_http_starting_recovering_and_stopped_are_retryable() {
+    for state in ["starting", "recovering", "stopped"] {
+        let st = fixture_state(0);
+        let pkg = st.manager.get_or_start_hls("fix", state).await.unwrap();
+        match state {
+            "starting" => {}
+            "recovering" => pkg.begin_generation(
+                crate::hls::GenerationId(1),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                true,
+            ),
+            "stopped" => pkg.stop(),
+            _ => unreachable!(),
+        }
+        let response = super::super::await_hls_playlist(&pkg, Duration::ZERO, "/seg", true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{state}"
+        );
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1", "{state}");
+        assert!(axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn normalization_http_playlist_wait_returns_retryable_response_at_request_deadline() {
+    let st = stalled_hls_state();
+    let pkg = st
+        .manager
+        .get_or_start_hls("stalled", "deadline")
+        .await
+        .unwrap();
+    pkg.begin_generation(
+        crate::hls::GenerationId(u64::MAX - 1),
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        false,
+    );
+
+    let response = super::super::await_hls_playlist(
+        &pkg,
+        Duration::from_millis(10),
+        "/streams/stalled/deadline/seg",
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn normalization_http_playlist_wait_wakes_promptly_on_terminal_failure() {
+    let st = fixture_state(0);
+    let pkg = st
+        .manager
+        .get_or_start_hls("fix", "terminal-wake")
+        .await
+        .unwrap();
+    pkg.begin_generation(
+        crate::hls::GenerationId(1),
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        false,
+    );
+
+    let started = tokio::time::Instant::now();
+    let waiter = tokio::spawn(async move {
+        super::super::await_hls_playlist(
+            &pkg,
+            Duration::from_secs(10),
+            "/streams/fix/terminal-wake/seg",
+            true,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    let pkg = st.manager.get_hls("fix", "terminal-wake").await.unwrap();
+    pkg.fail_generation(
+        crate::hls::GenerationId(1),
+        crate::hls::HlsFailure::ChildExit,
+    );
+
+    let response = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("terminal transition must wake the playlist waiter within one second")
+        .unwrap()
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+}
+
+#[tokio::test]
+async fn normalization_http_ready_to_recovery_cannot_serve_old_playlist_or_reset_deadline() {
+    let st = fixture_state(0);
+    let pkg = st
+        .manager
+        .get_or_start_hls("fix", "ready-recovery-race")
+        .await
+        .unwrap();
+    let first = crate::hls::GenerationId(1);
+    pkg.begin_generation(
+        first,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
+    );
+    // Turn the current generation Ready from the checked-in synthetic transport fixture.
+    pkg.feed_generation(first, FIXTURE);
+    assert_eq!(pkg.status(), crate::hls::HlsStatus::Ready);
+
+    // Start a fresh Starting generation so the request first waits, then make it Ready
+    // after a measurable portion of the original request budget has elapsed.
+    let second = crate::hls::GenerationId(2);
+    pkg.begin_generation(
+        second,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        true,
+    );
+    let started = tokio::time::Instant::now();
+    let hook_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_was_called = hook_called.clone();
+    let response = super::super::HLS_AFTER_READY
+        .scope(
+            Box::new(move |pkg: &crate::hls::HlsPackager| {
+                hook_was_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(pkg.status(), crate::hls::HlsStatus::Ready);
+                pkg.begin_generation(
+                    crate::hls::GenerationId(3),
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    true,
+                );
+            }),
+            async {
+                // The task-local hook is only consulted after wait_available returns Ready.
+                let ready = pkg.clone();
+                let feed = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    ready.feed_generation(second, FIXTURE);
+                });
+                let response = super::super::await_hls_playlist(
+                    &pkg,
+                    Duration::from_millis(300),
+                    "/streams/fix/ready-recovery-race/seg",
+                    true,
+                )
+                .await;
+                feed.await.expect("feed task must complete");
+                response
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(hook_called.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    assert!(axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(280));
+    assert!(started.elapsed() < Duration::from_millis(450));
+}
+
+#[tokio::test]
 async fn delete_stops_running_session_then_404() {
     let st = state();
     let app = router(st.clone());

@@ -1,9 +1,17 @@
 use super::*;
 
 async fn server_api_json(state: AppState, query: &str) -> (StatusCode, serde_json::Value) {
+    control_api_json(state, "/server/api", query).await
+}
+
+async fn control_api_json(
+    state: AppState,
+    path: &str,
+    query: &str,
+) -> (StatusCode, serde_json::Value) {
     let resp = router(state)
         .oneshot(
-            Request::get(format!("/server/api?{query}"))
+            Request::get(format!("{path}?{query}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -27,6 +35,21 @@ async fn server_api_get_version_returns_the_result_envelope() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["error"], serde_json::Value::Null);
     assert_eq!(json["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(json["result"]["code"].is_u64());
+    assert_eq!(json["result"]["platform"], std::env::consts::OS);
+}
+
+#[tokio::test]
+async fn webui_service_get_version_matches_server_api() {
+    let (status, json) = control_api_json(
+        ace_compat_state(0),
+        "/webui/api/service",
+        "method=get_version",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, server_json) = server_api_json(ace_compat_state(0), "method=get_version").await;
+    assert_eq!(json, server_json);
 }
 
 #[tokio::test]
@@ -88,11 +111,16 @@ async fn server_api_get_network_connection_status_reports_connected() {
 
 #[tokio::test]
 async fn server_api_unknown_method_returns_error_with_http_200() {
-    let (status, json) =
-        server_api_json(ace_compat_state(0), "method=get_available_channels").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["result"], serde_json::Value::Null);
-    assert!(json["error"].as_str().unwrap().contains("unknown method"));
+    for path in ["/server/api", "/webui/api/service"] {
+        let (status, json) =
+            control_api_json(ace_compat_state(0), path, "method=get_available_channels").await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(json["result"], serde_json::Value::Null, "{path}");
+        assert!(
+            json["error"].as_str().unwrap().contains("unknown method"),
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -118,7 +146,9 @@ async fn server_api_content_id_resolution_errors_when_catalog_lookup_is_disabled
 
 #[tokio::test]
 async fn server_api_is_gated_by_experimental_ace_compat() {
-    // fixture_state leaves the compat surface off, so /server/api is not routed at all.
-    let (status, _) = server_api_json(fixture_state(0), "method=get_version").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // fixture_state leaves the compat surface off, so neither control route is registered.
+    for path in ["/server/api", "/webui/api/service"] {
+        let (status, _) = control_api_json(fixture_state(0), path, "method=get_version").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
 }

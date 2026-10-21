@@ -166,9 +166,23 @@ pub(super) async fn stream_file_with_hls_timeout(
         };
         return match s.manager.get_or_start_hls(&network, &id).await {
             Ok(pkg) => {
-                if let Err(response) = await_hls_ready(&pkg, timeout).await {
-                    return *response;
+                let prefix = format!(
+                    "/streams/{network}/{}/seg",
+                    native_public_stream_id(&network, &id)
+                );
+                let playlist = await_hls_playlist(&pkg, timeout, &prefix, true).await;
+                if !s
+                    .manager
+                    .get_hls(&network, &id)
+                    .await
+                    .is_some_and(|current| Arc::ptr_eq(&current, &pkg))
+                {
+                    return StatusCode::NOT_FOUND.into_response();
                 }
+                let playlist = match playlist {
+                    Ok(playlist) => playlist,
+                    Err(response) => return *response,
+                };
                 // Deliberately no `icy-*` header here: on an HLS manifest it makes VLC's HTTP
                 // access promote the URL to the `icyx://` (Icecast) scheme and treat the body as
                 // a raw audio stream, so the HLS demux never loads and playback busy-loops the
@@ -176,7 +190,7 @@ pub(super) async fn stream_file_with_hls_timeout(
                 // SDT `service_name` embedded in the segments themselves.
                 (
                     [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
-                    pkg.playlist(&network, &native_public_stream_id(&network, &id)),
+                    playlist,
                 )
                     .into_response()
             }
