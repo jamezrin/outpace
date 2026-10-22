@@ -146,14 +146,16 @@ pub(super) async fn ace_manifest(
 /// Tokenized HLS playlist returned by `/ace/manifest.m3u8` JSON/redirect modes.
 pub(super) async fn ace_hls_playback(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path((id, manifest)): Path<(String, String)>,
 ) -> Response {
     let timeout = s.manager.hls_startup_timeout();
-    ace_hls_playback_with_timeout(State(s), Path((id, manifest)), timeout).await
+    ace_hls_playback_with_timeout(State(s), headers, Path((id, manifest)), timeout).await
 }
 
 pub(super) async fn ace_hls_playback_with_timeout(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path((id, manifest)): Path<(String, String)>,
     timeout: Duration,
 ) -> Response {
@@ -169,7 +171,9 @@ pub(super) async fn ace_hls_playback_with_timeout(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let prefix = format!("/ace/c/{token}");
+    // Sampled proxies rewrite absolute engine URLs into their own segment catch-all route.
+    // Reuse the playback/control URL policy without trusting additional proxy headers.
+    let prefix = format!("{}/ace/c/{token}", request_base(&headers));
     let playlist = tokio::select! {
         biased;
         _ = cancel.changed() => return StatusCode::NOT_FOUND.into_response(),
@@ -372,12 +376,18 @@ pub(super) async fn ace_command(
 pub(super) async fn server_api(
     State(s): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Response {
     use crate::server_api as api;
 
     let method = params.get("method").map(String::as_str).unwrap_or("");
     let body = match api::parse_method(method) {
-        api::Method::GetVersion => api::ok(api::version_result()),
+        api::Method::GetVersion => {
+            // The sampled Compose healthcheck greps for the literal `"error": null`.
+            // Pretty-print only this success envelope; its parsed fields stay identical.
+            let body = serde_json::to_string_pretty(&api::ok(api::version_result()))
+                .expect("version JSON is serializable");
+            return ([(header::CONTENT_TYPE, "application/json")], body).into_response();
+        }
         api::Method::GetStatus => api::ok(api::status_result(s.manager.list().await.len())),
         api::Method::GetNetworkConnectionStatus => api::ok(api::network_status_result(&s.networks)),
         // `get_content_id` only echoes an id the caller already gave; it can't derive one from a
@@ -399,7 +409,7 @@ pub(super) async fn server_api(
         }
         api::Method::Unknown(name) => api::err(format!("unknown method: {name}")),
     };
-    Json(body)
+    Json(body).into_response()
 }
 
 /// Resolve a `/server/api` content [`crate::server_api::Selector`] to its infohash. Direct

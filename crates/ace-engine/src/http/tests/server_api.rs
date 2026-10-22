@@ -40,6 +40,33 @@ async fn server_api_get_version_returns_the_result_envelope() {
 }
 
 #[tokio::test]
+async fn get_version_success_bytes_include_the_healthcheck_spacing_on_both_aliases() {
+    for (path, query) in [
+        ("/server/api", "method=get_version"),
+        ("/webui/api/service", "method=get_version"),
+    ] {
+        let response = router(ace_compat_state(0))
+            .oneshot(
+                Request::get(format!("{path}?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("\"error\": null"), "{path}: {text}");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["result"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+}
+
+#[tokio::test]
 async fn webui_service_get_version_matches_server_api() {
     let (status, json) = control_api_json(
         ace_compat_state(0),
