@@ -42,9 +42,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         infohash: [u8; 20],
         peer_id: [u8; 20],
     ) -> Result<Handshake> {
+        self.perform_handshake_with_observer(infohash, peer_id, || {})
+            .await
+    }
+
+    /// Like [`Self::perform_handshake`], notifying `on_sent` once our entire handshake
+    /// has been written, before awaiting the reply. The caller can retain this progress
+    /// when an outer deadline cancels the exchange. No peer data is passed to the observer.
+    pub async fn perform_handshake_with_observer(
+        &mut self,
+        infohash: [u8; 20],
+        peer_id: [u8; 20],
+        on_sent: impl FnOnce(),
+    ) -> Result<Handshake> {
         let ours = Handshake::new(infohash, peer_id);
         let timeout = self.timeout;
         with_timeout(timeout, self.stream.write_all(&ours.encode())).await??;
+        on_sent();
         let mut hs = [0u8; HANDSHAKE_LEN];
         with_timeout(timeout, self.stream.read_exact(&mut hs)).await??;
         let peer = Handshake::decode(&hs)?;
@@ -387,6 +401,20 @@ mod tests {
             .perform_handshake([0x11u8; 20], *b"R30------CLIENTPEERy")
             .await;
         assert!(matches!(res, Err(PeerError::Timeout)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_observer_distinguishes_blocked_write_from_silent_reply() {
+        for (capacity, expected_sent) in [(1, false), (4096, true)] {
+            let (client, _server) = tokio::io::duplex(capacity);
+            let mut session = PeerSession::new(client).with_timeout(Duration::from_secs(5));
+            let mut sent = false;
+            let result = session
+                .perform_handshake_with_observer([0; 20], [0; 20], || sent = true)
+                .await;
+            assert!(matches!(result, Err(PeerError::Timeout)));
+            assert_eq!(sent, expected_sent);
+        }
     }
 
     #[tokio::test]

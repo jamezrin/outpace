@@ -131,6 +131,9 @@ pub struct LiveSeedOptions {
 type SeedConfig = LiveSeedOptions;
 type LiveRecoveryConfig = LiveRecoveryOptions;
 
+mod connect_diagnostics;
+use connect_diagnostics::{ConnectPhase, PeerConnectProgress, PeerConnectStats, PeerConnectTiming};
+
 mod peer;
 #[cfg(test)]
 use peer::prefer_window;
@@ -178,7 +181,7 @@ pub(super) struct ConnectedUpstream {
 }
 
 pub(super) enum PeerConnectAttempt {
-    Connected(ConnectedUpstream),
+    Connected(ConnectedUpstream, PeerConnectTiming),
     Failed(PeerConnectFailure),
 }
 
@@ -186,6 +189,7 @@ pub(super) enum PeerConnectAttempt {
 pub(super) struct PeerConnectFailure {
     pub(super) addr: SocketAddrV4,
     pub(super) stage: PeerConnectStage,
+    pub(super) timing: PeerConnectTiming,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,70 +198,6 @@ pub(super) enum PeerConnectStage {
     Handshake,
     Window,
     TotalTimeout,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PeerConnectStats {
-    pub(super) connected: usize,
-    pub(super) tcp: usize,
-    pub(super) handshake: usize,
-    pub(super) window: usize,
-    pub(super) total_timeout: usize,
-    pub(super) task: usize,
-}
-
-impl PeerConnectStats {
-    fn record_connected(&mut self) {
-        self.connected += 1;
-    }
-
-    pub(super) fn record_failure(&mut self, failure: PeerConnectFailure) {
-        let _addr = failure.addr;
-        match failure.stage {
-            PeerConnectStage::Tcp => self.tcp += 1,
-            PeerConnectStage::Handshake => self.handshake += 1,
-            PeerConnectStage::Window => self.window += 1,
-            PeerConnectStage::TotalTimeout => self.total_timeout += 1,
-        }
-    }
-
-    fn record_task_failure(&mut self) {
-        self.task += 1;
-    }
-
-    fn has_observations(&self) -> bool {
-        self.connected + self.tcp + self.handshake + self.window + self.total_timeout + self.task
-            > 0
-    }
-
-    pub(super) fn summary(&self) -> String {
-        let attempted = self.connected
-            + self.tcp
-            + self.handshake
-            + self.window
-            + self.total_timeout
-            + self.task;
-        let mut parts = vec![format!("attempted={attempted}")];
-        if self.connected > 0 {
-            parts.push(format!("connected={}", self.connected));
-        }
-        if self.tcp > 0 {
-            parts.push(format!("tcp={}", self.tcp));
-        }
-        if self.handshake > 0 {
-            parts.push(format!("handshake={}", self.handshake));
-        }
-        if self.window > 0 {
-            parts.push(format!("window={}", self.window));
-        }
-        if self.total_timeout > 0 {
-            parts.push(format!("total_timeout={}", self.total_timeout));
-        }
-        if self.task > 0 {
-            parts.push(format!("task={}", self.task));
-        }
-        parts.join(" ")
-    }
 }
 
 #[derive(Debug)]
