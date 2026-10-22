@@ -130,7 +130,8 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
 
 /// Build a [`VodInfo`] from exported torrent metainfo or legacy `AceStreamTransport` bytes
 /// (the pure half of VOD resolution). Exported metainfo uses the original encoded `info`
-/// bytes for identity; it never uses the live descriptor identity formula.
+/// bytes for identity and standard BitTorrent peer handshakes. Wrapped descriptors retain
+/// AceStream peer handshakes. Exported metainfo never uses the live descriptor identity formula.
 ///
 /// Errors if the descriptor is live (no `pieces`), advertises a multi-file layout (`files`
 /// present — intentionally unsupported), fails geometry validation, or lacks a single-file
@@ -142,6 +143,7 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
         validate_geometry(metainfo.piece_length, DEFAULT_CHUNK_LENGTH)?;
         return Ok(VodInfo {
             infohash: metainfo.infohash,
+            peer_protocol: ace_wire::handshake::HandshakeProtocol::BitTorrent,
             piece_length: metainfo.piece_length,
             chunk_length: DEFAULT_CHUNK_LENGTH,
             trackers: metainfo.trackers,
@@ -163,6 +165,7 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
     Ok(VodInfo {
         infohash: infohash_of_descriptor(&d.raw)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
+        peer_protocol: ace_wire::handshake::HandshakeProtocol::AceStream,
         piece_length: d.piece_length,
         chunk_length: d.chunk_length,
         trackers: d.trackers,

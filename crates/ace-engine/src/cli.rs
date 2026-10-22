@@ -273,10 +273,7 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         let mut stdout = tokio::io::stdout();
-        while let Some(chunk) = source.next().await {
-            stdout.write_all(&chunk).await?;
-            stdout.flush().await?;
-        }
+        write_vod_output(source.as_mut(), total, &mut stdout).await?;
         return Ok(());
     }
 
@@ -288,6 +285,40 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     while let Some(chunk) = source.next().await {
         stdout.write_all(&chunk).await?;
         stdout.flush().await?;
+    }
+    Ok(())
+}
+
+async fn write_vod_output(
+    source: &mut dyn crate::provider::VodByteSource,
+    total: u64,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut emitted = 0u64;
+    while let Some(chunk) = source.next().await {
+        let next = emitted.checked_add(chunk.len() as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "VOD output length overflow",
+            )
+        })?;
+        if next > total {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "VOD output exceeds its declared length",
+            ));
+        }
+        output.write_all(&chunk).await?;
+        emitted = next;
+        output.flush().await?;
+    }
+    if emitted < total {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("VOD output ended after {emitted} of {total} bytes"),
+        ));
     }
     Ok(())
 }
@@ -365,8 +396,78 @@ fn percent_decode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{broadcast_output, play_provider_from_config, Cli, Command, PlaybackTarget};
+    use super::{
+        broadcast_output, play_provider_from_config, write_vod_output, Cli, Command, PlaybackTarget,
+    };
+    use bytes::Bytes;
     use clap::{CommandFactory, Parser};
+
+    struct Chunks {
+        length: u64,
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::VodByteSource for Chunks {
+        fn content_length(&self) -> u64 {
+            self.length
+        }
+
+        async fn next(&mut self) -> Option<Bytes> {
+            self.chunks.pop_front()
+        }
+    }
+
+    fn chunks(length: u64, parts: &[&[u8]]) -> Chunks {
+        Chunks {
+            length,
+            chunks: parts
+                .iter()
+                .map(|part| Bytes::copy_from_slice(part))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn vod_output_returns_unexpected_eof_when_source_is_short() {
+        let mut source = chunks(3, &[b"ab"]);
+        let mut output = Vec::new();
+
+        let error = write_vod_output(&mut source, 3, &mut output)
+            .await
+            .expect_err("short VOD input must fail instead of succeeding with a truncated file");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(output, b"ab");
+    }
+
+    #[tokio::test]
+    async fn vod_output_rejects_source_bytes_beyond_declared_total() {
+        let mut source = chunks(2, &[b"abc"]);
+        let mut output = Vec::new();
+
+        let error = write_vod_output(&mut source, 2, &mut output)
+            .await
+            .expect_err("VOD output must not exceed the declared file length");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            output.is_empty(),
+            "reject an oversized chunk before writing it"
+        );
+    }
+
+    #[tokio::test]
+    async fn vod_output_writes_exact_declared_bytes_and_succeeds() {
+        let mut source = chunks(5, &[b"ab", b"cde"]);
+        let mut output = Vec::new();
+
+        write_vod_output(&mut source, 5, &mut output)
+            .await
+            .expect("complete VOD source should write successfully");
+
+        assert_eq!(output, b"abcde");
+    }
 
     #[test]
     fn play_provider_receives_live_playback_policy_from_runtime_config() {

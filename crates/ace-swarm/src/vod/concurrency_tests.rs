@@ -196,6 +196,7 @@ fn content_and_info_with_length(total_len: usize) -> (Vec<u8>, VodInfo) {
         content,
         VodInfo {
             infohash: [0x4d; 20],
+            peer_protocol: Default::default(),
             piece_length: PIECE_LEN as u64,
             chunk_length: PIECE_LEN as u64,
             trackers: vec![],

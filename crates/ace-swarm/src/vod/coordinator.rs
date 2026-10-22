@@ -297,10 +297,11 @@ async fn run_worker(
         notify,
         timeouts,
     } = context;
-    let mut session = tokio::time::timeout(timeouts.connect, connect(&address.to_string()))
+    let session = tokio::time::timeout(timeouts.connect, connect(&address.to_string()))
         .await
         .map_err(|_| Failure::Peer)?
         .map_err(|_| Failure::Peer)?;
+    let mut session = session.with_protocol(info.peer_protocol);
     tokio::time::timeout(
         timeouts.handshake,
         session.perform_handshake(info.infohash, random_peer_id()),

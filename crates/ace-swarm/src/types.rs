@@ -47,6 +47,8 @@ impl StreamInfo {
 pub struct VodInfo {
     /// 20-byte BitTorrent infohash of the VOD swarm.
     pub infohash: [u8; 20],
+    /// Peer handshake selected by the descriptor format, never by retrying a failed exchange.
+    pub peer_protocol: ace_wire::handshake::HandshakeProtocol,
     /// Bytes per piece (e.g. 131_072).
     pub piece_length: u64,
     /// Bytes per chunk / request block (e.g. 16_384).

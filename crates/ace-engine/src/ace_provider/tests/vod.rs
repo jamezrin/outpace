@@ -75,6 +75,7 @@ fn make_vod_content(piece_length: u64, chunk_length: u64, total_len: u64) -> (Ve
     }
     let info = VodInfo {
         infohash: [0x42; 20],
+        peer_protocol: Default::default(),
         piece_length,
         chunk_length,
         trackers: vec![],
