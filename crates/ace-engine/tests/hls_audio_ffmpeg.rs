@@ -237,6 +237,53 @@ fn packet_times(tools: &SyntheticTools, data: &[u8], selector: &str) -> Vec<f64>
         .collect()
 }
 
+fn video_keyframe_offsets(tools: &SyntheticTools, data: &[u8]) -> Vec<usize> {
+    let output = run_ffprobe(
+        tools,
+        data,
+        &[
+            "-select_streams",
+            "v:0",
+            "-show_packets",
+            "-show_entries",
+            "packet=pos,flags",
+            "-of",
+            "json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "video access-point probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let packets: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let keyframes: Vec<usize> = packets["packets"]
+        .as_array()
+        .expect("video packets")
+        .iter()
+        .filter(|packet| {
+            packet["flags"]
+                .as_str()
+                .is_some_and(|flags| flags.contains('K'))
+        })
+        .map(|packet| {
+            packet["pos"]
+                .as_str()
+                .expect("packet byte position")
+                .parse()
+                .expect("numeric packet byte position")
+        })
+        .collect();
+    keyframes
+}
+
+fn second_video_keyframe_offset(tools: &SyntheticTools, data: &[u8]) -> usize {
+    let keyframes = video_keyframe_offsets(tools, data);
+    let offset = *keyframes.get(1).expect("second video access point");
+    assert_eq!(offset % 188, 0, "video access point is TS packet aligned");
+    offset
+}
+
 fn pcr_ticks(data: &[u8], pid: u16) -> Vec<u64> {
     data.as_chunks::<188>()
         .0
@@ -1153,12 +1200,7 @@ async fn generated_recovery_switches_ac3_to_mp2_across_native_and_compat_routes(
     assert!(String::from_utf8(compat_initial)
         .unwrap()
         .contains("#EXTINF"));
-    // The source was delivered as one chunk, so wait for its entire generated output to settle
-    // before taking the retained-window baseline for recovery.
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let initial = media.playlist_with_segment_prefix("/segments");
-    let (initial_seq, initial_count) = playlist_sequence_and_count(&initial);
-    let old = media.segment(initial_seq).expect("old segment retained");
     assert!(initial.contains("#EXTINF"));
 
     // Keep the source open after a boundary so both route handlers see Recovering.
@@ -1172,6 +1214,11 @@ async fn generated_recovery_switches_ac3_to_mp2_across_native_and_compat_routes(
     })
     .await
     .expect("source boundary enters recovery");
+    // Take the baseline only after the source boundary has been consumed. This fences the old
+    // generation so a late segment cannot look like output from the replacement input.
+    let boundary_playlist = media.playlist_with_segment_prefix("/segments");
+    let (initial_seq, initial_count) = playlist_sequence_and_count(&boundary_playlist);
+    let old = media.segment(initial_seq).expect("old segment retained");
     let old_path = first_playlist_uri(&native_initial);
     let (old_status, old_http) = route_body(&app, &old_path).await;
     assert_eq!(old_status, axum::http::StatusCode::OK);
@@ -1190,10 +1237,17 @@ async fn generated_recovery_switches_ac3_to_mp2_across_native_and_compat_routes(
     .await
     .expect_err("both playlist routes remain pending during recovery");
 
-    // Deliver replacement output in bounded stages. The first stage must not satisfy the
-    // configured two-segment readiness threshold; the second one does.
+    // Stop the first replacement stage immediately before its second video access point. Without
+    // that next GOP boundary the packager cannot close a retained segment; the remainder then
+    // allows the configured two-segment readiness threshold to be met.
     let packet_aligned_len = mp2.transport.len() / 188 * 188;
-    let first_stage_len = packet_aligned_len / 4 / 188 * 188;
+    let first_stage_len = second_video_keyframe_offset(&tools, &mp2.transport);
+    assert!(first_stage_len < packet_aligned_len);
+    assert_eq!(
+        video_keyframe_offsets(&tools, &mp2.transport[..first_stage_len]).len(),
+        1,
+        "first-stage prefix contains only its opening video access point"
+    );
     tx.send((
         false,
         Bytes::copy_from_slice(&mp2.transport[..first_stage_len]),
