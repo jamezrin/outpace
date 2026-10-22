@@ -332,3 +332,364 @@ async fn cancelled_range_finishes_background_transaction_before_overlap_download
         "cancelled overlap cannot race a duplicate piece download/write"
     );
 }
+
+struct ScriptedRequest {
+    index: u32,
+    begin: u32,
+    length: u32,
+    reply: tokio::sync::oneshot::Sender<Vec<u8>>,
+}
+
+struct ScriptedSeeder {
+    addr: SocketAddrV4,
+    requests: mpsc::Receiver<ScriptedRequest>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    join: tokio::task::JoinHandle<()>,
+    closed: Arc<AtomicU64>,
+}
+
+impl ScriptedSeeder {
+    async fn stop(self) {
+        let _ = self.shutdown.send(());
+        self.join.await.unwrap();
+    }
+}
+
+// A test seeder whose request replies are controlled by the test. The listener owns all
+// connection tasks and aborts/joins them on shutdown; client cancellation is observable through
+// `closed` while an unanswered request is pending.
+async fn spawn_scripted_vod_seeder(info: VodInfo) -> ScriptedSeeder {
+    use ace_wire::handshake::Handshake;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinSet;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = match listener.local_addr().unwrap() {
+        std::net::SocketAddr::V4(addr) => addr,
+        _ => unreachable!(),
+    };
+    let (request_tx, requests) = mpsc::channel(32);
+    let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let closed = Arc::new(AtomicU64::new(0));
+    let closed_for_task = closed.clone();
+    let join = tokio::spawn(async move {
+        let mut sessions = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut socket, _)) = accepted else { break };
+                    let info = info.clone();
+                    let request_tx = request_tx.clone();
+                    let closed = closed_for_task.clone();
+                    sessions.spawn(async move {
+                        let mut handshake = [0; ace_wire::handshake::HANDSHAKE_LEN];
+                        if socket.read_exact(&mut handshake).await.is_err() {
+                            return;
+                        }
+                        let response = Handshake::new(info.infohash, random_peer_id()).encode();
+                        if socket.write_all(&response).await.is_err() {
+                            return;
+                        }
+                        let count = info.piece_count() as usize;
+                        let mut bits = vec![0; count.div_ceil(8)];
+                        for piece in 0..count {
+                            bits[piece / 8] |= 0x80 >> (piece % 8);
+                        }
+                        if socket.write_all(&PeerMessage::Bitfield(bits).encode()).await.is_err()
+                            || socket.write_all(&PeerMessage::Unchoke.encode()).await.is_err()
+                        {
+                            return;
+                        }
+
+                        let mut buffer = Vec::new();
+                        let mut scratch = [0; 4096];
+                        'session: loop {
+                            loop {
+                                match PeerMessage::decode(&buffer) {
+                                    Ok(Some((message, used))) => {
+                                        buffer.drain(..used);
+                                        if let PeerMessage::Request { index, begin, length } = message {
+                                            let (reply, response_rx) = tokio::sync::oneshot::channel();
+                                            if request_tx.send(ScriptedRequest { index, begin, length, reply }).await.is_err() {
+                                                break 'session;
+                                            }
+                                            tokio::select! {
+                                                response = response_rx => {
+                                                    let Ok(block) = response else { break 'session };
+                                                    let message = PeerMessage::Piece { index, begin, block }.encode();
+                                                    if socket.write_all(&message).await.is_err() {
+                                                        break 'session;
+                                                    }
+                                                }
+                                                read = socket.read(&mut scratch) => {
+                                                    match read {
+                                                        Ok(0) | Err(_) => break 'session,
+                                                        Ok(n) => buffer.extend_from_slice(&scratch[..n]),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(_) => break 'session,
+                                }
+                            }
+                            match socket.read(&mut scratch).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => buffer.extend_from_slice(&scratch[..n]),
+                            }
+                        }
+                        closed.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
+            }
+        }
+        sessions.abort_all();
+        while sessions.join_next().await.is_some() {}
+    });
+    ScriptedSeeder {
+        addr,
+        requests,
+        shutdown,
+        join,
+        closed,
+    }
+}
+
+async fn next_scripted_request(seeders: &mut [ScriptedSeeder]) -> (usize, ScriptedRequest) {
+    loop {
+        for (index, seeder) in seeders.iter_mut().enumerate() {
+            if let Ok(request) = seeder.requests.try_recv() {
+                return (index, request);
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_multi_peer_range_is_followed_by_correct_overlapping_range() {
+    let (content, info) = make_vod_content(16, 16, 32);
+    let mut seeders = vec![
+        spawn_scripted_vod_seeder(info.clone()).await,
+        spawn_scripted_vod_seeder(info.clone()).await,
+    ];
+    let registry = SeedRegistry::new();
+    let store = registry.lease_store(info.infohash, || PieceStore::new(16, 16, 128));
+    let shared_store = store.0.clone();
+    let range_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let vod = Arc::new(AceVodContent {
+        info: info.clone(),
+        bootstrap_peers: seeders.iter().map(|s| s.addr).collect(),
+        announce_peer_port: tokio::sync::watch::channel(None).1,
+        store,
+        peers: Arc::new(tokio::sync::Mutex::new(None)),
+        range_lock: range_lock.clone(),
+    });
+
+    let cancelled = vod.open_range(0, 31).await.unwrap();
+    let mut active = [false; 2];
+    let mut pending = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !active.iter().all(|active| *active) {
+            let (peer, request) = next_scripted_request(&mut seeders).await;
+            active[peer] = true;
+            pending.push(request);
+        }
+    })
+    .await
+    .expect("both peer sockets receive active piece requests");
+
+    // Queue the overlap while the first transaction still owns the lock.
+    let next_vod = vod.clone();
+    let overlapping = tokio::spawn(async move { next_vod.open_range(0, 31).await });
+    drop(cancelled);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while seeders
+            .iter()
+            .any(|seeder| seeder.closed.load(Ordering::SeqCst) == 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancellation closes every active upstream socket");
+    drop(pending);
+
+    // Both old sockets report EOF before the queued overlap is awaited for correct completion.
+    // This observes socket shutdown followed by overlap correctness, not exact remote-EOF versus
+    // lock-release timing.
+    let second = tokio::time::timeout(Duration::from_secs(3), overlapping)
+        .await
+        .expect("the cancelled range releases its lock")
+        .unwrap()
+        .unwrap();
+    let reader = tokio::spawn(read_all(second));
+    let mut requested = Vec::new();
+    let bytes = tokio::time::timeout(Duration::from_secs(3), async {
+        while requested.len() < 2 {
+            let (_, request) = next_scripted_request(&mut seeders).await;
+            let start =
+                request.index as usize * info.piece_length as usize + request.begin as usize;
+            let end = start + request.length as usize;
+            request.reply.send(content[start..end].to_vec()).unwrap();
+            requested.push(request.index);
+        }
+        reader.await.unwrap()
+    })
+    .await
+    .expect("the overlapping range completes");
+    assert_eq!(bytes, content);
+    assert!(seeders.iter().all(|s| s.closed.load(Ordering::SeqCst) >= 1));
+    assert!(PieceStore::shared_block(&shared_store, 0, 0, 16)
+        .await
+        .is_some());
+
+    for seeder in seeders {
+        seeder.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn out_of_order_and_corrupt_upstream_never_reseed_unverified_bytes() {
+    let (content, info) = make_vod_content(16, 16, 32);
+    let mut seeders = vec![
+        spawn_scripted_vod_seeder(info.clone()).await,
+        spawn_scripted_vod_seeder(info.clone()).await,
+    ];
+    let registry = SeedRegistry::new();
+    let store = registry.lease_store(info.infohash, || PieceStore::new(16, 16, 128));
+    let shared_store = store.0.clone();
+    let vod = AceVodContent {
+        info: info.clone(),
+        bootstrap_peers: seeders.iter().map(|s| s.addr).collect(),
+        announce_peer_port: tokio::sync::watch::channel(None).1,
+        store,
+        peers: Arc::new(tokio::sync::Mutex::new(None)),
+        range_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let source = vod.open_range(0, 31).await.unwrap();
+    let mut first = None;
+    let mut later = None;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while first.is_none() || later.is_none() {
+            let (peer, request) = next_scripted_request(&mut seeders).await;
+            if request.index == 0 {
+                first = Some((peer, request));
+            } else if request.index == 1 {
+                later = Some((peer, request));
+            } else {
+                panic!("unexpected piece request: {}", request.index);
+            }
+        }
+    })
+    .await
+    .expect("both peers are assigned concurrent pieces");
+
+    let (_, later) = later.unwrap();
+    let later_start = info.piece_length as usize;
+    let later_end = later_start + later.length as usize;
+    later
+        .reply
+        .send(content[later_start..later_end].to_vec())
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(PieceStore::shared_block(&shared_store, 1, 0, 16)
+        .await
+        .is_none());
+
+    let (bad_peer, first) = first.unwrap();
+    let mut corrupted = content[..first.length as usize].to_vec();
+    corrupted[0] ^= 0xff;
+    first.reply.send(corrupted).unwrap();
+    let (retry_peer, retry) = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (peer, request) = next_scripted_request(&mut seeders).await;
+            if request.index == 0 {
+                break (peer, request);
+            }
+        }
+    })
+    .await
+    .expect("corrupt piece is retried");
+    assert_ne!(retry_peer, bad_peer, "a hash-failing peer is not reused");
+    retry
+        .reply
+        .send(content[..retry.length as usize].to_vec())
+        .unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(3), read_all(source))
+        .await
+        .expect("verified ordered pieces reach the source");
+    assert_eq!(got, content);
+    assert_eq!(
+        PieceStore::shared_block(&shared_store, 0, 0, 16)
+            .await
+            .unwrap(),
+        content[..16]
+    );
+    assert_eq!(
+        PieceStore::shared_block(&shared_store, 1, 0, 16)
+            .await
+            .unwrap(),
+        content[16..]
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let listener_task = tokio::spawn(ace_swarm::listen::PeerListener::serve(
+        listener,
+        registry,
+        random_peer_id(),
+        [0; 8],
+        8,
+        Arc::new(Identity::generate()),
+        8,
+        None,
+    ));
+    let mut peer = PeerSession::new(TcpStream::connect(addr).await.unwrap());
+    peer.perform_handshake(info.infohash, random_peer_id())
+        .await
+        .unwrap();
+    peer.send(&PeerMessage::Interested).await.unwrap();
+    loop {
+        if matches!(peer.read_message().await.unwrap(), PeerMessage::Unchoke) {
+            break;
+        }
+    }
+    for (index, expected) in [content[..16].as_ref(), content[16..].as_ref()]
+        .into_iter()
+        .enumerate()
+    {
+        peer.send(&PeerMessage::Request {
+            index: index as u32,
+            begin: 0,
+            length: 16,
+        })
+        .await
+        .unwrap();
+        loop {
+            if let PeerMessage::Piece {
+                index: got_index,
+                begin,
+                block,
+            } = peer.read_message().await.unwrap()
+            {
+                assert_eq!((got_index, begin), (index as u32, 0));
+                assert_eq!(block, expected);
+                break;
+            }
+        }
+    }
+
+    listener_task.abort();
+    let _ = listener_task.await;
+
+    for seeder in seeders {
+        seeder.stop().await;
+    }
+}
