@@ -128,18 +128,23 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
     })
 }
 
-/// Build a [`VodInfo`] from exported torrent metainfo or legacy `AceStreamTransport` bytes
-/// (the pure half of VOD resolution). Exported metainfo uses the original encoded `info`
-/// bytes for identity and standard BitTorrent peer handshakes. Wrapped descriptors retain
-/// AceStream peer handshakes. Exported metainfo never uses the live descriptor identity formula.
+/// Build a [`VodInfo`] from bare or original-disk-enveloped torrent metainfo, or legacy
+/// `AceStreamTransport` bytes (the pure half of VOD resolution). Metainfo uses the original
+/// encoded `info` bytes for identity and standard BitTorrent peer handshakes. Legacy wrapped
+/// descriptors retain AceStream peer handshakes and their existing identity formula.
 ///
 /// Errors if the descriptor is live (no `pieces`), advertises a multi-file layout (`files`
 /// present — intentionally unsupported), fails geometry validation, or lacks a single-file
 /// `length`.
 pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
     if !ace_wire::infohash::is_transport_file(bytes) {
-        let metainfo = ace_wire::metainfo::decode_metainfo(bytes)
-            .map_err(|_| ResolveError::Transport("invalid single-file metainfo"))?;
+        let metainfo = if ace_wire::disk_envelope::is_disk_envelope(bytes) {
+            // A recognized envelope is terminal: never retry bare or legacy decoding.
+            ace_wire::disk_envelope::decode_disk_metainfo(bytes)
+        } else {
+            ace_wire::metainfo::decode_metainfo(bytes)
+        }
+        .map_err(|_| ResolveError::Transport("invalid single-file metainfo"))?;
         validate_geometry(metainfo.piece_length, DEFAULT_CHUNK_LENGTH)?;
         return Ok(VodInfo {
             infohash: metainfo.infohash,

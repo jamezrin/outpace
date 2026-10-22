@@ -135,8 +135,20 @@ after extraction; decoding does not contact trackers or authorize new network ta
 Encrypted `AceStreamTransport` decoding and live identity remain unchanged. The earlier
 synthetic wrapped VOD schema (`pieces`, `length`, and geometry at the descriptor root)
 remains supported for compatibility; it is distinct from exported torrent metainfo.
-The original engine's opaque on-disk descriptor framing remains unresolved and is
-unsupported. Outpace never strips or scans guessed prefixes to recover a dictionary.
+The VOD resolver also accepts the original-disk envelope with the exact eight-byte
+marker `01 02 03 04 11 02 65 2e`. Its suffix is AES-128-CBC using a distinct fixed
+disk key (raw MD5 of the compiled 59-byte loader argument in engine 3.2.11) and a
+zero IV. Total input is capped at 1 MiB before decryption allocation; the suffix
+must contain at least one complete 16-byte block. Every PKCS#7 padding byte is
+validated, with padding lengths limited to 1 through 16. The unchanged unpadded
+bytes pass directly to the strict metainfo decoder above, preserving its limits,
+single-file policy, original-info identity, and standard BitTorrent handshakes.
+Only one envelope layer is accepted. A recognized marker makes any framing,
+padding, or metainfo error terminal; alternate markers, nesting, and prefix
+scanning are unsupported. Live decoding does not accept this envelope. CBC is
+unauthenticated: padding and metainfo validation do not detect every ciphertext
+change or establish catalog authenticity. Catalog authentication, URL/tracker
+policy, and network defaults are unchanged.
 
 Tracked metainfo vectors are synthetic and carry no content ids or recorded infohashes.
 Original-engine exported metainfo and production download/range validation artifacts
