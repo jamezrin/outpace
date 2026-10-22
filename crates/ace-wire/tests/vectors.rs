@@ -1,4 +1,4 @@
-use ace_wire::handshake::{Handshake, PSTR};
+use ace_wire::handshake::{Handshake, HandshakeProtocol, PSTR};
 use ace_wire::infohash::{infohash_of_transport, is_transport_file, transport_file_hash};
 use ace_wire::transport::{decode_transport, TransportDescriptor};
 use std::path::PathBuf;
@@ -68,6 +68,59 @@ fn rejects_wrong_pstr() {
     let mut bytes = vec_bytes("messages/encrypter-handshake-peer-in.bin");
     bytes[1] = b'X'; // corrupt pstr
     assert!(Handshake::decode(&bytes).is_err());
+}
+
+fn fixed_bittorrent_handshake(infohash: [u8; 20], peer_id: [u8; 20]) -> Vec<u8> {
+    let mut bytes = b"\x13BitTorrent protocol".to_vec();
+    bytes.extend([0u8; 8]);
+    bytes.extend(infohash);
+    bytes.extend(peer_id);
+    bytes
+}
+
+#[test]
+fn bittorrent_handshake_roundtrips_fixed_standard_wire_bytes() {
+    let infohash = [0x42; 20];
+    let peer_id = *b"-UT0001-123456789012";
+    let bytes = fixed_bittorrent_handshake(infohash, peer_id);
+
+    let decoded = Handshake::decode_with_protocol(&bytes, HandshakeProtocol::BitTorrent).unwrap();
+
+    assert_eq!(bytes.len(), 68);
+    assert_eq!(decoded.infohash, infohash);
+    assert_eq!(decoded.peer_id, peer_id);
+    assert_eq!(decoded.reserved, [0; 8]);
+    assert_eq!(
+        Handshake::new(infohash, peer_id).encode_with_protocol(HandshakeProtocol::BitTorrent),
+        bytes
+    );
+}
+
+#[test]
+fn bittorrent_handshake_matches_synthetic_golden_vector() {
+    let bytes = vec_bytes("handshakes/bittorrent-standard.bin");
+    let decoded = Handshake::decode_with_protocol(&bytes, HandshakeProtocol::BitTorrent).unwrap();
+
+    assert_eq!(decoded.infohash, std::array::from_fn(|index| index as u8));
+    assert_eq!(decoded.peer_id, *b"-UT0001-123456789012");
+    assert_eq!(
+        Handshake::new(decoded.infohash, decoded.peer_id)
+            .encode_with_protocol(HandshakeProtocol::BitTorrent),
+        bytes
+    );
+}
+
+#[test]
+fn bittorrent_handshake_decoder_rejects_wrong_protocol_and_truncation() {
+    let bytes = fixed_bittorrent_handshake([0x42; 20], *b"-UT0001-123456789012");
+    let mut wrong_protocol = bytes.clone();
+    wrong_protocol[1] = b'X';
+
+    assert!(
+        Handshake::decode_with_protocol(&wrong_protocol, HandshakeProtocol::BitTorrent).is_err()
+    );
+    assert!(Handshake::decode_with_protocol(&bytes[..67], HandshakeProtocol::BitTorrent).is_err());
+    assert!(Handshake::decode_with_protocol(&bytes, HandshakeProtocol::AceStream).is_err());
 }
 
 #[test]

@@ -141,6 +141,7 @@ fn test_info(piece_count: usize, piece_length: usize) -> (Vec<u8>, VodInfo) {
         .collect();
     let info = VodInfo {
         infohash: [0x7c; 20],
+        peer_protocol: Default::default(),
         piece_length: piece_length as u64,
         chunk_length: piece_length as u64,
         trackers: Vec::new(),
@@ -169,6 +170,7 @@ async fn fetch_piece_keeps_at_most_eight_requests_outstanding_and_requests_short
         .collect();
     let info = VodInfo {
         infohash: [0x5a; 20],
+        peer_protocol: Default::default(),
         piece_length: content.len() as u64,
         chunk_length: CHUNK as u64,
         trackers: Vec::new(),
@@ -340,6 +342,7 @@ async fn conflicting_partial_overlap_fails_piece_hash_verification() {
     let content: Vec<u8> = (0..32).collect();
     let info = VodInfo {
         infohash: [0x5b; 20],
+        peer_protocol: Default::default(),
         piece_length: 32,
         chunk_length: 32,
         trackers: Vec::new(),
@@ -457,6 +460,7 @@ async fn duplicate_bytes_and_choke_chatter_do_not_extend_progress_deadline() {
     let content: Vec<u8> = (0..32).collect();
     let info = VodInfo {
         infohash: [0x6c; 20],
+        peer_protocol: Default::default(),
         piece_length: 32,
         chunk_length: 32,
         trackers: Vec::new(),
@@ -542,6 +546,7 @@ async fn fetch_piece_absolute_deadline_stops_unique_byte_dribble_at_120_seconds(
     let content: Vec<u8> = (0..13).collect();
     let info = VodInfo {
         infohash: [0x6b; 20],
+        peer_protocol: Default::default(),
         piece_length: content.len() as u64,
         chunk_length: content.len() as u64,
         trackers: Vec::new(),

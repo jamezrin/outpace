@@ -4,6 +4,7 @@
 //! Most peers use the full 66-byte form, but the official engine as an inbound leecher has
 //! also been observed opening with only the 46-byte prefix through `infohash`; responders
 //! must accept that short form and reply with their full handshake.
+//! Exported torrent metainfo selects the separate standard 68-byte BitTorrent form explicitly.
 use crate::{Result, WireError};
 use rand::Rng;
 
@@ -13,6 +14,20 @@ pub const PSTR: &[u8] = b"AceStreamProtocol";
 pub const HANDSHAKE_PREFIX_LEN: usize = 46;
 /// Total handshake length: 1 + 17 + 8 + 20 + 20.
 pub const HANDSHAKE_LEN: usize = 66;
+/// Standard BitTorrent protocol string used by exported torrent metainfo.
+pub const BITTORRENT_PSTR: &[u8] = b"BitTorrent protocol";
+/// Standard BitTorrent handshake length, including the peer id.
+pub const BITTORRENT_HANDSHAKE_LEN: usize = 68;
+
+/// Selected from the transport descriptor before exchanging any peer bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HandshakeProtocol {
+    /// Legacy wrapped VOD and live/metadata sessions retain the AceStream handshake.
+    #[default]
+    AceStream,
+    /// Exported torrent metainfo uses the standard BitTorrent handshake.
+    BitTorrent,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
@@ -39,6 +54,44 @@ impl Handshake {
         out[26..46].copy_from_slice(&self.infohash);
         out[46..66].copy_from_slice(&self.peer_id);
         out
+    }
+
+    /// Encode the explicitly selected protocol; [`Self::encode`] remains AceStream.
+    pub fn encode_with_protocol(&self, protocol: HandshakeProtocol) -> Vec<u8> {
+        if protocol == HandshakeProtocol::AceStream {
+            return self.encode().to_vec();
+        }
+        let mut out = Vec::with_capacity(BITTORRENT_HANDSHAKE_LEN);
+        out.push(BITTORRENT_PSTR.len() as u8);
+        out.extend_from_slice(BITTORRENT_PSTR);
+        out.extend_from_slice(&self.reserved);
+        out.extend_from_slice(&self.infohash);
+        out.extend_from_slice(&self.peer_id);
+        out
+    }
+
+    /// Decode only the selected protocol, without guessing or falling back.
+    pub fn decode_with_protocol(buf: &[u8], protocol: HandshakeProtocol) -> Result<Handshake> {
+        if protocol == HandshakeProtocol::AceStream {
+            return Self::decode(buf);
+        }
+        if buf.len() < BITTORRENT_HANDSHAKE_LEN {
+            return Err(WireError::Truncated);
+        }
+        if buf[0] as usize != BITTORRENT_PSTR.len() || &buf[1..20] != BITTORRENT_PSTR {
+            return Err(WireError::Invalid("not a BitTorrent protocol handshake"));
+        }
+        let mut reserved = [0u8; 8];
+        reserved.copy_from_slice(&buf[20..28]);
+        let mut infohash = [0u8; 20];
+        infohash.copy_from_slice(&buf[28..48]);
+        let mut peer_id = [0u8; 20];
+        peer_id.copy_from_slice(&buf[48..68]);
+        Ok(Handshake {
+            reserved,
+            infohash,
+            peer_id,
+        })
     }
 
     pub fn decode(buf: &[u8]) -> Result<Handshake> {

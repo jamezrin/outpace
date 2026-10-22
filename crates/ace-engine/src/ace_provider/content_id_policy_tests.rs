@@ -4,6 +4,8 @@ use ace_wire::infohash::transport_file_hash;
 use std::future::{ready, Future};
 
 const CID: &str = "0123456789abcdef0123456789abcdef01234567";
+const RAW_METAINFO: &[u8] =
+    include_bytes!("../../../../tests/vectors/metainfo/single-file-unsorted.torrent");
 
 fn catalog_failure<T>() -> impl Future<Output = Result<T, ResolveError>> {
     ready(Err(ResolveError::Catalog("synthetic catalog unavailable")))
@@ -91,6 +93,28 @@ async fn disabled_live_and_vod_fail_before_peer_connections_or_discovery() {
         tokio::time::timeout(Duration::from_millis(20), listener.accept())
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn catalog_raw_metainfo_is_vod_only_at_the_provider_boundary() {
+    let p = provider();
+    let vod = p
+        .resolve_vod_info_with_catalog(&format!("cid:{CID}"), ready(Ok(RAW_METAINFO.to_vec())))
+        .await
+        .unwrap();
+    assert_eq!(vod.total_length, 16_385);
+    assert_eq!(vod.piece_hashes, vec![[0xA5; 20], [0x5A; 20]]);
+
+    let live = p
+        .resolve_content_id_with_catalog(&infohash_hex(&hex20(CID).unwrap()), async {
+            stream_info_from_transport(RAW_METAINFO)
+                .map_err(|_| ResolveError::Transport("raw metainfo is not live transport"))
+        })
+        .await;
+    assert!(
+        live.is_err(),
+        "raw metainfo must not become a live StreamInfo"
     );
 }
 
