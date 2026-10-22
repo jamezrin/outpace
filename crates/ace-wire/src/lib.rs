@@ -3,6 +3,7 @@
 
 pub mod bencode;
 pub mod chunker;
+pub mod disk_envelope;
 pub mod extended;
 pub mod handshake;
 pub mod identity;
