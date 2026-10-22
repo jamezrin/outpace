@@ -129,6 +129,7 @@ impl HlsPackager {
             access = VideoAccessPointState::new();
             filter_sdt = false;
         }
+        access.enable_mpeg2();
         Arc::new(HlsPackager {
             state: Mutex::new(HlsState {
                 generation: GenerationId(0),
@@ -983,6 +984,38 @@ mod tests {
 
     fn video_access_packet(pid: u16, pcr: u64) -> Vec<u8> {
         pcr_packet(pid, pcr, true, false, (pcr / 90_000) as u8)
+    }
+
+    fn mpeg2_pes_packet(pcr: u64, picture_type: u8) -> Vec<u8> {
+        let mut packet = pcr_packet(VIDEO_PID, pcr, false, false, 0);
+        let pes = [
+            0,
+            0,
+            1,
+            0xe0,
+            0,
+            0,
+            0x80,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            ((picture_type & 7) << 3),
+            0x55,
+            0x66,
+        ];
+        packet[1] |= 0x40; // PUSI
+        packet[12..12 + pes.len()].copy_from_slice(&pes);
+        packet
+    }
+
+    fn mpeg2_b3_packet(pcr: u64) -> Vec<u8> {
+        let mut packet = mpeg2_pes_packet(pcr, 1);
+        packet[21..25].copy_from_slice(&[0, 0, 1, 0xb3]);
+        packet
     }
 
     fn clean_pkg(segment_packets: usize) -> Arc<HlsPackager> {
@@ -2712,6 +2745,224 @@ mod tests {
             .segment(0)
             .expect("a segment should still emit at a sub-SDT ceiling");
         assert!(ace_media::mpegts::read_sdt_service_name(&seg).is_none());
+    }
+
+    #[test]
+    fn normal_hls_mpeg2_start_and_target_cut_retain_original_pes_packets() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 20,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        let pat_packet = pat(PMT_PID);
+        let pmt_packet = pmt_codec_mpeg2(PMT_PID, VIDEO_PID);
+        let first = mpeg2_pes_packet(0, 1);
+        let between = pcr_packet(VIDEO_PID, 108_000, false, false, 0);
+        let second = mpeg2_pes_packet(180_000, 1);
+        let third = mpeg2_pes_packet(270_000, 1);
+        let stream = [
+            pat_packet.clone(),
+            pmt_packet.clone(),
+            first.clone(),
+            between.clone(),
+            second.clone(),
+            third,
+        ]
+        .concat();
+        for chunk in stream.chunks(73) {
+            p.feed(chunk);
+        }
+
+        assert_eq!(
+            p.segment(0).unwrap().as_ref(),
+            [pat_packet, pmt_packet, first, between].concat()
+        );
+        let next_segment = p.segment(1).unwrap();
+        assert_eq!(&next_segment[2 * TS_PACKET..], second.as_slice());
+
+        // Reset requires fresh tables but keeps normal HLS's MPEG-2 opt-in active.
+        p.discontinuity();
+        let reset_pat = pat(PMT_PID);
+        let reset_pmt = pmt_codec_mpeg2(PMT_PID, VIDEO_PID);
+        let reset_i = mpeg2_pes_packet(300_000, 1);
+        let next_i = mpeg2_pes_packet(408_000, 1);
+        p.feed(&reset_pat);
+        p.feed(&reset_pmt);
+        p.feed(&reset_i);
+        p.feed(&next_i);
+        assert_eq!(
+            p.segment(2).unwrap().as_ref(),
+            [reset_pat, reset_pmt, reset_i].concat()
+        );
+    }
+
+    #[test]
+    fn normal_hls_mpeg2_ceiling_lookahead_cuts_on_i_picture() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 4,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            Some("Fits exactly".into()),
+        );
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt_codec_mpeg2(PMT_PID, VIDEO_PID));
+        let first = mpeg2_pes_packet(0, 1);
+        let second = mpeg2_pes_packet(180_000, 1);
+        let third = mpeg2_pes_packet(270_000, 1);
+        p.feed(&first); // PAT + PMT + SDT + I fills the configured ceiling
+        p.feed(&pcr_packet(VIDEO_PID, 108_000, false, false, 0)); // classified in lookahead
+        p.feed(&second); // I in lookahead emits the ceiling-full segment
+        let segment = p
+            .segment(0)
+            .expect("I picture in lookahead closes the full segment");
+        assert_eq!(segment.len(), 4 * TS_PACKET);
+        assert_eq!(&segment[3 * TS_PACKET..], first.as_slice());
+        p.feed(&third);
+        let next_segment = p.segment(1).unwrap();
+        assert!(next_segment.ends_with(&second));
+        assert_eq!(
+            ace_media::mpegts::read_sdt_service_name(&segment).as_deref(),
+            Some("Fits exactly")
+        );
+    }
+
+    #[test]
+    fn normal_hls_mpeg2_non_i_and_split_pes_cannot_cut_at_target() {
+        let p = clean_pkg(20);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt_codec_mpeg2(PMT_PID, VIDEO_PID));
+        let first = mpeg2_pes_packet(0, 1);
+        let b3 = mpeg2_b3_packet(108_000);
+        let p_picture = mpeg2_pes_packet(180_000, 2);
+        let b_picture = mpeg2_pes_packet(216_000, 3);
+        let next_i = mpeg2_pes_packet(270_000, 1);
+        p.feed(&first);
+        p.feed(&b3);
+        p.feed(&p_picture);
+        p.feed(&b_picture);
+        assert!(p.segment(0).is_none(), "B3/P/B must not trigger target cut");
+        p.feed(&next_i);
+        let segment = p.segment(0).expect("next complete I closes the segment");
+        assert!(segment.ends_with(&b_picture));
+        p.feed(&mpeg2_pes_packet(360_000, 1));
+        assert!(p.segment(1).unwrap().ends_with(&next_i));
+
+        let split = clean_pkg(20);
+        split.feed(&pat(PMT_PID));
+        split.feed(&pmt_codec_mpeg2(PMT_PID, VIDEO_PID));
+        let pes = [
+            0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0, 0, 0, 1, 0, 0, 8, 0x55, 0x66,
+        ];
+        let fragment = |bytes: &[u8], pusi: bool| {
+            let mut packet = vec![0xff; TS_PACKET];
+            packet[0] = 0x47;
+            packet[1] = ((VIDEO_PID >> 8) as u8 & 0x1f) | if pusi { 0x40 } else { 0 };
+            packet[2] = VIDEO_PID as u8;
+            packet[3] = 0x30;
+            packet[4] = (TS_PACKET - 5 - bytes.len()) as u8;
+            packet[5] = 0;
+            let start = 5 + packet[4] as usize;
+            packet[start..start + bytes.len()].copy_from_slice(bytes);
+            packet
+        };
+        split.feed(&fragment(&pes[..15], true));
+        split.feed(&fragment(&pes[15..], false));
+        assert!(
+            split.segment(0).is_none(),
+            "split PES picture header is rejected"
+        );
+        split.feed(&mpeg2_pes_packet(108_000, 1));
+        split.feed(&mpeg2_pes_packet(216_000, 1));
+        assert!(
+            split.segment(0).is_some(),
+            "a fresh complete I can start HLS"
+        );
+    }
+
+    #[test]
+    fn malformed_pes_timestamps_cannot_start_or_cut_normal_hls() {
+        let p = clean_pkg(20);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt_codec_mpeg2(PMT_PID, VIDEO_PID));
+
+        let mut malformed_start = mpeg2_pes_packet(0, 1);
+        // PTS is declared, but optional-header data length is zero.
+        malformed_start[19] = 0x80;
+        p.feed(&malformed_start);
+        assert!(p.segment(0).is_none(), "missing PTS cannot start a segment");
+
+        p.feed(&mpeg2_pes_packet(90_000, 1));
+        p.feed(&mpeg2_b3_packet(108_000));
+        let mut malformed_cut = mpeg2_pes_packet(180_000, 1);
+        // Forbidden PTS_DTS_flags = 01 must not provide cut evidence.
+        malformed_cut[19] = 0x40;
+        p.feed(&malformed_cut);
+        assert!(p.segment(0).is_none(), "malformed PES cannot cut a segment");
+
+        p.feed(&mpeg2_pes_packet(270_000, 1));
+        assert!(
+            p.segment(0).is_some(),
+            "a later valid I can start and cut HLS"
+        );
+    }
+
+    #[test]
+    fn strict_mpeg2_hls_title_fallback_and_non_i_rejection() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 3,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            Some("Synthetic title".into()),
+        );
+        p.begin_generation(
+            GenerationId(1),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            false,
+        );
+        p.feed_generation(GenerationId(1), &pat(PMT_PID));
+        p.feed_generation(GenerationId(1), &pmt_codec_mpeg2(PMT_PID, VIDEO_PID));
+        p.feed_generation(GenerationId(1), &mpeg2_pes_packet(0, 2));
+        p.feed_generation(GenerationId(1), &mpeg2_pes_packet(108_000, 3));
+        assert!(
+            p.segment(0).is_none(),
+            "P/B pictures cannot start or cut segments"
+        );
+        let i = mpeg2_pes_packet(216_000, 1);
+        p.feed_generation(GenerationId(1), &i);
+        p.feed_generation(GenerationId(1), &mpeg2_pes_packet(324_000, 1));
+        let seg = p
+            .segment(0)
+            .expect("small-title fallback still permits MPEG-2 start");
+        assert!(ace_media::mpegts::read_sdt_service_name(&seg).is_none());
+        assert!(seg.ends_with(&i));
+    }
+
+    fn pmt_codec_mpeg2(pmt_pid: u16, video_pid: u16) -> Vec<u8> {
+        let section_length = 5 + 4 + 5 + 4;
+        let mut section = vec![0x02, 0xb0, section_length as u8, 0, 1, 0xc1, 0, 0];
+        section.extend_from_slice(&[
+            0xe0 | ((video_pid >> 8) as u8 & 0x1f),
+            video_pid as u8,
+            0xf0,
+            0,
+            0x02,
+            0xe0 | ((video_pid >> 8) as u8 & 0x1f),
+            video_pid as u8,
+            0xf0,
+            0,
+        ]);
+        section.extend_from_slice(&[0; 4]);
+        psi(pmt_pid, &section)
     }
     fn feed_clean_run_generation(
         p: &HlsPackager,
