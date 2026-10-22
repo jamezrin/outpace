@@ -102,24 +102,45 @@ Content-id resolution is catalog-only by default (plus the daemon's trusted loca
 registry); raw-hash BEP-9 fallback requires `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1`.
 See [note 63](notes/63-bep9-content-id-policy.md) for the evidence and trust boundaries.
 
-## VOD piece-hash list and file layout (implemented #47)
-Both captured fixtures are **live** (no `pieces`). A **VOD** transport carries `pieces`
-= a concatenated list of 20-byte SHA1 piece hashes (standard BitTorrent piece integrity).
-The decoder surfaces `pieces` and `is_live`, and outpace now downloads, verifies, and serves
-single-file VOD content over vanilla BitTorrent (`ace_swarm::vod::download_vod`,
-`GET /vod/:network/:id`, `outpace play --vod`). Each assembled piece is SHA1-checked against
-its `pieces` entry before any bytes are emitted.
+## Single-file VOD metainfo (#80)
 
-**SYNTHESIZED SCHEMA (still OPEN — reconcile against a real VOD capture).** No public VOD
-transport was available, so the file-layout keys are assumed from standard BitTorrent
-conventions and encoded that way in the synthetic test fixtures:
-- Single-file VOD: a `length` key = total content bytes (the final piece is truncated to it).
-- Multi-file VOD: a `files` list. Multi-file is detected (`TransportDescriptor::is_multifile`)
-  and **intentionally rejected** with a clear error; only single-file VOD is supported.
+The original engine can **export** ordinary bencoded torrent metainfo. Outpace's VOD
+resolver accepts that complete exported file, starting at its root dictionary, through
+`outpace play <http(s)-metainfo-url> --vod` and the native `/vod/{network}/{id}` routes
+with a transport-URL id. URL fetches keep the existing SSRF guard and size cap. Catalog
+responses still pass authentication before decoding; a caller-supplied metainfo file
+does not acquire catalog provenance or enter the live infohash index.
 
-If a real capture shows a different encoding (e.g. length carried inside a `files`/`info`
-sub-dict), only `vod_total_length()` / `is_multifile()` in `transport.rs` need to change; the
-download/verify/serve path is standard BitTorrent and is unaffected.
+The supported `info` dictionary contains positive `length` and `piece length` integers
+and a nonempty binary `pieces` string of concatenated 20-byte SHA-1 digests. `files` is
+rejected regardless of its value: only single-file VOD is supported. Piece length must
+be a multiple of the existing 16 KiB request block size and at most 8 MiB. Digest count
+must equal `ceil(length / piece length)`; the final piece may be short. Length is bounded
+by the signed 64-bit bencode integer range and, together with the digest list and piece
+limit, by exact piece geometry. Every downloaded piece is SHA-1 verified before emission.
+
+Swarm identity is **SHA1 of the original encoded `info` byte span**, including its original
+key ordering and unknown fields. It never uses dictionary reserialization or the live
+transport identity formula. The dedicated decoder accepts unique out-of-order dictionary
+keys, rejects duplicate keys at every depth, malformed/noncanonical integers and byte-string
+lengths, and trailing data. Input is limited to 1 MiB, nesting to 32 containers, and parsed
+values (including dictionary keys) to 65,536.
+
+Optional `announce` and `announce-list` tracker fields are decoded as UTF-8 byte strings
+and lists of tiers respectively, with ordered deduplication. At most 128 entries are
+accepted, each at most 2,048 bytes, with a nonempty authority, an `http`, `https`, or `udp`
+scheme and no ASCII whitespace/control characters. Existing tracker policy still applies
+after extraction; decoding does not contact trackers or authorize new network targets.
+
+Encrypted `AceStreamTransport` decoding and live identity remain unchanged. The earlier
+synthetic wrapped VOD schema (`pieces`, `length`, and geometry at the descriptor root)
+remains supported for compatibility; it is distinct from exported torrent metainfo.
+The original engine's opaque on-disk descriptor framing remains unresolved and is
+unsupported. Outpace never strips or scans guessed prefixes to recover a dictionary.
+
+Tracked metainfo vectors are synthetic and carry no content ids or recorded infohashes.
+Original-engine exported metainfo and production download/range validation artifacts
+remain private; decoder tests alone do not establish original-engine peer interoperability.
 
 ## Implementation note
 `ace-wire` can: (1) compute the official descriptor-derived swarm infohash and the

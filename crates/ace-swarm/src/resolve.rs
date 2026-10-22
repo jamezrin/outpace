@@ -128,12 +128,27 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
     })
 }
 
-/// Build a [`VodInfo`] from raw `AceStreamTransport` bytes (the pure half of VOD resolution).
+/// Build a [`VodInfo`] from exported torrent metainfo or legacy `AceStreamTransport` bytes
+/// (the pure half of VOD resolution). Exported metainfo uses the original encoded `info`
+/// bytes for identity; it never uses the live descriptor identity formula.
 ///
 /// Errors if the descriptor is live (no `pieces`), advertises a multi-file layout (`files`
 /// present — intentionally unsupported), fails geometry validation, or lacks a single-file
 /// `length`.
 pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
+    if !ace_wire::infohash::is_transport_file(bytes) {
+        let metainfo = ace_wire::metainfo::decode_metainfo(bytes)
+            .map_err(|_| ResolveError::Transport("invalid single-file metainfo"))?;
+        validate_geometry(metainfo.piece_length, DEFAULT_CHUNK_LENGTH)?;
+        return Ok(VodInfo {
+            infohash: metainfo.infohash,
+            piece_length: metainfo.piece_length,
+            chunk_length: DEFAULT_CHUNK_LENGTH,
+            trackers: metainfo.trackers,
+            piece_hashes: metainfo.piece_hashes,
+            total_length: metainfo.total_length,
+        });
+    }
     let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
     if d.is_live {
         return Err(ResolveError::Transport("not a VOD transport (no pieces)"));
