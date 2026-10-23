@@ -39,7 +39,7 @@ descriptor = bencode_parse(plaintext)          # a single dict
 | `pubkey` | 124-byte RSA DER public key of the broadcaster |
 | `trackers` | list of `udp://…/announce` tracker URLs |
 | `categories`, `allow_public_trackers`, `permanent` | metadata/flags |
-| `pieces` | **VOD only** — concatenated 20-byte SHA1 piece hashes (see OPEN) |
+| `pieces` | **VOD only (legacy synthetic root schema)** — concatenated 20-byte SHA1 piece hashes |
 
 The bitrate unit is bytes per second, matching the original engine 3.2.11. Its torrent
 metadata duration fallback computes media byte length divided by seconds: a synthetic
@@ -133,8 +133,10 @@ scheme and no ASCII whitespace/control characters. Existing tracker policy still
 after extraction; decoding does not contact trackers or authorize new network targets.
 
 Encrypted `AceStreamTransport` decoding and live identity remain unchanged. The earlier
-synthetic wrapped VOD schema (`pieces`, `length`, and geometry at the descriptor root)
-remains supported for compatibility; it is distinct from exported torrent metainfo.
+synthetic ASCII-wrapped VOD schema (`pieces`, `length`, and geometry at the descriptor
+root) remains a historical compatibility path, not a verified original-engine schema.
+Original-engine VOD uses the ordinary `info` dictionary described above, implemented
+in `metainfo` and `disk_envelope`.
 The VOD resolver also accepts the original-disk envelope with the exact eight-byte
 marker `01 02 03 04 11 02 65 2e`. Its suffix is AES-128-CBC using a distinct fixed
 disk key (raw MD5 of the compiled 59-byte loader argument in engine 3.2.11) and a
@@ -153,6 +155,28 @@ policy, and network defaults are unchanged.
 Tracked metainfo vectors are synthetic and carry no content ids or recorded infohashes.
 Original-engine exported metainfo and production download/range validation artifacts
 remain private; decoder tests alone do not establish original-engine peer interoperability.
+
+### Empirical acceptance (2026-10-22)
+
+The operator validation for #80 used legally unencumbered generated synthetic media.
+Engine 3.2.11 created a 1,944-byte original disk descriptor and exported ordinary
+metainfo. An independent cold official-engine consumer and the production cold Outpace
+CLI each recovered all 2,767,449 source bytes, with all 85 piece hashes matching and
+exact source byte equality. Both exported metainfo and the original disk envelope were
+validated in production ([PR #260](https://github.com/jamezrin/outpace/pull/260),
+[PR #261](https://github.com/jamezrin/outpace/pull/261)); the original-disk CLI exited 0
+in about six seconds.
+
+A fresh production daemon served a full 200 response, a cross-piece 206 range, a suffix
+206 covering the final short piece, and an invalid-range 416, with exact expected
+headers and bodies. The full request started cold; the suffix reused downloaded data.
+Runs used normal mode, `max_cache_size=0`, internal Docker networking, an explicit
+private peer, and process-scoped non-global transport-URL opt-in. Cleanup of run-owned
+processes, listeners, containers, and networks was verified.
+
+These results establish single-file schema, download, and byte-range interoperability
+with the original engine. Public swarm discovery was not exercised; no public-catalog
+or multi-file ground-truth claim is made. Multi-file VOD remains unsupported.
 
 ## Implementation note
 `ace-wire` can: (1) compute the official descriptor-derived swarm infohash and the
