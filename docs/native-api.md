@@ -229,14 +229,21 @@ For dispatcharr-style playlist integration, generate entries using one of these 
 `/ace/getstream` handshake is required. Use `GET /streams` and per-stream `/status` for
 monitoring; do not poll a playback URL as a health check because that creates or joins a session.
 
-## Experimental legacy compatibility
+## Supported Ace HTTP subset
 
-Legacy `/ace/*` and `/server/api` routes are disabled by default. Enable the thin adapter only for
-middleware that cannot consume native URLs:
+Legacy `/ace/*`, `/server/api`, and `/webui/api/service` routes are disabled by default.
+Enable the supported adapter subset for middleware that cannot consume native URLs:
 
 ```bash
-OUTPACE_EXPERIMENTAL_ACE_COMPAT=1 outpace serve
+OUTPACE_ACE_COMPAT=1 outpace serve
 ```
+
+Set `OUTPACE_ACE_COMPAT=0` to disable it explicitly. The canonical variable wins whenever
+present, including false; `OUTPACE_EXPERIMENTAL_ACE_COMPAT` is a deprecated fallback only
+when it is unset. The selected value must be exactly `1`, `true`, `0`, or `false`;
+empty, malformed, and non-Unicode selected values fail startup. Unused legacy values
+are ignored. Rename the old variable when migrating and restart the daemon to apply changes
+(recreate the service for Compose).
 
 The flag does not change native routes. Compatibility is deliberately not a full engine clone:
 account/premium, UI remote control, channel catalog, playlist/EPG, and encrypted-content features
@@ -246,4 +253,7 @@ deferred. The exact supported methods and error envelopes are pinned in
 [`protocol/compat-matrix.md`](protocol/compat-matrix.md).
 
 Compatibility `getstream`, `manifest` JSON, and `stat` responses expose the same nested metadata
-object. Direct and tokenized MPEG-TS playback also emits `Icy-Name` when a title is known.
+object. Compatibility direct and tokenized MPEG-TS playback do not emit `Icy-Name`;
+the native TS routes described above include it when the descriptor supplies a title.
+Compatibility live HLS follows the existing global `OUTPACE_HLS_AUDIO_NORMALIZE` policy;
+per-request transcoding hints do not configure conversion.

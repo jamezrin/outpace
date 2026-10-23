@@ -16,7 +16,7 @@ services:
       OUTPACE_CACHE_TYPE: ${OUTPACE_CACHE_TYPE:-memory}
       OUTPACE_CACHE_DIR: ${OUTPACE_CACHE_DIR:-/var/lib/outpace/cache}
       OUTPACE_SEED_STORE_BYTES: ${OUTPACE_SEED_STORE_BYTES:-134217728}
-      OUTPACE_EXPERIMENTAL_ACE_COMPAT: ${OUTPACE_EXPERIMENTAL_ACE_COMPAT:-0}
+      OUTPACE_ACE_COMPAT: ${OUTPACE_ACE_COMPAT-${OUTPACE_EXPERIMENTAL_ACE_COMPAT-0}}
     ports:
       # API and ingest stay host-local by default. Set the *_HOST variables deliberately
       # if remote clients need them, and protect those listeners with a firewall/proxy.

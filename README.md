@@ -291,13 +291,15 @@ release tag.
 
 ## Runtime Surfaces
 
-The supported integration contract is the native CLI and HTTP API. See the
+The primary integration contract is the native CLI and HTTP API. See the
 route table, response shapes, and VLC/Jellyfin/dispatcharr examples in
 [`docs/native-api.md`](docs/native-api.md).
 
 Legacy Acestream-compatible routes (`/ace/*`, `/server/api`, and
-`/webui/api/service`) are experimental and disabled by default. Enable them only
-when needed with `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1` on the serving daemon.
+`/webui/api/service`) provide a supported subset, disabled by default. Enable them
+when needed with `OUTPACE_ACE_COMPAT=1` on the serving daemon, or explicitly disable
+them with `OUTPACE_ACE_COMPAT=0`. Restart the daemon to apply a change; for Compose,
+recreate the service with `docker compose up -d --wait`.
 The canonical [Acestream HTTP support contract](docs/protocol/compat-matrix.md)
 covers direct VLC and JSON-session examples, supported routes/selectors, errors,
 lease ownership, live HLS and intentional gaps. The
@@ -395,7 +397,13 @@ Environment variables parsed by the daemon include:
   normal bridge-mode containers should use a manual router-to-Docker-host TCP forward.
 - `OUTPACE_PORT_MAP_BACKEND` - `auto`, `upnp`, `natpmp`, or `none`; default `auto`.
 - `OUTPACE_PORT_MAP_EXTERNAL_PORT` - optional external TCP port requested from the gateway.
-- `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - enables legacy compatibility routes.
+- `OUTPACE_ACE_COMPAT` - enables the supported Ace HTTP subset, default off. Accepts
+  exactly `1`, `true`, `0`, or `false`. A present value takes precedence over the legacy
+  alias, including `0`/`false`; an empty, malformed, or non-Unicode selected value fails
+  startup. Set `0` to explicitly disable compatibility routes.
+- `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - deprecated fallback, parsed only when
+  `OUTPACE_ACE_COMPAT` is unset, with the same strict boolean rules. Rename it to
+  `OUTPACE_ACE_COMPAT` when migrating; an unused invalid alias is ignored.
 - `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
 - `OUTPACE_TRACKERS` - comma-separated `scheme://…` (typically `udp://host:port/announce`)
   tracker URLs minted into `outpace broadcast` descriptors and used for broadcast self-announce.

@@ -24,7 +24,7 @@ services:
       OUTPACE_CACHE_DIR: /var/lib/outpace/cache
       OUTPACE_SEED_STORE_BYTES: "134217728"
       # Serves the legacy /ace/getstream routes for existing media stacks. Drop if unused.
-      OUTPACE_EXPERIMENTAL_ACE_COMPAT: "1"
+      OUTPACE_ACE_COMPAT: "1"
     volumes:
       - outpace-data:/var/lib/outpace
     healthcheck:

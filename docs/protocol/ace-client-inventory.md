@@ -3,9 +3,12 @@
 This inventory pins three representative clients inspected on 2026-10-23. Their source shows
 what they request, not complete official-engine behavior or successful playback in a deployed
 application. The [compatibility matrix](compat-matrix.md) remains the route and error contract.
-The entire adapter remains opt-in through `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`, disabled by
-default. Native APIs remain the primary interface. No new control methods are required by
-these samples.
+The supported subset remains opt-in through `OUTPACE_ACE_COMPAT=1`, disabled by
+default; `OUTPACE_ACE_COMPAT=0` explicitly disables it. The deprecated
+`OUTPACE_EXPERIMENTAL_ACE_COMPAT` alias is a fallback only when the canonical variable
+is unset; see the [configuration contract](compat-matrix.md#enable-and-advertise-the-adapter)
+for precedence, strict validation, and restart requirements. Native APIs remain the primary
+interface. No new control methods are required by these samples.
 
 Source snapshots use abbreviated Git commit URLs to distinguish provenance from content
 identifiers. Examples below use only the synthetic selector
@@ -118,7 +121,7 @@ The HTTP tests live in `crates/ace-engine/src/http/tests/`.
 | JSON `id` + `format=json` + `pid`; playback/stat/stop | `compat.rs`: typed client DTO flow and malformed-input error; existing token, expiry and multi-consumer stop tests | JSON minting alone does not prove playable content; stat does not start work |
 | HLS redirect and JSON, playlist and segment | `compat_hls.rs`: engine Host, absolute segment, sampled Manager rewrite/catch-all mapping, retained TS bytes; existing forged-token, expiry and eviction cases | Tests URI routing locally; no proxy deployment or player timing claim |
 | `get_version` on both aliases | `server_api.rs`: literal spaced error, parsed result fields and JSON content type | Successful version formatting only; other methods keep their envelopes |
-| Gate off | Playback/control route table plus existing native route coverage | Default remains off; no gate promotion |
+| Gate off | Playback/control route table plus existing native route coverage | Supported opt-in configuration; default remains off |
 | Stats counters | `compat.rs`: measured units/positions, idle/invalid-token cases | Provider observations, not an exact client playhead |
 
 The other existing methods have no discovered caller in these three snapshots. Their current
@@ -135,11 +138,15 @@ subset remains available, without expanding the method set:
 No sampled caller requires POST, PUT, body forms, new aliases, account methods or a new token
 API. Existing selector precedence, source leases, token isolation, typed errors, transport URL
 SSRF checks and authenticated catalog resolution remain in force. Compatibility gate policy
-belongs to #202 and the broader operator contract rewrite to #204.
+is documented in the [operator contract](compat-matrix.md#enable-and-advertise-the-adapter).
 
 Premium/account/subscription/encrypted inputs, remote/player UI, search/channel catalogs and
-EPG are excluded. Legacy VOD playback/HLS, seek/file selection, transcoding, raw transport dumps
-and reverse content-id lookup remain deferred. Native `/vod` is a separate surface. Inert
-transcoding hints do not mean conversion occurred. Neither these static sources nor fixture
-tests establish official failure parity, deployed routing, startup time, source availability,
+EPG are excluded. Legacy VOD playback/HLS, seek/file selection, arbitrary client-selected
+transcoding, raw transport dumps and reverse content-id lookup remain deferred.
+Native `/vod` is a separate surface. Inert
+transcoding hints do not mean conversion occurred. Live HLS follows the existing daemon-wide
+`OUTPACE_HLS_AUDIO_NORMALIZE` policy described in the
+[contract](compat-matrix.md#lease-ownership-and-live-hls); request hints do not enable it.
+Neither these static sources nor fixture tests establish official failure parity,
+deployed routing, startup time, source availability,
 continuous decoding or playback smoothness.

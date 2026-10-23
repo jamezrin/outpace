@@ -155,7 +155,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_PORT_MAP_EXTERNAL_PORT") {
         config.port_map_external_port = Some(v.parse()?);
     }
-    if let Some(v) = bool_from_env("OUTPACE_EXPERIMENTAL_ACE_COMPAT")? {
+    if let Some(v) = bool_from_env("OUTPACE_ACE_COMPAT")? {
+        config.experimental_ace_compat = v;
+    } else if let Some(v) = bool_from_env("OUTPACE_EXPERIMENTAL_ACE_COMPAT")? {
         config.experimental_ace_compat = v;
     }
     if let Some(v) = bool_from_env("OUTPACE_BEP9_CONTENT_ID_FALLBACK")? {
@@ -870,6 +872,189 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    struct CompatEnvRestore([Option<std::ffi::OsString>; 2]);
+
+    impl CompatEnvRestore {
+        fn new() -> Self {
+            let names = ["OUTPACE_ACE_COMPAT", "OUTPACE_EXPERIMENTAL_ACE_COMPAT"];
+            let old = names.map(std::env::var_os);
+            for name in names {
+                std::env::remove_var(name);
+            }
+            Self(old)
+        }
+    }
+
+    impl Drop for CompatEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in ["OUTPACE_ACE_COMPAT", "OUTPACE_EXPERIMENTAL_ACE_COMPAT"]
+                .into_iter()
+                .zip(self.0.iter())
+            {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ace_compat_environment_prefers_canonical_and_strictly_parses_selected_value() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = CompatEnvRestore::new();
+        let mut failures = Vec::new();
+        macro_rules! check {
+            ($condition:expr, $label:expr) => {
+                if !$condition {
+                    failures.push($label);
+                }
+            };
+        }
+        macro_rules! check_error_name {
+            ($result:expr, $name:literal, $label:expr) => {
+                match $result {
+                    Err(error) => {
+                        if !error.to_string().contains($name) {
+                            failures.push($label);
+                        }
+                    }
+                    Ok(_) => failures.push($label),
+                }
+            };
+        }
+
+        check!(
+            matches!(config_from_env(), Ok(c) if !c.experimental_ace_compat),
+            "default is off"
+        );
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var("OUTPACE_ACE_COMPAT", value);
+            check!(
+                matches!(config_from_env(), Ok(c) if c.experimental_ace_compat == expected),
+                "canonical boolean values"
+            );
+        }
+
+        std::env::remove_var("OUTPACE_ACE_COMPAT");
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", value);
+            check!(
+                matches!(config_from_env(), Ok(c) if c.experimental_ace_compat == expected),
+                "legacy fallback values"
+            );
+        }
+
+        std::env::set_var("OUTPACE_ACE_COMPAT", "0");
+        std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "1");
+        check!(
+            matches!(config_from_env(), Ok(c) if !c.experimental_ace_compat),
+            "canonical false beats legacy true"
+        );
+        std::env::set_var("OUTPACE_ACE_COMPAT", "1");
+        std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "0");
+        check!(
+            matches!(config_from_env(), Ok(c) if c.experimental_ace_compat),
+            "canonical true beats legacy false"
+        );
+
+        std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "1");
+        for value in ["", "yes"] {
+            std::env::set_var("OUTPACE_ACE_COMPAT", value);
+            check_error_name!(
+                config_from_env(),
+                "OUTPACE_ACE_COMPAT",
+                "invalid canonical fails even with valid legacy"
+            );
+        }
+        std::env::remove_var("OUTPACE_ACE_COMPAT");
+        for value in ["", "invalid"] {
+            std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", value);
+            check_error_name!(
+                config_from_env(),
+                "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+                "selected invalid legacy value fails"
+            );
+        }
+
+        std::env::set_var("OUTPACE_ACE_COMPAT", "true");
+        check!(
+            matches!(config_from_env(), Ok(c) if c.experimental_ace_compat),
+            "valid canonical ignores invalid legacy"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let non_unicode = std::ffi::OsString::from_vec(vec![0xff]);
+            std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "1");
+            std::env::set_var("OUTPACE_ACE_COMPAT", &non_unicode);
+            check_error_name!(
+                config_from_env(),
+                "OUTPACE_ACE_COMPAT",
+                "selected canonical non-Unicode fails despite valid legacy"
+            );
+            std::env::remove_var("OUTPACE_ACE_COMPAT");
+            std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", &non_unicode);
+            check_error_name!(
+                config_from_env(),
+                "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+                "selected legacy non-Unicode fails"
+            );
+            std::env::set_var("OUTPACE_ACE_COMPAT", "true");
+            check!(
+                matches!(config_from_env(), Ok(c) if c.experimental_ace_compat),
+                "canonical ignores non-Unicode legacy"
+            );
+        }
+        drop(_restore);
+        drop(_lock);
+        assert!(
+            failures.is_empty(),
+            "failed compatibility cases: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_false_keeps_compat_routes_off_and_native_health_available() {
+        use axum::{body::Body, http::Request, http::StatusCode};
+        use tower::ServiceExt;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = CompatEnvRestore::new();
+        std::env::set_var("OUTPACE_ACE_COMPAT", "false");
+        std::env::set_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT", "1");
+        let config = config_from_env().unwrap();
+        let disabled = !config.experimental_ace_compat;
+
+        let app = router(AppState {
+            manager: StreamManager::new(ProviderRegistry::new()),
+            networks: Vec::new(),
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
+            experimental_ace_compat: config.experimental_ace_compat,
+            broadcasts: None,
+        });
+        drop(_restore);
+        drop(_lock);
+        let health = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let compat = app
+            .oneshot(
+                Request::get("/server/api?method=get_version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(disabled, "canonical false must override legacy true");
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(compat.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn daemon_provider_receives_startup_buffer_from_runtime_config() {
         let config = Config {
@@ -1249,14 +1434,21 @@ mod tests {
     #[test]
     fn exposed_boolean_gates_use_one_strict_parser() {
         let _g = ENV_LOCK.lock().unwrap();
+        let _restore = CompatEnvRestore::new();
+        let mut config_errors = Vec::new();
         let names = [
             "OUTPACE_ENABLE_SEEDING",
             "OUTPACE_ENABLE_INBOUND",
             "OUTPACE_ENABLE_PORT_MAPPING",
+            "OUTPACE_ACE_COMPAT",
             "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
             "OUTPACE_BEP9_CONTENT_ID_FALLBACK",
         ];
         for name in names {
+            if name == "OUTPACE_ACE_COMPAT" || name == "OUTPACE_EXPERIMENTAL_ACE_COMPAT" {
+                std::env::remove_var("OUTPACE_ACE_COMPAT");
+                std::env::remove_var("OUTPACE_EXPERIMENTAL_ACE_COMPAT");
+            }
             std::env::remove_var(name);
             for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
                 std::env::set_var(name, value);
@@ -1267,14 +1459,20 @@ mod tests {
                 );
             }
             std::env::set_var(name, "ture");
-            let error = config_from_env().unwrap_err().to_string();
-            assert!(error.contains(name), "unexpected error: {error}");
-            assert!(
-                error.contains("expected one of"),
-                "unexpected error: {error}"
-            );
+            match config_from_env() {
+                Ok(_) => config_errors.push(format!("{name} malformed value was accepted")),
+                Err(error) => {
+                    let error = error.to_string();
+                    if !error.contains(name) || !error.contains("expected one of") {
+                        config_errors.push(format!("{name} unexpected error: {error}"));
+                    }
+                }
+            }
             std::env::remove_var(name);
         }
+        drop(_restore);
+        drop(_g);
+        assert!(config_errors.is_empty(), "{config_errors:?}");
     }
 
     #[tokio::test]
