@@ -114,7 +114,15 @@ infohash index and do not authorize later bare-infohash playback.
 The broadcast Ace link needs this opt-in when used across daemons or by standalone `play`.
 Alternatively, use `http://<host>:<http-port>/broadcast/<name>` as a transport URL, subject
 to the receiver's transport-URL access policy. Same-daemon broadcast playback needs no
-opt-in. See [protocol note 63](protocol/notes/63-bep9-content-id-policy.md) for evidence,
+opt-in.
+
+Transport-file URL fetching explicitly ignores environment and system proxies and never
+follows redirects. Its independent `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT=1` opt-in stays
+narrow: private/loopback/CGNAT targets are permitted, while link-local, unspecified,
+multicast, broadcast and documentation addresses remain blocked. Fetches retain a 1 MiB
+body ceiling, a 5-second connect timeout and a 15-second finite request deadline.
+
+See [protocol note 63](protocol/notes/63-bep9-content-id-policy.md) for evidence,
 trust boundaries and migration details.
 
 ## Infohash inputs
