@@ -111,6 +111,52 @@ services:
       - 9.9.9.9
 ```
 
+## Managed source declarations
+
+Both Compose examples forward `OUTPACE_BROADCAST_SOURCES` as `{}` when unset and
+`OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE` as `0`. Listener/cache/seeding defaults are
+unchanged. Declarations use one JSON object; for example, in a protected deployment env file:
+
+```dotenv
+OUTPACE_BROADCAST_SOURCES='{"demo-source":{"url":"https://source.invalid/live.ts?token=SYNTHETIC_TOKEN"}}'
+OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE=0
+```
+
+Replace the synthetic URL with an authorized public, unencrypted MPEG-TS source. Use your
+existing protected environment delivery and restrict env-file/process/container inspection;
+URLs may contain private query tokens. Avoid printing the environment, `docker compose config`
+output or full serialized config in logs/support bundles. No new secret store is added and
+source URLs are never persisted in broadcast state. JSON must survive shell/Compose quoting,
+including any literal dollar signs in tokens; single-quote dotenv values as above. An explicitly
+empty source-map variable is invalid, so the forwarding uses an unset-only default.
+
+The complete map validates before startup effects: <=64 valid names, <=256 KiB UTF-8,
+<=8,192-byte URLs, duplicate/unknown keys rejected. Timing defaults are connect 5s/read 15s/
+reconnect initial 1s/maximum 30s; ranges and all API states/errors are documented in
+[native API](native-api.md#managed-http-mpeg-ts-sources). HTTP/owned RTMP startup precedes
+sorted source admission and API traffic; upstream downtime is accepted, local reservation
+failure unwinds earlier broadcast work and HLS. `202` means accepted, so inspect source status
+for health rather than treating container `/healthz` as proof of origin progress.
+
+Current environment declarations reattach after every daemon restart. API attachments last
+only for that process. Detach or full delete suppresses a declaration only until restart;
+remove it from the deployment environment to keep it absent. Detach keeps the signing
+identity, cache lease/store and announcement pair; full delete removes identity. Use detach
+before changing a source URL or timing; pull claims remain exclusive during backoff/failure.
+A finite HTTP resource is treated as a live source: it reconnects after EOF and drops partial
+tails, unlike ordinary finite raw/RTMP ingest. Storage reservations create intentional gaps
+on reconnect/restart; follow the backup/older-binary/platform caveats below.
+
+Only exact `1` enables the independent non-global source switch. It adds private/loopback/
+CGNAT IPv4 and ULA/loopback IPv6, including mapped equivalents; link-local metadata endpoints,
+unspecified/multicast and IPv4 broadcast/documentation remain blocked. Transport/tracker
+switches do not authorize sources. Every attempt re-resolves and pins a permitted address,
+ignores proxies, rejects redirects and preserves normal TLS verification. Protect the existing
+native HTTP mutations and RTMP listener using the same exposure controls as other ingest.
+Shutdown owns broadcast workers/announcements and the RTMP listener; established RTMP
+connections belong to the dependency and can remain connected with all broadcast operations
+fenced. The supported cleanup boundary does not promise to terminate those sockets.
+
 ## Configuration contract
 
 For `outpace serve`, supported operator overrides currently come from `OUTPACE_*` environment

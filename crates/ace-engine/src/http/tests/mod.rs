@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
 mod broadcast;
+mod broadcast_source;
 mod compat;
 mod compat_hls;
 mod native;

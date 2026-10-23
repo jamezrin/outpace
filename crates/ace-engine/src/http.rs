@@ -29,11 +29,13 @@ tokio::task_local! {
 use tokio::sync::broadcast::error::RecvError;
 
 mod broadcast;
+mod broadcast_source;
 mod compat;
 mod streams;
 mod vod;
 
 use broadcast::*;
+use broadcast_source::*;
 use compat::*;
 use streams::*;
 use vod::*;
@@ -117,24 +119,92 @@ pub struct BroadcastState {
 }
 
 impl BroadcastState {
-    pub async fn acquire_producer(&self, name: &str, kind: crate::broadcast::ProducerKind)
-        -> Result<(crate::broadcast::Broadcast, crate::broadcast::ProducerSession), crate::broadcast::BroadcastError> {
-        let pair = self.registry.acquire_producer(name, name, &self.trackers,
-            &self.seed_registry, self.store_bytes, kind).await?;
+    pub async fn attach_source(
+        &self,
+        name: &str,
+        config: crate::broadcast_pull::ValidatedSourceConfig,
+    ) -> Result<
+        (
+            crate::broadcast::Broadcast,
+            crate::broadcast_pull::SourceStatus,
+        ),
+        crate::broadcast::BroadcastError,
+    > {
+        self.registry
+            .attach_source(
+                name,
+                config,
+                &self.seed_registry,
+                &self.trackers,
+                self.store_bytes,
+                self.inbound_peer_port.clone(),
+            )
+            .await
+    }
+    pub async fn source_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::broadcast_pull::SourceStatus>, crate::broadcast::BroadcastError> {
+        self.registry.source_status(name).await
+    }
+    pub async fn detach_source(&self, name: &str) -> Result<(), crate::broadcast::BroadcastError> {
+        self.registry.detach_source(name).await
+    }
+
+    pub async fn acquire_producer(
+        &self,
+        name: &str,
+        kind: crate::broadcast::ProducerKind,
+    ) -> Result<
+        (
+            crate::broadcast::Broadcast,
+            crate::broadcast::ProducerSession,
+        ),
+        crate::broadcast::BroadcastError,
+    > {
+        let pair = self
+            .registry
+            .acquire_producer(
+                name,
+                name,
+                &self.trackers,
+                &self.seed_registry,
+                self.store_bytes,
+                kind,
+            )
+            .await?;
         self.ensure_announcing(name).await?;
         Ok(pair)
     }
 
     /// Reserve identity/index space without attaching an ingress source.
-    pub async fn mint(&self, name: &str) -> Result<crate::broadcast::Broadcast, crate::broadcast::BroadcastError> {
-        self.registry.mint(name, name, &self.trackers, &self.seed_registry, self.store_bytes).await
+    pub async fn mint(
+        &self,
+        name: &str,
+    ) -> Result<crate::broadcast::Broadcast, crate::broadcast::BroadcastError> {
+        self.registry
+            .mint(
+                name,
+                name,
+                &self.trackers,
+                &self.seed_registry,
+                self.store_bytes,
+            )
+            .await
     }
 
-    pub async fn ensure_announcing(&self, name: &str) -> Result<(), crate::broadcast::BroadcastError> {
-        self.registry.ensure_announcing(name, &self.trackers, self.inbound_peer_port.clone()).await
+    pub async fn ensure_announcing(
+        &self,
+        name: &str,
+    ) -> Result<(), crate::broadcast::BroadcastError> {
+        self.registry
+            .ensure_announcing(name, &self.trackers, self.inbound_peer_port.clone())
+            .await
     }
 
-    pub fn close_admissions(&self) { self.registry.close_admissions(); }
+    pub fn close_admissions(&self) {
+        self.registry.close_admissions();
+    }
 
     pub async fn delete(&self, name: &str) -> Result<(), crate::broadcast::BroadcastError> {
         self.registry.delete(name).await
@@ -190,6 +260,12 @@ pub fn router(state: AppState) -> Router {
         .route("/vod/{network}/{id}", get(vod_stream))
         .route("/vod/{network}/{id}/manifest.m3u8", get(vod_manifest))
         .route("/vod/{network}/{id}/seg/{seg}", get(vod_hls_segment))
+        .route(
+            "/broadcast/{name}/source",
+            put(broadcast_source_put)
+                .get(broadcast_source_get)
+                .delete(broadcast_source_delete),
+        )
         .route(
             "/broadcast/{name}",
             put(broadcast_ingest)

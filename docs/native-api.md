@@ -55,10 +55,13 @@ outpace broadcast sports --public-host stream.example
 | `GET /vod/<network>/<id>/manifest.m3u8` | `200 application/vnd.apple.mpegurl` | Static VOD HLS playlist. |
 | `GET /vod/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Verified VOD HLS segment. |
 | `PUT /broadcast/<name>` | `200 application/json` | Exclusively admits raw MPEG-TS ingest. Returns `name`, `content_id`, and `infohash` immediately while an owned task consumes the request body. |
+| `PUT /broadcast/<name>/source` | `202 application/json` | Attaches one managed HTTP(S) MPEG-TS source; returns `name`, `content_id`, `infohash`, `source`. Acceptance is independent of upstream health. |
+| `GET /broadcast/<name>/source` | `200 application/json` | Returns exactly `name`, `source`; never creates a broadcast. |
+| `DELETE /broadcast/<name>/source` | `204` | Cancels/joins the source only, retaining identity/store/announcements. Detached or unknown is idempotent. |
 | `GET /broadcast/<name>` | `200 application/octet-stream` | Returns the broadcast transport descriptor; `404` until minted. |
 | `DELETE /broadcast/<name>` | `204` | Stops ingress/announcements and deletes identity after persistence settles; unknown names are idempotent. Names must be 1–64 ASCII letters, digits, `.`, `_`, or `-`, excluding `.` and `..`. |
 
-A broadcast accepts one producer at a time across raw PUT and RTMP. A competing publisher
+A broadcast accepts one producer at a time across raw PUT, RTMP and managed HTTP sources. A competing publisher
 receives `409` / `producer_conflict`; separate names can ingest concurrently. Sequential
 producers retain the signing identity and continue piece numbering. RTMP keys use the exact
 same name rules, without whitespace trimming. Ordinary PUT EOF/body termination and RTMP
@@ -108,6 +111,153 @@ established connection tasks: they may remain connected, but canceled-session ca
 publish, finish tails or mutate a replacement publisher. New publish requests are rejected
 after service admission closes. A publishing connection canceled by full deletion must reconnect
 to publish that name again; ordinary unpublish may republish on the same connection.
+
+## Managed HTTP MPEG-TS sources
+
+The source routes are native routes and remain available when Ace compatibility is off. They
+use the existing native listener/exposure policy; protect broadcast mutation access with the
+same firewall/authenticating proxy as raw ingest. They add no new authentication framework.
+Names are 1–64 ASCII letters/digits/`.`/`_`/`-`, excluding `.` and `..`.
+
+A PUT body requires `application/json` (JSON structured suffixes are also accepted), is at
+most 16 KiB, and contains exactly this schema. `url` is required; timings default as shown:
+
+```json
+{
+  "url": "https://source.invalid/live.ts?token=SYNTHETIC_TOKEN",
+  "connect_timeout_secs": 5,
+  "read_timeout_secs": 15,
+  "reconnect_initial_secs": 1,
+  "reconnect_max_secs": 30
+}
+```
+
+The URL is synthetic. Durations must be integer seconds: connect 1–60, read 1–300, and both
+reconnect values 1–300 with initial <= maximum. Reject null/float/negative/zero durations,
+duplicate keys, unknown fields, userinfo (even empty), fragments, controls, non-HTTP(S)
+schemes, missing hosts, port zero and URLs longer than 8,192 bytes. Literal address policy
+is checked synchronously without DNS, before identity/producer admission. Hostname resolution
+happens in the worker. Timings and normalized parsed URL determine idempotency: host case
+and default-port normalization apply; path/query ordering and token values remain significant.
+
+`OUTPACE_BROADCAST_SOURCES` declares a JSON object mapping names to those objects (default
+`{}`). It allows at most 64 entries and 256 KiB UTF-8. Empty/malformed text and duplicate names
+fail startup. Programmatic configuration passes the same validation. All declarations validate
+before filesystem/identity/runtime effects, then attach in name order after the HTTP listener
+and owned RTMP service start, before API traffic. A down/blocked origin is accepted; a local
+identity/reservation failure unwinds startup, including earlier workers and HLS cleanup.
+
+API attachment specifications are process-local and are never written to disk. Current
+environment declarations reattach on each startup. Detach/full delete suppress a declaration
+only until restart; remove it from the environment to keep it absent. API-only sources stay
+detached after restart although persisted descriptors/signing identities survive. There is no
+live environment reload, durable job specification or automatic source replacement.
+
+With a controlled MPEG-TS origin already listening on loopback port 8080, start the daemon
+with the independent operator opt-in, then issue these executable requests:
+
+```bash
+OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE=1 outpace serve
+# In a second terminal:
+curl --fail-with-body -X PUT http://127.0.0.1:6878/broadcast/demo-source/source \
+  -H 'Content-Type: application/json' \
+  --data '{"url":"http://127.0.0.1:8080/live.ts"}'
+curl --fail-with-body http://127.0.0.1:6878/broadcast/demo-source/source
+curl --fail-with-body -X DELETE http://127.0.0.1:6878/broadcast/demo-source/source
+```
+
+PUT returns `202` with exactly `{name, content_id, infohash, source}` after durable admission
+and owned worker registration; this does not establish health. Identical normalized/default-filled
+configuration returns the same attachment/identity/current attempts, even in backoff or failed
+state. Changed URL/token/timing or a competing producer conflicts; detach before replacement.
+GET returns `200` with exactly `{name, source}`, or `404` / `source_not_found`. Source detach
+waits for cancellation and worker/publication cleanup; concurrent deletes share the stop. It
+keeps descriptor, signing identity, cached seed lease/store and one announcement pair, and
+does not stop raw PUT/RTMP. Full broadcast DELETE stops all producers/announcements, removes
+the seed lease and durably deletes identity. During full deletion descriptor GET is `404`,
+source GET may still show `stopping`, and new admissions get `broadcast_stopping`.
+
+`source` always has exactly four fields, with no URL or upstream diagnostics:
+
+```json
+{"state":"backoff","attempts":2,"last_error":"upstream_eof","retry_in_ms":950}
+```
+
+| State | Meaning |
+| --- | --- |
+| `connecting` | Opening an attempt, including DNS; headers alone do not establish streaming. |
+| `streaming` | Authorized ingest emitted aligned TS; this is alignment, not codec validation. |
+| `backoff` | Waiting to retry a transient upstream failure or finite EOF. |
+| `blocked` | DNS resolved only disallowed addresses; waiting to re-resolve/revalidate. |
+| `failed` | Terminal local ingest/persistence/worker failure; keeps the exclusive attachment. |
+| `stopping` | Canceling/joining work; producer authority remains fenced until cleanup settles. |
+
+`attempts` saturates at `u64::MAX` and increments when each attempt (including DNS) begins.
+`last_error` is nullable and clears on the first aligned TS of a new attempt. `retry_in_ms`
+is nullable and reports monotonic remaining delay only in `backoff`/`blocked`.
+
+Retryable status codes are `dns_timeout`, `dns_failed`, `address_blocked`, `connect_timeout`,
+`connect_failed`, `tls_failed`, `headers_timeout`, `redirect_rejected`, `http_status`,
+`unsupported_response`, `body_failed`, `body_frame_too_large`, `read_timeout`,
+`progress_timeout`, `upstream_eof`. Terminal codes are `persistence_failed`,
+`piece_index_exhausted`, `ingest_failed`, `worker_failed`. A terminal failure stays attached
+without retry. Detach/reattach requests fresh admission, but a poisoned persistence generation
+remains closed until safe reload on restart or successful full deletion.
+
+Source errors and newly introduced mutation failures use `application/json` and exactly
+`{"error":{"code":"..."}}`. Source names validate first, followed by disabled support,
+service shutdown and per-name stopping, before any mutation:
+
+| HTTP status | Fixed codes |
+| --- | --- |
+| `400` | `invalid_name`, `invalid_source_config`, `invalid_source_url`, `source_address_blocked` |
+| `404` | `broadcasts_disabled`, `source_not_found` |
+| `409` | `producer_conflict`, `source_conflict`, `broadcast_stopping` |
+| `413` | `source_request_too_large` |
+| `415` | `source_content_type_required` |
+| `500` | `broadcast_persistence_failed`, `broadcast_state_invalid`, `piece_index_exhausted` |
+| `503` | `broadcast_service_stopping`, `broadcast_cleanup_timeout` |
+
+Only exact `OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE=1` expands the source address policy;
+all other strings deny. This operator switch is separate from transport/tracker opt-ins and
+cannot be supplied in source JSON. The established denylist rejects IPv4 private/loopback,
+CGNAT, link-local, unspecified, broadcast, documentation and multicast, and IPv6 loopback,
+unspecified, multicast, ULA and link-local; mapped IPv4 follows IPv4. The opt-in adds only
+private/loopback/CGNAT IPv4 and ULA/loopback IPv6 (including mapped equivalents). It never
+unblocks link-local metadata services, unspecified, multicast, IPv4 broadcast/documentation.
+Other special ranges retain the existing classifier; this is not a complete IANA classifier.
+
+Each attempt resolves afresh with a fixed 5s DNS limit, chooses/pins one permitted candidate,
+and preserves original Host/TLS SNI and certificate verification. There is no previous-address
+fallback when DNS becomes blocked. Sources use fresh HTTP/1 clients, no proxies (including
+environment/system proxies), redirects, hidden retries, compression, Range resume, forwarded
+headers, cookies or custom authorization headers. HTTPS retains bundled roots and normal
+hostname checks. Open/header completion is capped at 15s after DNS; configured connection
+limits cannot extend it. Accept body-bearing 2xx except 204/205/206; reject partial semantics,
+upgrades and nonidentity encoding. Generic/missing MIME is allowed, with TS progress required.
+The header acceptance limits are 64 headers and 32 KiB parsed name/value bytes; the locked
+HTTP/1 parser also has a finite 417,792-byte read-buffer bound (not a total heap guarantee).
+
+Read idle measures nonempty body data while waiting upstream; empty frames do not reset it.
+Aligned TS must progress within 30s, so junk trickle cannot keep a source alive. A local ingest
+operation has a 15s terminal limit and never releases a still-active disk fence. Retries use
+`min(maximum, initial * 2^k)` from `k=0`, with uniform integer milliseconds in
+`[ceil(0.9 * base_ms), base_ms]`. Only 30s of streaming with at least one committed complete
+piece resets backoff. Policy denials and clean finite Content-Length EOF also wait and retry.
+
+Every attempt creates fresh resync/signing state at the shared cursor. Pull EOF/error/cancel
+never calls finite `finish()`; incomplete TS/signing tails are discarded and exposed piece
+indexes are skipped permanently. Completed signed pieces survive, but timestamp/PAT/PMT
+continuity across origin restarts is not promised. Reads/ingest are sequential with backpressure,
+frames <=256 KiB and feeds <=64 KiB; retained application buffers are one frame, resync tail,
+signing payload and one slice's output vector. There is no lifetime body-size limit or claim
+about total HTTP/TLS heap. No source URL/query token, address, upstream body/error chain,
+storage path or key appears in status/logs/Debug or persisted broadcast records. Operational
+source logs contain only validated name/state/fixed codes, throttled to 30s plus one terminal
+event. See [deployment environment handling](deployment.md#managed-source-declarations) and
+the reservation/storage/platform/RTMP guarantees above before backing up or rolling back.
+
+## Stream status
 
 An active stream status response has stable field names and numeric counters:
 

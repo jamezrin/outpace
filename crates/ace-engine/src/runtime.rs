@@ -2,10 +2,16 @@
 
 use crate::ace_provider::AceProvider;
 use crate::broadcast::{Broadcast, BroadcastError, BroadcastRegistry};
+use crate::broadcast_pull::{
+    parse_non_global_source_opt_in, parse_source_configs, validate_source_map,
+    ValidatedSourceConfig,
+};
 use crate::config::{load_or_create_identity, safe_in_memory_pool_limit, CacheType, Config};
 use crate::http::{router, AppState, BroadcastState};
 use crate::manager::StreamManager;
 use crate::provider::ProviderRegistry;
+use ace_swarm::http_fetch::FetchPolicy;
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
@@ -38,10 +44,28 @@ pub struct EngineRuntime {
     pub reachability: Option<Arc<ace_swarm::reachability::ReachabilityMonitor>>,
     announce_port_tx: tokio::sync::watch::Sender<Option<u16>>,
     identity: Arc<ace_wire::identity::Identity>,
+    source_configs: BTreeMap<String, ValidatedSourceConfig>,
 }
 
 pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     let mut config = Config::default();
+    config.allow_non_global_broadcast_source = parse_non_global_source_opt_in(
+        std::env::var("OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE")
+            .ok()
+            .as_deref(),
+    );
+    let raw_sources = match std::env::var("OUTPACE_BROADCAST_SOURCES") {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return Err("invalid_source_config".into()),
+    };
+    config.broadcast_sources = parse_source_configs(raw_sources.as_deref())?;
+    validate_source_map(
+        &config.broadcast_sources,
+        FetchPolicy {
+            allow_non_global: config.allow_non_global_broadcast_source,
+        },
+    )?;
     if let Ok(bind) = std::env::var("OUTPACE_BIND") {
         config.bind = bind.parse()?;
     }
@@ -449,6 +473,12 @@ pub async fn build_runtime(
     mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    // Validate the complete ordered map before normalizer, filesystem, identity, or
+    // runtime side effects, including when Config was constructed directly in Rust.
+    let source_policy = FetchPolicy {
+        allow_non_global: config.allow_non_global_broadcast_source,
+    };
+    let source_configs = validate_source_map(&config.broadcast_sources, source_policy)?;
     config.live_recovery.validate()?;
     config.hls.validate()?;
     config.hls_audio.validate()?;
@@ -559,10 +589,15 @@ pub async fn build_runtime(
         inbound_peer_port: announce_port_rx,
     };
 
+    broadcasts.registry.set_source_policy(source_policy);
+
     // Reconstruct/reserve identities without starting announcements or readers. Serving
     // startup owns network work only after listeners are established.
-    let reloaded = match broadcasts.registry
-        .reload_persisted(&broadcasts.seed_registry, broadcasts.store_bytes).await {
+    let reloaded = match broadcasts
+        .registry
+        .reload_persisted(&broadcasts.seed_registry, broadcasts.store_bytes)
+        .await
+    {
         Ok(reloaded) => reloaded,
         Err(error) => {
             broadcasts.close_admissions();
@@ -587,6 +622,7 @@ pub async fn build_runtime(
         reachability,
         announce_port_tx,
         identity,
+        source_configs,
     })
 }
 
@@ -609,9 +645,11 @@ pub(crate) async fn serve_http_until(
     manager.shutdown().await;
     match (result, cleanup) {
         (Err(error), cleanup) => {
-            if let Err(cleanup) = cleanup { crate::alog!("[broadcast] cleanup: {}", cleanup.code()); }
+            if let Err(cleanup) = cleanup {
+                crate::alog!("[broadcast] cleanup: {}", cleanup.code());
+            }
             Err(error)
-        },
+        }
         (Ok(()), Err(error)) => Err(Box::new(error)),
         (Ok(()), Ok(())) => Ok(()),
     }
@@ -630,7 +668,9 @@ async fn serve_http_inner(
         reachability,
         announce_port_tx,
         identity,
+        source_configs,
     } = runtime;
+    let mut shutdown = Box::pin(shutdown);
 
     // Startup banner: plain `eprintln!` on purpose. These lines are read live by whoever
     // just ran the daemon, so they intentionally skip the `alog!` timestamp/`[tag]` prefix.
@@ -760,8 +800,20 @@ async fn serve_http_inner(
     let cancel_rtmp = rtmp.cancel.clone();
     let draining_broadcasts = broadcasts.clone();
     let result: Result<(), Box<dyn std::error::Error>> = async {
-        for name in broadcasts.registry.names().await {
-            broadcasts.ensure_announcing(&name).await?;
+        let startup = async {
+            // BTreeMap iteration is deterministic; API traffic cannot race these claims.
+            for (name, config) in source_configs {
+                broadcasts.attach_source(&name, config).await?;
+            }
+            for name in broadcasts.registry.names().await {
+                broadcasts.ensure_announcing(&name).await?;
+            }
+            Ok::<(), BroadcastError>(())
+        };
+        tokio::select! {
+            biased;
+            () = &mut shutdown => return Ok(()),
+            result = startup => result?,
         }
         axum::serve(listener, router(state))
             .with_graceful_shutdown(async move {
@@ -772,9 +824,11 @@ async fn serve_http_inner(
                 if let Err(error) = draining_broadcasts.shutdown().await {
                     crate::alog!("[broadcast] shutdown: {}", error.code());
                 }
-            }).await?;
+            })
+            .await?;
         Ok(())
-    }.await;
+    }
+    .await;
     broadcasts.close_admissions();
     rtmp.stop(broadcasts.registry.cleanup_deadline()).await;
     result
@@ -794,7 +848,10 @@ impl OwnedRtmpListener {
                 crate::alog!("[rtmp] ingest stopped: listener_failed");
             }
         });
-        Self { cancel, task: Some(task) }
+        Self {
+            cancel,
+            task: Some(task),
+        }
     }
     async fn stop(&mut self, deadline: tokio::time::Instant) {
         self.cancel.send_replace(true);
@@ -809,7 +866,9 @@ impl OwnedRtmpListener {
 impl Drop for OwnedRtmpListener {
     fn drop(&mut self) {
         self.cancel.send_replace(true);
-        if let Some(task) = &self.task { task.abort(); }
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -838,7 +897,10 @@ async fn shutdown_signal() {
     crate::alog!("[runtime] shutdown signal received; draining HTTP connections");
 }
 
-pub async fn mint_broadcast(runtime: &EngineRuntime, name: &str) -> Result<Broadcast, BroadcastError> {
+pub async fn mint_broadcast(
+    runtime: &EngineRuntime,
+    name: &str,
+) -> Result<Broadcast, BroadcastError> {
     runtime.broadcasts.mint(name).await
 }
 

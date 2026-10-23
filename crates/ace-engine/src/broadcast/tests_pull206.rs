@@ -6,11 +6,114 @@ use super::{
 use crate::broadcast_persist::{
     tests_pull206::persistence_observer, BroadcastPersist, PersistOperation, PersistedBroadcast,
 };
+use crate::broadcast_pull::{
+    validate_source, BroadcastSourceConfig, SourceErrorCode, SourceState, SourceTestHooks,
+    TestSourceBody, TestSourceOpen,
+};
 use crate::config::CacheType;
+use ace_swarm::http_fetch::{FetchError, FetchPolicy};
 use ace_swarm::listen::SeedRegistry;
+use async_trait::async_trait;
+use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
+use tower::ServiceExt;
+
+const POLICY: FetchPolicy = FetchPolicy {
+    allow_non_global: true,
+};
+
+struct PullFrames(mpsc::UnboundedReceiver<Result<Option<Bytes>, FetchError>>);
+
+#[async_trait]
+impl TestSourceBody for PullFrames {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, FetchError> {
+        self.0.recv().await.unwrap_or(Err(FetchError::Cancelled))
+    }
+}
+
+fn source_config(url: String) -> BroadcastSourceConfig {
+    BroadcastSourceConfig {
+        url,
+        connect_timeout_secs: 5,
+        read_timeout_secs: 15,
+        reconnect_initial_secs: 1,
+        reconnect_max_secs: 30,
+    }
+}
+
+fn source(url: &str) -> BroadcastSourceConfig {
+    source_config(url.to_owned())
+}
+
+fn ts_packets(count: usize, marker: u8) -> Bytes {
+    let mut body = Vec::with_capacity(count * 188);
+    for _ in 0..count {
+        body.push(0x47);
+        body.extend(std::iter::repeat_n(marker, 187));
+    }
+    Bytes::from(body)
+}
+
+fn test_broadcast_state(
+    registry: Arc<BroadcastRegistry>,
+    policy: FetchPolicy,
+) -> crate::http::BroadcastState {
+    registry.set_source_policy(policy);
+    crate::http::BroadcastState {
+        registry,
+        seed_registry: SeedRegistry::new(),
+        trackers: vec![],
+        store_bytes: 4 << 20,
+        inbound_peer_port: watch::channel(None).1,
+    }
+}
+
+async fn attach_test_source(
+    state: &crate::http::BroadcastState,
+    name: &str,
+    config: BroadcastSourceConfig,
+    policy: FetchPolicy,
+) -> (super::Broadcast, crate::broadcast_pull::SourceStatus) {
+    state
+        .attach_source(name, validate_source(config, policy).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn wait_status_with_state(
+    state: &crate::http::BroadcastState,
+    name: &str,
+    predicate: impl Fn(&crate::broadcast_pull::SourceStatus) -> bool,
+) -> crate::broadcast_pull::SourceStatus {
+    for _ in 0..10_000 {
+        let status = state.source_status(name).await.unwrap().unwrap();
+        if predicate(&status) {
+            return status;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("source status did not reach the expected transition");
+}
+
+struct ReleaseDiskGate(Option<std::sync::mpsc::SyncSender<()>>);
+
+impl ReleaseDiskGate {
+    fn release(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+impl Drop for ReleaseDiskGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 fn temp_dir() -> PathBuf {
     let path = std::env::temp_dir().join(format!("outpace-pull206-{}", rand::random::<u64>()));
@@ -532,4 +635,485 @@ async fn pull206_settled_delete_failure_requires_explicit_retry() {
         "new identity follows explicit successful retry"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pull206_actual_persistence_failure_is_terminal_and_keeps_failed_claim() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = std::env::temp_dir().join(format!(
+        "outpace-pull206-terminal-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let observer = persistence_observer();
+    let registry = BroadcastRegistry::with_test_persist(BroadcastPersist::with_test_io(
+        &dir,
+        observer.clone(),
+    ));
+    let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+    let frames_rx = Arc::new(Mutex::new(Some(frames_rx)));
+    let frames_rx_hook = frames_rx.clone();
+    let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+    let (release_open_tx, release_open_rx) = tokio::sync::oneshot::channel();
+    let release_open_rx = Arc::new(Mutex::new(Some(release_open_rx)));
+    let release_open_hook = release_open_rx.clone();
+    let open: TestSourceOpen = Arc::new(move |_, _, _, _| {
+        let receiver = frames_rx_hook.clone();
+        let opened = opened_tx.clone();
+        let release = release_open_hook.clone();
+        Box::pin(async move {
+            let _ = opened.send(());
+            let release = release.lock().unwrap().take().unwrap();
+            release.await.map_err(|_| FetchError::Cancelled)?;
+            Ok(
+                Box::new(PullFrames(receiver.lock().unwrap().take().unwrap()))
+                    as Box<dyn TestSourceBody>,
+            )
+        })
+    });
+    let logs = Arc::new(AtomicUsize::new(0));
+    let logs_hook = logs.clone();
+    registry.set_source_test_hooks(SourceTestHooks {
+        open: Some(open),
+        on_log: Some(Arc::new(move |_| {
+            logs_hook.fetch_add(1, Ordering::SeqCst);
+        })),
+        ..SourceTestHooks::default()
+    });
+    let state = test_broadcast_state(registry.clone(), POLICY);
+    let config = source("http://127.0.0.1:1/persistence-failure");
+    let (broadcast, _) =
+        attach_test_source(&state, "persist-failure", config.clone(), POLICY).await;
+    tokio::time::timeout(Duration::from_secs(2), opened_rx.recv())
+        .await
+        .expect("source worker should reach the open boundary")
+        .expect("open notification should arrive");
+
+    // The actual HTTP source and worker continue normally; force its next complete signed
+    // piece across the real reservation boundary and fail BroadcastPersist::save's FileSync.
+    broadcast.cursor.next.store(
+        broadcast.cursor.reserved_until(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    observer.fail_next(PersistOperation::FileSync);
+    release_open_tx.send(()).unwrap();
+    let packets = (65_536usize - broadcast.auth.signature_len()).div_ceil(188) + 8;
+    frames_tx.send(Ok(Some(ts_packets(packets, 0x42)))).unwrap();
+    let failed = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_status_with_state(&state, "persist-failure", |status| {
+            status.state == SourceState::Failed
+        }),
+    )
+    .await
+    .expect("worker should classify real persistence failure");
+    assert_eq!(failed.attempts, 1);
+    assert_eq!(failed.last_error, Some(SourceErrorCode::PersistenceFailed));
+    assert_eq!(failed.retry_in_ms, None);
+    assert_eq!(logs.load(Ordering::SeqCst), 1);
+
+    let (same, same_status) = attach_test_source(&state, "persist-failure", config, POLICY).await;
+    assert_eq!(same.infohash, broadcast.infohash);
+    assert_eq!(same_status.attempts, 1);
+    for kind in [ProducerKind::RawPut, ProducerKind::Rtmp] {
+        assert_eq!(
+            registry
+                .acquire_producer(
+                    "persist-failure",
+                    "conflict",
+                    &[],
+                    &state.seed_registry,
+                    state.store_bytes,
+                    kind,
+                )
+                .await
+                .err()
+                .unwrap(),
+            BroadcastError::ProducerConflict
+        );
+    }
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        state
+            .source_status("persist-failure")
+            .await
+            .unwrap()
+            .unwrap()
+            .attempts,
+        1
+    );
+    assert_eq!(logs.load(Ordering::SeqCst), 1);
+    state.detach_source("persist-failure").await.unwrap();
+    assert!(state
+        .source_status("persist-failure")
+        .await
+        .unwrap()
+        .is_none());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pull206_detach_timeout_keeps_claim_and_io_fence_until_real_disk_gate_releases() {
+    let dir = std::env::temp_dir().join(format!(
+        "outpace-pull206-detach-gate-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let observer = persistence_observer();
+    let registry = BroadcastRegistry::with_test_persist(BroadcastPersist::with_test_io(
+        &dir,
+        observer.clone(),
+    ));
+    let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+    let frames_rx = Arc::new(Mutex::new(Some(frames_rx)));
+    let frames_rx_hook = frames_rx.clone();
+    let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+    let (release_open_tx, release_open_rx) = tokio::sync::oneshot::channel();
+    let release_open_rx = Arc::new(Mutex::new(Some(release_open_rx)));
+    let release_open_hook = release_open_rx.clone();
+    let open: TestSourceOpen = Arc::new(move |_, _, _, _| {
+        let receiver = frames_rx_hook.clone();
+        let opened = opened_tx.clone();
+        let release = release_open_hook.clone();
+        Box::pin(async move {
+            let _ = opened.send(());
+            let release = release.lock().unwrap().take().unwrap();
+            release.await.map_err(|_| FetchError::Cancelled)?;
+            Ok(
+                Box::new(PullFrames(receiver.lock().unwrap().take().unwrap()))
+                    as Box<dyn TestSourceBody>,
+            )
+        })
+    });
+    registry.set_source_test_hooks(SourceTestHooks {
+        open: Some(open),
+        ..SourceTestHooks::default()
+    });
+    let state = test_broadcast_state(registry.clone(), POLICY);
+    let (broadcast, _) = attach_test_source(
+        &state,
+        "disk-gated-detach",
+        source("http://127.0.0.1:1/disk-gated-detach"),
+        POLICY,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), opened_rx.recv())
+        .await
+        .expect("worker should pause before opening its real ingest")
+        .expect("open notification should arrive");
+
+    broadcast.cursor.next.store(
+        broadcast.cursor.reserved_until(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let (disk_entered, release_disk) =
+        observer.gate_with_watchdog(PersistOperation::FileSync, Duration::from_secs(30));
+    release_open_tx.send(()).unwrap();
+    let packets = (65_536usize - broadcast.auth.signature_len()).div_ceil(188) + 8;
+    frames_tx.send(Ok(Some(ts_packets(packets, 0x43)))).unwrap();
+    tokio::task::spawn_blocking(move || {
+        disk_entered
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("real reservation save should block at FileSync")
+    })
+    .await
+    .unwrap();
+
+    let detaching = {
+        let state = state.clone();
+        tokio::spawn(async move { state.detach_source("disk-gated-detach").await })
+    };
+    let stopping = wait_status_with_state(&state, "disk-gated-detach", |status| {
+        status.state == SourceState::Stopping
+    })
+    .await;
+    assert_eq!(stopping.attempts, 1);
+    tokio::time::advance(crate::broadcast::CLEANUP_GRACE).await;
+    assert_eq!(
+        detaching.await.unwrap(),
+        Err(BroadcastError::CleanupTimeout)
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            state.source_status("disk-gated-detach")
+        )
+        .await
+        .expect("status remains readable while cleanup is disk-fenced")
+        .unwrap()
+        .is_some(),
+        "timed-out detach must retain the source attachment until the blocking operation settles"
+    );
+    for kind in [ProducerKind::RawPut, ProducerKind::Rtmp] {
+        assert_eq!(
+            registry
+                .acquire_producer(
+                    "disk-gated-detach",
+                    "conflict",
+                    &[],
+                    &state.seed_registry,
+                    state.store_bytes,
+                    kind,
+                )
+                .await
+                .err()
+                .unwrap(),
+            BroadcastError::Stopping
+        );
+    }
+
+    release_disk.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if state
+                .source_status("disk-gated-detach")
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned detach cleanup should settle after the actual disk call returns");
+    let (_, raw_session) = registry
+        .acquire_producer(
+            "disk-gated-detach",
+            "after detach",
+            &[],
+            &state.seed_registry,
+            state.store_bytes,
+            ProducerKind::RawPut,
+        )
+        .await
+        .expect("the producer claim is released only after disk cleanup settles");
+    drop(raw_session);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pull206_queued_http_attach_returns_503_while_detach_holds_real_disk_fence() {
+    let dir = temp_dir();
+    let observer = persistence_observer();
+    let registry = BroadcastRegistry::with_test_persist(BroadcastPersist::with_test_io(
+        &dir,
+        observer.clone(),
+    ));
+    let state = test_broadcast_state(registry.clone(), POLICY);
+
+    let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+    let frames_rx = Arc::new(Mutex::new(Some(frames_rx)));
+    let frames_rx_hook = frames_rx.clone();
+    let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+    let (release_open_tx, release_open_rx) = tokio::sync::oneshot::channel();
+    let release_open_rx = Arc::new(Mutex::new(Some(release_open_rx)));
+    let release_open_hook = release_open_rx.clone();
+    let open: TestSourceOpen = Arc::new(move |_, _, _, _| {
+        let receiver = frames_rx_hook.clone();
+        let opened = opened_tx.clone();
+        let release = release_open_hook.clone();
+        Box::pin(async move {
+            let _ = opened.send(());
+            let release = release.lock().unwrap().take().unwrap();
+            release.await.map_err(|_| FetchError::Cancelled)?;
+            Ok(
+                Box::new(PullFrames(receiver.lock().unwrap().take().unwrap()))
+                    as Box<dyn TestSourceBody>,
+            )
+        })
+    });
+    registry.set_source_test_hooks(SourceTestHooks {
+        open: Some(open),
+        ..SourceTestHooks::default()
+    });
+
+    let config = source("http://127.0.0.1:1/queued-http-attach");
+    let (broadcast, _) =
+        attach_test_source(&state, "queued-http-attach", config.clone(), POLICY).await;
+    tokio::time::timeout(Duration::from_secs(2), opened_rx.recv())
+        .await
+        .expect("attached source worker should reach the body boundary")
+        .expect("open notification should arrive");
+
+    // Drive one full signed piece through the real worker, store, and persistence path.
+    broadcast
+        .cursor
+        .next
+        .store(broadcast.cursor.reserved_until(), Ordering::SeqCst);
+    let (disk_entered, disk_release) =
+        observer.gate_with_watchdog(PersistOperation::FileSync, Duration::from_secs(30));
+    let mut disk_release = ReleaseDiskGate(Some(disk_release));
+    release_open_tx.send(()).unwrap();
+    let packets = (PIECE_LENGTH as usize - broadcast.auth.signature_len()).div_ceil(188) + 8;
+    frames_tx.send(Ok(Some(ts_packets(packets, 0x54)))).unwrap();
+    tokio::task::spawn_blocking(move || {
+        disk_entered
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("actual reservation FileSync should be blocked")
+    })
+    .await
+    .unwrap();
+
+    let entry = registry
+        .by_name
+        .lock()
+        .unwrap()
+        .get("queued-http-attach")
+        .unwrap()
+        .clone();
+    let (initializer_entered_tx, mut initializer_entered_rx) = mpsc::unbounded_channel();
+    let (release_initializer_tx, release_initializer_rx) = tokio::sync::oneshot::channel();
+    let release_initializer_rx = Arc::new(Mutex::new(Some(release_initializer_rx)));
+    let release_initializer_hook = release_initializer_rx.clone();
+    let before_source_gate = Arc::new(move || {
+        let entered = initializer_entered_tx.clone();
+        let release = release_initializer_hook.clone();
+        Box::pin(async move {
+            let _ = entered.send(());
+            let release = release.lock().unwrap().take().unwrap();
+            let _ = release.await;
+        }) as futures::future::BoxFuture<'static, ()>
+    });
+    registry.set_source_test_hooks(SourceTestHooks {
+        before_source_gate: Some(before_source_gate),
+        ..SourceTestHooks::default()
+    });
+
+    let manager = crate::manager::StreamManager::new(crate::provider::ProviderRegistry::new());
+    let app = crate::http::router(crate::http::AppState {
+        manager,
+        networks: vec![],
+        resolve_content_ids_in_getstream: false,
+        ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
+        experimental_ace_compat: false,
+        broadcasts: Some(state.clone()),
+    });
+    let put = app.oneshot(
+        axum::http::Request::put("/broadcast/queued-http-attach/source")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&config).unwrap()))
+            .unwrap(),
+    );
+    let put = tokio::spawn(put);
+    tokio::pin!(put);
+    tokio::time::timeout(Duration::from_secs(2), initializer_entered_rx.recv())
+        .await
+        .expect("real owned initializer should stop before source_gate")
+        .expect("pre-gate hook notification should arrive");
+
+    // With the initializer paused before its first lock poll, the only possible source-gate
+    // owner is the real detach continuation. Bound this exact lock observation with wall time.
+    let gate_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let detach = {
+        let state = state.clone();
+        tokio::spawn(async move { state.detach_source("queued-http-attach").await })
+    };
+    let detach_owns_source_gate = loop {
+        if entry.source_gate.try_lock().is_err() {
+            break true;
+        }
+        if std::time::Instant::now() >= gate_deadline {
+            break false;
+        }
+        tokio::task::yield_now().await;
+    };
+
+    // Record all pre-release facts, then release the actual blocking syscall before asserting
+    // anything that may fail. This keeps the expected RED from leaving runtime work wedged.
+    let retained_fences = entry.state.io.try_lock().is_err()
+        && entry.state.data.lock().unwrap().source.is_some()
+        && entry.state.data.lock().unwrap().producer.is_some();
+    let _ = release_initializer_tx.send(());
+    registry.close_admissions();
+    let mut response_before_disk_release = None;
+    for _ in 0..64 {
+        if let std::task::Poll::Ready(joined) = futures::poll!(put.as_mut()) {
+            response_before_disk_release = Some(joined);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if response_before_disk_release.is_none() {
+        tokio::time::advance(Duration::from_millis(250)).await;
+        for _ in 0..64 {
+            if let std::task::Poll::Ready(joined) = futures::poll!(put.as_mut()) {
+                response_before_disk_release = Some(joined);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+    let fixed_503_before_disk_release = response_before_disk_release
+        .as_ref()
+        .and_then(|joined| joined.as_ref().ok())
+        .and_then(|response| response.as_ref().ok())
+        .is_some_and(|response| response.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+    tokio::time::advance(crate::broadcast::CLEANUP_GRACE).await;
+    let detach_result = tokio::time::timeout(Duration::from_secs(2), detach)
+        .await
+        .expect("detach should hit cleanup grace while FileSync remains blocked")
+        .unwrap();
+    let retained_after_detach_timeout = entry.state.data.lock().unwrap().source.is_some()
+        && entry.state.data.lock().unwrap().producer.is_some()
+        && entry.state.io.try_lock().is_err();
+
+    disk_release.release();
+    let response = match response_before_disk_release {
+        Some(Ok(Ok(response))) => response,
+        Some(Ok(Err(never))) => match never {},
+        Some(Err(error)) => panic!("HTTP PUT task failed before disk release: {error}"),
+        None => tokio::time::timeout(Duration::from_secs(10), put)
+            .await
+            .expect("HTTP PUT must settle after the real source gate is released")
+            .expect("HTTP PUT task should return a response")
+            .expect("router response is infallible"),
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let settled = {
+                let data = entry.state.data.lock().unwrap();
+                data.source.is_none() && data.source_detach.is_none()
+            };
+            if settled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned detach cleanup should settle after the real FileSync release");
+    let response_status = response.status();
+    let response_body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+
+    assert!(
+        detach_owns_source_gate,
+        "detach must own the real source gate before PUT resumes"
+    );
+    assert!(
+        retained_fences,
+        "source claim and actual I/O fence remain held before disk release"
+    );
+    assert_eq!(detach_result, Err(BroadcastError::CleanupTimeout));
+    assert!(
+        retained_after_detach_timeout,
+        "cleanup timeout must retain source and producer claims plus the I/O fence"
+    );
+    assert!(
+        fixed_503_before_disk_release,
+        "queued source PUT must return fixed 503 before the blocked FileSync is released"
+    );
+    assert_eq!(response_status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response_json,
+        serde_json::json!({"error":{"code":"broadcast_service_stopping"}})
+    );
 }

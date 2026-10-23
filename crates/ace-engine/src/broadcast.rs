@@ -3,7 +3,9 @@
 use crate::ace_provider::build_piece_store;
 use crate::broadcast_ingest::{BroadcastIngest, IngestError};
 use crate::broadcast_persist::{BroadcastPersist, PersistedBroadcast};
+use crate::broadcast_pull::{run_source, SourceStatus, SourceStatusWriter, ValidatedSourceConfig};
 use crate::config::CacheType;
+use ace_swarm::http_fetch::FetchPolicy;
 use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::store::PieceStore;
 use ace_wire::bencode::Bencode;
@@ -27,17 +29,33 @@ pub const CURSOR_PERSIST_INTERVAL: u64 = 128;
 pub const CLEANUP_GRACE: Duration = Duration::from_secs(5);
 
 pub fn valid_broadcast_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && name != "." && name != ".."
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProducerKind { RawPut, Rtmp, Pull }
+pub enum ProducerKind {
+    RawPut,
+    Rtmp,
+    Pull,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BroadcastError {
-    InvalidName, ProducerConflict, Stopping, ServiceStopping, PersistenceFailed,
-    StateInvalid, PieceIndexExhausted, CleanupTimeout,
+    InvalidName,
+    ProducerConflict,
+    SourceConflict,
+    Stopping,
+    ServiceStopping,
+    PersistenceFailed,
+    StateInvalid,
+    PieceIndexExhausted,
+    CleanupTimeout,
 }
 
 impl BroadcastError {
@@ -45,6 +63,7 @@ impl BroadcastError {
         match self {
             Self::InvalidName => "invalid_name",
             Self::ProducerConflict => "producer_conflict",
+            Self::SourceConflict => "source_conflict",
             Self::Stopping => "broadcast_stopping",
             Self::ServiceStopping => "broadcast_service_stopping",
             Self::PersistenceFailed => "broadcast_persistence_failed",
@@ -55,7 +74,9 @@ impl BroadcastError {
     }
 }
 impl std::fmt::Display for BroadcastError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.code()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code())
+    }
 }
 impl std::error::Error for BroadcastError {}
 
@@ -63,15 +84,23 @@ type Completion = watch::Receiver<Option<Result<(), BroadcastError>>>;
 
 async fn completed(mut rx: Completion) -> Result<(), BroadcastError> {
     loop {
-        if let Some(result) = *rx.borrow_and_update() { return result; }
-        if rx.changed().await.is_err() { return Err(BroadcastError::StateInvalid); }
+        if let Some(result) = *rx.borrow_and_update() {
+            return result;
+        }
+        if rx.changed().await.is_err() {
+            return Err(BroadcastError::StateInvalid);
+        }
     }
 }
 
 pub(crate) async fn cancelled(rx: &mut watch::Receiver<bool>) {
     loop {
-        if *rx.borrow_and_update() { return; }
-        if rx.changed().await.is_err() { return; }
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -89,7 +118,9 @@ struct PoisonOnFailure {
 }
 impl Drop for PoisonOnFailure {
     fn drop(&mut self) {
-        if !self.succeeded { self.poisoned.store(true, Ordering::SeqCst); }
+        if !self.succeeded {
+            self.poisoned.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -109,20 +140,32 @@ pub struct BroadcastCursor {
 }
 
 impl BroadcastCursor {
-    pub fn start_piece(&self) -> u64 { self.next.load(Ordering::SeqCst) }
-    pub fn reserved_until(&self) -> u64 { self.reserved.load(Ordering::SeqCst) }
+    pub fn start_piece(&self) -> u64 {
+        self.next.load(Ordering::SeqCst)
+    }
+    pub fn reserved_until(&self) -> u64 {
+        self.reserved.load(Ordering::SeqCst)
+    }
 
     pub(crate) fn check(&self) -> Result<(), BroadcastError> {
-        if self.poisoned.load(Ordering::SeqCst) { return Err(BroadcastError::PersistenceFailed); }
-        if self.closed.load(Ordering::SeqCst) || self.service_closed.load(Ordering::SeqCst)
-            || *self.cancel.borrow() { return Err(BroadcastError::Stopping); }
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(BroadcastError::PersistenceFailed);
+        }
+        if self.closed.load(Ordering::SeqCst)
+            || self.service_closed.load(Ordering::SeqCst)
+            || *self.cancel.borrow()
+        {
+            return Err(BroadcastError::Stopping);
+        }
         Ok(())
     }
 
     fn record(&self, reserved_until: u64) -> Option<PersistedBroadcast> {
         self.sink.as_ref().map(|sink| PersistedBroadcast {
-            transport: sink.transport.clone(), key_pkcs1_pem: sink.key_pkcs1_pem.clone(),
-            next_piece: self.start_piece(), reserved_until: Some(reserved_until),
+            transport: sink.transport.clone(),
+            key_pkcs1_pem: sink.key_pkcs1_pem.clone(),
+            next_piece: self.start_piece(),
+            reserved_until: Some(reserved_until),
         })
     }
 
@@ -130,7 +173,9 @@ impl BroadcastCursor {
     // write an older reservation after it. The blocking guard also fences deletion.
     async fn save(&self, reservation: u64) -> Result<(), BroadcastError> {
         self.check()?;
-        let Some(rec) = self.record(reservation) else { return Ok(()); };
+        let Some(rec) = self.record(reservation) else {
+            return Ok(());
+        };
         let sink = self.sink.as_ref().unwrap().clone();
         let io = self.io.clone().lock_owned().await;
         self.check()?;
@@ -138,8 +183,13 @@ impl BroadcastCursor {
         let (tx, rx) = watch::channel(None);
         let job = tokio::task::spawn_blocking(move || {
             let _io = io;
-            let mut fence = PoisonOnFailure { poisoned: poison, succeeded: false };
-            let result = sink.persist.save(&sink.name, &rec)
+            let mut fence = PoisonOnFailure {
+                poisoned: poison,
+                succeeded: false,
+            };
+            let result = sink
+                .persist
+                .save(&sink.name, &rec)
                 .map_err(|_| BroadcastError::PersistenceFailed);
             fence.succeeded = result.is_ok();
             tx.send_replace(Some(result));
@@ -161,11 +211,14 @@ impl BroadcastCursor {
 
     pub(crate) async fn consume(&self, piece: u64) -> Result<(), BroadcastError> {
         self.check()?;
-        let next = piece.checked_add(1).ok_or(BroadcastError::PieceIndexExhausted)?;
+        let next = piece
+            .checked_add(1)
+            .ok_or(BroadcastError::PieceIndexExhausted)?;
         let current = self.reserved_until();
         if piece >= current {
             let blocks = (piece - current) / CURSOR_PERSIST_INTERVAL;
-            let extension = blocks.checked_add(1)
+            let extension = blocks
+                .checked_add(1)
                 .and_then(|n| n.checked_mul(CURSOR_PERSIST_INTERVAL))
                 .and_then(|n| current.checked_add(n))
                 .ok_or(BroadcastError::PieceIndexExhausted)?;
@@ -212,13 +265,19 @@ pub(crate) struct ProducerAuthority {
 /// Completion observer for entry-owned ingress. It owns no controller/task handle, so a
 /// source attachment or test may observe completion without taking join ownership away.
 #[derive(Clone)]
-pub struct IngressTask { completion: watch::Receiver<bool> }
+pub struct IngressTask {
+    completion: watch::Receiver<bool>,
+}
 impl IngressTask {
     pub async fn wait(&self) -> Result<(), BroadcastError> {
         let mut completion = self.completion.clone();
         loop {
-            if *completion.borrow_and_update() { return Ok(()); }
-            if completion.changed().await.is_err() { return Err(BroadcastError::StateInvalid); }
+            if *completion.borrow_and_update() {
+                return Ok(());
+            }
+            if completion.changed().await.is_err() {
+                return Err(BroadcastError::StateInvalid);
+            }
         }
     }
 }
@@ -233,24 +292,44 @@ pub struct ProducerSession {
 impl ProducerSession {
     pub fn open_ingest(&mut self) -> Result<BroadcastIngest, IngestError> {
         self.check().map_err(IngestError::from)?;
-        if self.authority.ingest_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        if self
+            .authority
+            .ingest_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Err(IngestError::ActiveIngest);
         }
-        Ok(BroadcastIngest::authorized(self.broadcast.clone(), self.authority.clone()))
+        Ok(BroadcastIngest::authorized(
+            self.broadcast.clone(),
+            self.authority.clone(),
+        ))
     }
 
-    pub fn kind(&self) -> ProducerKind { self.authority.kind }
-    pub fn generation(&self) -> u64 { self.authority.generation }
-    pub fn cancellation(&self) -> watch::Receiver<bool> { self.authority.cancel.subscribe() }
-    pub(crate) fn generation_cancellation(&self) -> watch::Receiver<bool> { self.broadcast.cursor.cancel.clone() }
+    pub fn kind(&self) -> ProducerKind {
+        self.authority.kind
+    }
+    pub fn generation(&self) -> u64 {
+        self.authority.generation
+    }
+    pub fn cancellation(&self) -> watch::Receiver<bool> {
+        self.authority.cancel.subscribe()
+    }
+    pub(crate) fn generation_cancellation(&self) -> watch::Receiver<bool> {
+        self.broadcast.cursor.cancel.clone()
+    }
     pub fn check(&self) -> Result<(), BroadcastError> {
         self.broadcast.cursor.check()?;
-        if *self.authority.cancel.borrow() { return Err(BroadcastError::Stopping); }
+        if *self.authority.cancel.borrow() {
+            return Err(BroadcastError::Stopping);
+        }
         Ok(())
     }
     /// RTMP holds this barrier across mux, ingest and finite finish. Cleanup waits for it
     /// without requiring the enclosing dependency-owned connection task to terminate.
-    pub(crate) fn operation_barrier(&self) -> Arc<Mutex<()>> { self.authority.operation.clone() }
+    pub(crate) fn operation_barrier(&self) -> Arc<Mutex<()>> {
+        self.authority.operation.clone()
+    }
 }
 impl Drop for ProducerSession {
     fn drop(&mut self) {
@@ -267,7 +346,17 @@ struct EntryData {
     closed: bool,
     producer: Option<Arc<ProducerAuthority>>,
     announcing: bool,
+    source: Option<SourceAttachment>,
+    source_detach: Option<(Completion, tokio::time::Instant)>,
 }
+struct SourceAttachment {
+    config: ValidatedSourceConfig,
+    status: SourceStatusWriter,
+    authority: Arc<ProducerAuthority>,
+    worker_abort: AbortHandle,
+    stopping: bool,
+}
+
 struct EntryState {
     data: StdMutex<EntryData>,
     cancel: watch::Sender<bool>,
@@ -283,6 +372,7 @@ struct StopJob {
 struct BroadcastEntry {
     state: Arc<EntryState>,
     lifecycle: Arc<Mutex<()>>,
+    source_gate: Arc<Mutex<()>>,
     initializers: StdMutex<Vec<JoinHandle<()>>>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
     aborters: StdMutex<Vec<AbortHandle>>,
@@ -293,26 +383,44 @@ impl BroadcastEntry {
         Self {
             state: Arc::new(EntryState {
                 data: StdMutex::new(EntryData {
-                    broadcast: None, lease: None, invalid: None, stopping: false,
-                    closed: false, producer: None, announcing: false,
+                    broadcast: None,
+                    lease: None,
+                    invalid: None,
+                    stopping: false,
+                    closed: false,
+                    producer: None,
+                    announcing: false,
+                    source: None,
+                    source_detach: None,
                 }),
                 cancel: watch::channel(false).0,
                 service_closed,
-                io: Arc::new(Mutex::new(())), publication: Arc::new(Mutex::new(())),
+                io: Arc::new(Mutex::new(())),
+                publication: Arc::new(Mutex::new(())),
             }),
-            lifecycle: Arc::new(Mutex::new(())), initializers: StdMutex::new(Vec::new()),
-            tasks: StdMutex::new(Vec::new()), aborters: StdMutex::new(Vec::new()),
+            lifecycle: Arc::new(Mutex::new(())),
+            source_gate: Arc::new(Mutex::new(())),
+            initializers: StdMutex::new(Vec::new()),
+            tasks: StdMutex::new(Vec::new()),
+            aborters: StdMutex::new(Vec::new()),
             stop: StdMutex::new(None),
         }
     }
     fn stop_admissions(&self) {
         let mut data = self.state.data.lock().unwrap();
         data.stopping = true;
+        if let Some(source) = &data.source {
+            source.status.stopping();
+        }
         self.state.cancel.send_replace(true);
-        if let Some(producer) = &data.producer { producer.cancel.send_replace(true); }
+        if let Some(producer) = &data.producer {
+            producer.cancel.send_replace(true);
+        }
     }
     fn abort_async(&self) {
-        for abort in self.aborters.lock().unwrap().iter() { abort.abort(); }
+        for abort in self.aborters.lock().unwrap().iter() {
+            abort.abort();
+        }
     }
 }
 
@@ -320,11 +428,15 @@ impl BroadcastEntry {
 pub struct BroadcastRegistry {
     by_name: Arc<StdMutex<BTreeMap<String, Arc<BroadcastEntry>>>>,
     closed: Arc<AtomicBool>,
+    service_cancel: watch::Sender<bool>,
     next_generation: AtomicU64,
     persist: Option<BroadcastPersist>,
     cache_type: CacheType,
     cache_dir: PathBuf,
     shutdown_deadline: StdMutex<Option<tokio::time::Instant>>,
+    source_policy: StdMutex<FetchPolicy>,
+    #[cfg(test)]
+    source_hooks: StdMutex<crate::broadcast_pull::SourceTestHooks>,
     #[cfg(test)]
     announcer: StdMutex<Option<AnnouncerFactory>>,
 }
@@ -334,16 +446,29 @@ type AnnounceFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub(crate) type AnnouncerFactory = Arc<dyn Fn([u8; 20]) -> AnnounceFuture + Send + Sync>;
 
 impl BroadcastRegistry {
-    pub fn new() -> Arc<Self> { Self::configured(None, CacheType::Memory, PathBuf::new()) }
+    pub fn new() -> Arc<Self> {
+        Self::configured(None, CacheType::Memory, PathBuf::new())
+    }
     pub fn with_persist(data_dir: &Path, cache_type: CacheType, cache_dir: PathBuf) -> Arc<Self> {
         Self::configured(Some(BroadcastPersist::new(data_dir)), cache_type, cache_dir)
     }
-    fn configured(persist: Option<BroadcastPersist>, cache_type: CacheType, cache_dir: PathBuf) -> Arc<Self> {
+    fn configured(
+        persist: Option<BroadcastPersist>,
+        cache_type: CacheType,
+        cache_dir: PathBuf,
+    ) -> Arc<Self> {
         Arc::new(Self {
             by_name: Arc::new(StdMutex::new(BTreeMap::new())),
-            closed: Arc::new(AtomicBool::new(false)), next_generation: AtomicU64::new(1),
-            persist, cache_type, cache_dir,
+            closed: Arc::new(AtomicBool::new(false)),
+            service_cancel: watch::channel(false).0,
+            next_generation: AtomicU64::new(1),
+            persist,
+            cache_type,
+            cache_dir,
             shutdown_deadline: StdMutex::new(None),
+            source_policy: StdMutex::new(FetchPolicy::default()),
+            #[cfg(test)]
+            source_hooks: StdMutex::new(crate::broadcast_pull::SourceTestHooks::default()),
             #[cfg(test)]
             announcer: StdMutex::new(None),
         })
@@ -357,30 +482,57 @@ impl BroadcastRegistry {
         *self.announcer.lock().unwrap() = Some(factory);
     }
 
-    pub fn is_service_stopping(&self) -> bool { self.closed.load(Ordering::SeqCst) }
+    pub fn is_service_stopping(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+    pub(crate) fn service_cancellation(&self) -> watch::Receiver<bool> {
+        self.service_cancel.subscribe()
+    }
 
     fn entry(&self, name: &str) -> Result<Arc<BroadcastEntry>, BroadcastError> {
-        if !valid_broadcast_name(name) { return Err(BroadcastError::InvalidName); }
+        if !valid_broadcast_name(name) {
+            return Err(BroadcastError::InvalidName);
+        }
         let mut map = self.by_name.lock().unwrap();
-        if self.closed.load(Ordering::SeqCst) { return Err(BroadcastError::ServiceStopping); }
-        Ok(map.entry(name.to_owned()).or_insert_with(|| Arc::new(BroadcastEntry::new(self.closed.clone()))).clone())
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(BroadcastError::ServiceStopping);
+        }
+        Ok(map
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(BroadcastEntry::new(self.closed.clone())))
+            .clone())
     }
     fn check_entry(state: &EntryState, data: &EntryData) -> Result<(), BroadcastError> {
-        if state.service_closed.load(Ordering::SeqCst) { return Err(BroadcastError::ServiceStopping); }
-        if data.stopping || data.closed { return Err(BroadcastError::Stopping); }
-        if let Some(error) = data.invalid { return Err(error); }
+        if state.service_closed.load(Ordering::SeqCst) {
+            return Err(BroadcastError::ServiceStopping);
+        }
+        if data.stopping || data.closed {
+            return Err(BroadcastError::Stopping);
+        }
+        if let Some(error) = data.invalid {
+            return Err(error);
+        }
         Ok(())
     }
     pub async fn get(&self, name: &str) -> Option<Broadcast> {
         let entry = self.by_name.lock().unwrap().get(name).cloned()?;
         let data = entry.state.data.lock().unwrap();
-        if data.stopping || data.closed { None } else { data.broadcast.clone() }
+        if data.stopping || data.closed {
+            None
+        } else {
+            data.broadcast.clone()
+        }
     }
     pub async fn names(&self) -> Vec<String> {
-        self.by_name.lock().unwrap().iter().filter_map(|(name, entry)| {
-            let data = entry.state.data.lock().unwrap();
-            (data.broadcast.is_some() && !data.stopping && !data.closed).then(|| name.clone())
-        }).collect()
+        self.by_name
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(name, entry)| {
+                let data = entry.state.data.lock().unwrap();
+                (data.broadcast.is_some() && !data.stopping && !data.closed).then(|| name.clone())
+            })
+            .collect()
     }
 
     async fn lock_lifecycle(entry: &BroadcastEntry) -> Result<OwnedMutexGuard<()>, BroadcastError> {
@@ -401,7 +553,12 @@ impl BroadcastRegistry {
     }
 
     async fn prepare(
-        &self, name: &str, title: &str, trackers: &[String], seed_registry: &SeedRegistry, store_bytes: u64,
+        &self,
+        name: &str,
+        title: &str,
+        trackers: &[String],
+        seed_registry: &SeedRegistry,
+        store_bytes: u64,
     ) -> Result<(Arc<BroadcastEntry>, Broadcast), BroadcastError> {
         let entry = self.entry(name)?;
         let lifecycle = Self::lock_lifecycle(&entry).await?;
@@ -429,16 +586,31 @@ impl BroadcastRegistry {
             let init_state = state.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let _io = io;
-                initialize(&name, &title, &trackers, &seed_registry, store_bytes, persist,
-                    cache_type, cache_dir, &init_state)
-            }).await.unwrap_or(Err(BroadcastError::StateInvalid));
+                initialize(
+                    &name,
+                    &title,
+                    &trackers,
+                    &seed_registry,
+                    store_bytes,
+                    persist,
+                    cache_type,
+                    cache_dir,
+                    &init_state,
+                )
+            })
+            .await
+            .unwrap_or(Err(BroadcastError::StateInvalid));
             let mut data = state.data.lock().unwrap();
             let outcome = match result {
                 Ok((bc, lease)) => {
-                    data.broadcast = Some(bc); data.lease = Some(lease);
+                    data.broadcast = Some(bc);
+                    data.lease = Some(lease);
                     Self::check_entry(&state, &data)
                 }
-                Err(error) => { data.invalid = Some(error); Err(error) }
+                Err(error) => {
+                    data.invalid = Some(error);
+                    Err(error)
+                }
             };
             tx.send_replace(Some(outcome));
         });
@@ -453,65 +625,446 @@ impl BroadcastRegistry {
             }
             result = completed(rx) => result?,
         }
-        let bc = entry.state.data.lock().unwrap().broadcast.clone().ok_or(BroadcastError::StateInvalid)?;
+        let bc = entry
+            .state
+            .data
+            .lock()
+            .unwrap()
+            .broadcast
+            .clone()
+            .ok_or(BroadcastError::StateInvalid)?;
         Ok((entry, bc))
     }
 
     pub async fn mint(
-        &self, name: &str, title: &str, trackers: &[String], seed_registry: &SeedRegistry, store_bytes: u64,
+        &self,
+        name: &str,
+        title: &str,
+        trackers: &[String],
+        seed_registry: &SeedRegistry,
+        store_bytes: u64,
     ) -> Result<Broadcast, BroadcastError> {
-        let (_, bc) = self.prepare(name, title, trackers, seed_registry, store_bytes).await?;
+        let (_, bc) = self
+            .prepare(name, title, trackers, seed_registry, store_bytes)
+            .await?;
         bc.cursor.check()?;
         Ok(bc)
     }
 
     pub async fn acquire_producer(
-        &self, name: &str, title: &str, trackers: &[String], seed_registry: &SeedRegistry,
-        store_bytes: u64, kind: ProducerKind,
+        &self,
+        name: &str,
+        title: &str,
+        trackers: &[String],
+        seed_registry: &SeedRegistry,
+        store_bytes: u64,
+        kind: ProducerKind,
     ) -> Result<(Broadcast, ProducerSession), BroadcastError> {
-        let (entry, bc) = self.prepare(name, title, trackers, seed_registry, store_bytes).await?;
+        self.source_preflight(name, true)?;
+        let (entry, bc) = self
+            .prepare(name, title, trackers, seed_registry, store_bytes)
+            .await?;
         let _lifecycle = Self::lock_lifecycle(&entry).await?;
         let mut data = entry.state.data.lock().unwrap();
         Self::check_entry(&entry.state, &data)?;
+        if data.source_detach.is_some() {
+            return Err(BroadcastError::Stopping);
+        }
+        if let Some(source) = &data.source {
+            return Err(if source.stopping {
+                BroadcastError::Stopping
+            } else {
+                BroadcastError::ProducerConflict
+            });
+        }
         if let Some(old) = &data.producer {
-            if old.owner_alive.load(Ordering::SeqCst) || old.ingest_busy.load(Ordering::SeqCst)
-                || old.operation.try_lock().is_err() || bc.cursor.publication.try_lock().is_err()
-                || bc.cursor.io.try_lock().is_err() {
+            if old.owner_alive.load(Ordering::SeqCst)
+                || old.ingest_busy.load(Ordering::SeqCst)
+                || old.operation.try_lock().is_err()
+                || bc.cursor.publication.try_lock().is_err()
+                || bc.cursor.io.try_lock().is_err()
+            {
                 return Err(BroadcastError::ProducerConflict);
             }
         }
         bc.cursor.check()?;
-        let generation = self.next_generation.try_update(Ordering::SeqCst, Ordering::SeqCst,
-            |generation| generation.checked_add(1)).map_err(|_| BroadcastError::StateInvalid)?;
+        let generation = self
+            .next_generation
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
+                generation.checked_add(1)
+            })
+            .map_err(|_| BroadcastError::StateInvalid)?;
         let authority = Arc::new(ProducerAuthority {
             generation,
-            cancel: watch::channel(false).0, owner_alive: AtomicBool::new(true),
-            ingest_busy: Arc::new(AtomicBool::new(false)), operation: Arc::new(Mutex::new(())),
-            jobs: StdMutex::new(Vec::new()), ingress: StdMutex::new(None), kind,
+            cancel: watch::channel(false).0,
+            owner_alive: AtomicBool::new(true),
+            ingest_busy: Arc::new(AtomicBool::new(false)),
+            operation: Arc::new(Mutex::new(())),
+            jobs: StdMutex::new(Vec::new()),
+            ingress: StdMutex::new(None),
+            kind,
         });
         data.producer = Some(authority.clone());
-        Ok((bc.clone(), ProducerSession { broadcast: bc, authority }))
+        Ok((
+            bc.clone(),
+            ProducerSession {
+                broadcast: bc,
+                authority,
+            },
+        ))
+    }
+
+    pub(crate) fn set_source_policy(&self, policy: FetchPolicy) {
+        *self.source_policy.lock().unwrap() = policy;
+    }
+    pub(crate) fn source_policy(&self) -> FetchPolicy {
+        *self.source_policy.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_source_test_hooks(&self, hooks: crate::broadcast_pull::SourceTestHooks) {
+        *self.source_hooks.lock().unwrap() = hooks;
+    }
+
+    /// Read-only route preflight. Unknown names never mint an entry or identity. GET may
+    /// inspect a stopping source, while mutation admission observes its stopping fence.
+    pub(crate) fn source_preflight(
+        &self,
+        name: &str,
+        attaching: bool,
+    ) -> Result<(), BroadcastError> {
+        if !valid_broadcast_name(name) {
+            return Err(BroadcastError::InvalidName);
+        }
+        if self.is_service_stopping() {
+            return Err(BroadcastError::ServiceStopping);
+        }
+        if let Some(entry) = self.by_name.lock().unwrap().get(name) {
+            let data = entry.state.data.lock().unwrap();
+            if attaching
+                && (data.stopping
+                    || data.closed
+                    || data.source_detach.is_some()
+                    || data.source.as_ref().is_some_and(|s| s.stopping))
+            {
+                return Err(BroadcastError::Stopping);
+            }
+        }
+        Ok(())
+    }
+
+    /// Admission itself is an entry-owned task before its first await. An HTTP future can
+    /// disappear at any point without dropping an admitted claim between acquire and spawn.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn attach_source(
+        self: &Arc<Self>,
+        name: &str,
+        config: ValidatedSourceConfig,
+        seeds: &SeedRegistry,
+        trackers: &[String],
+        store_bytes: u64,
+        port: watch::Receiver<Option<u16>>,
+    ) -> Result<(Broadcast, SourceStatus), BroadcastError> {
+        self.source_preflight(name, true)?;
+        let entry = self.entry(name)?;
+        let registry = self.clone();
+        let name = name.to_owned();
+        let seeds = seeds.clone();
+        let trackers = trackers.to_vec();
+        let owned_entry = entry.clone();
+        let (tx, mut rx) = watch::channel(None);
+        {
+            // start_stop first closes this data gate before taking owned initializers.
+            let data = entry.state.data.lock().unwrap();
+            Self::check_entry(&entry.state, &data)?;
+            let task = tokio::spawn(async move {
+                let result = registry
+                    .commit_source(
+                        &owned_entry,
+                        &name,
+                        config,
+                        &seeds,
+                        &trackers,
+                        store_bytes,
+                        port,
+                    )
+                    .await;
+                tx.send_replace(Some(result));
+            });
+            let mut initializers = entry.initializers.lock().unwrap();
+            initializers.retain(|job| !job.is_finished());
+            initializers.push(task);
+        }
+        let mut service_cancel = self.service_cancellation();
+        // Cancel only this request's observer. The initializer and any persistence work
+        // stay entry-owned even when shutdown releases the HTTP request before they settle.
+        tokio::select! {
+            biased;
+            () = cancelled(&mut service_cancel) => Err(BroadcastError::ServiceStopping),
+            result = async {
+                loop {
+                    let result = rx.borrow_and_update().clone();
+                    if let Some(result) = result {
+                        #[cfg(test)]
+                        if result.is_ok() {
+                            let gate = self.source_hooks.lock().unwrap().after_commit.clone();
+                            if let Some(gate) = gate { gate().await; }
+                        }
+                        return result;
+                    }
+                    if rx.changed().await.is_err() { return Err(BroadcastError::StateInvalid); }
+                }
+            } => {
+                if self.is_service_stopping() { Err(BroadcastError::ServiceStopping) }
+                else { result }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_source(
+        &self,
+        entry: &BroadcastEntry,
+        name: &str,
+        config: ValidatedSourceConfig,
+        seeds: &SeedRegistry,
+        trackers: &[String],
+        store_bytes: u64,
+        port: watch::Receiver<Option<u16>>,
+    ) -> Result<(Broadcast, SourceStatus), BroadcastError> {
+        #[cfg(test)]
+        {
+            let hook = self.source_hooks.lock().unwrap().before_source_gate.clone();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        let mut service_cancel = self.service_cancellation();
+        let mut entry_cancel = entry.state.cancel.subscribe();
+        let _gate = tokio::select! {
+            biased;
+            () = cancelled(&mut service_cancel) => return Err(BroadcastError::ServiceStopping),
+            () = cancelled(&mut entry_cancel) => return Err(if self.is_service_stopping() {
+                BroadcastError::ServiceStopping
+            } else { BroadcastError::Stopping }),
+            gate = entry.source_gate.lock() => gate,
+        };
+        {
+            let data = entry.state.data.lock().unwrap();
+            // Cancellation may race lock readiness; recheck before inspecting or changing
+            // the attachment, even when the lock branch won the selection.
+            Self::check_entry(&entry.state, &data)?;
+            if data.source_detach.is_some() {
+                return Err(BroadcastError::Stopping);
+            }
+            if let Some(source) = &data.source {
+                if source.stopping {
+                    return Err(BroadcastError::Stopping);
+                }
+                if source.config != config {
+                    return Err(BroadcastError::SourceConflict);
+                }
+                return Ok((
+                    data.broadcast.clone().ok_or(BroadcastError::StateInvalid)?,
+                    source.status.snapshot(),
+                ));
+            }
+        }
+        let (bc, session) = self
+            .acquire_producer(name, name, trackers, seeds, store_bytes, ProducerKind::Pull)
+            .await?;
+        self.ensure_announcing(name, trackers, port).await?;
+        let status = SourceStatusWriter::new(name);
+        #[cfg(test)]
+        let status = {
+            let mut status = status;
+            status.hooks = self.source_hooks.lock().unwrap().clone();
+            status
+        };
+        // Worker/status/handle visibility commits together below, with no await.
+        let mut data = entry.state.data.lock().unwrap();
+        Self::check_entry(&entry.state, &data)?;
+        if data.source_detach.is_some() {
+            return Err(BroadcastError::Stopping);
+        }
+        session.check()?;
+        let authority = session.authority.clone();
+        let policy = self.source_policy();
+        let worker_config = config.clone();
+        let worker_status = status.clone();
+        let (done, completion) = watch::channel(false);
+        let worker = IngressTask { completion };
+        *authority.ingress.lock().unwrap() = Some(worker.clone());
+        let task = tokio::spawn(async move {
+            run_source(session, worker_config, policy, worker_status).await;
+            done.send_replace(true);
+        });
+        let worker_abort = task.abort_handle();
+        let mut aborters = entry.aborters.lock().unwrap();
+        aborters.retain(|abort| !abort.is_finished());
+        aborters.push(worker_abort.clone());
+        let mut tasks = entry.tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+        data.source = Some(SourceAttachment {
+            config,
+            status: status.clone(),
+            authority,
+            worker_abort,
+            stopping: false,
+        });
+        Ok((bc, status.snapshot()))
+    }
+
+    pub(crate) async fn source_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<SourceStatus>, BroadcastError> {
+        self.source_preflight(name, false)?;
+        let entry = self.by_name.lock().unwrap().get(name).cloned();
+        Ok(entry.and_then(|entry| {
+            entry
+                .state
+                .data
+                .lock()
+                .unwrap()
+                .source
+                .as_ref()
+                .map(|source| source.status.snapshot())
+        }))
+    }
+
+    pub(crate) async fn detach_source(self: &Arc<Self>, name: &str) -> Result<(), BroadcastError> {
+        self.source_preflight(name, false)?;
+        let Some(entry) = self.by_name.lock().unwrap().get(name).cloned() else {
+            return Ok(());
+        };
+        let stop = Self::queue_source_detach(&entry)?;
+        let Some((completion, deadline)) = stop else {
+            return Ok(());
+        };
+        match tokio::time::timeout_at(deadline, completed(completion)).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(source) = &entry.state.data.lock().unwrap().source {
+                    source.worker_abort.abort();
+                }
+                Err(BroadcastError::CleanupTimeout)
+            }
+        }
+    }
+
+    fn queue_source_detach(
+        entry: &BroadcastEntry,
+    ) -> Result<Option<(Completion, tokio::time::Instant)>, BroadcastError> {
+        let mut data = entry.state.data.lock().unwrap();
+        if entry.state.service_closed.load(Ordering::SeqCst) {
+            return Err(BroadcastError::ServiceStopping);
+        }
+        if data.stopping || data.closed {
+            return Err(BroadcastError::Stopping);
+        }
+        if let Some(stop) = &data.source_detach {
+            return Ok(Some(stop.clone()));
+        }
+        // No attachment and no admission occupying its gate: raw/RTMP is an immediate no-op.
+        if data.source.is_none() && entry.source_gate.try_lock().is_ok() {
+            return Ok(None);
+        }
+        if let Some(source) = data.source.as_mut() {
+            source.stopping = true;
+            source.status.stopping();
+            source.authority.cancel.send_replace(true);
+        }
+        let state = entry.state.clone();
+        let source_gate = entry.source_gate.clone();
+        // Only the task list is shared, not the entry/controller; the continuation cannot
+        // own the registry. Taking the worker handle happens under the admission data gate.
+        let worker = if let Some(source) = &data.source {
+            let mut tasks = entry.tasks.lock().unwrap();
+            let index = tasks
+                .iter()
+                .position(|task| task.id() == source.worker_abort.id())
+                .ok_or(BroadcastError::StateInvalid)?;
+            Some((tasks.swap_remove(index), source.authority.clone()))
+        } else {
+            None
+        };
+        let (tx, rx) = watch::channel(None);
+        let deadline = tokio::time::Instant::now() + CLEANUP_GRACE;
+        data.source_detach = Some((rx.clone(), deadline));
+        // Owned before waiting on a pending admission. That admission rechecks the detach
+        // fence before claiming/spawning; an HTTP timeout cannot later resurrect a source.
+        let job = tokio::spawn(async move {
+            let _gate = source_gate.lock().await;
+            if let Some((worker, authority)) = worker {
+                let _ = worker.await;
+                let _operation = authority.operation.clone().lock_owned().await;
+                let jobs = std::mem::take(&mut *authority.jobs.lock().unwrap());
+                for job in jobs {
+                    let _ = job.await;
+                }
+                let _publication = state.publication.clone().lock_owned().await;
+                let _io = state.io.clone().lock_owned().await;
+                let mut data = state.data.lock().unwrap();
+                if data
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| Arc::ptr_eq(&s.authority, &authority))
+                {
+                    data.source.take();
+                    if data
+                        .producer
+                        .as_ref()
+                        .is_some_and(|p| Arc::ptr_eq(p, &authority))
+                    {
+                        data.producer.take();
+                    }
+                }
+                data.source_detach.take();
+            } else {
+                // A still-running admission may own a noncancelable initialization save.
+                // Its source gate is released only after that admission has settled.
+                state.data.lock().unwrap().source_detach.take();
+            }
+            tx.send_replace(Some(Ok(())));
+        });
+        let mut initializers = entry.initializers.lock().unwrap();
+        initializers.retain(|job| !job.is_finished());
+        initializers.push(job);
+        Ok(Some((rx, deadline)))
     }
 
     /// Startup reconstructs/reserves identities but starts no network work. Invalid names
     /// retain their tombstones; a directory-enumeration failure is a startup error.
-    pub async fn reload_persisted(&self, seed_registry: &SeedRegistry, store_bytes: u64)
-        -> Result<Vec<Broadcast>, BroadcastError> {
-        let Some(persist) = &self.persist else { return Ok(Vec::new()); };
+    pub async fn reload_persisted(
+        &self,
+        seed_registry: &SeedRegistry,
+        store_bytes: u64,
+    ) -> Result<Vec<Broadcast>, BroadcastError> {
+        let Some(persist) = &self.persist else {
+            return Ok(Vec::new());
+        };
         let persist = persist.clone();
-        let records = tokio::task::spawn_blocking(move || persist.load_all()).await
+        let records = tokio::task::spawn_blocking(move || persist.load_all())
+            .await
             .map_err(|_| BroadcastError::StateInvalid)?
             .map_err(|_| BroadcastError::PersistenceFailed)?;
         let mut out = Vec::new();
         for (name, rec) in records {
             if rec.is_err() || !valid_broadcast_name(&name) {
                 let mut map = self.by_name.lock().unwrap();
-                let entry = map.entry(name).or_insert_with(|| Arc::new(BroadcastEntry::new(self.closed.clone())));
+                let entry = map
+                    .entry(name)
+                    .or_insert_with(|| Arc::new(BroadcastEntry::new(self.closed.clone())));
                 entry.state.data.lock().unwrap().invalid = Some(BroadcastError::StateInvalid);
                 crate::alog!("[broadcast] persisted state rejected: broadcast_state_invalid");
                 continue;
             }
-            match self.mint(&name, &name, &[], seed_registry, store_bytes).await {
+            match self
+                .mint(&name, &name, &[], seed_registry, store_bytes)
+                .await
+            {
                 Ok(bc) => out.push(bc),
                 Err(_) => crate::alog!("[broadcast] {name}: persisted state rejected"),
             }
@@ -521,13 +1074,30 @@ impl BroadcastRegistry {
 
     /// Atomically register a task while the generation is open. The future owns only its
     /// producer/session data; the entry owns the handle, avoiding controller/worker cycles.
-    pub fn spawn_ingress<F, Run>(&self, name: &str, session: ProducerSession, run: Run)
-        -> Result<IngressTask, BroadcastError>
-    where F: Future<Output = ()> + Send + 'static, Run: FnOnce(ProducerSession) -> F {
-        let entry = self.by_name.lock().unwrap().get(name).cloned().ok_or(BroadcastError::Stopping)?;
+    pub fn spawn_ingress<F, Run>(
+        &self,
+        name: &str,
+        session: ProducerSession,
+        run: Run,
+    ) -> Result<IngressTask, BroadcastError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        Run: FnOnce(ProducerSession) -> F,
+    {
+        let entry = self
+            .by_name
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or(BroadcastError::Stopping)?;
         let data = entry.state.data.lock().unwrap();
         Self::check_entry(&entry.state, &data)?;
-        if !data.producer.as_ref().is_some_and(|p| Arc::ptr_eq(p, &session.authority)) {
+        if !data
+            .producer
+            .as_ref()
+            .is_some_and(|p| Arc::ptr_eq(p, &session.authority))
+        {
             return Err(BroadcastError::Stopping);
         }
         session.check()?;
@@ -550,13 +1120,28 @@ impl BroadcastRegistry {
         Ok(observer)
     }
 
-    pub async fn ensure_announcing(&self, name: &str, trackers: &[String], port: watch::Receiver<Option<u16>>)
-        -> Result<(), BroadcastError> {
-        let entry = self.by_name.lock().unwrap().get(name).cloned().ok_or(BroadcastError::StateInvalid)?;
+    pub async fn ensure_announcing(
+        &self,
+        name: &str,
+        trackers: &[String],
+        port: watch::Receiver<Option<u16>>,
+    ) -> Result<(), BroadcastError> {
+        let entry = self
+            .by_name
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or(BroadcastError::StateInvalid)?;
         let mut data = entry.state.data.lock().unwrap();
         Self::check_entry(&entry.state, &data)?;
-        if data.announcing || port.borrow().is_none() { return Ok(()); }
-        let bc = data.broadcast.as_ref().ok_or(BroadcastError::StateInvalid)?;
+        if data.announcing || port.borrow().is_none() {
+            return Ok(());
+        }
+        let bc = data
+            .broadcast
+            .as_ref()
+            .ok_or(BroadcastError::StateInvalid)?;
         bc.cursor.check()?;
         let mut tasks = entry.tasks.lock().unwrap();
         for id in [bc.infohash, bc.content_id] {
@@ -565,10 +1150,19 @@ impl BroadcastRegistry {
             #[cfg(test)]
             let announce: AnnounceFuture = match factory {
                 Some(factory) => factory(id),
-                None => Box::pin(crate::ace_provider::announce_infohash_periodically_dynamic(trackers.to_vec(), id, port.clone())),
+                None => Box::pin(crate::ace_provider::announce_infohash_periodically_dynamic(
+                    trackers.to_vec(),
+                    id,
+                    port.clone(),
+                )),
             };
             #[cfg(not(test))]
-            let announce: AnnounceFuture = Box::pin(crate::ace_provider::announce_infohash_periodically_dynamic(trackers.to_vec(), id, port.clone()));
+            let announce: AnnounceFuture =
+                Box::pin(crate::ace_provider::announce_infohash_periodically_dynamic(
+                    trackers.to_vec(),
+                    id,
+                    port.clone(),
+                ));
             let mut cancel = entry.state.cancel.subscribe();
             let task = tokio::spawn(async move {
                 tokio::select! { biased; () = cancelled(&mut cancel) => {}, () = announce => {} }
@@ -581,18 +1175,30 @@ impl BroadcastRegistry {
     }
 
     pub fn cleanup_deadline(&self) -> tokio::time::Instant {
-        *self.shutdown_deadline.lock().unwrap().get_or_insert_with(|| tokio::time::Instant::now() + CLEANUP_GRACE)
+        *self
+            .shutdown_deadline
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| tokio::time::Instant::now() + CLEANUP_GRACE)
     }
 
     pub fn close_admissions(&self) {
         self.cleanup_deadline();
         let map = self.by_name.lock().unwrap();
         self.closed.store(true, Ordering::SeqCst);
-        for entry in map.values() { entry.stop_admissions(); }
+        self.service_cancel.send_replace(true);
+        for entry in map.values() {
+            entry.stop_admissions();
+        }
     }
 
-    fn start_stop(&self, name: &str, entry: &BroadcastEntry, delete: bool, deadline: tokio::time::Instant)
-        -> (Completion, tokio::time::Instant) {
+    fn start_stop(
+        &self,
+        name: &str,
+        entry: &BroadcastEntry,
+        delete: bool,
+        deadline: tokio::time::Instant,
+    ) -> (Completion, tokio::time::Instant) {
         let mut stop = entry.stop.lock().unwrap();
         if let Some(job) = stop.as_ref() {
             let result = *job.completion.borrow();
@@ -612,15 +1218,23 @@ impl BroadcastRegistry {
         let (tx, rx) = watch::channel(None);
         let job = tokio::spawn(async move {
             let _lifecycle = lifecycle.lock_owned().await;
-            for init in initializers { let _ = init.await; }
-            for task in tasks { let _ = task.await; }
+            for init in initializers {
+                let _ = init.await;
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
             let producer = state.data.lock().unwrap().producer.clone();
             let _operation = if let Some(producer) = &producer {
                 Some(producer.operation.clone().lock_owned().await)
-            } else { None };
+            } else {
+                None
+            };
             if let Some(producer) = &producer {
                 let jobs = std::mem::take(&mut *producer.jobs.lock().unwrap());
-                for job in jobs { let _ = job.await; }
+                for job in jobs {
+                    let _ = job.await;
+                }
             }
             let _publication = state.publication.clone().lock_owned().await;
             let io = state.io.clone().lock_owned().await;
@@ -628,20 +1242,36 @@ impl BroadcastRegistry {
             if let Some(bc) = &bc {
                 bc.cursor.closed.store(true, Ordering::SeqCst);
                 let jobs = std::mem::take(&mut *bc.cursor.io_jobs.lock().unwrap());
-                for job in jobs { let _ = job.await; }
+                for job in jobs {
+                    let _ = job.await;
+                }
             }
             // Keep the guard and blocking handle in this non-abortable stop continuation.
             let result = if delete {
                 if let Some(persist) = persist {
                     tokio::task::spawn_blocking(move || {
                         let _io = io;
-                        persist.delete(&name).map_err(|_| BroadcastError::PersistenceFailed)
-                    }).await.unwrap_or(Err(BroadcastError::StateInvalid))
-                } else { drop(io); Ok(()) }
-            } else { drop(io); Ok(()) };
+                        persist
+                            .delete(&name)
+                            .map_err(|_| BroadcastError::PersistenceFailed)
+                    })
+                    .await
+                    .unwrap_or(Err(BroadcastError::StateInvalid))
+                } else {
+                    drop(io);
+                    Ok(())
+                }
+            } else {
+                drop(io);
+                Ok(())
+            };
             if result.is_ok() {
                 let mut data = state.data.lock().unwrap();
-                data.lease.take(); data.broadcast.take(); data.producer.take(); data.closed = true;
+                data.lease.take();
+                data.broadcast.take();
+                data.producer.take();
+                data.source.take();
+                data.closed = true;
                 drop(data);
                 if delete {
                     if let Some(map) = map.upgrade() {
@@ -653,36 +1283,67 @@ impl BroadcastRegistry {
             }
             tx.send_replace(Some(result));
         });
-        *stop = Some(StopJob { completion: rx.clone(), deadline, _join: job });
+        *stop = Some(StopJob {
+            completion: rx.clone(),
+            deadline,
+            _join: job,
+        });
         (rx, deadline)
     }
 
     pub async fn delete(&self, name: &str) -> Result<(), BroadcastError> {
-        if !valid_broadcast_name(name) { return Err(BroadcastError::InvalidName); }
+        if !valid_broadcast_name(name) {
+            return Err(BroadcastError::InvalidName);
+        }
         let entry = {
             let mut map = self.by_name.lock().unwrap();
-            if self.closed.load(Ordering::SeqCst) { return Err(BroadcastError::ServiceStopping); }
-            map.entry(name.to_owned()).or_insert_with(|| Arc::new(BroadcastEntry::new(self.closed.clone()))).clone()
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(BroadcastError::ServiceStopping);
+            }
+            map.entry(name.to_owned())
+                .or_insert_with(|| Arc::new(BroadcastEntry::new(self.closed.clone())))
+                .clone()
         };
-        let (rx, deadline) = self.start_stop(name, &entry, true, tokio::time::Instant::now() + CLEANUP_GRACE);
+        let (rx, deadline) = self.start_stop(
+            name,
+            &entry,
+            true,
+            tokio::time::Instant::now() + CLEANUP_GRACE,
+        );
         match tokio::time::timeout_at(deadline, completed(rx)).await {
             Ok(result) => result,
-            Err(_) => { entry.abort_async(); Err(BroadcastError::CleanupTimeout) }
+            Err(_) => {
+                entry.abort_async();
+                Err(BroadcastError::CleanupTimeout)
+            }
         }
     }
 
     pub async fn shutdown(&self) -> Result<(), BroadcastError> {
         self.close_admissions();
-        let entries: Vec<_> = self.by_name.lock().unwrap().iter().map(|(name, entry)| (name.clone(), entry.clone())).collect();
+        let entries: Vec<_> = self
+            .by_name
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect();
         let deadline = self.cleanup_deadline();
-        let stops: Vec<_> = entries.iter().map(|(name, entry)| self.start_stop(name, entry, false, deadline)).collect();
+        let stops: Vec<_> = entries
+            .iter()
+            .map(|(name, entry)| self.start_stop(name, entry, false, deadline))
+            .collect();
         let mut outcome = Ok(());
         for (stop, stop_deadline) in stops {
             match tokio::time::timeout_at(stop_deadline, completed(stop)).await {
-                Ok(Ok(())) => {},
-                Ok(Err(error)) => { outcome = Err(error); },
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    outcome = Err(error);
+                }
                 Err(_) => {
-                    for (_, entry) in &entries { entry.abort_async(); }
+                    for (_, entry) in &entries {
+                        entry.abort_async();
+                    }
                     outcome = Err(BroadcastError::CleanupTimeout);
                 }
             }
@@ -696,32 +1357,58 @@ impl Drop for BroadcastRegistry {
         // Async shutdown is the normal joined path. This backstop also fences publication
         // when a serving caller is canceled or drops its final registry owner unexpectedly.
         self.close_admissions();
-        for entry in self.by_name.lock().unwrap().values() { entry.abort_async(); }
+        for entry in self.by_name.lock().unwrap().values() {
+            entry.abort_async();
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn initialize(
-    name: &str, title: &str, trackers: &[String], seeds: &SeedRegistry, store_bytes: u64,
-    persist: Option<BroadcastPersist>, cache_type: CacheType, cache_dir: PathBuf, state: &EntryState,
+    name: &str,
+    title: &str,
+    trackers: &[String],
+    seeds: &SeedRegistry,
+    store_bytes: u64,
+    persist: Option<BroadcastPersist>,
+    cache_type: CacheType,
+    cache_dir: PathBuf,
+    state: &EntryState,
 ) -> Result<(Broadcast, SeedLease), BroadcastError> {
     let loaded = match &persist {
-        Some(persist) => persist.load(name).map_err(|_| BroadcastError::StateInvalid)?, None => None,
+        Some(persist) => persist
+            .load(name)
+            .map_err(|_| BroadcastError::StateInvalid)?,
+        None => None,
     };
     let (auth, transport, start) = match loaded {
         Some(rec) => {
-            let auth = LiveSourceAuth::from_pkcs1_pem(&rec.key_pkcs1_pem).map_err(|_| BroadcastError::StateInvalid)?;
-            let decoded = decode_transport(&rec.transport).map_err(|_| BroadcastError::StateInvalid)?;
-            if decoded.pubkey != auth.pubkey_der() || !decoded.is_live
-                || decoded.piece_length != PIECE_LENGTH || decoded.chunk_length != CHUNK_LENGTH
+            let auth = LiveSourceAuth::from_pkcs1_pem(&rec.key_pkcs1_pem)
+                .map_err(|_| BroadcastError::StateInvalid)?;
+            let decoded =
+                decode_transport(&rec.transport).map_err(|_| BroadcastError::StateInvalid)?;
+            if decoded.pubkey != auth.pubkey_der()
+                || !decoded.is_live
+                || decoded.piece_length != PIECE_LENGTH
+                || decoded.chunk_length != CHUNK_LENGTH
                 || auth.signature_len() as u64 >= PIECE_LENGTH
                 || decoded.raw.get(b"pieces").is_some()
-                || decoded.raw.get(b"name").and_then(Bencode::as_bytes).is_none()
+                || decoded
+                    .raw
+                    .get(b"name")
+                    .and_then(Bencode::as_bytes)
+                    .is_none()
                 || decoded.bitrate.is_none_or(|bitrate| bitrate <= 0)
-                || decoded.raw.get(b"authmethod").and_then(Bencode::as_bytes) != Some(b"RSA".as_slice()) {
+                || decoded.raw.get(b"authmethod").and_then(Bencode::as_bytes)
+                    != Some(b"RSA".as_slice())
+            {
                 return Err(BroadcastError::StateInvalid);
             }
-            if decoded.raw.get(b"outpace_name").is_some_and(|value| value.as_bytes() != Some(name.as_bytes())) {
+            if decoded
+                .raw
+                .get(b"outpace_name")
+                .is_some_and(|value| value.as_bytes() != Some(name.as_bytes()))
+            {
                 return Err(BroadcastError::StateInvalid);
             }
             // decode_transport tolerates absent metadata; the identity helper does not.
@@ -730,25 +1417,38 @@ fn initialize(
             let start = match rec.reserved_until {
                 Some(reserved) if rec.next_piece <= reserved => reserved,
                 Some(_) => return Err(BroadcastError::StateInvalid),
-                None => rec.next_piece.checked_add(CURSOR_PERSIST_INTERVAL).ok_or(BroadcastError::PieceIndexExhausted)?,
+                None => rec
+                    .next_piece
+                    .checked_add(CURSOR_PERSIST_INTERVAL)
+                    .ok_or(BroadcastError::PieceIndexExhausted)?,
             };
             (auth, rec.transport, start)
         }
         None => {
             let auth = LiveSourceAuth::generate();
             let descriptor = build_descriptor(name, title, trackers, &auth.pubkey_der());
-            let _ = infohash_of_descriptor(&descriptor).map_err(|_| BroadcastError::StateInvalid)?;
+            let _ =
+                infohash_of_descriptor(&descriptor).map_err(|_| BroadcastError::StateInvalid)?;
             let transport = encode_transport(&descriptor);
             (auth, transport, 0)
         }
     };
-    let reserved = start.checked_add(CURSOR_PERSIST_INTERVAL).ok_or(BroadcastError::PieceIndexExhausted)?;
+    let reserved = start
+        .checked_add(CURSOR_PERSIST_INTERVAL)
+        .ok_or(BroadcastError::PieceIndexExhausted)?;
     let key_pkcs1_pem = auth.to_pkcs1_pem();
     if let Some(persist) = &persist {
-        persist.save(name, &PersistedBroadcast {
-            transport: transport.clone(), key_pkcs1_pem: key_pkcs1_pem.clone(),
-            next_piece: start, reserved_until: Some(reserved),
-        }).map_err(|_| BroadcastError::PersistenceFailed)?;
+        persist
+            .save(
+                name,
+                &PersistedBroadcast {
+                    transport: transport.clone(),
+                    key_pkcs1_pem: key_pkcs1_pem.clone(),
+                    next_piece: start,
+                    reserved_until: Some(reserved),
+                },
+            )
+            .map_err(|_| BroadcastError::PersistenceFailed)?;
     }
     if state.service_closed.load(Ordering::SeqCst) || *state.cancel.borrow() {
         return Err(BroadcastError::Stopping);
@@ -756,15 +1456,44 @@ fn initialize(
     let infohash = infohash_of_transport(&transport);
     let content_id = transport_file_hash(&transport);
     let (store, lease) = seeds.lease_broadcast(infohash, content_id, transport.clone(), || {
-        build_piece_store(PIECE_LENGTH, CHUNK_LENGTH, store_bytes, None, cache_type, &cache_dir, &infohash)
+        build_piece_store(
+            PIECE_LENGTH,
+            CHUNK_LENGTH,
+            store_bytes,
+            None,
+            cache_type,
+            &cache_dir,
+            &infohash,
+        )
     });
     let cursor = Arc::new(BroadcastCursor {
-        next: AtomicU64::new(start), reserved: AtomicU64::new(reserved), poisoned: Arc::new(AtomicBool::new(false)),
-        closed: AtomicBool::new(false), service_closed: state.service_closed.clone(), cancel: state.cancel.subscribe(),
-        sink: persist.map(|persist| CursorSink { persist, name: name.to_owned(), transport: transport.clone(), key_pkcs1_pem }),
-        io: state.io.clone(), publication: state.publication.clone(), io_jobs: StdMutex::new(Vec::new()),
+        next: AtomicU64::new(start),
+        reserved: AtomicU64::new(reserved),
+        poisoned: Arc::new(AtomicBool::new(false)),
+        closed: AtomicBool::new(false),
+        service_closed: state.service_closed.clone(),
+        cancel: state.cancel.subscribe(),
+        sink: persist.map(|persist| CursorSink {
+            persist,
+            name: name.to_owned(),
+            transport: transport.clone(),
+            key_pkcs1_pem,
+        }),
+        io: state.io.clone(),
+        publication: state.publication.clone(),
+        io_jobs: StdMutex::new(Vec::new()),
     });
-    Ok((Broadcast { infohash, content_id, transport_bytes: Arc::new(transport), store, auth: Arc::new(auth), cursor }, lease))
+    Ok((
+        Broadcast {
+            infohash,
+            content_id,
+            transport_bytes: Arc::new(transport),
+            store,
+            auth: Arc::new(auth),
+            cursor,
+        },
+        lease,
+    ))
 }
 
 /// Build the bencode descriptor dict for a fresh MPEG-TS live broadcast. Field set matches a
@@ -820,7 +1549,16 @@ mod tests {
     #[tokio::test]
     async fn minted_broadcast_decodes_to_a_live_descriptor_with_our_pubkey() {
         let (registry, seed) = registry();
-        let bc = registry.mint("test", "Test Stream", &["udp://t.example:1/announce".into()], &seed, 1 << 20).await.unwrap();
+        let bc = registry
+            .mint(
+                "test",
+                "Test Stream",
+                &["udp://t.example:1/announce".into()],
+                &seed,
+                1 << 20,
+            )
+            .await
+            .unwrap();
         let decoded = decode_transport(&bc.transport_bytes).unwrap();
         assert_eq!(decoded.name, "Test Stream");
         assert_eq!(decoded.piece_length, PIECE_LENGTH);
@@ -834,10 +1572,22 @@ mod tests {
     #[tokio::test]
     async fn minted_descriptor_hash_and_seed_metadata_match() {
         let (registry, seed) = registry();
-        let bc = registry.mint("channel", "Channel", &["udp://tracker.example:2710/announce".into()], &seed, 1 << 20).await.unwrap();
+        let bc = registry
+            .mint(
+                "channel",
+                "Channel",
+                &["udp://tracker.example:2710/announce".into()],
+                &seed,
+                1 << 20,
+            )
+            .await
+            .unwrap();
         assert_eq!(bc.infohash, infohash_of_transport(&bc.transport_bytes));
         assert_eq!(bc.content_id, transport_file_hash(&bc.transport_bytes));
-        assert_eq!(seed.metadata(&bc.content_id).as_deref().map(Vec::as_slice), Some(bc.transport_bytes.as_slice()));
+        assert_eq!(
+            seed.metadata(&bc.content_id).as_deref().map(Vec::as_slice),
+            Some(bc.transport_bytes.as_slice())
+        );
         assert!(seed.serves(&bc.infohash));
         assert!(seed.serves(&bc.content_id));
     }
@@ -847,13 +1597,22 @@ mod tests {
         let dir = tmp_dir();
         let seed = SeedRegistry::new();
         let registry = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
-        let old = registry.mint("channel", "Channel", &[], &seed, 1 << 20).await.unwrap();
+        let old = registry
+            .mint("channel", "Channel", &[], &seed, 1 << 20)
+            .await
+            .unwrap();
         assert!(seed.serves(&old.infohash));
         registry.delete("channel").await.unwrap();
-        assert!(BroadcastPersist::new(&dir).load("channel").unwrap().is_none());
+        assert!(BroadcastPersist::new(&dir)
+            .load("channel")
+            .unwrap()
+            .is_none());
         assert!(!seed.serves(&old.infohash));
         assert!(!seed.serves(&old.content_id));
-        let new = registry.mint("channel", "Channel", &[], &seed, 1 << 20).await.unwrap();
+        let new = registry
+            .mint("channel", "Channel", &[], &seed, 1 << 20)
+            .await
+            .unwrap();
         assert_ne!(old.infohash, new.infohash);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -863,11 +1622,20 @@ mod tests {
         let dir = tmp_dir();
         let seed1 = SeedRegistry::new();
         let first = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new())
-            .mint("news", "News", &[], &seed1, 1 << 20).await.unwrap();
+            .mint("news", "News", &[], &seed1, 1 << 20)
+            .await
+            .unwrap();
         let seed2 = SeedRegistry::new();
-        let second_registry = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
-        let loaded = second_registry.reload_persisted(&seed2, 1 << 20).await.unwrap();
-        let second = loaded.into_iter().find(|bc| bc.infohash == first.infohash).unwrap();
+        let second_registry =
+            BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
+        let loaded = second_registry
+            .reload_persisted(&seed2, 1 << 20)
+            .await
+            .unwrap();
+        let second = loaded
+            .into_iter()
+            .find(|bc| bc.infohash == first.infohash)
+            .unwrap();
         assert_eq!(second.transport_bytes, first.transport_bytes);
         assert_eq!(second.auth.pubkey_der(), first.auth.pubkey_der());
         assert_eq!(second.cursor.start_piece(), CURSOR_PERSIST_INTERVAL);

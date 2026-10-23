@@ -19,7 +19,7 @@ The live byte path is built and proven against real public swarms:
 - the daemon can discover peers, connect, download live media, and serve it over
   the native API;
 - reciprocal upload, inbound seeding plumbing, signed broadcast origination,
-  HTTP raw ingest, RTMP ingest, content-id metadata serving, and the three-command
+  HTTP raw ingest, managed HTTP(S) MPEG-TS sources, RTMP ingest, content-id metadata serving, and the three-command
   CLI are implemented;
 - live-network tests remain ignored by default because they need the public swarm
   and a suitable network.
@@ -204,6 +204,31 @@ catalog policy does not automatically resolve these raw-hash links. Alternativel
 broadcast transport URL (`http://<host>:<http-port>/broadcast/<name>`) to `outpace play`
 or use the `url=` selector. The receiver's transport-URL access policy still applies.
 
+Attach an engine-owned HTTP(S) MPEG-TS source with `PUT /broadcast/<name>/source`, or
+set startup declarations in `OUTPACE_BROADCAST_SOURCES`:
+
+```bash
+OUTPACE_BROADCAST_SOURCES='{"demo-source":{"url":"https://source.invalid/live.ts"}}' \
+  cargo run -p ace-engine --bin outpace -- serve
+```
+
+The URL above is synthetic; replace it with an authorized public, unencrypted MPEG-TS origin.
+Acceptance reserves the signing identity and schedules a worker; check
+`GET /broadcast/demo-source/source` for upstream health. A worker reconnects on finite EOF
+and discards incomplete tails. It keeps exclusive production through backoff and failure;
+DELETE the `/source` attachment before replacing it. Detach retains identity and cached data;
+DELETE the broadcast itself to remove identity. API attachments last for this process only.
+Current environment declarations reattach on restart, including declarations detached or
+deleted during the previous process. Remove a declaration to keep it absent after restart.
+
+Source URLs/query tokens stay out of status, logs and persisted broadcast records. Protect
+the deployment environment and avoid dumping configuration. Default source policy denies
+private/loopback addresses; only exact `OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE=1` adds
+the documented LAN subset. This switch is independent of transport/tracker opt-ins and
+never admits link-local metadata endpoints. Sources ignore proxies and reject redirects.
+See [source API/configuration](docs/native-api.md#managed-http-mpeg-ts-sources) and
+[storage, restart and deployment guidance](docs/deployment.md#managed-source-declarations).
+
 ## Installation
 
 Release artifacts are created from `vX.Y.Z` git tags and published on GitHub
@@ -316,6 +341,11 @@ Environment variables parsed by the daemon include:
   live and VOD; peer results do not populate the catalog-provenance infohash index.
 - `OUTPACE_BIND` - HTTP bind address, default `127.0.0.1:6878`.
 - `OUTPACE_RTMP_BIND` - RTMP ingest bind address, default `127.0.0.1:1935`.
+- `OUTPACE_BROADCAST_SOURCES` - startup source JSON map, default `{}`; at most 64 names,
+  256 KiB UTF-8, URLs up to 8,192 bytes. Duplicate/unknown fields fail startup. Source timing
+  defaults: connect 5s, read 15s, reconnect initial 1s, maximum 30s; see the native API limits.
+- `OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE` - independent operator-only source address
+  opt-in; only exact `1` enables it, default off. It cannot be set in an API request.
 - `OUTPACE_DATA_DIR` - persistent identity/cache root, default platform data dir
   plus `outpace`.
 - `OUTPACE_PEER_LISTEN` - inbound peer listener bind, default `0.0.0.0:8621`.

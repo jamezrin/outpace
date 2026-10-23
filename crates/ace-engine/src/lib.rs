@@ -19,6 +19,10 @@ pub mod ace_provider;
 pub mod broadcast;
 pub mod broadcast_ingest;
 pub mod broadcast_persist;
+pub mod broadcast_pull;
+#[cfg(test)]
+#[path = "broadcast_pull/tests.rs"]
+mod broadcast_pull_tests;
 pub mod cli;
 pub mod config;
 pub mod hls;
