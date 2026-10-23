@@ -56,8 +56,11 @@ pub struct TransportDescriptor {
 impl TransportDescriptor {
     /// Total content byte length for a single-file VOD (`length` key), if present.
     ///
-    /// SYNTHESIZED SCHEMA: no public VOD fixture is available, so the single-file `length`
-    /// key is assumed from standard BitTorrent conventions. Reconcile against a real capture.
+    /// Historical synthetic compatibility schema for the legacy ASCII-wrapped descriptor,
+    /// with fields at the root; this is not a verified original-engine VOD schema.
+    /// Engine 3.2.11 VOD uses ordinary `info.length`, `piece length`, and binary `pieces`,
+    /// validated through export and the eight-byte AES-CBC disk envelope; see `metainfo`
+    /// and `disk_envelope`.
     pub fn vod_total_length(&self) -> Option<u64> {
         self.raw
             .get(b"length")
@@ -67,7 +70,8 @@ impl TransportDescriptor {
     }
 
     /// Whether this descriptor advertises a multi-file layout (`files` list). Multi-file VOD is
-    /// intentionally unsupported; callers reject it. SYNTHESIZED SCHEMA (see [`Self::vod_total_length`]).
+    /// intentionally unsupported; callers reject it. This checks the historical synthetic
+    /// root schema (see [`Self::vod_total_length`]), not an original-engine multi-file schema.
     pub fn is_multifile(&self) -> bool {
         matches!(self.raw.get(b"files"), Some(Bencode::List(_)))
     }
