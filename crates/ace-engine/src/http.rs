@@ -117,25 +117,31 @@ pub struct BroadcastState {
 }
 
 impl BroadcastState {
-    /// Start the periodic tracker/DHT self-announce loops for `bc` (its infohash + content-id
-    /// metadata swarm). A no-op without an inbound listener: advertising a port nobody serves
-    /// on would misdirect real peers. Shared by fresh mint (`PUT`/RTMP) and startup reload, so
-    /// each runs exactly once per broadcast.
-    pub fn spawn_announce(&self, bc: &crate::broadcast::Broadcast) {
-        if self.inbound_peer_port.borrow().is_none() {
-            return;
-        }
-        let trackers = self.trackers.clone();
-        tokio::spawn(crate::ace_provider::announce_infohash_periodically_dynamic(
-            trackers.clone(),
-            bc.infohash,
-            self.inbound_peer_port.clone(),
-        ));
-        tokio::spawn(crate::ace_provider::announce_infohash_periodically_dynamic(
-            trackers,
-            bc.content_id,
-            self.inbound_peer_port.clone(),
-        ));
+    pub async fn acquire_producer(&self, name: &str, kind: crate::broadcast::ProducerKind)
+        -> Result<(crate::broadcast::Broadcast, crate::broadcast::ProducerSession), crate::broadcast::BroadcastError> {
+        let pair = self.registry.acquire_producer(name, name, &self.trackers,
+            &self.seed_registry, self.store_bytes, kind).await?;
+        self.ensure_announcing(name).await?;
+        Ok(pair)
+    }
+
+    /// Reserve identity/index space without attaching an ingress source.
+    pub async fn mint(&self, name: &str) -> Result<crate::broadcast::Broadcast, crate::broadcast::BroadcastError> {
+        self.registry.mint(name, name, &self.trackers, &self.seed_registry, self.store_bytes).await
+    }
+
+    pub async fn ensure_announcing(&self, name: &str) -> Result<(), crate::broadcast::BroadcastError> {
+        self.registry.ensure_announcing(name, &self.trackers, self.inbound_peer_port.clone()).await
+    }
+
+    pub fn close_admissions(&self) { self.registry.close_admissions(); }
+
+    pub async fn delete(&self, name: &str) -> Result<(), crate::broadcast::BroadcastError> {
+        self.registry.delete(name).await
+    }
+
+    pub async fn shutdown(&self) -> Result<(), crate::broadcast::BroadcastError> {
+        self.registry.shutdown().await
     }
 }
 

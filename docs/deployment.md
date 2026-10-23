@@ -156,6 +156,41 @@ Back up the `outpace-data` volume before an upgrade. It contains `identity.seed`
 broadcast records under `broadcasts/`; losing it changes the node identity and minted broadcast
 identities. Cache contents under `cache/` do not need backing up.
 
+Run exactly one daemon per data directory. Signing records and piece reservations assume
+exclusive ownership and storage that honors checked sync/replacement operations. Protect the
+data directory: its broadcast JSON files contain private signing keys (Unix temporary files
+are created with mode `0600`; other platforms use the directory's access controls).
+
+Broadcast indexes are durably reserved in 128-piece blocks before publication. Restart skips
+unconsumed reservations and abandoned pieces, so gaps are expected. An unreadable/corrupt
+record blocks admission for that name; it is never silently replaced. Deliberately delete the
+broadcast through the API to remove its identity, or repair state while the daemon is stopped.
+Do not edit an active record or restore an old signing/cursor backup under the same identity:
+a stale but syntactically valid backup can reuse previously published indexes.
+
+Linux requires file and affected-directory/new-link synchronization; macOS uses file full-sync
+and distinct directory `fsync`. The stronger crash/deletion boundary depends on filesystem and
+storage support. Windows supports process-crash/ordinary restart while OS/filesystem state
+survives, with checked file-sync/replacement/delete ordering and no directory-sync or elevated
+execution requirement. It does **not** promise safety after system crash/power loss: reservation
+rollback can reuse indexes, identities can disappear and deleted records can reappear. Other
+filesystems whose stronger semantics are not established share this limitation. Successful
+ordering/fault-injection tests do not certify all filesystems against power loss.
+
+Older binaries ignore the new `reserved_until` field and use the unsafe checkpoint scheme.
+For an active persistent broadcast, keep the new binary. Before rolling back, stop origination,
+deliberately remove that identity, then originate a fresh identity after rollback. Restoring
+an older data-volume snapshot is subject to the same index-reuse hazard; a normal backup alone
+does not make rollback safe for a surviving signing identity.
+
+Shutdown closes/cancels broadcast admissions before HTTP drains. Cleanup shares a 5-second
+grace and retains stopping fences for unfinished OS I/O; it cannot cancel a stuck syscall or
+promise immediate blocking-pool/process exit. Full DELETE can return `500` for persistence
+failure or `503` for cleanup timeout instead of acknowledging early. Retry a settled failed
+delete explicitly. RTMP shutdown owns the listener and broadcast-operation barriers, while
+established dependency-owned connection tasks may remain alive with their producer authority
+fenced. Bind, cache, seeding and tracker defaults are unchanged.
+
 To upgrade or roll back, change the pinned `OUTPACE_IMAGE` tag and run:
 
 ```bash

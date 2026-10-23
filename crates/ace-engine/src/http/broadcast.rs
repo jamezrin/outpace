@@ -21,86 +21,81 @@ pub(super) async fn broadcast_transport(
     }
 }
 
-/// Whether `name` is safe to use as both a registry key and a persistence filename. Names
-/// come straight from the URL path, so this closes a path-traversal vector: allow only
-/// `[A-Za-z0-9._-]`, length 1..=64, and never `.`/`..`.
-/// `PUT /broadcast/{name}` (B1) — accepts a chunked MPEG-TS body and originates it as an
-/// Acestream-compatible live swarm. Responds immediately with the minted infohash (identical
-/// name -> identical, already-minted broadcast; see `BroadcastRegistry::start_or_resume`)
-/// while ingest continues in a background task — the request body may be a long-lived,
-/// effectively-unbounded stream (a live source), so the handler can't wait for it to finish.
-///
-/// Piece numbering resumes from the broadcast's persisted cursor, so a second `PUT` to the
-/// same name continues the sequence rather than restarting at 0 (issue #3).
-pub(super) async fn broadcast_ingest(
-    State(s): State<AppState>,
-    Path(name): Path<String>,
-    body: Body,
-) -> Response {
-    if !crate::broadcast::valid_broadcast_name(&name) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let Some(bs) = &s.broadcasts else {
-        return StatusCode::NOT_FOUND.into_response();
+/// Fixed-code mutation failures; never return a storage path, key or error chain.
+pub(super) fn broadcast_error(error: crate::broadcast::BroadcastError) -> Response {
+    use crate::broadcast::BroadcastError;
+    let status = match error {
+        BroadcastError::InvalidName => StatusCode::BAD_REQUEST,
+        BroadcastError::ProducerConflict | BroadcastError::Stopping => StatusCode::CONFLICT,
+        BroadcastError::PersistenceFailed | BroadcastError::StateInvalid
+            | BroadcastError::PieceIndexExhausted => StatusCode::INTERNAL_SERVER_ERROR,
+        BroadcastError::ServiceStopping | BroadcastError::CleanupTimeout => StatusCode::SERVICE_UNAVAILABLE,
     };
-    let (bc, freshly_minted) = bs
-        .registry
-        .start_or_resume(
-            &name,
-            &name,
-            &bs.trackers,
-            &bs.seed_registry,
-            bs.store_bytes,
-        )
-        .await;
-    let infohash = infohash_hex(&bc.infohash);
-    let content_id = infohash_hex(&bc.content_id);
-    crate::alog!("[broadcast] {name}: ingesting as infohash {infohash}");
-
-    // Self-announce to tracker + DHT exactly once per freshly-minted name — resumed PUTs and
-    // disk reloads must not spawn duplicate loops.
-    if freshly_minted {
-        bs.spawn_announce(&bc);
-    }
-
-    let store = bc.store.clone();
-    let auth = bc.auth.clone();
-    let cursor = bc.cursor.clone();
-    tokio::spawn(async move {
-        let mut ingest = crate::broadcast_ingest::BroadcastIngest::new(store, auth, cursor);
-        let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            let Ok(chunk) = chunk else { break };
-            ingest.push_bytes(&chunk).await;
-        }
-        ingest.finish().await;
-    });
-
-    Json(json!({
-        "name": name,
-        "content_id": content_id,
-        "infohash": infohash,
-    }))
-    .into_response()
+    (status, Json(json!({ "error": { "code": error.code() } }))).into_response()
 }
 
-/// `DELETE /broadcast/{name}` — purge a broadcast: drop it from the registry (and its persisted
-/// record) and stop serving its infohash/content_id, so a subsequent `PUT` mints a fresh
-/// identity. Idempotent: `204 No Content` whether or not the name existed.
-pub(super) async fn broadcast_delete(
-    State(s): State<AppState>,
-    Path(name): Path<String>,
+/// Immediate successful admission; the entry owns the streaming body's task independently
+/// of the request/response future. Only ordinary body termination flushes a finite tail.
+pub(super) async fn broadcast_ingest(
+    State(s): State<AppState>, Path(name): Path<String>, body: Body,
 ) -> Response {
+    use crate::broadcast::{cancelled, BroadcastError, ProducerKind};
     if !crate::broadcast::valid_broadcast_name(&name) {
-        return StatusCode::BAD_REQUEST.into_response();
+        return broadcast_error(BroadcastError::InvalidName);
     }
     let Some(bs) = &s.broadcasts else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND, Json(json!({"error":{"code":"broadcasts_disabled"}}))).into_response();
     };
-    if bs.registry.delete(&name).await.is_some() {
-        // Registry-entry eviction (and disk-dir cleanup) now ride the broadcast's SeedLease drop
-        // inside `registry.delete` — no explicit seed_registry.remove / remove_cache_dir needed.
-        crate::alog!("[broadcast] {name}: deleted");
+    let (bc, session) = match bs.acquire_producer(&name, ProducerKind::RawPut).await {
+        Ok(pair) => pair, Err(error) => return broadcast_error(error),
+    };
+    let infohash = infohash_hex(&bc.infohash);
+    let content_id = infohash_hex(&bc.content_id);
+    let task_name = name.clone();
+    let registered = bs.registry.spawn_ingress(&name, session, move |mut session| async move {
+        let mut cancel = session.cancellation();
+        let mut ingest = match session.open_ingest() {
+            Ok(ingest) => ingest,
+            Err(error) => { crate::alog!("[broadcast] {task_name}: {}", error.code()); return; }
+        };
+        let mut stream = body.into_data_stream();
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                () = cancelled(&mut cancel) => return,
+                chunk = stream.next() => chunk,
+            };
+            let Some(Ok(chunk)) = chunk else { break; };
+            let result = tokio::select! {
+                biased;
+                () = cancelled(&mut cancel) => return,
+                result = ingest.push_bytes(&chunk) => result,
+            };
+            if let Err(error) = result {
+                crate::alog!("[broadcast] {task_name}: {}", error.code());
+                return;
+            }
+        }
+        let result = tokio::select! {
+            biased;
+            () = cancelled(&mut cancel) => return,
+            result = ingest.finish() => result,
+        };
+        if let Err(error) = result { crate::alog!("[broadcast] {task_name}: {}", error.code()); }
+    });
+    if let Err(error) = registered { return broadcast_error(error); }
+    Json(json!({ "name": name, "content_id": content_id, "infohash": infohash })).into_response()
+}
+
+pub(super) async fn broadcast_delete(State(s): State<AppState>, Path(name): Path<String>) -> Response {
+    if !crate::broadcast::valid_broadcast_name(&name) {
+        return broadcast_error(crate::broadcast::BroadcastError::InvalidName);
     }
-    StatusCode::NO_CONTENT.into_response()
+    let Some(bs) = &s.broadcasts else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error":{"code":"broadcasts_disabled"}}))).into_response();
+    };
+    match bs.delete(&name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => broadcast_error(error),
+    }
 }

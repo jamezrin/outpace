@@ -54,9 +54,60 @@ outpace broadcast sports --public-host stream.example
 | `GET /vod/<network>/<id>` | `200` or `206` streaming body | Verified single-file VOD. Supports one byte range and advertises `Accept-Ranges: bytes`; an unsatisfiable range returns `416`. |
 | `GET /vod/<network>/<id>/manifest.m3u8` | `200 application/vnd.apple.mpegurl` | Static VOD HLS playlist. |
 | `GET /vod/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Verified VOD HLS segment. |
-| `PUT /broadcast/<name>` | `200 application/json` | Starts/resumes raw MPEG-TS ingest. Returns `name`, `content_id`, and `infohash` while consuming the request body. |
+| `PUT /broadcast/<name>` | `200 application/json` | Exclusively admits raw MPEG-TS ingest. Returns `name`, `content_id`, and `infohash` immediately while an owned task consumes the request body. |
 | `GET /broadcast/<name>` | `200 application/octet-stream` | Returns the broadcast transport descriptor; `404` until minted. |
-| `DELETE /broadcast/<name>` | `204` | Stops and removes a broadcast; idempotent. Names must be 1-64 ASCII letters, digits, `.`, `_`, or `-`. |
+| `DELETE /broadcast/<name>` | `204` | Stops ingress/announcements and deletes identity after persistence settles; unknown names are idempotent. Names must be 1–64 ASCII letters, digits, `.`, `_`, or `-`, excluding `.` and `..`. |
+
+A broadcast accepts one producer at a time across raw PUT and RTMP. A competing publisher
+receives `409` / `producer_conflict`; separate names can ingest concurrently. Sequential
+producers retain the signing identity and continue piece numbering. RTMP keys use the exact
+same name rules, without whitespace trimming. Ordinary PUT EOF/body termination and RTMP
+unpublish sign the buffered finite tail once. Deletion, shutdown and fatal ingest failures
+discard that tail. A short signed final piece retains the existing fixed-geometry consumer
+limitation; it is not guaranteed playable by consumers that require full pieces.
+
+New mutation failures are JSON with exactly `{"error":{"code":"..."}}`:
+
+| Status | Code |
+| --- | --- |
+| `400` | `invalid_name` |
+| `404` | `broadcasts_disabled` |
+| `409` | `producer_conflict`, `broadcast_stopping` |
+| `500` | `broadcast_persistence_failed`, `broadcast_state_invalid`, `piece_index_exhausted` |
+| `503` | `broadcast_service_stopping`, `broadcast_cleanup_timeout` |
+
+DELETE returns `204` only after broadcast work has stopped, both seed registrations have been
+evicted and the identity record has been deleted under the platform guarantees below. While
+stopping, descriptor GET is `404` and new producers receive `409`. Cleanup has a shared
+5-second grace. A blocked filesystem operation retains the stopping name and its I/O fence;
+`503` does not authorize reuse. The owned deletion may complete later; repeat DELETE to observe
+it. A settled disk failure returns `500` and requires an explicit DELETE retry. A successfully
+deleted name mints a fresh identity on its next admission. A raw admission already answered
+`200` cannot report a later ingest failure through that response; such failures stop its
+session and log a fixed error code.
+
+Before publication, the daemon saves exclusive reservations in blocks of 128 piece indexes.
+Restart skips the entire last reservation, even after a very short ingest; repeated restarts
+therefore create intentional forward gaps rather than reusing signed indexes. Unfinished
+pieces are also skipped. Invalid/unreadable identity records fail closed instead of silently
+minting over the same name. Shutdown preserves signing identities and reservations.
+
+Linux saves use a private exclusive same-directory temporary file, complete write, file sync,
+replacement and directory/new-link sync. macOS uses file `sync_all` (full-sync) and separate
+directory `fsync`. These depend on the filesystem/storage honoring the requested operations;
+they are not universal power-loss certification. Windows preserves process-crash/ordinary
+daemon restart safety while OS/filesystem state survives, using checked write, file sync,
+replacement and deletion without requiring directory sync. Windows system crash/power loss
+can roll back reservations, lose identities or resurrect deleted records; DELETE has the same
+limitation. Other filesystems without established namespace/flush semantics have the same
+strong-guarantee limitation. See [deployment storage/rollback guidance](deployment.md#upgrade-rollback-and-removal).
+
+RTMP cleanup fences broadcast operations and waits for the per-publisher mux/ingest/finish
+barrier. Runtime cleanup also stops/joins its owned RTMP listener. The dependency owns
+established connection tasks: they may remain connected, but canceled-session callbacks cannot
+publish, finish tails or mutate a replacement publisher. New publish requests are rejected
+after service admission closes. A publishing connection canceled by full deletion must reconnect
+to publish that name again; ordinary unpublish may republish on the same connection.
 
 An active stream status response has stable field names and numeric counters:
 
