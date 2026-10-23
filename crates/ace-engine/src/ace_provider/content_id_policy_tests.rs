@@ -183,9 +183,10 @@ async fn enabled_vod_resolves_raw_hash_metadata() {
 async fn local_broadcast_content_id_resolves_without_catalog_or_opt_in() {
     let seed = SeedRegistry::new();
     let broadcasts = crate::broadcast::BroadcastRegistry::new();
-    let (broadcast, _) = broadcasts
-        .start_or_resume("policy-test", "Synthetic broadcast", &[], &seed, 1 << 20)
-        .await;
+    let broadcast = broadcasts
+        .mint("policy-test", "Synthetic broadcast", &[], &seed, 1 << 20)
+        .await
+        .unwrap();
     let p = provider().with_seed_registry(seed);
     let cid = infohash_hex(&broadcast.content_id);
     let info = p

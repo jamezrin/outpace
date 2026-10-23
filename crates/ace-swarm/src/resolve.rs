@@ -9,6 +9,9 @@
 //! infohash carries no geometry, so it is never turned into a `StreamInfo` by guessing
 //! (issue #164); callers keep descriptors they have verified in an [`InfohashIndex`].
 
+use crate::http_fetch::{self, FetchError, FetchLimits, FetchPolicy, FetchUrl, GuardedBody};
+#[cfg(test)]
+use crate::http_fetch::{is_private_or_loopback, is_safe_ip};
 use crate::types::{StreamInfo, StreamMetadata, VodInfo};
 use ace_peer::session::PeerSession;
 use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
@@ -21,6 +24,7 @@ use base64ct::{Base64, Encoding};
 use rand::RngExt;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -676,44 +680,6 @@ fn decode_hex20(hex: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
-/// Whether an IP is safe to fetch a transport file from — a conservative denylist that fails
-/// closed on anything private, local, or otherwise not a normal public unicast address. Used by
-/// the transport-file `url=` fetch to block SSRF into internal services.
-fn is_safe_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_multicast()
-                // Shared address space / CGNAT: 100.64.0.0/10.
-                || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000))
-        }
-        IpAddr::V6(v6) => {
-            // Re-check IPv4-mapped addresses against the v4 rules.
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_safe_ip(&IpAddr::V4(v4));
-            }
-            let seg = v6.segments();
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // Unique local fc00::/7.
-                || (seg[0] & 0xfe00) == 0xfc00
-                // Link-local unicast fe80::/10.
-                || (seg[0] & 0xffc0) == 0xfe80)
-        }
-    }
-}
-
-/// Resolve `host` to a single safe [`SocketAddr`], or [`ResolveError::Url`] if it is unresolvable
-/// or every resolved address is blocked by [`is_safe_ip`]. IP literals are validated directly;
-/// hostnames are resolved and the first safe address is kept (later pinned into the client so
-/// DNS rebinding cannot swap it).
 /// Env opt-in to allow fetching transport files from non-global (private/LAN/loopback)
 /// hosts. Default off — the SSRF guard stays closed for normal use. Intended for
 /// controlled self-hosted or test swarms on a private network, and mirrors
@@ -733,54 +699,20 @@ fn allow_non_global_transport_value(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-/// Whether `ip` is a private/LAN/loopback address — the *only* extra targets the
-/// `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT` opt-in unblocks. This deliberately stays narrower
-/// than "not [`is_safe_ip`]": link-local (e.g. the `169.254.169.254` cloud metadata
-/// endpoint), unspecified, multicast, broadcast, and documentation ranges remain blocked
-/// even with the opt-in on, so enabling it for a LAN swarm cannot become an SSRF footgun.
-fn is_private_or_loopback(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                // Shared address space / CGNAT: 100.64.0.0/10.
-                || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000)
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_private_or_loopback(&IpAddr::V4(v4));
-            }
-            // Loopback ::1 or unique-local fc00::/7.
-            v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00
-        }
-    }
-}
-
+// Retain the existing inline policy tests without duplicating the shared classifier.
+#[cfg(test)]
 async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveError> {
-    // `Url::host_str` keeps the brackets on an IPv6 literal (`[::1]`); strip them so the literal
-    // parses and is validated, rather than falling through to a doomed DNS lookup.
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    let allow_non_global = allow_non_global_transport();
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return if is_safe_ip(&ip) || (allow_non_global && is_private_or_loopback(&ip)) {
-            Ok(SocketAddr::new(ip, port))
-        } else {
-            Err(ResolveError::Url("blocked address"))
-        };
-    }
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| ResolveError::Url("dns failed"))?;
-    for addr in addrs {
-        if is_safe_ip(&addr.ip()) || (allow_non_global && is_private_or_loopback(&addr.ip())) {
-            return Ok(addr);
-        }
-    }
-    Err(ResolveError::Url("blocked address"))
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    http_fetch::resolve_addr(
+        host,
+        port,
+        FetchPolicy {
+            allow_non_global: allow_non_global_transport(),
+        },
+        cancel,
+    )
+    .await
+    .map_err(transport_fetch_error)
 }
 
 /// Upper bound on a fetched transport-file body (bytes). Matches the descriptor ceilings the
@@ -790,56 +722,56 @@ pub const MAX_TRANSPORT_FILE: u64 = 1_048_576;
 const TRANSPORT_URL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSPORT_URL_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Fetch a transport file from `url`, connecting only to the pre-validated `addr` (pinned so DNS
-/// rebinding cannot redirect the connection), and decode it into a [`StreamInfo`]. Redirects are
-/// disabled (a redirect is an SSRF bypass), the body is size-capped, and a non-2xx status fails
-/// closed. This is the inner seam the public entry calls after the SSRF guard runs.
-/// Fetch + decode a transport URL into a [`StreamInfo`]. Retained as a test helper; the
-/// production path fetches bytes via [`fetch_transport_bytes_from`] and decodes for the
-/// specific stream kind (live vs VOD).
+/// Retain the existing local transport tests while using the shared connector.
 #[cfg(test)]
 async fn fetch_transport_from(
     url: &str,
-    host: &str,
+    _host: &str,
     addr: SocketAddr,
 ) -> Result<StreamInfo, ResolveError> {
-    stream_info_from_transport(&fetch_transport_bytes_from(url, host, addr).await?)
+    let parsed = FetchUrl::parse_transport(url).map_err(transport_fetch_error)?;
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    let hooks = http_fetch::test_support::TestHooks::new().with_dns_answers(vec![addr]);
+    let body = http_fetch::test_support::open_with(
+        &parsed,
+        FetchPolicy {
+            allow_non_global: true,
+        },
+        transport_fetch_limits(),
+        cancel,
+        hooks,
+    )
+    .await
+    .map_err(transport_fetch_error)?;
+    let bytes = collect_transport(body).await?;
+    stream_info_from_transport(&bytes)
 }
 
-async fn fetch_transport_bytes_from(
-    url: &str,
-    host: &str,
-    addr: SocketAddr,
-) -> Result<Vec<u8>, ResolveError> {
-    // Reqwest 0.13 needs an installed provider with rustls-no-provider. Respect a
-    // provider already selected by the embedding application.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::builder()
-        .tls_certs_only(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().map(|cert| {
-            reqwest::Certificate::from_der(cert.as_ref()).expect("bundled TLS root certificate")
-        }))
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(TRANSPORT_URL_CONNECT_TIMEOUT)
-        .timeout(TRANSPORT_URL_TOTAL_TIMEOUT)
-        .resolve(host, addr)
-        .build()
-        .map_err(|_| ResolveError::Url("client build failed"))?;
-
-    let mut resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| ResolveError::Url("fetch failed"))?;
-    if !resp.status().is_success() {
-        return Err(ResolveError::Url("http status"));
+fn transport_fetch_limits() -> FetchLimits {
+    FetchLimits {
+        connect_timeout: TRANSPORT_URL_CONNECT_TIMEOUT,
+        headers_timeout: TRANSPORT_URL_TOTAL_TIMEOUT,
+        source_response: false,
     }
+}
 
+fn transport_fetch_error(error: FetchError) -> ResolveError {
+    ResolveError::Url(match error {
+        FetchError::BadUrl | FetchError::InvalidSourceUrl => "bad url",
+        FetchError::UnsupportedScheme => "unsupported scheme",
+        FetchError::NoHost => "no host",
+        FetchError::NoPort => "no port",
+        FetchError::AddressBlocked | FetchError::SourceAddressBlocked => "blocked address",
+        FetchError::DnsFailed | FetchError::DnsTimeout => "dns failed",
+        FetchError::ClientBuildFailed => "client build failed",
+        FetchError::HttpStatus | FetchError::RedirectRejected => "http status",
+        _ => "fetch failed",
+    })
+}
+
+async fn collect_transport(mut response: GuardedBody) -> Result<Vec<u8>, ResolveError> {
     let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|_| ResolveError::Url("fetch failed"))?
-    {
+    while let Some(chunk) = response.next_chunk().await.map_err(transport_fetch_error)? {
         if body.len() as u64 + chunk.len() as u64 > MAX_TRANSPORT_FILE {
             return Err(ResolveError::Url("transport too large"));
         }
@@ -849,8 +781,8 @@ async fn fetch_transport_bytes_from(
 }
 
 /// Resolve a transport-file `url=` input into a [`StreamInfo`]: require an http/https scheme, run
-/// the SSRF guard on the host, then fetch+decode via [`fetch_transport_from`]. Every failure path
-/// is fail-closed.
+/// the SSRF guard on the host, then fetch and decode through the shared guarded client.
+/// Every failure path is fail-closed.
 pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, ResolveError> {
     stream_info_from_transport(&transport_bytes_from_url(url).await?)
 }
@@ -859,16 +791,17 @@ pub async fn stream_info_from_transport_url(url: &str) -> Result<StreamInfo, Res
 /// SSRF guard and size cap as [`stream_info_from_transport_url`]. The pure decode half is left
 /// to the caller ([`vod_info_from_transport`] for VOD).
 pub async fn transport_bytes_from_url(url: &str) -> Result<Vec<u8>, ResolveError> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| ResolveError::Url("bad url"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(ResolveError::Url("unsupported scheme"));
-    }
-    let host = parsed.host_str().ok_or(ResolveError::Url("no host"))?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or(ResolveError::Url("no port"))?;
-    let addr = resolve_safe_addr(host, port).await?;
-    fetch_transport_bytes_from(url, host, addr).await
+    let parsed = FetchUrl::parse_transport(url).map_err(transport_fetch_error)?;
+    let policy = FetchPolicy {
+        allow_non_global: allow_non_global_transport(),
+    };
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    // Shared transport mode retains the finite request/body budget after DNS;
+    // source-only status/header/frame restrictions do not apply here.
+    let response = http_fetch::open(&parsed, policy, transport_fetch_limits(), cancel)
+        .await
+        .map_err(transport_fetch_error)?;
+    collect_transport(response).await
 }
 
 #[cfg(test)]

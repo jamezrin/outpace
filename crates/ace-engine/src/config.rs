@@ -1,7 +1,9 @@
 //! Daemon configuration and persistent node identity.
 
+use crate::broadcast_pull::BroadcastSourceConfig;
 use ace_wire::identity::Identity;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -338,6 +340,11 @@ pub struct Config {
     pub experimental_ace_compat: bool,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
     pub bep9_content_id_fallback: bool,
+    /// Process-start declarations; URLs remain private and are never persisted.
+    #[serde(deserialize_with = "crate::broadcast_pull::deserialize_source_map")]
+    pub broadcast_sources: BTreeMap<String, BroadcastSourceConfig>,
+    /// Independent operator-only SSRF opt-in, enabled by exact env string `1`.
+    pub allow_non_global_broadcast_source: bool,
 }
 
 impl Default for Config {
@@ -372,6 +379,8 @@ impl Default for Config {
             port_map_external_port: None,
             experimental_ace_compat: false,
             bep9_content_id_fallback: false,
+            broadcast_sources: BTreeMap::new(),
+            allow_non_global_broadcast_source: false,
         }
     }
 }

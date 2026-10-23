@@ -65,6 +65,7 @@ dependencies = [
  "cbc",
  "crab_nat",
  "hex",
+ "hyper",
  "igd-next",
  "libc",
  "rand 0.10.3",

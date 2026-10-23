@@ -435,15 +435,16 @@ async fn content_id_resolution_records_the_descriptor_under_its_infohash() {
 async fn own_broadcast_opens_by_infohash_with_its_minted_geometry() {
     let seed = SeedRegistry::new();
     let broadcasts = crate::broadcast::BroadcastRegistry::new();
-    let (bc, _) = broadcasts
-        .start_or_resume(
+    let bc = broadcasts
+        .mint(
             "t164",
             "T164",
             &["udp://tracker.invalid:80".into()],
             &seed,
             1 << 20,
         )
-        .await;
+        .await
+        .unwrap();
     let id = infohash_hex(&bc.infohash);
 
     // A provider that does not share the broadcast's registry still refuses it.
@@ -515,15 +516,16 @@ async fn own_broadcast_wins_over_a_conflicting_index_entry() {
     use ace_wire::bencode::Bencode;
     let seed = SeedRegistry::new();
     let broadcasts = crate::broadcast::BroadcastRegistry::new();
-    let (bc, _) = broadcasts
-        .start_or_resume(
+    let bc = broadcasts
+        .mint(
             "t164b",
             "T164B",
             &["udp://own.invalid:80".into()],
             &seed,
             1 << 20,
         )
-        .await;
+        .await
+        .unwrap();
     let own = seed.broadcast_transport_for_infohash(&bc.infohash).unwrap();
 
     // Same infohash, different (unbound) trackers.

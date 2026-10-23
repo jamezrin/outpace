@@ -148,8 +148,15 @@ async fn run_broadcast(args: BroadcastArgs) -> Result<(), Box<dyn std::error::Er
     config.enable_inbound = true;
     let peers = crate::runtime::bootstrap_peers_from_env();
     let runtime = crate::runtime::build_runtime(config, peers).await?;
-    let bc = crate::runtime::mint_broadcast(&runtime, &name).await;
-    crate::runtime::announce_broadcast(&runtime, &bc);
+    let bc = match crate::runtime::mint_broadcast(&runtime, &name).await {
+        Ok(bc) => bc,
+        Err(error) => {
+            let _ = runtime.broadcasts.shutdown().await;
+            runtime.manager.shutdown().await;
+            return Err(Box::new(error));
+        }
+    };
+    // The serving runtime starts the same entry-owned announcers after listener startup.
 
     let bind = runtime.config.bind;
     let urls = crate::runtime::broadcast_ingest_urls(
