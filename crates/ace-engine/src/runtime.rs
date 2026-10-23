@@ -48,12 +48,15 @@ pub struct EngineRuntime {
 }
 
 pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
-    let mut config = Config::default();
-    config.allow_non_global_broadcast_source = parse_non_global_source_opt_in(
-        std::env::var("OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE")
-            .ok()
-            .as_deref(),
-    );
+    let defaults = Config::default();
+    let mut config = Config {
+        allow_non_global_broadcast_source: parse_non_global_source_opt_in(
+            std::env::var("OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE")
+                .ok()
+                .as_deref(),
+        ),
+        ..defaults
+    };
     let raw_sources = match std::env::var("OUTPACE_BROADCAST_SOURCES") {
         Ok(raw) => Some(raw),
         Err(std::env::VarError::NotPresent) => None,

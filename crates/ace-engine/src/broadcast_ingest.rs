@@ -9,19 +9,29 @@ use tokio::sync::watch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngestError {
-    ActiveIngest, Sealed, Stopping, PersistenceFailed, PieceIndexExhausted, IngestFailed,
+    ActiveIngest,
+    Sealed,
+    Stopping,
+    PersistenceFailed,
+    PieceIndexExhausted,
+    IngestFailed,
 }
 impl IngestError {
     pub fn code(self) -> &'static str {
         match self {
-            Self::ActiveIngest => "producer_conflict", Self::Sealed => "ingest_sealed",
-            Self::Stopping => "broadcast_stopping", Self::PersistenceFailed => "persistence_failed",
-            Self::PieceIndexExhausted => "piece_index_exhausted", Self::IngestFailed => "ingest_failed",
+            Self::ActiveIngest => "producer_conflict",
+            Self::Sealed => "ingest_sealed",
+            Self::Stopping => "broadcast_stopping",
+            Self::PersistenceFailed => "persistence_failed",
+            Self::PieceIndexExhausted => "piece_index_exhausted",
+            Self::IngestFailed => "ingest_failed",
         }
     }
 }
 impl std::fmt::Display for IngestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.code()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code())
+    }
 }
 impl std::error::Error for IngestError {}
 impl From<BroadcastError> for IngestError {
@@ -49,11 +59,15 @@ struct Attempt {
     busy: Arc<AtomicBool>,
 }
 impl Drop for Attempt {
-    fn drop(&mut self) { self.busy.store(false, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::SeqCst);
+    }
 }
 struct IngestPermit(Arc<Attempt>);
 impl Drop for IngestPermit {
-    fn drop(&mut self) { self.0.live.store(false, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.live.store(false, Ordering::SeqCst);
+    }
 }
 
 pub struct BroadcastIngest {
@@ -75,20 +89,37 @@ impl BroadcastIngest {
         let start = broadcast.cursor.start_piece();
         let sig_len = broadcast.auth.signature_len() as u64;
         Self {
-            broadcast, permit: IngestPermit(Arc::new(Attempt {
-                live: AtomicBool::new(true), busy: authority.ingest_busy.clone(),
-            })), authority, resync: ace_media::mpegts::TsResync::new(),
+            broadcast,
+            permit: IngestPermit(Arc::new(Attempt {
+                live: AtomicBool::new(true),
+                busy: authority.ingest_busy.clone(),
+            })),
+            authority,
+            resync: ace_media::mpegts::TsResync::new(),
             // Rebase the unmodified wire chunker after each complete signed piece. Keep
             // global indexes checked here, without imposing a lifetime byte-count ceiling.
-            chunker: ace_wire::signing_chunker::SigningChunker::new(PIECE_LENGTH, CHUNK_LENGTH, 0, sig_len),
-            start, signature_len: sig_len, payload_capacity: (PIECE_LENGTH - sig_len) as usize,
-            buffered_payload: 0, sealed: false, failure: None,
+            chunker: ace_wire::signing_chunker::SigningChunker::new(
+                PIECE_LENGTH,
+                CHUNK_LENGTH,
+                0,
+                sig_len,
+            ),
+            start,
+            signature_len: sig_len,
+            payload_capacity: (PIECE_LENGTH - sig_len) as usize,
+            buffered_payload: 0,
+            sealed: false,
+            failure: None,
         }
     }
 
     fn check(&self) -> Result<(), IngestError> {
-        if let Some(error) = self.failure { return Err(error); }
-        if self.sealed { return Err(IngestError::Sealed); }
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if self.sealed {
+            return Err(IngestError::Sealed);
+        }
         self.broadcast.cursor.check()?;
         if *self.authority.cancel.borrow() || !self.permit.0.live.load(Ordering::SeqCst) {
             return Err(IngestError::Stopping);
@@ -96,7 +127,8 @@ impl BroadcastIngest {
         Ok(())
     }
     fn fail(&mut self, error: IngestError) -> IngestError {
-        self.failure = Some(error); self.sealed = true;
+        self.failure = Some(error);
+        self.sealed = true;
         self.permit.0.live.store(false, Ordering::SeqCst);
         // The owner observes the error and decides its lifetime. In particular a terminal
         // pull failure must retain its claim/status until explicit cancellation/detach.
@@ -113,7 +145,9 @@ impl BroadcastIngest {
             let mut remaining = aligned.as_slice();
             while !remaining.is_empty() {
                 self.check()?;
-                let take = remaining.len().min(self.payload_capacity - self.buffered_payload);
+                let take = remaining
+                    .len()
+                    .min(self.payload_capacity - self.buffered_payload);
                 let outputs = self.chunker.push(&remaining[..take], &self.broadcast.auth);
                 self.buffered_payload += take;
                 remaining = &remaining[take..];
@@ -121,7 +155,10 @@ impl BroadcastIngest {
                 // owned publication job still keeps its permit/fences until it settles.
                 self.failure = Some(IngestError::IngestFailed);
                 match self.store_outputs(outputs, false).await {
-                    Ok(pieces) => { self.failure = None; progress.committed_pieces += pieces; },
+                    Ok(pieces) => {
+                        self.failure = None;
+                        progress.committed_pieces += pieces;
+                    }
                     Err(error) => return Err(self.fail(error)),
                 }
                 if self.buffered_payload == self.payload_capacity {
@@ -131,7 +168,10 @@ impl BroadcastIngest {
                     };
                     self.buffered_payload = 0;
                     self.chunker = ace_wire::signing_chunker::SigningChunker::new(
-                        PIECE_LENGTH, CHUNK_LENGTH, 0, self.signature_len,
+                        PIECE_LENGTH,
+                        CHUNK_LENGTH,
+                        0,
+                        self.signature_len,
                     );
                 }
             }
@@ -141,21 +181,35 @@ impl BroadcastIngest {
 
     /// Ordinary finite EOF only. Cancellation/fatal errors discard the buffered tail.
     pub async fn finish(&mut self) -> Result<(), IngestError> {
-        if self.sealed { return self.failure.map_or(Ok(()), Err); }
+        if self.sealed {
+            return self.failure.map_or(Ok(()), Err);
+        }
         self.check()?;
         self.sealed = true;
         self.failure = Some(IngestError::IngestFailed);
         let outputs = self.chunker.flush(&self.broadcast.auth);
         match self.store_outputs(outputs, true).await {
-            Ok(_) => { self.failure = None; Ok(()) }, Err(error) => Err(self.fail(error)),
+            Ok(_) => {
+                self.failure = None;
+                Ok(())
+            }
+            Err(error) => Err(self.fail(error)),
         }
     }
 
-    async fn store_outputs(&self, mut outputs: Vec<ace_wire::chunker::OutChunk>, checkpoint: bool)
-        -> Result<u64, IngestError> {
-        if outputs.is_empty() && !checkpoint { return Ok(0); }
+    async fn store_outputs(
+        &self,
+        mut outputs: Vec<ace_wire::chunker::OutChunk>,
+        checkpoint: bool,
+    ) -> Result<u64, IngestError> {
+        if outputs.is_empty() && !checkpoint {
+            return Ok(0);
+        }
         for out in &mut outputs {
-            out.piece = self.start.checked_add(out.piece).filter(|piece| *piece < u64::MAX)
+            out.piece = self
+                .start
+                .checked_add(out.piece)
+                .filter(|piece| *piece < u64::MAX)
                 .ok_or(IngestError::PieceIndexExhausted)?;
         }
         let publication = self.broadcast.cursor.publication.clone().lock_owned().await;
@@ -213,27 +267,43 @@ impl BroadcastIngest {
             jobs.push(job);
         }
         loop {
-            if let Some(result) = *rx.borrow_and_update() { return result; }
-            if rx.changed().await.is_err() { return Err(IngestError::IngestFailed); }
+            if let Some(result) = *rx.borrow_and_update() {
+                return result;
+            }
+            if rx.changed().await.is_err() {
+                return Err(IngestError::IngestFailed);
+            }
         }
     }
 }
 
-fn check_publication(broadcast: &Broadcast, attempt: &Attempt, cancel: &watch::Receiver<bool>)
-    -> Result<(), IngestError> {
+fn check_publication(
+    broadcast: &Broadcast,
+    attempt: &Attempt,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(), IngestError> {
     broadcast.cursor.check()?;
-    if *cancel.borrow() || !attempt.live.load(Ordering::SeqCst) { return Err(IngestError::Stopping); }
+    if *cancel.borrow() || !attempt.live.load(Ordering::SeqCst) {
+        return Err(IngestError::Stopping);
+    }
     Ok(())
 }
 
 fn current_live_piece_header() -> [u8; 8] {
-    let seconds = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     piece_header_from_unix_seconds(seconds)
 }
 fn header_for_piece(current: &mut Option<(u64, [u8; 8])>, piece: u64) -> [u8; 8] {
     match current {
         Some((current_piece, header)) if *current_piece == piece => *header,
-        _ => { let header = current_live_piece_header(); *current = Some((piece, header)); header }
+        _ => {
+            let header = current_live_piece_header();
+            *current = Some((piece, header));
+            header
+        }
     }
 }
 
@@ -255,12 +325,25 @@ mod tests {
     async fn shared_ingest_writes_signed_ts_chunks_to_the_real_store() {
         let registry = BroadcastRegistry::new();
         let seed = SeedRegistry::new();
-        let (broadcast, mut producer) = registry.acquire_producer("ingest", "Ingest", &[], &seed, 4 << 20, ProducerKind::RawPut).await.unwrap();
+        let (broadcast, mut producer) = registry
+            .acquire_producer(
+                "ingest",
+                "Ingest",
+                &[],
+                &seed,
+                4 << 20,
+                ProducerKind::RawPut,
+            )
+            .await
+            .unwrap();
         let mut ingest = producer.open_ingest().unwrap();
         ingest.push_bytes(&ts_packets(400)).await.unwrap();
         ingest.finish().await.unwrap();
         let store = broadcast.store.lock().await;
-        assert!(store.chunk(0, 0).is_some(), "real store contains the signed first chunk");
+        assert!(
+            store.chunk(0, 0).is_some(),
+            "real store contains the signed first chunk"
+        );
         assert_ne!(store.piece_header(0).unwrap(), [0; 8]);
     }
 
@@ -268,7 +351,10 @@ mod tests {
     async fn a_new_real_ingest_starts_at_the_next_committed_piece() {
         let registry = BroadcastRegistry::new();
         let seed = SeedRegistry::new();
-        let (broadcast, mut producer) = registry.acquire_producer("resume", "Resume", &[], &seed, 8 << 20, ProducerKind::Pull).await.unwrap();
+        let (broadcast, mut producer) = registry
+            .acquire_producer("resume", "Resume", &[], &seed, 8 << 20, ProducerKind::Pull)
+            .await
+            .unwrap();
         let mut first = producer.open_ingest().unwrap();
         first.push_bytes(&ts_packets(700)).await.unwrap();
         first.finish().await.unwrap();

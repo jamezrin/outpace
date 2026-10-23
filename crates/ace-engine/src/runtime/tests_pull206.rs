@@ -232,7 +232,7 @@ async fn pull206_build_runtime_validates_sources_without_starting_workers_or_ann
         .await
         .is_none());
     assert!(
-        !std::fs::read_dir(&dir.join("broadcasts"))
+        !std::fs::read_dir(dir.join("broadcasts"))
             .map(|mut entries| entries.next().is_some())
             .unwrap_or(false),
         "build_runtime validates declarations but defers readers and attachments to serving"

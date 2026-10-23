@@ -38,13 +38,25 @@ struct OnDisk {
 /// the filesystem implementation and its ordering remain the production implementation.
 #[cfg(test)]
 pub(crate) trait TestPersistIo: Send + Sync {
-    fn before(&self, operation: PersistOperation, path: &Path, other: Option<&Path>) -> io::Result<()>;
+    fn before(
+        &self,
+        operation: PersistOperation,
+        path: &Path,
+        other: Option<&Path>,
+    ) -> io::Result<()>;
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PersistOperation {
-    CreateDirectory, CreateTemp, Write, FileSync, Replace, DirectorySync, Delete, CleanupTemp,
+    CreateDirectory,
+    CreateTemp,
+    Write,
+    FileSync,
+    Replace,
+    DirectorySync,
+    Delete,
+    CleanupTemp,
 }
 
 type NameLock = Arc<Mutex<()>>;
@@ -71,19 +83,29 @@ impl BroadcastPersist {
 
     #[cfg(test)]
     pub(crate) fn with_test_io(data_dir: &Path, observer: Arc<dyn TestPersistIo>) -> Self {
-        Self { observer: Some(observer), ..Self::new(data_dir) }
+        Self {
+            observer: Some(observer),
+            ..Self::new(data_dir)
+        }
     }
 
     fn path(&self, name: &str) -> io::Result<PathBuf> {
         if !crate::broadcast::valid_broadcast_name(name) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid broadcast name"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid broadcast name",
+            ));
         }
         Ok(self.dir.join(format!("{name}.json")))
     }
 
     fn serial_for(&self, name: &str) -> Arc<Mutex<()>> {
-        self.serial.lock().unwrap().entry(name.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        self.serial
+            .lock()
+            .unwrap()
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub fn save(&self, name: &str, rec: &PersistedBroadcast) -> io::Result<()> {
@@ -96,9 +118,12 @@ impl BroadcastPersist {
             key_pkcs1_pem: rec.key_pkcs1_pem.clone(),
             next_piece: rec.next_piece,
             reserved_until: rec.reserved_until,
-        }).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid broadcast record"))?;
+        })
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid broadcast record"))?;
         let (tmp, mut file) = loop {
-            let tmp = self.dir.join(format!(".{name}.{:016x}.tmp", rand::random::<u64>()));
+            let tmp = self
+                .dir
+                .join(format!(".{name}.{:016x}.tmp", rand::random::<u64>()));
             #[cfg(test)]
             self.observe(PersistOperation::CreateTemp, &tmp, Some(&final_path))?;
             let mut opts = std::fs::OpenOptions::new();
@@ -130,7 +155,10 @@ impl BroadcastPersist {
         })();
         if result.is_err() {
             #[cfg(test)]
-            if self.observe(PersistOperation::CleanupTemp, &tmp, None).is_ok() {
+            if self
+                .observe(PersistOperation::CleanupTemp, &tmp, None)
+                .is_ok()
+            {
                 let _ = std::fs::remove_file(&tmp);
             }
             #[cfg(not(test))]
@@ -144,9 +172,13 @@ impl BroadcastPersist {
         let path = self.path(name)?;
         match load_record(&path) {
             Ok(rec) => Ok(Some(rec)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match std::fs::symlink_metadata(&path)
+            {
                 Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
-                _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unreadable broadcast record")),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unreadable broadcast record",
+                )),
             },
             Err(e) => Err(e),
         }
@@ -157,22 +189,30 @@ impl BroadcastPersist {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 match std::fs::symlink_metadata(&self.dir) {
-                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => {
+                        return Ok(Vec::new())
+                    }
                     _ => return Err(e),
                 }
-            },
+            }
             Err(e) => return Err(e),
         };
         let mut out = Vec::new();
         for entry in entries {
             let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
-            let name = path.file_stem().and_then(|s| s.to_str())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid broadcast filename"))?;
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid broadcast filename")
+            })?;
             let record = if crate::broadcast::valid_broadcast_name(name) {
                 load_record(&path)
             } else {
-                Err(io::Error::new(io::ErrorKind::InvalidData, "invalid broadcast name"))
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid broadcast name",
+                ))
             };
             out.push((name.to_owned(), record));
         }
@@ -204,14 +244,23 @@ impl BroadcastPersist {
     fn create_directories(&self, path: &Path) -> io::Result<()> {
         let missing = match std::fs::metadata(path) {
             Ok(meta) if meta.is_dir() => false,
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::NotADirectory, "invalid state directory")),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "invalid state directory",
+                ))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => true,
             Err(e) => return Err(e),
         };
         // Settle ancestor links too: runtime identity setup may just have created the data
         // directory hierarchy. Empty relative parents refer to the current directory.
         let parent = path.parent().map(|parent| {
-            if parent.as_os_str().is_empty() { Path::new(".") } else { parent }
+            if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            }
         });
         if let Some(parent) = parent.filter(|parent| *parent != path) {
             self.create_directories(parent)?;
@@ -220,8 +269,8 @@ impl BroadcastPersist {
             #[cfg(test)]
             self.observe(PersistOperation::CreateDirectory, path, None)?;
             match std::fs::create_dir(path) {
-                Ok(()) => {},
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {},
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
                 Err(e) => return Err(e),
             }
         }
@@ -261,7 +310,10 @@ impl BroadcastPersist {
 
     #[cfg(test)]
     fn observe(&self, op: PersistOperation, path: &Path, other: Option<&Path>) -> io::Result<()> {
-        match &self.observer { Some(observer) => observer.before(op, path, other), None => Ok(()) }
+        match &self.observer {
+            Some(observer) => observer.before(op, path, other),
+            None => Ok(()),
+        }
     }
 }
 
@@ -378,8 +430,22 @@ mod tests {
         std::fs::write(dir.join("broadcasts/bad.json"), b"{ not valid json").unwrap();
         let loaded = p.load_all().unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded.iter().find(|(name, _)| name == "good").unwrap().1.as_ref().unwrap(), &sample());
-        assert!(loaded.iter().find(|(name, _)| name == "bad").unwrap().1.is_err());
+        assert_eq!(
+            loaded
+                .iter()
+                .find(|(name, _)| name == "good")
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap(),
+            &sample()
+        );
+        assert!(loaded
+            .iter()
+            .find(|(name, _)| name == "bad")
+            .unwrap()
+            .1
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
