@@ -331,9 +331,10 @@ pub struct Config {
     /// External port to request on the gateway. When unset, request the same port as
     /// `peer_listen`. `OUTPACE_PORT_MAP_EXTERNAL_PORT`.
     pub port_map_external_port: Option<u16>,
-    /// Expose Acestream-engine-compatible HTTP routes (`/ace/*`, `/server/api`). This is an
-    /// experimental legacy adapter; outpace's native `/streams` and `/broadcast` API is the
-    /// supported surface.
+    /// Expose the supported Acestream HTTP subset (`/ace/*`, `/server/api`,
+    /// `/webui/api/service`), off by default. `OUTPACE_ACE_COMPAT` takes precedence over
+    /// the deprecated `OUTPACE_EXPERIMENTAL_ACE_COMPAT` alias. The field name is retained
+    /// for Rust and serialized configuration compatibility; native APIs remain primary.
     pub experimental_ace_compat: bool,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
     pub bep9_content_id_fallback: bool,

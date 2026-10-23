@@ -131,6 +131,25 @@ making internal scheduler details a permanent public contract.
 The complete environment-variable reference remains in the root [`README`](../README.md#configuration).
 Keep credentials out of `.env`; none of the current daemon settings require secrets.
 
+### Ace HTTP compatibility
+
+The [supported Ace HTTP subset](protocol/compat-matrix.md) is off by default. Set
+`OUTPACE_ACE_COMPAT=1` in `.env` to enable it, or `OUTPACE_ACE_COMPAT=0` to explicitly
+disable it. Apply the setting by recreating the service with `docker compose up -d --wait`;
+`docker compose restart` alone does not apply changed container environment variables.
+
+`OUTPACE_EXPERIMENTAL_ACE_COMPAT` is a deprecated fallback only when the canonical variable
+is unset. Rename the old setting to `OUTPACE_ACE_COMPAT` when migrating. A present canonical
+value wins, including `0`/`false`; the canonical `0` in a newly copied `.env.example`
+therefore overrides a legacy `1`. The selected value accepts exactly `1`, `true`, `0`, or
+`false`. Empty, malformed, or non-Unicode selected values fail daemon startup; unused legacy
+values are ignored. Native daemon installations must restart the process to apply changes.
+
+Generic Compose forwards the selection as
+`OUTPACE_ACE_COMPAT: ${OUTPACE_ACE_COMPAT-${OUTPACE_EXPERIMENTAL_ACE_COMPAT-0}}`.
+The unset-only fallback preserves legacy-only opt-in and empty values for runtime validation.
+It does not enable any additional compatibility methods or change listener exposure.
+
 ## Upgrade, rollback, and removal
 
 Back up the `outpace-data` volume before an upgrade. It contains `identity.seed` and persisted

@@ -119,7 +119,7 @@ python3 tools/abcompare/ab_analyze.py /tmp/new-ab-run 180 engine outpace
 Engine specifications are `name=BASE` for `/ace/getstream?id=…&format=json`,
 `name=nativecid:BASE` for `/streams/ace/cid:…`, or `name=native:BASE` for
 `/streams/ace/ih:…` using an **infohash**. Outpace compat routes
-require `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`; the runner uses native content-id
+require `OUTPACE_ACE_COMPAT=1`; the runner uses native content-id
 routing so it needs no compat flag. Names must contain only letters, digits,
 underscores and hyphens, and must be unique. Playback follows up to five relative
 or absolute redirects, including the original engine's 302 to `/content/…` and

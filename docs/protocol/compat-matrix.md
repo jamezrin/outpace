@@ -2,7 +2,7 @@
 
 This is the canonical operator contract for Outpace's opt-in Acestream HTTP adapter.
 Prefer the [native CLI and HTTP API](../native-api.md) for new integrations. The adapter
-supports public, unencrypted **live** playback and a small JSON control subset; it does
+provides a supported subset of public, unencrypted **live** playback and JSON control; it does
 not claim full engine or application parity. Native VOD is a separate `/vod` surface.
 
 ## Enable and advertise the adapter
@@ -10,8 +10,17 @@ not claim full engine or application parity. Native VOD is a separate `/vod` sur
 The gate is **off by default**. Enable it on the serving daemon:
 
 ```bash
-OUTPACE_EXPERIMENTAL_ACE_COMPAT=1 cargo run -p ace-engine --bin outpace -- serve
+OUTPACE_ACE_COMPAT=1 cargo run -p ace-engine --bin outpace -- serve
 ```
+
+Set `OUTPACE_ACE_COMPAT=0` to explicitly disable it. The selected value accepts exactly
+`1`, `true`, `0`, or `false`; empty, malformed, or non-Unicode values fail startup.
+`OUTPACE_EXPERIMENTAL_ACE_COMPAT` is a deprecated fallback used only when
+`OUTPACE_ACE_COMPAT` is unset. A present canonical value always wins, including false;
+invalid canonical values fail rather than falling back, and unused legacy values are
+ignored. Rename the old variable to migrate. Restart the daemon to apply changes;
+Compose users must recreate the service as described in the
+[deployment guide](../deployment.md#configuration-contract).
 
 With the gate off, all routes in this document return HTTP 404. Enabling it does not
 change the bind address or add engine access-token authentication. Caller `pid`, input

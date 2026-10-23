@@ -94,7 +94,7 @@ pub struct AppState {
     /// Internally, keep using `cid:<content_id>` so playback gets the catalog-derived
     /// transport geometry/trackers (a bare infohash would need an already-indexed descriptor).
     pub ace_sessions: Arc<AceSessionStore>,
-    /// Experimental legacy Acestream HTTP compatibility surface. Native `/streams` and
+    /// Supported, opt-in Acestream HTTP subset. Native `/streams` and
     /// `/broadcast` routes remain available regardless of this flag.
     pub experimental_ace_compat: bool,
     /// B1: origination state. `None` disables `PUT /broadcast/{name}` (404) — e.g. in tests
