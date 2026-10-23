@@ -412,10 +412,11 @@ impl Choker {
     }
 }
 
-/// Per-infohash multi-peer serve coordinator. Tracks every inbound connection for one stream and
-/// applies [`Choker`] so no more than `max_unchoked` (+1 rotating optimistic) peers are unchoked at
-/// once. Each connection observes a `watch<bool>` (true = unchoked) and sends Choke/Unchoke on the
-/// wire when it flips. Recompute runs on every interest change, peer leave, and rechoke tick.
+/// Per-exact-key multi-peer serve coordinator. For I interested peers, [`Choker`] selects
+/// min(I, max_unchoked + 1) desired unchokes in interest-entry order, including a rotating tail
+/// peer. Each connection observes a `watch<bool>` and sends Choke/Unchoke when it flips;
+/// asynchronous observation and writes mean this is not an instantaneous wire-visible bound.
+/// Metadata replies bypass this gate. Recompute runs on interest change, leave, and rechoke tick.
 pub struct ServeCoordinator {
     choker: Choker,
     next_id: AtomicU64,
@@ -424,7 +425,7 @@ pub struct ServeCoordinator {
 
 #[derive(Default)]
 struct CoordState {
-    /// Interested peers in stable (join) order — the order `Choker::choose` consumes.
+    /// Interested peers in interest-entry order — the order `Choker::choose` consumes.
     interested: Vec<u64>,
     /// Per-peer unchoke signal sender.
     senders: StdHashMap<u64, watch::Sender<bool>>,
@@ -573,6 +574,95 @@ mod tests {
             *rx_c.borrow(),
             "a genuinely-choked peer becomes unchoked after another leaves"
         );
+    }
+
+    #[test]
+    fn coordinator_tracks_exact_desired_set_and_interest_order() {
+        fn desired(rxs: &[watch::Receiver<bool>]) -> Vec<usize> {
+            rxs.iter()
+                .enumerate()
+                .filter_map(|(index, rx)| (*rx.borrow()).then_some(index))
+                .collect()
+        }
+
+        let coord = ServeCoordinator::new(2);
+        let mut rxs = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let (id, rx) = coord.join();
+            ids.push(id);
+            rxs.push(rx);
+        }
+        assert_eq!(desired(&rxs), Vec::<usize>::new());
+
+        for id in &ids {
+            coord.set_interested(*id, true);
+        }
+        assert_eq!(desired(&rxs), vec![0, 1, 2]);
+
+        // Repeating Interested must not duplicate the id or change the desired order.
+        coord.set_interested(ids[0], true);
+        assert_eq!(desired(&rxs), vec![0, 1, 2]);
+
+        coord.rechoke();
+        assert_eq!(desired(&rxs), vec![0, 1, 3]);
+
+        // NotInterested frees the guaranteed slot and removes the peer from the ordered set.
+        coord.set_interested(ids[1], false);
+        assert_eq!(desired(&rxs), vec![0, 2, 4]);
+
+        coord.leave(ids[0]);
+        assert!(
+            rxs[2..].iter().all(|rx| *rx.borrow()),
+            "leaving interested peers must promote the remaining interested set"
+        );
+    }
+
+    #[test]
+    fn coordinator_zero_limit_keeps_one_optimistic_and_rotates_tail() {
+        fn desired(rxs: &[watch::Receiver<bool>]) -> Vec<usize> {
+            rxs.iter()
+                .enumerate()
+                .filter_map(|(index, rx)| (*rx.borrow()).then_some(index))
+                .collect()
+        }
+
+        let coord = ServeCoordinator::new(0);
+        let mut rxs = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let (id, rx) = coord.join();
+            ids.push(id);
+            rxs.push(rx);
+        }
+        for id in &ids {
+            coord.set_interested(*id, true);
+        }
+        assert_eq!(desired(&rxs), vec![0]);
+        coord.rechoke();
+        assert_eq!(desired(&rxs), vec![1]);
+        coord.rechoke();
+        assert_eq!(desired(&rxs), vec![2]);
+        coord.rechoke();
+        assert_eq!(desired(&rxs), vec![0]);
+    }
+
+    #[test]
+    fn independent_coordinators_keep_exact_key_membership_separate() {
+        let first = ServeCoordinator::new(1);
+        let second = ServeCoordinator::new(1);
+        let (first_id, first_rx) = first.join();
+        let (second_id, second_rx) = second.join();
+
+        first.set_interested(first_id, true);
+        assert!(*first_rx.borrow());
+        assert!(!*second_rx.borrow());
+
+        second.set_interested(second_id, true);
+        assert!(*first_rx.borrow());
+        assert!(*second_rx.borrow());
+        first.leave(first_id);
+        assert!(*second_rx.borrow());
     }
 
     #[test]

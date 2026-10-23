@@ -299,12 +299,15 @@ pub struct Config {
     /// HLS byte-segment packaging policy.
     pub hls: HlsConfig,
     pub hls_audio: HlsAudioConfig,
-    /// Max simultaneously-unchoked peers per served stream (S2). Wired into the inbound serve
-    /// path via the per-infohash `ServeCoordinator`: each stream unchokes up to this many
-    /// interested peers plus one rotating optimistic slot (rotated by the daemon's rechoke ticker).
+    /// Stable desired unchokes per exact served key, plus one rotating optimistic slot.
+    /// With I interested peers, the coordinator desires min(I, max_unchoked + 1); this is not
+    /// an instantaneous wire-visible bound. Zero still selects one optimistic peer.
     pub max_unchoked: usize,
-    /// Max concurrent inbound peer connections accepted by the listener.
+    /// Max retained inbound peer connections, including unidentified handshakes. Zero acts as one.
     pub max_inbound_peers: usize,
+    /// Max admitted connections per canonical stream, combining broadcast media and metadata.
+    /// Defaults to 16; zero disables this cap while preserving the global limit and coordinator.
+    pub max_inbound_per_stream: usize,
     /// Idle-TTL (seconds) after which an OWNERLESS leech `SeedRegistry` entry (one with no live
     /// producer lease) is force-evicted by the reaper — a backstop against orphans created outside
     /// the lease API. Entries held by a live lease and all broadcasts are never reaped; normal
@@ -371,6 +374,7 @@ impl Default for Config {
             hls_audio: HlsAudioConfig::default(),
             max_unchoked: 8,
             max_inbound_peers: 64,
+            max_inbound_per_stream: 16,
             seed_ttl_secs: 300,
             enable_seeding: true,
             enable_inbound: true,
@@ -729,3 +733,6 @@ mod tests {
         assert_eq!(Config::default().seed_ttl_secs, 300);
     }
 }
+
+#[cfg(test)]
+mod inbound_policy_tests;

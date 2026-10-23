@@ -164,6 +164,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_MAX_INBOUND") {
         config.max_inbound_peers = v.parse()?;
     }
+    apply_inbound_per_stream_env(&mut config, std::env::var("OUTPACE_MAX_INBOUND_PER_STREAM"))?;
     if let Ok(v) = std::env::var("OUTPACE_SEED_TTL_SECS") {
         config.seed_ttl_secs = v.parse()?;
     }
@@ -196,6 +197,34 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
     Ok(config)
+}
+
+fn apply_inbound_per_stream_env(
+    config: &mut Config,
+    raw: Result<String, std::env::VarError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match raw {
+        Ok(value) => {
+            config.max_inbound_per_stream = value.parse::<usize>().map_err(|_| {
+                "OUTPACE_MAX_INBOUND_PER_STREAM must be an unsigned integer fitting usize"
+            })?;
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("OUTPACE_MAX_INBOUND_PER_STREAM must be valid UTF-8".into());
+        }
+    }
+    Ok(())
+}
+
+/// Construct the actual listener domain once, including canonical admission capacity.
+fn inbound_admission_from_config(config: &Config) -> ace_swarm::listen::InboundAdmission {
+    ace_swarm::listen::InboundPolicy {
+        max_inbound: config.max_inbound_peers,
+        max_per_stream: config.max_inbound_per_stream,
+        max_unchoked: config.max_unchoked,
+    }
+    .admission()
 }
 
 fn bool_from_env(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>> {
@@ -713,19 +742,17 @@ async fn serve_http_inner(
         );
         let listener_peer_id = ace_wire::handshake::random_peer_id();
         let inbound_registry = seed_registry.clone();
-        let max_inbound = config.max_inbound_peers;
-        let max_unchoked = config.max_unchoked;
+        let inbound_admission = inbound_admission_from_config(&config);
         let listener_identity = identity.clone();
         let listener_reachability = reachability.clone();
         tokio::spawn(async move {
-            ace_swarm::listen::PeerListener::serve(
+            ace_swarm::listen::PeerListener::serve_with_policy(
                 peer_listener,
                 inbound_registry,
                 listener_peer_id,
                 [0u8; 8],
-                max_inbound,
+                inbound_admission,
                 listener_identity,
-                max_unchoked,
                 listener_reachability,
             )
             .await;
@@ -2151,3 +2178,6 @@ mod tests {
 
 #[cfg(test)]
 mod tests_pull206;
+
+#[cfg(test)]
+mod inbound_policy_tests;

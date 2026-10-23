@@ -61,6 +61,45 @@ OUTPACE_ENABLE_SEEDING=0
 No peer listener or self-announcement is started in that mode. The Compose port entries may stay
 present—the container has nothing listening on them—or be removed in a local override.
 
+### Inbound occupancy policy
+
+Defaults are G=64 retained inbound connections, N=16 admitted connections per canonical stream,
+and U=8 stable desired unchokes per exact served key. Broadcast media and metadata aliases share
+N, including metadata-only and choked occupants. At defaults, a stream's 17th admission closes
+before a handshake response. G=0 acts as one; N=0 restores global-only admission; U=0 still
+selects one optimistic interested peer. Positive N greater than G is valid. Configuration is
+read at startup; it is not hot-reloaded.
+
+To restore global-only admission, put this explicit service override in `compose.override.yml`
+(the service name matches the root Compose file):
+
+```yaml
+services:
+  outpace:
+    environment:
+      OUTPACE_MAX_INBOUND_PER_STREAM: "0"
+```
+
+Recreate the service with `docker compose up -d --force-recreate --wait`. Use `"16"` to restore
+the default, or another unsigned integer to select N. Merely placing the new variable in `.env`
+does not forward it into the container: the current Compose templates do not interpolate or
+forward it. Empty, negative, malformed, overflow or non-Unicode values fail process startup.
+This setting changes no listener address, port publishing, enable flag, or cache path.
+
+Admission promises neither bandwidth/equal shares nor class reservations: metadata clients can
+fill N and crowd out media, and unidentified handshakes can still fill G. For I interested peers,
+each exact-key coordinator selects `min(I, U + 1)` desired unchokes in interest-entry order,
+rotating its tail on nominal 10-second ticks. Asynchronous observation/writes prevent treating
+this as an instantaneous wire-visible bound; metadata replies bypass Interested/Unchoke.
+
+DELETE removes producer/registry ownership, not existing connections. Admitted sessions retain
+their data and coordinator Arcs; old coordinators stop receiving registry-driven rotations.
+Aborting only the listener also leaves detached handlers running until they exit. TTL=300
+reaps ownerless registry entries, not sessions. The serve loop's 250 ms polling can cancel
+pending reads and their inner timeouts, so per-operation timeouts do not establish a whole-session
+idle deadline. Outbound reciprocal uploads are outside these inbound budgets. See
+[shared seeding](protocol/shared-seeding.md) for lifetime details.
+
 For a disk-backed piece cache:
 
 ```dotenv
