@@ -250,16 +250,22 @@ does not change them. They are not an independent media-capability probe.
 
 ## Unsupported and deferred work
 
-**Intentional non-goals:** premium/encrypted content; accounts, subscriptions,
-DAO/auth methods and engine access-token authentication; player/remote UI and bundled
-web UI; search, channel catalogs, EPG, and playlist enumeration. Outpace serves known
-public inputs rather than cloning these engine/application services. Unknown control
-methods use the in-band error above; absent routes such as `/search` return 404.
+| Feature | Status | Rationale / limit |
+| --- | --- | --- |
+| Premium/encrypted content | Unsupported; intentional non-goal | The adapter supports public, unencrypted live inputs. |
+| Accounts, subscriptions, DAO/auth methods and engine access-token authentication | Unsupported; intentional non-goal | Outpace does not clone these engine services. |
+| Player/remote UI and bundled web UI | Unsupported; intentional non-goal | Outpace does not clone these application services. |
+| Search, channel catalogs, EPG and playlist enumeration | Unsupported; intentional non-goal | Outpace serves known public inputs. Unknown control methods use the in-band error above; absent routes such as `/search` return 404. |
 
-**Deferred, not supported:** legacy VOD playback/HLS, seek/file selection, reverse
-content-id lookup, raw transport dumping, and arbitrary client-selected transcoding.
-Native `/vod` and the bounded global live-HLS audio option do not implement these
-legacy contracts. No future availability is promised.
+| Feature | Status | Rationale / limit |
+| --- | --- | --- |
+| Legacy VOD playback/HLS | Deferred; not supported | Native `/vod` is a separate surface, not this legacy contract. |
+| Seek/file selection | Deferred; not supported | No legacy seeking or file-selection contract is implemented. |
+| Reverse content-id lookup | Deferred; not supported | `get_content_id` only echoes a supplied content id. |
+| Raw transport dumping | Deferred; not supported | `get_media_files` does not produce a raw transport dump. |
+| Arbitrary client-selected transcoding | Deferred; not supported | The bounded global live-HLS audio option does not implement this legacy contract. |
+
+No future availability is promised for deferred features.
 
 ## Evidence boundary
 
