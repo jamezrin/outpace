@@ -38,6 +38,107 @@ type CreatingStores = Arc<StdMutex<HashMap<[u8; 20], StoreRendezvous>>>;
 /// Per-infohash metadata blob, shared by inbound seed sessions serving BEP-9 metadata.
 type SharedMetadata = Arc<Vec<u8>>;
 
+/// Inbound connection occupancy and exact-key desired-unchoke policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboundPolicy {
+    pub max_inbound: usize,
+    /// Combined media/metadata occupancy per canonical stream; zero disables this cap.
+    pub max_per_stream: usize,
+    pub max_unchoked: usize,
+}
+
+impl InboundPolicy {
+    /// Create one domain for a listener. Clones share global and canonical capacity.
+    pub fn admission(self) -> InboundAdmission {
+        InboundAdmission {
+            policy: self,
+            global: Arc::new(tokio::sync::Semaphore::new(self.max_inbound.max(1))),
+            accounting: Arc::new(StdMutex::new(AdmissionState::default())),
+        }
+    }
+}
+
+/// Shared admission domain for accepted transports, independent of registry generations.
+#[derive(Clone)]
+pub struct InboundAdmission {
+    policy: InboundPolicy,
+    global: Arc<tokio::sync::Semaphore>,
+    accounting: Arc<StdMutex<AdmissionState>>,
+}
+
+impl InboundAdmission {
+    /// Reserve global capacity without waiting, returning an owning connection future.
+    /// At capacity the transport closes immediately. Dropping an unpolled future also releases
+    /// its reservation; once polled, it retains both reservations through every serving await.
+    pub fn accept<S>(
+        &self,
+        stream: S,
+        registry: SeedRegistry,
+        our_peer_id: [u8; 20],
+        piece_header: [u8; 8],
+        identity: Arc<Identity>,
+        peer_ip: [u8; 4],
+    ) -> Option<impl std::future::Future<Output = ace_peer::Result<()>> + Send + 'static>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let permit = self.global.clone().try_acquire_owned().ok()?;
+        let admission = self.clone();
+        Some(async move {
+            let _global_permit = permit;
+            handle_inbound(
+                stream,
+                registry,
+                our_peer_id,
+                piece_header,
+                &identity,
+                peer_ip,
+                &admission,
+            )
+            .await
+        })
+    }
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    counts: HashMap<[u8; 20], usize>,
+    bindings: HashMap<[u8; 20], [u8; 20]>,
+}
+
+/// Weak observers let broadcast registration extend a live canonical group's alias bindings,
+/// even when the group's last snapshot predates that registration. No accounting owner is kept
+/// alive by the registry, and this list's lock is released before taking an accounting lock.
+type AdmissionDomains = Arc<StdMutex<Vec<std::sync::Weak<StdMutex<AdmissionState>>>>>;
+
+struct InboundPermit {
+    accounting: Arc<StdMutex<AdmissionState>>,
+    canonical: [u8; 20],
+}
+
+impl Drop for InboundPermit {
+    fn drop(&mut self) {
+        // Never acquire the registry lock here: admission's lock order is registry -> accounting.
+        let mut state = self.accounting.lock().unwrap();
+        if let Some(count) = state.counts.get_mut(&self.canonical) {
+            *count -= 1;
+            if *count == 0 {
+                state.counts.remove(&self.canonical);
+                state
+                    .bindings
+                    .retain(|_, canonical| *canonical != self.canonical);
+            }
+        }
+    }
+}
+
+struct AdmittedSeed {
+    store: Option<SharedStore>,
+    metadata: Option<SharedMetadata>,
+    coordinator: Arc<ServeCoordinator>,
+    _permit: InboundPermit,
+}
+
 /// Who keeps a registry entry alive. `Leech` entries are refcounted by `SeedLease`s (the download
 /// loop) and are also eligible for the idle-TTL backstop reaper; `Broadcast` entries are
 /// operator-controlled (removed only when their lease drops on DELETE) and exempt from the reaper.
@@ -65,6 +166,28 @@ struct SeedEntry {
     last_active: u64,
     /// Lazily-created multi-peer serve coordinator (S2). Shares the entry's lifetime.
     coordinator: Option<Arc<ServeCoordinator>>,
+    /// None marks an inconsistent association, rejected until this entry is removed.
+    canonical: Option<[u8; 20]>,
+    /// Keep the broadcast group on both entries, including aliases removed before admission.
+    /// Live admissions additionally retain these bindings outside the registry generation.
+    admission_aliases: Vec<[u8; 20]>,
+}
+
+impl SeedEntry {
+    fn require_canonical(&mut self, canonical: [u8; 20]) {
+        if self.canonical != Some(canonical) {
+            self.canonical = None;
+        }
+    }
+
+    fn associate_broadcast(&mut self, canonical: [u8; 20], alias: [u8; 20]) {
+        self.require_canonical(canonical);
+        for key in [canonical, alias] {
+            if !self.admission_aliases.contains(&key) {
+                self.admission_aliases.push(key);
+            }
+        }
+    }
 }
 
 /// Maps infohash -> the store and/or metadata we'd serve. Entry lifetime is anchored by
@@ -74,6 +197,7 @@ struct SeedEntry {
 #[derive(Clone, Default)]
 pub struct SeedRegistry {
     stores: Arc<StdMutex<HashMap<[u8; 20], SeedEntry>>>,
+    admission_domains: AdmissionDomains,
     /// Per-key construction rendezvous. `OnceLock` runs the potentially blocking factory without
     /// holding `stores`; racing callers wait for and reuse the exact published store instead of
     /// constructing a disposable disk-backed candidate.
@@ -87,30 +211,30 @@ impl SeedRegistry {
 
     /// Register (or replace) the store for `infohash`.
     pub fn register(&self, infohash: [u8; 20], store: SharedStore) {
-        self.stores
-            .lock()
-            .unwrap()
-            .entry(infohash)
-            .or_insert_with(|| SeedEntry {
-                generation: next_generation(),
-                last_active: now_millis(),
-                ..Default::default()
-            })
-            .store = Some(store);
+        let mut map = self.stores.lock().unwrap();
+        let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
+            canonical: Some(infohash),
+            generation: next_generation(),
+            last_active: now_millis(),
+            ..Default::default()
+        });
+        entry.require_canonical(infohash);
+        let old = entry.store.replace(store);
+        drop(map);
+        drop(old);
     }
 
     /// Register (or replace) the BEP-9 metadata for `key`.
     pub fn register_metadata(&self, key: [u8; 20], metadata: Vec<u8>) {
-        self.stores
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_insert_with(|| SeedEntry {
-                generation: next_generation(),
-                last_active: now_millis(),
-                ..Default::default()
-            })
-            .metadata = Some(Arc::new(metadata));
+        let mut map = self.stores.lock().unwrap();
+        let entry = map.entry(key).or_insert_with(|| SeedEntry {
+            canonical: Some(key),
+            generation: next_generation(),
+            last_active: now_millis(),
+            ..Default::default()
+        });
+        entry.require_canonical(key);
+        entry.metadata = Some(Arc::new(metadata));
     }
 
     /// The store for `infohash`, creating it via `make` (and registering it) if absent.
@@ -121,8 +245,15 @@ impl SeedRegistry {
         infohash: [u8; 20],
         make: impl FnOnce() -> PieceStore,
     ) -> SharedStore {
-        if let Some(store) = self.get(&infohash) {
-            return store;
+        {
+            let mut map = self.stores.lock().unwrap();
+            if let Some(entry) = map.get_mut(&infohash) {
+                entry.require_canonical(infohash);
+                entry.last_active = now_millis();
+                if let Some(store) = &entry.store {
+                    return store.clone();
+                }
+            }
         }
         let rendezvous = {
             let mut creating = self.creating.lock().unwrap();
@@ -133,15 +264,14 @@ impl SeedRegistry {
             .clone();
         let store = {
             let mut map = self.stores.lock().unwrap();
-            map.entry(infohash)
-                .or_insert_with(|| SeedEntry {
-                    generation: next_generation(),
-                    last_active: now_millis(),
-                    ..Default::default()
-                })
-                .store
-                .get_or_insert_with(|| candidate.clone())
-                .clone()
+            let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
+                canonical: Some(infohash),
+                generation: next_generation(),
+                last_active: now_millis(),
+                ..Default::default()
+            });
+            entry.require_canonical(infohash);
+            entry.store.get_or_insert_with(|| candidate.clone()).clone()
         };
         // Removing the rendezvous can drop its final store reference, so do it outside `stores`.
         let finished = self.creating.lock().unwrap().remove(&infohash);
@@ -163,10 +293,12 @@ impl SeedRegistry {
         let candidate = self.get_or_create(infohash, make);
         let mut map = self.stores.lock().unwrap();
         let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
+            canonical: Some(infohash),
             generation: next_generation(),
             last_active: now_millis(),
             ..Default::default()
         });
+        entry.require_canonical(infohash);
         let store = entry.store.get_or_insert_with(|| candidate.clone()).clone();
         entry.producers += 1;
         let lease = SeedLease {
@@ -195,10 +327,12 @@ impl SeedRegistry {
         let mut map = self.stores.lock().unwrap();
         let (store, ih_generation) = {
             let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
+                canonical: Some(infohash),
                 generation: next_generation(),
                 last_active: now_millis(),
                 ..Default::default()
             });
+            entry.associate_broadcast(infohash, content_id);
             entry.producers += 1;
             entry.kind = OwnerKind::Broadcast;
             let store = entry.store.get_or_insert_with(|| candidate.clone()).clone();
@@ -206,20 +340,83 @@ impl SeedRegistry {
         };
         let cid_generation = {
             let meta_entry = map.entry(content_id).or_insert_with(|| SeedEntry {
+                canonical: Some(infohash),
                 generation: next_generation(),
                 last_active: now_millis(),
                 ..Default::default()
             });
+            meta_entry.associate_broadcast(infohash, content_id);
             meta_entry.producers += 1;
             meta_entry.kind = OwnerKind::Broadcast;
             meta_entry.metadata = Some(Arc::new(metadata));
             meta_entry.generation
         };
+        self.retain_live_aliases(&mut map, infohash);
         let lease = SeedLease {
             registry: Arc::downgrade(&self.stores),
             keys: vec![(infohash, ih_generation), (content_id, cid_generation)],
         };
         (store, lease)
+    }
+
+    /// Called under the registry mutation lock after associating both broadcast entries.
+    /// Extending a group must also bind its new aliases for already-admitted media-only peers.
+    fn retain_live_aliases(&self, map: &mut HashMap<[u8; 20], SeedEntry>, canonical: [u8; 20]) {
+        let Some(aliases) = Self::canonical_aliases(map, canonical) else {
+            return;
+        };
+        let domains: Vec<_> = {
+            let mut domains = self.admission_domains.lock().unwrap();
+            domains.retain(|domain| domain.strong_count() != 0);
+            domains
+                .iter()
+                .filter_map(|domain| domain.upgrade())
+                .collect()
+        };
+        for domain in domains {
+            let mut state = domain.lock().unwrap();
+            if !state.counts.contains_key(&canonical) {
+                continue;
+            }
+            if aliases.iter().any(|alias| {
+                state
+                    .bindings
+                    .get(alias)
+                    .is_some_and(|bound| *bound != canonical)
+            }) {
+                // An extension that would join two live identities is inconsistent for this
+                // registry generation, rather than silently moving either identity's aliases.
+                for entry in map.values_mut() {
+                    if entry.canonical == Some(canonical) {
+                        entry.canonical = None;
+                    }
+                }
+                return;
+            }
+            for alias in &aliases {
+                state.bindings.insert(*alias, canonical);
+            }
+        }
+    }
+
+    fn canonical_aliases(
+        map: &HashMap<[u8; 20], SeedEntry>,
+        canonical: [u8; 20],
+    ) -> Option<Vec<[u8; 20]>> {
+        let mut aliases = vec![canonical];
+        for (key, entry) in map.iter() {
+            if entry.canonical == Some(canonical) {
+                aliases.push(*key);
+                aliases.extend_from_slice(&entry.admission_aliases);
+            }
+        }
+        if aliases.iter().any(|alias| {
+            map.get(alias)
+                .is_some_and(|entry| entry.canonical != Some(canonical))
+        }) {
+            return None;
+        }
+        Some(aliases)
     }
 
     /// The store for `infohash`, if we serve it. Touches the entry's activity clock (used by the
@@ -271,9 +468,67 @@ impl SeedRegistry {
         })
     }
 
-    /// True iff we serve `infohash` (used as the inbound handshake's accept predicate).
+    /// True iff a registry entry exists. Inbound handshakes use coherent admission instead.
     pub fn serves(&self, infohash: &[u8; 20]) -> bool {
         self.stores.lock().unwrap().contains_key(infohash)
+    }
+
+    /// Resolve and reserve under one mutation lock; no later resource lookup is needed.
+    fn admit_inbound(&self, key: &[u8; 20], admission: &InboundAdmission) -> Option<AdmittedSeed> {
+        let mut map = self.stores.lock().unwrap();
+        let entry = map.get(key)?;
+        if entry.store.is_none() && entry.metadata.is_none() {
+            return None;
+        }
+        let canonical = entry.canonical?;
+        // A collision on any member invalidates admission for the whole canonical group,
+        // including media-only requests that would otherwise avoid the conflicting alias.
+        let aliases = Self::canonical_aliases(&map, canonical)?;
+        let mut state = admission.accounting.lock().unwrap();
+        if aliases.iter().any(|alias| {
+            state
+                .bindings
+                .get(alias)
+                .is_some_and(|bound| *bound != canonical)
+        }) {
+            return None;
+        }
+        let count = state.counts.get(&canonical).copied().unwrap_or(0);
+        if admission.policy.max_per_stream != 0 && count >= admission.policy.max_per_stream {
+            return None;
+        }
+        let next = count.checked_add(1)?;
+        let entry = map.get_mut(key)?;
+        let coordinator = entry
+            .coordinator
+            .get_or_insert_with(|| ServeCoordinator::new(admission.policy.max_unchoked))
+            .clone();
+        entry.last_active = now_millis();
+        let store = entry.store.clone();
+        let metadata = entry.metadata.clone();
+        state.counts.insert(canonical, next);
+        for alias in aliases {
+            state.bindings.insert(alias, canonical);
+        }
+        drop(state);
+        {
+            let mut domains = self.admission_domains.lock().unwrap();
+            domains.retain(|domain| domain.strong_count() != 0);
+            let domain = Arc::downgrade(&admission.accounting);
+            if !domains.iter().any(|existing| existing.ptr_eq(&domain)) {
+                domains.push(domain);
+            }
+        }
+        drop(map);
+        Some(AdmittedSeed {
+            store,
+            metadata,
+            coordinator,
+            _permit: InboundPermit {
+                accounting: admission.accounting.clone(),
+                canonical,
+            },
+        })
     }
 
     /// The serve coordinator for `infohash`, creating it (with `max_unchoked`) on first use.
@@ -380,7 +635,7 @@ impl Drop for SeedLease {
 }
 
 /// Accepts inbound peer connections, verifies the requested infohash against `registry`, and
-/// serves accepted peers via `SeederSession::serve`. Bounded to `max_inbound` concurrent peers.
+/// serves accepted peers via `SeederSession::serve`, retaining admission until connection exit.
 pub struct PeerListener;
 
 impl PeerListener {
@@ -404,7 +659,37 @@ impl PeerListener {
         max_unchoked: usize,
         reachability: Option<Arc<ReachabilityMonitor>>,
     ) {
-        let sem = Arc::new(tokio::sync::Semaphore::new(max_inbound.max(1)));
+        Self::serve_with_policy(
+            listener,
+            registry,
+            our_peer_id,
+            piece_header,
+            Self::compatibility_policy(max_inbound, max_unchoked).admission(),
+            identity,
+            reachability,
+        )
+        .await;
+    }
+
+    fn compatibility_policy(max_inbound: usize, max_unchoked: usize) -> InboundPolicy {
+        InboundPolicy {
+            max_inbound,
+            max_per_stream: 0,
+            max_unchoked,
+        }
+    }
+
+    /// Serve with an already-constructed shared policy domain. Aborting this listener does not
+    /// abort its detached connection tasks; their permits and snapshots remain live until exit.
+    pub async fn serve_with_policy(
+        listener: TcpListener,
+        registry: SeedRegistry,
+        our_peer_id: [u8; 20],
+        piece_header: [u8; 8],
+        admission: InboundAdmission,
+        identity: Arc<Identity>,
+        reachability: Option<Arc<ReachabilityMonitor>>,
+    ) {
         loop {
             let (stream, addr) = match listener.accept().await {
                 Ok(pair) => pair,
@@ -423,35 +708,24 @@ impl PeerListener {
             if let Some(monitor) = &reachability {
                 monitor.note_inbound_peer();
             }
-            // Bounded concurrency: try_acquire_owned (non-blocking) rather than
-            // acquire_owned().await. At capacity we want to drop the new connection
-            // immediately and keep accepting, not stall the accept loop queuing up
-            // sockets the kernel has already handed us — a slow/idle peer holding a
-            // permit must not back up every other inbound connection behind it.
-            let permit = match sem.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => continue, // at capacity; drop the connection
-            };
-            let registry = registry.clone();
-            let identity = identity.clone();
             let peer_ip = match addr.ip() {
                 std::net::IpAddr::V4(v4) => v4.octets(),
                 std::net::IpAddr::V6(_) => [0, 0, 0, 0],
             };
+            // The same nonblocking gate owns the permit for TCP and other accepted transports.
+            let Some(connection) = admission.accept(
+                stream,
+                registry.clone(),
+                our_peer_id,
+                piece_header,
+                identity.clone(),
+                peer_ip,
+            ) else {
+                continue;
+            };
             tokio::spawn(async move {
-                let _permit = permit;
                 crate::alog!("[seed-listener] accepted connection from {addr}");
-                if let Err(e) = handle_inbound(
-                    stream,
-                    registry,
-                    our_peer_id,
-                    piece_header,
-                    &identity,
-                    peer_ip,
-                    max_unchoked,
-                )
-                .await
-                {
+                if let Err(e) = connection.await {
                     crate::alog!("[seed-listener] peer error from {addr}: {e:?}");
                 }
             });
@@ -466,28 +740,29 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     piece_header: [u8; 8],
     identity: &Identity,
     peer_ip: [u8; 4],
-    max_unchoked: usize,
+    admission: &InboundAdmission,
 ) -> ace_peer::Result<()> {
     let mut session = PeerSession::new(stream);
-    let peer_hs = session
-        .accept_handshake(our_peer_id, |ih| registry.serves(ih))
+    let mut admitted = None;
+    session
+        .accept_handshake(our_peer_id, |key| {
+            admitted = registry.admit_inbound(key, admission);
+            admitted.is_some()
+        })
         .await?;
-    let store = registry.get(&peer_hs.infohash);
-    let metadata = registry.metadata(&peer_hs.infohash);
-    if store.is_none() && metadata.is_none() {
-        return Err(ace_peer::PeerError::InfohashMismatch);
-    }
-    let coordinator = registry.coordinator_for(&peer_hs.infohash, max_unchoked);
-    SeederSession::serve(
+    let snapshot = admitted.ok_or(ace_peer::PeerError::InfohashMismatch)?;
+    let result = SeederSession::serve(
         &mut session,
-        store,
-        metadata,
+        snapshot.store.clone(),
+        snapshot.metadata.clone(),
         piece_header,
         identity,
         peer_ip,
-        coordinator,
+        Some(snapshot.coordinator.clone()),
     )
-    .await
+    .await;
+    drop(snapshot);
+    result
 }
 
 #[cfg(test)]
@@ -746,3 +1021,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod inbound_policy_tests;

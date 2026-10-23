@@ -405,16 +405,30 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_HLS_STARTUP_TIMEOUT_MS` - maximum HLS playlist startup wait, default `45000`; must be
   at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. If the startup segment count is not reached, the
   request returns a retryable HTTP `503` at the deadline.
-- `OUTPACE_MAX_UNCHOKED` - max simultaneously-unchoked peers per served stream (default 8). Wired
-  into the inbound serve path via the per-infohash serve coordinator: each stream unchokes up to
-  this many interested peers plus one rotating optimistic slot (rotated on a ~10s rechoke tick).
+- `OUTPACE_MAX_UNCHOKED` - stable desired unchokes per exact served key, default `8` (U).
+  For I interested peers, the coordinator selects `min(I, U + 1)` desired states in
+  interest-entry order, with one rotating tail peer on nominal 10-second ticks. `0` still
+  selects one optimistic peer. Watch updates and pending writes make this a desired selection,
+  not an instantaneous wire-visible bound. Metadata replies bypass Interested/Unchoke.
 - `OUTPACE_SEED_TTL_SECS` - idle-TTL (seconds, default 300; 0 disables) after which an *ownerless*
   seed-registry entry (one with no live producer lease) is force-evicted by the reaper. A backstop
   only — normal teardown rides the lease drop, and entries held by a live producer or a broadcast
-  are never reaped.
-- `OUTPACE_MAX_INBOUND` - inbound peer connection limit, default `64`.
+  are never reaped. This TTL limits registry lifetime, not connection lifetime.
+- `OUTPACE_MAX_INBOUND` - retained inbound connection limit, default `64` (G); `0` acts as `1`.
+  Unidentified/incomplete handshakes consume this capacity too. Excess accepted sockets close
+  immediately without queuing behind retained connections.
+- `OUTPACE_MAX_INBOUND_PER_STREAM` - admitted connections per canonical stream, default `16`
+  (N), serialized in Config as `max_inbound_per_stream`. Broadcast media and metadata aliases
+  share this allowance, including idle, uninterested, choked and metadata-only connections.
+  At defaults the 17th combined admission closes before a handshake response. `0` restores
+  global-only admission and preserves U; positive N greater than G is valid and redundant for
+  occupancy. Empty, negative, malformed, overflow and non-Unicode environment values fail
+  startup; absence retains 16. Changes require restart/recreation. For rollback set
+  `OUTPACE_MAX_INBOUND_PER_STREAM=0`; Compose requires an explicit service environment override,
+  shown in [deployment.md](docs/deployment.md), rather than `.env` interpolation alone.
 - `OUTPACE_ENABLE_SEEDING` - reciprocal upload gate over outbound leech connections
   (answering peers' chunk requests). Self-announce is gated on `OUTPACE_ENABLE_INBOUND`.
+  Outbound reciprocal serving is outside the inbound admission/coordinator budgets.
 - `OUTPACE_ENABLE_INBOUND` (default: on) - inbound peer serving (S2) gate. On by default,
   intentionally matching the Acestream engine's out-of-the-box behavior: a full P2P participant
   that binds its peer port (`OUTPACE_PEER_LISTEN`), accepts inbound peers, seeds, and
@@ -462,6 +476,14 @@ boolean gates below, `true` does **not** enable them).
 
 Boolean gates accept exactly `1`, `true`, `0`, or `false`; other values are configuration errors
 rather than silently disabling a feature.
+
+Inbound admission grants no bandwidth/equal-share or class reservation guarantee; metadata-only
+clients can fill a stream's allowance. DELETE removes registry/producer ownership, while existing
+connections retain data and coordinator Arcs; their old coordinators stop receiving registry
+rotations. Aborting only the listener leaves detached handlers running. The serve loop's 250 ms
+polling can cancel reads and their inner timeouts, so those per-operation timeouts do not establish
+a whole-session idle deadline. See [shared seeding](docs/protocol/shared-seeding.md) for the
+admission, coordination and lifetime boundaries.
 
 The disk cache is **ephemeral**: a dedicated cache directory is cleared when a store is created and
 never reloaded across restarts (live piece data goes stale), which also avoids serving
