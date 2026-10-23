@@ -4,6 +4,8 @@ outpace keeps a **thin, opt-in** Acestream-compatible HTTP surface. The native `
 `/broadcast` APIs are the supported primary surface; the legacy `/ace/*`, `/server/api`, and
 `/webui/api/service` routes exist only to interoperate with existing Acestream middleware. This
 document is the contract: what is supported, what is intentionally rejected, and what is deferred.
+The [pinned client inventory](ace-client-inventory.md) maps representative client call sites to
+this subset, its regression coverage, and application features outside the contract.
 
 The whole compatibility surface is gated behind `OUTPACE_EXPERIMENTAL_ACE_COMPAT=1`
 (`experimental_ace_compat`) and is disabled by default. When the gate is off, every route below
@@ -24,7 +26,7 @@ Two envelope shapes are in play (a real engine quirk, not an outpace choice):
 | `GET /ace/getstream` | Supported | Selectors `content_id` > `infohash` > legacy `id` > `url` > `magnet`. With no `format`, directly streams `video/mp2t` and emits `Icy-Name` when the descriptor has a title; `format=json` returns playback/stat/command URLs and nested descriptor metadata with a new unpredictable, client-specific token. `id` is a content-ID alias; `infohash` is the only explicit bare-swarm selector, and it (like `magnet`) permits cold inputs. JSON URL creation mints a lease; authenticated catalog lookup and descriptor/hash verification occur when playback is opened. Unresolvable playback fails closed. Tokens expire after six hours and state is capped at 4096 live leases. Unsupported formats return an `/ace/*` error envelope. |
 | `GET /ace/r/<id>/<token>` | Supported | Playback byte stream for a valid lease. Missing, invalid, expired, stopped, or wrong-content tokens and `ProviderError::NotFound` (unregistered network only) return HTTP 404. Start errors return plain-text HTTP 502 (`Backend`) or 422 (`Unresolvable`); the lease remains usable for retry until expiry or revocation. |
 | `GET /ace/manifest.m3u8` | Supported (live) | Uses the same selectors and catalog resolution as `getstream`. The default and `format=redirect` return `302` to a stable `/ace/m/...` playlist; `format=json` returns documented playback/stat/command fields plus nested descriptor metadata. Each request owns one bounded HLS lease over the shared native packager. |
-| `GET /ace/m/<id>/<token>.m3u8` | Supported (live) | Token-authenticated media playlist over the native live HLS window. Missing, forged, expired, stopped, or evicted leases return `404`; responses are `no-store`. |
+| `GET /ace/m/<id>/<token>.m3u8` | Supported (live) | Token-authenticated media playlist over the native live HLS window. Segment URLs are absolute, using the same request `Host`/HTTP base policy as playback/control URLs; native HLS retains relative URLs. Missing, forged, expired, stopped, or evicted leases return `404`; responses are `no-store`. |
 | `GET /ace/c/<session>/<seq>.ts` | Supported (live) | `session` is the unpredictable HLS lease token emitted in the playlist. Retained native bytes are returned as `video/mp2t`; forged tokens and evicted, future, or malformed sequence numbers return `404`. Segment probes never start a stream. |
 | `GET /ace/stat/<id>/<token>` | Supported | Session stats and nested descriptor metadata under `.response`. Invalid/expired tokens return HTTP 200 with `response: null` and `error: "invalid or expired playback session"`. |
 | `GET /ace/cmd/<id>/<token>?method=stop` | Supported | `stop` revokes only this compatibility client's lease; other clients and native consumers keep the shared source alive. Invalid/expired tokens use the same error envelope as `stat`; other methods return an error envelope. |
@@ -76,8 +78,8 @@ not claimed; native VOD remains available under `/vod`. See note 56 for the obse
 contract and lifecycle details.
 
 The additive `metadata` object has stable `title`, `bitrate`, and `categories` fields. Unknown
-values are represented as `null`, `null`, and `[]`. HLS media playlists are unchanged; stream
-titles are exposed in the control JSON rather than encoded into a non-portable playlist tag.
+values are represented as `null`, `null`, and `[]`. Stream titles are exposed in the control
+JSON rather than encoded into a non-portable playlist tag.
 
 ## `/server/api` control methods
 
@@ -86,11 +88,11 @@ Dispatched on `?method=`; the response envelope is `{ "result": <value>, "error"
 
 | Method | Status | Result fields | Notes |
 | --- | --- | --- | --- |
-| `get_version` | Supported | `version`, `code`, `platform` | `version` is the crate version; `code` packs `MAJOR*10000 + MINOR*100 + PATCH`; `platform` is `std::env::consts::OS` (`linux` on Linux). |
+| `get_version` | Supported | `version`, `code`, `platform` | `version` is the crate version; `code` packs `MAJOR*10000 + MINOR*100 + PATCH`; `platform` is `std::env::consts::OS` (`linux` on Linux). Successful JSON on both aliases includes the literal `"error": null` for the sampled Compose healthcheck. |
 | `get_status` | Supported | `status`, `active_sessions` | `status` is `dl` when any session is active, else `idle`. |
 | `get_network_connection_status` | Supported | `status`, `connected`, `networks` | `connected` reflects whether any provider network is registered. |
 | `analyze_content` | Supported | `infohash`, `content_id`, `is_live`, `is_encrypted`, `status` | Resolves the content selector to its infohash. `infohash`/`magnet` selectors resolve offline; `content_id`/`url` need the live catalog/transport and are gated by the same switch as `/ace/getstream` content-id resolution. Resolving a `content_id` through the signed catalog here also lets a later `infohash=` playback of the result succeed (a BEP-9 result or `url` does not); an offline `infohash`/`magnet` analysis does not make that infohash playable. |
-| `get_content_id` | Supported (echo only) | `content_id` | Echoes a caller-supplied `content_id`/`query`. It cannot derive a content id from a bare infohash/url and returns an error envelope in that case. |
+| `get_content_id` | Supported (echo only) | `content_id` | Echoes a nonempty caller-supplied `content_id`/`query`, including malformed strings without 40-hex validation. It cannot derive a content id from a bare infohash/url and returns an error envelope in that case. |
 | `get_media_files` | Supported (best-effort) | `infohash`, `files[]` | outpace transports are single-file, so one media file is reported, keyed by infohash. Resolving a `content_id` through the signed catalog here also lets a later `infohash=` playback of the result succeed (a BEP-9 result or `url` does not). `dump_transport_file` is not supported. |
 
 Content-id resolution for live and VOD is catalog-only by default, with a trusted local
@@ -105,7 +107,10 @@ playback resolution, not content analysis.
 ### Selector parameters (`analyze_content`, `get_content_id`, `get_media_files`)
 
 Same precedence as `/ace/getstream`: `content_id` (or its alias `query`) > `infohash` > `url` >
-`magnet`. A malformed or missing selector returns an error envelope, never an HTTP error status.
+`magnet`. Analysis/media resolution rejects malformed or missing selectors in an error envelope,
+never an HTTP error status. `get_content_id` is an echo-only exception: nonempty supplied
+`content_id`/`query` strings are returned without syntax validation; missing or unavailable
+selectors return an error envelope.
 
 ## Intentionally unsupported
 

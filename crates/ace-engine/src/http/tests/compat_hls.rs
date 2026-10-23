@@ -27,7 +27,9 @@ async fn ace_manifest_redirects_to_stable_authenticated_native_hls_view() {
     assert!(playback.starts_with(&format!("/ace/m/{id}/")));
 
     let playlist = wait_for_hls_playlist(&app, &playback).await;
+    let segment_uri = playlist_segment_uri(&playlist);
     let segment_path = playlist_segment_path(&playlist).to_owned();
+    assert!(segment_uri.starts_with("http://127.0.0.1:6878/ace/c/"));
     assert!(segment_path.starts_with("/ace/c/"));
     assert_eq!(segment_path.split('/').nth(3).unwrap().len(), 64);
     assert_eq!(
@@ -44,6 +46,115 @@ async fn ace_manifest_redirects_to_stable_authenticated_native_hls_view() {
     assert_eq!(compat_segment.status(), StatusCode::OK);
     assert_eq!(compat_segment.headers()[header::CONTENT_TYPE], "video/mp2t");
     assert_eq!(compat_segment.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn compatibility_hls_segments_are_absolute_and_survive_proxy_base_rewrite() {
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let engine_base = "http://proxy-engine.example:6900";
+    let state = ace_hls_state(Duration::from_secs(60), 8);
+    let manager = state.manager.clone();
+    let app = router(state);
+
+    let redirect = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/ace/manifest.m3u8?infohash={id}"))
+                .header(header::HOST, "proxy-engine.example:6900")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), StatusCode::FOUND);
+    let redirect_playback = redirect.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .strip_prefix(engine_base)
+        .unwrap()
+        .to_owned();
+    let redirect_playlist =
+        wait_for_hls_playlist_with_host(&app, &redirect_playback, "proxy-engine.example:6900")
+            .await;
+    let absolute_segment = playlist_segment_uri(&redirect_playlist);
+    assert!(absolute_segment.starts_with(engine_base));
+
+    // Acestream-Manager replaces its configured engine base with its own origin and
+    // forwards the remaining URI through its same-origin catch-all proxy.
+    let proxy_base = format!("http://manager.example:8080/stream-proxy/hls/{id}");
+    let proxied_segment = absolute_segment.replacen(engine_base, &proxy_base, 1);
+    assert!(proxied_segment.starts_with(&proxy_base));
+    let catchall_suffix = proxied_segment.strip_prefix(&proxy_base).unwrap();
+    let rewritten_path = catchall_suffix;
+    let expected_segment = |path: &str, pkg: &crate::hls::HlsPackager| {
+        let seq = path
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .strip_suffix(".ts")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        pkg.compatibility_segment(seq).unwrap()
+    };
+    let pkg = manager.get_hls("hlsfix", id).await.unwrap();
+    assert!(rewritten_path.starts_with("/ace/c/"));
+    let retained = app
+        .clone()
+        .oneshot(
+            Request::get(rewritten_path)
+                .header(header::HOST, "proxy-engine.example:6900")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained.status(), StatusCode::OK);
+    let retained = axum::body::to_bytes(retained.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(retained, expected_segment(rewritten_path, &pkg));
+
+    let json_response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/ace/manifest.m3u8?format=json&infohash={id}"))
+                .header(header::HOST, "proxy-engine.example:6900")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_response.status(), StatusCode::OK);
+    let envelope: serde_json::Value =
+        serde_json::from_str(&response_text(json_response).await).unwrap();
+    let json_playback = envelope["response"]["playback_url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix(engine_base)
+        .unwrap();
+    let json_playlist =
+        wait_for_hls_playlist_with_host(&app, json_playback, "proxy-engine.example:6900").await;
+    let json_segment = playlist_segment_uri(&json_playlist);
+    assert!(json_segment.starts_with(engine_base));
+    let proxied_json_segment = json_segment.replacen(engine_base, &proxy_base, 1);
+    assert!(proxied_json_segment.starts_with(&proxy_base));
+    let json_catchall_suffix = proxied_json_segment.strip_prefix(&proxy_base).unwrap();
+    let rewritten_json_path = json_catchall_suffix;
+    let json_retained = app
+        .oneshot(
+            Request::get(rewritten_json_path)
+                .header(header::HOST, "proxy-engine.example:6900")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_retained.status(), StatusCode::OK);
+    let json_retained = axum::body::to_bytes(json_retained.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(json_retained, expected_segment(rewritten_json_path, &pkg));
 }
 
 #[tokio::test]
@@ -88,6 +199,7 @@ async fn ace_hls_stalled_playlist_returns_retryable_503() {
 
     let response = ace_hls_playback_with_timeout(
         State(state),
+        axum::http::HeaderMap::new(),
         Path((playback_id, manifest)),
         Duration::from_millis(1),
     )
@@ -118,6 +230,7 @@ async fn normalization_http_compat_terminal_failure_is_retryable_and_private() {
 
     let response = ace_hls_playback_with_timeout(
         State(request_state),
+        axum::http::HeaderMap::new(),
         Path((playback_id, manifest)),
         Duration::from_secs(1),
     )
@@ -453,6 +566,10 @@ async fn ace_and_native_hls_return_the_same_retained_segment_bytes() {
         .await
         .unwrap();
     assert_eq!(native_manifest.status(), StatusCode::OK);
+    let native_playlist = response_text(native_manifest).await;
+    assert!(
+        playlist_segment_uri(&native_playlist).starts_with(&format!("/streams/hlsfix/{id}/seg/"))
+    );
     assert!(Arc::ptr_eq(
         &compat_packager,
         &manager.get_hls("hlsfix", id).await.unwrap()

@@ -281,6 +281,158 @@ async fn ace_getstream_content_id_returns_a_playback_url_that_streams() {
 }
 
 #[tokio::test]
+async fn acexy_id_json_handshake_accepts_typed_response_and_returned_lifecycle_urls() {
+    use futures::StreamExt;
+
+    #[derive(serde::Deserialize)]
+    struct AcexyResponse {
+        playback_url: String,
+        stat_url: String,
+        command_url: String,
+        playback_session_id: String,
+        client_session_id: i32,
+        infohash: String,
+        is_live: u32,
+        is_encrypted: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AcexyEnvelope {
+        response: AcexyResponse,
+        error: Option<String>,
+    }
+
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let app = router(ace_compat_state(0));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/ace/getstream?id={id}&format=json&pid=synthetic-pid"
+            ))
+            .header(header::HOST, "localhost:6900")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let envelope: AcexyEnvelope = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(envelope.error.is_none());
+    assert_eq!(envelope.response.infohash, id);
+    assert_eq!(envelope.response.client_session_id, -1);
+    assert_eq!(envelope.response.is_live, 1);
+    assert_eq!(envelope.response.is_encrypted, 0);
+    assert!(envelope.response.playback_session_id.len() >= 32);
+
+    let playback_path = envelope
+        .response
+        .playback_url
+        .strip_prefix("http://localhost:6900")
+        .unwrap();
+    let mut playback = app
+        .clone()
+        .oneshot(Request::get(playback_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .into_body()
+        .into_data_stream();
+    assert_eq!(playback.next().await.unwrap().unwrap()[0], 0x47);
+
+    let stat_path = envelope
+        .response
+        .stat_url
+        .strip_prefix("http://localhost:6900")
+        .unwrap();
+    let stat = app
+        .clone()
+        .oneshot(Request::get(stat_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stat.status(), StatusCode::OK);
+    let stat: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(stat.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stat["error"], serde_json::Value::Null);
+    assert_eq!(stat["response"]["status"], "dl");
+
+    let command_path = envelope
+        .response
+        .command_url
+        .strip_prefix("http://localhost:6900")
+        .unwrap();
+    let stop = app
+        .oneshot(
+            Request::get(format!("{command_path}?method=stop"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let stop: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(stop.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stop["response"], "ok");
+    assert_eq!(stop["error"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn ace_getstream_malformed_json_id_returns_error_envelope() {
+    let response = router(ace_compat_state(0))
+        .oneshot(
+            Request::get("/ace/getstream?id=bad&format=json&pid=synthetic-pid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["response"], serde_json::Value::Null);
+    assert!(json["error"]
+        .as_str()
+        .is_some_and(|error| !error.is_empty()));
+}
+
+#[tokio::test]
+async fn ace_compat_playback_and_control_routes_are_gated_off_by_default() {
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    for path in [
+        format!("/ace/getstream?id={id}&format=json"),
+        format!("/ace/r/{id}/synthetic-token"),
+        format!("/ace/stat/{id}/synthetic-token"),
+        format!("/ace/cmd/{id}/synthetic-token?method=stop"),
+        format!("/ace/manifest.m3u8?infohash={id}"),
+        format!("/ace/m/{id}/synthetic-token.m3u8"),
+        "/ace/c/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/0.ts".into(),
+        "/server/api?method=get_version".into(),
+        "/webui/api/service?method=get_version".into(),
+    ] {
+        let response = router(fixture_state(0))
+            .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn ace_getstream_without_format_directly_streams_legacy_id_as_mpegts() {
     use futures::StreamExt;
     let content_id = "2123456789abcdef0123456789abcdef01234567";

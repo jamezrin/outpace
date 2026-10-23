@@ -360,6 +360,7 @@ fn spawn_stalled_hls_request(
     tokio::spawn(async move {
         ace_hls_playback_with_timeout(
             State(state),
+            axum::http::HeaderMap::new(),
             Path((playback_id, manifest)),
             Duration::from_secs(5),
         )
@@ -396,10 +397,43 @@ async fn wait_for_hls_playlist(app: &Router, path: &str) -> String {
 }
 
 fn playlist_segment_path(playlist: &str) -> &str {
+    let uri = playlist_segment_uri(playlist);
+    let Some((_, after_scheme)) = uri.split_once("://") else {
+        return uri;
+    };
+    let Some(path_start) = after_scheme.find('/') else {
+        return uri;
+    };
+    &after_scheme[path_start..]
+}
+
+fn playlist_segment_uri(playlist: &str) -> &str {
     playlist
         .lines()
         .find(|line| line.ends_with(".ts"))
         .expect("playlist segment")
+}
+
+async fn wait_for_hls_playlist_with_host(app: &Router, path: &str, host: &str) -> String {
+    for _ in 0..50 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header(axum::http::header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let playlist = response_text(response).await;
+        if playlist.contains(".ts") {
+            return playlist;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("HLS packager did not produce a segment");
 }
 
 async fn body_text(resp: Response) -> String {
