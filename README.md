@@ -204,6 +204,20 @@ catalog policy does not automatically resolve these raw-hash links. Alternativel
 broadcast transport URL (`http://<host>:<http-port>/broadcast/<name>`) to `outpace play`
 or use the `url=` selector. The receiver's transport-URL access policy still applies.
 
+Set one immutable profile for every producer path (raw PUT, RTMP, managed pull and CLI):
+
+```bash
+OUTPACE_BROADCAST_OPTIONS='{"synthetic-origin":{"title":"Synthetic broadcast","bitrate_bytes_per_sec":500000,"piece_length":131072,"quality":"HD","categories":[]}}' \
+  cargo run -p ace-engine --bin outpace -- broadcast synthetic-origin
+```
+
+An unused profile creates nothing. Fresh omissions retain the legacy defaults; resumed
+identities retain raw transport/key bytes and match only explicit fields. Changing an
+explicit option can fail with `broadcast_options_conflict`; use a new name or explicitly
+DELETE/recreate, losing identity/cursor continuity. Each default/profile/stored piece must fit
+one full wire piece in the store budget, including disk and unused profiles. See the
+[complete profile schema and startup/resume rules](docs/native-api.md#broadcast-startup-profiles).
+
 Attach an engine-owned HTTP(S) MPEG-TS source with `PUT /broadcast/<name>/source`, or
 set startup declarations in `OUTPACE_BROADCAST_SOURCES`:
 
@@ -341,6 +355,11 @@ Environment variables parsed by the daemon include:
   live and VOD; peer results do not populate the catalog-provenance infohash index.
 - `OUTPACE_BIND` - HTTP bind address, default `127.0.0.1:6878`.
 - `OUTPACE_RTMP_BIND` - RTMP ingest bind address, default `127.0.0.1:1935`.
+- `OUTPACE_BROADCAST_OPTIONS` - strict named startup profile JSON, default `{}`; at most
+  64 names and 262144 UTF-8 bytes. Optional title, bitrate in bytes/second, piece length,
+  quality and ordered categories; invalid values fail with `invalid_broadcast_options`.
+  Defaults: path name, `8375`, `65536`, `auto`, `["other"]`. No hot reload or profile-only mint.
+  See [bounds and immutable resume](docs/native-api.md#broadcast-startup-profiles).
 - `OUTPACE_BROADCAST_SOURCES` - startup source JSON map, default `{}`; at most 64 names,
   256 KiB UTF-8, URLs up to 8,192 bytes. Duplicate/unknown fields fail startup. Source timing
   defaults: connect 5s, read 15s, reconnect initial 1s, maximum 30s; see the native API limits.
@@ -450,7 +469,9 @@ Environment variables parsed by the daemon include:
   `OUTPACE_ACE_COMPAT` when migrating; an unused invalid alias is ignored.
 - `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
 - `OUTPACE_TRACKERS` - comma-separated `scheme://…` (typically `udp://host:port/announce`)
-  tracker URLs minted into `outpace broadcast` descriptors and used for broadcast self-announce.
+  tracker URLs minted into fresh broadcast descriptors for every producer path. Self-announce
+  uses that stored list for both keys on resume; process changes affect future identities only,
+  and empty stored lists remain empty.
   When set (non-empty after trimming) it fully replaces the built-in public default
   (`udp://t1.torrentstream.org:2710/announce`); unset leaves that default in place. Entries with
   no `scheme://` prefix (or longer than 256 bytes) are dropped with a warning, and the list is

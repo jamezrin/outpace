@@ -2,17 +2,20 @@
 
 use crate::ace_provider::build_piece_store;
 use crate::broadcast_ingest::{BroadcastIngest, IngestError};
+use crate::broadcast_options::{
+    validate_broadcast_options, BroadcastOptions, BroadcastOptionsError, ResolvedBroadcastOptions,
+};
 use crate::broadcast_persist::{BroadcastPersist, PersistedBroadcast};
 use crate::broadcast_pull::{run_source, SourceStatus, SourceStatusWriter, ValidatedSourceConfig};
-use crate::config::CacheType;
+use crate::config::{CacheType, Config};
 use ace_swarm::http_fetch::FetchPolicy;
 use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::store::PieceStore;
 use ace_wire::bencode::Bencode;
 use ace_wire::infohash::{infohash_of_descriptor, infohash_of_transport, transport_file_hash};
 use ace_wire::live_auth::LiveSourceAuth;
-use ace_wire::transport::{decode_transport, encode_transport};
-use std::collections::BTreeMap;
+use ace_wire::transport::{decode_transport, encode_transport, TransportDescriptor};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -45,11 +48,12 @@ pub enum ProducerKind {
     Pull,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastError {
     InvalidName,
     ProducerConflict,
     SourceConflict,
+    OptionsConflict,
     Stopping,
     ServiceStopping,
     PersistenceFailed,
@@ -64,6 +68,7 @@ impl BroadcastError {
             Self::InvalidName => "invalid_name",
             Self::ProducerConflict => "producer_conflict",
             Self::SourceConflict => "source_conflict",
+            Self::OptionsConflict => "broadcast_options_conflict",
             Self::Stopping => "broadcast_stopping",
             Self::ServiceStopping => "broadcast_service_stopping",
             Self::PersistenceFailed => "broadcast_persistence_failed",
@@ -71,6 +76,13 @@ impl BroadcastError {
             Self::PieceIndexExhausted => "piece_index_exhausted",
             Self::CleanupTimeout => "broadcast_cleanup_timeout",
         }
+    }
+}
+// Runtime/CLI may box this error directly after actual reload. Termination uses
+// Debug, so every presentation must retain the fixed public code.
+impl std::fmt::Debug for BroadcastError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 impl std::fmt::Display for BroadcastError {
@@ -244,6 +256,8 @@ pub struct Broadcast {
     pub infohash: [u8; 20],
     pub content_id: [u8; 20],
     pub transport_bytes: Arc<Vec<u8>>,
+    pub geometry: BroadcastGeometry,
+    pub trackers: Arc<Vec<String>>,
     pub store: Arc<Mutex<PieceStore>>,
     pub auth: Arc<LiveSourceAuth>,
     pub cursor: Arc<BroadcastCursor>,
@@ -358,6 +372,7 @@ struct SourceAttachment {
 }
 
 struct EntryState {
+    capacity_invalid: AtomicBool,
     data: StdMutex<EntryData>,
     cancel: watch::Sender<bool>,
     service_closed: Arc<AtomicBool>,
@@ -382,6 +397,7 @@ impl BroadcastEntry {
     fn new(service_closed: Arc<AtomicBool>) -> Self {
         Self {
             state: Arc::new(EntryState {
+                capacity_invalid: AtomicBool::new(false),
                 data: StdMutex::new(EntryData {
                     broadcast: None,
                     lease: None,
@@ -426,6 +442,7 @@ impl BroadcastEntry {
 
 /// Registry map locks only locate controllers; joins and all filesystem work are per entry.
 pub struct BroadcastRegistry {
+    options: BTreeMap<String, BroadcastOptions>,
     by_name: Arc<StdMutex<BTreeMap<String, Arc<BroadcastEntry>>>>,
     closed: Arc<AtomicBool>,
     service_cancel: watch::Sender<bool>,
@@ -443,7 +460,8 @@ pub struct BroadcastRegistry {
 
 type AnnounceFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[cfg(test)]
-pub(crate) type AnnouncerFactory = Arc<dyn Fn([u8; 20]) -> AnnounceFuture + Send + Sync>;
+pub(crate) type AnnouncerFactory =
+    Arc<dyn Fn([u8; 20], Vec<String>) -> AnnounceFuture + Send + Sync>;
 
 impl BroadcastRegistry {
     pub fn new() -> Arc<Self> {
@@ -457,7 +475,41 @@ impl BroadcastRegistry {
         cache_type: CacheType,
         cache_dir: PathBuf,
     ) -> Arc<Self> {
+        Self::configured_with_options(persist, cache_type, cache_dir, BTreeMap::new())
+    }
+    pub fn new_with_options(
+        options: BTreeMap<String, BroadcastOptions>,
+    ) -> Result<Arc<Self>, BroadcastOptionsError> {
+        validate_broadcast_options(&options)?;
+        Ok(Self::configured_with_options(
+            None,
+            CacheType::Memory,
+            PathBuf::new(),
+            options,
+        ))
+    }
+    pub fn with_persist_and_options(
+        data_dir: &Path,
+        cache_type: CacheType,
+        cache_dir: PathBuf,
+        options: BTreeMap<String, BroadcastOptions>,
+    ) -> Result<Arc<Self>, BroadcastOptionsError> {
+        validate_broadcast_options(&options)?;
+        Ok(Self::configured_with_options(
+            Some(BroadcastPersist::new(data_dir)),
+            cache_type,
+            cache_dir,
+            options,
+        ))
+    }
+    fn configured_with_options(
+        persist: Option<BroadcastPersist>,
+        cache_type: CacheType,
+        cache_dir: PathBuf,
+        options: BTreeMap<String, BroadcastOptions>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            options,
             by_name: Arc::new(StdMutex::new(BTreeMap::new())),
             closed: Arc::new(AtomicBool::new(false)),
             service_cancel: watch::channel(false).0,
@@ -555,10 +607,10 @@ impl BroadcastRegistry {
     async fn prepare(
         &self,
         name: &str,
-        title: &str,
         trackers: &[String],
         seed_registry: &SeedRegistry,
         store_bytes: u64,
+        require_persisted: bool,
     ) -> Result<(Arc<BroadcastEntry>, Broadcast), BroadcastError> {
         let entry = self.entry(name)?;
         let lifecycle = Self::lock_lifecycle(&entry).await?;
@@ -566,12 +618,13 @@ impl BroadcastRegistry {
             let data = entry.state.data.lock().unwrap();
             Self::check_entry(&entry.state, &data)?;
             if let Some(bc) = &data.broadcast {
+                check_store_capacity(bc.geometry, store_bytes, self.cache_type)?;
                 return Ok((entry.clone(), bc.clone()));
             }
         }
         let state = entry.state.clone();
         let name = name.to_owned();
-        let title = title.to_owned();
+        let options = self.options.get(&name).cloned().unwrap_or_default();
         let trackers = trackers.to_vec();
         let seed_registry = seed_registry.clone();
         let persist = self.persist.clone();
@@ -588,7 +641,7 @@ impl BroadcastRegistry {
                 let _io = io;
                 initialize(
                     &name,
-                    &title,
+                    &options,
                     &trackers,
                     &seed_registry,
                     store_bytes,
@@ -596,6 +649,7 @@ impl BroadcastRegistry {
                     cache_type,
                     cache_dir,
                     &init_state,
+                    require_persisted,
                 )
             })
             .await
@@ -639,13 +693,12 @@ impl BroadcastRegistry {
     pub async fn mint(
         &self,
         name: &str,
-        title: &str,
         trackers: &[String],
         seed_registry: &SeedRegistry,
         store_bytes: u64,
     ) -> Result<Broadcast, BroadcastError> {
         let (_, bc) = self
-            .prepare(name, title, trackers, seed_registry, store_bytes)
+            .prepare(name, trackers, seed_registry, store_bytes, false)
             .await?;
         bc.cursor.check()?;
         Ok(bc)
@@ -654,7 +707,6 @@ impl BroadcastRegistry {
     pub async fn acquire_producer(
         &self,
         name: &str,
-        title: &str,
         trackers: &[String],
         seed_registry: &SeedRegistry,
         store_bytes: u64,
@@ -662,7 +714,7 @@ impl BroadcastRegistry {
     ) -> Result<(Broadcast, ProducerSession), BroadcastError> {
         self.source_preflight(name, true)?;
         let (entry, bc) = self
-            .prepare(name, title, trackers, seed_registry, store_bytes)
+            .prepare(name, trackers, seed_registry, store_bytes, false)
             .await?;
         let _lifecycle = Self::lock_lifecycle(&entry).await?;
         let mut data = entry.state.data.lock().unwrap();
@@ -864,16 +916,15 @@ impl BroadcastRegistry {
                 if source.config != config {
                     return Err(BroadcastError::SourceConflict);
                 }
-                return Ok((
-                    data.broadcast.clone().ok_or(BroadcastError::StateInvalid)?,
-                    source.status.snapshot(),
-                ));
+                let bc = data.broadcast.clone().ok_or(BroadcastError::StateInvalid)?;
+                check_store_capacity(bc.geometry, store_bytes, self.cache_type)?;
+                return Ok((bc, source.status.snapshot()));
             }
         }
         let (bc, session) = self
-            .acquire_producer(name, name, trackers, seeds, store_bytes, ProducerKind::Pull)
+            .acquire_producer(name, trackers, seeds, store_bytes, ProducerKind::Pull)
             .await?;
-        self.ensure_announcing(name, trackers, port).await?;
+        self.ensure_announcing(name, port).await?;
         let status = SourceStatusWriter::new(name);
         #[cfg(test)]
         let status = {
@@ -1041,6 +1092,7 @@ impl BroadcastRegistry {
         &self,
         seed_registry: &SeedRegistry,
         store_bytes: u64,
+        configured_sources: &BTreeSet<String>,
     ) -> Result<Vec<Broadcast>, BroadcastError> {
         let Some(persist) = &self.persist else {
             return Ok(Vec::new());
@@ -1051,8 +1103,8 @@ impl BroadcastRegistry {
             .map_err(|_| BroadcastError::StateInvalid)?
             .map_err(|_| BroadcastError::PersistenceFailed)?;
         let mut out = Vec::new();
-        for (name, rec) in records {
-            if rec.is_err() || !valid_broadcast_name(&name) {
+        for (name, _record) in records {
+            if !valid_broadcast_name(&name) {
                 let mut map = self.by_name.lock().unwrap();
                 let entry = map
                     .entry(name)
@@ -1061,12 +1113,53 @@ impl BroadcastRegistry {
                 crate::alog!("[broadcast] persisted state rejected: broadcast_state_invalid");
                 continue;
             }
-            match self
-                .mint(&name, &name, &[], seed_registry, store_bytes)
+            // Re-read and validate inside prepare's owned lifecycle/I/O fences. The
+            // enumeration snapshot cannot authorize a later, replaced record.
+            let restored = self
+                .prepare(&name, &[], seed_registry, store_bytes, true)
                 .await
-            {
+                .and_then(|(_, bc)| {
+                    bc.cursor.check()?;
+                    Ok(bc)
+                });
+            match restored {
                 Ok(bc) => out.push(bc),
-                Err(_) => crate::alog!("[broadcast] {name}: persisted state rejected"),
+                Err(error) => {
+                    let capacity_invalid =
+                        self.by_name
+                            .lock()
+                            .unwrap()
+                            .get(&name)
+                            .is_some_and(|entry| {
+                                entry.state.capacity_invalid.load(Ordering::SeqCst)
+                                    || entry
+                                        .state
+                                        .data
+                                        .lock()
+                                        .unwrap()
+                                        .broadcast
+                                        .as_ref()
+                                        .is_some_and(|bc| {
+                                            check_store_capacity(
+                                                bc.geometry,
+                                                store_bytes,
+                                                self.cache_type,
+                                            )
+                                            .is_err()
+                                        })
+                            });
+                    if capacity_invalid
+                        || !matches!(
+                            error,
+                            BroadcastError::StateInvalid | BroadcastError::PieceIndexExhausted
+                        )
+                        || self.options.contains_key(&name)
+                        || configured_sources.contains(&name)
+                    {
+                        return Err(error);
+                    }
+                    crate::alog!("[broadcast] persisted state rejected: {}", error.code());
+                }
             }
         }
         Ok(out)
@@ -1123,7 +1216,6 @@ impl BroadcastRegistry {
     pub async fn ensure_announcing(
         &self,
         name: &str,
-        trackers: &[String],
         port: watch::Receiver<Option<u16>>,
     ) -> Result<(), BroadcastError> {
         let entry = self
@@ -1144,12 +1236,13 @@ impl BroadcastRegistry {
             .ok_or(BroadcastError::StateInvalid)?;
         bc.cursor.check()?;
         let mut tasks = entry.tasks.lock().unwrap();
+        let trackers = bc.trackers.as_ref();
         for id in [bc.infohash, bc.content_id] {
             #[cfg(test)]
             let factory = self.announcer.lock().unwrap().clone();
             #[cfg(test)]
             let announce: AnnounceFuture = match factory {
-                Some(factory) => factory(id),
+                Some(factory) => factory(id, trackers.to_vec()),
                 None => Box::pin(crate::ace_provider::announce_infohash_periodically_dynamic(
                     trackers.to_vec(),
                     id,
@@ -1363,10 +1456,183 @@ impl Drop for BroadcastRegistry {
     }
 }
 
+/// Geometry frozen from a validated transport, including consumer-valid legacy sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BroadcastGeometry {
+    pub piece_length: u64,
+    pub chunk_length: u64,
+}
+impl BroadcastGeometry {
+    pub fn from_transport(
+        descriptor: &TransportDescriptor,
+        signature_len: usize,
+    ) -> Result<Self, BroadcastError> {
+        let piece = descriptor.piece_length;
+        let chunk = descriptor.chunk_length;
+        let signature = u64::try_from(signature_len).map_err(|_| BroadcastError::StateInvalid)?;
+        if chunk != CHUNK_LENGTH
+            || piece == 0
+            || piece > ace_swarm::resolve::MAX_PIECE_LENGTH
+            || !piece.is_multiple_of(chunk)
+            || u16::try_from(piece / chunk).is_err()
+            || signature == 0
+            || signature >= piece
+            || i64::try_from(piece).is_err()
+            || i64::try_from(chunk).is_err()
+        {
+            return Err(BroadcastError::StateInvalid);
+        }
+        for length in [piece, chunk, piece - signature] {
+            let length = usize::try_from(length).map_err(|_| BroadcastError::StateInvalid)?;
+            if length > isize::MAX as usize {
+                return Err(BroadcastError::StateInvalid);
+            }
+        }
+        Ok(Self {
+            piece_length: piece,
+            chunk_length: chunk,
+        })
+    }
+}
+
+fn check_store_capacity(
+    geometry: BroadcastGeometry,
+    store_bytes: u64,
+    cache_type: CacheType,
+) -> Result<(), BroadcastError> {
+    if store_bytes < geometry.piece_length
+        || (cache_type == CacheType::Memory
+            && store_bytes > crate::config::safe_in_memory_pool_limit(isize::MAX as u64))
+    {
+        return Err(BroadcastError::StateInvalid);
+    }
+    Ok(())
+}
+
+struct ValidatedPersistedBroadcast {
+    auth: LiveSourceAuth,
+    geometry: BroadcastGeometry,
+    trackers: Vec<String>,
+    start: u64,
+}
+fn validate_persisted(
+    name: &str,
+    record: &PersistedBroadcast,
+    options: &BroadcastOptions,
+) -> Result<ValidatedPersistedBroadcast, BroadcastError> {
+    let auth = LiveSourceAuth::from_pkcs1_pem(&record.key_pkcs1_pem)
+        .map_err(|_| BroadcastError::StateInvalid)?;
+    let decoded = decode_transport(&record.transport).map_err(|_| BroadcastError::StateInvalid)?;
+    let geometry = BroadcastGeometry::from_transport(&decoded, auth.signature_len())?;
+    if !valid_broadcast_name(name)
+        || decoded.pubkey != auth.pubkey_der()
+        || !decoded.is_live
+        || decoded.raw.get(b"pieces").is_some()
+        || decoded
+            .raw
+            .get(b"name")
+            .and_then(Bencode::as_bytes)
+            .is_none()
+        || decoded.bitrate.is_none_or(|bitrate| bitrate <= 0)
+        || decoded.raw.get(b"authmethod").and_then(Bencode::as_bytes) != Some(b"RSA".as_slice())
+        || decoded
+            .raw
+            .get(b"outpace_name")
+            .is_some_and(|value| value.as_bytes() != Some(name.as_bytes()))
+    {
+        return Err(BroadcastError::StateInvalid);
+    }
+    infohash_of_descriptor(&decoded.raw).map_err(|_| BroadcastError::StateInvalid)?;
+    let start = match record.reserved_until {
+        Some(reserved) if record.next_piece <= reserved => reserved,
+        Some(_) => return Err(BroadcastError::StateInvalid),
+        None => record
+            .next_piece
+            .checked_add(CURSOR_PERSIST_INTERVAL)
+            .ok_or(BroadcastError::PieceIndexExhausted)?,
+    };
+    start
+        .checked_add(CURSOR_PERSIST_INTERVAL)
+        .ok_or(BroadcastError::PieceIndexExhausted)?;
+    if !options.matches_descriptor(&decoded.raw) {
+        return Err(BroadcastError::OptionsConflict);
+    }
+    Ok(ValidatedPersistedBroadcast {
+        auth,
+        geometry,
+        trackers: decoded.trackers,
+        start,
+    })
+}
+
+pub(crate) enum BroadcastStartupError {
+    StoreTooSmall,
+    Broadcast(BroadcastError),
+}
+// Boxed startup errors reach Result's Termination through Debug, including
+// profile conflicts and capacity failures. Keep that presentation sanitized too.
+impl std::fmt::Debug for BroadcastStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::fmt::Display for BroadcastStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StoreTooSmall => f.write_str("broadcast_store_too_small"),
+            Self::Broadcast(error) => f.write_str(error.code()),
+        }
+    }
+}
+impl std::error::Error for BroadcastStartupError {}
+
+/// Read-only startup policy: never generates keys, creates stores or advances reservations.
+pub(crate) fn preflight_broadcasts(config: &Config) -> Result<(), BroadcastStartupError> {
+    let enough = |piece_length| {
+        if config.seed_store_bytes < piece_length {
+            Err(BroadcastStartupError::StoreTooSmall)
+        } else {
+            Ok(())
+        }
+    };
+    enough(PIECE_LENGTH)?;
+    for (name, options) in &config.broadcast_options {
+        let options = options
+            .resolve_fresh(name)
+            .map_err(|_| BroadcastStartupError::Broadcast(BroadcastError::StateInvalid))?;
+        enough(options.piece_length)?;
+    }
+    let records = BroadcastPersist::new(&config.data_dir)
+        .load_all()
+        .map_err(|_| BroadcastStartupError::Broadcast(BroadcastError::PersistenceFailed))?;
+    for (name, record) in records {
+        let options = config
+            .broadcast_options
+            .get(&name)
+            .cloned()
+            .unwrap_or_default();
+        let validated = record
+            .map_err(|_| BroadcastError::StateInvalid)
+            .and_then(|record| validate_persisted(&name, &record, &options));
+        match validated {
+            Ok(validated) => enough(validated.geometry.piece_length)?,
+            Err(error)
+                if error == BroadcastError::OptionsConflict
+                    || config.broadcast_options.contains_key(&name)
+                    || config.broadcast_sources.contains_key(&name) =>
+            {
+                return Err(BroadcastStartupError::Broadcast(error));
+            }
+            Err(_) => {} // Unrelated malformed records retain their tombstones on actual reload.
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn initialize(
     name: &str,
-    title: &str,
+    options: &BroadcastOptions,
     trackers: &[String],
     seeds: &SeedRegistry,
     store_bytes: u64,
@@ -1374,6 +1640,7 @@ fn initialize(
     cache_type: CacheType,
     cache_dir: PathBuf,
     state: &EntryState,
+    require_persisted: bool,
 ) -> Result<(Broadcast, SeedLease), BroadcastError> {
     let loaded = match &persist {
         Some(persist) => persist
@@ -1381,62 +1648,49 @@ fn initialize(
             .map_err(|_| BroadcastError::StateInvalid)?,
         None => None,
     };
-    let (auth, transport, start) = match loaded {
+    let capacity = |geometry| {
+        check_store_capacity(geometry, store_bytes, cache_type).inspect_err(|_| {
+            state.capacity_invalid.store(true, Ordering::SeqCst);
+        })
+    };
+    let (auth, transport, key_pkcs1_pem, geometry, trackers, start) = match loaded {
         Some(rec) => {
-            let auth = LiveSourceAuth::from_pkcs1_pem(&rec.key_pkcs1_pem)
-                .map_err(|_| BroadcastError::StateInvalid)?;
-            let decoded =
-                decode_transport(&rec.transport).map_err(|_| BroadcastError::StateInvalid)?;
-            if decoded.pubkey != auth.pubkey_der()
-                || !decoded.is_live
-                || decoded.piece_length != PIECE_LENGTH
-                || decoded.chunk_length != CHUNK_LENGTH
-                || auth.signature_len() as u64 >= PIECE_LENGTH
-                || decoded.raw.get(b"pieces").is_some()
-                || decoded
-                    .raw
-                    .get(b"name")
-                    .and_then(Bencode::as_bytes)
-                    .is_none()
-                || decoded.bitrate.is_none_or(|bitrate| bitrate <= 0)
-                || decoded.raw.get(b"authmethod").and_then(Bencode::as_bytes)
-                    != Some(b"RSA".as_slice())
-            {
-                return Err(BroadcastError::StateInvalid);
-            }
-            if decoded
-                .raw
-                .get(b"outpace_name")
-                .is_some_and(|value| value.as_bytes() != Some(name.as_bytes()))
-            {
-                return Err(BroadcastError::StateInvalid);
-            }
-            // decode_transport tolerates absent metadata; the identity helper does not.
-            // Validate its required fields before saving or calling its infallible wrapper.
-            infohash_of_descriptor(&decoded.raw).map_err(|_| BroadcastError::StateInvalid)?;
-            let start = match rec.reserved_until {
-                Some(reserved) if rec.next_piece <= reserved => reserved,
-                Some(_) => return Err(BroadcastError::StateInvalid),
-                None => rec
-                    .next_piece
-                    .checked_add(CURSOR_PERSIST_INTERVAL)
-                    .ok_or(BroadcastError::PieceIndexExhausted)?,
-            };
-            (auth, rec.transport, start)
+            let validated = validate_persisted(name, &rec, options)?;
+            capacity(validated.geometry)?;
+            (
+                validated.auth,
+                rec.transport,
+                rec.key_pkcs1_pem,
+                validated.geometry,
+                validated.trackers,
+                validated.start,
+            )
         }
         None => {
+            if require_persisted {
+                return Err(BroadcastError::StateInvalid);
+            }
+            let resolved = options
+                .resolve_fresh(name)
+                .map_err(|_| BroadcastError::StateInvalid)?;
+            // Reject a bad direct-call budget before generating an identity or saving anything.
+            capacity(BroadcastGeometry {
+                piece_length: resolved.piece_length,
+                chunk_length: CHUNK_LENGTH,
+            })?;
             let auth = LiveSourceAuth::generate();
-            let descriptor = build_descriptor(name, title, trackers, &auth.pubkey_der());
-            let _ =
-                infohash_of_descriptor(&descriptor).map_err(|_| BroadcastError::StateInvalid)?;
+            let descriptor = build_descriptor(name, &resolved, trackers, &auth.pubkey_der());
+            infohash_of_descriptor(&descriptor).map_err(|_| BroadcastError::StateInvalid)?;
             let transport = encode_transport(&descriptor);
-            (auth, transport, 0)
+            let decoded = decode_transport(&transport).map_err(|_| BroadcastError::StateInvalid)?;
+            let geometry = BroadcastGeometry::from_transport(&decoded, auth.signature_len())?;
+            let key = auth.to_pkcs1_pem();
+            (auth, transport, key, geometry, decoded.trackers, 0)
         }
     };
     let reserved = start
         .checked_add(CURSOR_PERSIST_INTERVAL)
         .ok_or(BroadcastError::PieceIndexExhausted)?;
-    let key_pkcs1_pem = auth.to_pkcs1_pem();
     if let Some(persist) = &persist {
         persist
             .save(
@@ -1457,8 +1711,8 @@ fn initialize(
     let content_id = transport_file_hash(&transport);
     let (store, lease) = seeds.lease_broadcast(infohash, content_id, transport.clone(), || {
         build_piece_store(
-            PIECE_LENGTH,
-            CHUNK_LENGTH,
+            geometry.piece_length,
+            geometry.chunk_length,
             store_bytes,
             None,
             cache_type,
@@ -1488,6 +1742,8 @@ fn initialize(
             infohash,
             content_id,
             transport_bytes: Arc::new(transport),
+            geometry,
+            trackers: Arc::new(trackers),
             store,
             auth: Arc::new(auth),
             cursor,
@@ -1500,16 +1756,39 @@ fn initialize(
 /// real engine-produced source-node transport (note 25): `name`, `piece_length`,
 /// `chunk_length`, `bitrate`, `quality`, `categories`, `authmethod`, `pubkey`, `trackers`,
 /// `allow_public_trackers`. No `pieces` key — live, matching `TransportDescriptor::is_live`.
-fn build_descriptor(name: &str, title: &str, trackers: &[String], pubkey_der: &[u8]) -> Bencode {
+fn build_descriptor(
+    name: &str,
+    options: &ResolvedBroadcastOptions,
+    trackers: &[String],
+    pubkey_der: &[u8],
+) -> Bencode {
     let mut d: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
-    d.insert(b"name".to_vec(), Bencode::Bytes(title.as_bytes().to_vec()));
-    d.insert(b"piece_length".to_vec(), Bencode::Int(PIECE_LENGTH as i64));
+    d.insert(
+        b"name".to_vec(),
+        Bencode::Bytes(options.title.as_bytes().to_vec()),
+    );
+    d.insert(
+        b"piece_length".to_vec(),
+        Bencode::Int(options.piece_length as i64),
+    );
     d.insert(b"chunk_length".to_vec(), Bencode::Int(CHUNK_LENGTH as i64));
-    d.insert(b"bitrate".to_vec(), Bencode::Int(DEFAULT_BROADCAST_BITRATE));
-    d.insert(b"quality".to_vec(), Bencode::Bytes(b"auto".to_vec()));
+    d.insert(
+        b"bitrate".to_vec(),
+        Bencode::Int(options.bitrate_bytes_per_sec as i64),
+    );
+    d.insert(
+        b"quality".to_vec(),
+        Bencode::Bytes(options.quality.as_bytes().to_vec()),
+    );
     d.insert(
         b"categories".to_vec(),
-        Bencode::List(vec![Bencode::Bytes(b"other".to_vec())]),
+        Bencode::List(
+            options
+                .categories
+                .iter()
+                .map(|s| Bencode::Bytes(s.as_bytes().to_vec()))
+                .collect(),
+        ),
     );
     d.insert(b"authmethod".to_vec(), Bencode::Bytes(b"RSA".to_vec()));
     d.insert(b"pubkey".to_vec(), Bencode::Bytes(pubkey_der.to_vec()));
@@ -1548,11 +1827,18 @@ mod tests {
 
     #[tokio::test]
     async fn minted_broadcast_decodes_to_a_live_descriptor_with_our_pubkey() {
-        let (registry, seed) = registry();
+        let options = std::collections::BTreeMap::from([(
+            "test".to_owned(),
+            crate::broadcast_options::BroadcastOptions {
+                title: Some("Test Stream".to_owned()),
+                ..Default::default()
+            },
+        )]);
+        let registry = BroadcastRegistry::new_with_options(options).unwrap();
+        let seed = SeedRegistry::new();
         let bc = registry
             .mint(
                 "test",
-                "Test Stream",
                 &["udp://t.example:1/announce".into()],
                 &seed,
                 1 << 20,
@@ -1575,7 +1861,6 @@ mod tests {
         let bc = registry
             .mint(
                 "channel",
-                "Channel",
                 &["udp://tracker.example:2710/announce".into()],
                 &seed,
                 1 << 20,
@@ -1597,10 +1882,7 @@ mod tests {
         let dir = tmp_dir();
         let seed = SeedRegistry::new();
         let registry = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
-        let old = registry
-            .mint("channel", "Channel", &[], &seed, 1 << 20)
-            .await
-            .unwrap();
+        let old = registry.mint("channel", &[], &seed, 1 << 20).await.unwrap();
         assert!(seed.serves(&old.infohash));
         registry.delete("channel").await.unwrap();
         assert!(BroadcastPersist::new(&dir)
@@ -1609,10 +1891,7 @@ mod tests {
             .is_none());
         assert!(!seed.serves(&old.infohash));
         assert!(!seed.serves(&old.content_id));
-        let new = registry
-            .mint("channel", "Channel", &[], &seed, 1 << 20)
-            .await
-            .unwrap();
+        let new = registry.mint("channel", &[], &seed, 1 << 20).await.unwrap();
         assert_ne!(old.infohash, new.infohash);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1622,14 +1901,14 @@ mod tests {
         let dir = tmp_dir();
         let seed1 = SeedRegistry::new();
         let first = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new())
-            .mint("news", "News", &[], &seed1, 1 << 20)
+            .mint("news", &[], &seed1, 1 << 20)
             .await
             .unwrap();
         let seed2 = SeedRegistry::new();
         let second_registry =
             BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
         let loaded = second_registry
-            .reload_persisted(&seed2, 1 << 20)
+            .reload_persisted(&seed2, 1 << 20, &std::collections::BTreeSet::new())
             .await
             .unwrap();
         let second = loaded
@@ -1647,11 +1926,13 @@ mod tests {
     #[tokio::test]
     async fn different_names_get_different_infohashes() {
         let (registry, seed) = registry();
-        let a = registry.mint("a", "A", &[], &seed, 1 << 20).await.unwrap();
-        let b = registry.mint("b", "B", &[], &seed, 1 << 20).await.unwrap();
+        let a = registry.mint("a", &[], &seed, 1 << 20).await.unwrap();
+        let b = registry.mint("b", &[], &seed, 1 << 20).await.unwrap();
         assert_ne!(a.infohash, b.infohash);
     }
 }
 
+#[cfg(test)]
+mod tests_options51;
 #[cfg(test)]
 mod tests_pull206;

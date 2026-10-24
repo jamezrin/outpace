@@ -18,6 +18,10 @@ pub use ace_log::alog;
 pub mod ace_provider;
 pub mod broadcast;
 pub mod broadcast_ingest;
+pub mod broadcast_options;
+#[cfg(test)]
+#[path = "broadcast_options/tests.rs"]
+mod broadcast_options_tests;
 pub mod broadcast_persist;
 pub mod broadcast_pull;
 #[cfg(test)]

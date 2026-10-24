@@ -27,6 +27,7 @@ pub(super) fn broadcast_error(error: crate::broadcast::BroadcastError) -> Respon
     let status = match error {
         BroadcastError::InvalidName => StatusCode::BAD_REQUEST,
         BroadcastError::ProducerConflict
+        | BroadcastError::OptionsConflict
         | BroadcastError::SourceConflict
         | BroadcastError::Stopping => StatusCode::CONFLICT,
         BroadcastError::PersistenceFailed

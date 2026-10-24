@@ -276,6 +276,32 @@ does not change them. They are not an independent media-capability probe.
 
 No future availability is promised for deferred features.
 
+## Native origination scope and follow-ups
+
+Native [broadcast startup profiles](../native-api.md#broadcast-startup-profiles) cover explicit
+title, bytes/second bitrate, piece size, quality and categories across all MPEG-TS producers.
+They preserve default descriptor encoding, stored identity/trackers on resume and consumer-valid
+legacy geometry; they add no compatibility endpoint or automatic media/bitrate detection.
+API bitrate metadata remains bits/second. See [deployment configuration](../deployment.md#broadcast-profile-configuration)
+for container forwarding, one-full-piece budgets and immutable restart behavior.
+
+This supported slice does not by itself close #51. Its remaining issue accounting belongs
+to the parent issue/PR workflow; no follow-up below is implemented or implied here:
+
+| Area | Disposition / evidence still required |
+| --- | --- |
+| Metatracker and startup-node fields (#51) | Deferred pending actual wire evidence and a scoped contract. |
+| Tags, logo and description (#51) | Deferred pending wire evidence; no arbitrary metadata bag or invented fields. |
+| Private peer/advertisement policy | Separate security/discovery scope; a tracker override does not establish privacy. |
+| HLS as an origination transport/support capability | Separate transport/support scope; existing playback HLS is unchanged. |
+| Autonomous support-node lifecycle and deployment | Separate topology/lifecycle/deployment scope; no autonomous node management here. |
+| SRT (#7) | Existing follow-up; no new source protocol in profiles. |
+| Live interoperability/deployment (#205) | Existing follow-up; offline tests do not establish deployed playback or interoperability. |
+
+Root must record/link the scoped follow-ups before claiming broader #51 closure. No public
+network probe, original-engine comparison, deployment or release evidence is claimed by this
+profile implementation.
+
 ## Evidence boundary
 
 This document pins current Outpace behavior. The

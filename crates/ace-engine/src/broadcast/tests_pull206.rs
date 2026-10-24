@@ -141,7 +141,7 @@ async fn pull206_reservations_survive_repeated_restart() {
     let seed1 = SeedRegistry::new();
     let reg1 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     let (first, mut owner1) = reg1
-        .acquire_producer("alpha", "Alpha", &[], &seed1, 8 << 20, ProducerKind::Pull)
+        .acquire_producer("alpha", &[], &seed1, 8 << 20, ProducerKind::Pull)
         .await
         .unwrap();
     let mut ingest = owner1.open_ingest().unwrap();
@@ -156,7 +156,7 @@ async fn pull206_reservations_survive_repeated_restart() {
     let seed2 = SeedRegistry::new();
     let reg2 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     let (second, owner2) = reg2
-        .acquire_producer("alpha", "Alpha", &[], &seed2, 8 << 20, ProducerKind::Pull)
+        .acquire_producer("alpha", &[], &seed2, 8 << 20, ProducerKind::Pull)
         .await
         .unwrap();
     assert_eq!(second.infohash, first.infohash);
@@ -168,7 +168,7 @@ async fn pull206_reservations_survive_repeated_restart() {
     let seed3 = SeedRegistry::new();
     let reg3 = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     let (third, _owner3) = reg3
-        .acquire_producer("alpha", "Alpha", &[], &seed3, 8 << 20, ProducerKind::RawPut)
+        .acquire_producer("alpha", &[], &seed3, 8 << 20, ProducerKind::RawPut)
         .await
         .unwrap();
     assert_eq!(third.infohash, first.infohash);
@@ -188,14 +188,7 @@ async fn pull206_legacy_and_invalid_records() {
     let registry = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     let seed1 = SeedRegistry::new();
     let (bc, _owner) = registry
-        .acquire_producer(
-            "legacy",
-            "Legacy",
-            &[],
-            &seed1,
-            1 << 20,
-            ProducerKind::RawPut,
-        )
+        .acquire_producer("legacy", &[], &seed1, 1 << 20, ProducerKind::RawPut)
         .await
         .unwrap();
 
@@ -210,7 +203,7 @@ async fn pull206_legacy_and_invalid_records() {
     let seed2 = SeedRegistry::new();
     let resumed_registry = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     let (resumed, _owner2) = resumed_registry
-        .acquire_producer("legacy", "Legacy", &[], &seed2, 1 << 20, ProducerKind::Pull)
+        .acquire_producer("legacy", &[], &seed2, 1 << 20, ProducerKind::Pull)
         .await
         .unwrap();
     assert_eq!(resumed.infohash, bc.infohash);
@@ -227,7 +220,7 @@ async fn pull206_legacy_and_invalid_records() {
     let seed3 = SeedRegistry::new();
     let invalid_registry = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     assert!(invalid_registry
-        .acquire_producer("broken", "Broken", &[], &seed3, 1 << 20, ProducerKind::Pull)
+        .acquire_producer("broken", &[], &seed3, 1 << 20, ProducerKind::Pull)
         .await
         .is_err());
     assert!(
@@ -245,14 +238,7 @@ async fn pull206_reserve_before_publish() {
     let registry = BroadcastRegistry::with_test_persist(persist);
     let seed = SeedRegistry::new();
     let (broadcast, mut session) = registry
-        .acquire_producer(
-            "boundary",
-            "Boundary",
-            &[],
-            &seed,
-            4 << 20,
-            ProducerKind::Pull,
-        )
+        .acquire_producer("boundary", &[], &seed, 4 << 20, ProducerKind::Pull)
         .await
         .unwrap();
     assert_eq!(broadcast.cursor.reserved_until(), CURSOR_PERSIST_INTERVAL);
@@ -287,7 +273,7 @@ async fn pull206_overflow_and_identity_mismatch_fail_closed() {
     let registry = BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     let seed = SeedRegistry::new();
     let broadcast = registry
-        .mint("overflow", "Overflow", &[], &seed, 1 << 20)
+        .mint("overflow", &[], &seed, 1 << 20)
         .await
         .unwrap();
     let persist = BroadcastPersist::new(&dir);
@@ -308,20 +294,13 @@ async fn pull206_overflow_and_identity_mismatch_fail_closed() {
     let overflow_registry =
         BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     assert!(overflow_registry
-        .acquire_producer(
-            "overflow",
-            "Overflow",
-            &[],
-            &overflow_seed,
-            1 << 20,
-            ProducerKind::Pull
-        )
+        .acquire_producer("overflow", &[], &overflow_seed, 1 << 20, ProducerKind::Pull)
         .await
         .is_err());
     assert!(!overflow_seed.serves(&broadcast.infohash));
 
     let mismatch_identity = registry
-        .mint("mismatch", "Mismatch", &[], &seed, 1 << 20)
+        .mint("mismatch", &[], &seed, 1 << 20)
         .await
         .unwrap();
     let mismatched_key = ace_wire::live_auth::LiveSourceAuth::generate();
@@ -340,14 +319,7 @@ async fn pull206_overflow_and_identity_mismatch_fail_closed() {
     let mismatch_registry =
         BroadcastRegistry::with_persist(&dir, CacheType::Memory, PathBuf::new());
     assert!(mismatch_registry
-        .acquire_producer(
-            "mismatch",
-            "Mismatch",
-            &[],
-            &mismatch_seed,
-            1 << 20,
-            ProducerKind::Pull
-        )
+        .acquire_producer("mismatch", &[], &mismatch_seed, 1 << 20, ProducerKind::Pull)
         .await
         .is_err());
     assert!(!mismatch_seed.serves(&broadcast.infohash));
@@ -358,14 +330,7 @@ async fn pull206_overflow_and_identity_mismatch_fail_closed() {
 async fn pull206_exclusive_finite_ingress() {
     let (registry, seed) = diskless_registry();
     let (broadcast, mut session) = registry
-        .acquire_producer(
-            "exclusive",
-            "Exclusive",
-            &[],
-            &seed,
-            2 << 20,
-            ProducerKind::RawPut,
-        )
+        .acquire_producer("exclusive", &[], &seed, 2 << 20, ProducerKind::RawPut)
         .await
         .unwrap();
 
@@ -375,14 +340,7 @@ async fn pull206_exclusive_finite_ingress() {
         "one producer may have one active ingest"
     );
     assert!(registry
-        .acquire_producer(
-            "exclusive",
-            "Exclusive",
-            &[],
-            &seed,
-            2 << 20,
-            ProducerKind::Rtmp
-        )
+        .acquire_producer("exclusive", &[], &seed, 2 << 20, ProducerKind::Rtmp)
         .await
         .is_err());
 
@@ -409,14 +367,7 @@ async fn pull206_exclusive_finite_ingress() {
     let _retry = session.open_ingest().unwrap();
     assert!(
         registry
-            .acquire_producer(
-                "exclusive",
-                "Exclusive",
-                &[],
-                &seed,
-                2 << 20,
-                ProducerKind::Pull
-            )
+            .acquire_producer("exclusive", &[], &seed, 2 << 20, ProducerKind::Pull)
             .await
             .is_err(),
         "dropping an attempt releases only its ingest permit"
@@ -431,7 +382,7 @@ async fn pull206_blocked_save_is_fenced_by_delete_and_recreate() {
     let registry = BroadcastRegistry::with_test_persist(persist);
     let seed = SeedRegistry::new();
     let (broadcast, mut session) = registry
-        .acquire_producer("fenced", "Fenced", &[], &seed, 2 << 20, ProducerKind::Pull)
+        .acquire_producer("fenced", &[], &seed, 2 << 20, ProducerKind::Pull)
         .await
         .unwrap();
     let identity = broadcast.infohash;
@@ -510,7 +461,7 @@ async fn pull206_blocked_save_is_fenced_by_delete_and_recreate() {
     );
     assert!(
         registry
-            .acquire_producer("fenced", "Fenced", &[], &seed, 2 << 20, ProducerKind::Pull)
+            .acquire_producer("fenced", &[], &seed, 2 << 20, ProducerKind::Pull)
             .await
             .is_err(),
         "admission remains closed while the filesystem gate is held"
@@ -551,7 +502,7 @@ async fn pull206_blocked_save_is_fenced_by_delete_and_recreate() {
         .unwrap()
         .is_none());
     let (recreated, _new_session) = registry
-        .acquire_producer("fenced", "Fenced", &[], &seed, 2 << 20, ProducerKind::Pull)
+        .acquire_producer("fenced", &[], &seed, 2 << 20, ProducerKind::Pull)
         .await
         .unwrap();
     assert_ne!(
@@ -570,7 +521,7 @@ async fn pull206_settled_delete_failure_requires_explicit_retry() {
     let registry = BroadcastRegistry::with_test_persist(persist);
     let seed = SeedRegistry::new();
     let broadcast = registry
-        .mint("retry-delete", "Retry delete", &[], &seed, 2 << 20)
+        .mint("retry-delete", &[], &seed, 2 << 20)
         .await
         .unwrap();
     observer.fail_at(PersistOperation::Delete, 1);
@@ -582,14 +533,7 @@ async fn pull206_settled_delete_failure_requires_explicit_retry() {
     assert!(registry.get("retry-delete").await.is_none());
     assert!(
         registry
-            .acquire_producer(
-                "retry-delete",
-                "Retry delete",
-                &[],
-                &seed,
-                2 << 20,
-                ProducerKind::Pull
-            )
+            .acquire_producer("retry-delete", &[], &seed, 2 << 20, ProducerKind::Pull)
             .await
             .is_err(),
         "a settled delete error leaves the entry stopping and nonadmitting"
@@ -627,7 +571,7 @@ async fn pull206_settled_delete_failure_requires_explicit_retry() {
         .is_none());
     assert!(!seed.serves(&broadcast.infohash));
     let recreated = registry
-        .mint("retry-delete", "Retry delete", &[], &seed, 2 << 20)
+        .mint("retry-delete", &[], &seed, 2 << 20)
         .await
         .unwrap();
     assert_ne!(
@@ -658,6 +602,7 @@ async fn pull206_actual_persistence_failure_is_terminal_and_keeps_failed_claim()
     let (release_open_tx, release_open_rx) = tokio::sync::oneshot::channel();
     let release_open_rx = Arc::new(Mutex::new(Some(release_open_rx)));
     let release_open_hook = release_open_rx.clone();
+    let (status_tx, status_rx) = std::sync::mpsc::sync_channel(16);
     let open: TestSourceOpen = Arc::new(move |_, _, _, _| {
         let receiver = frames_rx_hook.clone();
         let opened = opened_tx.clone();
@@ -676,10 +621,30 @@ async fn pull206_actual_persistence_failure_is_terminal_and_keeps_failed_claim()
     let logs_hook = logs.clone();
     registry.set_source_test_hooks(SourceTestHooks {
         open: Some(open),
+        on_status: Some(Arc::new(move |status| {
+            let _ = status_tx.send(status);
+        })),
         on_log: Some(Arc::new(move |_| {
             logs_hook.fetch_add(1, Ordering::SeqCst);
         })),
         ..SourceTestHooks::default()
+    });
+    // Start consuming notifications before attachment; the bounded queue also retains an
+    // early Failed event if it arrives before this async test resumes. Use a real-time
+    // watchdog because Tokio's clock is paused while FileSync runs on the blocking pool.
+    let status_waiter = tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for Failed source status".to_owned());
+            }
+            match status_rx.recv_timeout(remaining) {
+                Ok(status) if status.state == SourceState::Failed => return Ok(status),
+                Ok(_) => {}
+                Err(error) => return Err(format!("source status channel: {error}")),
+            }
+        }
     });
     let state = test_broadcast_state(registry.clone(), POLICY);
     let config = source("http://127.0.0.1:1/persistence-failure");
@@ -700,14 +665,10 @@ async fn pull206_actual_persistence_failure_is_terminal_and_keeps_failed_claim()
     release_open_tx.send(()).unwrap();
     let packets = (65_536usize - broadcast.auth.signature_len()).div_ceil(188) + 8;
     frames_tx.send(Ok(Some(ts_packets(packets, 0x42)))).unwrap();
-    let failed = tokio::time::timeout(
-        Duration::from_secs(5),
-        wait_status_with_state(&state, "persist-failure", |status| {
-            status.state == SourceState::Failed
-        }),
-    )
-    .await
-    .expect("worker should classify real persistence failure");
+    let failed = status_waiter
+        .await
+        .expect("source status receiver task should complete")
+        .expect("worker should classify real persistence failure");
     assert_eq!(failed.attempts, 1);
     assert_eq!(failed.last_error, Some(SourceErrorCode::PersistenceFailed));
     assert_eq!(failed.retry_in_ms, None);
@@ -721,11 +682,10 @@ async fn pull206_actual_persistence_failure_is_terminal_and_keeps_failed_claim()
             registry
                 .acquire_producer(
                     "persist-failure",
-                    "conflict",
                     &[],
                     &state.seed_registry,
                     state.store_bytes,
-                    kind,
+                    kind
                 )
                 .await
                 .err()
@@ -851,11 +811,10 @@ async fn pull206_detach_timeout_keeps_claim_and_io_fence_until_real_disk_gate_re
             registry
                 .acquire_producer(
                     "disk-gated-detach",
-                    "conflict",
                     &[],
                     &state.seed_registry,
                     state.store_bytes,
-                    kind,
+                    kind
                 )
                 .await
                 .err()
@@ -883,7 +842,6 @@ async fn pull206_detach_timeout_keeps_claim_and_io_fence_until_real_disk_gate_re
     let (_, raw_session) = registry
         .acquire_producer(
             "disk-gated-detach",
-            "after detach",
             &[],
             &state.seed_registry,
             state.store_bytes,

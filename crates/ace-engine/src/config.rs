@@ -261,9 +261,62 @@ impl HlsAudioConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Config {
+// Declare the fields once for the public struct and its private Serde remote
+// helper. Root redaction must run before the derived field visitor, without
+// changing field defaults, streaming parsing, or unrelated field diagnostics.
+macro_rules! config_with_root_redaction {
+    ($( $(#[$attr:meta])* pub $field:ident: $ty:ty, )*) => {
+        #[derive(Debug, Clone, Serialize)]
+        #[serde(default)]
+        pub struct Config {
+            $( $(#[$attr])* pub $field: $ty, )*
+        }
+
+        // A remote helper is never constructed and cannot expose a public
+        // deserialization entry point that bypasses the root boundary.
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(default, remote = "Config")]
+        struct ConfigFields {
+            $( $(#[$attr])* pub $field: $ty, )*
+        }
+        impl Default for ConfigFields {
+            fn default() -> Self {
+                let defaults = Config::default();
+                Self { $($field: defaults.$field,)* }
+            }
+        }
+
+        impl<'de> Deserialize<'de> for Config {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct ConfigVisitor<'a>(&'a std::cell::Cell<bool>);
+                impl<'de> serde::de::Visitor<'de> for ConfigVisitor<'_> {
+                    type Value = Config;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("configuration object")
+                    }
+                    fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M) -> Result<Config, M::Error> {
+                        self.0.set(true);
+                        ConfigFields::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    }
+                    fn visit_seq<S: serde::de::SeqAccess<'de>>(self, seq: S) -> Result<Config, S::Error> {
+                        self.0.set(true);
+                        ConfigFields::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    }
+                }
+                let entered_fields = std::cell::Cell::new(false);
+                deserializer.deserialize_struct("Config", &[$(stringify!($field)),*], ConfigVisitor(&entered_fields))
+                    .map_err(|error| {
+                        if entered_fields.get() { error } else {
+                            serde::de::Error::custom(crate::broadcast_options::BroadcastOptionsError)
+                        }
+                    })
+            }
+        }
+    };
+}
+
+config_with_root_redaction! {
     /// Address the HTTP API binds to.
     pub bind: SocketAddr,
     /// Address the RTMP ingest listener binds to.
@@ -343,6 +396,9 @@ pub struct Config {
     pub experimental_ace_compat: bool,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
     pub bep9_content_id_fallback: bool,
+    /// Immutable per-name origination profiles, applied only at identity admission.
+    #[serde(deserialize_with = "crate::broadcast_options::deserialize_broadcast_options")]
+    pub broadcast_options: BTreeMap<String, crate::broadcast_options::BroadcastOptions>,
     /// Process-start declarations; URLs remain private and are never persisted.
     #[serde(deserialize_with = "crate::broadcast_pull::deserialize_source_map")]
     pub broadcast_sources: BTreeMap<String, BroadcastSourceConfig>,
@@ -383,6 +439,7 @@ impl Default for Config {
             port_map_external_port: None,
             experimental_ace_compat: false,
             bep9_content_id_fallback: false,
+            broadcast_options: BTreeMap::new(),
             broadcast_sources: BTreeMap::new(),
             allow_non_global_broadcast_source: false,
         }

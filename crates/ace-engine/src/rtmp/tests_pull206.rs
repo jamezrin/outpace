@@ -20,6 +20,88 @@ fn state() -> BroadcastState {
     }
 }
 
+#[tokio::test]
+async fn options51_rtmp_publish_uses_the_named_profile() {
+    let mut state = state();
+    let registry = BroadcastRegistry::new_with_options(std::collections::BTreeMap::from([(
+        "synthetic-origin".to_owned(),
+        crate::broadcast_options::BroadcastOptions {
+            title: Some("Synthetic title".to_owned()),
+            bitrate_bytes_per_sec: Some(500_000),
+            piece_length: Some(131_072),
+            quality: Some("HD".to_owned()),
+            categories: Some(vec![]),
+        },
+    )]))
+    .unwrap();
+    state.registry = registry.clone();
+    let handler = RtmpIngestHandler::new(state);
+    assert!(matches!(
+        handler
+            .on_publish(&session(51), &publish("synthetic-origin"))
+            .await,
+        AuthResult::Accept
+    ));
+    let broadcast = registry.get("synthetic-origin").await.unwrap();
+    let decoded = ace_wire::transport::decode_transport(&broadcast.transport_bytes).unwrap();
+    assert_eq!(decoded.name, "Synthetic title");
+    assert_eq!(decoded.bitrate, Some(500_000));
+    assert_eq!(decoded.piece_length, 131_072);
+    assert_eq!(
+        decoded.raw.get(b"quality").unwrap().as_bytes(),
+        Some(b"HD".as_slice())
+    );
+    assert!(
+        matches!(decoded.raw.get(b"categories"), Some(ace_wire::bencode::Bencode::List(items)) if items.is_empty())
+    );
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn options51_rtmp_profile_conflict_uses_the_stable_rejection_code() {
+    let dir = std::env::temp_dir().join(format!(
+        "outpace-options51-rtmp-conflict-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let original = BroadcastRegistry::with_persist(
+        &dir,
+        crate::config::CacheType::Memory,
+        std::path::PathBuf::new(),
+    );
+    original
+        .mint("synthetic-origin", &[], &SeedRegistry::new(), 2 << 20)
+        .await
+        .unwrap();
+    original.shutdown().await.unwrap();
+
+    let registry = BroadcastRegistry::with_persist_and_options(
+        &dir,
+        crate::config::CacheType::Memory,
+        std::path::PathBuf::new(),
+        std::collections::BTreeMap::from([(
+            "synthetic-origin".to_owned(),
+            crate::broadcast_options::BroadcastOptions {
+                title: Some("Conflicting synthetic title".to_owned()),
+                ..Default::default()
+            },
+        )]),
+    )
+    .unwrap();
+    let mut state = state();
+    state.registry = registry.clone();
+    let handler = RtmpIngestHandler::new(state);
+    assert!(matches!(
+        handler
+            .on_publish(&session(52), &publish("synthetic-origin"))
+            .await,
+        AuthResult::Reject(code) if code == "broadcast_options_conflict"
+    ));
+    assert!(registry.get("synthetic-origin").await.is_none());
+    registry.shutdown().await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn session(id: u64) -> SessionContext {
     SessionContext::new(id, "127.0.0.1:40000".parse().unwrap())
 }

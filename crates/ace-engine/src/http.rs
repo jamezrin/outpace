@@ -166,7 +166,6 @@ impl BroadcastState {
             .registry
             .acquire_producer(
                 name,
-                name,
                 &self.trackers,
                 &self.seed_registry,
                 self.store_bytes,
@@ -183,13 +182,7 @@ impl BroadcastState {
         name: &str,
     ) -> Result<crate::broadcast::Broadcast, crate::broadcast::BroadcastError> {
         self.registry
-            .mint(
-                name,
-                name,
-                &self.trackers,
-                &self.seed_registry,
-                self.store_bytes,
-            )
+            .mint(name, &self.trackers, &self.seed_registry, self.store_bytes)
             .await
     }
 
@@ -198,7 +191,7 @@ impl BroadcastState {
         name: &str,
     ) -> Result<(), crate::broadcast::BroadcastError> {
         self.registry
-            .ensure_announcing(name, &self.trackers, self.inbound_peer_port.clone())
+            .ensure_announcing(name, self.inbound_peer_port.clone())
             .await
     }
 
