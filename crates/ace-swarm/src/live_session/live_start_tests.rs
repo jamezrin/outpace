@@ -146,6 +146,7 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
                 session: PeerSession::new(client),
                 addr: relay_addr,
                 window: window(7, 8),
+                unchoked: false,
                 yourip: None,
             }],
             &info,
@@ -385,6 +386,7 @@ async fn single_peer_with_hint_or_head(
                 session: PeerSession::new(client),
                 addr,
                 window: window(7, 8),
+                unchoked: false,
                 yourip: None,
             }],
             &info,
@@ -562,6 +564,7 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
             session: PeerSession::new(client),
             addr,
             window: window(7, 8),
+            unchoked: false,
             yourip: None,
         },
         7,
@@ -595,6 +598,7 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
             session: PeerSession::new(client),
             addr: bad_addr,
             window: window(7, 8),
+            unchoked: true,
             yourip: None,
         },
         7,
@@ -611,6 +615,10 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
         "failed activation must retain the sole valid provisional runtime"
     );
     assert_eq!(peers.len(), 1);
+    assert!(
+        !c.active_peers.any_unchoked_covers(8),
+        "failed activation must not admit the candidate's retained Unchoke"
+    );
     server.send(&PeerMessage::Unchoke).await.unwrap();
     assert!(matches!(
         event_rx.recv().await.unwrap(),

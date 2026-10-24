@@ -117,13 +117,14 @@ async fn connect_upstream_inner(
     }
     progress.advance(ConnectPhase::Window);
     crate::alog!("[ace] discovery stage=bt-handshake");
-    let Some((window, yourip)) = read_peer_window(&mut session).await else {
+    let Some((window, yourip, unchoked)) = read_peer_window(&mut session).await else {
         return Err(PeerConnectStage::Window);
     };
     Ok(ConnectedUpstream {
         session,
         addr,
         window,
+        unchoked,
         yourip,
     })
 }

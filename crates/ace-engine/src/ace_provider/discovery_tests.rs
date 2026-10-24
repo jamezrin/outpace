@@ -512,6 +512,651 @@ async fn late_candidate_at_full_active_cap_survives_for_pool_rebuild() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum InitialControlOrder {
+    NoControl,
+    Unchoke,
+    UnchokeThenChoke,
+    ChokeThenUnchoke,
+    WindowThenUnchoke,
+    LaterUnchoke,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestObservation {
+    Request(Vec<u8>),
+    NoRequestWithinBound,
+    PeerExited,
+}
+
+async fn observe_request(
+    session: &mut PeerSession<TcpStream>,
+    bound: Duration,
+) -> RequestObservation {
+    match tokio::time::timeout(bound, async {
+        loop {
+            match session.read_message().await {
+                Ok(PeerMessage::Unknown { id: 6, payload }) => {
+                    return RequestObservation::Request(payload);
+                }
+                Ok(_) => {}
+                Err(_) => return RequestObservation::PeerExited,
+            }
+        }
+    })
+    .await
+    {
+        Ok(observation) => observation,
+        Err(_) => RequestObservation::NoRequestWithinBound,
+    }
+}
+
+fn assert_live_piece_request(observation: RequestObservation, context: &str) {
+    assert_live_piece_request_in_range(observation, 9..=9, context);
+}
+
+fn assert_live_piece_request_in_range(
+    observation: RequestObservation,
+    expected_pieces: std::ops::RangeInclusive<u32>,
+    context: &str,
+) {
+    let RequestObservation::Request(payload) = observation else {
+        panic!("{context}: expected an id-6 request, observed {observation:?}");
+    };
+    assert_eq!(payload.len(), 10, "{context}: request payload length");
+    assert_eq!(&payload[..4], &[0; 4], "{context}: stream identifier");
+    let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+    assert!(
+        expected_pieces.contains(&piece),
+        "{context}: requested piece {piece} outside {expected_pieces:?}"
+    );
+    assert_eq!(
+        u16::from_be_bytes(payload[8..10].try_into().unwrap()),
+        0,
+        "{context}: requested chunk"
+    );
+}
+
+async fn unchoke_order_control(order: InitialControlOrder) -> RequestObservation {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let (activated_tx, activated_rx) = tokio::sync::oneshot::channel();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let mut server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut session = PeerSession::new(stream);
+        session.accept_handshake([0; 20], |_| true).await.unwrap();
+
+        match order {
+            InitialControlOrder::Unchoke => {
+                session.send(&PeerMessage::Unchoke).await.unwrap();
+            }
+            InitialControlOrder::UnchokeThenChoke => {
+                session.send(&PeerMessage::Unchoke).await.unwrap();
+                session.send(&PeerMessage::Choke).await.unwrap();
+            }
+            InitialControlOrder::ChokeThenUnchoke => {
+                session.send(&PeerMessage::Choke).await.unwrap();
+                session.send(&PeerMessage::Unchoke).await.unwrap();
+            }
+            InitialControlOrder::NoControl
+            | InitialControlOrder::WindowThenUnchoke
+            | InitialControlOrder::LaterUnchoke => {}
+        }
+        session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(LivePosition {
+                    min_piece: 7,
+                    max_piece: 10,
+                    position: -1,
+                    distance_from_source: 1,
+                }),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .unwrap();
+        if matches!(order, InitialControlOrder::WindowThenUnchoke) {
+            session.send(&PeerMessage::Unchoke).await.unwrap();
+        }
+
+        assert!(matches!(
+            session.read_message().await.unwrap(),
+            PeerMessage::Extended { ext_id: 0, .. }
+        ));
+        assert_eq!(
+            session.read_message().await.unwrap(),
+            PeerMessage::Interested
+        );
+        activated_tx.send(()).unwrap();
+        if matches!(order, InitialControlOrder::LaterUnchoke) {
+            session.send(&PeerMessage::Unchoke).await.unwrap();
+        }
+
+        let observation = observe_request(&mut session, Duration::from_secs(4)).await;
+        let _ = request_tx.send(observation);
+    });
+
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        Box::pin(async move {
+            sender.send(addr).await.unwrap();
+            sender.closed().await;
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_prefetch_pieces(Some(1))
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..StartupBufferConfig::default()
+        });
+    let source = match provider.open_resolved("synthetic", info(), discovery).await {
+        Ok(source) => source,
+        Err(error) => {
+            server.abort();
+            let _ = server.await;
+            panic!("synthetic resolved open failed: {error}");
+        }
+    };
+
+    let activated = tokio::time::timeout(Duration::from_secs(2), activated_rx).await;
+    let request = if matches!(&activated, Ok(Ok(()))) {
+        match tokio::time::timeout(Duration::from_secs(5), request_rx).await {
+            Ok(Ok(observation)) => observation,
+            Ok(Err(_)) => RequestObservation::PeerExited,
+            Err(_) => RequestObservation::PeerExited,
+        }
+    } else {
+        RequestObservation::PeerExited
+    };
+
+    drop(source);
+    let server_done = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+    if server_done.is_err() {
+        server.abort();
+        let _ = server.await;
+    }
+    assert!(
+        matches!(&activated, Ok(Ok(()))),
+        "peer activation must reach the signed-extension and Interested barrier"
+    );
+    server_done
+        .expect("fake peer must stop after source cleanup")
+        .expect("fake peer task must not panic");
+    request
+}
+
+#[tokio::test]
+async fn unchoke_ordering_window_then_unchoke_requests_a_live_piece() {
+    assert_live_piece_request(
+        unchoke_order_control(InitialControlOrder::WindowThenUnchoke).await,
+        "window-first Unchoke must reach the real chunk-request path",
+    );
+}
+
+#[tokio::test]
+async fn unchoke_ordering_early_unchoke_is_retained_for_live_piece_requests() {
+    assert_live_piece_request(
+        unchoke_order_control(InitialControlOrder::Unchoke).await,
+        "window-reader must preserve an earlier Unchoke through peer activation",
+    );
+}
+
+#[tokio::test]
+async fn unchoke_ordering_default_peer_does_not_request_without_control() {
+    assert_eq!(
+        unchoke_order_control(InitialControlOrder::NoControl).await,
+        RequestObservation::NoRequestWithinBound,
+        "no pre-window control must leave the peer choked and observable"
+    );
+}
+
+#[tokio::test]
+async fn unchoke_ordering_pre_window_unchoke_then_choke_remains_choked() {
+    assert_eq!(
+        unchoke_order_control(InitialControlOrder::UnchokeThenChoke).await,
+        RequestObservation::NoRequestWithinBound,
+        "the last pre-window Choke must override Unchoke while observable"
+    );
+}
+
+#[tokio::test]
+async fn unchoke_ordering_pre_window_choke_then_unchoke_requests_a_live_piece() {
+    assert_live_piece_request(
+        unchoke_order_control(InitialControlOrder::ChokeThenUnchoke).await,
+        "the last pre-window Unchoke must enable the real chunk-request path",
+    );
+}
+
+#[tokio::test]
+async fn unchoke_ordering_later_control_uses_the_active_worker_path() {
+    assert_live_piece_request(
+        unchoke_order_control(InitialControlOrder::LaterUnchoke).await,
+        "a post-activation Unchoke must reach the existing worker/event path",
+    );
+}
+
+#[tokio::test]
+async fn unchoke_ordering_initial_two_early_peers_schedule_without_later_control() {
+    let mut servers = tokio::task::JoinSet::new();
+    let (ready_tx, ready_rx) = tokio::sync::mpsc::channel(2);
+    let mut ready_rx = ready_rx;
+    let (activated_tx, activated_rx) = tokio::sync::mpsc::channel(2);
+    let mut activated_rx = activated_rx;
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+    let mut addrs = Vec::new();
+    let mut request_receivers = Vec::new();
+
+    for _ in 0..2 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        addrs.push(addr);
+        let ready_tx = ready_tx.clone();
+        let activated_tx = activated_tx.clone();
+        let gate = gate.clone();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        request_receivers.push(request_rx);
+        servers.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut session = PeerSession::new(stream);
+            session.accept_handshake([0; 20], |_| true).await.unwrap();
+            ready_tx.send(()).await.unwrap();
+            gate.wait().await;
+
+            // Both connected candidates receive exactly one early Unchoke and the same
+            // window together; neither sends any later control or advancing window.
+            session.send(&PeerMessage::Unchoke).await.unwrap();
+            session
+                .send_extended_handshake(&OutgoingExtendedHandshake {
+                    ace_metadata_version: 1,
+                    ut_metadata_id: 2,
+                    mi: Some(LivePosition {
+                        min_piece: 7,
+                        max_piece: 10,
+                        position: -1,
+                        distance_from_source: 1,
+                    }),
+                    node: NodeFields::default(),
+                    peer_ip: None,
+                    metadata_size: None,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Extended { ext_id: 0, .. }
+            ));
+            assert_eq!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Interested
+            );
+            activated_tx.send(()).await.unwrap();
+
+            let observation = observe_request(&mut session, Duration::from_secs(4)).await;
+            let _ = request_tx.send(observation);
+        });
+    }
+    drop(ready_tx);
+    drop(activated_tx);
+
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let addrs = addrs.clone();
+        Box::pin(async move {
+            for addr in addrs {
+                sender.send(addr).await.unwrap();
+            }
+            sender.closed().await;
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_prefetch_pieces(Some(1))
+        .with_live_recovery(LiveRecoveryConfig {
+            max_active_upstreams: 2,
+            max_parallel_connect: 2,
+            ..LiveRecoveryConfig::default()
+        })
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..StartupBufferConfig::default()
+        });
+    let source = match provider.open_resolved("synthetic", info(), discovery).await {
+        Ok(source) => source,
+        Err(error) => {
+            servers.abort_all();
+            while servers.join_next().await.is_some() {}
+            panic!("synthetic resolved open failed: {error}");
+        }
+    };
+
+    let both_connected = tokio::time::timeout(Duration::from_secs(2), async {
+        ready_rx.recv().await?;
+        ready_rx.recv().await
+    })
+    .await;
+    // Each post-activation barrier is emitted only after the real initial upstream
+    // selection has admitted that connection.
+    let both_activated = tokio::time::timeout(Duration::from_secs(2), async {
+        activated_rx.recv().await?;
+        activated_rx.recv().await
+    })
+    .await;
+    let mut request_receivers = request_receivers.into_iter();
+    let mut first_request_rx = request_receivers.next().unwrap();
+    let mut second_request_rx = request_receivers.next().unwrap();
+    let (first_observation, second_observation) = if matches!(&both_activated, Ok(Some(()))) {
+        let first = async {
+            match tokio::time::timeout(Duration::from_secs(5), &mut first_request_rx).await {
+                Ok(Ok(observation)) => observation,
+                Ok(Err(_)) | Err(_) => RequestObservation::PeerExited,
+            }
+        };
+        let second = async {
+            match tokio::time::timeout(Duration::from_secs(5), &mut second_request_rx).await {
+                Ok(Ok(observation)) => observation,
+                Ok(Err(_)) | Err(_) => RequestObservation::PeerExited,
+            }
+        };
+        tokio::join!(first, second)
+    } else {
+        (
+            RequestObservation::PeerExited,
+            RequestObservation::PeerExited,
+        )
+    };
+
+    drop(source);
+    let servers_done = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut all_succeeded = true;
+        while let Some(result) = servers.join_next().await {
+            all_succeeded &= result.is_ok();
+        }
+        all_succeeded
+    })
+    .await;
+    if servers_done.is_err() {
+        servers.abort_all();
+        while servers.join_next().await.is_some() {}
+    }
+
+    assert!(
+        matches!(both_connected, Ok(Some(()))),
+        "both loopback peers must connect before either sends its early control"
+    );
+    assert!(
+        matches!(both_activated, Ok(Some(()))),
+        "both peers must be admitted by the initial selected pool"
+    );
+    assert!(
+        matches!(servers_done, Ok(true)),
+        "fake peers must stop cleanly after their bounded observation and source cleanup"
+    );
+    let mut request_count = 0;
+    for observation in [first_observation, second_observation] {
+        match observation {
+            RequestObservation::Request(payload) => {
+                assert_live_piece_request_in_range(
+                    RequestObservation::Request(payload),
+                    9..=10,
+                    "initial multi-peer retained Unchoke must request an in-window live piece",
+                );
+                request_count += 1;
+            }
+            RequestObservation::NoRequestWithinBound => {}
+            RequestObservation::PeerExited => {
+                panic!("peer exited before completing its bounded request observation")
+            }
+        }
+    }
+    assert!(
+        request_count > 0,
+        "two initially admitted early-Unchoke peers must schedule a request without a later control"
+    );
+}
+
+#[tokio::test]
+async fn unchoke_ordering_active_peer_does_not_change_another_peers_default() {
+    let mut servers = tokio::task::JoinSet::new();
+    let (activated_tx, mut activated_rx) = tokio::sync::mpsc::channel(2);
+    let mut addrs = Vec::new();
+    let mut request_receivers = Vec::new();
+
+    for unchoke_after_activation in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        addrs.push(addr);
+        let activated_tx = activated_tx.clone();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        request_receivers.push(request_rx);
+        servers.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut session = PeerSession::new(stream);
+            session.accept_handshake([0; 20], |_| true).await.unwrap();
+            session
+                .send_extended_handshake(&OutgoingExtendedHandshake {
+                    ace_metadata_version: 1,
+                    ut_metadata_id: 2,
+                    mi: Some(LivePosition {
+                        min_piece: 7,
+                        max_piece: 10,
+                        position: -1,
+                        distance_from_source: 1,
+                    }),
+                    node: NodeFields::default(),
+                    peer_ip: None,
+                    metadata_size: None,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Extended { ext_id: 0, .. }
+            ));
+            assert_eq!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Interested
+            );
+            activated_tx.send(unchoke_after_activation).await.unwrap();
+            if unchoke_after_activation {
+                session.send(&PeerMessage::Unchoke).await.unwrap();
+            }
+            let observation = observe_request(&mut session, Duration::from_secs(4)).await;
+            let _ = request_tx.send(observation);
+        });
+    }
+    drop(activated_tx);
+
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let addrs = addrs.clone();
+        Box::pin(async move {
+            for addr in addrs {
+                sender.send(addr).await.unwrap();
+            }
+            sender.closed().await;
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_prefetch_pieces(Some(1))
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..StartupBufferConfig::default()
+        });
+    let source = match provider.open_resolved("synthetic", info(), discovery).await {
+        Ok(source) => source,
+        Err(error) => {
+            servers.abort_all();
+            while servers.join_next().await.is_some() {}
+            panic!("synthetic resolved open failed: {error}");
+        }
+    };
+    let activated = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut roles = Vec::new();
+        for _ in 0..2 {
+            roles.push(activated_rx.recv().await?);
+        }
+        Some(roles)
+    })
+    .await;
+    let mut request_receivers = request_receivers.into_iter();
+    let mut unchoked_request_rx = request_receivers.next().unwrap();
+    let mut choked_request_rx = request_receivers.next().unwrap();
+    let (unchoked_request, choked_request) = if matches!(&activated, Ok(Some(_))) {
+        let unchoked = async {
+            match tokio::time::timeout(Duration::from_secs(5), &mut unchoked_request_rx).await {
+                Ok(Ok(observation)) => observation,
+                Ok(Err(_)) | Err(_) => RequestObservation::PeerExited,
+            }
+        };
+        let choked = async {
+            match tokio::time::timeout(Duration::from_secs(5), &mut choked_request_rx).await {
+                Ok(Ok(observation)) => observation,
+                Ok(Err(_)) | Err(_) => RequestObservation::PeerExited,
+            }
+        };
+        tokio::join!(unchoked, choked)
+    } else {
+        (
+            RequestObservation::PeerExited,
+            RequestObservation::PeerExited,
+        )
+    };
+
+    drop(source);
+    let servers_done = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut all_succeeded = true;
+        while let Some(result) = servers.join_next().await {
+            all_succeeded &= result.is_ok();
+        }
+        all_succeeded
+    })
+    .await;
+    if servers_done.is_err() {
+        servers.abort_all();
+        while servers.join_next().await.is_some() {}
+    }
+    assert!(
+        matches!(activated, Ok(Some(_))),
+        "both peer activations must reach their barriers"
+    );
+    assert!(
+        matches!(servers_done, Ok(true)),
+        "fake peers must stop cleanly after source cleanup"
+    );
+    assert_live_piece_request(
+        unchoked_request,
+        "the unchoked peer must receive a valid request",
+    );
+    assert!(
+        choked_request == RequestObservation::NoRequestWithinBound,
+        "the default-choked peer must remain observably request-free; got {choked_request:?}"
+    );
+}
+
+#[tokio::test]
+async fn unchoke_ordering_early_incoming_does_not_suppress_reciprocal_seed_unchoke() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let (activated_tx, activated_rx) = tokio::sync::oneshot::channel();
+    let (reciprocal_tx, reciprocal_rx) = tokio::sync::oneshot::channel();
+    let mut server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut session = PeerSession::new(stream).with_timeout(Duration::from_secs(3));
+        session.accept_handshake([0; 20], |_| true).await.unwrap();
+        session.send(&PeerMessage::Unchoke).await.unwrap();
+        session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(LivePosition {
+                    min_piece: 7,
+                    max_piece: 10,
+                    position: -1,
+                    distance_from_source: 1,
+                }),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.read_message().await.unwrap(),
+            PeerMessage::Extended { ext_id: 0, .. }
+        ));
+        assert_eq!(
+            session.read_message().await.unwrap(),
+            PeerMessage::Interested
+        );
+        session.send(&PeerMessage::Interested).await.unwrap();
+        activated_tx.send(()).unwrap();
+        let reciprocal = tokio::time::timeout(Duration::from_secs(2), session.read_message())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let _ = reciprocal_tx.send(matches!(reciprocal, Some(PeerMessage::Unchoke)));
+    });
+
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        Box::pin(async move {
+            sender.send(addr).await.unwrap();
+            sender.closed().await;
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_seeding_enabled(true)
+        .with_prefetch_pieces(Some(1))
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..StartupBufferConfig::default()
+        });
+    let source = match provider.open_resolved("synthetic", info(), discovery).await {
+        Ok(source) => source,
+        Err(error) => {
+            server.abort();
+            let _ = server.await;
+            panic!("synthetic resolved open failed: {error}");
+        }
+    };
+
+    let activated = tokio::time::timeout(Duration::from_secs(2), activated_rx).await;
+    let reciprocal = if matches!(&activated, Ok(Ok(()))) {
+        tokio::time::timeout(Duration::from_secs(3), reciprocal_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    } else {
+        None
+    };
+
+    drop(source);
+    let server_done = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+    if server_done.is_err() {
+        server.abort();
+        let _ = server.await;
+    }
+    assert!(
+        matches!(&activated, Ok(Ok(()))),
+        "fake peer must observe our signed extension and Interested"
+    );
+    server_done
+        .expect("fake peer must stop after source cleanup")
+        .expect("fake peer task must not panic");
+    assert_eq!(
+        reciprocal,
+        Some(true),
+        "retaining incoming Unchoke must not imply we already sent reciprocal Unchoke"
+    );
+}
+
 async fn surviving_peer_capacity_control(active_cap: usize) {
     let mut servers = tokio::task::JoinSet::new();
     let mut addrs = Vec::new();

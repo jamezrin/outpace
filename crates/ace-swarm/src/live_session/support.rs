@@ -45,30 +45,38 @@ pub(super) fn hex_preview(bytes: &[u8]) -> String {
 /// Read messages until the peer's extended handshake arrives; return its live `mi` window and
 /// the `yourip` public address it echoed to us (issue #22 — the swarm telling us how it sees us
 /// on this outbound connection; `None` when the peer sent no usable `yourip`).
+/// Also return the latest Choke/Unchoke state, defaulting to choked on this connection.
 pub(super) async fn read_peer_window(
     session: &mut PeerSession<TcpStream>,
-) -> Option<(WireLivePosition, Option<IpAddr>)> {
+) -> Option<(WireLivePosition, Option<IpAddr>, bool)> {
+    let mut unchoked = false;
     for _ in 0..32 {
         let msg = session.read_message().await.ok()?;
-        if let PeerMessage::Extended { ext_id: 0, payload } = msg {
-            let eh = ExtendedHandshake::parse(&payload).ok()?;
-            let yourip = eh.yourip();
-            let mi = eh.raw.get(b"mi")?;
-            let get = |k: &[u8]| mi.get(k).and_then(|v| v.as_int()).unwrap_or(-1);
-            let min_piece = get(b"min_piece");
-            let max_piece = get(b"max_piece");
-            if min_piece < 0 || max_piece < min_piece || max_piece > u32::MAX as i64 {
-                return None;
+        match msg {
+            PeerMessage::Choke => unchoked = false,
+            PeerMessage::Unchoke => unchoked = true,
+            PeerMessage::Extended { ext_id: 0, payload } => {
+                let eh = ExtendedHandshake::parse(&payload).ok()?;
+                let yourip = eh.yourip();
+                let mi = eh.raw.get(b"mi")?;
+                let get = |k: &[u8]| mi.get(k).and_then(|v| v.as_int()).unwrap_or(-1);
+                let min_piece = get(b"min_piece");
+                let max_piece = get(b"max_piece");
+                if min_piece < 0 || max_piece < min_piece || max_piece > u32::MAX as i64 {
+                    return None;
+                }
+                return Some((
+                    WireLivePosition {
+                        min_piece,
+                        max_piece,
+                        position: get(b"position"),
+                        distance_from_source: get(b"distance_from_source"),
+                    },
+                    yourip,
+                    unchoked,
+                ));
             }
-            return Some((
-                WireLivePosition {
-                    min_piece,
-                    max_piece,
-                    position: get(b"position"),
-                    distance_from_source: get(b"distance_from_source"),
-                },
-                yourip,
-            ));
+            _ => {}
         }
     }
     None
