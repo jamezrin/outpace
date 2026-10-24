@@ -137,6 +137,7 @@ async fn rejected_signed_piece_retries_through_full_peer_pool() {
                 session: PeerSession::new(client),
                 addr,
                 window: live_pos(7, 7),
+                unchoked: false,
                 yourip: None,
             }],
             &info,

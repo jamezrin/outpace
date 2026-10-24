@@ -29,6 +29,7 @@ async fn stale_gossip_harvests_each_peer_with_one_total_deadline() {
             session: PeerSession::new(client),
             addr,
             window: live_pos(1, 1),
+            unchoked: false,
             yourip: None,
         });
         servers.push(tokio::spawn(async move {
@@ -566,6 +567,7 @@ async fn retired_same_address_worker_events_cannot_target_fresh_source_runtime()
                 session: PeerSession::new(client),
                 addr,
                 window: live_pos(7, 10),
+                unchoked: false,
                 yourip: None,
             },
             9,
@@ -789,12 +791,14 @@ async fn active_source_loss_enters_cooldown_before_another_announcement() {
                     session: PeerSession::new(relay_client),
                     addr: relay_addr,
                     window: live_pos(7, 8),
+                    unchoked: false,
                     yourip: None,
                 },
                 ConnectedUpstream {
                     session: PeerSession::new(source_client),
                     addr: source_addr,
                     window: live_pos(7, 8),
+                    unchoked: false,
                     yourip: None,
                 },
             ],
@@ -1199,6 +1203,7 @@ async fn retained_producer_window_control(producer_first: bool, head_only_max: u
             session: PeerSession::new(client),
             addr,
             window: live_pos(7, 8),
+            unchoked: false,
             yourip: None,
         });
         let (command, mut control) = mpsc::channel::<()>(1);

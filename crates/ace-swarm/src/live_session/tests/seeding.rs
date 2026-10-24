@@ -64,6 +64,7 @@ async fn start_pool(enabled: bool) -> PoolCaller {
                 session: PeerSession::new(client),
                 addr,
                 window: live_pos(7, 7),
+                unchoked: false,
                 yourip: None,
             }],
             &info,

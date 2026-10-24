@@ -65,6 +65,7 @@ pub(super) async fn activate_upstream_peer(
     // leaves its runtime, gossip reader, and request slots intact.
     let replaced = replacing.and_then(|(peers, id)| drop_peer_runtime(id, peers, continuity));
     continuity.register_active_peer(peer_id, upstream.addr, upstream.window);
+    continuity.set_peer_unchoked(peer_id, upstream.unchoked);
     if continuity.reconnect_pool {
         continuity.recovery_event(RecoveryEvent::UpstreamReconnect);
     }
@@ -85,6 +86,7 @@ pub(super) async fn activate_upstream_peer(
             addr: upstream.addr,
             min_piece: peer_min,
             max_piece: peer_max,
+            // Tracks our outgoing reciprocal Unchoke, independently of the peer's incoming state.
             unchoked_peer: false,
             produced_output: false,
             seen_ids: HashSet::new(),
@@ -277,6 +279,11 @@ pub(super) async fn follow_peer_pool_with_discovery(
                 record_pool_losses(candidates, &mut loss_count, [addr]);
             }
         }
+    }
+    if !peers.is_empty() {
+        // Retained early Unchokes need the same scheduling trigger as active peer events.
+        let newly_lost = advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
+        record_pool_losses(candidates, &mut loss_count, newly_lost);
     }
     if peers.is_empty() {
         return FollowEnd::PeerLost(loss_count);
