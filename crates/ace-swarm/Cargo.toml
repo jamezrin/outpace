@@ -25,7 +25,7 @@ webpki-root-certs = "1"
 hyper = { version = "1", default-features = false }
 hex = "0.4"
 roxmltree = "0.21"
-igd-next = { version = "0.17", features = ["aio_tokio"] }
+igd-next = { version = "0.18", features = ["aio_tokio"] }
 crab_nat = "0.8"
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
