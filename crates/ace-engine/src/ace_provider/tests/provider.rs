@@ -436,13 +436,7 @@ async fn own_broadcast_opens_by_infohash_with_its_minted_geometry() {
     let seed = SeedRegistry::new();
     let broadcasts = crate::broadcast::BroadcastRegistry::new();
     let bc = broadcasts
-        .mint(
-            "t164",
-            "T164",
-            &["udp://tracker.invalid:80".into()],
-            &seed,
-            1 << 20,
-        )
+        .mint("t164", &["udp://tracker.invalid:80".into()], &seed, 1 << 20)
         .await
         .unwrap();
     let id = infohash_hex(&bc.infohash);
@@ -517,13 +511,7 @@ async fn own_broadcast_wins_over_a_conflicting_index_entry() {
     let seed = SeedRegistry::new();
     let broadcasts = crate::broadcast::BroadcastRegistry::new();
     let bc = broadcasts
-        .mint(
-            "t164b",
-            "T164B",
-            &["udp://own.invalid:80".into()],
-            &seed,
-            1 << 20,
-        )
+        .mint("t164b", &["udp://own.invalid:80".into()], &seed, 1 << 20)
         .await
         .unwrap();
     let own = seed.broadcast_transport_for_infohash(&bc.infohash).unwrap();

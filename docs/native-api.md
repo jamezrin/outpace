@@ -75,7 +75,7 @@ New mutation failures are JSON with exactly `{"error":{"code":"..."}}`:
 | --- | --- |
 | `400` | `invalid_name` |
 | `404` | `broadcasts_disabled` |
-| `409` | `producer_conflict`, `broadcast_stopping` |
+| `409` | `producer_conflict`, `broadcast_options_conflict`, `broadcast_stopping` |
 | `500` | `broadcast_persistence_failed`, `broadcast_state_invalid`, `piece_index_exhausted` |
 | `503` | `broadcast_service_stopping`, `broadcast_cleanup_timeout` |
 
@@ -111,6 +111,76 @@ established connection tasks: they may remain connected, but canceled-session ca
 publish, finish tails or mutate a replacement publisher. New publish requests are rejected
 after service admission closes. A publishing connection canceled by full deletion must reconnect
 to publish that name again; ordinary unpublish may republish on the same connection.
+
+## Broadcast startup profiles
+
+`OUTPACE_BROADCAST_OPTIONS` is an immutable process-start JSON object keyed by broadcast
+name. It applies through raw PUT, RTMP publishing, API-managed HTTP pull, startup-declared
+HTTP pull, and `outpace broadcast <name>` creation/resume. There is no request-level override
+or hot reload. A profile without a producer/source declaration creates no identity, record,
+store, source worker or announcement. Existing records still reload at startup.
+
+```bash
+OUTPACE_BROADCAST_OPTIONS='{"synthetic-origin":{"title":"Synthetic broadcast","bitrate_bytes_per_sec":500000,"piece_length":131072,"quality":"HD","categories":[]}}' \
+  outpace broadcast synthetic-origin
+```
+
+| Optional field | Explicit value | Fresh default when omitted |
+| --- | --- | --- |
+| `title` | UTF-8 text, 1–256 bytes | Broadcast path name |
+| `bitrate_bytes_per_sec` | Integer, 1–2305843009213693951 | `8375` |
+| `piece_length` | Power-of-two integer, 65536–1048576 bytes | `65536` |
+| `quality` | Exactly `auto`, `SD`, or `HD` | `auto` |
+| `categories` | 0–32 distinct text labels, each 1–128 UTF-8 bytes | `["other"]` |
+
+Title/category text cannot have edge whitespace or Unicode control characters. Accepted
+bytes and category order are preserved; explicit `[]` remains empty. Bitrate is a fixed
+**bytes/second** hint in the descriptor; existing API metadata projects **bits/second**.
+The arithmetic maximum permits exact multiplication by eight; it is no throughput promise.
+There is no bitrate detection or zero sentinel. `chunk_length` stays `16384` and cannot be set.
+
+Unset means `{}`; explicit `{}` and an empty profile object are valid. Blank, non-UTF-8,
+non-object, trailing input, `null` (including any supplied field), wrong types, unknown keys,
+duplicate decoded profile/field names, fractional/exponent numbers, and out-of-bounds values
+fail with `invalid_broadcast_options`. Names follow the broadcast path rules above. The map
+has at most 64 profiles and 262144 UTF-8 bytes; direct Rust Config values have the same bounds,
+including compact JSON size counting every present field. Errors do not echo supplied values.
+
+On resume the raw stored transport and private key are authoritative. Only explicitly present
+profile fields assert equality against exact stored types/bytes/category order. Omission
+asserts nothing; an explicit default conflicts with a different **or absent** stored field.
+Resume does not insert defaults, normalize metadata, re-encode transports or remint a failed
+record. Otherwise-valid legacy metadata/positive bitrate outside fresh bounds survives when
+unasserted. Legacy piece lengths that are positive multiples of 16384 up to 8388608, including
+98304, remain resumable when consumer/signing/allocation checks pass. An explicit profile
+piece length still has to satisfy the narrower fresh-profile bounds.
+
+`OUTPACE_SEED_STORE_BYTES` must fit at least one full wire piece on memory **and** disk:
+the unprofiled default, every declared profile (even unused), and every valid stored record.
+Startup rejects smaller budgets with `broadcast_store_too_small`; it never shrinks geometry
+or resizes the budget. Existing memory upper bounds and disk-failure behavior remain. One
+piece is a minimum admission budget, not a retention guarantee. Ingest signs using effective
+geometry, counts only full pieces as progress, and retains finite short-tail consumer limits.
+
+The complete configuration and stored preflight run before normalizer, identity/cache or task
+effects. Explicit conflicts fail startup even without a source. Invalid records targeted by a
+profile/source fail startup; unrelated malformed records retain blocked-name tombstones.
+Initialization repeats checks under the actual entry fences before saving reservations or
+exposing a store. A later failure uses existing cleanup, without rollback of completed writes.
+Options conflicts use `broadcast_options_conflict`: HTTP `409` with the existing JSON error
+envelope, the same RTMP rejection code, and a nonzero CLI/startup exit. Invalid stored state
+retains `broadcast_state_invalid`; an inconsistent direct registry budget also uses that code.
+
+`OUTPACE_TRACKERS` selects trackers only for fresh identities, retaining its existing unset/
+blank/filter/count rules. Resumed announcements use the stored transport list for both keys;
+process changes do not redirect them, an empty stored list stays empty, and non-UDP entries
+remain available to other consumers. UDP resolution, DHT, port gating and cancellation rules
+are unchanged. This is no private-distribution policy or new announcement protocol.
+
+To change immutable options or trackers, use a new name or explicitly DELETE and recreate
+the broadcast. Recreation loses its old signing/swarm/transport identity and cursor continuity.
+Do not edit a live record or restore an old cursor. No profile copy is persisted, so retain
+startup configuration separately and restart to apply it.
 
 ## Managed HTTP MPEG-TS sources
 
@@ -212,7 +282,7 @@ service shutdown and per-name stopping, before any mutation:
 | --- | --- |
 | `400` | `invalid_name`, `invalid_source_config`, `invalid_source_url`, `source_address_blocked` |
 | `404` | `broadcasts_disabled`, `source_not_found` |
-| `409` | `producer_conflict`, `source_conflict`, `broadcast_stopping` |
+| `409` | `producer_conflict`, `source_conflict`, `broadcast_options_conflict`, `broadcast_stopping` |
 | `413` | `source_request_too_large` |
 | `415` | `source_content_type_required` |
 | `500` | `broadcast_persistence_failed`, `broadcast_state_invalid`, `piece_index_exhausted` |

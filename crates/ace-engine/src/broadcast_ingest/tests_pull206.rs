@@ -17,7 +17,7 @@ async fn pull206_one_active_ingest_per_producer_and_drop_keeps_claim() {
     let registry = BroadcastRegistry::new();
     let seed = SeedRegistry::new();
     let (_broadcast, mut producer) = registry
-        .acquire_producer("permit", "Permit", &[], &seed, 2 << 20, ProducerKind::Pull)
+        .acquire_producer("permit", &[], &seed, 2 << 20, ProducerKind::Pull)
         .await
         .unwrap();
 
@@ -27,7 +27,7 @@ async fn pull206_one_active_ingest_per_producer_and_drop_keeps_claim() {
 
     // Dropping a retry attempt releases only its permit; the producer still owns the name.
     assert!(registry
-        .acquire_producer("permit", "Permit", &[], &seed, 2 << 20, ProducerKind::Rtmp)
+        .acquire_producer("permit", &[], &seed, 2 << 20, ProducerKind::Rtmp)
         .await
         .is_err());
     let _next_attempt = producer.open_ingest().unwrap();
@@ -38,14 +38,7 @@ async fn pull206_finish_publishes_a_signed_short_tail_once() {
     let registry = BroadcastRegistry::new();
     let seed = SeedRegistry::new();
     let (broadcast, mut producer) = registry
-        .acquire_producer(
-            "finite",
-            "Finite",
-            &[],
-            &seed,
-            2 << 20,
-            ProducerKind::RawPut,
-        )
+        .acquire_producer("finite", &[], &seed, 2 << 20, ProducerKind::RawPut)
         .await
         .unwrap();
     let mut ingest = producer.open_ingest().unwrap();
@@ -71,7 +64,7 @@ async fn pull206_drop_retry_discards_tail_and_reopens_same_identity() {
     let registry = BroadcastRegistry::new();
     let seed = SeedRegistry::new();
     let (broadcast, mut producer) = registry
-        .acquire_producer("retry", "Retry", &[], &seed, 2 << 20, ProducerKind::Pull)
+        .acquire_producer("retry", &[], &seed, 2 << 20, ProducerKind::Pull)
         .await
         .unwrap();
     let identity = broadcast.infohash;

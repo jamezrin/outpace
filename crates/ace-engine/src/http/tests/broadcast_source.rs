@@ -642,6 +642,73 @@ async fn pull206_source_api_contract_idempotent_attach_status_detach_and_identit
 }
 
 #[tokio::test]
+async fn options51_api_pull_attach_uses_the_named_profile() {
+    let mut app_state = source_state();
+    let registry =
+        crate::broadcast::BroadcastRegistry::new_with_options(std::collections::BTreeMap::from([
+            (
+                "synthetic-origin".to_owned(),
+                crate::broadcast_options::BroadcastOptions {
+                    title: Some("Synthetic title".to_owned()),
+                    bitrate_bytes_per_sec: Some(500_000),
+                    piece_length: Some(131_072),
+                    quality: Some("HD".to_owned()),
+                    categories: Some(vec![]),
+                },
+            ),
+        ]))
+        .unwrap();
+    registry.set_source_policy(FetchPolicy {
+        allow_non_global: true,
+    });
+    let (opened_sender, mut opened_rx) = tokio::sync::oneshot::channel::<()>();
+    let opened_sender = Arc::new(std::sync::Mutex::new(Some(opened_sender)));
+    let open: TestSourceOpen = Arc::new(move |_, _, _, _| {
+        let opened_sender = opened_sender.clone();
+        Box::pin(async move {
+            if let Some(sender) = opened_sender.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            std::future::pending::<()>().await;
+            Err(FetchError::Cancelled)
+        })
+    });
+    registry.set_source_test_hooks(SourceTestHooks {
+        open: Some(open),
+        ..SourceTestHooks::default()
+    });
+    app_state.broadcasts.as_mut().unwrap().registry = registry.clone();
+
+    let response = router(app_state)
+        .oneshot(request(
+            axum::http::Method::PUT,
+            "/broadcast/synthetic-origin/source",
+            r#"{"url":"http://127.0.0.1:1/live"}"#,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tokio::time::timeout(Duration::from_secs(2), &mut opened_rx)
+        .await
+        .expect("the real source worker should reach its fake opener")
+        .unwrap();
+    let broadcast = registry.get("synthetic-origin").await.unwrap();
+    let decoded = ace_wire::transport::decode_transport(&broadcast.transport_bytes).unwrap();
+    assert_eq!(decoded.name, "Synthetic title");
+    assert_eq!(decoded.bitrate, Some(500_000));
+    assert_eq!(decoded.piece_length, 131_072);
+    assert_eq!(
+        decoded.raw.get(b"quality").unwrap().as_bytes(),
+        Some(b"HD".as_slice())
+    );
+    assert!(
+        matches!(decoded.raw.get(b"categories"), Some(ace_wire::bencode::Bencode::List(items)) if items.is_empty())
+    );
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn pull206_reconnect_signatures_and_tails() {
     const PIECE_LENGTH: usize = 65_536;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

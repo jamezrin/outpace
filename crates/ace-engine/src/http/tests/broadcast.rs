@@ -68,6 +68,107 @@ async fn broadcast_get_404s_until_minted_then_serves_the_transport_bytes() {
 }
 
 #[tokio::test]
+async fn options51_raw_put_uses_the_named_profile() {
+    let mut app_state = broadcast_state();
+    let registry =
+        crate::broadcast::BroadcastRegistry::new_with_options(std::collections::BTreeMap::from([
+            (
+                "synthetic-origin".to_owned(),
+                crate::broadcast_options::BroadcastOptions {
+                    title: Some("Synthetic title".to_owned()),
+                    bitrate_bytes_per_sec: Some(500_000),
+                    piece_length: Some(131_072),
+                    quality: Some("HD".to_owned()),
+                    categories: Some(vec![]),
+                },
+            ),
+        ]))
+        .unwrap();
+    app_state.broadcasts.as_mut().unwrap().registry = registry.clone();
+    let app = router(app_state);
+    let response = app
+        .oneshot(
+            Request::put("/broadcast/synthetic-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let broadcast = registry.get("synthetic-origin").await.unwrap();
+    let decoded = ace_wire::transport::decode_transport(&broadcast.transport_bytes).unwrap();
+    assert_eq!(decoded.name, "Synthetic title");
+    assert_eq!(decoded.bitrate, Some(500_000));
+    assert_eq!(decoded.piece_length, 131_072);
+    assert_eq!(
+        decoded.raw.get(b"quality").unwrap().as_bytes(),
+        Some(b"HD".as_slice())
+    );
+    assert!(
+        matches!(decoded.raw.get(b"categories"), Some(ace_wire::bencode::Bencode::List(items)) if items.is_empty())
+    );
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn options51_raw_put_conflict_uses_the_existing_http_envelope() {
+    let dir = std::env::temp_dir().join(format!(
+        "outpace-options51-http-conflict-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let original = crate::broadcast::BroadcastRegistry::with_persist(
+        &dir,
+        crate::config::CacheType::Memory,
+        std::path::PathBuf::new(),
+    );
+    original
+        .mint(
+            "synthetic-origin",
+            &[],
+            &ace_swarm::listen::SeedRegistry::new(),
+            4 << 20,
+        )
+        .await
+        .unwrap();
+    original.shutdown().await.unwrap();
+
+    let registry = crate::broadcast::BroadcastRegistry::with_persist_and_options(
+        &dir,
+        crate::config::CacheType::Memory,
+        std::path::PathBuf::new(),
+        std::collections::BTreeMap::from([(
+            "synthetic-origin".to_owned(),
+            crate::broadcast_options::BroadcastOptions {
+                title: Some("Conflicting synthetic title".to_owned()),
+                ..Default::default()
+            },
+        )]),
+    )
+    .unwrap();
+    let mut app_state = broadcast_state();
+    app_state.broadcasts.as_mut().unwrap().registry = registry.clone();
+    let response = router(app_state)
+        .oneshot(
+            Request::put("/broadcast/synthetic-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"broadcast_options_conflict"}})
+    );
+    registry.shutdown().await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn broadcast_put_mints_and_serves_via_the_shared_seed_registry() {
     let st = broadcast_state();
     let seed_registry = st.broadcasts.as_ref().unwrap().seed_registry.clone();

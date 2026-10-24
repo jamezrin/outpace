@@ -1,7 +1,10 @@
 //! Shared outpace runtime setup for the daemon and CLI commands.
 
 use crate::ace_provider::AceProvider;
-use crate::broadcast::{Broadcast, BroadcastError, BroadcastRegistry};
+use crate::broadcast::{preflight_broadcasts, Broadcast, BroadcastError, BroadcastRegistry};
+use crate::broadcast_options::{
+    parse_broadcast_options, validate_broadcast_options, BroadcastOptionsError,
+};
 use crate::broadcast_pull::{
     parse_non_global_source_opt_in, parse_source_configs, validate_source_map,
     ValidatedSourceConfig,
@@ -57,6 +60,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         ),
         ..defaults
     };
+    apply_broadcast_options_env(&mut config, std::env::var("OUTPACE_BROADCAST_OPTIONS"))?;
     let raw_sources = match std::env::var("OUTPACE_BROADCAST_SOURCES") {
         Ok(raw) => Some(raw),
         Err(std::env::VarError::NotPresent) => None,
@@ -199,6 +203,18 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(config)
 }
 
+fn apply_broadcast_options_env(
+    config: &mut Config,
+    raw: Result<String, std::env::VarError>,
+) -> Result<(), BroadcastOptionsError> {
+    config.broadcast_options = match raw {
+        Ok(raw) => parse_broadcast_options(Some(&raw))?,
+        Err(std::env::VarError::NotPresent) => parse_broadcast_options(None)?,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(BroadcastOptionsError),
+    };
+    Ok(())
+}
+
 fn apply_inbound_per_stream_env(
     config: &mut Config,
     raw: Result<String, std::env::VarError>,
@@ -244,6 +260,74 @@ fn bool_from_env(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>>
 
 /// Marker that `OUTPACE_CACHE_DIR` is a dedicated Outpace disk cache and may be wiped at startup.
 const DISK_CACHE_SENTINEL: &str = ".outpace-cache";
+
+// Resolve existing ancestors without creating a directory. Missing suffixes can be
+// projected lexically; existing symlinks must be resolved before processing `..`.
+fn projected_directory(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::path::Component;
+    if path.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty cache directory",
+        ));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut resolved = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+        match std::fs::canonicalize(&resolved) {
+            Ok(path) => {
+                if !std::fs::metadata(&path)?.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "invalid cache directory",
+                    ));
+                }
+                resolved = path;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&resolved) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(error), // Includes dangling symlinks.
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match std::fs::metadata(&resolved) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "invalid cache directory",
+            ))
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    Ok(resolved)
+}
+
+fn preflight_disk_cache_paths(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.cache_type != CacheType::Disk {
+        return Ok(());
+    }
+    let cache = projected_directory(&config.cache_dir)?;
+    let data = projected_directory(&config.data_dir)?;
+    if data.starts_with(&cache) {
+        return Err("OUTPACE_CACHE_DIR must not equal or contain OUTPACE_DATA_DIR".into());
+    }
+    ensure_disk_cache_is_dedicated(&cache)
+}
 
 /// Create and resolve the disk/data roots before any persistent state is loaded or cache cleanup
 /// runs. Validation and later deletion must use this exact canonical cache path: lexically
@@ -511,10 +595,17 @@ pub async fn build_runtime(
         allow_non_global: config.allow_non_global_broadcast_source,
     };
     let source_configs = validate_source_map(&config.broadcast_sources, source_policy)?;
+    validate_broadcast_options(&config.broadcast_options)?;
+    if config.session_buffer == 0 {
+        return Err("OUTPACE_SESSION_BUFFER must be >= 1".into());
+    }
+    config.startup_buffer.validate()?;
     config.live_recovery.validate()?;
     config.hls.validate()?;
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
+    preflight_broadcasts(&config)?;
+    preflight_disk_cache_paths(&config)?;
     let normalizer = crate::hls_audio::preflight(&config.hls_audio).await?;
 
     // This must precede identity creation and, critically, the disk cache's remove_dir_all.
@@ -607,15 +698,15 @@ pub async fn build_runtime(
         });
     }
     let broadcasts = BroadcastState {
-        registry: BroadcastRegistry::with_persist(
+        registry: BroadcastRegistry::with_persist_and_options(
             &config.data_dir,
             config.cache_type,
             config.cache_dir.clone(),
-        ),
+            config.broadcast_options.clone(),
+        )?,
         seed_registry: seed_registry.clone(),
-        // Single resolved tracker list — `OUTPACE_TRACKERS` overrides the public default here, so
-        // BOTH descriptor minting (`mint_broadcast`) and self-announce (`announce_broadcast`),
-        // which read `broadcasts.trackers`, stay in lockstep.
+        // Process trackers select fresh identities only. Resumed announcements use the
+        // validated transport's own list, including an empty list.
         trackers: broadcast_trackers_from_env(),
         store_bytes: config.seed_store_bytes,
         inbound_peer_port: announce_port_rx,
@@ -627,7 +718,11 @@ pub async fn build_runtime(
     // startup owns network work only after listeners are established.
     let reloaded = match broadcasts
         .registry
-        .reload_persisted(&broadcasts.seed_registry, broadcasts.store_bytes)
+        .reload_persisted(
+            &broadcasts.seed_registry,
+            broadcasts.store_bytes,
+            &source_configs.keys().cloned().collect(),
+        )
         .await
     {
         Ok(reloaded) => reloaded,
@@ -1451,7 +1546,7 @@ mod tests {
 
         let reg = crate::broadcast::BroadcastRegistry::new();
         let seed = ace_swarm::listen::SeedRegistry::new();
-        let bc = reg.mint("t", "T", &trackers, &seed, 1 << 20).await.unwrap();
+        let bc = reg.mint("t", &trackers, &seed, 1 << 20).await.unwrap();
         let decoded = ace_wire::transport::decode_transport(&bc.transport_bytes).unwrap();
         assert_eq!(
             decoded.trackers,
@@ -2092,7 +2187,7 @@ mod tests {
                 CacheType::Memory,
                 std::path::PathBuf::new(),
             );
-            let bc = reg.mint("news", "News", &[], &seed, 1 << 20).await.unwrap();
+            let bc = reg.mint("news", &[], &seed, 1 << 20).await.unwrap();
             bc.infohash
         };
 
@@ -2176,6 +2271,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod tests_options51;
 #[cfg(test)]
 mod tests_pull206;
 

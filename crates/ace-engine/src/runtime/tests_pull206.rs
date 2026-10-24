@@ -50,7 +50,7 @@ async fn pull206_announcements_are_entry_owned_idempotent_and_canceled_on_shutdo
     let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
     let starts = Arc::new(AtomicUsize::new(0));
     let start_counter = starts.clone();
-    let factory: AnnouncerFactory = Arc::new(move |id| {
+    let factory: AnnouncerFactory = Arc::new(move |id, _trackers| {
         let started = started_tx.clone();
         let dropped = dropped_tx.clone();
         let starts = start_counter.clone();
@@ -114,7 +114,7 @@ async fn pull206_announcements_are_entry_owned_idempotent_and_canceled_on_shutdo
     let quiet_registry = BroadcastRegistry::new();
     let quiet_starts = Arc::new(AtomicUsize::new(0));
     let quiet_counter = quiet_starts.clone();
-    quiet_registry.set_test_announcer(Arc::new(move |_| {
+    quiet_registry.set_test_announcer(Arc::new(move |_, _trackers| {
         quiet_counter.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { pending::<()>().await })
     }));
@@ -155,7 +155,7 @@ async fn pull206_real_serving_wrapper_stops_owned_listeners_and_preserves_broadc
         .await
         .unwrap();
     assert!(registry
-        .mint("after-shutdown", "After", &[], &seed, 1 << 20)
+        .mint("after-shutdown", &[], &seed, 1 << 20)
         .await
         .is_err());
     assert!(BroadcastPersist::new(&dir)

@@ -184,7 +184,7 @@ async fn local_broadcast_content_id_resolves_without_catalog_or_opt_in() {
     let seed = SeedRegistry::new();
     let broadcasts = crate::broadcast::BroadcastRegistry::new();
     let broadcast = broadcasts
-        .mint("policy-test", "Synthetic broadcast", &[], &seed, 1 << 20)
+        .mint("policy-test", &[], &seed, 1 << 20)
         .await
         .unwrap();
     let p = provider().with_seed_registry(seed);

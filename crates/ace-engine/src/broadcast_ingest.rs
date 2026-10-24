@@ -1,6 +1,6 @@
 //! Session-authorized finite/live MPEG-TS signing and publication.
 
-use crate::broadcast::{Broadcast, BroadcastError, ProducerAuthority, CHUNK_LENGTH, PIECE_LENGTH};
+use crate::broadcast::{Broadcast, BroadcastError, ProducerAuthority};
 use ace_wire::live_codec::piece_header_from_unix_seconds;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -88,6 +88,7 @@ impl BroadcastIngest {
     pub(crate) fn authorized(broadcast: Broadcast, authority: Arc<ProducerAuthority>) -> Self {
         let start = broadcast.cursor.start_piece();
         let sig_len = broadcast.auth.signature_len() as u64;
+        let geometry = broadcast.geometry;
         Self {
             broadcast,
             permit: IngestPermit(Arc::new(Attempt {
@@ -99,14 +100,14 @@ impl BroadcastIngest {
             // Rebase the unmodified wire chunker after each complete signed piece. Keep
             // global indexes checked here, without imposing a lifetime byte-count ceiling.
             chunker: ace_wire::signing_chunker::SigningChunker::new(
-                PIECE_LENGTH,
-                CHUNK_LENGTH,
+                geometry.piece_length,
+                geometry.chunk_length,
                 0,
                 sig_len,
             ),
             start,
             signature_len: sig_len,
-            payload_capacity: (PIECE_LENGTH - sig_len) as usize,
+            payload_capacity: (geometry.piece_length - sig_len) as usize,
             buffered_payload: 0,
             sealed: false,
             failure: None,
@@ -168,8 +169,8 @@ impl BroadcastIngest {
                     };
                     self.buffered_payload = 0;
                     self.chunker = ace_wire::signing_chunker::SigningChunker::new(
-                        PIECE_LENGTH,
-                        CHUNK_LENGTH,
+                        self.broadcast.geometry.piece_length,
+                        self.broadcast.geometry.chunk_length,
                         0,
                         self.signature_len,
                     );
@@ -233,8 +234,8 @@ impl BroadcastIngest {
                     };
                     check_publication(&broadcast, &attempt, &cancel)?;
                     let header = header_for_piece(&mut current_header, out.piece);
-                    let completes_piece = u64::from(out.chunk) + 1 == PIECE_LENGTH / CHUNK_LENGTH
-                        && out.data.len() == CHUNK_LENGTH as usize;
+                    let completes_piece = u64::from(out.chunk) + 1 == broadcast.geometry.piece_length / broadcast.geometry.chunk_length
+                        && out.data.len() == broadcast.geometry.chunk_length as usize;
                     let current = broadcast.clone();
                     let current_attempt = attempt.clone();
                     let current_cancel = cancel.clone();
@@ -326,14 +327,7 @@ mod tests {
         let registry = BroadcastRegistry::new();
         let seed = SeedRegistry::new();
         let (broadcast, mut producer) = registry
-            .acquire_producer(
-                "ingest",
-                "Ingest",
-                &[],
-                &seed,
-                4 << 20,
-                ProducerKind::RawPut,
-            )
+            .acquire_producer("ingest", &[], &seed, 4 << 20, ProducerKind::RawPut)
             .await
             .unwrap();
         let mut ingest = producer.open_ingest().unwrap();
@@ -352,7 +346,7 @@ mod tests {
         let registry = BroadcastRegistry::new();
         let seed = SeedRegistry::new();
         let (broadcast, mut producer) = registry
-            .acquire_producer("resume", "Resume", &[], &seed, 8 << 20, ProducerKind::Pull)
+            .acquire_producer("resume", &[], &seed, 8 << 20, ProducerKind::Pull)
             .await
             .unwrap();
         let mut first = producer.open_ingest().unwrap();
@@ -371,5 +365,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod tests_options51;
 #[cfg(test)]
 mod tests_pull206;

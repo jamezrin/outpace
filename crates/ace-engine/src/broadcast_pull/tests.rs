@@ -765,11 +765,10 @@ async fn pull206_local_ingest_timeout_is_terminal_and_retains_source_claim() {
         registry
             .acquire_producer(
                 "ingest-timeout",
-                "raw conflict",
                 &[],
                 &state.seed_registry,
                 state.store_bytes,
-                ProducerKind::RawPut,
+                ProducerKind::RawPut
             )
             .await
             .err()
@@ -780,11 +779,10 @@ async fn pull206_local_ingest_timeout_is_terminal_and_retains_source_claim() {
         registry
             .acquire_producer(
                 "ingest-timeout",
-                "rtmp conflict",
                 &[],
                 &state.seed_registry,
                 state.store_bytes,
-                ProducerKind::Rtmp,
+                ProducerKind::Rtmp
             )
             .await
             .err()

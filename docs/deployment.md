@@ -150,6 +150,43 @@ services:
       - 9.9.9.9
 ```
 
+## Broadcast profile configuration
+
+Set `OUTPACE_BROADCAST_OPTIONS` before starting the daemon; the same named profile applies
+to raw PUT, RTMP, API/startup HTTP pull and CLI mint/resume. See the
+[exact schema/defaults/errors](native-api.md#broadcast-startup-profiles). In a protected env file:
+
+```dotenv
+OUTPACE_BROADCAST_OPTIONS='{"synthetic-origin":{"title":"Synthetic broadcast","bitrate_bytes_per_sec":500000,"piece_length":131072,"quality":"HD","categories":[]}}'
+```
+
+Compose does not automatically pass arbitrary host variables into containers. Add this to
+`compose.override.yml` when using profiles with the supplied Compose files:
+
+```yaml
+services:
+  outpace:
+    environment:
+      OUTPACE_BROADCAST_OPTIONS: '${OUTPACE_BROADCAST_OPTIONS-{}}'
+```
+
+Use the unset-only default to preserve invalid explicit blank values for strict validation.
+Keep JSON quoting intact and recreate the container after changing startup settings. Profiles
+are immutable in a running process and are not persisted with the signing record. An unused
+profile mints nothing, but its full wire piece must fit `OUTPACE_SEED_STORE_BYTES`. The same
+one-piece minimum applies to the default and every valid persisted geometry on memory/disk.
+Otherwise startup fails with `broadcast_store_too_small` before normalizer/cache/identity work.
+Legacy consumer-valid geometry, including 98304-byte pieces, is preserved when unasserted.
+
+Existing records retain exact transport/key bytes. Explicit fields must match raw stored
+values; explicit defaults can conflict with absent fields. Conflicts fail startup without a
+source too; configured names with invalid state fail closed, while unrelated invalid names
+remain tombstoned. Actual reload rechecks state before reserving/storing, with existing cleanup
+on failure and no new rollback guarantee. `OUTPACE_TRACKERS` affects fresh identities only;
+resumed announcements retain stored lists, including empty lists. New options/trackers require
+a new name or explicit broadcast DELETE/recreate, losing the previous identity and cursor
+continuity. These settings change no bind, seeding, source-address or tracker-address policy.
+
 ## Managed source declarations
 
 Both Compose examples forward `OUTPACE_BROADCAST_SOURCES` as `{}` when unset and
