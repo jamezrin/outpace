@@ -1,4 +1,14 @@
+use super::connect_diagnostics::{BasicReplyCause, BasicReplyProgress};
 use super::*;
+use ace_peer::PeerError;
+use ace_wire::handshake::HANDSHAKE_LEN;
+
+fn reply(received: usize, cause: BasicReplyCause) -> Option<BasicReplyProgress> {
+    Some(BasicReplyProgress {
+        received,
+        cause: Some(cause),
+    })
+}
 
 #[test]
 fn upstream_phase_summary_counts_timeouts_and_only_samples_reached_phases() {
@@ -17,12 +27,17 @@ fn upstream_phase_summary_counts_timeouts_and_only_samples_reached_phases() {
         stats.record_failure(PeerConnectFailure {
             addr,
             stage: PeerConnectStage::TotalTimeout,
-            timing: PeerConnectTiming { phase, durations },
+            timing: PeerConnectTiming {
+                phase,
+                durations,
+                reply: None,
+            },
         });
     }
     stats.record_connected(PeerConnectTiming {
         phase: ConnectPhase::Window,
         durations: [ms(0), ms(0), ms(0), ms(0)],
+        reply: None,
     });
     stats.record_task_failure();
     let summary = stats.summary();
@@ -55,6 +70,7 @@ fn upstream_phase_errors_are_timed_without_becoming_total_timeouts() {
                 Some(Duration::from_millis(50)),
                 None,
             ],
+            reply: None,
         },
     });
     let summary = stats.summary();
@@ -114,11 +130,16 @@ async fn upstream_phase_window_timeout_is_distinct_from_basic_handshake_timeout(
     };
     assert_eq!(failure.stage, PeerConnectStage::TotalTimeout);
     assert_eq!(failure.timing.phase, ConnectPhase::Window);
+    assert_eq!(
+        failure.timing.reply,
+        reply(HANDSHAKE_LEN, BasicReplyCause::Valid)
+    );
     assert!(failure.timing.durations.iter().all(Option::is_some));
     let mut stats = PeerConnectStats::default();
     stats.record_failure(failure);
     assert!(stats.summary().contains("timeout_window=1"));
     assert!(!stats.summary().contains("timeout_handshake_reply="));
+    assert!(stats.summary().contains("reply_valid_complete=1"));
 }
 
 #[tokio::test]
@@ -151,12 +172,135 @@ async fn upstream_phase_success_records_all_phases() {
         panic!("valid window must connect");
     };
     assert_eq!(timing.phase, ConnectPhase::Window);
+    assert_eq!(timing.reply, reply(HANDSHAKE_LEN, BasicReplyCause::Valid));
     assert!(timing.durations.iter().all(Option::is_some));
     let mut stats = PeerConnectStats::default();
     stats.record_connected(timing);
     assert!(stats.summary().starts_with("attempted=1 connected=1 "));
     assert!(stats.summary().contains("window_ms_p50="));
     assert!(!stats.summary().contains("timeout_"));
+    assert!(stats.summary().contains("reply_valid_complete=1"));
+}
+
+#[tokio::test]
+async fn upstream_partial_reply_outer_deadline_retains_bytes_and_counts_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let connect = tokio::spawn(connect_upstream(addr, [0; 20]));
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = [0; HANDSHAKE_LEN];
+    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut request)
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &[0xE1; 7])
+        .await
+        .unwrap();
+    let PeerConnectAttempt::Failed(failure) = connect.await.unwrap() else {
+        panic!("partial basic reply must hit the outer connection deadline");
+    };
+
+    assert_eq!(failure.stage, PeerConnectStage::TotalTimeout);
+    assert_eq!(failure.timing.phase, ConnectPhase::HandshakeReply);
+    assert_eq!(failure.timing.reply, reply(7, BasicReplyCause::Timeout));
+    let mut stats = PeerConnectStats::default();
+    stats.record_failure(failure);
+    assert!(stats.summary().starts_with("attempted=1 total_timeout=1 "));
+    assert!(stats.summary().contains("timeout_handshake_reply=1"));
+    assert!(stats.summary().contains("reply_timeout_partial=1"));
+}
+
+#[test]
+fn reply_stats_are_fixed_one_count_per_terminal_cause_and_leave_stage_totals_unchanged() {
+    let addr = SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1);
+    let mut stats = PeerConnectStats::default();
+    let cases = [
+        (0, BasicReplyCause::Timeout, "reply_timeout_zero=1"),
+        (7, BasicReplyCause::Eof, "reply_eof_partial=1"),
+        (7, BasicReplyCause::Reset, "reply_reset_partial=1"),
+        (0, BasicReplyCause::IoOther, "reply_io_other_zero=1"),
+        (
+            HANDSHAKE_LEN,
+            BasicReplyCause::Timeout,
+            "reply_timeout_complete=1",
+        ),
+        (
+            HANDSHAKE_LEN,
+            BasicReplyCause::Decode,
+            "reply_decode_complete=1",
+        ),
+        (
+            HANDSHAKE_LEN,
+            BasicReplyCause::HashMismatch,
+            "reply_hash_mismatch_complete=1",
+        ),
+        (
+            HANDSHAKE_LEN,
+            BasicReplyCause::Valid,
+            "reply_valid_complete=1",
+        ),
+    ];
+    for (received, cause, _) in cases {
+        stats.record_failure(PeerConnectFailure {
+            addr,
+            stage: PeerConnectStage::Handshake,
+            timing: PeerConnectTiming {
+                phase: ConnectPhase::HandshakeReply,
+                durations: [None; 4],
+                reply: reply(received, cause),
+            },
+        });
+    }
+    let summary = stats.summary();
+    assert!(summary.starts_with("attempted=8 handshake=8 "));
+    for (_, _, field) in cases {
+        assert!(summary.contains(field), "missing {field}: {summary}");
+    }
+    assert_eq!(summary.matches("reply_").count(), cases.len());
+}
+
+#[test]
+fn reply_stats_omit_attempts_before_sent_and_classify_typed_errors() {
+    let mut stats = PeerConnectStats::default();
+    stats.record_failure(PeerConnectFailure {
+        addr: SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1),
+        stage: PeerConnectStage::Tcp,
+        timing: PeerConnectTiming {
+            phase: ConnectPhase::Connect,
+            durations: [None; 4],
+            reply: None,
+        },
+    });
+    let summary = stats.summary();
+    assert_eq!(summary, "attempted=1 tcp=1");
+    assert!(!summary.contains("reply_"));
+
+    let cases = [
+        (PeerError::Timeout, BasicReplyCause::Timeout),
+        (
+            PeerError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            BasicReplyCause::Eof,
+        ),
+        (
+            PeerError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            BasicReplyCause::Reset,
+        ),
+        (
+            PeerError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            BasicReplyCause::IoOther,
+        ),
+        (
+            PeerError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            BasicReplyCause::IoOther,
+        ),
+        (PeerError::Protocol("synthetic"), BasicReplyCause::Decode),
+        (PeerError::InfohashMismatch, BasicReplyCause::HashMismatch),
+        (PeerError::Closed, BasicReplyCause::Eof),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(BasicReplyCause::from_error(&error), expected);
+    }
 }
 
 #[test]

@@ -4,8 +4,10 @@ use ace_wire::handshake::{
     Handshake, HandshakeProtocol, BITTORRENT_HANDSHAKE_LEN, HANDSHAKE_LEN, HANDSHAKE_PREFIX_LEN,
 };
 use ace_wire::message::PeerMessage;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 /// Default ceiling for any single peer I/O operation (connect, handshake, read).
 ///
@@ -14,6 +16,46 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// fans out across many flaky peers.
 pub const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(20);
 const INBOUND_PEER_ID_GRACE: Duration = Duration::from_millis(20);
+
+/// Outgoing basic-handshake progress, retained by the caller if it cancels the exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeProgress {
+    /// The entire local handshake has been written.
+    Sent,
+    /// Cumulative bytes consumed into the ACE reply buffer, in 1..=66.
+    /// Standard BitTorrent handshakes emit only [`Self::Sent`].
+    ReplyBytes { received: usize },
+}
+
+// Observe inside poll_read: read_exact can consume a prefix and return Pending in
+// the same poll, after which an outer timeout can drop it without another await.
+struct ReplyProgressReader<'a, S, F> {
+    stream: &'a mut S,
+    observe: &'a mut F,
+    received: usize,
+}
+
+impl<S: AsyncRead + Unpin, F: FnMut(HandshakeProgress)> AsyncRead
+    for ReplyProgressReader<'_, S, F>
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut *this.stream).poll_read(cx, buf);
+        let added = buf.filled().len() - before;
+        if added > 0 {
+            this.received += added;
+            (this.observe)(HandshakeProgress::ReplyBytes {
+                received: this.received,
+            });
+        }
+        result
+    }
+}
 
 pub struct PeerSession<S> {
     stream: S,
@@ -66,17 +108,47 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         peer_id: [u8; 20],
         on_sent: impl FnOnce(),
     ) -> Result<Handshake> {
+        let mut on_sent = Some(on_sent);
+        self.perform_handshake_with_progress_observer(infohash, peer_id, |event| {
+            if event == HandshakeProgress::Sent {
+                if let Some(on_sent) = on_sent.take() {
+                    on_sent();
+                }
+            }
+        })
+        .await
+    }
+
+    /// Like [`Self::perform_handshake`], observing the completed local write and
+    /// strictly increasing ACE reply byte counts, bounded by the 66-byte reply.
+    /// These count consumed bytes, without implying remote acceptance or a valid reply.
+    /// Byte events run synchronously while reading,
+    /// before cancellation can discard a partially consumed reply. This does not
+    /// make resuming a canceled handshake safe. Standard BitTorrent emits only Sent.
+    pub async fn perform_handshake_with_progress_observer(
+        &mut self,
+        infohash: [u8; 20],
+        peer_id: [u8; 20],
+        mut observe: impl FnMut(HandshakeProgress),
+    ) -> Result<Handshake> {
         if self.protocol == HandshakeProtocol::BitTorrent {
             return self
-                .perform_bittorrent_handshake(infohash, peer_id, on_sent)
+                .perform_bittorrent_handshake(infohash, peer_id, || {
+                    observe(HandshakeProgress::Sent)
+                })
                 .await;
         }
         let ours = Handshake::new(infohash, peer_id);
         let timeout = self.timeout;
         with_timeout(timeout, self.stream.write_all(&ours.encode())).await??;
-        on_sent();
+        observe(HandshakeProgress::Sent);
         let mut hs = [0u8; HANDSHAKE_LEN];
-        with_timeout(timeout, self.stream.read_exact(&mut hs)).await??;
+        let mut reader = ReplyProgressReader {
+            stream: &mut self.stream,
+            observe: &mut observe,
+            received: 0,
+        };
+        with_timeout(timeout, reader.read_exact(&mut hs)).await??;
         let peer = Handshake::decode(&hs)?;
         if peer.infohash != infohash {
             return Err(PeerError::InfohashMismatch);
@@ -472,6 +544,363 @@ mod tests {
             assert!(matches!(result, Err(PeerError::Timeout)));
             assert_eq!(sent, expected_sent);
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_handshake_observer_accepts_a_genuinely_fnonce_callback() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server
+                .write_all(&Handshake::new([0; 20], [0; 20]).encode())
+                .await
+                .unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let token = String::from("consumed by FnOnce");
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_callback = sent.clone();
+
+        session
+            .perform_handshake_with_observer([0; 20], [1; 20], move || {
+                drop(token);
+                sent_callback.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .await
+            .unwrap();
+
+        assert!(sent.load(std::sync::atomic::Ordering::Relaxed));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bittorrent_progress_observer_reports_sent_without_ace_reply_bytes() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let infohash = [0x11; 20];
+        let peer_id = [0x22; 20];
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; BITTORRENT_HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            assert_eq!(
+                local.as_slice(),
+                fixed_bittorrent_handshake(infohash, peer_id)
+            );
+            server
+                .write_all(&fixed_bittorrent_handshake(infohash, [0x33; 20]))
+                .await
+                .unwrap();
+        });
+        let mut session = PeerSession::new(client).with_protocol(HandshakeProtocol::BitTorrent);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer(infohash, peer_id, |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(result.infohash, infohash);
+        assert_eq!(events, [HandshakeProgress::Sent]);
+        server_task.await.unwrap();
+    }
+
+    struct ErrorAfterPrefix {
+        prefix: std::collections::VecDeque<u8>,
+        error: std::io::ErrorKind,
+        emitted_error: bool,
+    }
+
+    impl AsyncRead for ErrorAfterPrefix {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.prefix.is_empty() {
+                let count = buf.remaining().min(self.prefix.len());
+                let bytes: Vec<_> = self.prefix.drain(..count).collect();
+                buf.put_slice(&bytes);
+                return Poll::Ready(Ok(()));
+            }
+            if !self.emitted_error {
+                self.emitted_error = true;
+                return Poll::Ready(Err(std::io::Error::new(
+                    self.error,
+                    "synthetic reply error",
+                )));
+            }
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ErrorAfterPrefix {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_observer_preserves_reset_and_other_io_errors_after_counting_prefix() {
+        for error_kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let stream = ErrorAfterPrefix {
+                prefix: [0xD4; 7].into(),
+                error: error_kind,
+                emitted_error: false,
+            };
+            let mut session = PeerSession::new(stream);
+            let mut events = Vec::new();
+
+            let result = session
+                .perform_handshake_with_progress_observer([0; 20], [1; 20], |event| {
+                    events.push(event)
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(PeerError::Io(ref error)) if error.kind() == error_kind
+            ));
+            assert_eq!(
+                events,
+                [
+                    HandshakeProgress::Sent,
+                    HandshakeProgress::ReplyBytes { received: 7 }
+                ]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_observer_reports_sent_and_zero_reply_when_outer_deadline_cancels() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let mut session = PeerSession::new(client).with_timeout(Duration::from_secs(5));
+        let mut events = Vec::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.perform_handshake_with_progress_observer([0; 20], [0; 20], |event| {
+                events.push(event)
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "outer deadline should cancel the pending reply read"
+        );
+        assert_eq!(events, [HandshakeProgress::Sent]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_observer_retains_partial_prefix_consumed_before_outer_cancellation() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server.write_all(&[0xA5; 7]).await.unwrap();
+            // Keep the read pending after the prefix has been consumed.
+            std::future::pending::<()>().await;
+        });
+        let mut session = PeerSession::new(client).with_timeout(Duration::from_secs(5));
+        let mut events = Vec::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.perform_handshake_with_progress_observer([0; 20], [0; 20], |event| {
+                events.push(event)
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "outer deadline should cancel the partial reply read"
+        );
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes { received: 7 }
+            ]
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_observer_retains_partial_prefix_when_inner_reply_deadline_expires() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server.write_all(&[0xC3; 7]).await.unwrap();
+            // Keep the read pending after the prefix has been consumed.
+            std::future::pending::<()>().await;
+        });
+        let mut session = PeerSession::new(client).with_timeout(Duration::from_secs(1));
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer([0; 20], [0; 20], |event| events.push(event))
+            .await;
+
+        assert!(matches!(result, Err(PeerError::Timeout)));
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes { received: 7 }
+            ]
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn progress_observer_reports_partial_eof_and_preserves_read_error() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server.write_all(&[0x5A; 11]).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer([0; 20], [0; 20], |event| events.push(event))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PeerError::Io(ref error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes { received: 11 }
+            ]
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_observer_counts_full_malformed_reply_without_accepting_it() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server.write_all(&[0; HANDSHAKE_LEN]).await.unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer([0; 20], [0; 20], |event| events.push(event))
+            .await;
+
+        assert!(matches!(result, Err(PeerError::Wire(_))));
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes {
+                    received: HANDSHAKE_LEN
+                }
+            ]
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_observer_counts_hash_mismatch_only_after_full_reply_validation() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server
+                .write_all(&Handshake::new([1; 20], [2; 20]).encode())
+                .await
+                .unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer([0; 20], [0; 20], |event| events.push(event))
+            .await;
+
+        assert!(matches!(result, Err(PeerError::InfohashMismatch)));
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes {
+                    received: HANDSHAKE_LEN
+                }
+            ]
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_observer_stops_at_basic_reply_and_leaves_following_frame_readable() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let infohash = [0x11; 20];
+        let frame = PeerMessage::KeepAlive.encode();
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut local = [0; HANDSHAKE_LEN];
+            server.read_exact(&mut local).await.unwrap();
+            server
+                .write_all(&Handshake::new(infohash, [2; 20]).encode())
+                .await
+                .unwrap();
+            server.write_all(&frame).await.unwrap();
+        });
+        let mut session = PeerSession::new(client);
+        let mut events = Vec::new();
+
+        let result = session
+            .perform_handshake_with_progress_observer(infohash, [3; 20], |event| events.push(event))
+            .await
+            .unwrap();
+        let following = session.read_message().await.unwrap();
+
+        assert_eq!(result.infohash, infohash);
+        assert_eq!(following, PeerMessage::KeepAlive);
+        assert_eq!(
+            events,
+            [
+                HandshakeProgress::Sent,
+                HandshakeProgress::ReplyBytes {
+                    received: HANDSHAKE_LEN
+                }
+            ]
+        );
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
