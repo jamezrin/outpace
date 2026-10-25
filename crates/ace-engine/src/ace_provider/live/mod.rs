@@ -1,6 +1,9 @@
 use super::*;
 use ace_swarm::live_session::{follow_live, LiveCounters, LiveSeedOptions, LiveSessionInputs};
 
+const INITIAL_DISCOVERY_BUDGET: Duration = Duration::from_secs(10);
+const EMPTY_DISCOVERY_RETRY_GAP: Duration = Duration::from_secs(1);
+
 pub(super) struct AceSource {
     pub(super) metrics: Option<Arc<crate::live_stats::LiveMetrics>>,
     pub(super) _sampler: Option<crate::live_stats::MetricsSampler>,
@@ -59,20 +62,54 @@ impl AceProvider {
         // tracker/DHT discovery. Background refill can still discover more peers after start.
         let mut initial_run = None;
         let peers = if self.bootstrap_peers.is_empty() {
-            let mut run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
-            self.warm_peers.initialized().await;
-            let hints = self.warm_peers.candidate_addresses(&info.infohash);
-            let mut peers: Vec<_> = hints.into_iter().collect();
-            if peers.is_empty() {
-                peers.extend(run.next_candidate().await);
+            // One budget covers warm-cache initialization, both generations and the gap.
+            let deadline = tokio::time::Instant::now() + INITIAL_DISCOVERY_BUDGET;
+            let acquired = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => None,
+                result = async {
+                    let mut run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
+                    self.warm_peers.initialized().await;
+                    let mut peers = self.warm_peers.candidate_addresses(&info.infohash);
+                    let mut retried = false;
+                    loop {
+                        if peers.is_empty() {
+                            // None means all candidate producers finished, not merely a quiet run.
+                            peers.extend(run.next_candidate().await);
+                        }
+                        while let Ok(peer) = run.try_next_candidate() {
+                            peers.push(peer);
+                        }
+                        if !peers.is_empty() || retried {
+                            break Some((peers, run));
+                        }
+                        // Release the empty generation before waiting; cancellation owns
+                        // both the active run and the gap through this opening future.
+                        drop(run);
+                        tokio::time::sleep(EMPTY_DISCOVERY_RETRY_GAP).await;
+                        if tokio::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                        retried = true;
+                        run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
+                    }
+                } => result,
+            };
+            // The deadline also wins if acquisition becomes ready in the same poll, or
+            // synchronous candidate collection crosses expiry before the timer is polled again.
+            match acquired {
+                Some((peers, run)) if tokio::time::Instant::now() < deadline => {
+                    if !peers.is_empty() {
+                        initial_run = Some(run);
+                    }
+                    peers
+                }
+                _ => {
+                    return Err(ProviderError::Backend(
+                        "initial peer discovery timed out".into(),
+                    ));
+                }
             }
-            while let Ok(peer) = run.try_next_candidate() {
-                peers.push(peer);
-            }
-            if !peers.is_empty() {
-                initial_run = Some(run);
-            }
-            peers
         } else {
             self.bootstrap_peers.clone()
         };
