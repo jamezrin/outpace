@@ -257,6 +257,922 @@ async fn quiet_candidate_cooldown_expiry_retries_without_new_discovery_or_gossip
     late_candidate_media_control(true, false, true).await;
 }
 
+#[derive(Clone, Copy)]
+enum InitialGeneration {
+    EmptyThenHealthy,
+    Healthy,
+}
+
+async fn completed_empty_generation_control(mode: InitialGeneration) {
+    const HARNESS_DEADLINE: Duration = Duration::from_secs(8);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(healthy_addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let healthy_handshakes = Arc::new(AtomicU32::new(0));
+    let observed_handshakes = healthy_handshakes.clone();
+    let mut server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut session = PeerSession::new(stream);
+        session.accept_handshake([0; 20], |_| true).await.unwrap();
+        observed_handshakes.fetch_add(1, Ordering::Relaxed);
+        session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(LivePosition {
+                    min_piece: 7,
+                    max_piece: 10,
+                    position: -1,
+                    distance_from_source: 1,
+                }),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .unwrap();
+        session.send(&PeerMessage::Unchoke).await.unwrap();
+        while let Ok(message) = session.read_message().await {
+            if let PeerMessage::Unknown { id: 6, payload } = message {
+                let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                if session
+                    .send(&build_piece(0, piece, 0, [0; 8], &media_piece(0x66)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+
+    let generations = Arc::new(AtomicU32::new(0));
+    let observed_generations = generations.clone();
+    let (first_completed_tx, first_completed_rx) = tokio::sync::oneshot::channel();
+    let first_completed_tx = Arc::new(std::sync::Mutex::new(Some(first_completed_tx)));
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let generation = observed_generations.fetch_add(1, Ordering::Relaxed) + 1;
+        let first_completed = first_completed_tx.clone();
+        Box::pin(async move {
+            match (mode, generation) {
+                (InitialGeneration::EmptyThenHealthy, 1) => {
+                    discover_peers_from_sources_incremental(
+                        async { Vec::new() },
+                        async { Vec::new() },
+                        sender,
+                    )
+                    .await;
+                    if let Some(completed) = first_completed.lock().unwrap().take() {
+                        let _ = completed.send(());
+                    }
+                }
+                (InitialGeneration::EmptyThenHealthy, 2) | (InitialGeneration::Healthy, 1) => {
+                    sender.send(healthy_addr).await.unwrap();
+                    sender.closed().await;
+                }
+                _ => {}
+            }
+        })
+    });
+
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_prefetch_pieces(Some(1))
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..StartupBufferConfig::default()
+        });
+    let playback = tokio::time::timeout(HARNESS_DEADLINE, async move {
+        let mut source = provider
+            .open_resolved("synthetic", info(), discovery)
+            .await
+            .map_err(|error| error.to_string())?;
+        let first_media = source.next().await;
+        drop(source);
+        Ok::<_, String>(first_media)
+    })
+    .await;
+
+    // Allow the real source/discovery ownership path to observe consumer closure before
+    // assertions. The listener task is always bounded and aborted/awaited if it stays open.
+    let server_finished = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+    match server_finished {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("healthy server task failed: {error}"),
+        Err(_) => {
+            server.abort();
+            let aborted = server.await;
+            assert!(
+                aborted.is_err_and(|error| error.is_cancelled()),
+                "healthy server did not stop after bounded abort"
+            );
+        }
+    }
+    let first_completed = if matches!(mode, InitialGeneration::EmptyThenHealthy) {
+        tokio::time::timeout(Duration::from_secs(1), first_completed_rx).await
+    } else {
+        Ok(Ok(()))
+    };
+
+    assert!(
+        first_completed.is_ok() && first_completed.unwrap().is_ok(),
+        "the completed-empty first generation did not finish"
+    );
+    let expected_generations = match mode {
+        InitialGeneration::EmptyThenHealthy => 2,
+        InitialGeneration::Healthy => 1,
+    };
+    let healthy_media = matches!(playback, Ok(Ok(Some(ref bytes))) if bytes.contains(&0x66));
+    assert_eq!(
+        generations.load(Ordering::Relaxed),
+        expected_generations,
+        "discovery generation count; playback={playback:?}, healthy handshakes={}",
+        healthy_handshakes.load(Ordering::Relaxed)
+    );
+    assert!(
+        healthy_media,
+        "one resolved-open call under the {HARNESS_DEADLINE:?} harness bound must reach a real healthy handshake and deliver synthetic media; playback={playback:?}, handshakes={}, generations={}",
+        healthy_handshakes.load(Ordering::Relaxed),
+        generations.load(Ordering::Relaxed),
+    );
+    assert_eq!(
+        healthy_handshakes.load(Ordering::Relaxed),
+        1,
+        "the loopback peer must complete exactly one real ACE handshake"
+    );
+}
+
+#[tokio::test]
+async fn completed_empty_initial_discovery_recovers_in_the_same_open_call() {
+    completed_empty_generation_control(InitialGeneration::EmptyThenHealthy).await;
+}
+
+#[tokio::test]
+async fn direct_healthy_initial_discovery_delivers_media_positive_control() {
+    completed_empty_generation_control(InitialGeneration::Healthy).await;
+}
+
+struct GenerationDropNotice {
+    generation: u32,
+    notices: tokio::sync::mpsc::UnboundedSender<u32>,
+}
+impl Drop for GenerationDropNotice {
+    fn drop(&mut self) {
+        let _ = self.notices.send(self.generation);
+    }
+}
+
+async fn yield_discovery_tasks() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn spawn_resolved_open(
+    provider: AceProvider,
+    discovery: PeerDiscovery,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    tokio::spawn(async move {
+        provider
+            .open_resolved("synthetic", info(), discovery)
+            .await
+            .map(drop)
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_discovery_policy_caps_empty_generations_and_waits_one_second() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let generation = observed_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = started_tx.send(generation);
+        let dropped = dropped_tx.clone();
+        Box::pin(async move {
+            let _notice = GenerationDropNotice {
+                generation,
+                notices: dropped,
+            };
+            drop(sender);
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let mut open = spawn_resolved_open(provider, discovery);
+
+    let first_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    let first_completed = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    yield_discovery_tasks().await;
+    let waiting_after_first = !open.is_finished();
+    tokio::time::advance(Duration::from_millis(999)).await;
+    yield_discovery_tasks().await;
+    let waiting_before_retry_gap_ends = !open.is_finished() && calls.load(Ordering::Relaxed) == 1;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let second_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(2);
+    let second_completed = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(2);
+    let open_result = if open.is_finished() {
+        Some(open.await)
+    } else {
+        match tokio::time::timeout(Duration::from_secs(1), &mut open).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                open.abort();
+                let _ = open.await;
+                None
+            }
+        }
+    };
+
+    assert!(
+        first_started && first_completed,
+        "first empty generation must complete"
+    );
+    assert!(
+        waiting_after_first && waiting_before_retry_gap_ends,
+        "opening must remain pending until the full one-second retry gap elapses"
+    );
+    assert!(
+        second_started && second_completed,
+        "exactly a second generation must run"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "a third generation must not start"
+    );
+    assert!(
+        matches!(open_result, Some(Ok(Err(_)))),
+        "two completed-empty generations must terminate with a backend error: {open_result:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_discovery_policy_bounds_a_hanging_first_generation() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let generation = observed_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = started_tx.send(generation);
+        let dropped = dropped_tx.clone();
+        Box::pin(async move {
+            let _notice = GenerationDropNotice {
+                generation,
+                notices: dropped,
+            };
+            sender.closed().await;
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let open = spawn_resolved_open(provider, discovery);
+    let first_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    yield_discovery_tasks().await;
+    let expired_at_original_budget = open.is_finished();
+    let open_result = if expired_at_original_budget {
+        Some(open.await)
+    } else {
+        open.abort();
+        let _ = open.await;
+        None
+    };
+    let first_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+
+    assert!(first_started, "the first generation must start");
+    assert!(
+        expired_at_original_budget,
+        "a hanging first generation must hit the 10s budget"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "a pending generation must not be restarted"
+    );
+    assert!(
+        first_dropped,
+        "budget expiry must cancel the discovery owner"
+    );
+    assert!(
+        matches!(open_result, Some(Ok(Err(_)))),
+        "budget expiry must return a backend error: {open_result:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_discovery_policy_does_not_reset_budget_and_rejects_late_candidate() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (second_sender_tx, second_sender_rx) = tokio::sync::oneshot::channel();
+    let second_sender_tx = Arc::new(std::sync::Mutex::new(Some(second_sender_tx)));
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let generation = observed_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = started_tx.send(generation);
+        let second_sender = second_sender_tx.clone();
+        let dropped = dropped_tx.clone();
+        Box::pin(async move {
+            let _notice = GenerationDropNotice {
+                generation,
+                notices: dropped,
+            };
+            if generation == 1 {
+                drop(sender);
+            } else {
+                if let Some(deliver) = second_sender.lock().unwrap().take() {
+                    let _ = deliver.send(sender.clone());
+                }
+                sender.closed().await;
+            }
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let open = spawn_resolved_open(provider, discovery);
+    let first_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    let first_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let second_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(2);
+    let second_sender = tokio::time::timeout(Duration::from_secs(1), second_sender_rx).await;
+
+    // Generation two began at t=1s. The original t=10s deadline must still expire here.
+    tokio::time::advance(Duration::from_secs(9)).await;
+    yield_discovery_tasks().await;
+    let expired_at_original_budget = open.is_finished();
+    let open_result = if expired_at_original_budget {
+        Some(open.await)
+    } else {
+        open.abort();
+        let _ = open.await;
+        None
+    };
+    let late_candidate_rejected = match second_sender {
+        Ok(Ok(sender)) => sender
+            .send(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1))
+            .await
+            .is_err(),
+        _ => false,
+    };
+    let second_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(2);
+
+    assert!(
+        first_started && first_dropped,
+        "the first generation must complete empty"
+    );
+    assert!(
+        second_started,
+        "the second generation must start after the retry gap"
+    );
+    assert!(
+        expired_at_original_budget,
+        "the 10s opening budget must not restart when generation two starts"
+    );
+    assert!(
+        late_candidate_rejected,
+        "a candidate arriving after expiry must be rejected"
+    );
+    assert!(second_dropped, "budget expiry must cancel generation two");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert!(
+        matches!(open_result, Some(Ok(Err(_)))),
+        "the original budget must terminate opening with a backend error: {open_result:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn exact_initial_discovery_deadline_rejects_candidate_ready_before_repoll() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (second_sender_tx, second_sender_rx) = tokio::sync::oneshot::channel();
+    let second_sender_tx = Arc::new(std::sync::Mutex::new(Some(second_sender_tx)));
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let generation = observed_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = started_tx.send(generation);
+        let second_sender = second_sender_tx.clone();
+        let dropped = dropped_tx.clone();
+        Box::pin(async move {
+            let _notice = GenerationDropNotice {
+                generation,
+                notices: dropped,
+            };
+            if generation == 1 {
+                drop(sender);
+            } else {
+                if let Some(deliver) = second_sender.lock().unwrap().take() {
+                    let _ = deliver.send(sender.clone());
+                }
+                sender.closed().await;
+            }
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let mut open = Box::pin(provider.open_resolved("synthetic", info(), discovery));
+
+    let initially_pending = futures::poll!(open.as_mut()).is_pending();
+    let first_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    let first_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    let waiting_in_gap = futures::poll!(open.as_mut()).is_pending();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let after_gap = futures::poll!(open.as_mut());
+    let second_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(2);
+    let second_sender = match tokio::time::timeout(Duration::from_secs(1), second_sender_rx).await {
+        Ok(Ok(sender)) => Some(sender),
+        _ => None,
+    };
+    let waiting_for_candidate = futures::poll!(open.as_mut()).is_pending();
+
+    // Advance to the absolute t=10s boundary without polling the opening future, then enqueue
+    // a candidate synchronously before the next poll can choose between candidate and timeout.
+    tokio::time::advance(Duration::from_secs(9)).await;
+    let candidate_ready_at_expiry = match &second_sender {
+        Some(sender) => sender
+            .try_send(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1))
+            .is_ok(),
+        None => false,
+    };
+    let result = futures::poll!(open.as_mut());
+    let exact_expiry_rejected = matches!(result, std::task::Poll::Ready(Err(_)));
+    let channel_closed = second_sender
+        .as_ref()
+        .is_some_and(|sender| sender.is_closed());
+    drop(open);
+    let second_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(2);
+
+    assert!(initially_pending && first_started && first_dropped);
+    assert!(waiting_in_gap && after_gap.is_pending() && second_started);
+    assert!(
+        waiting_for_candidate,
+        "second generation must remain pending before expiry"
+    );
+    assert!(
+        candidate_ready_at_expiry,
+        "candidate must be queued at the exact deadline"
+    );
+    assert!(exact_expiry_rejected && channel_closed);
+    assert!(second_dropped, "expiry must cancel the second generation");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn canceling_during_initial_discovery_retry_gap_prevents_second_generation() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let generation = observed_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = started_tx.send(generation);
+        let dropped = dropped_tx.clone();
+        Box::pin(async move {
+            let _notice = GenerationDropNotice {
+                generation,
+                notices: dropped,
+            };
+            drop(sender);
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let open = spawn_resolved_open(provider, discovery);
+    let first_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    let first_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    yield_discovery_tasks().await;
+    let in_retry_gap = !open.is_finished();
+    open.abort();
+    let canceled = open.await.is_err_and(|error| error.is_cancelled());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    yield_discovery_tasks().await;
+
+    assert!(
+        first_started && first_dropped,
+        "the first generation must finish empty"
+    );
+    assert!(
+        in_retry_gap,
+        "opening must still be pending in the retry gap"
+    );
+    assert!(canceled, "dropping opening during the gap must cancel it");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "the retry must not detach after cancellation"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn canceling_during_second_initial_generation_drops_its_owner() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let generation = observed_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = started_tx.send(generation);
+        let dropped = dropped_tx.clone();
+        Box::pin(async move {
+            let _notice = GenerationDropNotice {
+                generation,
+                notices: dropped,
+            };
+            if generation == 1 {
+                drop(sender);
+            } else {
+                sender.closed().await;
+            }
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let open = spawn_resolved_open(provider, discovery);
+    let first_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    let first_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let second_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(2);
+    open.abort();
+    let canceled = open.await.is_err_and(|error| error.is_cancelled());
+    let second_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(2);
+
+    assert!(
+        first_started && first_dropped,
+        "the first generation must finish empty"
+    );
+    assert!(
+        second_started,
+        "the second generation must be owned by the opening call"
+    );
+    assert!(canceled, "dropping opening must cancel generation two");
+    assert!(
+        second_dropped,
+        "generation two must be dropped after caller cancellation"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
+async fn finish_open_with_bounded_cleanup(
+    open: &mut tokio::task::JoinHandle<Result<(), String>>,
+    bound: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(bound, &mut *open).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("open task failed: {error}")),
+        Err(_) => {
+            open.abort();
+            match open.await {
+                Ok(Ok(())) => Err("open completed after the test bound".into()),
+                Ok(Err(error)) => Err(format!("open failed after the test bound: {error}")),
+                Err(error) if error.is_cancelled() => {
+                    Err("open exceeded the test bound and was canceled".into())
+                }
+                Err(error) => Err(format!("open exceeded the test bound and failed: {error}")),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_open_error_is_returned_without_repolling_join_handle() {
+    let mut completed_open =
+        tokio::spawn(async { Err::<(), _>("synthetic open error".to_owned()) });
+    let completed = tokio::time::timeout(Duration::from_secs(1), async {
+        while !completed_open.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    if !completed {
+        completed_open.abort();
+        let _ = completed_open.await;
+        panic!("the helper regression requires an already-completed handle");
+    }
+    let result =
+        finish_open_with_bounded_cleanup(&mut completed_open, Duration::from_secs(1)).await;
+
+    assert_eq!(result, Err("synthetic open error".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn elapsed_open_bound_aborts_and_awaits_open_task() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut pending_open = tokio::spawn(async move {
+        let _notice = GenerationDropNotice {
+            generation: 99,
+            notices: dropped_tx,
+        };
+        let _ = started_tx.send(());
+        std::future::pending::<Result<(), String>>().await
+    });
+    started_rx.await.unwrap();
+
+    let result = finish_open_with_bounded_cleanup(&mut pending_open, Duration::from_secs(1)).await;
+    let dropped = dropped_rx.recv().await;
+
+    assert_eq!(
+        result,
+        Err("open exceeded the test bound and was canceled".into())
+    );
+    assert_eq!(
+        dropped,
+        Some(99),
+        "the timed-out open task must be aborted and joined"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ongoing_initial_discovery_keeps_late_candidate_without_restarting() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let generation = observed_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = started_tx.send(generation);
+        let dropped = dropped_tx.clone();
+        let release = release_rx.clone();
+        Box::pin(async move {
+            let _notice = GenerationDropNotice {
+                generation,
+                notices: dropped,
+            };
+            let released = match release.lock().await.take() {
+                Some(receiver) => receiver.await.is_ok(),
+                None => false,
+            };
+            if generation == 1 && released {
+                let _ = sender
+                    .send(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1))
+                    .await;
+                sender.closed().await;
+            }
+        })
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let mut open = spawn_resolved_open(provider, discovery);
+    let first_started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    yield_discovery_tasks().await;
+    let one_generation_while_pending = calls.load(Ordering::Relaxed) == 1 && !open.is_finished();
+    let _ = release_tx.send(());
+    let open_result = finish_open_with_bounded_cleanup(&mut open, Duration::from_secs(1)).await;
+    let first_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+
+    assert!(first_started, "the initial generation must start");
+    assert!(
+        one_generation_while_pending,
+        "an ongoing generation must not be restarted just because it yielded no candidate yet"
+    );
+    assert!(
+        open_result.is_ok(),
+        "the original generation's late candidate must open the source: {open_result:?}"
+    );
+    assert!(
+        first_dropped,
+        "consumer closure must release the sole generation owner"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn bootstrap_peer_path_still_bypasses_initial_discovery() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let discovery: PeerDiscovery = Arc::new(move |_, _| {
+        observed_calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {})
+    });
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_bootstrap_peers(vec![SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1)]);
+    let open_result = tokio::time::timeout(
+        Duration::from_secs(1),
+        provider.open_resolved("synthetic", info(), discovery),
+    )
+    .await;
+    match open_result {
+        Ok(Ok(source)) => drop(source),
+        Ok(Err(error)) => panic!("bootstrap open failed: {error}"),
+        Err(_) => panic!("bootstrap open exceeded its test bound"),
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn warm_peer_hint_still_opens_without_waiting_for_discovery_output() {
+    let directory = std::env::temp_dir().join(format!(
+        "outpace-empty-discovery-warm-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(&directory).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cache_file = directory.join("recent-peers-v1");
+    std::fs::write(
+        &cache_file,
+        format!(
+            "OUTPACE-WARM-1\n{} {now} S 127.0.0.1 1\n",
+            hex::encode([0u8; 20])
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let initial_inode = std::fs::metadata(&cache_file).unwrap().ino();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed_calls = calls.clone();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        observed_calls.fetch_add(1, Ordering::Relaxed);
+        let dropped = dropped_tx.clone();
+        Box::pin(async move {
+            let _notice = GenerationDropNotice {
+                generation: 1,
+                notices: dropped,
+            };
+            sender.closed().await;
+        })
+    });
+    let mut provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    provider.warm_peers = WarmPeerCache::new(&directory, true);
+    let opened = tokio::time::timeout(
+        Duration::from_secs(2),
+        provider.open_resolved("synthetic", info(), discovery),
+    )
+    .await;
+    drop(provider);
+    let warm_hint_opened = match opened {
+        Ok(Ok(source)) => {
+            drop(source);
+            true
+        }
+        Ok(Err(_)) | Err(_) => false,
+    };
+    let owner_released = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        == Some(1);
+    yield_discovery_tasks().await;
+    let discovery_calls = calls.load(Ordering::Relaxed);
+    let cache_worker_flushed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if std::fs::metadata(&cache_file).is_ok_and(|metadata| metadata.ino() != initial_inode)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    if cache_worker_flushed {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let cleanup = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match std::fs::remove_dir_all(&directory) {
+                Ok(()) => break true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break true,
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    tokio::task::yield_now().await
+                }
+                Err(_) => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(
+        owner_released,
+        "source drop must release the discovery owner"
+    );
+    assert!(
+        cache_worker_flushed,
+        "warm cache owner must finish its final bounded write"
+    );
+    assert!(cleanup, "warm cache test directory must be removed");
+    assert!(
+        warm_hint_opened,
+        "warm peer hint must open without waiting for discovery output"
+    );
+    assert_eq!(discovery_calls, 1);
+}
+
 // Reconstruct the entire provider: process-local candidate memory cannot satisfy this.
 struct DiscoveryDropProbe(Arc<AtomicU32>);
 impl Drop for DiscoveryDropProbe {
