@@ -1,3 +1,4 @@
+use super::connect_diagnostics::BasicReplyCause;
 use super::*;
 
 pub(super) fn prefer_window(candidate: &WireLivePosition, current: &WireLivePosition) -> bool {
@@ -67,7 +68,10 @@ pub(super) async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> 
     .await
     {
         Ok(result) => result,
-        Err(_) => Err(PeerConnectStage::TotalTimeout),
+        Err(_) => {
+            progress.reply_timeout();
+            Err(PeerConnectStage::TotalTimeout)
+        }
     };
     let timing = progress.finish();
     let outcome = match &result {
@@ -106,14 +110,17 @@ async fn connect_upstream_inner(
     };
     progress.advance(ConnectPhase::HandshakeSend);
     crate::alog!("[ace] discovery stage=tcp-connected");
-    if session
-        .perform_handshake_with_observer(infohash, random_peer_id(), || {
-            progress.advance(ConnectPhase::HandshakeReply);
+    match session
+        .perform_handshake_with_progress_observer(infohash, random_peer_id(), |event| {
+            progress.observe_handshake(event);
         })
         .await
-        .is_err()
     {
-        return Err(PeerConnectStage::Handshake);
+        Ok(_) => progress.finish_handshake(BasicReplyCause::Valid),
+        Err(error) => {
+            progress.finish_handshake(BasicReplyCause::from_error(&error));
+            return Err(PeerConnectStage::Handshake);
+        }
     }
     progress.advance(ConnectPhase::Window);
     crate::alog!("[ace] discovery stage=bt-handshake");
