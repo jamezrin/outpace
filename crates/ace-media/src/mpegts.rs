@@ -691,14 +691,14 @@ fn ts_random_access_indicator(pkt: &[u8]) -> bool {
     af_len >= 1 && pkt[5] & 0x40 != 0
 }
 
-/// Scan the packet payload for an Annex-B start code `00 00 01` followed by a keyframe NAL for
-/// the stream's `codec`: H.264 IDR (5), or HEVC IRAP (16..=21). Parameter sets alone
-/// do not contain a picture and must not open the gate.
+/// Scan packet-local PES elementary bytes for an Annex-B start code `00 00 01` followed
+/// by a keyframe NAL for the stream's `codec`: H.264 IDR (5), or HEVC IRAP (16..=21).
+/// Parameter sets alone do not contain a picture and must not open the gate.
 /// The scan is codec-gated because the two codecs read the NAL-type bits differently (H.264 uses
 /// `byte & 0x1F`, HEVC uses `(byte >> 1) & 0x3F`), so an H.264 slice type would otherwise be
 /// interpreted under the wrong codec. Without a resolved codec, returns false and
 /// leaves keyframe detection to the codec-agnostic random_access_indicator.
-/// MPEG-2 instead requires a bounded video PES and its first complete picture header.
+/// MPEG-2 instead requires its first complete picture header to be an I-picture.
 fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     let Some(codec) = codec else {
         return false;
@@ -706,11 +706,13 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     let Some(off) = ts_payload_offset(pkt) else {
         return false;
     };
-    let p = &pkt[off..];
+    let Some(elementary) = video_pes_elementary_payload(&pkt[off..]) else {
+        return false;
+    };
     if codec == VideoCodec::Mpeg2 {
-        return mpeg2_pes_has_i_picture(p);
+        return mpeg2_has_i_picture(elementary);
     }
-    p.windows(4).any(|w| {
+    elementary.windows(4).any(|w| {
         if w[0] != 0 || w[1] != 0 || w[2] != 1 {
             return false;
         }
@@ -722,17 +724,17 @@ fn payload_has_irap(pkt: &[u8], codec: Option<VideoCodec>) -> bool {
     })
 }
 
-/// Inspect only elementary bytes in a packet-local MPEG-2 video PES header's bounds.
-/// Split PES/picture headers deliberately remain false negatives: reporting access on
-/// their continuation would discard the earlier PES-start packet needed by the decoder.
-/// An I-picture header is evidence of intra coding, not complete decoding independence.
-fn mpeg2_pes_has_i_picture(payload: &[u8]) -> bool {
+/// Borrow elementary bytes after a complete packet-local video PES header, bounded by
+/// the available packet payload and, when nonzero, the declared PES end.
+/// Split PES headers deliberately remain false negatives: reporting access on their
+/// continuation would discard the earlier PES-start packet needed by the decoder.
+fn video_pes_elementary_payload(payload: &[u8]) -> Option<&[u8]> {
     if payload.len() < 9
         || payload[..3] != [0, 0, 1]
         || !(0xe0..=0xef).contains(&payload[3])
         || payload[6] & 0xc0 != 0x80
     {
-        return false;
+        return None;
     }
     let declared_length = u16::from_be_bytes([payload[4], payload[5]]) as usize;
     let end = if declared_length == 0 {
@@ -742,9 +744,15 @@ fn mpeg2_pes_has_i_picture(payload: &[u8]) -> bool {
     };
     let start = 9 + payload[8] as usize;
     if start > end || !mpeg2_pes_optional_header_valid(payload[7], &payload[9..start]) {
-        return false;
+        return None;
     }
-    let elementary = &payload[start..end];
+    Some(&payload[start..end])
+}
+
+/// Inspect the first complete MPEG-2 picture header in elementary bytes. Split picture
+/// headers remain false negatives. An I-picture indicates intra coding, not complete
+/// decoding independence.
+fn mpeg2_has_i_picture(elementary: &[u8]) -> bool {
     for (offset, code) in elementary.windows(4).enumerate() {
         if code == [0, 0, 1, 0] {
             // The first picture alone decides: a later I cannot make an earlier P/B
@@ -1271,6 +1279,22 @@ mod tests {
         gate
     }
 
+    fn pes_with_private_data(fake_nal: &[u8], elementary: &[u8]) -> Vec<u8> {
+        let mut pes = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0x01, 17, 0x8e];
+        let mut private_data = [0x55; 16];
+        private_data[4..4 + fake_nal.len()].copy_from_slice(fake_nal);
+        pes.extend_from_slice(&private_data);
+        pes.extend_from_slice(elementary);
+        pes
+    }
+
+    fn pes_with_pts(elementary: &[u8]) -> Vec<u8> {
+        let mut pes = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5];
+        pes.extend_from_slice(&[0x21, 0, 1, 0, 1]);
+        pes.extend_from_slice(elementary);
+        pes
+    }
+
     /// True iff `pkt` is on `pid` (single-packet helper for assertions).
     fn pid_of(pkt: &[u8]) -> u16 {
         (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16
@@ -1279,6 +1303,219 @@ mod tests {
     const PMT_PID: u16 = 0x0100;
     const VIDEO_PID: u16 = 0x0101;
     const AUDIO_PID: u16 = 0x0102;
+
+    #[test]
+    fn pes_access_private_data_fake_h264_idr_does_not_open_access_or_client_gate() {
+        let mut state = VideoAccessPointState::new();
+        state.observe(&valid_pat(PMT_PID));
+        state.observe(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x1b));
+        let mut gate = gate_with_valid_video(0x1b);
+        let false_start = mpeg2_packet(&pes_with_private_data(&[0, 0, 1, 0x65], &[0, 0, 1, 0x41]));
+
+        let access_point = state.observe(&false_start);
+        let withheld = gate.push_report(&false_start);
+        assert!(
+            !access_point
+                && !gate.is_locked()
+                && withheld.resumed.is_none()
+                && withheld.bytes.is_empty()
+                && withheld.withheld_bytes == TS_PACKET_LEN,
+            "fake PES-header IDR opened access={access_point}, locked={}, resumed={:?}",
+            gate.is_locked(),
+            withheld.resumed
+        );
+
+        let idr = mpeg2_packet(&pes_nal(&[0x65]));
+        assert!(state.observe(&idr));
+        let resumed = gate.push_report(&idr);
+        assert!(gate.is_locked());
+        assert_eq!(resumed.resumed, Some(GateResume::AccessPoint));
+        assert!(resumed
+            .bytes
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
+            .any(|p| p[2] == VIDEO_PID as u8));
+    }
+
+    #[test]
+    fn pes_access_private_data_fake_hevc_irap_does_not_open_access_or_client_gate() {
+        let mut state = VideoAccessPointState::new();
+        state.observe(&valid_pat(PMT_PID));
+        state.observe(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x24));
+        let mut gate = gate_with_valid_video(0x24);
+        let false_start = mpeg2_packet(&pes_with_private_data(
+            &[0, 0, 1, 0x26, 0x01],
+            &[0, 0, 1, 0x02, 0x01],
+        ));
+
+        let access_point = state.observe(&false_start);
+        let withheld = gate.push_report(&false_start);
+        assert!(
+            !access_point
+                && !gate.is_locked()
+                && withheld.resumed.is_none()
+                && withheld.bytes.is_empty()
+                && withheld.withheld_bytes == TS_PACKET_LEN,
+            "fake PES-header IRAP opened access={access_point}, locked={}, resumed={:?}",
+            gate.is_locked(),
+            withheld.resumed
+        );
+
+        let irap = mpeg2_packet(&pes_nal(&[0x26, 0x01]));
+        assert!(state.observe(&irap));
+        let resumed = gate.push_report(&irap);
+        assert!(gate.is_locked());
+        assert_eq!(resumed.resumed, Some(GateResume::AccessPoint));
+    }
+
+    #[test]
+    fn pes_access_declared_length_excludes_trailing_fake_h264_idr() {
+        let mut pes = vec![0, 0, 1, 0xe0, 0, 7, 0x80, 0, 0];
+        pes.extend_from_slice(&[0, 0, 1, 0x41]);
+        pes.extend_from_slice(&[0, 0, 1, 0x65]);
+        let packet = mpeg2_packet(&pes);
+        let mut state = VideoAccessPointState::new();
+        state.observe(&valid_pat(PMT_PID));
+        state.observe(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x1b));
+        let mut gate = gate_with_valid_video(0x1b);
+
+        let access_point = state.observe(&packet);
+        let withheld = gate.push_report(&packet);
+        assert!(
+            !access_point
+                && !gate.is_locked()
+                && withheld.resumed.is_none()
+                && withheld.bytes.is_empty()
+                && withheld.withheld_bytes == TS_PACKET_LEN,
+            "trailing fake IDR opened access={access_point}, locked={}, resumed={:?}",
+            gate.is_locked(),
+            withheld.resumed
+        );
+    }
+
+    #[test]
+    fn pes_access_real_h264_keys_with_no_optional_header_and_pts() {
+        for keyframe in [pes_nal(&[0x65]), pes_with_pts(&[0, 0, 1, 0x65])] {
+            let mut state = VideoAccessPointState::new();
+            state.observe(&valid_pat(PMT_PID));
+            state.observe(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x1b));
+            assert!(state.observe(&mpeg2_packet(&keyframe)));
+
+            let mut gate = gate_with_valid_video(0x1b);
+            let resumed = gate.push_report(&mpeg2_packet(&keyframe));
+            assert!(gate.is_locked());
+            assert_eq!(resumed.resumed, Some(GateResume::AccessPoint));
+        }
+    }
+
+    #[test]
+    fn pes_access_real_hevc_irap_with_no_optional_header_and_pts() {
+        for keyframe in [pes_nal(&[0x26, 0x01]), pes_with_pts(&[0, 0, 1, 0x26, 0x01])] {
+            let mut state = VideoAccessPointState::new();
+            state.observe(&valid_pat(PMT_PID));
+            state.observe(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x24));
+            assert!(state.observe(&mpeg2_packet(&keyframe)));
+
+            let mut gate = gate_with_valid_video(0x24);
+            let resumed = gate.push_report(&mpeg2_packet(&keyframe));
+            assert!(gate.is_locked());
+            assert_eq!(resumed.resumed, Some(GateResume::AccessPoint));
+        }
+    }
+
+    #[test]
+    fn pes_access_malformed_optional_header_stays_closed() {
+        let mut malformed = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0x81, 22, 0x11, 0, 1, 0, 1, 0x8e];
+        let mut private_data = [0x55; 16];
+        private_data[4..8].copy_from_slice(&[0, 0, 1, 0x65]);
+        malformed.extend_from_slice(&private_data);
+        malformed.extend_from_slice(&[0, 0, 1, 0x41]);
+
+        let mut state = VideoAccessPointState::new();
+        state.observe(&valid_pat(PMT_PID));
+        state.observe(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x1b));
+        let mut gate = gate_with_valid_video(0x1b);
+        let packet = mpeg2_packet(&malformed);
+
+        let access_point = state.observe(&packet);
+        let withheld = gate.push_report(&packet);
+        assert!(
+            !access_point
+                && !gate.is_locked()
+                && withheld.resumed.is_none()
+                && withheld.bytes.is_empty(),
+            "malformed optional PES opened access={access_point}, locked={}, resumed={:?}",
+            gate.is_locked(),
+            withheld.resumed
+        );
+    }
+
+    #[test]
+    fn pes_access_split_fixed_and_optional_headers_reject_continuations_then_recover() {
+        for (stream_type, fake_nal, nonkey, key_nal) in [
+            (
+                0x1b,
+                &[0, 0, 1, 0x65][..],
+                &[0, 0, 1, 0x41][..],
+                &[0x65][..],
+            ),
+            (
+                0x24,
+                &[0, 0, 1, 0x26, 0x01][..],
+                &[0, 0, 1, 0x02, 0x01][..],
+                &[0x26, 0x01][..],
+            ),
+        ] {
+            let complete = pes_with_private_data(fake_nal, nonkey);
+            for split_at in [8, 20] {
+                let mut state = VideoAccessPointState::new();
+                state.observe(&valid_pat(PMT_PID));
+                state.observe(&valid_pmt_codec(PMT_PID, VIDEO_PID, stream_type));
+                let mut gate = gate_with_valid_video(stream_type);
+                let start = mpeg2_packet_exact(&complete[..split_at], true, VIDEO_PID);
+                let continuation = mpeg2_packet_exact(&complete[split_at..], false, VIDEO_PID);
+
+                for packet in [&start, &continuation] {
+                    let access_point = state.observe(packet);
+                    let withheld = gate.push_report(packet);
+                    assert!(
+                        !access_point
+                            && !gate.is_locked()
+                            && withheld.resumed.is_none()
+                            && withheld.bytes.is_empty(),
+                        "split PES at byte {split_at} opened access={access_point}, locked={}, resumed={:?}",
+                        gate.is_locked(),
+                        withheld.resumed
+                    );
+                }
+
+                let real_key = mpeg2_packet(&pes_nal(key_nal));
+                assert!(
+                    state.observe(&real_key),
+                    "complete elementary key must recover"
+                );
+                let resumed = gate.push_report(&real_key);
+                assert!(gate.is_locked());
+                assert_eq!(resumed.resumed, Some(GateResume::AccessPoint));
+            }
+        }
+    }
+
+    #[test]
+    fn pes_access_random_access_indicator_remains_independent_of_pes_validation() {
+        let malformed_pes = [0, 0, 1, 0xe0, 0, 0, 0, 0, 1, 0, 0, 1, 0x65];
+        let packet = ts(VIDEO_PID, true, true, &malformed_pes);
+        let mut state = VideoAccessPointState::new();
+        state.observe(&valid_pat(PMT_PID));
+        state.observe(&valid_pmt_codec(PMT_PID, VIDEO_PID, 0x1b));
+        let mut gate = gate_with_valid_video(0x1b);
+
+        assert!(state.observe(&packet));
+        let resumed = gate.push_report(&packet);
+        assert!(gate.is_locked());
+        assert_eq!(resumed.resumed, Some(GateResume::AccessPoint));
+    }
 
     fn random_access_packet(pid: u16) -> Vec<u8> {
         ts(pid, true, true, &[])
@@ -1692,7 +1929,7 @@ mod tests {
         g.push(&pat(PMT_PID));
         g.push(&pmt(PMT_PID, VIDEO_PID));
         // Keyframe flagged only by an IDR NAL (type 5) in the payload, no RAI bit.
-        let pes = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x65];
+        let pes = pes_nal(&[0x65]);
         let out = g.push(&ts(VIDEO_PID, true, false, &pes));
         assert_eq!(packet_count(&out), 3, "IDR NAL should lock the gate");
         assert_eq!(
@@ -1714,7 +1951,7 @@ mod tests {
         g.push(&pat(PMT_PID));
         g.push(&pmt(PMT_PID, VIDEO_PID));
         // PES start (PUSI) but only a non-IDR slice NAL (type 1) and no RAI.
-        let pes = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x61];
+        let pes = pes_nal(&[0x61]);
         assert!(g.push(&ts(VIDEO_PID, true, false, &pes)).is_empty());
     }
 
@@ -1748,9 +1985,7 @@ mod tests {
         g.push(&pmt_codec(PMT_PID, VIDEO_PID, 0x24));
         // HEVC video. Keyframe flagged only by an IDR_W_RADL NAL (type 19), no RAI bit.
         // HEVC NAL header: byte0 = type << 1 = 19 << 1 = 0x26, byte1 = 0x01 (layer 0, tid 1).
-        let pes = [
-            0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x26, 0x01,
-        ];
+        let pes = pes_nal(&[0x26, 0x01]);
         let out = g.push(&ts(VIDEO_PID, true, false, &pes));
         assert_eq!(packet_count(&out), 3, "HEVC IRAP NAL should lock the gate");
     }
@@ -1843,12 +2078,12 @@ mod tests {
 
     #[test]
     fn gate_does_not_treat_h264_pslice_as_hevc_irap() {
-        // Guards the codec-gating: NAL byte 0x41 is an H.264 P-slice (type 1), but under HEVC's
-        // (byte >> 1) & 0x3F it reads as 32 (VPS). An H.264 stream must not be mis-detected.
+        // NAL byte 0x21 is an H.264 P-slice (type 1), but under HEVC's
+        // (byte >> 1) & 0x3F it reads as 16 (IRAP). An H.264 stream must use H.264's type bits.
         let mut g = KeyframeGate::new();
         g.push(&pat(PMT_PID));
         g.push(&pmt(PMT_PID, VIDEO_PID)); // H.264
-        let pes = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x01, 0x41];
+        let pes = pes_nal(&[0x21, 0x01]);
         assert!(g.push(&ts(VIDEO_PID, true, false, &pes)).is_empty());
     }
 
@@ -1894,7 +2129,7 @@ mod tests {
     fn discontinuity_reset_inserts_adaptation_only_marker_when_needed() {
         let mut gate = KeyframeGate::new();
         gate.reset_for_discontinuity();
-        let idr = [0x00, 0x00, 0x01, 0xE0, 0, 0, 0, 0, 1, 0x65];
+        let idr = pes_nal(&[0x65]);
 
         let out = gate.push(
             &[
@@ -2510,7 +2745,7 @@ mod tests {
         );
         gate.rearm_for_discontinuity();
         assert!(gate
-            .push(&ts(VIDEO_PID, true, false, &[0, 0, 1, 0x41]))
+            .push(&ts(VIDEO_PID, true, false, &pes_nal(&[0x41])))
             .is_empty());
         let resumed = gate.push(&random_access_packet(VIDEO_PID));
         assert_eq!(resumed.len(), 3 * TS_PACKET_LEN);
@@ -2534,7 +2769,7 @@ mod tests {
         gate.rearm_for_discontinuity();
         assert!(gate.push(&random_access_packet(VIDEO_PID)).is_empty());
         // HEVC IDR_W_RADL (NAL type19); no RAI. Cached codec is required.
-        let resumed = gate.push(&ts(new_video, true, false, &[0, 0, 1, 0x26]));
+        let resumed = gate.push(&ts(new_video, true, false, &pes_nal(&[0x26, 0x01])));
         assert!(!resumed.is_empty());
         assert_eq!(pid_of(&resumed[2 * TS_PACKET_LEN..]), new_video);
     }
