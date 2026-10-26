@@ -162,9 +162,11 @@ use pool_support::{
     spawn_candidate_connects, take_ready_with_stats,
 };
 mod support;
+#[cfg(test)]
+use support::stale_upstream_budget;
 use support::{
-    advance_head_from_window, hex_preview, read_peer_window, schedule_piece_assignments,
-    should_refresh_stale_deadline, stale_upstream_budget,
+    advance_head_from_window, hex_preview, pool_progress_budget, read_peer_window,
+    schedule_piece_assignments, should_refresh_stale_deadline,
 };
 
 mod reconnect;

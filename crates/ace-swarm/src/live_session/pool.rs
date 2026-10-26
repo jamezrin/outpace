@@ -302,6 +302,8 @@ pub(super) async fn follow_peer_pool_with_discovery(
             true,
         );
     }
+    // One opportunity per pool after activation/scheduling and corroboration release.
+    let mut first_output_deadline = None;
     let mut last_progress = Instant::now();
     let mut refill_closed = false;
     let mut observed_capacity = (peers.len(), learned_pending.len());
@@ -342,14 +344,16 @@ pub(super) async fn follow_peer_pool_with_discovery(
             let lost = advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
             record_pool_losses(candidates, &mut loss_count, lost);
         }
-        let Some(stale_budget) =
-            stale_upstream_budget(last_progress, now, live_recovery.stale_upstream_timeout())
-                .or_else(|| {
-                    continuity
-                        .startup_deadline
-                        .map(|deadline| deadline.saturating_duration_since(now))
-                })
-        else {
+        // Release scheduling may await channel I/O; grant the full interval afterward.
+        let now = Instant::now();
+        let Some(stale_budget) = pool_progress_budget(
+            &mut first_output_deadline,
+            continuity.emitted,
+            continuity.startup_deadline,
+            last_progress,
+            now,
+            live_recovery.stale_upstream_timeout(),
+        ) else {
             let stalled = peers.values().map(|p| p.addr).collect::<Vec<_>>();
             crate::alog!(
                 "[ace] upstream pool stale — no live progress for {:?}; reconnecting {} peer(s)",
