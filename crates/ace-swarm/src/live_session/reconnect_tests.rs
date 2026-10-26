@@ -13,6 +13,93 @@ fn live_pos(min_piece: i64, max_piece: i64) -> WireLivePosition {
     }
 }
 
+struct SelectionPeer {
+    addr: SocketAddrV4,
+    accepted: tokio::sync::oneshot::Receiver<Instant>,
+    server: tokio::task::JoinHandle<SelectionPeerOutcome>,
+}
+
+#[derive(Default)]
+struct SelectionPeerOutcome {
+    accepted_at: Option<Instant>,
+    handshake_accepted: bool,
+    window_sent: bool,
+    window_sent_at: Option<Instant>,
+    socket_closed: bool,
+}
+
+async fn selection_peer(delay: Duration, window: WireLivePosition) -> SelectionPeer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let (accepted_tx, accepted) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let accepted_at = Instant::now();
+        let _ = accepted_tx.send(accepted_at);
+        let mut session = PeerSession::new(stream);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if session.accept_handshake([0; 20], |_| true).await.is_err() {
+            return SelectionPeerOutcome {
+                accepted_at: Some(accepted_at),
+                socket_closed: true,
+                ..SelectionPeerOutcome::default()
+            };
+        }
+        if session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(window),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .is_err()
+        {
+            return SelectionPeerOutcome {
+                accepted_at: Some(accepted_at),
+                handshake_accepted: true,
+                socket_closed: true,
+                ..SelectionPeerOutcome::default()
+            };
+        }
+        let window_sent_at = Instant::now();
+        while session.read_message().await.is_ok() {}
+        SelectionPeerOutcome {
+            accepted_at: Some(accepted_at),
+            handshake_accepted: true,
+            window_sent: true,
+            window_sent_at: Some(window_sent_at),
+            socket_closed: true,
+        }
+    });
+    SelectionPeer {
+        addr,
+        accepted,
+        server,
+    }
+}
+
+async fn reap_selection_peer(
+    server: &mut tokio::task::JoinHandle<SelectionPeerOutcome>,
+    budget: Duration,
+) -> Option<SelectionPeerOutcome> {
+    match tokio::time::timeout(budget, &mut *server).await {
+        Ok(Ok(outcome)) => Some(outcome),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            server.abort();
+            let _ = (&mut *server).await;
+            None
+        }
+    }
+}
+
 #[tokio::test]
 async fn stale_gossip_harvests_each_peer_with_one_total_deadline() {
     let mut upstreams = Vec::new();
@@ -120,6 +207,7 @@ async fn slow_preferred_source_does_not_starve_working_pex_fallback() {
                 ..default_live_recovery()
             },
             &mut None,
+            None,
         ),
     )
     .await
@@ -203,7 +291,9 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
     let source_addr = v4(source_listener.local_addr().unwrap());
     let relay_addr = v4(relay_listener.local_addr().unwrap());
     let source_connections = Arc::new(AtomicU32::new(0));
+    let source_connections_at_announcement = Arc::new(AtomicU32::new(u32::MAX));
     let stale_requests = Arc::new(AtomicU32::new(0));
+    let gossip_sends = Arc::new(AtomicU32::new(0));
     let payload: Vec<u8> = (0..4)
         .flat_map(|cc| {
             let mut packet = vec![0x55; 188];
@@ -213,16 +303,17 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         .collect();
     let source_payload = payload.clone();
     let connection_count = source_connections.clone();
+    let piece8_ready = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let source_piece8_ready = piece8_ready.clone();
     let (produced_tx, produced_rx) = tokio::sync::watch::channel(false);
     let source = tokio::spawn(async move {
-        let ready_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
         let mut connections = tokio::task::JoinSet::new();
         loop {
             let (stream, _) = source_listener.accept().await.unwrap();
             let number = connection_count.fetch_add(1, Ordering::Relaxed);
             let payload = source_payload.clone();
             let produced = produced_tx.clone();
-            let ready_at = ready_at.clone();
+            let ready_at = source_piece8_ready.clone();
             connections.spawn(async move {
                 let mut session = PeerSession::new(stream);
                 session.accept_handshake([0; 20], |_| true).await.unwrap();
@@ -248,7 +339,7 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
                                 && ready_at
                                     .lock()
                                     .unwrap()
-                                    .is_some_and(|deadline| Instant::now() >= deadline))
+                                    .is_some_and(|ready| Instant::now() >= ready))
                         {
                             let mut fresh = payload.clone();
                             if piece == 8 {
@@ -260,14 +351,10 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
                                 .send(&build_piece(0, piece, 0, [0; 8], &fresh))
                                 .await
                                 .unwrap();
-                            if piece == 7 {
-                                ready_at.lock().unwrap().get_or_insert_with(|| {
-                                    Instant::now() + Duration::from_millis(1600)
-                                });
-                            }
                             produced.send_replace(true);
                             if disconnect && number == 0 {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
+                                *ready_at.lock().unwrap() = Some(Instant::now());
                                 return;
                             }
                         }
@@ -277,6 +364,10 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         }
     });
     let requests = stale_requests.clone();
+    let announced_source_connections = source_connections_at_announcement.clone();
+    let source_connections_for_relay = source_connections.clone();
+    let sent_gossip = gossip_sends.clone();
+    let relay_piece8_ready = piece8_ready.clone();
     let relay = tokio::spawn(async move {
         let mut number = 0;
         let mut connections = tokio::task::JoinSet::new();
@@ -284,7 +375,15 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
             let (stream, _) = relay_listener.accept().await.unwrap();
             let first = number == 0;
             number += 1;
+            if !first {
+                // The relay's second transport marks the actual pool rebuild. Let piece 8
+                // answer immediately on the source connection recovered into that pool.
+                *relay_piece8_ready.lock().unwrap() = Some(Instant::now());
+            }
             let requests = requests.clone();
+            let announced_source_connections = announced_source_connections.clone();
+            let source_connections_for_relay = source_connections_for_relay.clone();
+            let sent_gossip = sent_gossip.clone();
             let mut produced = produced_rx.clone();
             connections.spawn(async move {
                     let mut session = PeerSession::new(stream);
@@ -294,17 +393,25 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
                     // Gossip is sent only on the initial connection: recovery must use the
                     // address remembered by the real session, not another announcement.
                     if first {
+                        announced_source_connections.store(
+                            source_connections_for_relay.load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
                         let mut announce = vec![0;14];
                         announce[8..12].copy_from_slice(&source_addr.ip().octets());
                         announce[12..14].copy_from_slice(&source_addr.port().to_be_bytes());
                         if pex {
+                            sent_gossip.fetch_add(1, Ordering::Relaxed);
                             let mut exchange = vec![0;16+108];
                             exchange[1..3].copy_from_slice(&1u16.to_be_bytes());
                             exchange[3..7].copy_from_slice(&17u32.to_be_bytes());
                             exchange[7..11].copy_from_slice(&108u32.to_be_bytes());
                             exchange[27..33].copy_from_slice(&announce[8..14]);
                             session.send(&PeerMessage::Unknown {id:12,payload:exchange}).await.unwrap();
-                        } else {session.send(&PeerMessage::Unknown {id:36,payload:announce}).await.unwrap();}
+                        } else {
+                            sent_gossip.fetch_add(1, Ordering::Relaxed);
+                            session.send(&PeerMessage::Unknown {id:36,payload:announce}).await.unwrap();
+                        }
                     }
                     loop {
                         tokio::select! {
@@ -330,9 +437,10 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         sig_len: 0,
         source_pubkey: vec![],
     };
+    let observed_media_bytes = Arc::new(AtomicU64::new(0));
     let recovery_observer = TestObserver::new(
         Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
+        observed_media_bytes.clone(),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU32::new(0)),
         Arc::new(AtomicU32::new(0)),
@@ -373,6 +481,11 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
     let count = peer_count.clone();
     let discovery_calls = Arc::new(AtomicU32::new(0));
     let calls = discovery_calls.clone();
+    let discovery_evidence = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded_evidence = discovery_evidence.clone();
+    let source_count_at_discovery = source_connections.clone();
+    let media_bytes_at_discovery = observed_media_bytes.clone();
+    let observer_at_discovery = recovery_observer.clone();
     let session = tokio::spawn(follow_live_session(
         info,
         vec![relay_addr],
@@ -385,6 +498,12 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         seed,
         completed_discovery(move |_| {
             calls.fetch_add(1, Ordering::Relaxed);
+            let observed = observer_at_discovery.snapshot();
+            recorded_evidence.lock().unwrap().push((
+                source_count_at_discovery.load(Ordering::Relaxed),
+                media_bytes_at_discovery.load(Ordering::Relaxed),
+                observed.recovery_events,
+            ));
             Box::pin(async { vec![] })
         }),
         None,
@@ -454,10 +573,53 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         result.is_ok(),
         "learned source must reconnect and resume after silence beyond stale timeout"
     );
+    let expected_discovery_calls = if full_pool && !disconnect { 1 } else { 0 };
     assert_eq!(
         discovery_calls.load(Ordering::Relaxed),
+        expected_discovery_calls,
+        "discovery follows learned-source progress and stale teardown when the sole eligible relay is stale"
+    );
+    let discovery_evidence = discovery_evidence.lock().unwrap();
+    assert_eq!(discovery_evidence.len(), expected_discovery_calls as usize);
+    for (index, (source_count, media_bytes, recovery_events)) in
+        discovery_evidence.iter().enumerate()
+    {
+        eprintln!(
+            "rediscovery evidence: call={} source_connections={} output_bytes={} recovery_events={recovery_events:?}",
+            index + 1,
+            source_count,
+            media_bytes
+        );
+        assert!(
+            *source_count > 0,
+            "rediscovery must follow a learned-source connection"
+        );
+        assert!(
+            *media_bytes > 0,
+            "rediscovery must follow actual first output"
+        );
+        assert!(
+            recovery_events.contains(&RecoveryEvent::StaleTeardown),
+            "rediscovery must follow the observed stale teardown"
+        );
+    }
+    assert_eq!(
+        source_connections_at_announcement.load(Ordering::Relaxed),
         0,
-        "learned source must be retried before rediscovery"
+        "the remembered source must not be connected before its real relay announcement"
+    );
+    assert_eq!(
+        gossip_sends.load(Ordering::Relaxed),
+        1,
+        "the relay gossips only once"
+    );
+    eprintln!(
+        "learned-source fixture: full_pool={full_pool} pex={pex} source_connections={} discovery_calls={} source_connections_at_announcement={} gossip_sends={} stale_requests={}",
+        source_connections.load(Ordering::Relaxed),
+        discovery_calls.load(Ordering::Relaxed),
+        source_connections_at_announcement.load(Ordering::Relaxed),
+        gossip_sends.load(Ordering::Relaxed),
+        stale_requests.load(Ordering::Relaxed)
     );
     assert!(
         source_connections.load(Ordering::Relaxed) >= 2,
@@ -1365,6 +1527,453 @@ async fn retained_producer_first_window_update_positive_control() {
 async fn retained_producer_lower_than_shared_head_window_update_supplies_media() {
     // Shared head11/cursor9; producer head10 remains usable inside prefetch2.
     retained_producer_window_control(false, 11).await;
+}
+
+#[tokio::test]
+async fn initial_selection_keeps_first_protocol_success_grace() {
+    let (info, seed) = cancellation_fixture();
+    let first = selection_peer(Duration::from_millis(50), live_pos(1, 8)).await;
+    let delayed = selection_peer(Duration::from_millis(400), live_pos(1, 9)).await;
+    let first_addr = first.addr;
+    let delayed_addr = delayed.addr;
+    let mut candidates = SessionCandidates::default();
+    candidates.learn(first_addr, CandidateKind::Source);
+    candidates.learn(delayed_addr, CandidateKind::Pex);
+    let started = Instant::now();
+    let selected = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_pool(
+            info.infohash,
+            &mut candidates,
+            LiveRecoveryConfig {
+                max_parallel_connect: 2,
+                max_active_upstreams: 2,
+                ..seed.live_recovery
+            },
+            &mut None,
+            None,
+        ),
+    )
+    .await
+    .expect("initial peer selection must be bounded");
+    let elapsed = started.elapsed();
+    let selected_addr = selected.first().map(|peer| peer.addr);
+    drop(selected);
+    tokio::time::timeout(Duration::from_secs(1), first.accepted)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), delayed.accepted)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_outcome = tokio::time::timeout(Duration::from_secs(1), first.server)
+        .await
+        .unwrap()
+        .unwrap();
+    let delayed_outcome = tokio::time::timeout(Duration::from_secs(1), delayed.server)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(selected_addr, Some(first_addr));
+    assert!((Duration::from_millis(250)..Duration::from_millis(390)).contains(&elapsed));
+    assert!(first_outcome.handshake_accepted && first_outcome.window_sent);
+    assert!(delayed_outcome.socket_closed);
+    assert!(candidates.eligible(Instant::now()).contains(&delayed_addr));
+}
+
+#[tokio::test]
+async fn reconnect_selection_grace_can_cancel_later_covering_peer() {
+    let cursor = 9;
+    let (info, seed) = cancellation_fixture();
+    let (mut continuity, _) = Continuity::fresh(&info, 7, 10, 1, seed.live_recovery);
+    continuity.reasm.skip_to(cursor);
+    // Establish prior output through the real TS resynchronizer before reconnecting.
+    let packet: Vec<u8> = (0..4)
+        .flat_map(|cc| {
+            let mut packet = vec![0x55; 188];
+            packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | cc]);
+            packet
+        })
+        .collect();
+    let output = continuity.resync_output(&packet);
+    assert!(!output.is_empty());
+    continuity.emitted = output.iter().map(|chunk| chunk.bytes.len() as u64).sum();
+    assert!(continuity.emitted > 0);
+    assert_eq!(continuity.reasm.next_needed(), cursor);
+
+    let stale = selection_peer(Duration::from_millis(50), live_pos(1, cursor as i64 - 1)).await;
+    let covering = selection_peer(Duration::from_millis(400), live_pos(1, cursor as i64)).await;
+    let stale_addr = stale.addr;
+    let covering_addr = covering.addr;
+    let mut candidates = SessionCandidates::default();
+    candidates.learn(stale_addr, CandidateKind::Source);
+    candidates.learn(covering_addr, CandidateKind::Pex);
+    let selected = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_pool(
+            info.infohash,
+            &mut candidates,
+            LiveRecoveryConfig {
+                max_parallel_connect: 2,
+                max_active_upstreams: 2,
+                ..seed.live_recovery
+            },
+            &mut None,
+            Some(continuity.resume_cursor()),
+        ),
+    )
+    .await
+    .expect("reconnect selection must be bounded");
+    let selected_addr = selected.first().map(|peer| peer.addr);
+    // Exercise the same post-selection coverage predicate the production follower applies.
+    let selected_contains_covering_peer = selected
+        .iter()
+        .any(|peer| continuity.window_can_resume(&peer.window));
+    drop(selected);
+    let covering_window = live_pos(1, cursor as i64);
+    let covering_window_can_resume = continuity.window_can_resume(&covering_window);
+    let retryable = candidates.eligible(Instant::now());
+    let stale_outcome = tokio::time::timeout(Duration::from_secs(1), stale.server)
+        .await
+        .unwrap()
+        .unwrap();
+    let covering_outcome = tokio::time::timeout(Duration::from_secs(1), covering.server)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        selected_addr == Some(covering_addr),
+        "the covering candidate must be selected in this reconnect round"
+    );
+    assert!(selected_contains_covering_peer);
+    assert!(
+        covering_window_can_resume,
+        "a cursor-covering window is accepted"
+    );
+    assert!(
+        !retryable.contains(&stale_addr),
+        "the rejected stale candidate enters cooldown"
+    );
+    assert_eq!(candidates.explorations(stale_addr), 1);
+    assert_eq!(candidates.explorations(covering_addr), 0);
+    assert!(
+        stale_outcome.handshake_accepted
+            && stale_outcome.window_sent
+            && stale_outcome.socket_closed,
+        "a protocol-valid stale candidate is rejected and closed"
+    );
+    assert!(
+        covering_outcome.handshake_accepted
+            && covering_outcome.window_sent
+            && covering_outcome.socket_closed,
+        "selected covering candidate closes only when the selected pool is dropped"
+    );
+
+    // Positive control: the same 400 ms covering peer succeeds when no earlier stale
+    // handshake starts the selection grace clock.
+    let alone_peer = selection_peer(Duration::from_millis(400), covering_window).await;
+    let alone_addr = alone_peer.addr;
+    let mut alone_candidates = SessionCandidates::default();
+    alone_candidates.learn(alone_addr, CandidateKind::Pex);
+    let alone = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_pool(
+            info.infohash,
+            &mut alone_candidates,
+            LiveRecoveryConfig {
+                max_parallel_connect: 2,
+                max_active_upstreams: 2,
+                ..seed.live_recovery
+            },
+            &mut None,
+            Some(continuity.resume_cursor()),
+        ),
+    )
+    .await
+    .expect("covering peer must succeed on its own");
+    let alone_selected_covers_cursor = alone
+        .first()
+        .is_some_and(|peer| peer.addr == alone_addr && continuity.window_can_resume(&peer.window));
+    drop(alone);
+    let alone_outcome = tokio::time::timeout(Duration::from_secs(1), alone_peer.server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(alone_selected_covers_cursor);
+    assert!(alone_outcome.handshake_accepted && alone_outcome.window_sent);
+
+    assert!(
+        selected_contains_covering_peer,
+        "reconnect selection must include a peer whose window can resume the current cursor"
+    );
+}
+
+#[tokio::test]
+async fn reconnect_stale_only_candidates_cool_down_across_cohorts() {
+    let (info, seed) = cancellation_fixture();
+    let (mut continuity, _) = Continuity::fresh(&info, 7, 10, 1, seed.live_recovery);
+    continuity.reasm.skip_to(9);
+    let first = selection_peer(Duration::ZERO, live_pos(1, 8)).await;
+    let later = selection_peer(Duration::ZERO, live_pos(1, 7)).await;
+    let first_addr = first.addr;
+    let later_addr = later.addr;
+    let mut candidates = SessionCandidates::default();
+    candidates.learn(first_addr, CandidateKind::Source);
+    candidates.learn(later_addr, CandidateKind::Pex);
+    candidates.explored(later_addr);
+
+    let selected = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_pool(
+            info.infohash,
+            &mut candidates,
+            LiveRecoveryConfig {
+                max_parallel_connect: 2,
+                max_active_upstreams: 2,
+                ..seed.live_recovery
+            },
+            &mut None,
+            Some(continuity.resume_cursor()),
+        ),
+    )
+    .await
+    .expect("finite stale cohorts must exhaust promptly");
+    let first_outcome = first.server.await.unwrap();
+    let later_outcome = later.server.await.unwrap();
+
+    assert!(selected.is_empty());
+    assert_eq!(candidates.explorations(first_addr), 1);
+    assert_eq!(candidates.explorations(later_addr), 2);
+    assert!(!candidates.eligible(Instant::now()).contains(&first_addr));
+    assert!(!candidates.eligible(Instant::now()).contains(&later_addr));
+    assert!(first_outcome.handshake_accepted && first_outcome.window_sent);
+    assert!(later_outcome.handshake_accepted && later_outcome.window_sent);
+    assert!(first_outcome.socket_closed && later_outcome.socket_closed);
+}
+
+#[tokio::test]
+async fn reconnect_grace_starts_at_first_usable_candidate() {
+    let (info, seed) = cancellation_fixture();
+    let (mut continuity, _) = Continuity::fresh(&info, 7, 10, 1, seed.live_recovery);
+    continuity.reasm.skip_to(9);
+    let stale = selection_peer(Duration::from_millis(50), live_pos(1, 8)).await;
+    let usable = selection_peer(Duration::from_millis(400), live_pos(1, 9)).await;
+    let pending = selection_peer(Duration::from_millis(750), live_pos(1, 10)).await;
+    let stale_addr = stale.addr;
+    let usable_addr = usable.addr;
+    let pending_addr = pending.addr;
+    let mut candidates = SessionCandidates::default();
+    candidates.learn(stale_addr, CandidateKind::Source);
+    candidates.learn(usable_addr, CandidateKind::Pex);
+    candidates.learn(pending_addr, CandidateKind::Discovered);
+    let started = Instant::now();
+    let selected = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_pool(
+            info.infohash,
+            &mut candidates,
+            LiveRecoveryConfig {
+                max_parallel_connect: 3,
+                max_active_upstreams: 2,
+                ..seed.live_recovery
+            },
+            &mut None,
+            Some(continuity.resume_cursor()),
+        ),
+    )
+    .await
+    .expect("usable candidate grace must remain bounded");
+    let elapsed = started.elapsed();
+    let selected_len = selected.len();
+    let selected_addr = selected.first().map(|peer| peer.addr);
+    drop(selected);
+    tokio::time::timeout(Duration::from_secs(1), pending.accepted)
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_outcome = stale.server.await.unwrap();
+    let usable_outcome = usable.server.await.unwrap();
+    let pending_outcome = pending.server.await.unwrap();
+
+    assert_eq!(selected_len, 1);
+    assert_eq!(selected_addr, Some(usable_addr));
+    assert!((Duration::from_millis(550)..Duration::from_millis(1050)).contains(&elapsed));
+    assert_eq!(candidates.explorations(stale_addr), 1);
+    assert!(candidates.explorations(pending_addr) == 0);
+    assert!(stale_outcome.handshake_accepted && stale_outcome.window_sent);
+    assert!(usable_outcome.handshake_accepted && usable_outcome.window_sent);
+    assert!(pending_outcome.socket_closed);
+    assert!(candidates.eligible(Instant::now()).contains(&pending_addr));
+}
+
+#[tokio::test]
+async fn rejected_stale_candidate_does_not_extend_usable_grace() {
+    let (info, seed) = cancellation_fixture();
+    let (mut continuity, _) = Continuity::fresh(&info, 7, 10, 1, seed.live_recovery);
+    continuity.reasm.skip_to(9);
+    let mut usable = selection_peer(Duration::from_millis(40), live_pos(1, 9)).await;
+    let mut stale = selection_peer(Duration::from_millis(210), live_pos(1, 8)).await;
+    let mut pending = selection_peer(Duration::from_secs(2), live_pos(1, 10)).await;
+    let stale_addr = stale.addr;
+    let usable_addr = usable.addr;
+    let pending_addr = pending.addr;
+    let mut candidates = SessionCandidates::default();
+    candidates.learn(stale_addr, CandidateKind::Source);
+    candidates.learn(usable_addr, CandidateKind::Pex);
+    candidates.learn(pending_addr, CandidateKind::Discovered);
+
+    // Keep a third attempt active past the original 250 ms grace deadline. The stale peer's
+    // valid response arrives during that grace, so a reset deadline would extend this round.
+    let selected_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_pool(
+            info.infohash,
+            &mut candidates,
+            LiveRecoveryConfig {
+                max_parallel_connect: 3,
+                max_active_upstreams: 2,
+                ..seed.live_recovery
+            },
+            &mut None,
+            Some(continuity.resume_cursor()),
+        ),
+    )
+    .await;
+    let selected_at = Instant::now();
+    let (selection_timed_out, selected_addrs) = match selected_result {
+        Ok(selected) => {
+            let addresses = selected.iter().map(|peer| peer.addr).collect();
+            drop(selected);
+            (false, addresses)
+        }
+        Err(_) => (true, Vec::new()),
+    };
+    let stale_explorations_at_selection = candidates.explorations(stale_addr);
+    let stale_cooled_at_selection = !candidates.eligible(selected_at).contains(&stale_addr);
+    let pending_explorations_at_selection = candidates.explorations(pending_addr);
+    let pending_retryable_at_selection = candidates.eligible(selected_at).contains(&pending_addr);
+
+    // Join all fixture servers before making assertions, with a bounded abort fallback so
+    // both successful and failing cases close every owned loopback task.
+    let server_outcomes = (
+        reap_selection_peer(&mut pending.server, Duration::from_millis(2500)).await,
+        reap_selection_peer(&mut stale.server, Duration::from_millis(500)).await,
+        reap_selection_peer(&mut usable.server, Duration::from_millis(500)).await,
+    );
+
+    assert!(
+        !selection_timed_out,
+        "selection must finish within its bound"
+    );
+    let pending_outcome = server_outcomes
+        .0
+        .expect("pending fixture task must be reaped");
+    let usable_outcome = server_outcomes
+        .2
+        .expect("usable fixture task must be reaped");
+    let stale_outcome = server_outcomes
+        .1
+        .expect("stale fixture task must be reaped");
+    let usable_sent_at = usable_outcome
+        .window_sent_at
+        .expect("usable peer must send its protocol-valid window");
+    let stale_sent_at = stale_outcome
+        .window_sent_at
+        .expect("stale peer must send its protocol-valid window during grace");
+    let elapsed_from_usable = selected_at.duration_since(usable_sent_at);
+    eprintln!(
+        "in-grace stale control: usable_to_stale={:?} usable_to_return={elapsed_from_usable:?} stale_explorations={} stale_cooled={} pending_explorations={} pending_retryable={} pending_accepted_before_return={}",
+        stale_sent_at.duration_since(usable_sent_at),
+        stale_explorations_at_selection,
+        stale_cooled_at_selection,
+        pending_explorations_at_selection,
+        pending_retryable_at_selection,
+        pending_outcome.accepted_at.is_some_and(|at| at < selected_at),
+    );
+
+    assert_eq!(selected_addrs, vec![usable_addr]);
+    assert!(usable_sent_at < stale_sent_at && stale_sent_at < selected_at);
+    assert!(
+        (Duration::from_millis(210)..Duration::from_millis(380)).contains(&elapsed_from_usable),
+        "selection should end near the original usable-peer grace deadline, elapsed={elapsed_from_usable:?}"
+    );
+    assert_eq!(stale_explorations_at_selection, 1);
+    assert!(
+        stale_cooled_at_selection,
+        "the completed stale candidate must be cooled down and excluded"
+    );
+    assert_eq!(pending_explorations_at_selection, 0);
+    assert!(
+        pending_retryable_at_selection,
+        "the cancelled pending candidate remains retryable"
+    );
+    assert!(stale_outcome.handshake_accepted && stale_outcome.window_sent);
+    assert!(usable_outcome.handshake_accepted && usable_outcome.window_sent);
+    assert!(pending_outcome
+        .accepted_at
+        .is_some_and(|at| at < selected_at));
+    assert!(!pending_outcome.window_sent);
+    assert!(pending_outcome.socket_closed);
+}
+
+#[tokio::test]
+async fn cancelling_reconnect_selection_closes_pending_socket_without_advancing_it() {
+    let (info, seed) = cancellation_fixture();
+    let (mut continuity, _) = Continuity::fresh(&info, 7, 10, 1, seed.live_recovery);
+    continuity.reasm.skip_to(9);
+    let stale = selection_peer(Duration::ZERO, live_pos(1, 8)).await;
+    let pending = selection_peer(Duration::from_millis(400), live_pos(1, 9)).await;
+    let stale_addr = stale.addr;
+    let pending_addr = pending.addr;
+    let mut candidates = SessionCandidates::default();
+    candidates.learn(stale_addr, CandidateKind::Source);
+    candidates.learn(pending_addr, CandidateKind::Pex);
+    let mut discovery = None;
+    let mut round = Box::pin(connect_pool(
+        info.infohash,
+        &mut candidates,
+        LiveRecoveryConfig {
+            max_parallel_connect: 2,
+            max_active_upstreams: 2,
+            ..seed.live_recovery
+        },
+        &mut discovery,
+        Some(continuity.resume_cursor()),
+    ));
+    let mut stale_server = stale.server;
+    let mut pending_accepted = pending.accepted;
+    let mut stale_outcome = None;
+    let mut saw_pending_accept = false;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while stale_outcome.is_none() || !saw_pending_accept {
+            tokio::select! {
+                result = &mut round => panic!("round completed while a peer was pending: {} selected", result.len()),
+                result = &mut stale_server, if stale_outcome.is_none() => {
+                    stale_outcome = Some(result.unwrap());
+                }
+                result = &mut pending_accepted, if !saw_pending_accept => {
+                    result.unwrap();
+                    saw_pending_accept = true;
+                }
+            }
+        }
+    })
+    .await
+    .expect("observe stale rejection and pending TCP before cancelling round");
+    drop(round);
+    let pending_outcome = tokio::time::timeout(Duration::from_secs(1), pending.server)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(stale_outcome.unwrap().handshake_accepted);
+    assert!(pending_outcome.socket_closed);
+    assert_eq!(candidates.explorations(stale_addr), 1);
+    assert_eq!(candidates.explorations(pending_addr), 0);
+    assert!(!candidates.eligible(Instant::now()).is_empty());
 }
 
 mod fairness;
