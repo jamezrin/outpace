@@ -15,6 +15,7 @@ use tower::ServiceExt;
 mod broadcast;
 mod broadcast_source;
 mod compat;
+mod compat_catalog;
 mod compat_hls;
 mod native;
 mod server_api;

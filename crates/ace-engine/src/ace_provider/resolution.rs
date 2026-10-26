@@ -8,42 +8,72 @@ impl AceProvider {
     /// infohash index; a BEP-9 result goes to `peer_resolve_cache` and never makes its infohash
     /// openable (#164).
     async fn resolve_content_id(&self, content_id: &str) -> Result<StreamInfo, ProviderError> {
-        self.resolve_content_id_with_catalog(content_id, resolve_via_catalog(content_id))
-            .await
+        let cid = content_id.to_owned();
+        self.resolve_content_id_with_catalog(
+            content_id,
+            async move { catalog_live_info(&cid).await },
+        )
+        .await
+    }
+
+    pub(super) async fn resolve_content_id_prepared(
+        &self,
+        cid: &str,
+    ) -> Result<ResolvedContentId, ProviderError> {
+        let content_id = cid.to_owned();
+        self.resolve_content_id_prepared_with_catalog(cid, async move {
+            catalog_live_info(&content_id).await
+        })
+        .await
     }
 
     pub(super) async fn resolve_content_id_with_catalog(
         &self,
         content_id: &str,
-        catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>>,
+        catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>> + Send + 'static,
     ) -> Result<StreamInfo, ProviderError> {
+        self.resolve_content_id_prepared_with_catalog(content_id, catalog)
+            .await
+            .map(ResolvedContentId::into_info)
+    }
+
+    async fn resolve_content_id_prepared_with_catalog(
+        &self,
+        content_id: &str,
+        catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>> + Send + 'static,
+    ) -> Result<ResolvedContentId, ProviderError> {
         if let Some(info) = self.resolve_cache.get(content_id) {
             // Re-record: the bounded infohash index may have evicted it since (#164).
             self.infohash_index.put(info.clone());
-            return Ok(info);
+            return Ok(ResolvedContentId::Catalog(info));
         }
         let key = hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
         if let Some(bytes) = self.seed_registry.broadcast_transport_for_content_id(&key) {
             return stream_info_from_transport(&bytes)
+                .map(ResolvedContentId::Provider)
                 .map_err(|e| ProviderError::Backend(format!("local broadcast descriptor: {e:?}")));
         }
         if self.bep9_content_id_fallback {
             if let Some(info) = self.peer_resolve_cache.get(content_id) {
-                return Ok(info);
+                return Ok(ResolvedContentId::Provider(info));
             }
         }
 
-        let catalog_error = match catalog.await {
+        let catalog_error = match self.resolve_cache.resolve_with(content_id, catalog).await {
             Ok(info) => {
                 crate::alog!("[ace] resolved content id via catalog");
-                self.resolve_cache.put(content_id, info.clone());
                 self.infohash_index.put(info.clone());
-                return Ok(info);
+                return Ok(ResolvedContentId::Catalog(info));
             }
-            Err(e) => e,
+            Err(CatalogLookupError::Capacity) => {
+                return Err(ProviderError::Backend(
+                    "content-id catalog resolution capacity exceeded".into(),
+                ));
+            }
+            Err(CatalogLookupError::Catalog(error)) => error,
         };
         if !self.bep9_content_id_fallback {
-            return Err(disabled_content_id_fallback(catalog_error));
+            return Err(disabled_content_id_fallback(&catalog_error));
         }
         crate::alog!("[ace] catalog resolution failed; trying opted-in raw-hash BEP-9 fallback");
 
@@ -77,7 +107,7 @@ impl AceProvider {
                     // A raw transport hash is not catalog authentication: keep the descriptor
                     // out of the infohash index (#164).
                     self.peer_resolve_cache.put(content_id, info.clone());
-                    return Ok(info);
+                    return Ok(ResolvedContentId::Provider(info));
                 }
                 Err(ResolveError::Peer(why)) => crate::alog!("[ace] resolve {addr}: {why}"),
                 Err(e) => crate::alog!("[ace] resolve {addr}: {e:?}"),
@@ -288,7 +318,7 @@ impl AceProvider {
         match catalog.await {
             Ok(bytes) => Ok(bytes),
             Err(error) if !self.bep9_content_id_fallback => {
-                Err(disabled_content_id_fallback(error))
+                Err(disabled_content_id_fallback(&error))
             }
             Err(_) => {
                 crate::alog!(
@@ -332,7 +362,7 @@ impl AceProvider {
     }
 }
 
-fn disabled_content_id_fallback(catalog_error: ResolveError) -> ProviderError {
+fn disabled_content_id_fallback(catalog_error: &ResolveError) -> ProviderError {
     ProviderError::Backend(format!(
         "content-id catalog resolution failed: {catalog_error:?}; raw-hash BEP-9 fallback is disabled (OUTPACE_BEP9_CONTENT_ID_FALLBACK=1 to opt in)"
     ))

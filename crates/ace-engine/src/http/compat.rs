@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::ContentIdPreparation;
 
 pub(super) async fn ace_getstream(
     State(s): State<AppState>,
@@ -502,19 +503,35 @@ async fn resolve_ace_selection(
     let network = ace_network(s);
     if s.resolve_content_ids_in_getstream {
         if let Some(content_id) = selection.content_id.as_deref() {
-            match resolve_via_catalog(content_id).await {
-                Ok(info) => {
-                    // A client may open this infohash directly later (#164). Signed catalog
-                    // (`resolve_via_catalog`) only, so the descriptor is indexable.
-                    if let Some(network) = network.as_deref() {
-                        s.manager.remember_live_descriptor(network, &info);
-                    }
+            let preparation = if let Some(network) = network.as_deref() {
+                s.manager
+                    .prepare_live_content_id(network, content_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                ContentIdPreparation::Unsupported
+            };
+            match preparation {
+                ContentIdPreparation::Catalog(info) => {
                     selection =
                         selection.with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
                 }
-                Err(e) => crate::alog!(
-                    "[ace] content-id catalog resolution failed, falling back to cid: {e:?}"
-                ),
+                ContentIdPreparation::ProviderResolved => {}
+                ContentIdPreparation::Unsupported => {
+                    match crate::ace_provider::catalog_live_info(content_id).await {
+                        Ok(info) => {
+                            // Legacy providers still receive only signed-catalog descriptors.
+                            if let Some(network) = network.as_deref() {
+                                s.manager.remember_live_descriptor(network, &info);
+                            }
+                            selection = selection
+                                .with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
+                        }
+                        Err(e) => crate::alog!(
+                            "[ace] content-id catalog resolution failed, falling back to cid: {e:?}"
+                        ),
+                    }
+                }
             }
         }
     }

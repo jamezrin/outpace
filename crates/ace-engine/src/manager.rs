@@ -3,7 +3,9 @@
 
 use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
-use crate::provider::{ProviderError, ProviderRegistry, TsSource, VodContent};
+use crate::provider::{
+    ContentIdPreparation, ProviderError, ProviderRegistry, TsSource, VodContent,
+};
 use crate::session::{StreamSession, Subscription};
 use ace_swarm::types::{StreamInfo, StreamMetadata};
 use std::collections::{HashMap, HashSet};
@@ -347,6 +349,19 @@ impl StreamManager {
             .get(network)
             .ok_or(ProviderError::NotFound)?
             .check_openable(id)
+    }
+
+    /// Prepare through the registered provider without opening a source or changing its key.
+    pub(crate) async fn prepare_live_content_id(
+        &self,
+        network: &str,
+        content_id: &str,
+    ) -> Result<ContentIdPreparation, ProviderError> {
+        self.registry
+            .get(network)
+            .ok_or(ProviderError::NotFound)?
+            .prepare_live_content_id(content_id)
+            .await
     }
 
     /// Hand a live descriptor resolved outside `open` to `network`'s provider; see
