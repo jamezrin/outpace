@@ -163,9 +163,9 @@ use pool_support::{
 };
 mod support;
 #[cfg(test)]
-use support::stale_upstream_budget;
+use support::{advance_head_from_window, stale_upstream_budget};
 use support::{
-    advance_head_from_window, hex_preview, pool_progress_budget, read_peer_window,
+    hex_preview, pool_progress_budget, read_peer_window, read_window_max,
     schedule_piece_assignments, should_refresh_stale_deadline,
 };
 
