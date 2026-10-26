@@ -1347,8 +1347,32 @@ async fn discovered_refill_reports_completed_transport_failure() {
     );
 }
 
-// Real pool/worker control for per-peer id=4 updates behind another peer's shared head.
-async fn retained_producer_window_control(producer_first: bool, head_only_max: u32) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetainedWindowUpdate {
+    Id4,
+    StructuredExtended,
+    StructuredUnknown,
+    DuplicateExtended,
+    DuplicateUnknown,
+    UnknownInvalidSequence,
+}
+
+// Real pool/worker control for per-peer window updates behind another peer's shared head.
+async fn retained_producer_window_control(
+    producer_first: bool,
+    head_only_max: u32,
+    producer_max_piece: u32,
+    update: RetainedWindowUpdate,
+) {
+    const INVALID_WINDOW_PAYLOADS: [&[u8]; 6] = [
+        b"not-bencode",
+        b"d1:ai1ee",
+        b"d9:max_piece1:xe",
+        b"d9:max_piecei-1ee",
+        b"d9:max_piecei4294967296ee",
+        b"d9:max_piecei0ee",
+    ];
+    let received = Arc::new(AtomicU64::new(0));
     let mut upstreams = Vec::new();
     let mut servers = tokio::task::JoinSet::new();
     let mut commands = Vec::new();
@@ -1377,16 +1401,113 @@ async fn retained_producer_window_control(producer_first: bool, head_only_max: u
         servers.spawn(async move {
             let mut session = PeerSession::new(stream);
             let mut request_tx = Some(request_tx);
+            let mut update_count = 0_u8;
             loop {
                 tokio::select! {
                     command = control.recv() => {
                         if command.is_none() { break; }
-                        let mut payload = vec![0; 8];
-                        payload[4..].copy_from_slice(&(if healthy { 10 } else { head_only_max }).to_be_bytes());
-                        session.send(&PeerMessage::Unknown { id: 4, payload }).await.unwrap();
-                        if !healthy {
-                            session.send(&PeerMessage::Unchoke).await.unwrap();
+                        let max_piece = if healthy { producer_max_piece } else { head_only_max };
+                        if healthy
+                            && matches!(update, RetainedWindowUpdate::UnknownInvalidSequence)
+                        {
+                            for payload in INVALID_WINDOW_PAYLOADS {
+                                session.send(&PeerMessage::Unknown {
+                                    id: 99,
+                                    payload: payload.to_vec(),
+                                }).await.unwrap();
+                            }
+                            // This same-max marker is an ordered observer barrier. It changes
+                            // preliminary coverage stats, but cannot extend B's runtime window.
+                            let marker = OutgoingExtendedHandshake {
+                                ace_metadata_version: 1,
+                                ut_metadata_id: 2,
+                                mi: Some(live_pos(6, 8)),
+                                node: NodeFields::default(),
+                                peer_ip: None,
+                                metadata_size: None,
+                            }.encode_payload();
+                            session.send(&PeerMessage::Unknown {
+                                id: 99,
+                                payload: marker,
+                            }).await.unwrap();
+                        } else if healthy
+                            && update_count > 0
+                            && matches!(
+                                update,
+                                RetainedWindowUpdate::DuplicateExtended
+                                    | RetainedWindowUpdate::DuplicateUnknown
+                            )
+                        {
+                            let duplicate_payload = OutgoingExtendedHandshake {
+                                ace_metadata_version: 1,
+                                ut_metadata_id: 2,
+                                mi: Some(live_pos(6, i64::from(max_piece))),
+                                node: NodeFields::default(),
+                                peer_ip: None,
+                                metadata_size: None,
+                            }
+                            .encode_payload();
+                            let marker_payload = OutgoingExtendedHandshake {
+                                ace_metadata_version: 1,
+                                ut_metadata_id: 2,
+                                mi: Some(live_pos(6 - i64::from(update_count), i64::from(max_piece))),
+                                node: NodeFields::default(),
+                                peer_ip: None,
+                                metadata_size: None,
+                            }
+                            .encode_payload();
+                            let msg = |payload| match update {
+                                RetainedWindowUpdate::DuplicateExtended => {
+                                    PeerMessage::Extended { ext_id: 0, payload }
+                                }
+                                RetainedWindowUpdate::DuplicateUnknown => {
+                                    PeerMessage::Unknown { id: 99, payload }
+                                }
+                                _ => unreachable!(),
+                            };
+                            // The first frame is an identical max update; the following
+                            // distinct minimum is an event barrier on the same stream.
+                            session.send(&msg(duplicate_payload)).await.unwrap();
+                            session.send(&msg(marker_payload)).await.unwrap();
+                        } else if healthy
+                            && matches!(
+                                update,
+                                RetainedWindowUpdate::StructuredExtended
+                                    | RetainedWindowUpdate::StructuredUnknown
+                                    | RetainedWindowUpdate::DuplicateExtended
+                                    | RetainedWindowUpdate::DuplicateUnknown
+                            )
+                        {
+                            // min_piece=6 distinguishes pool observation of this update from
+                            // the other peer's already-established 7..=10 window.
+                            let payload = OutgoingExtendedHandshake {
+                                ace_metadata_version: 1,
+                                ut_metadata_id: 2,
+                                mi: Some(live_pos(6, i64::from(max_piece))),
+                                node: NodeFields::default(),
+                                peer_ip: None,
+                                metadata_size: None,
+                            }
+                            .encode_payload();
+                            let message = match update {
+                                RetainedWindowUpdate::StructuredExtended
+                                | RetainedWindowUpdate::DuplicateExtended => {
+                                    PeerMessage::Extended { ext_id: 0, payload }
+                                }
+                                RetainedWindowUpdate::StructuredUnknown
+                                | RetainedWindowUpdate::DuplicateUnknown => {
+                                    PeerMessage::Unknown { id: 99, payload }
+                                }
+                                RetainedWindowUpdate::Id4
+                                | RetainedWindowUpdate::UnknownInvalidSequence => unreachable!(),
+                            };
+                            session.send(&message).await.unwrap();
+                        } else {
+                            let mut payload = vec![0; 8];
+                            payload[4..].copy_from_slice(&max_piece.to_be_bytes());
+                            session.send(&PeerMessage::Unknown { id: 4, payload }).await.unwrap();
                         }
+                        update_count = update_count.saturating_add(1);
                     }
                     message = session.read_message() => {
                         let Ok(message) = message else { break; };
@@ -1401,12 +1522,18 @@ async fn retained_producer_window_control(producer_first: bool, head_only_max: u
                                     let _ = sender.send(());
                                 }
                                 if !healthy {
-                                    // Head-only peer makes the ordering observable, then stops
-                                    // owning new requests. Its old reservation expires normally.
+                                    // The head-only peer makes request ordering observable, then
+                                    // stops receiving useful data. Its reservation expires normally.
                                     session.send(&PeerMessage::Choke).await.unwrap();
                                 }
                             }
-                            if healthy {
+                            if healthy
+                                && (!matches!(
+                                    update,
+                                    RetainedWindowUpdate::DuplicateExtended
+                                        | RetainedWindowUpdate::DuplicateUnknown
+                                ) || piece <= 8 || piece == 9)
+                            {
                                 let marker = if piece <= 8 { 0x44 } else { 0x66 };
                                 let media: Vec<_> = (0..4).flat_map(|cc| {
                                     let mut packet = vec![marker; 188];
@@ -1424,11 +1551,29 @@ async fn retained_producer_window_control(producer_first: bool, head_only_max: u
         });
     }
     let (info, mut seed) = cancellation_fixture();
-    seed.prefetch_pieces = u64::from(head_only_max - 9);
+    seed.prefetch_pieces = u64::from(head_only_max.max(producer_max_piece) - 9);
     seed.live_recovery.max_active_upstreams = 2;
-    let (tx, mut rx) = mpsc::channel(16);
+    let duplicate_chatter = matches!(
+        update,
+        RetainedWindowUpdate::DuplicateExtended | RetainedWindowUpdate::DuplicateUnknown
+    );
+    if duplicate_chatter {
+        seed.live_recovery.stale_upstream_timeout_ms = 5_000;
+        seed.live_recovery.request_check_interval_ms = 100;
+    }
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let observer = TestObserver::new(
+        downloaded.clone(),
+        received.clone(),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    );
+    seed.metrics = Some(observer.clone());
+    let (tx, rx) = mpsc::channel(16);
+    let mut rx = Some(rx);
     let addresses: Vec<_> = upstreams.iter().map(|peer| peer.addr).collect();
-    let pool = tokio::spawn(async move {
+    let mut pool = tokio::spawn(async move {
         let mut candidates = SessionCandidates::default();
         candidates.learn(addresses[0], CandidateKind::Pex);
         candidates.learn(addresses[1], CandidateKind::Source);
@@ -1458,25 +1603,90 @@ async fn retained_producer_window_control(producer_first: bool, head_only_max: u
         (end, continuity.head, continuity.reasm.next_needed())
     });
     // Require both original pieces through the actual media path before advancing either head.
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let initial_output = tokio::time::timeout(Duration::from_secs(2), async {
         let mut bytes = 0;
         while bytes < 7 * 188 {
-            let output = rx.recv().await.unwrap();
-            assert!(output.bytes.contains(&0x44));
+            let Some(output) = rx.as_mut().unwrap().recv().await else {
+                return false;
+            };
+            if !output.bytes.contains(&0x44) {
+                return false;
+            }
             bytes += output.bytes.len();
         }
+        true
     })
     .await
-    .expect("healthy initial producer fixture");
+    .unwrap_or(false);
     let first = if producer_first { 0 } else { 1 };
-    commands[first].send(()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), requested[first].take().unwrap())
+    let first_barrier = if initial_output && commands[first].send(()).await.is_ok() {
+        if first == 1 {
+            // The head-only peer is deliberately choked: observe its accepted head update
+            // after the initial producer has advanced the cursor to piece 9.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let position = observer.snapshot().livepos;
+                    if position.as_ref().and_then(|p| p.last) == Some(u64::from(head_only_max))
+                        && position.as_ref().and_then(|p| p.pos) == Some(9)
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or(false)
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), requested[first].take().unwrap())
+                .await
+                .is_ok_and(|result| result.is_ok())
+        }
+    } else {
+        false
+    };
+    let update_sent = if first_barrier {
+        commands[1 - first].send(()).await.is_ok()
+    } else {
+        false
+    };
+    let observed_window_update = if update_sent && update != RetainedWindowUpdate::Id4 {
+        let expected_min = match update {
+            RetainedWindowUpdate::UnknownInvalidSequence => 6,
+            _ => 6,
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if observer
+                    .snapshot()
+                    .livepos
+                    .as_ref()
+                    .and_then(|p| p.live_first)
+                    == Some(expected_min)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
         .await
-        .expect("first id=4 must actually schedule piece9")
-        .unwrap();
-    commands[1 - first].send(()).await.unwrap();
-    let output = tokio::time::timeout(Duration::from_secs(3), async {
-        while let Some(output) = rx.recv().await {
+        .unwrap_or(false)
+    } else {
+        update_sent
+    };
+    let healthy_requested_piece9 = if observed_window_update {
+        if first == 0 {
+            // The healthy producer's request was the first ordering barrier.
+            first_barrier
+        } else {
+            tokio::time::timeout(Duration::from_millis(750), requested[0].take().unwrap())
+                .await
+                .is_ok_and(|result| result.is_ok())
+        }
+    } else {
+        false
+    };
+    let output = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(output) = rx.as_mut().unwrap().recv().await {
             if output.bytes.contains(&0x66) {
                 return true;
             }
@@ -1484,49 +1694,205 @@ async fn retained_producer_window_control(producer_first: bool, head_only_max: u
         false
     })
     .await;
-    drop(rx);
-    let (end, head, cursor) = tokio::time::timeout(Duration::from_secs(1), pool)
-        .await
-        .unwrap()
-        .unwrap();
-    while let Some(server) = tokio::time::timeout(Duration::from_secs(1), servers.join_next())
-        .await
-        .unwrap()
-    {
-        server.unwrap();
+    let output_at = Instant::now();
+    let duplicate_barriers = if duplicate_chatter && matches!(output, Ok(true)) {
+        let mut all_observed = true;
+        for expected_min in [5, 4, 3, 2] {
+            if commands[0].send(()).await.is_err() {
+                all_observed = false;
+                break;
+            }
+            let observed = tokio::time::timeout(Duration::from_millis(250), async {
+                loop {
+                    if observer
+                        .snapshot()
+                        .livepos
+                        .as_ref()
+                        .and_then(|p| p.live_first)
+                        == Some(expected_min)
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or(false);
+            if !observed {
+                all_observed = false;
+                break;
+            }
+        }
+        all_observed
+    } else {
+        !duplicate_chatter
+    };
+    if !duplicate_chatter {
+        drop(rx.take());
     }
-    assert!(matches!(end, FollowEnd::ConsumerGone));
+    let pool_outcome = match tokio::time::timeout(
+        if duplicate_chatter {
+            Duration::from_secs(7)
+        } else {
+            Duration::from_secs(1)
+        },
+        &mut pool,
+    )
+    .await
+    {
+        Ok(Ok(outcome)) => Some(outcome),
+        _ => None,
+    };
+    if pool_outcome.is_none() {
+        drop(rx.take());
+        pool.abort();
+        let _ = pool.await;
+    } else {
+        drop(rx.take());
+    }
+    drop(commands);
+    let stale_elapsed = output_at.elapsed();
+    servers.abort_all();
+    while tokio::time::timeout(Duration::from_secs(1), servers.join_next())
+        .await
+        .is_ok_and(|joined| joined.is_some())
+    {}
+    let (end, head, cursor) = pool_outcome.expect("pool worker must stop after consumer closes");
+    eprintln!(
+        "window control: producer_first={producer_first} head={head} cursor={cursor} healthy_requests={:?} head_only_requests={:?}",
+        requests[0].lock().unwrap(),
+        requests[1].lock().unwrap()
+    );
+    assert!(initial_output, "healthy initial producer fixture");
+    assert!(
+        first_barrier,
+        "head/cursor ordering barrier must be reached"
+    );
+    assert!(
+        observed_window_update,
+        "peer update bytes must reach the pool reader"
+    );
     assert_eq!(
         head,
-        u64::from(head_only_max),
+        u64::from(head_only_max.max(producer_max_piece)),
         "shared head must stay monotonic"
     );
-    assert!(
-        cursor > 9,
-        "new producer media must advance the actual cursor"
-    );
-    eprintln!("window control: producer_first={producer_first} head={head} cursor={cursor} healthy_requests={:?} head_only_requests={:?}",
-        requests[0].lock().unwrap(), requests[1].lock().unwrap());
-    assert!(
-        matches!(output, Ok(true)),
-        "retained healthy producer's same-head id=4 must extend its request window"
-    );
+    if matches!(update, RetainedWindowUpdate::UnknownInvalidSequence) {
+        assert!(matches!(end, FollowEnd::ConsumerGone));
+        assert!(
+            !healthy_requested_piece9,
+            "malformed, negative, over-bound, and max-zero updates must not request piece9"
+        );
+        assert!(
+            !matches!(output, Ok(true)),
+            "invalid windows must supply no new output"
+        );
+        assert_eq!(
+            cursor, 9,
+            "invalid windows must not advance the media cursor"
+        );
+    } else {
+        assert!(
+            healthy_requested_piece9,
+            "healthy producer must receive actual piece9 request"
+        );
+        assert!(
+            matches!(output, Ok(true)),
+            "retained healthy producer's window update must supply usable output"
+        );
+        assert!(
+            cursor > 9,
+            "new producer media must advance the actual cursor"
+        );
+        if duplicate_chatter {
+            assert!(
+                duplicate_barriers,
+                "duplicate frames must be accepted in order"
+            );
+            assert!(matches!(end, FollowEnd::PoolStale { .. }));
+            assert_eq!(
+                cursor, 10,
+                "duplicate window chatter must not produce more media"
+            );
+            assert!(
+                stale_elapsed >= Duration::from_secs(4)
+                    && stale_elapsed < Duration::from_secs(7),
+                "duplicate max updates must not renew the post-output stale deadline: {stale_elapsed:?}"
+            );
+        } else {
+            assert!(matches!(end, FollowEnd::ConsumerGone));
+        }
+    }
 }
 
 #[tokio::test]
 async fn retained_producer_same_head_window_update_supplies_media() {
-    retained_producer_window_control(false, 10).await;
+    retained_producer_window_control(false, 10, 10, RetainedWindowUpdate::Id4).await;
 }
 
 #[tokio::test]
 async fn retained_producer_first_window_update_positive_control() {
-    retained_producer_window_control(true, 10).await;
+    retained_producer_window_control(true, 10, 10, RetainedWindowUpdate::Id4).await;
 }
 
 #[tokio::test]
 async fn retained_producer_lower_than_shared_head_window_update_supplies_media() {
     // Shared head11/cursor9; producer head10 remains usable inside prefetch2.
-    retained_producer_window_control(false, 11).await;
+    retained_producer_window_control(false, 11, 10, RetainedWindowUpdate::Id4).await;
+}
+
+#[tokio::test]
+async fn retained_producer_structured_same_head_window_update_supplies_media() {
+    retained_producer_window_control(false, 10, 10, RetainedWindowUpdate::StructuredExtended).await;
+}
+
+#[tokio::test]
+async fn retained_producer_structured_new_head_window_update_supplies_media() {
+    retained_producer_window_control(false, 10, 11, RetainedWindowUpdate::StructuredExtended).await;
+}
+
+#[tokio::test]
+async fn retained_producer_unknown_structured_same_head_window_update_supplies_media() {
+    retained_producer_window_control(false, 10, 10, RetainedWindowUpdate::StructuredUnknown).await;
+}
+
+#[tokio::test]
+async fn retained_producer_unknown_structured_lower_head_window_update_supplies_media() {
+    retained_producer_window_control(false, 11, 10, RetainedWindowUpdate::StructuredUnknown).await;
+}
+
+#[tokio::test]
+async fn retained_producer_extended_structured_lower_head_window_update_supplies_media() {
+    retained_producer_window_control(false, 11, 10, RetainedWindowUpdate::StructuredExtended).await;
+}
+
+#[tokio::test]
+async fn retained_producer_extended_duplicate_updates_do_not_renew_stale_deadline() {
+    retained_producer_window_control(false, 10, 10, RetainedWindowUpdate::DuplicateExtended).await;
+}
+
+#[tokio::test]
+async fn retained_producer_unknown_duplicate_updates_do_not_renew_stale_deadline() {
+    retained_producer_window_control(false, 10, 10, RetainedWindowUpdate::DuplicateUnknown).await;
+}
+
+#[tokio::test]
+async fn retained_producer_unknown_invalid_windows_preserve_global_head_and_coverage() {
+    retained_producer_window_control(false, 10, 10, RetainedWindowUpdate::UnknownInvalidSequence)
+        .await;
+}
+
+#[test]
+fn read_window_max_preserves_live_window_parser_compatibility() {
+    assert_eq!(read_window_max(b"d9:max_piecei0ee"), Some(0));
+    assert_eq!(read_window_max(b"d2:mid9:max_piecei0eee"), Some(0));
+    assert_eq!(read_window_max(b"d9:max_piecei10ee"), Some(10));
+    assert_eq!(read_window_max(b"d9:max_piecei10ee trailing"), Some(10));
+    assert_eq!(read_window_max(b"d1:ai1ee"), None);
+    assert_eq!(read_window_max(b"d9:max_piece1:xe"), None);
+    assert_eq!(read_window_max(b"d9:max_piecei-1ee"), None);
+    assert_eq!(read_window_max(b"not-bencode"), None);
+    assert_eq!(read_window_max(b"d9:max_piecei4294967296ee"), None);
 }
 
 #[tokio::test]
@@ -1891,7 +2257,9 @@ async fn rejected_stale_candidate_does_not_extend_usable_grace() {
         stale_cooled_at_selection,
         pending_explorations_at_selection,
         pending_retryable_at_selection,
-        pending_outcome.accepted_at.is_some_and(|at| at < selected_at),
+        pending_outcome
+            .accepted_at
+            .is_some_and(|at| at < selected_at),
     );
 
     assert_eq!(selected_addrs, vec![usable_addr]);

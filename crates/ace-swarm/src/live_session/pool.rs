@@ -693,13 +693,18 @@ pub(super) async fn follow_peer_pool_with_discovery(
                 record_pool_losses(candidates, &mut loss_count, newly_lost);
             }
             PeerMessage::Extended { ref payload, .. } => {
-                if let Some(new_head) = advance_head_from_window(payload, continuity.head) {
-                    continuity.head = new_head;
-                    update_runtime_window(&mut peers, continuity, peer_id, new_head);
-                    made_activity = true;
-                    let newly_lost =
-                        advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                    record_pool_losses(candidates, &mut loss_count, newly_lost);
+                if let Some(max_piece) = read_window_max(payload) {
+                    let window_advanced = peers
+                        .get(&peer_id)
+                        .is_some_and(|peer| max_piece > peer.max_piece);
+                    if max_piece > continuity.head || window_advanced {
+                        continuity.head = continuity.head.max(max_piece);
+                        update_runtime_window(&mut peers, continuity, peer_id, max_piece);
+                        made_activity = true;
+                        let newly_lost =
+                            advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
+                        record_pool_losses(candidates, &mut loss_count, newly_lost);
+                    }
                 }
             }
             m @ PeerMessage::Piece { .. } => {
@@ -940,13 +945,22 @@ pub(super) async fn follow_peer_pool_with_discovery(
                 id: 11 | 13 | 34, ..
             } => {}
             PeerMessage::Unknown { id, ref payload } => {
-                if let Some(new_head) = advance_head_from_window(payload, continuity.head) {
-                    crate::alog!(
-                        "[ace] {addr}: live window update (msg id={id}) head {} -> {new_head}",
-                        continuity.head
-                    );
-                    continuity.head = new_head;
-                    update_runtime_window(&mut peers, continuity, peer_id, new_head);
+                let max_piece = read_window_max(payload);
+                let window_advanced = max_piece.is_some_and(|max_piece| {
+                    max_piece > continuity.head
+                        || peers
+                            .get(&peer_id)
+                            .is_some_and(|peer| max_piece > peer.max_piece)
+                });
+                if let Some(max_piece) = max_piece.filter(|_| window_advanced) {
+                    if max_piece > continuity.head {
+                        crate::alog!(
+                            "[ace] {addr}: live window update (msg id={id}) head {} -> {max_piece}",
+                            continuity.head
+                        );
+                    }
+                    continuity.head = continuity.head.max(max_piece);
+                    update_runtime_window(&mut peers, continuity, peer_id, max_piece);
                     made_activity = true;
                     let newly_lost =
                         advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;

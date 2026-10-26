@@ -263,7 +263,9 @@ async fn fast_source_fairness(return_source: bool) {
     if return_source {
         assert!(source_admissions.load(Ordering::Relaxed) > 0);
     }
-    eprintln!("fairness control: first_ms={first_ms}, attempts={attempts}, admitted={admitted}, returning_source={return_source}");
+    eprintln!(
+        "fairness control: first_ms={first_ms}, attempts={attempts}, admitted={admitted}, returning_source={return_source}"
+    );
 }
 
 #[tokio::test]
