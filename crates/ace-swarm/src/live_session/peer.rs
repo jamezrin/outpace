@@ -1,4 +1,5 @@
 use super::connect_diagnostics::BasicReplyCause;
+use super::continuity::ResumeCursor;
 use super::*;
 
 pub(super) fn prefer_window(candidate: &WireLivePosition, current: &WireLivePosition) -> bool {
@@ -163,6 +164,7 @@ pub(super) async fn connect_pool(
     candidates: &mut SessionCandidates,
     live_recovery: LiveRecoveryConfig,
     discovery: &mut Option<DiscoveryRun>,
+    resume: Option<ResumeCursor>,
 ) -> Vec<ConnectedUpstream> {
     let mut attempted = HashSet::new();
     let mut stats = PeerConnectStats::default();
@@ -210,6 +212,14 @@ pub(super) async fn connect_pool(
                     match joined {
                         Some(Ok(PeerConnectAttempt::Connected(candidate, timing))) => {
                             stats.record_connected(timing);
+                            if resume.is_some_and(|cursor| {
+                                !cursor.window_can_resume(&candidate.window)
+                            }) {
+                                candidates.explored(candidate.addr);
+                                candidates.failed(candidate.addr, Instant::now());
+                                drop(candidate);
+                                continue;
+                            }
                             connected.push(candidate);
                             deadline.get_or_insert_with(|| {
                                 tokio::time::Instant::now() + UPSTREAM_SELECTION_GRACE

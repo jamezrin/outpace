@@ -380,9 +380,16 @@ async fn follow_live_session_with_run(
             "[ace] reconnect candidates: eligible={} learned_source={sources} learned_pex={pex}",
             ready.len()
         );
+        let resume = continuity.as_ref().map(Continuity::resume_cursor);
         let mut upstreams = tokio::select! {
             _ = tx.closed() => return,
-            connected = connect_pool(info.infohash,&mut candidates,seed.live_recovery,&mut rediscovery) => connected,
+            connected = connect_pool(
+                info.infohash,
+                &mut candidates,
+                seed.live_recovery,
+                &mut rediscovery,
+                resume,
+            ) => connected,
         };
         if let Some(c) = &continuity {
             let mut usable = Vec::new();

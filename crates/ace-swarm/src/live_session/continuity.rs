@@ -1,5 +1,32 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct ResumeCursor {
+    next_needed: u64,
+    head: u64,
+}
+
+impl ResumeCursor {
+    /// Whether a peer advertising `window` can still serve the piece we need next.
+    ///
+    /// A window that already covers the piece trivially can. The subtle case is the live edge:
+    /// once we are caught up, `next_needed` is the piece *after* the newest one the source has
+    /// produced, so no peer in the swarm can advertise it yet. Requiring coverage there rejects
+    /// every peer at once and leaves the pool reconnecting into "no usable upstreams" until some
+    /// advertisement drifts forward — a multi-second output gap on a stream that was healthy.
+    /// A peer that is current with the live edge is precisely the one to wait on: it delivers the
+    /// piece via a live HAVE as soon as the source produces it. A peer whose window ends short of
+    /// the edge is genuinely behind and still rejected.
+    pub(super) fn window_can_resume(&self, window: &WireLivePosition) -> bool {
+        let needed = i64::try_from(self.next_needed).unwrap_or(i64::MAX);
+        if window.max_piece >= needed {
+            return true;
+        }
+        let head = i64::try_from(self.head).unwrap_or(i64::MAX);
+        needed > head && window.max_piece >= head
+    }
+}
+
 /// First piece to request given a peer window and a configured prefetch depth.
 pub(super) fn prefetch_start(min_piece: u64, max_piece: u64, prefetch: u64) -> u64 {
     max_piece.saturating_sub(prefetch).max(min_piece)
@@ -97,23 +124,15 @@ impl Continuity {
         resume
     }
 
-    /// Whether a peer advertising `window` can still serve the piece we need next.
-    ///
-    /// A window that already covers the piece trivially can. The subtle case is the live edge:
-    /// once we are caught up, `next_needed` is the piece *after* the newest one the source has
-    /// produced, so no peer in the swarm can advertise it yet. Requiring coverage there rejects
-    /// every peer at once and leaves the pool reconnecting into "no usable upstreams" until some
-    /// advertisement drifts forward — a multi-second output gap on a stream that was healthy.
-    /// A peer that is current with the live edge is precisely the one to wait on: it delivers the
-    /// piece via a live HAVE as soon as the source produces it. A peer whose window ends short of
-    /// the edge is genuinely behind and still rejected.
-    pub(super) fn window_can_resume(&self, window: &WireLivePosition) -> bool {
-        let needed = i64::try_from(self.reasm.next_needed()).unwrap_or(i64::MAX);
-        if window.max_piece >= needed {
-            return true;
+    pub(super) fn resume_cursor(&self) -> ResumeCursor {
+        ResumeCursor {
+            next_needed: self.reasm.next_needed(),
+            head: self.head,
         }
-        let head = i64::try_from(self.head).unwrap_or(i64::MAX);
-        needed > head && window.max_piece >= head
+    }
+
+    pub(super) fn window_can_resume(&self, window: &WireLivePosition) -> bool {
+        self.resume_cursor().window_can_resume(window)
     }
 
     /// Rejected bytes cannot complete a request. Forget the partial chunk count and all

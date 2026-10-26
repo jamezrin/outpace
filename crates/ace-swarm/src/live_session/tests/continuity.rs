@@ -1,5 +1,53 @@
 use super::*;
 
+#[test]
+fn resume_cursor_matches_existing_window_policy_at_edges() {
+    let (mut continuity, _) = Continuity::fresh(
+        &info(),
+        10,
+        20,
+        PREFETCH_PIECES,
+        LiveRecoveryConfig::default(),
+    );
+    let agrees = |continuity: &Continuity, window: WireLivePosition| {
+        let snapshot = continuity.resume_cursor();
+        assert_eq!(
+            snapshot.window_can_resume(&window),
+            continuity.window_can_resume(&window),
+            "snapshot and continuity predicates must agree for {window:?}"
+        );
+        snapshot.window_can_resume(&window)
+    };
+
+    assert!(agrees(&continuity, win(12, 12)), "ordinary covering window");
+    assert!(!agrees(&continuity, win(1, 11)), "ordinary stale window");
+    assert!(
+        agrees(&continuity, win(13, 14)),
+        "future minimum may resync forward"
+    );
+
+    continuity.reasm.skip_to(11);
+    continuity.head = 10;
+    assert!(agrees(&continuity, win(1, 10)), "caught-up edge fallback");
+    assert!(!agrees(&continuity, win(1, 9)), "below caught-up head");
+
+    continuity.reasm.skip_to(u64::MAX);
+    continuity.head = u64::MAX;
+    assert!(
+        agrees(&continuity, win(0, i64::MAX),),
+        "cursor and head saturate to i64::MAX"
+    );
+    assert!(
+        !agrees(&continuity, win(0, i64::MAX - 1),),
+        "saturated cursor still rejects a lower maximum"
+    );
+    continuity.head = u64::MAX - 1;
+    assert!(
+        !agrees(&continuity, win(0, i64::MAX - 1),),
+        "saturated cursor/head preserve the existing fallback comparison"
+    );
+}
+
 // Note: the "no peers -> Backend error" path is intentionally not unit-tested, since
 // discovery now always consults the live DHT (network). It's exercised by the live
 // capture path instead.
