@@ -43,7 +43,7 @@ Pin these inputs in the task's tests: a future window with min above cursor; cau
   - `resume_cursor_matches_continuity_window_policy`: ordinary cover/stale; N11/H10/max10 accepted, max9 rejected; N9/H10/window[12,15] accepted; preserve saturated conversion behavior.
   - `reconnect_selection_cancellation_closes_pending_peers`: drop the selection future after A rejects and B accepts TCP but before its delayed reply; B socket closes, no B exploration/failure/admission. Retain existing consumer-close, fairness and timeout-fallback tests.
 
-- [ ] **4. Verify and review the one change.** Root-authorized integration is pending; run on the clean merge result using the pinned toolchain:
+- [x] **4. Verify and review the one change.** Root-authorized integration is complete; the clean merge result passed the requested gates using the pinned toolchain:
   ```sh
   cargo test --offline -p ace-swarm reconnect_selection_grace_can_cancel_later_covering_peer --lib -- --nocapture
   cargo test --offline -p ace-swarm live_session:: --lib
@@ -55,8 +55,8 @@ Pin these inputs in the task's tests: a future window with min above cursor; cau
   ```
   Require focused GREEN, broader suites passing with documented ignored live tests, clean lint/format/hygiene/whitespace. Review the actual diff against the spec and verify no test weakens the normative assertion or changes initial behavior. No live reliability claim follows.
 
-- [ ] **5. Handoff one reviewable change.** Record baseline RED, GREEN commands/results and limitations. Root has now authorized the local commit and main integration in this test worktree; no push/PR/publication is authorized.
+- [x] **5. Handoff one reviewable change.** Record baseline RED, GREEN commands/results and limitations. Root authorized and received the local commit and main integration in this test worktree; no push/PR/publication was performed.
 
 ## Root-authorized integration status
 
-Fresh independent review approved the production diff and accepted the in-grace stale completion control. Implementation and focused-control tasks 1–3 are complete. Task 4 remains open until the clean merge result passes the requested tests, lint, formatting, hygiene and build. Task 5 remains open until the normal-hook commit, merge and final artifact/report are recorded.
+Fresh independent reviews approved the production diff and accepted the in-grace stale completion control. Implementation and focused-control tasks 1–3 are complete. Root committed `a05c27b`, merged `origin/main` `f1b6390` at `9b1e047`, and passed the focused, reconnect, cursor, workspace, lint, formatting, hygiene and release compatibility gates on the clean merge source. The release candidate and final gate/commit records are in `/tmp/outpace-overnight/reconnect-commit-build.md` and `.superpowers/sdd/2026-10-26-reconnect-window-selection/reconnect-commit-build.md`. Local publication remains with root; no push or PR was created.
