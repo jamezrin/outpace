@@ -160,6 +160,237 @@ fn stale_upstream_budget_expires_after_no_forward_progress() {
 }
 
 #[test]
+fn pool_progress_budget_waits_for_corroboration_then_grants_full_interval() {
+    let base = Instant::now();
+    let gate = base + Duration::from_secs(1);
+    let mut first_output_deadline = None;
+
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            0,
+            Some(gate),
+            base,
+            base + Duration::from_millis(400),
+            Duration::from_millis(200),
+        ),
+        Some(Duration::from_millis(600)),
+        "pending corroboration keeps its remaining absolute gate"
+    );
+    assert_eq!(first_output_deadline, None);
+
+    // Release scheduling has completed and the gate is cleared; even though T is shorter
+    // than the gate, this new pool budget starts with the full configured interval.
+    let after_release_scheduling = gate + Duration::from_millis(25);
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            0,
+            None,
+            gate,
+            after_release_scheduling,
+            Duration::from_millis(200),
+        ),
+        Some(Duration::from_millis(200))
+    );
+    assert_eq!(
+        first_output_deadline,
+        Some(after_release_scheduling + Duration::from_millis(200))
+    );
+}
+
+#[test]
+fn pool_progress_budget_startup_activity_cannot_slide_deadline() {
+    let base = Instant::now();
+    let timeout = Duration::from_secs(2);
+    let deadline = base + timeout;
+    let mut first_output_deadline = None;
+    let mut last_progress = base;
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            0,
+            None,
+            last_progress,
+            base,
+            timeout
+        ),
+        Some(timeout)
+    );
+    assert_eq!(first_output_deadline, Some(deadline));
+
+    for elapsed in [300, 700, 1_100, 1_600, 1_999] {
+        let activity_at = base + Duration::from_millis(elapsed);
+        assert!(should_refresh_stale_deadline(0, false, true));
+        last_progress = activity_at;
+        let budget = pool_progress_budget(
+            &mut first_output_deadline,
+            0,
+            Some(activity_at + Duration::from_secs(1)),
+            last_progress,
+            activity_at,
+            timeout,
+        );
+        assert_eq!(
+            first_output_deadline,
+            Some(deadline),
+            "new head/peer activity at {elapsed} ms cannot move the original deadline"
+        );
+        assert_eq!(
+            budget,
+            Some(deadline.duration_since(activity_at)),
+            "armed deadline ignores last_progress and later corroboration values"
+        );
+    }
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            0,
+            None,
+            last_progress,
+            deadline - Duration::from_nanos(1),
+            timeout,
+        ),
+        Some(Duration::from_nanos(1)),
+        "one tick before expiry remains usable"
+    );
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            0,
+            None,
+            last_progress,
+            deadline,
+            timeout
+        ),
+        None,
+        "deadline equality expires"
+    );
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            0,
+            None,
+            last_progress,
+            deadline + Duration::from_nanos(1),
+            timeout,
+        ),
+        None,
+        "later activity cannot revive an expired deadline"
+    );
+}
+
+#[test]
+fn pool_progress_budget_first_output_restores_existing_stale_policy() {
+    let base = Instant::now();
+    let timeout = Duration::from_secs(2);
+    let mut first_output_deadline = Some(base + Duration::from_secs(1));
+    let now = base + Duration::from_millis(1_500);
+    let last_progress = base + Duration::from_secs(1);
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            1,
+            None,
+            last_progress,
+            now,
+            timeout,
+        ),
+        stale_upstream_budget(last_progress, now, timeout),
+        "first output delegates exactly to the existing sliding policy"
+    );
+    assert_eq!(first_output_deadline, None);
+    assert!(!should_refresh_stale_deadline(1, false, true));
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            1,
+            None,
+            last_progress,
+            last_progress + timeout,
+            timeout,
+        ),
+        None,
+        "post-output chatter cannot refresh last_progress"
+    );
+    assert_eq!(first_output_deadline, None);
+}
+
+#[test]
+fn pool_progress_budget_new_unemitted_pool_gets_one_fresh_interval() {
+    let base = Instant::now();
+    let timeout = Duration::from_secs(2);
+    let mut prior_pool_deadline = None;
+    assert_eq!(
+        pool_progress_budget(&mut prior_pool_deadline, 0, None, base, base, timeout),
+        Some(timeout)
+    );
+    let rebuilt_at = base + Duration::from_millis(1_500);
+    assert_eq!(
+        pool_progress_budget(
+            &mut prior_pool_deadline,
+            0,
+            None,
+            rebuilt_at,
+            rebuilt_at,
+            timeout,
+        ),
+        Some(Duration::from_millis(500)),
+        "the existing pool keeps its original expiry"
+    );
+
+    // A rebuilt never-emitted pool owns a new local Option and a full fresh T.
+    let mut rebuilt_pool_deadline = None;
+    assert_eq!(
+        pool_progress_budget(
+            &mut rebuilt_pool_deadline,
+            0,
+            None,
+            rebuilt_at,
+            rebuilt_at,
+            timeout,
+        ),
+        Some(timeout)
+    );
+    assert_eq!(rebuilt_pool_deadline, Some(rebuilt_at + timeout));
+    assert_eq!(prior_pool_deadline, Some(base + timeout));
+}
+
+#[test]
+fn pool_progress_budget_resumed_emitted_continuity_never_arms() {
+    let base = Instant::now();
+    let timeout = Duration::from_secs(2);
+    let last_progress = base;
+    let mut first_output_deadline = None;
+    assert!(!should_refresh_stale_deadline(1, false, true));
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            1,
+            Some(base + Duration::from_secs(1)),
+            last_progress,
+            base + Duration::from_millis(500),
+            timeout,
+        ),
+        Some(Duration::from_millis(1_500)),
+        "emitted continuity uses the existing stale budget, even with a gate argument"
+    );
+    assert_eq!(first_output_deadline, None);
+    assert_eq!(
+        pool_progress_budget(
+            &mut first_output_deadline,
+            1,
+            None,
+            last_progress,
+            base + timeout,
+            timeout,
+        ),
+        None
+    );
+    assert_eq!(first_output_deadline, None);
+}
+
+#[test]
 fn timed_out_requests_returns_only_aged_pieces_and_prunes_passed_ones() {
     let (mut c, _) = Continuity::fresh(
         &info(),

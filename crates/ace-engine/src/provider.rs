@@ -105,12 +105,34 @@ pub trait VodContent: Send + Sync {
     ) -> Result<Box<dyn VodByteSource>, ProviderError>;
 }
 
+/// Result of preparing a live content id without opening its media source.
+#[derive(Debug)]
+pub enum ContentIdPreparation {
+    /// The provider leaves preparation to the caller's legacy catalog preflight.
+    Unsupported,
+    /// Metadata authenticated by the catalog, suitable for public infohash aliases.
+    Catalog(StreamInfo),
+    /// The provider resolved its own local or opted-in peer path, without catalog trust.
+    ProviderResolved,
+}
+
 /// Adapter for one network (e.g. "ace").
 #[async_trait]
 pub trait StreamProvider: Send + Sync {
     fn network(&self) -> &'static str;
     /// Open a live TS source for `id` (the provider resolves/discovers internally).
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError>;
+
+    /// Prepare a live content id using the same policy and cache as [`open`](Self::open).
+    /// Only `Catalog` grants catalog provenance. A supported provider's error is terminal
+    /// for this selection; `Unsupported` alone permits the caller's legacy preflight.
+    async fn prepare_live_content_id(
+        &self,
+        _content_id: &str,
+    ) -> Result<ContentIdPreparation, ProviderError> {
+        Ok(ContentIdPreparation::Unsupported)
+    }
+
     /// Resolve `id` to a single-file VOD, returning its geometry (total length) and a handle for
     /// opening verified byte ranges. Defaults to unsupported; networks with a VOD path override
     /// this. Kept separate from [`open`](Self::open) because VOD is finite, length-known content

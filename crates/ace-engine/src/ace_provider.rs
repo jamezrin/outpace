@@ -10,12 +10,14 @@
 //! authenticated catalog and require a descriptor whose computed hash matches the request.
 
 mod announce;
+mod catalog_resolution;
 #[cfg(test)]
 mod content_id_policy_tests;
 #[cfg(test)]
 mod discovery_tests;
 use announce::announce_seeder_periodically;
 pub use announce::{announce_infohash_periodically, announce_infohash_periodically_dynamic};
+use catalog_resolution::{CatalogLookupError, CatalogResolutionCache};
 mod live;
 #[cfg(test)]
 use live::AceSource;
@@ -30,7 +32,8 @@ mod resync_tests;
 
 use crate::config::{CacheType, LiveRecoveryConfig, StartupBufferConfig};
 use crate::provider::{
-    ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource, VodContent,
+    ContentIdPreparation, ProviderError, SourceStats, StreamProvider, TsSource, VodByteSource,
+    VodContent,
 };
 use crate::startup_buffer::StartupBufferedSource;
 use ace_peer::session::connect;
@@ -64,6 +67,8 @@ use ace_wire::reassembly::PieceReassembler;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::future::Future;
 use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -72,6 +77,51 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+
+#[cfg(test)]
+pub(crate) type CatalogFetch = Arc<
+    dyn Fn(String) -> futures::future::BoxFuture<'static, Result<StreamInfo, ResolveError>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static CATALOG_FETCH: CatalogFetch;
+}
+
+/// Fetch the authenticated live catalog descriptor. Tests can scope a task-local scripted
+/// response around a future; production always forwards once to the signed catalog resolver.
+pub(crate) async fn catalog_live_info(cid: &str) -> Result<StreamInfo, ResolveError> {
+    #[cfg(test)]
+    if let Ok(fetch) = CATALOG_FETCH.try_with(Arc::clone) {
+        return fetch(cid.to_owned()).await;
+    }
+    resolve_via_catalog(cid).await
+}
+
+#[cfg(test)]
+pub(crate) async fn with_catalog_fetch_for_test<F>(fetch: CatalogFetch, future: F) -> F::Output
+where
+    F: Future,
+{
+    CATALOG_FETCH.scope(fetch, future).await
+}
+
+/// Preserve provenance until the caller chooses whether catalog aliases are appropriate.
+#[derive(Debug)]
+enum ResolvedContentId {
+    Catalog(StreamInfo),
+    Provider(StreamInfo),
+}
+
+impl ResolvedContentId {
+    fn into_info(self) -> StreamInfo {
+        match self {
+            Self::Catalog(info) | Self::Provider(info) => info,
+        }
+    }
+}
 
 /// How many pieces behind the live edge to start, so we have buffer immediately.
 const PREFETCH_PIECES: u64 = 8;
@@ -206,7 +256,7 @@ pub struct AceProvider {
     announce_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
     default_trackers: Vec<String>,
     bootstrap_peers: Vec<SocketAddrV4>,
-    resolve_cache: ResolveCache,
+    resolve_cache: CatalogResolutionCache,
     /// Raw wrapped-transport hashes resolved over BEP-9 peers with explicit opt-in. The raw
     /// hash does not establish a public content-id binding, and the infohash does not bind
     /// trackers/categories, so these results must
@@ -216,7 +266,7 @@ pub struct AceProvider {
     /// Live descriptors keyed by swarm infohash. Filled only by signed-catalog content-id
     /// resolutions (never BEP-9 or a transport url; own broadcasts are read from the seed
     /// registry instead), so a later bare-infohash open uses the real geometry, pubkey and
-    /// trackers (#164). Separate from `resolve_cache`, which is keyed by the content-id string.
+    /// trackers (#164). Separate from `resolve_cache`, which is keyed by content-id bytes.
     infohash_index: InfohashIndex,
     /// Bounded short-lived suppression of failed cold lookups; never a source of metadata.
     infohash_failures: std::sync::Mutex<VecDeque<([u8; 20], Instant)>>,
@@ -250,7 +300,7 @@ impl AceProvider {
             announce_peer_port: tokio::sync::watch::channel(None).1,
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_peers: Vec::new(),
-            resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
+            resolve_cache: CatalogResolutionCache::new(RESOLVE_CACHE_TTL),
             peer_resolve_cache: ResolveCache::new(RESOLVE_CACHE_TTL),
             bep9_content_id_fallback: false,
             infohash_index: InfohashIndex::new(INFOHASH_INDEX_CAPACITY),
@@ -454,6 +504,13 @@ fn derived_prefetch_pieces(
     u64::try_from(pieces).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
+impl AceProvider {
+    pub(crate) fn catalog_pending_waiters_for_test(&self, cid: &str) -> Option<usize> {
+        self.resolve_cache.pending_waiters_for_test(cid)
+    }
+}
+
 #[async_trait]
 impl StreamProvider for AceProvider {
     fn network(&self) -> &'static str {
@@ -462,6 +519,18 @@ impl StreamProvider for AceProvider {
 
     async fn resolve_vod(&self, id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
         self.resolve_vod_inner(id).await
+    }
+
+    async fn prepare_live_content_id(
+        &self,
+        content_id: &str,
+    ) -> Result<ContentIdPreparation, ProviderError> {
+        self.resolve_content_id_prepared(content_id)
+            .await
+            .map(|resolved| match resolved {
+                ResolvedContentId::Catalog(info) => ContentIdPreparation::Catalog(info),
+                ResolvedContentId::Provider(_) => ContentIdPreparation::ProviderResolved,
+            })
     }
 
     fn check_openable(&self, _id: &str) -> Result<(), ProviderError> {
