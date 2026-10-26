@@ -183,8 +183,10 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
     assert!(
         output
             .bytes
-            .as_chunks::<188>().0.iter()
-            .all(|packet| packet[4] == if matching_window {0x55} else {0x66}),
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .all(|packet| packet[4] == if matching_window { 0x55 } else { 0x66 }),
         "initial output must use the best-window transport and retain the healthy peer when windows match"
     );
     assert!(received.load(Ordering::Relaxed) >= output.bytes.len() as u64);
@@ -495,6 +497,305 @@ async fn consumer_close_during_corroboration_cancels_pending_source() {
 }
 
 #[tokio::test]
+async fn startup_progress_resumed_output_uses_existing_post_output_stale() {
+    let (mut info, mut seed) = fixture(1);
+    seed.live_recovery.request_timeout_ms = 100;
+    seed.live_recovery.stale_upstream_timeout_ms = 300;
+    seed.live_recovery.request_check_interval_ms = 20;
+    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+    info.sig_len = auth.signature_len();
+    info.source_pubkey = auth.pubkey_der();
+    let mut signed_media = packet_piece(0x66);
+    signed_media.extend_from_slice(&auth.sign(&signed_media));
+    info.piece_length = signed_media.len() as u64;
+    info.chunk_length = signed_media.len() as u64;
+    let first_piece = signed_media.clone();
+    let recovery_observer = TestObserver::new(
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    );
+    seed.metrics = Some(recovery_observer.clone());
+
+    let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_addr = v4(first_listener.local_addr().unwrap());
+    let (first_client, first_server) = {
+        let client = TcpStream::connect(first_addr).await.unwrap();
+        let (server, _) = first_listener.accept().await.unwrap();
+        (client, server)
+    };
+    let (stop_first_tx, stop_first_rx) = tokio::sync::oneshot::channel();
+    let mut first_server = tokio::spawn(async move {
+        let mut session = PeerSession::new(first_server);
+        session.accept_handshake([0; 20], |_| true).await.unwrap();
+        session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(window(7, 8)),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .unwrap();
+        session.send(&PeerMessage::Unchoke).await.unwrap();
+        while let Ok(message) = session.read_message().await {
+            if let PeerMessage::Unknown { id: 6, payload } = message {
+                let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                session
+                    .send(&build_piece(0, piece, 0, [0; 8], &first_piece))
+                    .await
+                    .unwrap();
+                let _ = stop_first_rx.await;
+                return;
+            }
+        }
+    });
+    let mut first_session = PeerSession::new(first_client);
+    first_session
+        .perform_handshake([0; 20], [0; 20])
+        .await
+        .unwrap();
+
+    let (first_tx, mut first_rx) = mpsc::channel(16);
+    let first_info = info.clone();
+    let first_seed = seed.clone();
+    let mut first_pool = tokio::spawn(async move {
+        let mut continuity = None;
+        let mut candidates = SessionCandidates::default();
+        let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(
+            first_info.piece_length,
+            first_info.chunk_length,
+            4096,
+        )));
+        let end = follow_peer_pool(
+            vec![ConnectedUpstream {
+                session: first_session,
+                addr: first_addr,
+                window: window(7, 8),
+                unchoked: false,
+                yourip: None,
+            }],
+            &first_info,
+            &Identity::generate(),
+            1,
+            &first_tx,
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU32::new(0)),
+            &first_seed,
+            &store,
+            &mut continuity,
+            vec![],
+            vec![first_addr],
+            completed_discovery(|_| Box::pin(async { vec![] })),
+            &mut candidates,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .await;
+        (end, continuity)
+    });
+    let first_output = tokio::time::timeout(Duration::from_secs(2), first_rx.recv()).await;
+    let _ = stop_first_tx.send(());
+    let first_pool_result =
+        match tokio::time::timeout(Duration::from_secs(2), &mut first_pool).await {
+            Ok(Ok(result)) => Some(result),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                first_pool.abort();
+                let _ = first_pool.await;
+                None
+            }
+        };
+    let first_server_ok =
+        match tokio::time::timeout(Duration::from_secs(1), &mut first_server).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                first_server.abort();
+                let _ = first_server.await;
+                false
+            }
+        };
+    let (first_end, continuity) = first_pool_result.unwrap_or((FollowEnd::ConsumerGone, None));
+    let first_continuity_emitted = continuity
+        .as_ref()
+        .is_some_and(|continuity| continuity.emitted > 0);
+
+    let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_addr = v4(second_listener.local_addr().unwrap());
+    let (second_client, second_server) = {
+        let client = TcpStream::connect(second_addr).await.unwrap();
+        let (server, _) = second_listener.accept().await.unwrap();
+        (client, server)
+    };
+    let second_requests = Arc::new(AtomicU32::new(0));
+    let second_requests_server = second_requests.clone();
+    let mut second_server = tokio::spawn(async move {
+        let mut session = PeerSession::new(second_server);
+        if session.accept_handshake([0; 20], |_| true).await.is_err() {
+            return;
+        }
+        if session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(window(7, 8)),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if session.send(&PeerMessage::Unchoke).await.is_err() {
+            return;
+        }
+        let mut head = 8u32;
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    head = head.saturating_add(1);
+                    if session.send(&PeerMessage::Have(head)).await.is_err() {
+                        return;
+                    }
+                }
+                message = session.read_message() => match message {
+                    Ok(PeerMessage::Unknown { id: 6, .. }) => {
+                        second_requests_server.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        }
+    });
+    let mut second_session = PeerSession::new(second_client);
+    second_session
+        .perform_handshake([0; 20], [0; 20])
+        .await
+        .unwrap();
+
+    let (second_tx, second_rx) = mpsc::channel(16);
+    let second_info = info;
+    let second_seed = seed;
+    let mut resumed = continuity;
+    let mut second_pool = tokio::spawn(async move {
+        let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(
+            second_info.piece_length,
+            second_info.chunk_length,
+            4096,
+        )));
+        let mut candidates = SessionCandidates::default();
+        let end = follow_peer_pool(
+            vec![ConnectedUpstream {
+                session: second_session,
+                addr: second_addr,
+                window: window(7, 8),
+                unchoked: false,
+                yourip: None,
+            }],
+            &second_info,
+            &Identity::generate(),
+            1,
+            &second_tx,
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU32::new(0)),
+            &second_seed,
+            &store,
+            &mut resumed,
+            vec![],
+            vec![second_addr],
+            completed_discovery(|_| Box::pin(async { vec![] })),
+            &mut candidates,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .await;
+        (end, resumed)
+    });
+    let second_result = match tokio::time::timeout(Duration::from_secs(2), &mut second_pool).await {
+        Ok(result) => Some(result),
+        Err(_) => {
+            second_pool.abort();
+            let _ = second_pool.await;
+            None
+        }
+    };
+    drop(second_rx);
+    let second_server_ok =
+        match tokio::time::timeout(Duration::from_secs(1), &mut second_server).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                second_server.abort();
+                let _ = second_server.await;
+                false
+            }
+        };
+
+    let first_output_ok = matches!(first_output, Ok(Some(ref output)) if !output.bytes.is_empty());
+    let resumed_result = second_result.and_then(Result::ok);
+    let resumed_emitted = resumed_result
+        .as_ref()
+        .and_then(|(_, continuity)| continuity.as_ref())
+        .is_some_and(|continuity| continuity.emitted > 0);
+    let resumed_stale = matches!(
+        resumed_result.as_ref().map(|(end, _)| end),
+        Some(FollowEnd::PoolStale { .. })
+    );
+    let stale_observed = recovery_observer
+        .snapshot()
+        .recovery_events
+        .contains(&RecoveryEvent::StaleTeardown);
+    assert!(
+        first_server_ok,
+        "first loopback fixture server must join cleanly"
+    );
+    assert!(
+        second_server_ok,
+        "resumed loopback fixture server must join cleanly"
+    );
+    assert!(
+        first_output_ok,
+        "the first pool must emit actual source bytes"
+    );
+    assert!(
+        matches!(first_end, FollowEnd::PeerLost(_)),
+        "closing the first source should leave a reusable continuity"
+    );
+    assert!(
+        first_continuity_emitted,
+        "the resumed continuity must have genuinely emitted media"
+    );
+    assert!(
+        second_requests.load(Ordering::Relaxed) > 0,
+        "resumed peer must consume requests"
+    );
+    assert!(
+        resumed_emitted,
+        "emitted history must remain on the resumed continuity"
+    );
+    assert!(
+        resumed_stale,
+        "head chatter must still reach the ordinary stale teardown"
+    );
+    assert!(
+        stale_observed,
+        "ordinary resumed stale teardown must remain observable"
+    );
+}
+
+#[tokio::test]
 async fn invalid_or_wrapping_handshake_windows_never_become_live_evidence() {
     for (min, max, valid) in [
         (-1, 10, false),
@@ -697,7 +998,10 @@ async fn queued_chunk_requests_stop_when_known_floor_advances() {
     }
     drop(commands);
     worker.await.unwrap();
-    assert!(stale_after_observation<=1,"only a write already underway before the new head may complete; queued stale chunk writes must stop, got {stale_after_observation}");
+    assert!(
+        stale_after_observation <= 1,
+        "only a write already underway before the new head may complete; queued stale chunk writes must stop, got {stale_after_observation}"
+    );
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@
 use super::*;
 use ace_swarm::discover::discover_peers_from_sources_incremental;
 use ace_swarm::discover::MAX_DISCOVERY_PEERS;
+use std::sync::atomic::AtomicBool;
 
 fn info() -> StreamInfo {
     StreamInfo {
@@ -92,6 +93,1258 @@ fn media_piece(marker: u8) -> Vec<u8> {
             packet
         })
         .collect()
+}
+
+fn signed_media_pieces(auth: &ace_wire::live_auth::LiveSourceAuth, marker: u8) -> Vec<Vec<u8>> {
+    let mut ts = vec![marker; 188 * 64];
+    for (packet_index, packet) in ts.chunks_mut(188).enumerate() {
+        if packet.len() >= 4 {
+            packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | (packet_index as u8 & 0x0f)]);
+        }
+    }
+    signed_media_pieces_from_ts(auth, &ts)
+}
+
+fn signed_media_pieces_from_ts(
+    auth: &ace_wire::live_auth::LiveSourceAuth,
+    stream: &[u8],
+) -> Vec<Vec<u8>> {
+    const PAYLOAD_PER_PIECE: usize = 752 - 96;
+    let total = PAYLOAD_PER_PIECE * 16;
+    let mut ts = Vec::with_capacity(total);
+    while ts.len() < total {
+        ts.extend_from_slice(stream);
+    }
+    ts.truncate(total);
+    ts.as_chunks::<PAYLOAD_PER_PIECE>()
+        .0
+        .iter()
+        .map(|payload| {
+            let mut piece = payload.to_vec();
+            piece.extend_from_slice(&auth.sign(payload));
+            piece
+        })
+        .collect()
+}
+
+fn test_ts_packet(pid: u16, start: bool, counter: u8, payload: &[u8]) -> Vec<u8> {
+    assert!(payload.len() <= 184);
+    let mut packet = vec![0xff; 188];
+    packet[..4].copy_from_slice(&[
+        0x47,
+        ((start as u8) << 6) | ((pid >> 8) as u8 & 0x1f),
+        pid as u8,
+        0x10 | (counter & 0x0f),
+    ]);
+    packet[4..4 + payload.len()].copy_from_slice(payload);
+    packet
+}
+
+fn with_mpeg_crc(mut section: Vec<u8>) -> Vec<u8> {
+    let crc = ace_media::mpegts::mpeg_crc32(&section);
+    section.extend_from_slice(&crc.to_be_bytes());
+    section
+}
+
+fn audio_only_test_stream() -> Vec<u8> {
+    let pat = with_mpeg_crc(vec![
+        0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00,
+    ]);
+    let pmt = with_mpeg_crc(vec![
+        0x02, 0xb0, 0x12, 0x00, 0x01, 0xc1, 0x00, 0x00, 0xe1, 0x01, 0xf0, 0x00, 0x0f, 0xe1, 0x01,
+        0xf0, 0x00,
+    ]);
+    let mut stream = Vec::new();
+    let mut pat_payload = vec![0];
+    pat_payload.extend_from_slice(&pat);
+    stream.extend_from_slice(&test_ts_packet(0, true, 0, &pat_payload));
+    let mut pmt_payload = vec![0];
+    pmt_payload.extend_from_slice(&pmt);
+    stream.extend_from_slice(&test_ts_packet(0x100, true, 0, &pmt_payload));
+    for counter in 0..16u8 {
+        // AAC-LC ADTS frame carried by an audio PES on PID 0x101.
+        let mut pes = vec![0x00, 0x00, 0x01, 0xc0, 0x00, 0x0e, 0x80, 0x00, 0x00];
+        pes.extend_from_slice(&[
+            0xff, 0xf1, 0x50, 0x80, 0x01, 0x7f, 0xfc, 0x21, 0x10, 0x56, 0xe5,
+        ]);
+        stream.extend_from_slice(&test_ts_packet(0x101, true, counter, &pes));
+    }
+    stream
+}
+
+fn audio_only_packet_reached(bytes: &[u8]) -> bool {
+    bytes.as_chunks::<188>().0.iter().any(|packet| {
+        packet[0] == 0x47
+            && (((packet[1] as u16 & 0x1f) << 8) | packet[2] as u16) == 0x101
+            && packet.windows(2).any(|pair| pair == [0xff, 0xf1])
+    })
+}
+
+#[derive(Clone, Copy)]
+enum StartupPeerMode {
+    Healthy,
+    Silent,
+    AdvancingHeads,
+    NearBoundHealthy,
+    NearBoundVideo,
+    NearBoundAudio,
+    ShortStaleHealthy,
+    ChatterLateAdmission,
+}
+
+fn expected_source_marker(mode: StartupPeerMode, bytes: &[u8]) -> Option<u8> {
+    match mode {
+        StartupPeerMode::NearBoundVideo if bytes.windows(4).any(|n| n == [0, 0, 1, 0x65]) => {
+            Some(0x77)
+        }
+        StartupPeerMode::NearBoundAudio if audio_only_packet_reached(bytes) => Some(0x78),
+        StartupPeerMode::NearBoundVideo | StartupPeerMode::NearBoundAudio => None,
+        _ if bytes.contains(&0x55) => Some(0x55),
+        _ if bytes.contains(&0x66) => Some(0x66),
+        _ => None,
+    }
+}
+
+async fn read_until_source_marker(
+    source: &mut Box<dyn TsSource>,
+    mode: StartupPeerMode,
+) -> Option<u8> {
+    let mut output = Vec::new();
+    while let Some(bytes) = source.next().await {
+        output.extend_from_slice(&bytes);
+        if let Some(marker) = expected_source_marker(mode, &output) {
+            return Some(marker);
+        }
+    }
+    None
+}
+
+fn stale_teardown_count(source: &dyn TsSource) -> u64 {
+    source
+        .stats()
+        .recovery
+        .map_or(0, |recovery| recovery.stale_teardowns)
+}
+
+#[derive(Debug)]
+struct StartupProgressObservation {
+    delivered: bool,
+    from_a: bool,
+    requested: bool,
+    published_b: bool,
+    tried_b: bool,
+    first_request_after_ms: Option<u128>,
+    survived_post_output_window: bool,
+    late_admission_peers: u32,
+    late_admission_published_after_request_ms: Option<u128>,
+    late_admission_activated_after_request_ms: Option<u128>,
+    late_admission_first_closed_after_request_ms: Option<u128>,
+    late_admission_closed_by_original_bound: bool,
+    stale_teardowns_after_admission: u64,
+    stale_teardowns_before_original_expiry: u64,
+    stale_teardowns_at_first_b_close: u64,
+    stale_teardown_observed_in_original_window: bool,
+    stale_teardown_after_request_ms: Option<u128>,
+    late_admission_head_updates: u32,
+    late_admission_requests: u32,
+}
+
+async fn startup_progress_recovery(
+    mode: StartupPeerMode,
+    active_cap: usize,
+) -> StartupProgressObservation {
+    let stale_ms = if matches!(mode, StartupPeerMode::ShortStaleHealthy) {
+        200
+    } else {
+        2_000
+    };
+    let request_timeout_ms = if stale_ms == 200 { 100 } else { 900 };
+    let request_check_interval_ms = if stale_ms == 200 { 20 } else { 100 };
+    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+    let mut signed_info = info();
+    signed_info.sig_len = auth.signature_len();
+    signed_info.source_pubkey = auth.pubkey_der();
+    let a_signed_pieces = Arc::new(match mode {
+        StartupPeerMode::NearBoundVideo => {
+            let vector = include_bytes!("../../../../tests/vectors/media/h264-keyframes.ts");
+            assert!(vector.windows(4).any(|window| window == [0, 0, 1, 0x65]));
+            signed_media_pieces_from_ts(&auth, vector)
+        }
+        StartupPeerMode::NearBoundAudio => {
+            signed_media_pieces_from_ts(&auth, &audio_only_test_stream())
+        }
+        _ => signed_media_pieces(&auth, 0x55),
+    });
+    let b_signed_pieces = Arc::new(signed_media_pieces(&auth, 0x66));
+    let mut servers = tokio::task::JoinSet::new();
+    let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(a_addr) = a_listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let b_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(b_addr) = b_listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let a_active = Arc::new(tokio::sync::Notify::new());
+    let a_active_server = a_active.clone();
+    let a_requests = Arc::new(AtomicU32::new(0));
+    let a_requests_server = a_requests.clone();
+    let first_request_at = Arc::new(std::sync::Mutex::new(None));
+    let first_request_at_server = first_request_at.clone();
+    let a_pieces = a_signed_pieces;
+    servers.spawn(async move {
+        let Ok((stream, _)) = a_listener.accept().await else {
+            return;
+        };
+        let mut session = PeerSession::new(stream);
+        let requests = a_requests_server;
+        if session.accept_handshake([0; 20], |_| true).await.is_err() {
+            return;
+        }
+        if session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(LivePosition {
+                    min_piece: if matches!(mode, StartupPeerMode::NearBoundVideo | StartupPeerMode::NearBoundAudio) { 0 } else { 7 },
+                    max_piece: match mode {
+                        StartupPeerMode::NearBoundVideo => 3,
+                        StartupPeerMode::NearBoundAudio => 1,
+                        _ => 8,
+                    },
+                    position: -1,
+                    distance_from_source: 1,
+                }),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if session.send(&PeerMessage::Unchoke).await.is_err() {
+            return;
+        }
+        let mut head = 10u32;
+        let mut delayed_first_output = false;
+        let mut ticker = tokio::time::interval(Duration::from_millis(400));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick(), if matches!(mode, StartupPeerMode::AdvancingHeads | StartupPeerMode::ChatterLateAdmission) => {
+                    head = head.saturating_add(1);
+                    if session.send(&PeerMessage::Have(head)).await.is_err() {
+                        return;
+                    }
+                    if matches!(mode, StartupPeerMode::ChatterLateAdmission)
+                        && session.send(&PeerMessage::Unchoke).await.is_err()
+                    {
+                        return;
+                    }
+                }
+                message = session.read_message() => match message {
+                    Ok(PeerMessage::Unknown { id: 6, payload }) => {
+                        if requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                            *first_request_at_server.lock().unwrap() = Some(Instant::now());
+                        }
+                        a_active_server.notify_one();
+                        if matches!(
+                            mode,
+                            StartupPeerMode::NearBoundHealthy
+                                | StartupPeerMode::NearBoundVideo
+                                | StartupPeerMode::NearBoundAudio
+                        )
+                            && !delayed_first_output
+                        {
+                            delayed_first_output = true;
+                            tokio::time::sleep(Duration::from_millis(1800)).await;
+                        }
+                        if matches!(
+                            mode,
+                            StartupPeerMode::Healthy
+                                | StartupPeerMode::NearBoundHealthy
+                                | StartupPeerMode::NearBoundVideo
+                                | StartupPeerMode::NearBoundAudio
+                                | StartupPeerMode::ShortStaleHealthy
+                        ) {
+                            let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                            let wire_piece = &a_pieces[piece as usize % a_pieces.len()];
+                            if session.send(&build_piece(0, piece, 0, [0; 8], wire_piece)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        }
+    });
+
+    let b_attempts = Arc::new(AtomicU32::new(0));
+    let b_attempts_server = b_attempts.clone();
+    let b_active = Arc::new(tokio::sync::Notify::new());
+    let b_active_server = b_active.clone();
+    let b_activated_at = Arc::new(std::sync::Mutex::new(None));
+    let b_activated_at_server = b_activated_at.clone();
+    let b_first_closed = Arc::new(tokio::sync::Notify::new());
+    let b_first_closed_server = b_first_closed.clone();
+    let b_first_closed_at = Arc::new(std::sync::Mutex::new(None));
+    let b_first_closed_at_server = b_first_closed_at.clone();
+    let b_first_requests = Arc::new(AtomicU32::new(0));
+    let b_first_requests_server = b_first_requests.clone();
+    let b_head_updates = Arc::new(AtomicU32::new(0));
+    let b_head_updates_server = b_head_updates.clone();
+    let b_pieces = b_signed_pieces;
+    servers.spawn(async move {
+        let mut attempt = 0u32;
+        loop {
+            let Ok((stream, _)) = b_listener.accept().await else {
+                return;
+            };
+            attempt += 1;
+            b_attempts_server.fetch_add(1, Ordering::Relaxed);
+            let mut session = PeerSession::new(stream);
+            if session.accept_handshake([0; 20], |_| true).await.is_err() {
+                return;
+            }
+            if session
+                .send_extended_handshake(&OutgoingExtendedHandshake {
+                    ace_metadata_version: 1,
+                    ut_metadata_id: 2,
+                    mi: Some(LivePosition {
+                        min_piece: 7,
+                        max_piece: if matches!(mode, StartupPeerMode::ChatterLateAdmission)
+                            && attempt > 1
+                        {
+                            10_000
+                        } else {
+                            1000
+                        },
+                        position: -1,
+                        distance_from_source: 1,
+                    }),
+                    node: NodeFields::default(),
+                    peer_ip: None,
+                    metadata_size: None,
+                })
+                .await
+                .is_err()
+                || session.send(&PeerMessage::Unchoke).await.is_err()
+            {
+                return;
+            }
+
+            if matches!(mode, StartupPeerMode::ChatterLateAdmission) && attempt == 1 {
+                let mut saw_signed_extension = false;
+                let mut saw_interested = false;
+                let mut active_recorded = false;
+                let mut head = 1000u32;
+                let mut ticks = 0u8;
+                let mut ticker = tokio::time::interval(Duration::from_millis(150));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            head = head.saturating_add(1);
+                            ticks = ticks.wrapping_add(1);
+                            b_head_updates_server.fetch_add(1, Ordering::Relaxed);
+                            if session.send(&PeerMessage::Have(head)).await.is_err()
+                                || (ticks.is_multiple_of(3) && session.send(&PeerMessage::Unchoke).await.is_err())
+                            {
+                                break;
+                            }
+                        }
+                        message = session.read_message() => match message {
+                            Ok(PeerMessage::Extended { ext_id: 0, .. }) => saw_signed_extension = true,
+                            Ok(PeerMessage::Interested) => saw_interested = true,
+                            Ok(PeerMessage::Unknown { id: 6, .. }) => {
+                                b_first_requests_server.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    if !active_recorded && saw_signed_extension && saw_interested {
+                        active_recorded = true;
+                        *b_activated_at_server.lock().unwrap() = Some(Instant::now());
+                        b_active_server.notify_one();
+                    }
+                }
+                *b_first_closed_at_server.lock().unwrap() = Some(Instant::now());
+                b_first_closed_server.notify_one();
+                continue;
+            }
+
+            while let Ok(message) = session.read_message().await {
+                if let PeerMessage::Unknown { id: 6, payload } = message {
+                    let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                    let wire_piece = &b_pieces[piece as usize % b_pieces.len()];
+                    if session
+                        .send(&build_piece(0, piece, 0, [0; 8], wire_piece))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            if !matches!(mode, StartupPeerMode::ChatterLateAdmission) || attempt > 1 {
+                return;
+            }
+        }
+    });
+
+    let published_b = Arc::new(AtomicBool::new(false));
+    let published_b_discovery = published_b.clone();
+    let b_published_at = Arc::new(std::sync::Mutex::new(None));
+    let b_published_at_discovery = b_published_at.clone();
+    let published_notify = Arc::new(tokio::sync::Notify::new());
+    let published_notify_discovery = published_notify.clone();
+    let discovery_active = a_active.clone();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let published = published_b_discovery.clone();
+        let published_at = b_published_at_discovery.clone();
+        let published_notify = published_notify_discovery.clone();
+        let active = discovery_active.clone();
+        Box::pin(async move {
+            sender.send(a_addr).await.unwrap();
+            if matches!(mode, StartupPeerMode::Healthy) {
+                sender.closed().await;
+                return;
+            }
+            // The first request occurs only after the lone-peer corroboration window.
+            // Publish B 1.2 seconds later, while A still occupies the active slot(s).
+            active.notified().await;
+            let admission_delay = if matches!(mode, StartupPeerMode::ChatterLateAdmission) {
+                600
+            } else {
+                1200
+            };
+            tokio::time::sleep(Duration::from_millis(admission_delay)).await;
+            *published_at.lock().unwrap() = Some(Instant::now());
+            published.store(true, Ordering::Release);
+            published_notify.notify_one();
+            sender.send(b_addr).await.unwrap();
+            sender.closed().await;
+        })
+    });
+
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_prefetch_pieces(Some(1))
+        .with_live_recovery(LiveRecoveryConfig {
+            max_active_upstreams: active_cap,
+            request_timeout_ms,
+            stale_upstream_timeout_ms: stale_ms,
+            request_check_interval_ms,
+            ..LiveRecoveryConfig::default()
+        })
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..StartupBufferConfig::default()
+        });
+    let opened_at = Instant::now();
+    let mut source = match provider
+        .open_resolved("synthetic", signed_info, discovery)
+        .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            servers.abort_all();
+            while servers.join_next().await.is_some() {}
+            panic!("startup progress loopback open failed before observation: {error}");
+        }
+    };
+    let mut late_admission_peers = 0;
+    let mut late_admission_closed_by_original_bound = false;
+    let mut stale_teardowns_after_admission = 0;
+    let mut stale_teardowns_before_original_expiry = 0;
+    let mut stale_teardowns_at_first_b_close = 0;
+    let mut stale_teardown_observed_in_original_window = false;
+    let mut stale_teardown_at = None;
+    let (published_seen, output) = match mode {
+        StartupPeerMode::Healthy => (
+            true,
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                read_until_source_marker(&mut source, mode),
+            )
+            .await,
+        ),
+        StartupPeerMode::ShortStaleHealthy => {
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                read_until_source_marker(&mut source, mode),
+            )
+            .await;
+            let published =
+                tokio::time::timeout(Duration::from_secs(4), published_notify.notified()).await;
+            (published.is_ok(), output)
+        }
+        StartupPeerMode::ChatterLateAdmission => {
+            let published =
+                tokio::time::timeout(Duration::from_secs(4), published_notify.notified()).await;
+            let activated = tokio::time::timeout(Duration::from_secs(2), b_active.notified()).await;
+            late_admission_peers = source.stats().peers;
+            stale_teardowns_after_admission = stale_teardown_count(source.as_ref());
+            let first_request = *first_request_at.lock().unwrap();
+            if activated.is_ok() {
+                if let Some(first_request) = first_request {
+                    // The admission is scheduled 600 ms after the original request. Allow
+                    // 250 ms past T for cooperative loop scheduling, still 350 ms before a
+                    // mistaken admission-time renewal could expire.
+                    let before_expiry = first_request + Duration::from_millis(stale_ms - 250);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(before_expiry)).await;
+                    stale_teardowns_before_original_expiry = stale_teardown_count(source.as_ref());
+                    let remained_zero =
+                        stale_teardowns_before_original_expiry == stale_teardowns_after_admission;
+                    let original_bound = first_request + Duration::from_millis(stale_ms + 250);
+                    let observed_stale = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(original_bound),
+                        async {
+                            loop {
+                                if stale_teardown_count(source.as_ref())
+                                    > stale_teardowns_after_admission
+                                {
+                                    return Some(Instant::now());
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        },
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                    stale_teardown_at = observed_stale;
+                    stale_teardown_observed_in_original_window = remained_zero
+                        && observed_stale.is_some_and(|observed| observed <= original_bound);
+                    let _ = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(original_bound),
+                        b_first_closed.notified(),
+                    )
+                    .await;
+                    late_admission_closed_by_original_bound = b_first_closed_at
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|closed_at| closed_at <= original_bound);
+                    stale_teardowns_at_first_b_close = stale_teardown_count(source.as_ref());
+                }
+            }
+            let output = tokio::time::timeout(
+                Duration::from_secs(4),
+                read_until_source_marker(&mut source, mode),
+            )
+            .await;
+            (published.is_ok(), output)
+        }
+        StartupPeerMode::Silent
+        | StartupPeerMode::AdvancingHeads
+        | StartupPeerMode::NearBoundHealthy
+        | StartupPeerMode::NearBoundVideo
+        | StartupPeerMode::NearBoundAudio => {
+            let published =
+                tokio::time::timeout(Duration::from_secs(4), published_notify.notified()).await;
+            let output = tokio::time::timeout(
+                Duration::from_millis(stale_ms + 800),
+                read_until_source_marker(&mut source, mode),
+            )
+            .await;
+            (published.is_ok(), output)
+        }
+    };
+    let marker = output.ok().flatten();
+    let delivered = marker.is_some();
+    let came_from_a = marker.is_some_and(|value| value != 0x66);
+    let post_output_window_ms = match mode {
+        StartupPeerMode::NearBoundHealthy
+        | StartupPeerMode::NearBoundVideo
+        | StartupPeerMode::NearBoundAudio => 500,
+        StartupPeerMode::ShortStaleHealthy => 300,
+        _ => 0,
+    };
+    let survived_post_output_window = if delivered && post_output_window_ms > 0 {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(post_output_window_ms);
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => return true,
+                    item = source.next() => if item.is_none() { return false; },
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    } else {
+        true
+    };
+    let b_was_published = published_b.load(Ordering::Acquire);
+    let first_request_after_ms = first_request_at
+        .lock()
+        .unwrap()
+        .map(|first| first.duration_since(opened_at).as_millis());
+    let first_request = *first_request_at.lock().unwrap();
+    let late_admission_published_after_request_ms = first_request
+        .zip(*b_published_at.lock().unwrap())
+        .map(|(first, published)| published.duration_since(first).as_millis());
+    let late_admission_activated_after_request_ms = first_request
+        .zip(*b_activated_at.lock().unwrap())
+        .map(|(first, activated)| activated.duration_since(first).as_millis());
+    let late_admission_first_closed_after_request_ms = first_request
+        .zip(*b_first_closed_at.lock().unwrap())
+        .map(|(first, closed)| closed.duration_since(first).as_millis());
+    let stale_teardown_after_request_ms = first_request
+        .zip(stale_teardown_at)
+        .map(|(first, teardown)| teardown.duration_since(first).as_millis());
+    drop(source);
+    servers.abort_all();
+    while servers.join_next().await.is_some() {}
+    StartupProgressObservation {
+        delivered,
+        from_a: came_from_a,
+        requested: a_requests.load(Ordering::Relaxed) > 0,
+        published_b: published_seen && b_was_published,
+        tried_b: b_was_published && b_attempts.load(Ordering::Relaxed) > 0,
+        first_request_after_ms,
+        survived_post_output_window,
+        late_admission_peers,
+        late_admission_published_after_request_ms,
+        late_admission_activated_after_request_ms,
+        late_admission_first_closed_after_request_ms,
+        late_admission_closed_by_original_bound,
+        stale_teardowns_after_admission,
+        stale_teardowns_before_original_expiry,
+        stale_teardowns_at_first_b_close,
+        stale_teardown_observed_in_original_window,
+        stale_teardown_after_request_ms,
+        late_admission_head_updates: b_head_updates.load(Ordering::Relaxed),
+        late_admission_requests: b_first_requests.load(Ordering::Relaxed),
+    }
+}
+
+#[tokio::test]
+async fn startup_progress_healthy_peer_positive_control() {
+    let observed = startup_progress_recovery(StartupPeerMode::Healthy, 1).await;
+    assert!(
+        observed.delivered,
+        "healthy A must deliver signed contiguous TS"
+    );
+    assert!(observed.from_a, "positive-control media must come from A");
+    assert!(observed.requested, "A must consume a production request");
+    assert!(
+        !observed.published_b,
+        "healthy control should not publish a late B candidate"
+    );
+    assert!(
+        !observed.tried_b,
+        "healthy A must not require the late candidate"
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_silent_peer_existing_recovery_control() {
+    let observed = startup_progress_recovery(StartupPeerMode::Silent, 1).await;
+    assert!(
+        observed.delivered,
+        "silent A must recover through healthy B"
+    );
+    assert!(!observed.from_a, "silent A cannot supply output");
+    assert!(
+        observed.requested,
+        "silent A must consume production requests"
+    );
+    assert!(
+        observed.published_b,
+        "B must be published after A's corroboration window"
+    );
+    assert!(
+        observed.tried_b,
+        "published B must be tried after stale recovery"
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_advancing_heads_do_not_starve_healthy_late_peer() {
+    let observed = startup_progress_recovery(StartupPeerMode::AdvancingHeads, 1).await;
+    assert!(
+        observed.requested,
+        "head-only A must consume production requests"
+    );
+    assert!(
+        observed.published_b,
+        "B must be published after A's corroboration window"
+    );
+    assert!(!observed.from_a, "head-only A cannot supply output");
+    assert!(
+        observed.delivered && observed.tried_b,
+        "after B was published and one stale interval elapsed, authenticated contiguous TS was absent; B attempted={}",
+        observed.tried_b
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_advancing_heads_refills_spare_four_peer_capacity() {
+    let observed = startup_progress_recovery(StartupPeerMode::AdvancingHeads, 4).await;
+    assert!(
+        observed.requested,
+        "head-only A must consume production requests"
+    );
+    assert!(
+        observed.published_b,
+        "B must be published after A's corroboration window"
+    );
+    assert!(!observed.from_a, "head-only A cannot supply output");
+    assert!(
+        observed.tried_b,
+        "a spare active slot must allow healthy B to connect"
+    );
+    assert!(
+        observed.delivered,
+        "healthy B must deliver actual TS through the spare slot"
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_chatter_and_late_admission_do_not_reset_bound() {
+    const STALE_MS: u128 = 2_000;
+    let observed = startup_progress_recovery(StartupPeerMode::ChatterLateAdmission, 2).await;
+    assert!(observed.requested, "A must consume a production request");
+    assert!(
+        observed
+            .first_request_after_ms
+            .is_some_and(|elapsed| elapsed >= 900),
+        "the original request barrier must follow the lone-peer corroboration gate; {observed:?}"
+    );
+    assert!(observed.published_b, "real discovery must publish late B");
+    assert!(
+        observed
+            .late_admission_published_after_request_ms
+            .is_some_and(|elapsed| (500..STALE_MS).contains(&elapsed)),
+        "B must be published after the original request barrier but before its T; {observed:?}"
+    );
+    assert!(
+        observed
+            .late_admission_activated_after_request_ms
+            .is_some_and(|elapsed| elapsed < STALE_MS),
+        "the new B must complete activation before the original first-output expiry; {observed:?}"
+    );
+    assert_eq!(
+        observed.late_admission_peers, 2,
+        "production must observe A and late B active at the admission barrier"
+    );
+    assert_eq!(
+        observed.stale_teardowns_after_admission, 0,
+        "no stale pool teardown may precede late B's active admission"
+    );
+    assert_eq!(
+        observed.stale_teardowns_before_original_expiry, 0,
+        "the admitted pool must remain free of stale teardown before the original T"
+    );
+    assert!(
+        observed.late_admission_head_updates > 0,
+        "the admitted unproductive B must continue advertising advancing heads"
+    );
+    assert!(
+        observed.late_admission_requests > 0,
+        "late B must participate in the active request pool without sending media"
+    );
+    assert!(
+        observed
+            .late_admission_first_closed_after_request_ms
+            .is_some_and(|elapsed| (STALE_MS - 250..=STALE_MS + 250).contains(&elapsed)),
+        "the unproductive B connection should close around the original T, not admission + T; {observed:?}"
+    );
+    assert!(
+        observed.late_admission_closed_by_original_bound,
+        "the original first-output deadline must tear down the admitted pool within T + 250 ms; {observed:?}"
+    );
+    assert_eq!(
+        observed.stale_teardowns_at_first_b_close, 1,
+        "the first B socket EOF must coincide with exactly one observed PoolStale teardown; {observed:?}"
+    );
+    assert!(
+        observed.stale_teardown_observed_in_original_window
+            && observed
+                .stale_teardown_after_request_ms
+                .is_some_and(|elapsed| (STALE_MS - 250..=STALE_MS + 250).contains(&elapsed)),
+        "source recovery stats must report StaleTeardown inside the original request+T window; {observed:?}"
+    );
+    assert!(
+        observed.delivered && !observed.from_a && observed.tried_b,
+        "after ordinary stale recovery, healthy B must deliver signed contiguous TS; {observed:?}"
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_healthy_peer_just_before_bound_survives_past_it() {
+    let observed = startup_progress_recovery(StartupPeerMode::NearBoundHealthy, 1).await;
+    assert!(
+        observed.requested,
+        "healthy A must receive a production request"
+    );
+    assert!(
+        observed.published_b,
+        "healthy B is published while A delays output"
+    );
+    assert!(
+        observed
+            .first_request_after_ms
+            .is_some_and(|elapsed| elapsed >= 900),
+        "first output budget opportunity begins after the lone-peer corroboration gate; observed={observed:?}"
+    );
+    assert!(
+        observed.delivered && observed.from_a,
+        "A must deliver signed TS before its bound"
+    );
+    assert!(
+        observed.survived_post_output_window,
+        "A must remain usable beyond the former startup bound"
+    );
+    assert!(
+        !observed.tried_b,
+        "late B must stay unused after A's first output"
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_healthy_video_just_before_bound_is_not_rebuilt() {
+    let observed = startup_progress_recovery(StartupPeerMode::NearBoundVideo, 1).await;
+    assert!(observed.requested, "healthy video A must receive requests");
+    assert!(
+        observed
+            .first_request_after_ms
+            .is_some_and(|elapsed| elapsed >= 900),
+        "the video request opportunity begins after the lone-peer corroboration gate; observed={observed:?}"
+    );
+    assert!(
+        observed.published_b,
+        "healthy video B is queued while A delays output"
+    );
+    assert!(
+        observed.delivered && observed.from_a,
+        "A must produce the signed H.264 IDR TS"
+    );
+    assert!(
+        observed.survived_post_output_window,
+        "video A must remain active after crossing its former no-output deadline"
+    );
+    assert!(
+        !observed.tried_b,
+        "the late candidate must not replace productive video A"
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_healthy_audio_just_before_bound_is_not_rebuilt() {
+    let observed = startup_progress_recovery(StartupPeerMode::NearBoundAudio, 1).await;
+    assert!(observed.requested, "healthy audio A must receive requests");
+    assert!(
+        observed
+            .first_request_after_ms
+            .is_some_and(|elapsed| elapsed >= 900),
+        "the audio request opportunity begins after the lone-peer corroboration gate; observed={observed:?}"
+    );
+    assert!(
+        observed.published_b,
+        "healthy audio B is queued while A delays output"
+    );
+    assert!(
+        observed.delivered && observed.from_a,
+        "A must output signed audio-only TS"
+    );
+    assert!(
+        observed.survived_post_output_window,
+        "audio-only output must count as usable source progress"
+    );
+    assert!(
+        !observed.tried_b,
+        "the late candidate must not replace productive audio A"
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_short_stale_interval_starts_after_corroboration() {
+    let observed = startup_progress_recovery(StartupPeerMode::ShortStaleHealthy, 1).await;
+    assert!(
+        observed.requested,
+        "A must receive a request after corroboration"
+    );
+    assert!(
+        observed
+            .first_request_after_ms
+            .is_some_and(|elapsed| elapsed >= 900),
+        "200 ms stale interval must not expire during the existing corroboration gate; observed={observed:?}"
+    );
+    assert!(
+        observed.delivered && observed.from_a,
+        "A must deliver signed TS"
+    );
+    assert!(
+        observed.published_b,
+        "B publication should occur after the request gate"
+    );
+}
+
+#[derive(Debug)]
+struct FullPoolObservation {
+    activated: u32,
+    requests: u32,
+    peers_at_publish: u32,
+    published: bool,
+    b_attempts_before_expiry: u32,
+    b_attempts_after_wait: u32,
+    b_output: bool,
+    active_connections_closed: u32,
+    discovery_stopped: bool,
+}
+
+async fn startup_progress_full_four_peer_pool(cancel_after_publish: bool) -> FullPoolObservation {
+    const ACTIVE_CAP: usize = 4;
+    const STALE_MS: u64 = 2_000;
+    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+    let mut signed_info = info();
+    signed_info.sig_len = auth.signature_len();
+    signed_info.source_pubkey = auth.pubkey_der();
+    let b_pieces = Arc::new(signed_media_pieces(&auth, 0x66));
+    let mut servers = tokio::task::JoinSet::new();
+    let activated = Arc::new(AtomicU32::new(0));
+    let activation_notify = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(AtomicU32::new(0));
+    let request_notify = Arc::new(tokio::sync::Notify::new());
+    let active_connections_closed = Arc::new(AtomicU32::new(0));
+    let mut a_addrs = Vec::with_capacity(ACTIVE_CAP);
+
+    for _ in 0..ACTIVE_CAP {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        a_addrs.push(addr);
+        let activated_server = activated.clone();
+        let activation_notify_server = activation_notify.clone();
+        let requests_server = requests.clone();
+        let request_notify_server = request_notify.clone();
+        let closed_server = active_connections_closed.clone();
+        servers.spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut session = PeerSession::new(stream);
+            if session.accept_handshake([0; 20], |_| true).await.is_err() {
+                return;
+            }
+            if session
+                .send_extended_handshake(&OutgoingExtendedHandshake {
+                    ace_metadata_version: 1,
+                    ut_metadata_id: 2,
+                    mi: Some(LivePosition {
+                        min_piece: 7,
+                        max_piece: 10,
+                        position: -1,
+                        distance_from_source: 1,
+                    }),
+                    node: NodeFields::default(),
+                    peer_ip: None,
+                    metadata_size: None,
+                })
+                .await
+                .is_err()
+                || session.send(&PeerMessage::Unchoke).await.is_err()
+            {
+                return;
+            }
+            let mut saw_signed_extension = false;
+            let mut saw_interested = false;
+            let mut counted_active = false;
+            let mut head = 10u32;
+            let mut ticker = tokio::time::interval(Duration::from_millis(400));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        head = head.saturating_add(1);
+                        if session.send(&PeerMessage::Have(head)).await.is_err() {
+                            closed_server.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    message = session.read_message() => match message {
+                        Ok(PeerMessage::Extended { ext_id: 0, .. }) => saw_signed_extension = true,
+                        Ok(PeerMessage::Interested) => saw_interested = true,
+                        Ok(PeerMessage::Unknown { id: 6, payload }) => {
+                            if requests_server.fetch_add(1, Ordering::Relaxed) == 0 {
+                                request_notify_server.notify_one();
+                            }
+                            let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                            let _ = piece;
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            closed_server.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+                if !counted_active && saw_signed_extension && saw_interested {
+                    counted_active = true;
+                    if activated_server.fetch_add(1, Ordering::Relaxed) + 1 == ACTIVE_CAP as u32 {
+                        activation_notify_server.notify_one();
+                    }
+                }
+            }
+        });
+    }
+
+    let b_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(b_addr) = b_listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let b_attempts = Arc::new(AtomicU32::new(0));
+    let b_attempts_server = b_attempts.clone();
+    servers.spawn(async move {
+        let Ok((stream, _)) = b_listener.accept().await else {
+            return;
+        };
+        b_attempts_server.fetch_add(1, Ordering::Relaxed);
+        let mut session = PeerSession::new(stream);
+        if session.accept_handshake([0; 20], |_| true).await.is_err() {
+            return;
+        }
+        if session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(LivePosition {
+                    min_piece: 7,
+                    max_piece: 1000,
+                    position: -1,
+                    distance_from_source: 1,
+                }),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .is_err()
+            || session.send(&PeerMessage::Unchoke).await.is_err()
+        {
+            return;
+        }
+        while let Ok(message) = session.read_message().await {
+            if let PeerMessage::Unknown { id: 6, payload } = message {
+                let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                let wire_piece = &b_pieces[piece as usize % b_pieces.len()];
+                if session
+                    .send(&build_piece(0, piece, 0, [0; 8], wire_piece))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+
+    struct DiscoveryStopped(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DiscoveryStopped {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let (discovery_stopped_tx, discovery_stopped_rx) = tokio::sync::oneshot::channel();
+    let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+    let discovery_state = Arc::new(std::sync::Mutex::new(Some((
+        discovery_stopped_tx,
+        published_tx,
+    ))));
+    let discovery_activated = activated.clone();
+    let discovery_activation_notify = activation_notify.clone();
+    let discovery_requests = requests.clone();
+    let discovery_request_notify = request_notify.clone();
+    let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+        let addresses = a_addrs.clone();
+        let state = discovery_state.clone();
+        let active = discovery_activated.clone();
+        let active_notify = discovery_activation_notify.clone();
+        let request_count = discovery_requests.clone();
+        let first_request = discovery_request_notify.clone();
+        Box::pin(async move {
+            let (stopped, published) = state.lock().unwrap().take().unwrap();
+            let _stopped = DiscoveryStopped(Some(stopped));
+            for address in addresses {
+                sender.try_send(address).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while active.load(Ordering::Acquire) < ACTIVE_CAP as u32 {
+                    active_notify.notified().await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while request_count.load(Ordering::Acquire) == 0 {
+                    first_request.notified().await;
+                }
+            })
+            .await
+            .unwrap();
+            // The fresh four-peer pool has no lone-peer gate. Hold B back beyond the
+            // first scheduling pass so it is known only after all four are active.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            sender.send(b_addr).await.unwrap();
+            let _ = published.send(());
+            sender.closed().await;
+        })
+    });
+
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_prefetch_pieces(Some(1))
+        .with_live_recovery(LiveRecoveryConfig {
+            max_active_upstreams: ACTIVE_CAP,
+            request_timeout_ms: 900,
+            stale_upstream_timeout_ms: STALE_MS,
+            request_check_interval_ms: 100,
+            ..LiveRecoveryConfig::default()
+        })
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..StartupBufferConfig::default()
+        });
+    let mut source = match provider
+        .open_resolved("synthetic", signed_info, discovery)
+        .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            servers.abort_all();
+            while servers.join_next().await.is_some() {}
+            panic!("four-peer loopback open failed before observation: {error}");
+        }
+    };
+    let published = tokio::time::timeout(Duration::from_secs(5), published_rx).await;
+    let published = matches!(published, Ok(Ok(())));
+    let peers_at_publish = source.stats().peers;
+    let b_attempts_before_expiry = if published {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        b_attempts.load(Ordering::Relaxed)
+    } else {
+        b_attempts.load(Ordering::Relaxed)
+    };
+    let b_output = if cancel_after_publish || !published {
+        false
+    } else {
+        matches!(
+            tokio::time::timeout(Duration::from_millis(STALE_MS + 800), async {
+                loop {
+                    match source.next().await {
+                        Some(bytes) if bytes.contains(&0x66) => return true,
+                        Some(_) => {}
+                        None => return false,
+                    }
+                }
+            })
+            .await,
+            Ok(true)
+        )
+    };
+    if cancel_after_publish {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(source);
+    let active_closed = tokio::time::timeout(Duration::from_secs(1), async {
+        while active_connections_closed.load(Ordering::Acquire) < ACTIVE_CAP as u32 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let discovery_stopped = tokio::time::timeout(Duration::from_secs(1), discovery_stopped_rx)
+        .await
+        .is_ok_and(|stopped| stopped.is_ok());
+    let active_closed_count = active_connections_closed.load(Ordering::Relaxed);
+    let b_attempts_after_wait = b_attempts.load(Ordering::Relaxed);
+    servers.abort_all();
+    while servers.join_next().await.is_some() {}
+
+    FullPoolObservation {
+        activated: activated.load(Ordering::Relaxed),
+        requests: requests.load(Ordering::Relaxed),
+        peers_at_publish,
+        published,
+        b_attempts_before_expiry,
+        b_attempts_after_wait,
+        b_output,
+        active_connections_closed: active_closed_count,
+        discovery_stopped: active_closed && discovery_stopped,
+    }
+}
+
+#[tokio::test]
+async fn startup_progress_four_advancing_peers_full_pool_recovers_late_healthy_peer() {
+    let observed = startup_progress_full_four_peer_pool(false).await;
+    assert_eq!(observed.activated, 4, "all four initial As must activate");
+    assert_eq!(
+        observed.peers_at_publish, 4,
+        "production peer count must be full"
+    );
+    assert!(
+        observed.requests > 0,
+        "the active A pool must consume requests"
+    );
+    assert!(
+        observed.published,
+        "late B must be published through discovery"
+    );
+    assert_eq!(
+        observed.b_attempts_before_expiry, 0,
+        "a still-live full pool must retain B until stale recovery"
+    );
+    assert!(
+        observed.b_output && observed.b_attempts_after_wait > 0,
+        "after one stale interval, B should be attempted and deliver authenticated contiguous TS; observed={observed:?}"
+    );
+    assert_eq!(
+        observed.active_connections_closed, 4,
+        "dropping the source must close all four active A connections"
+    );
+    assert!(
+        observed.discovery_stopped,
+        "source drop must stop discovery ownership"
+    );
+}
+
+#[tokio::test]
+async fn startup_progress_consumer_drop_before_first_output_cleans_full_pool() {
+    let observed = startup_progress_full_four_peer_pool(true).await;
+    assert_eq!(observed.activated, 4, "all four initial As must activate");
+    assert_eq!(
+        observed.peers_at_publish, 4,
+        "production peer count must be full"
+    );
+    assert!(
+        observed.requests > 0,
+        "the active A pool must consume requests"
+    );
+    assert!(
+        observed.published,
+        "late B must be published through discovery"
+    );
+    assert_eq!(observed.b_attempts_before_expiry, 0);
+    assert_eq!(
+        observed.b_attempts_after_wait, 0,
+        "consumer drop must not admit B"
+    );
+    assert_eq!(
+        observed.active_connections_closed, 4,
+        "consumer drop must close every active A socket"
+    );
+    assert!(
+        observed.discovery_stopped,
+        "consumer drop must stop discovery"
+    );
 }
 
 async fn late_candidate_media_control(late: bool, silent_slot: bool, fail_first: bool) {

@@ -20,6 +20,29 @@ pub(super) fn stale_upstream_budget(
     }
 }
 
+/// Bound each never-emitted pool independently of startup activity bookkeeping.
+pub(super) fn pool_progress_budget(
+    first_output_deadline: &mut Option<Instant>,
+    emitted: u64,
+    startup_deadline: Option<Instant>,
+    last_progress: Instant,
+    now: Instant,
+    stale_timeout: Duration,
+) -> Option<Duration> {
+    if emitted > 0 {
+        *first_output_deadline = None;
+        return stale_upstream_budget(last_progress, now, stale_timeout);
+    }
+    if let Some(deadline) = *first_output_deadline {
+        return (now < deadline).then(|| deadline.duration_since(now));
+    }
+    if let Some(deadline) = startup_deadline {
+        return Some(deadline.saturating_duration_since(now));
+    }
+    *first_output_deadline = Some(now + stale_timeout);
+    Some(stale_timeout)
+}
+
 pub(super) fn should_refresh_stale_deadline(
     emitted: u64,
     made_output: bool,
