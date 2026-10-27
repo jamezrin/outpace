@@ -24,7 +24,8 @@ Wrapping `Transport.hashlib.sha1` captured both hashes the official module compu
 
 ## Actual formula
 
-For live BT transports, the official swarm infohash is:
+The originally observed live-BT descriptors had no selected optional suffix fields,
+so their official swarm infohash was the following six-field case:
 
 ```text
 SHA1(bencode([
@@ -36,6 +37,17 @@ SHA1(bencode([
   ["bitrate",      descriptor["bitrate"]],
 ]))
 ```
+
+Issue #253 recovered the complete ordered selector through static analysis and a
+genuine offline synthetic eight-versus-six reproduction. After the six fields
+above, append present `premium`, `commerce`, `provider_key`, `provider_sid`, `access`,
+`sharing`, `private`, `tns`, `license` in that order, preserving raw values even
+when zero or empty. Skip absent suffix fields and all unlisted metadata; retain
+Outpace's required-six errors. See [the complete contract](../transport-file.md).
+The extension is live-only: decoded transport classification keeps legacy wrapped
+VOD on its required six-field identity; ordinary metainfo hashing is unchanged.
+The synthetic provider fields do not identify discarded production fields or
+establish a historical playback cause; #253 remains open.
 
 The order above is engine order, not lexicographic dict order. Example captured preimage for
 `transport-02.bin`:
