@@ -53,17 +53,37 @@ Validated decode:
 - `transport-02.bin` → name "Synthetic Demo Channel", `piece_length=131072`, tracker `udp://t1.torrentstream.org:2710/announce`, **live (no `pieces`)**.
 
 ## Infohash derivation — VALIDATED, corrected 2026-07-01
+
+The complete live-BT selector, recovered in issue #253, is ordered as follows:
+
+```text
+keys = [name, authmethod, pubkey, piece_length, chunk_length, bitrate,
+        premium, commerce, provider_key, provider_sid, access,
+        sharing, private, tns, license]
+pairs = [[key, descriptor[key]] for key in keys if key in descriptor]
+infohash = SHA1(bencode(pairs))
 ```
-infohash = SHA1(bencode([
-  ["name",         descriptor["name"]],
-  ["authmethod",   descriptor["authmethod"]],
-  ["pubkey",       descriptor["pubkey"]],
-  ["piece_length", descriptor["piece_length"]],
-  ["chunk_length", descriptor["chunk_length"]],
-  ["bitrate",      descriptor["bitrate"]],
-]))
-```
-Confirmed by importing the official `Transport.so` in the sandbox and calling
+
+Selection uses raw decoded Bencode values and exact key membership. Present zero
+or empty values are included; absent suffix fields supply no defaults. The pair
+list follows selector order, not dictionary order, and excludes unlisted metadata.
+Outpace retains its existing error when any of the first six fields is missing.
+
+This suffix extension applies only to live transports. Transport consumers use
+the decoder's existing `is_live` classification; legacy wrapped VOD retains the
+required six-field selector, even when selected suffix keys are present. Bare or
+disk-enveloped torrent metainfo retains its standard encoded-`info` identity.
+The raw `infohash_of_descriptor` helper remains a live-BT entrypoint.
+
+Static recovery of the original BT selector and hash consumer establishes this
+fifteen-key rule. An offline, wholly synthetic BT descriptor with invented
+`provider_key` and `provider_sid` strings reproduced eight original pairs versus
+the previous six-field implementation; all six shared values and encoded spans
+agreed. This does not identify discarded production fields or establish historical
+playback causality. Issue #253 remains open pending validation and review.
+
+The earlier ground-truth vectors cover the six-field case, with no selected suffix
+fields. It was confirmed by importing the official `Transport.so` in the sandbox and calling
 `load_transport_file_from_string(...).get_infohash()` while wrapping `hashlib.sha1`.
 Ground-truth vectors:
 - `tests/vectors/transport-01.bin` → official infohash =

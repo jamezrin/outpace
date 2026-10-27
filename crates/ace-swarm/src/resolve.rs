@@ -17,7 +17,7 @@ use ace_peer::session::PeerSession;
 use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
-use ace_wire::infohash::{infohash_of_descriptor, transport_file_hash};
+use ace_wire::infohash::{infohash_of_decoded_transport, transport_file_hash};
 use ace_wire::message::PeerMessage;
 use ace_wire::transport::decode_transport;
 use base64ct::{Base64, Encoding};
@@ -108,6 +108,8 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
     // treat pieces as unsigned (don't strip, nothing to verify).
     let sig_len = ace_wire::live_auth::signature_len_from_pubkey_der(&d.pubkey);
+    let infohash = infohash_of_decoded_transport(&d)
+        .map_err(|_| ResolveError::Transport("infohash failed"))?;
     let metadata = StreamMetadata {
         title: normalized_title(&d.name),
         bitrate: d
@@ -117,8 +119,7 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
         categories: d.categories,
     };
     Ok(StreamInfo {
-        infohash: infohash_of_descriptor(&d.raw)
-            .map_err(|_| ResolveError::Transport("infohash failed"))?,
+        infohash,
         piece_length: d.piece_length,
         chunk_length: d.chunk_length,
         trackers: d.trackers,
@@ -172,7 +173,7 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
         .vod_total_length()
         .ok_or(ResolveError::Transport("VOD descriptor missing length"))?;
     Ok(VodInfo {
-        infohash: infohash_of_descriptor(&d.raw)
+        infohash: infohash_of_decoded_transport(&d)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
         peer_protocol: ace_wire::handshake::HandshakeProtocol::AceStream,
         piece_length: d.piece_length,
@@ -630,7 +631,7 @@ impl ResolveCache {
 /// id's entry to a lookup of the other. Every entry here is keyed by its own `info.infohash`,
 /// which [`stream_info_from_transport`] computed from the same descriptor that supplied the
 /// geometry and pubkey. The swarm infohash commits to `piece_length`, `chunk_length` and
-/// `pubkey` (see [`infohash_of_descriptor`]), so an entry can neither pair an infohash with
+/// `pubkey` (see [`infohash_of_decoded_transport`]), so an entry can neither pair an infohash with
 /// another stream's geometry nor go stale. Entries therefore carry no TTL; the index is bounded
 /// by evicting the least recently stored entry once `capacity` is reached.
 pub struct InfohashIndex {
@@ -845,6 +846,104 @@ mod tests {
         ace_wire::transport::encode_transport(&Bencode::Dict(d))
     }
 
+    fn vod_transport_with_provider_selectors() -> Vec<u8> {
+        use ace_wire::bencode::Bencode;
+
+        let transport = vod_transport(60, Some(300000), false);
+        let mut descriptor = ace_wire::transport::decode_transport(&transport)
+            .expect("existing synthetic VOD fixture decodes")
+            .raw;
+        let Bencode::Dict(fields) = &mut descriptor else {
+            unreachable!("decoded transport descriptor is a dictionary");
+        };
+        fields.insert(
+            b"provider_key".to_vec(),
+            Bencode::Bytes(b"synthetic-provider-key".to_vec()),
+        );
+        fields.insert(
+            b"provider_sid".to_vec(),
+            Bencode::Bytes(b"synthetic-provider-session".to_vec()),
+        );
+        ace_wire::transport::encode_transport(&descriptor)
+    }
+
+    fn independent_six_field_hash(descriptor: &ace_wire::bencode::Bencode) -> [u8; 20] {
+        use ace_wire::bencode::Bencode;
+
+        let pairs: Vec<Bencode> = [
+            b"name".as_slice(),
+            b"authmethod".as_slice(),
+            b"pubkey".as_slice(),
+            b"piece_length".as_slice(),
+            b"chunk_length".as_slice(),
+            b"bitrate".as_slice(),
+        ]
+        .iter()
+        .map(|key| {
+            Bencode::List(vec![
+                Bencode::Bytes(key.to_vec()),
+                descriptor
+                    .get(key)
+                    .expect("synthetic VOD has each legacy field")
+                    .clone(),
+            ])
+        })
+        .collect();
+        Sha1::digest(Bencode::List(pairs).encode()).into()
+    }
+
+    fn synthetic_live_transport_with_provider_selectors() -> (Vec<u8>, ace_wire::bencode::Bencode) {
+        use ace_wire::bencode::Bencode;
+
+        let original = include_bytes!("../../../tests/vectors/transport/synthetic-live-512k.bin");
+        let mut descriptor = ace_wire::transport::decode_transport(original)
+            .expect("accepted synthetic live fixture decodes")
+            .raw;
+        let Bencode::Dict(fields) = &mut descriptor else {
+            unreachable!("decoded transport descriptor is a dictionary");
+        };
+        fields.insert(
+            b"provider_key".to_vec(),
+            Bencode::Bytes(b"synthetic-provider-key".to_vec()),
+        );
+        fields.insert(
+            b"provider_sid".to_vec(),
+            Bencode::Bytes(b"synthetic-provider-session".to_vec()),
+        );
+        let wrapped = ace_wire::transport::encode_transport(&descriptor);
+        (wrapped, descriptor)
+    }
+
+    fn independent_live_selector_hash(descriptor: &ace_wire::bencode::Bencode) -> [u8; 20] {
+        use ace_wire::bencode::Bencode;
+
+        let pairs: Vec<Bencode> = [
+            b"name".as_slice(),
+            b"authmethod".as_slice(),
+            b"pubkey".as_slice(),
+            b"piece_length".as_slice(),
+            b"chunk_length".as_slice(),
+            b"bitrate".as_slice(),
+            b"premium".as_slice(),
+            b"commerce".as_slice(),
+            b"provider_key".as_slice(),
+            b"provider_sid".as_slice(),
+            b"access".as_slice(),
+            b"sharing".as_slice(),
+            b"private".as_slice(),
+            b"tns".as_slice(),
+            b"license".as_slice(),
+        ]
+        .iter()
+        .filter_map(|key| {
+            descriptor
+                .get(key)
+                .map(|value| Bencode::List(vec![Bencode::Bytes(key.to_vec()), value.clone()]))
+        })
+        .collect();
+        Sha1::digest(Bencode::List(pairs).encode()).into()
+    }
+
     #[test]
     fn vod_info_from_single_file_transport() {
         let tf = vod_transport(60, Some(300000), false); // 3 pieces, single-file
@@ -852,6 +951,114 @@ mod tests {
         assert_eq!(info.piece_hashes.len(), 3);
         assert_eq!(info.total_length, 300000);
         assert_eq!(info.piece_size(2), 300000 - 2 * 131072);
+    }
+
+    #[test]
+    fn wrapped_vod_resolution_keeps_legacy_hash_with_provider_selectors() {
+        let transport = vod_transport_with_provider_selectors();
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        assert!(
+            !decoded.is_live,
+            "synthetic descriptor must take the VOD path"
+        );
+        assert_eq!(
+            decoded.pieces.len(),
+            3,
+            "synthetic VOD has valid piece hashes"
+        );
+
+        let expected = independent_six_field_hash(&decoded.raw);
+        assert_eq!(
+            vod_info_from_transport(&transport).unwrap().infohash,
+            expected,
+            "VOD resolver must preserve the legacy six-field identity"
+        );
+    }
+
+    #[test]
+    fn live_stream_info_matches_raw_and_wrapped_fifteen_field_identity() {
+        let (transport, descriptor) = synthetic_live_transport_with_provider_selectors();
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        assert!(
+            decoded.is_live,
+            "synthetic descriptor must take the live path"
+        );
+
+        let expected = independent_live_selector_hash(&descriptor);
+        assert_eq!(
+            ace_wire::infohash::infohash_of_descriptor(&decoded.raw).unwrap(),
+            expected,
+            "raw live descriptor uses the extended selector"
+        );
+        assert_eq!(
+            ace_wire::infohash::try_infohash_of_transport(&transport).unwrap(),
+            expected,
+            "wrapped live wire entrypoint uses the extended selector"
+        );
+        assert_eq!(
+            stream_info_from_transport(&transport).unwrap().infohash,
+            expected,
+            "StreamInfo uses the same decoded live identity"
+        );
+    }
+
+    #[test]
+    fn stream_info_accepts_optional_bearing_wrapped_vod_with_legacy_identity() {
+        let transport = vod_transport_with_provider_selectors();
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        assert!(
+            !decoded.is_live,
+            "synthetic descriptor must classify as VOD"
+        );
+        let expected = independent_six_field_hash(&decoded.raw);
+
+        let info = stream_info_from_transport(&transport)
+            .expect("StreamInfo path continues to accept the legacy wrapped VOD descriptor");
+        assert_eq!(info.infohash, expected);
+        assert_eq!(info.piece_length, decoded.piece_length);
+        assert_eq!(info.chunk_length, decoded.chunk_length);
+    }
+
+    #[test]
+    fn optional_bearing_live_stream_info_keeps_geometry_key_and_index_binding() {
+        let (base_transport, pubkey) = synthetic_512k_transport();
+        let mut descriptor = ace_wire::transport::decode_transport(&base_transport)
+            .expect("synthetic 512 KiB live fixture decodes")
+            .raw;
+        let ace_wire::bencode::Bencode::Dict(fields) = &mut descriptor else {
+            unreachable!("decoded transport descriptor is a dictionary");
+        };
+        fields.insert(
+            b"provider_key".to_vec(),
+            ace_wire::bencode::Bencode::Bytes(b"synthetic-provider-key".to_vec()),
+        );
+        fields.insert(
+            b"provider_sid".to_vec(),
+            ace_wire::bencode::Bencode::Bytes(b"synthetic-provider-session".to_vec()),
+        );
+        let transport = ace_wire::transport::encode_transport(&descriptor);
+        let decoded = ace_wire::transport::decode_transport(&transport).unwrap();
+        assert!(
+            decoded.is_live,
+            "synthetic descriptor must classify as live"
+        );
+
+        let expected = independent_live_selector_hash(&descriptor);
+        let previous_six_field = independent_six_field_hash(&descriptor);
+        assert_ne!(expected, previous_six_field);
+
+        let info = stream_info_from_transport(&transport).unwrap();
+        assert_eq!(info.infohash, expected);
+        assert_eq!(info.piece_length, 524_288);
+        assert_eq!(info.chunk_length, 16_384);
+        assert_eq!(info.chunks_per_piece(), 32);
+        assert_eq!(info.sig_len, 96);
+        assert_eq!(info.source_pubkey, pubkey);
+
+        let index = InfohashIndex::new(2);
+        index.put(info.clone());
+        assert_eq!(index.get(&expected), Some(info));
+        assert!(index.get(&previous_six_field).is_none());
     }
 
     #[test]
