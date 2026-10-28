@@ -331,3 +331,49 @@ async fn admission_queued_hls_does_not_open_after_shutdown() {
         assert_eq!(manager.admission_status(), (0, Some(1)));
     }
 }
+
+#[tokio::test]
+async fn admission_periodic_reap_expires_vod_without_releasing_retained_ranges() {
+    for retain_range in [false, true] {
+        let (manager, provider) = setup(1);
+        let content = manager.resolve_vod("synthetic", "vod").await.unwrap();
+        let range = if retain_range {
+            Some(content.open_range(0, 2).await.unwrap())
+        } else {
+            None
+        };
+        drop(content);
+        let at = manager.vod_cache.lock().await.values().next().unwrap().1;
+        manager
+            .reap_idle_at(at + manager.grace - Duration::from_nanos(1))
+            .await;
+        assert_eq!(manager.vod_cache.lock().await.len(), 1);
+        assert_eq!(manager.admission_status().0, 1);
+        manager.reap_idle_at(at + manager.grace).await;
+        let removed = manager.vod_cache.lock().await.is_empty();
+        let occupied = manager.admission_status().0;
+        if retain_range {
+            assert!(matches!(
+                manager.get_or_start("synthetic", "live").await,
+                Err(ProviderError::CapacityExhausted)
+            ));
+        }
+        drop(range);
+        assert!(
+            removed,
+            "periodic reap must expire VOD without another lookup"
+        );
+        assert_eq!(occupied, usize::from(retain_range));
+        let live = manager.get_or_start("synthetic", "live").await.unwrap();
+        let (_, shared, pin) = manager
+            .get_or_start_compatibility_hls("synthetic", "live")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&live, &shared));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        manager.stop("synthetic", "live").await;
+        drop((live, shared, pin));
+        empty(&manager).await;
+        manager.shutdown().await;
+    }
+}

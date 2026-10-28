@@ -723,6 +723,20 @@ impl StreamManager {
     }
 
     async fn reap_idle_at(&self, now: Instant) {
+        let expired: Vec<_> = {
+            let mut cache = self.vod_cache.lock().await;
+            let keys: Vec<_> = cache
+                .iter()
+                .filter(|(_, (_, at))| now.saturating_duration_since(*at) >= self.grace)
+                .map(|(key, _)| key.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| cache.remove(&key))
+                .collect()
+        };
+        // Content destruction may release the final provider reservation; never do it
+        // while holding the cache lock. Active handles/ranges retain their own owner.
+        drop(expired);
         let controls = {
             let _finalizing = self.hls_finalization.lock().await;
             let pending_hls: HashSet<_> = self
