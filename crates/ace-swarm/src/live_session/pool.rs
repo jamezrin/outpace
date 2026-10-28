@@ -712,20 +712,14 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     {
                         continue;
                     }
-                    PieceStore::shared_put_chunk_with_header(
-                        store,
+                    let outcome = match continuity.reasm.add_live_chunk(
                         piece,
                         lc.chunk,
+                        info.chunk_length,
                         lc.piece_header,
                         &lc.data,
-                    )
-                    .await;
-                    let begin = lc.chunk as u64 * info.chunk_length;
-                    let contribution = match continuity
-                        .reasm
-                        .add_block_with_contribution(piece, begin, &lc.data)
-                    {
-                        Ok(contribution) => contribution,
+                    ) {
+                        Ok(outcome) => outcome,
                         Err(e) => {
                             if e == ace_wire::WireError::SignatureRejected {
                                 continuity.recovery_event(RecoveryEvent::SignatureReject);
@@ -742,7 +736,28 @@ pub(super) async fn follow_peer_pool_with_discovery(
                             continue;
                         }
                     };
-                    if contribution {
+                    if outcome.completed {
+                        if let Some(done) = continuity.reasm.completed_live_piece(piece) {
+                            if matches!(done.acceptance,
+                                ace_wire::reassembly::LiveAcceptance::SourceVerified
+                                | ace_wire::reassembly::LiveAcceptance::UnsignedAssemblyAccepted)
+                            {
+                                if let Err(e) = PieceStore::shared_put_complete_piece(
+                                    store,
+                                    piece,
+                                    done.header,
+                                    done.wire,
+                                )
+                                .await
+                                {
+                                    crate::alog!(
+                                        "[cache] whole live piece publication failed: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if outcome.contributed {
                         continuity
                             .piece_producers
                             .entry(piece)
