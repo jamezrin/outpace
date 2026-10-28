@@ -101,6 +101,27 @@ impl ActivePeers {
         next_needed: u64,
         head: u64,
     ) -> Vec<PeerAssignment> {
+        self.assign_inner(scheduler, next_needed, head, None)
+    }
+
+    /// Admit only requests that fit the peer's currently available command slots.
+    pub(crate) fn assign_with_queue_slots(
+        &mut self,
+        scheduler: &mut Scheduler,
+        next_needed: u64,
+        head: u64,
+        queue_slots: &BTreeMap<u64, usize>,
+    ) -> Vec<PeerAssignment> {
+        self.assign_inner(scheduler, next_needed, head, Some(queue_slots))
+    }
+
+    fn assign_inner(
+        &mut self,
+        scheduler: &mut Scheduler,
+        next_needed: u64,
+        head: u64,
+        queue_slots: Option<&BTreeMap<u64, usize>>,
+    ) -> Vec<PeerAssignment> {
         let views: Vec<PeerView> = self
             .peers
             .iter()
@@ -112,7 +133,10 @@ impl ActivePeers {
                 in_flight: peer.in_flight.len(),
             })
             .collect();
-        let assigned = scheduler.assign(next_needed, head, &views);
+        let assigned = match queue_slots {
+            Some(slots) => scheduler.assign_with_queue_slots(next_needed, head, &views, slots),
+            None => scheduler.assign(next_needed, head, &views),
+        };
         let mut out = Vec::with_capacity(assigned.len());
         for (peer_id, piece) in assigned {
             if let Some(peer) = self.peers.get_mut(&peer_id) {
@@ -123,6 +147,13 @@ impl ActivePeers {
             }
         }
         out
+    }
+
+    /// Release only this peer's selected request when it was not enqueued.
+    pub(crate) fn cancel_assignment(&mut self, id: u64, piece: u64) {
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.in_flight.remove(&piece);
+        }
     }
 
     pub fn remove(&mut self, id: u64) -> Vec<u64> {
@@ -208,39 +239,77 @@ impl Scheduler {
     /// has spare in-flight capacity. Returns `(peer_id, piece)` pairs and records them as
     /// in-flight.
     pub fn assign(&mut self, next_needed: u64, head: u64, peers: &[PeerView]) -> Vec<(u64, u64)> {
+        self.assign_inner(next_needed, head, peers, None)
+    }
+
+    /// Queue credits constrain admission; reserved pieces do not consume its bounded scan.
+    pub(crate) fn assign_with_queue_slots(
+        &mut self,
+        next_needed: u64,
+        head: u64,
+        peers: &[PeerView],
+        queue_slots: &BTreeMap<u64, usize>,
+    ) -> Vec<(u64, u64)> {
+        self.assign_inner(next_needed, head, peers, Some(queue_slots))
+    }
+
+    fn assign_inner(
+        &mut self,
+        next_needed: u64,
+        head: u64,
+        peers: &[PeerView],
+        queue_slots: Option<&BTreeMap<u64, usize>>,
+    ) -> Vec<(u64, u64)> {
         // Drop bookkeeping for pieces we've moved past.
         self.requested.retain(|&p| p >= next_needed);
 
         // Remaining capacity per peer for this tick (only unchoked peers can serve).
-        let mut cap: Vec<(PeerView, usize)> = peers
+        let mut cap: Vec<(PeerView, usize, usize)> = peers
             .iter()
             .filter(|p| p.unchoked)
-            .map(|p| (*p, self.max_in_flight.saturating_sub(p.in_flight)))
+            .map(|p| {
+                let spare = self.max_in_flight.saturating_sub(p.in_flight);
+                let slots = match queue_slots {
+                    Some(slots) => slots.get(&p.id).copied().unwrap_or(0),
+                    None => spare,
+                };
+                (*p, spare, slots)
+            })
             .collect();
 
-        // Bound the scan (and thus per-tick fan-out) to the number of request slots we can
-        // actually fill this tick. `head` comes from untrusted peer `Have`/window
-        // advertisements, so an implausibly large jump must not make us iterate over billions
-        // of piece indices and tie up the session task. We never assign more than the total
-        // spare capacity, so scanning that far past the cursor suffices; anything beyond is
-        // scheduled on later ticks as the cursor advances, and a genuinely evicted cursor is
-        // moved forward by the driver's skip-evicted-gap path.
-        let total_spare: u64 = cap.iter().map(|(_, c)| *c as u64).sum();
-        let ceiling = head.min(next_needed.saturating_add(total_spare));
+        // Keep the original remaining-spare scan for unconstrained calls. Credited
+        // turns must also pass reservations made on earlier worker turns, without
+        // letting an untrusted head or reserved piece extend the scan indefinitely.
+        let total_spare: u64 = cap.iter().map(|(_, c, _)| *c as u64).sum();
+        let scan_slots = if queue_slots.is_some() {
+            // The original empty-batch policy horizon, independent of queue slots.
+            cap.iter().fold(0_u64, |total, _| {
+                total.saturating_add(self.max_in_flight as u64)
+            })
+        } else {
+            total_spare
+        };
+        let scan_ceiling = head.min(next_needed.saturating_add(scan_slots));
+        let mut ceiling = head.min(next_needed.saturating_add(total_spare));
 
         let mut out = Vec::new();
         let mut piece = next_needed;
         while piece <= ceiling {
-            if !self.requested.contains(&piece) {
+            if self.requested.contains(&piece) {
+                // A prior admission used policy capacity, not a new scan position.
+                // For unconstrained calls scan_ceiling equals the original ceiling.
+                ceiling = ceiling.saturating_add(1).min(scan_ceiling);
+            } else {
                 // Prefer the peer with the most spare capacity that covers this piece —
                 // spreads load and keeps the rarest-window peers in reserve.
                 if let Some(slot) = cap
                     .iter_mut()
-                    .filter(|(p, c)| *c > 0 && p.covers(piece))
-                    .max_by_key(|(_, c)| *c)
+                    .filter(|(p, c, slots)| *c > 0 && *slots > 0 && p.covers(piece))
+                    .max_by_key(|(_, c, _)| *c)
                 {
                     out.push((slot.0.id, piece));
                     slot.1 -= 1;
+                    slot.2 -= 1;
                     self.requested.insert(piece);
                 }
             }
@@ -471,5 +540,168 @@ mod tests {
         // Window advanced to 3 (live edge moved); stale entries pruned.
         s.assign(3, 4, &[peer(1, 0, 4, true, 5)]);
         assert_eq!(s.in_flight_count(), 2); // only 3,4 remain
+    }
+
+    #[test]
+    fn queue_credit_assignment_preserves_unconstrained_order_and_spare_ranking() {
+        let peers = [peer(1, 0, 3, true, 0), peer(2, 0, 3, true, 0)];
+        let expected = vec![(2, 0), (1, 1), (2, 2), (1, 3)];
+        let mut unrestricted = Scheduler::new(2);
+        assert_eq!(unrestricted.assign(0, 3, &peers), expected);
+
+        let mut fully_credited = Scheduler::new(2);
+        assert_eq!(
+            fully_credited
+                .assign_with_queue_slots(0, 3, &peers, &BTreeMap::from([(1, 2), (2, 2)]),),
+            expected,
+            "unconstrained admission must keep the existing sequence"
+        );
+
+        let mut mixed = Scheduler::new(3);
+        let got = mixed.assign_with_queue_slots(
+            0,
+            5,
+            &[
+                peer(1, 0, 5, true, 2), // policy spare 1
+                peer(2, 0, 5, true, 0), // policy spare 3
+                peer(3, 0, 5, true, 0), // policy spare 3, wins tie by existing order
+            ],
+            &BTreeMap::from([(1, 1), (2, 1), (3, 1)]),
+        );
+        assert_eq!(got, vec![(3, 0), (2, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn queue_slots_and_policy_spare_are_independent_caps() {
+        let peers = [peer(1, 0, 10, true, 0)];
+        let mut policy_limited = Scheduler::new(2);
+        assert_eq!(
+            policy_limited.assign_with_queue_slots(0, 10, &peers, &BTreeMap::from([(1, 8)])),
+            vec![(1, 0), (1, 1)],
+            "extra queue slots cannot exceed the existing per-peer policy cap"
+        );
+
+        let mut queue_limited = Scheduler::new(8);
+        assert_eq!(
+            queue_limited.assign_with_queue_slots(0, 10, &peers, &BTreeMap::from([(1, 1)])),
+            vec![(1, 0)],
+            "one command credit admits one RequestPiece"
+        );
+    }
+
+    #[test]
+    fn zero_credit_does_not_shorten_policy_scan_before_a_later_peer() {
+        let mut scheduler = Scheduler::new(4);
+        let got = scheduler.assign_with_queue_slots(
+            10,
+            14,
+            &[peer(1, 10, 11, true, 0), peer(2, 14, 14, true, 0)],
+            &BTreeMap::from([(1, 0), (2, 1)]),
+        );
+        assert_eq!(got, vec![(2, 14)]);
+        assert_eq!(scheduler.in_flight_count(), 1);
+    }
+
+    #[test]
+    fn missing_zero_choked_and_out_of_window_peers_receive_no_credit_assignment() {
+        let peers = [peer(1, 0, 5, true, 0), peer(2, 3, 3, false, 0)];
+        let mut missing = Scheduler::new(2);
+        assert!(missing
+            .assign_with_queue_slots(0, 5, &peers, &BTreeMap::new())
+            .is_empty());
+        assert_eq!(missing.in_flight_count(), 0);
+
+        let mut zero = Scheduler::new(2);
+        assert!(zero
+            .assign_with_queue_slots(0, 5, &peers, &BTreeMap::from([(1, 0), (2, 1)]),)
+            .is_empty());
+        assert_eq!(zero.in_flight_count(), 0);
+
+        let mut filtered = Scheduler::new(2);
+        assert_eq!(
+            filtered.assign_with_queue_slots(0, 5, &peers, &BTreeMap::from([(1, 2), (2, 2)]),),
+            vec![(1, 0), (1, 1)],
+            "choked and out-of-window pieces remain ineligible"
+        );
+    }
+
+    #[test]
+    fn active_peer_credit_selection_owns_only_eligible_assignments() {
+        let mut active = ActivePeers::new();
+        active.insert(1, addr(), win(10, 11));
+        active.insert(2, addr(), win(14, 14));
+        active.set_unchoked(1, true);
+        active.set_unchoked(2, true);
+        let mut scheduler = Scheduler::new(4);
+
+        let got = active.assign_with_queue_slots(
+            &mut scheduler,
+            10,
+            14,
+            &BTreeMap::from([(1, 0), (2, 1)]),
+        );
+
+        assert_eq!(
+            got,
+            vec![PeerAssignment {
+                peer_id: 2,
+                piece: 14
+            }]
+        );
+        assert_eq!(active.in_flight_count(1), 0);
+        assert_eq!(active.in_flight_count(2), 1);
+        assert_eq!(scheduler.in_flight_count(), 1);
+    }
+
+    #[test]
+    fn cancelling_an_unsent_retry_releases_only_the_new_peer_slot() {
+        let mut active = ActivePeers::new();
+        active.insert(1, addr(), win(0, 0));
+        active.insert(2, addr(), win(0, 0));
+        active.set_unchoked(1, true);
+        active.set_unchoked(2, true);
+        let mut scheduler = Scheduler::new(1);
+
+        let first = active.assign(&mut scheduler, 0, 0);
+        assert_eq!(first.len(), 1);
+        let original_peer = first[0].peer_id;
+        scheduler.on_drop(first[0].piece);
+        let retry = active.assign(&mut scheduler, 0, 0);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].piece, first[0].piece);
+        assert_ne!(retry[0].peer_id, original_peer);
+        assert_eq!(active.in_flight_count(original_peer), 1);
+        assert_eq!(active.in_flight_count(retry[0].peer_id), 1);
+
+        active.cancel_assignment(retry[0].peer_id, retry[0].piece);
+        scheduler.on_drop(retry[0].piece);
+
+        assert_eq!(active.in_flight_count(original_peer), 1);
+        assert_eq!(active.in_flight_count(retry[0].peer_id), 0);
+        assert_eq!(scheduler.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn credited_turns_replenish_only_reserved_holes_within_the_empty_policy_horizon() {
+        let mut scheduler = Scheduler::new(4);
+        let slots = BTreeMap::from([(1, 1)]);
+        let mut admitted = Vec::new();
+
+        for expected_piece in 0..4 {
+            let got = scheduler.assign_with_queue_slots(
+                0,
+                10_000,
+                &[peer(1, 0, 10_000, true, expected_piece as usize)],
+                &slots,
+            );
+            assert_eq!(got, vec![(1, expected_piece)]);
+            admitted.extend(got);
+        }
+
+        assert_eq!(admitted, (0..4).map(|piece| (1, piece)).collect::<Vec<_>>());
+        assert_eq!(scheduler.in_flight_count(), 4);
+        assert!(scheduler
+            .assign_with_queue_slots(0, 10_000, &[peer(1, 0, 10_000, true, 4)], &slots,)
+            .is_empty());
     }
 }

@@ -23,15 +23,18 @@ pub(super) fn update_runtime_window(
     }
 }
 
+/// Return the address on failed admission, not an already-accounted peer loss.
+/// Keep its generation current until queued events reach terminal handling.
 pub(super) async fn send_peer_command(
     peer_id: u64,
     msg: PeerMessage,
     peers: &mut BTreeMap<u64, PeerRuntime>,
-    continuity: &mut Continuity,
+    _continuity: &mut Continuity,
 ) -> Option<SocketAddrV4> {
-    let sender = peers.get(&peer_id).map(|peer| peer.commands.clone())?;
-    if sender.send(PeerCommand::Send(msg)).await.is_err() {
-        drop_peer_runtime(peer_id, peers, continuity)
+    let peer = peers.get(&peer_id)?;
+    if peer.commands.try_send(PeerCommand::Send(msg)).is_err() {
+        peer.worker.abort();
+        Some(peer.addr)
     } else {
         None
     }
@@ -208,46 +211,100 @@ pub(super) async fn advance_pool_requests(
     if continuity.startup_deadline.is_some() {
         return Vec::new();
     }
-    let assignments = schedule_piece_assignments(
+    // Only this actor produces commands; workers can only release these slots.
+    // Keep snapshot, selection and enqueue free of awaits.
+    let queue_slots = peers
+        .iter()
+        .map(|(&id, peer)| {
+            let slots = if peer.commands.is_closed() {
+                0
+            } else {
+                peer.commands.capacity()
+            };
+            (id, slots)
+        })
+        .collect();
+    let assignments = continuity.active_peers.assign_with_queue_slots(
         &mut continuity.scheduler,
-        &mut continuity.active_peers,
         continuity.reasm.next_needed(),
         continuity.head,
+        &queue_slots,
     );
-    // Start (or keep) a retransmit timer for each freshly-assigned piece.
     let now = Instant::now();
-    for assignment in &assignments {
-        continuity
-            .requested_at
-            .entry(assignment.piece)
-            .or_insert(now);
-    }
-    let mut failed = Vec::new();
+    let mut failed = HashSet::new();
     for assignment in assignments {
-        let Some(sender) = peers
-            .get(&assignment.peer_id)
-            .map(|peer| peer.commands.clone())
-        else {
-            continuity.scheduler.on_drop(assignment.piece);
-            continue;
+        let admitted = if failed.contains(&assignment.peer_id) {
+            false
+        } else if let Some(peer) = peers.get(&assignment.peer_id) {
+            if peer
+                .commands
+                .try_send(PeerCommand::RequestPiece {
+                    piece: assignment.piece,
+                    chunks_per_piece,
+                })
+                .is_err()
+            {
+                // Retain this generation for its queued reliable events.
+                peer.worker.abort();
+                failed.insert(assignment.peer_id);
+                false
+            } else {
+                true
+            }
+        } else {
+            false
         };
-        if sender
-            .send(PeerCommand::RequestPiece {
-                piece: assignment.piece,
-                chunks_per_piece,
-            })
-            .await
-            .is_err()
-        {
-            failed.push(assignment.peer_id);
+        if admitted {
+            continuity
+                .requested_at
+                .entry(assignment.piece)
+                .or_insert(now);
+        } else {
+            // Undo only the unsent selection, not old admitted work or B's slots.
+            continuity
+                .active_peers
+                .cancel_assignment(assignment.peer_id, assignment.piece);
+            continuity.scheduler.on_drop(assignment.piece);
         }
     }
-    failed.sort_unstable();
-    failed.dedup();
-    failed
-        .into_iter()
-        .filter_map(|peer_id| drop_peer_runtime(peer_id, peers, continuity))
-        .collect()
+    // Loss accounting/removal belongs to the pool's terminal event branch.
+    Vec::new()
+}
+
+/// Poll one FIFO event, or synthesize Lost after a finished worker's prefix.
+pub(super) fn poll_closed_peer_event(
+    peers: &BTreeMap<u64, PeerRuntime>,
+    events: &mut mpsc::Receiver<PeerEvent>,
+    pending: &mut BTreeMap<u64, (SocketAddrV4, usize)>,
+) -> Option<PeerEvent> {
+    pending.retain(|id, (addr, _)| peers.get(id).is_some_and(|peer| peer.addr == *addr));
+    for (&id, peer) in peers {
+        if peer.commands.is_closed() && peer.worker.is_finished() {
+            // No more events can be sent by this worker. Its queued tail is
+            // within at most the channel capacity, even with concurrent senders.
+            pending
+                .entry(id)
+                .or_insert((peer.addr, events.max_capacity()));
+        }
+    }
+    // Fully free capacity also excludes reserved, not-yet-published messages.
+    let drained = events.capacity() == events.max_capacity();
+    if let Some(event) = pending.iter().find_map(|(&peer_id, &(addr, remaining))| {
+        (remaining == 0 || drained).then_some(PeerEvent::Lost { peer_id, addr })
+    }) {
+        return Some(event);
+    }
+    if pending.is_empty() {
+        return None;
+    }
+    // Service the queued prefix before unrelated wakes can prolong retention.
+    let Ok(event) = events.try_recv() else {
+        return None;
+    };
+    for (_, remaining) in pending.values_mut() {
+        *remaining = remaining.saturating_sub(1);
+    }
+    Some(event)
 }
 
 pub(super) fn observe_live_window(c: &mut Continuity, peer: u64, payload: &[u8]) {
@@ -387,6 +444,47 @@ pub(super) async fn retransmit_stalled_requests(
     } else {
         Vec::new()
     }
+}
+
+/// Shared terminal path, after the generation's queued reliable events are handled.
+pub(super) async fn handle_pool_peer_loss(
+    peer_id: u64,
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+    continuity: &mut Continuity,
+    chunks_per_piece: u16,
+    candidates: &mut SessionCandidates,
+    loss_count: &mut usize,
+    peer_count: &AtomicU32,
+) -> bool {
+    let lost_producer = peers.get(&peer_id).is_some_and(|peer| peer.produced_output);
+    if let Some(lost) = drop_peer_runtime(peer_id, peers, continuity) {
+        crate::alog!("[ace] {lost}: upstream peer lost");
+        record_pool_losses(candidates, loss_count, [lost]);
+        let newly_lost = advance_pool_requests(peers, continuity, chunks_per_piece).await;
+        record_pool_losses(candidates, loss_count, newly_lost);
+        peer_count.store(peers.len() as u32, Ordering::Relaxed);
+    }
+    if lost_producer && !peers.values().any(|peer| peer.produced_output) {
+        let cursor = continuity.reasm.next_needed();
+        let stale_sources: Vec<_> = peers
+            .iter()
+            .filter_map(|(&id, peer)| {
+                (peer.max_piece < cursor && candidates.kind(peer.addr) == CandidateKind::Source)
+                    .then_some(id)
+            })
+            .collect();
+        for id in stale_sources {
+            if let Some(source) = drop_peer_runtime(id, peers, continuity) {
+                // This transport still works but its old window cannot cover
+                // the cursor. Refresh current source priority after the last
+                // producer is lost; retain all usable fallback transports.
+                candidates.refresh_stale_transport(source, Instant::now());
+                crate::alog!("[ace] refreshing stale source window after producer loss");
+            }
+        }
+        peer_count.store(peers.len() as u32, Ordering::Relaxed);
+    }
+    peers.is_empty()
 }
 
 pub(super) fn drop_peer_runtime(
