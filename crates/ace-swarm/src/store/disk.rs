@@ -8,7 +8,31 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
-use crate::store::Stored;
+use crate::store::{CompletePut, Stored};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+// The command owns admission through commit/failure, even if its reply is dropped.
+struct PendingWire {
+    data: Vec<u8>,
+    pending: Arc<AtomicUsize>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for PendingWire {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.data));
+        self.pending.store(0, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PublicationHooks {
+    // Actor takes this gate outside every metadata/store lock.
+    pause: Option<(Arc<tokio::sync::Notify>, mpsc::Receiver<()>)>,
+    fail_next_write: bool,
+}
 
 const MAX_OPEN_PIECES: usize = 64;
 
@@ -22,9 +46,19 @@ struct PieceIndex {
 struct State {
     index: BTreeMap<u64, PieceIndex>,
     cur_bytes: u64,
+    first_seen: BTreeMap<u64, Instant>,
 }
 
 enum Command {
+    PutComplete {
+        piece: u64,
+        header: [u8; 8],
+        wire: PendingWire,
+        max_bytes: u64,
+        chunks: u16,
+        retention: Option<Duration>,
+        reply: tokio::sync::oneshot::Sender<std::io::Result<CompletePut>>,
+    },
     Put {
         piece: u64,
         chunk: u16,
@@ -62,17 +96,27 @@ enum Command {
 pub(super) struct DiskBackend {
     tx: mpsc::Sender<Command>,
     state: Arc<Mutex<State>>,
+    publication: Arc<tokio::sync::Semaphore>,
+    pending: Arc<AtomicUsize>,
+    #[cfg(test)]
+    hooks: Arc<Mutex<PublicationHooks>>,
 }
 
 #[derive(Clone)]
 pub(super) struct DiskHandle {
     tx: mpsc::Sender<Command>,
+    publication: Arc<tokio::sync::Semaphore>,
+    pending: Arc<AtomicUsize>,
 }
 
 impl DiskBackend {
     pub(super) fn handle(&self) -> DiskHandle {
+        #[cfg(test)]
+        let _ = &self.hooks; // Kept on the backend for colocated test configuration.
         DiskHandle {
             tx: self.tx.clone(),
+            publication: Arc::clone(&self.publication),
+            pending: Arc::clone(&self.pending),
         }
     }
     pub(super) fn new(dir: PathBuf, chunk_length: u64) -> std::io::Result<Self> {
@@ -83,10 +127,33 @@ impl DiskBackend {
         let state = Arc::new(Mutex::new(State::default()));
         let (tx, rx) = mpsc::channel();
         let actor_state = Arc::clone(&state);
+        #[cfg(test)]
+        let hooks = Arc::new(Mutex::new(PublicationHooks::default()));
+        #[cfg(test)]
+        let actor_hooks = Arc::clone(&hooks);
         std::thread::Builder::new()
             .name("outpace-disk-cache".into())
-            .spawn(move || Actor::new(dir, chunk_length, actor_state).run(rx))?;
-        Ok(Self { tx, state })
+            .spawn(move || {
+                let actor = Actor::new(dir, chunk_length, actor_state);
+                #[cfg(test)]
+                let actor = Actor {
+                    hooks: actor_hooks,
+                    ..actor
+                };
+                actor.run(rx);
+            })?;
+        Ok(Self {
+            tx,
+            state,
+            publication: Arc::new(tokio::sync::Semaphore::new(1)),
+            pending: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            hooks,
+        })
+    }
+
+    pub(super) fn retained_bytes(&self) -> u64 {
+        self.state.lock().unwrap().cur_bytes
     }
 
     pub(super) fn put(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) -> Stored {
@@ -172,6 +239,42 @@ impl DiskBackend {
 }
 
 impl DiskHandle {
+    pub(super) async fn put_complete(
+        &self,
+        piece: u64,
+        header: [u8; 8],
+        data: &[u8],
+        max_bytes: u64,
+        chunks: u16,
+        retention: Option<Duration>,
+    ) -> std::io::Result<CompletePut> {
+        let permit = Arc::clone(&self.publication)
+            .acquire_owned()
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        let data = data.to_vec();
+        self.pending.store(data.len(), Ordering::Release);
+        let wire = PendingWire {
+            data,
+            pending: Arc::clone(&self.pending),
+            _permit: permit,
+        };
+        let (reply, done) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Command::PutComplete {
+                piece,
+                header,
+                wire,
+                max_bytes,
+                chunks,
+                retention,
+                reply,
+            })
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        done.await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+    }
+
     pub(super) async fn put(
         &self,
         piece: u64,
@@ -215,6 +318,8 @@ struct Actor {
     state: Arc<Mutex<State>>,
     files: BTreeMap<u64, File>,
     lru: VecDeque<u64>,
+    #[cfg(test)]
+    hooks: Arc<Mutex<PublicationHooks>>,
 }
 
 impl Actor {
@@ -225,12 +330,28 @@ impl Actor {
             state,
             files: BTreeMap::new(),
             lru: VecDeque::new(),
+            #[cfg(test)]
+            hooks: Arc::new(Mutex::new(PublicationHooks::default())),
         }
     }
 
     fn run(mut self, rx: mpsc::Receiver<Command>) {
         while let Ok(command) = rx.recv() {
             match command {
+                Command::PutComplete {
+                    piece,
+                    header,
+                    wire,
+                    max_bytes,
+                    chunks,
+                    retention,
+                    reply,
+                } => {
+                    let result =
+                        self.put_complete(piece, header, &wire.data, max_bytes, chunks, retention);
+                    drop(wire);
+                    let _ = reply.send(result);
+                }
                 Command::Put {
                     piece,
                     chunk,
@@ -347,6 +468,7 @@ impl Actor {
                 let entry = state.index.remove(&lowest).unwrap();
                 let freed = entry.present.values().map(|&n| n as u64).sum::<u64>();
                 state.cur_bytes -= freed;
+                state.first_seen.remove(&lowest);
                 evicted.push(lowest);
             }
             (stored, evicted)
@@ -355,6 +477,102 @@ impl Actor {
             self.remove(piece);
         }
         stored
+    }
+
+    fn put_complete(
+        &mut self,
+        piece: u64,
+        header: [u8; 8],
+        wire: &[u8],
+        max: u64,
+        chunks: u16,
+        retention: Option<Duration>,
+    ) -> std::io::Result<CompletePut> {
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .index
+            .get(&piece)
+            .is_some_and(|entry| entry.present.len() == usize::from(chunks))
+        {
+            return Ok(CompletePut::AlreadyPresent);
+        }
+        #[cfg(test)]
+        let fail = {
+            let (pause, fail) = {
+                let mut hooks = self.hooks.lock().unwrap();
+                (
+                    hooks.pause.take(),
+                    std::mem::take(&mut hooks.fail_next_write),
+                )
+            };
+            if let Some((reached, release)) = pause {
+                reached.notify_one();
+                let _ = release.recv();
+            }
+            fail
+        };
+        let temp = self.dir.join(format!("{piece}.pending"));
+        let result = (|| {
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)?;
+            #[cfg(test)]
+            if fail {
+                return Err(std::io::Error::other("injected whole-piece write failure"));
+            }
+            write_all_at(&file, wire, 0)?;
+            drop(file);
+            std::fs::rename(&temp, self.path(piece))?;
+            Ok::<(), std::io::Error>(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        // Drop any descriptor for the replaced trusted partial generation.
+        self.files.remove(&piece);
+        self.lru.retain(|&p| p != piece);
+        let (evicted, retained) = {
+            let mut state = self.state.lock().unwrap();
+            let present = (0..chunks)
+                .map(|chunk| (chunk, self.chunk_length as u32))
+                .collect();
+            let removed = state
+                .index
+                .insert(piece, PieceIndex { header, present })
+                .map_or(0, |old| old.present.values().map(|&n| u64::from(n)).sum());
+            state.cur_bytes = state.cur_bytes - removed + wire.len() as u64;
+            let now = Instant::now();
+            state.first_seen.entry(piece).or_insert(now);
+            let mut evicted = Vec::new();
+            while let Some((&lowest, _)) = state.index.first_key_value() {
+                let expired = retention.is_some_and(|age| {
+                    state
+                        .first_seen
+                        .get(&lowest)
+                        .is_some_and(|seen| now.saturating_duration_since(*seen) >= age)
+                });
+                if state.cur_bytes <= max && !expired {
+                    break;
+                }
+                let old = state.index.remove(&lowest).unwrap();
+                state.cur_bytes -= old.present.values().map(|&n| u64::from(n)).sum::<u64>();
+                state.first_seen.remove(&lowest);
+                evicted.push(lowest);
+            }
+            (evicted, state.index.contains_key(&piece))
+        };
+        for old in evicted {
+            self.remove(old);
+        }
+        Ok(if retained {
+            CompletePut::Published
+        } else {
+            CompletePut::NotRetained
+        })
     }
 
     fn get(&mut self, piece: u64, chunk: u16) -> Option<(Vec<u8>, [u8; 8])> {
@@ -386,6 +604,7 @@ impl Actor {
             let mut state = self.state.lock().unwrap();
             let (&piece, _) = state.index.iter().next()?;
             let entry = state.index.remove(&piece)?;
+            state.first_seen.remove(&piece);
             let freed = entry.present.values().map(|&n| n as u64).sum();
             state.cur_bytes = state.cur_bytes.saturating_sub(freed);
             (piece, freed)
@@ -439,6 +658,105 @@ fn read_exact_at(file: &File, data: &mut [u8], offset: u64) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn contract_whole_cancel_admission_keeps_one_owned_buffer_and_atomic_budget() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DiskBackend::new(dir.path().join("cache"), 4).unwrap();
+        let handle = backend.handle();
+        handle
+            .put_complete(1, [1; 8], b"11112222", 8, 2, None)
+            .await
+            .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let (release, gate) = mpsc::channel();
+        backend.hooks.lock().unwrap().pause = Some((reached.clone(), gate));
+        let mut admitted = Box::pin(handle.put_complete(2, [2; 8], b"abcdefgh", 8, 2, None));
+        assert!(admitted
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        // Capture observations before releasing the actor, then assert after drain.
+        let before = {
+            let state = backend.state.lock().unwrap();
+            (
+                state.index.contains_key(&2),
+                state.cur_bytes,
+                state.index.len(),
+            )
+        };
+        let pending_before = backend.pending.load(Ordering::Acquire);
+        let mut waiting = Box::pin(handle.put_complete(3, [3; 8], b"XXXXXXXX", 8, 2, None));
+        let waiting_pending = waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending();
+        drop(waiting); // Cancellation before admission must not copy or enqueue.
+        drop(admitted); // Admitted command, rather than caller, owns capacity.
+        let held = (
+            backend.pending.load(Ordering::Acquire),
+            backend.publication.available_permits(),
+        );
+        drop(release); // Disconnection unconditionally releases actor even on unwind.
+        let committed = tokio::time::timeout(Duration::from_secs(5), handle.get(2, 1))
+            .await
+            .unwrap();
+        let absent = tokio::time::timeout(Duration::from_secs(5), handle.get(3, 0))
+            .await
+            .unwrap();
+        assert_eq!(before, (false, 8, 1));
+        assert_eq!(pending_before, 8);
+        assert!(waiting_pending);
+        assert_eq!(held, (8, 0));
+        assert_eq!(committed, Some((b"efgh".to_vec(), [2; 8])));
+        assert!(absent.is_none());
+        assert_eq!(backend.pending.load(Ordering::Acquire), 0);
+        assert_eq!(backend.publication.available_permits(), 1);
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.cur_bytes, 8);
+        assert_eq!(state.index.keys().copied().collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn contract_whole_io_failure_cleans_temp_and_allows_valid_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let backend = DiskBackend::new(cache.clone(), 4).unwrap();
+        let handle = backend.handle();
+        backend.hooks.lock().unwrap().fail_next_write = true;
+        let failed = handle
+            .put_complete(7, [7; 8], b"abcdefgh", 8, 2, None)
+            .await;
+        assert!(failed.is_err());
+        assert!(handle.get(7, 0).await.is_none());
+        assert_eq!(backend.retained_bytes(), 0);
+        assert!(backend.state.lock().unwrap().index.is_empty());
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+        assert_eq!(backend.pending.load(Ordering::Acquire), 0);
+        assert_eq!(backend.publication.available_permits(), 1);
+        assert_eq!(
+            handle
+                .put_complete(7, [8; 8], b"ijklmnop", 8, 2, None)
+                .await
+                .unwrap(),
+            CompletePut::Published
+        );
+        assert_eq!(handle.get(7, 1).await, Some((b"mnop".to_vec(), [8; 8])));
+        assert_eq!(
+            handle
+                .put_complete(7, [9; 8], b"XXXXXXXX", 8, 2, None)
+                .await
+                .unwrap(),
+            CompletePut::AlreadyPresent
+        );
+        assert_eq!(handle.get(7, 0).await, Some((b"ijkl".to_vec(), [8; 8])));
+        assert_eq!(backend.retained_bytes(), 8);
+    }
 
     #[tokio::test]
     async fn cancelled_disk_put_still_commits_index_and_budget_atomically() {

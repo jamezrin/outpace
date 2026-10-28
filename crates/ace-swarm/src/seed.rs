@@ -503,6 +503,250 @@ impl ServeCoordinator {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn contract_producer_completed_store_drives_actual_bitfield_have_and_reply_profiles() {
+        use crate::seed::protocol::{prepare_reply, ServeProfile};
+        use ace_wire::reassembly::PieceReassembler;
+        for disk in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = if disk {
+                crate::store::BackendKind::Disk {
+                    dir: dir.path().join("cache"),
+                }
+            } else {
+                crate::store::BackendKind::Memory
+            };
+            let store = Arc::new(Mutex::new(
+                PieceStore::with_backend(8, 4, 64, backend).unwrap(),
+            ));
+            let mut producer = PieceReassembler::new(8, 7);
+            producer.add_live_chunk(7, 0, 4, [2; 8], b"part").unwrap();
+            assert!(producer.completed_live_piece(7).is_none());
+            producer.add_live_chunk(8, 0, 4, [3; 8], b"abcd").unwrap();
+            producer.add_live_chunk(8, 1, 4, [3; 8], b"efgh").unwrap();
+            let complete = producer.completed_live_piece(8).unwrap();
+            PieceStore::shared_put_complete_piece(&store, 8, complete.header, complete.wire)
+                .await
+                .unwrap();
+            assert!(producer.take_ready().is_empty());
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let served = store.clone();
+            let task = tokio::spawn(async move {
+                let mut session = PeerSession::new(server);
+                SeederSession::serve(
+                    &mut session,
+                    Some(served),
+                    None,
+                    [0; 8],
+                    &Identity::generate(),
+                    [127, 0, 0, 1],
+                    None,
+                )
+                .await
+            });
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut peer = PeerSession::new(client);
+                peer.read_message().await.unwrap();
+                peer.send(&PeerMessage::Extended {
+                    ext_id: 0,
+                    payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+                })
+                .await
+                .unwrap();
+                let bootstrap = loop {
+                    let msg = peer.read_message().await.unwrap();
+                    if matches!(msg, PeerMessage::Bitfield(_)) {
+                        break msg;
+                    }
+                };
+                producer.add_live_chunk(9, 1, 4, [4; 8], b"mnop").unwrap();
+                producer.add_live_chunk(9, 0, 4, [4; 8], b"ijkl").unwrap();
+                let complete = producer.completed_live_piece(9).unwrap();
+                PieceStore::shared_put_complete_piece(&store, 9, complete.header, complete.wire)
+                    .await
+                    .unwrap();
+                let have = loop {
+                    let msg = peer.read_message().await.unwrap();
+                    if matches!(msg, PeerMessage::Unknown { id: 4, .. }) {
+                        break msg;
+                    }
+                };
+                (bootstrap, have)
+            })
+            .await;
+            task.abort();
+            let _ = task.await;
+            let (bootstrap, have) = result.expect("bounded actual seeder advertisements");
+            assert_eq!(bootstrap, ace_wire::live_codec::live_bitfield(8, 1));
+            assert_eq!(have, ace_wire::live_codec::live_have(9));
+            for profile in [
+                ServeProfile::Inbound {
+                    fallback_header: [9; 8],
+                },
+                ServeProfile::Reciprocal,
+            ] {
+                assert!(prepare_reply(
+                    &ace_wire::live_codec::chunk_request(7, 0),
+                    Some(&store),
+                    profile
+                )
+                .await
+                .is_none());
+                let reply = prepare_reply(
+                    &ace_wire::live_codec::chunk_request(8, 1),
+                    Some(&store),
+                    profile,
+                )
+                .await
+                .unwrap();
+                let chunk = ace_wire::live_codec::LiveChunk::from_message(&reply.message).unwrap();
+                assert_eq!(chunk.data, b"efgh");
+                assert_eq!(chunk.piece_header, [3; 8]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_rsa_producer_reject_retry_drives_actual_bitfield_have_and_replies() {
+        use crate::seed::protocol::{prepare_reply, ServeProfile};
+        use ace_wire::reassembly::PieceReassembler;
+        let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+        let mut wire = vec![0x42; 128 - auth.signature_len()];
+        wire.extend(auth.sign(&wire));
+        let mut corrupt = wire.clone();
+        corrupt[0] ^= 1;
+        for disk in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = if disk {
+                crate::store::BackendKind::Disk {
+                    dir: dir.path().join("cache"),
+                }
+            } else {
+                crate::store::BackendKind::Memory
+            };
+            let store = Arc::new(Mutex::new(
+                PieceStore::with_backend(128, 64, 512, backend).unwrap(),
+            ));
+            let mut producer = PieceReassembler::new(128, 7).with_source_pubkey(auth.pubkey_der());
+            producer
+                .add_live_chunk(7, 0, 64, [2; 8], &corrupt[..64])
+                .unwrap();
+            assert!(matches!(
+                producer.add_live_chunk(7, 1, 64, [2; 8], &corrupt[64..]),
+                Err(ace_wire::WireError::SignatureRejected)
+            ));
+            assert!(producer.completed_live_piece(7).is_none());
+            producer
+                .add_live_chunk(8, 0, 64, [3; 8], &wire[..64])
+                .unwrap();
+            producer
+                .add_live_chunk(8, 1, 64, [3; 8], &wire[64..])
+                .unwrap();
+            let complete = producer.completed_live_piece(8).unwrap();
+            assert_eq!(
+                complete.acceptance,
+                ace_wire::reassembly::LiveAcceptance::SourceVerified
+            );
+            PieceStore::shared_put_complete_piece(&store, 8, complete.header, complete.wire)
+                .await
+                .unwrap();
+            assert!(producer.take_ready().is_empty());
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let served = store.clone();
+            let task = tokio::spawn(async move {
+                let mut session = PeerSession::new(server);
+                SeederSession::serve(
+                    &mut session,
+                    Some(served),
+                    None,
+                    [0; 8],
+                    &Identity::generate(),
+                    [127, 0, 0, 1],
+                    None,
+                )
+                .await
+            });
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut peer = PeerSession::new(client);
+                peer.read_message().await.unwrap();
+                peer.send(&PeerMessage::Extended {
+                    ext_id: 0,
+                    payload: b"d1:md11:ut_metadatai2eee".to_vec(),
+                })
+                .await
+                .unwrap();
+                let bootstrap = loop {
+                    let msg = peer.read_message().await.unwrap();
+                    if matches!(msg, PeerMessage::Bitfield(_)) {
+                        break msg;
+                    }
+                };
+                producer
+                    .add_live_chunk(9, 1, 64, [4; 8], &wire[64..])
+                    .unwrap();
+                producer
+                    .add_live_chunk(9, 0, 64, [4; 8], &wire[..64])
+                    .unwrap();
+                let complete = producer.completed_live_piece(9).unwrap();
+                PieceStore::shared_put_complete_piece(&store, 9, complete.header, complete.wire)
+                    .await
+                    .unwrap();
+                let have = loop {
+                    let msg = peer.read_message().await.unwrap();
+                    if matches!(msg, PeerMessage::Unknown { id: 4, .. }) {
+                        break msg;
+                    }
+                };
+                (bootstrap, have)
+            })
+            .await;
+            task.abort();
+            let _ = task.await;
+            let (bootstrap, have) = result.expect("bounded actual seeder advertisements");
+            assert_eq!(bootstrap, ace_wire::live_codec::live_bitfield(8, 1));
+            assert_eq!(have, ace_wire::live_codec::live_have(9));
+            for profile in [
+                ServeProfile::Inbound {
+                    fallback_header: [9; 8],
+                },
+                ServeProfile::Reciprocal,
+            ] {
+                assert!(prepare_reply(
+                    &ace_wire::live_codec::chunk_request(7, 0),
+                    Some(&store),
+                    profile
+                )
+                .await
+                .is_none());
+                let reply = prepare_reply(
+                    &ace_wire::live_codec::chunk_request(8, 1),
+                    Some(&store),
+                    profile,
+                )
+                .await
+                .unwrap();
+                let chunk = ace_wire::live_codec::LiveChunk::from_message(&reply.message).unwrap();
+                assert_eq!(chunk.data, wire[64..]);
+                assert_eq!(chunk.piece_header, [3; 8]);
+            }
+            producer
+                .add_live_chunk(7, 1, 64, [5; 8], &wire[64..])
+                .unwrap();
+            producer
+                .add_live_chunk(7, 0, 64, [5; 8], &wire[..64])
+                .unwrap();
+            let retry = producer.completed_live_piece(7).unwrap();
+            assert_eq!(
+                retry.acceptance,
+                ace_wire::reassembly::LiveAcceptance::SourceVerified
+            );
+            PieceStore::shared_put_complete_piece(&store, 7, retry.header, retry.wire)
+                .await
+                .unwrap();
+            assert!(store.lock().await.has_piece(7));
+        }
+    }
+
     #[test]
     fn unchokes_up_to_max_plus_one_optimistic() {
         let c = Choker::new(2);

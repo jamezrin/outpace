@@ -16,6 +16,14 @@ use tokio::sync::Mutex;
 /// Maximum request block accepted from a standard BitTorrent peer (BEP 3 convention).
 pub const MAX_BT_REQUEST_LEN: u32 = 16 * 1024;
 
+/// Result of an atomic trusted whole-wire publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletePut {
+    Published,
+    AlreadyPresent,
+    NotRetained,
+}
+
 mod disk;
 use disk::DiskBackend;
 
@@ -201,6 +209,90 @@ impl MemoryBackend {
 }
 
 impl PieceStore {
+    /// Publish trusted full wire bytes atomically. Authentication belongs to the caller.
+    pub async fn shared_put_complete_piece(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        header: [u8; 8],
+        wire: &[u8],
+    ) -> std::io::Result<CompletePut> {
+        let (handle, max, chunks, retention) = {
+            let mut guard = store.lock().await;
+            let length = guard.piece_length;
+            let chunk = guard.chunk_length;
+            if length == 0
+                || chunk == 0
+                || length % chunk != 0
+                || length / chunk > u16::MAX as u64
+                || usize::try_from(length).ok() != Some(wire.len())
+                || u32::try_from(chunk).is_err()
+            {
+                return Err(std::io::ErrorKind::InvalidInput.into());
+            }
+            let chunks = (length / chunk) as u16;
+            if guard.max_bytes < length {
+                return Ok(CompletePut::NotRetained);
+            }
+            if let Backend::Memory(memory) = &mut guard.backend {
+                if memory.has_piece(piece, chunks) {
+                    return Ok(CompletePut::AlreadyPresent);
+                }
+                let complete = wire
+                    .chunks_exact(chunk as usize)
+                    .enumerate()
+                    .map(|(i, bytes)| (i as u16, bytes.to_vec()))
+                    .collect();
+                let removed = memory
+                    .pieces
+                    .insert(piece, complete)
+                    .map_or(0, |old| old.values().map(|b| b.len() as u64).sum());
+                memory.headers.insert(piece, header);
+                guard.cur_bytes = guard.cur_bytes - removed + length;
+                let now = Instant::now();
+                if guard.retention.is_some() {
+                    guard.first_seen.entry(piece).or_insert(now);
+                    guard.newest_seen = Some(guard.newest_seen.map_or(now, |old| old.max(now)));
+                }
+                while guard.cur_bytes > guard.max_bytes {
+                    let Some(freed) = guard.evict_lowest_tracked() else {
+                        break;
+                    };
+                    guard.cur_bytes -= freed;
+                }
+                if let (Some(age), Some(newest)) = (guard.retention, guard.newest_seen) {
+                    while guard
+                        .first_seen
+                        .first_key_value()
+                        .is_some_and(|(_, seen)| newest.saturating_duration_since(*seen) >= age)
+                    {
+                        let Some(freed) = guard.evict_lowest_tracked() else {
+                            break;
+                        };
+                        guard.cur_bytes -= freed;
+                    }
+                }
+                return Ok(if guard.has_piece(piece) {
+                    CompletePut::Published
+                } else {
+                    CompletePut::NotRetained
+                });
+            }
+            let Backend::Disk(disk) = &guard.backend else {
+                unreachable!()
+            };
+            (disk.handle(), guard.max_bytes, chunks, guard.retention)
+        };
+        let result = handle
+            .put_complete(piece, header, wire, max, chunks, retention)
+            .await;
+        // Disk actor state is authoritative, including after cancellation of this caller.
+        let mut guard = store.lock().await;
+        if let Backend::Disk(disk) = &guard.backend {
+            guard.cur_bytes = disk.retained_bytes();
+        }
+        result
+    }
+
     /// Read a chunk from a shared store without running disk I/O on a Tokio worker thread.
     /// Memory stores take the ordinary async lock and preserve their zero-copy internal path;
     /// disk stores perform the synchronous compatibility operation on the blocking pool.
@@ -392,8 +484,14 @@ impl PieceStore {
             self.first_seen.entry(piece).or_insert(now);
             self.newest_seen = Some(self.newest_seen.map_or(now, |m| m.max(now)));
         }
-        self.cur_bytes -= stored.removed;
-        self.cur_bytes += stored.added;
+        if let Backend::Disk(disk) = &self.backend {
+            // Admitted whole publications can outlive their async callers. Refresh
+            // after the serialized write rather than applying deltas to a stale mirror.
+            self.cur_bytes = disk.retained_bytes();
+        } else {
+            self.cur_bytes -= stored.removed;
+            self.cur_bytes += stored.added;
+        }
         while self.cur_bytes > self.max_bytes {
             // Stop only when the store is empty (`None`); a zero-byte piece (`Some(0)`) must not
             // halt eviction while real over-budget bytes remain in higher pieces.
@@ -462,6 +560,168 @@ mod tests {
     // 4-byte chunks, 2 chunks/piece, tiny budget for eviction tests.
     fn store(max_bytes: u64) -> PieceStore {
         PieceStore::new(8, 4, max_bytes)
+    }
+
+    #[tokio::test]
+    async fn contract_concurrent_complete_puts_preserve_one_whole_generation() {
+        for disk in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = if disk {
+                BackendKind::Disk {
+                    dir: dir.path().join("cache"),
+                }
+            } else {
+                BackendKind::Memory
+            };
+            let store = Arc::new(Mutex::new(
+                PieceStore::with_backend(8, 4, 8, backend).unwrap(),
+            ));
+            let (a, b) = tokio::join!(
+                PieceStore::shared_put_complete_piece(&store, 7, [1; 8], b"abcdefgh"),
+                PieceStore::shared_put_complete_piece(&store, 7, [2; 8], b"ijklmnop")
+            );
+            let a = a.unwrap();
+            let b = b.unwrap();
+            assert!(matches!(
+                (a, b),
+                (CompletePut::Published, CompletePut::AlreadyPresent)
+                    | (CompletePut::AlreadyPresent, CompletePut::Published)
+            ));
+            let (wire, header) = if a == CompletePut::Published {
+                (b"abcdefgh", [1; 8])
+            } else {
+                (b"ijklmnop", [2; 8])
+            };
+            assert_eq!(
+                PieceStore::shared_block(&store, 7, 0, 8).await.unwrap(),
+                wire
+            );
+            assert_eq!(store.lock().await.piece_header(7), Some(header));
+            assert_eq!(store.lock().await.cur_bytes, 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_complete_publication_is_exact_immutable_and_budgeted_on_both_backends() {
+        for disk in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = if disk {
+                BackendKind::Disk {
+                    dir: dir.path().join("cache"),
+                }
+            } else {
+                BackendKind::Memory
+            };
+            let store = Arc::new(Mutex::new(
+                PieceStore::with_backend(8, 4, 16, backend).unwrap(),
+            ));
+            assert!(PieceStore::shared_chunk(&store, 7, 0).await.is_none());
+            assert_eq!(
+                PieceStore::shared_put_complete_piece(&store, 7, [3; 8], b"abcdefgh")
+                    .await
+                    .unwrap(),
+                CompletePut::Published
+            );
+            assert_eq!(
+                PieceStore::shared_chunk(&store, 7, 0).await,
+                Some((b"abcd".to_vec(), [3; 8]))
+            );
+            assert_eq!(
+                PieceStore::shared_chunk(&store, 7, 1).await,
+                Some((b"efgh".to_vec(), [3; 8]))
+            );
+            assert_eq!(
+                PieceStore::shared_put_complete_piece(&store, 8, [4; 8], b"ijklmnop")
+                    .await
+                    .unwrap(),
+                CompletePut::Published
+            );
+            assert_eq!(
+                PieceStore::shared_put_complete_piece(&store, 7, [9; 8], b"XXXXXXXX")
+                    .await
+                    .unwrap(),
+                CompletePut::AlreadyPresent
+            );
+            assert_eq!(
+                PieceStore::shared_block(&store, 7, 0, 8).await.unwrap(),
+                b"abcdefgh"
+            );
+            assert_eq!(store.lock().await.cur_bytes, 16);
+            PieceStore::shared_put_complete_piece(&store, 9, [5; 8], b"qrstuvwx")
+                .await
+                .unwrap();
+            let guard = store.lock().await;
+            assert_eq!(guard.have_pieces(), vec![8, 9]);
+            assert_eq!(guard.cur_bytes, 16);
+            assert!(guard.piece_header(7).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_complete_publication_rejects_geometry_without_mutation() {
+        for disk in [false, true] {
+            for (piece_len, chunk_len, wire) in [
+                (8, 4, b"short".as_slice()),
+                (8, 4, b"too long!".as_slice()),
+                (8, 3, b"abcdefgh".as_slice()),
+                (0, 4, b"".as_slice()),
+                (8, 0, b"abcdefgh".as_slice()),
+                (65536, 1, b"".as_slice()),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let backend = if disk {
+                    BackendKind::Disk {
+                        dir: dir.path().join("cache"),
+                    }
+                } else {
+                    BackendKind::Memory
+                };
+                let store = Arc::new(Mutex::new(
+                    PieceStore::with_backend(piece_len, chunk_len, 100000, backend).unwrap(),
+                ));
+                assert!(
+                    PieceStore::shared_put_complete_piece(&store, 7, [3; 8], wire)
+                        .await
+                        .is_err()
+                );
+                let guard = store.lock().await;
+                if chunk_len != 0 {
+                    assert!(guard.have_pieces().is_empty());
+                    assert_eq!(guard.window(), None);
+                }
+                assert_eq!(guard.cur_bytes, 0);
+                assert!(guard.piece_header(7).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_complete_publication_disabled_or_undersized_has_no_metadata() {
+        for disk in [false, true] {
+            for budget in [0, 7] {
+                let dir = tempfile::tempdir().unwrap();
+                let backend = if disk {
+                    BackendKind::Disk {
+                        dir: dir.path().join("cache"),
+                    }
+                } else {
+                    BackendKind::Memory
+                };
+                let store = Arc::new(Mutex::new(
+                    PieceStore::with_backend(8, 4, budget, backend).unwrap(),
+                ));
+                assert_eq!(
+                    PieceStore::shared_put_complete_piece(&store, 7, [1; 8], b"abcdefgh")
+                        .await
+                        .unwrap(),
+                    CompletePut::NotRetained
+                );
+                let guard = store.lock().await;
+                assert_eq!(guard.cur_bytes, 0);
+                assert_eq!(guard.window(), None);
+                assert!(guard.piece_header(7).is_none());
+            }
+        }
     }
 
     #[tokio::test]

@@ -8,7 +8,39 @@
 use crate::{Result, WireError};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone, Copy)]
+struct LiveMetadata {
+    header: [u8; 8],
+    chunk_length: u64,
+    eligible: bool,
+}
+
+/// Authentication status of a completed live wire piece.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveAcceptance {
+    SourceVerified,
+    UnsignedAssemblyAccepted,
+    Unauthenticated,
+}
+
+pub struct LiveBlockOutcome {
+    pub contributed: bool,
+    pub completed: bool,
+}
+
+pub struct CompletedLivePiece<'a> {
+    pub wire: &'a [u8],
+    pub header: [u8; 8],
+    pub acceptance: LiveAcceptance,
+}
+
+struct Complete {
+    buf: Vec<u8>,
+    live: Option<LiveMetadata>,
+}
+
 struct Partial {
+    live: Option<LiveMetadata>,
     buf: Vec<u8>,
     /// Offsets (`begin`) of the blocks already written, so a block delivered more than once
     /// is counted toward completion only once. Blocks are chunk-aligned and non-overlapping
@@ -42,7 +74,7 @@ pub struct PieceReassembler {
     /// set a window that comfortably covers what they actually request.
     max_ahead: u64,
     partial: BTreeMap<u64, Partial>,
-    complete: BTreeMap<u64, Vec<u8>>,
+    complete: BTreeMap<u64, Complete>,
 }
 
 impl PieceReassembler {
@@ -137,10 +169,12 @@ impl PieceReassembler {
             return Err(WireError::Invalid("block exceeds piece length"));
         }
         let p = self.partial.entry(index).or_insert_with(|| Partial {
+            live: None,
             buf: vec![0u8; self.piece_length as usize],
             filled_offsets: BTreeSet::new(),
             filled: 0,
         });
+        p.live = None; // Generic writes do not establish publication geometry.
         p.buf[begin as usize..end as usize].copy_from_slice(block);
         // Count each distinct block once. A duplicate delivery (same `begin`) — which the
         // retransmit path produces by re-requesting a whole piece from a second peer without
@@ -163,9 +197,80 @@ impl PieceReassembler {
                     return Err(WireError::SignatureRejected);
                 }
             }
-            self.complete.insert(index, done.buf);
+            self.complete.insert(
+                index,
+                Complete {
+                    buf: done.buf,
+                    live: None,
+                },
+            );
         }
         Ok(!block.is_empty())
+    }
+
+    /// Track publication eligibility independently of the legacy playback assembly rules.
+    pub fn add_live_chunk(
+        &mut self,
+        index: u64,
+        chunk: u16,
+        chunk_length: u64,
+        header: [u8; 8],
+        block: &[u8],
+    ) -> Result<LiveBlockOutcome> {
+        if index < self.next_emit || self.complete.contains_key(&index) {
+            return Ok(LiveBlockOutcome {
+                contributed: false,
+                completed: false,
+            });
+        }
+        let prior = self.partial.get(&index);
+        let geometry = chunk_length > 0
+            && self.piece_length > 0
+            && self.piece_length.is_multiple_of(chunk_length)
+            && self.piece_length / chunk_length <= u16::MAX as u64
+            && u64::from(chunk) < self.piece_length / chunk_length
+            && block.len() as u64 == chunk_length
+            && usize::try_from(self.piece_length).is_ok();
+        let mut metadata = prior.and_then(|p| p.live).unwrap_or(LiveMetadata {
+            header,
+            chunk_length,
+            eligible: prior.is_none(),
+        });
+        metadata.eligible &=
+            geometry && metadata.header == header && metadata.chunk_length == chunk_length;
+        // u16 * u64 is checked; normal pool geometry retains the old begin value.
+        let begin = u64::from(chunk)
+            .checked_mul(chunk_length)
+            .ok_or(WireError::Invalid("block offset overflow"))?;
+        let contributed = self.add_block_with_contribution(index, begin, block)?;
+        let completed = self.complete.contains_key(&index);
+        if let Some(done) = self.complete.get_mut(&index) {
+            done.live = Some(metadata);
+        } else if let Some(partial) = self.partial.get_mut(&index) {
+            partial.live = Some(metadata);
+        }
+        Ok(LiveBlockOutcome {
+            contributed,
+            completed,
+        })
+    }
+
+    /// Borrow full wire bytes before ordered playback removes their signature trailer.
+    pub fn completed_live_piece(&self, index: u64) -> Option<CompletedLivePiece<'_>> {
+        let done = self.complete.get(&index)?;
+        let metadata = done.live.filter(|m| m.eligible)?;
+        let acceptance = if self.verify_pubkey.is_some() {
+            LiveAcceptance::SourceVerified
+        } else if self.piece_trailer == 0 {
+            LiveAcceptance::UnsignedAssemblyAccepted
+        } else {
+            LiveAcceptance::Unauthenticated
+        };
+        Some(CompletedLivePiece {
+            wire: &done.buf,
+            header: metadata.header,
+            acceptance,
+        })
     }
 
     /// Discard only incomplete bytes for a rejected piece before requesting it again.
@@ -178,7 +283,7 @@ impl PieceReassembler {
     pub fn ready_chunks(&self) -> impl Iterator<Item = &[u8]> {
         let mut next = self.next_emit;
         std::iter::from_fn(move || {
-            let bytes = self.complete.get(&next)?;
+            let bytes = &self.complete.get(&next)?.buf;
             next = next.checked_add(1)?;
             Some(&bytes[..bytes.len().saturating_sub(self.piece_trailer as usize)])
         })
@@ -188,7 +293,8 @@ impl PieceReassembler {
     /// advancing the emit cursor. Returns empty if the next needed piece isn't ready yet.
     pub fn take_ready(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
-        while let Some(bytes) = self.complete.remove(&self.next_emit) {
+        while let Some(done) = self.complete.remove(&self.next_emit) {
+            let bytes = done.buf;
             let media_end = bytes.len().saturating_sub(self.piece_trailer as usize);
             out.extend_from_slice(&bytes[..media_end]);
             self.next_emit += 1;
@@ -220,6 +326,113 @@ impl PieceReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_invalid_publication_geometry_preserves_generic_playback() {
+        // Legacy distinct-offset completion remains playback-compatible even when
+        // short chunks cannot establish a publishable live geometry.
+        let mut r = PieceReassembler::new(8, 0);
+        r.add_live_chunk(0, 0, 4, [0; 8], b"ab").unwrap();
+        assert!(r.add_live_chunk(0, 1, 4, [0; 8], b"cdefgh").is_err());
+        // Finish through the generic path, which must invalidate publication only.
+        r.add_block(0, 2, b"cdefgh").unwrap();
+        assert!(r.completed_live_piece(0).is_none());
+        assert_eq!(r.take_ready(), b"abcdefgh");
+    }
+
+    #[test]
+    fn contract_live_signed_ahead_completion_retains_wire_and_ignores_bad_duplicate() {
+        let auth = crate::live_auth::LiveSourceAuth::generate();
+        let (wire, media) = signed_piece(&auth, 128, 0x5a);
+        let mut r = PieceReassembler::new(128, 7).with_source_pubkey(auth.pubkey_der());
+        let first = r.add_live_chunk(8, 1, 64, [3; 8], &wire[64..]).unwrap();
+        assert!(first.contributed && !first.completed);
+        assert!(r.completed_live_piece(8).is_none());
+        let last = r.add_live_chunk(8, 0, 64, [3; 8], &wire[..64]).unwrap();
+        assert!(last.contributed && last.completed);
+        assert!(
+            r.take_ready().is_empty(),
+            "ahead completion cannot advance playback"
+        );
+        let completed = r.completed_live_piece(8).unwrap();
+        assert_eq!(completed.wire, wire);
+        assert_eq!(completed.header, [3; 8]);
+        assert!(matches!(
+            completed.acceptance,
+            LiveAcceptance::SourceVerified
+        ));
+        let duplicate = r.add_live_chunk(8, u16::MAX, 0, [9; 8], b"bad").unwrap();
+        assert!(!duplicate.contributed && !duplicate.completed);
+        assert_eq!(r.completed_live_piece(8).unwrap().wire, wire);
+        r.skip_to(8);
+        assert_eq!(r.take_ready(), media);
+        assert!(r.completed_live_piece(8).is_none());
+    }
+
+    #[test]
+    fn contract_live_rejection_then_last_chunk_first_retry_has_clean_metadata() {
+        let auth = crate::live_auth::LiveSourceAuth::generate();
+        let (wire, media) = signed_piece(&auth, 128, 0x33);
+        let mut bad = wire.clone();
+        bad[0] ^= 1;
+        let mut r = PieceReassembler::new(128, 7).with_source_pubkey(auth.pubkey_der());
+        r.add_live_chunk(7, 0, 64, [1; 8], &bad[..64]).unwrap();
+        assert!(matches!(
+            r.add_live_chunk(7, 1, 64, [1; 8], &bad[64..]),
+            Err(WireError::SignatureRejected)
+        ));
+        assert!(r.completed_live_piece(7).is_none());
+        assert!(r.take_ready().is_empty());
+        r.add_live_chunk(7, 1, 64, [2; 8], &wire[64..]).unwrap();
+        r.add_live_chunk(7, 0, 64, [2; 8], &wire[..64]).unwrap();
+        assert_eq!(r.completed_live_piece(7).unwrap().header, [2; 8]);
+        assert_eq!(r.completed_live_piece(7).unwrap().wire, wire);
+        assert_eq!(r.take_ready(), media);
+    }
+
+    #[test]
+    fn contract_live_unsigned_and_unusable_key_keep_distinct_acceptance_and_playback() {
+        for (trailer, expected) in [(0, b"abcdefgh".as_slice()), (2, b"abcdef".as_slice())] {
+            let mut r = PieceReassembler::new(8, 0)
+                .with_piece_trailer(trailer)
+                .with_source_pubkey(vec![0xff]);
+            r.add_live_chunk(0, 0, 4, [0; 8], b"abcd").unwrap();
+            r.add_live_chunk(0, 1, 4, [0; 8], b"efgh").unwrap();
+            let completed = r.completed_live_piece(0).unwrap();
+            assert_eq!(completed.wire, b"abcdefgh");
+            if trailer == 0 {
+                assert!(matches!(
+                    completed.acceptance,
+                    LiveAcceptance::UnsignedAssemblyAccepted
+                ));
+            } else {
+                assert!(matches!(
+                    completed.acceptance,
+                    LiveAcceptance::Unauthenticated
+                ));
+            }
+            assert_eq!(r.take_ready(), expected);
+        }
+    }
+
+    #[test]
+    fn contract_live_header_conflict_disables_publication_without_rejecting_signed_playback() {
+        let auth = crate::live_auth::LiveSourceAuth::generate();
+        let (wire, media) = signed_piece(&auth, 128, 0x44);
+        let mut r = PieceReassembler::new(128, 0).with_source_pubkey(auth.pubkey_der());
+        r.add_live_chunk(0, 0, 64, [0; 8], &wire[..64]).unwrap();
+        let outcome = r.add_live_chunk(0, 1, 64, [1; 8], &wire[64..]).unwrap();
+        assert!(outcome.contributed && outcome.completed);
+        assert!(
+            r.completed_live_piece(0).is_none(),
+            "conflicting headers are ineligible for publication"
+        );
+        assert_eq!(
+            r.take_ready(),
+            media,
+            "publication checks must preserve accepted playback"
+        );
+    }
 
     #[test]
     fn ready_chunks_observe_only_contiguous_media_without_trailers() {
