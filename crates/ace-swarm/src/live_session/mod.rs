@@ -21,7 +21,9 @@ pub type StoreFactory = std::sync::Arc<dyn Fn([u8; 20]) -> crate::store::PieceSt
 use crate::discover::{DiscoveryOptions, MAX_DISCOVERY_PEERS};
 use crate::listen::SeedRegistry;
 use crate::reachability::ReachabilityMonitor;
-use crate::scheduler::{ActivePeers, PeerAssignment, Scheduler};
+#[cfg(test)]
+use crate::scheduler::PeerAssignment;
+use crate::scheduler::{ActivePeers, Scheduler};
 use crate::store::PieceStore;
 use crate::types::StreamInfo;
 #[cfg(test)]
@@ -163,10 +165,10 @@ use pool_support::{
 };
 mod support;
 #[cfg(test)]
-use support::{advance_head_from_window, stale_upstream_budget};
+use support::{advance_head_from_window, schedule_piece_assignments, stale_upstream_budget};
 use support::{
     hex_preview, pool_progress_budget, read_peer_window, read_window_max,
-    schedule_piece_assignments, should_refresh_stale_deadline,
+    should_refresh_stale_deadline,
 };
 
 mod reconnect;

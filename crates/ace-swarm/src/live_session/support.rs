@@ -56,6 +56,7 @@ pub(super) fn should_refresh_stale_deadline(
     made_output || (emitted == 0 && made_activity)
 }
 
+#[cfg(test)]
 pub(super) fn schedule_piece_assignments(
     scheduler: &mut Scheduler,
     active_peers: &mut ActivePeers,

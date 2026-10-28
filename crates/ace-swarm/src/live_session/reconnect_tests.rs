@@ -643,6 +643,137 @@ async fn learned_source_recovers_after_peer_lost() {
 }
 
 #[tokio::test]
+async fn idle_pool_turn_replenishes_request_credit_without_inbound_peer_frames() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (server_stream, _) = listener.accept().await.unwrap();
+
+    let (mut info, mut seed) = cancellation_fixture();
+    info.piece_length = 752;
+    info.chunk_length = 752;
+    let policy = LiveRecoveryConfig {
+        request_timeout_ms: 5_000,
+        stale_upstream_timeout_ms: 10_000,
+        request_check_interval_ms: 10,
+        max_piece_advance: 256,
+        ..default_live_recovery()
+    };
+    seed.live_recovery = policy;
+    seed.prefetch_pieces = 256;
+    let (continuity, _) = Continuity::fresh(&info, 1, 256, 256, policy);
+    let (output_tx, output_rx) = mpsc::channel(4);
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let uploaded = Arc::new(AtomicU64::new(0));
+    let peers_served = Arc::new(AtomicU32::new(0));
+    let peer_count = Arc::new(AtomicU32::new(0));
+    let identity = Identity::generate();
+    let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(
+        info.piece_length,
+        info.chunk_length,
+        4096,
+    )));
+    let mut candidates = SessionCandidates::default();
+    let started_at = Instant::now();
+    let mut server = tokio::spawn(async move {
+        let mut session = PeerSession::new(server_stream);
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            if !matches!(
+                session.read_message().await,
+                Ok(PeerMessage::Extended { ext_id: 0, .. })
+            ) {
+                return Err("pool did not send its extended handshake".to_string());
+            }
+            if !matches!(session.read_message().await, Ok(PeerMessage::Interested)) {
+                return Err("pool did not send Interested".to_string());
+            }
+            let mut pieces = Vec::with_capacity(128);
+            while pieces.len() < 128 {
+                let message = session
+                    .read_message()
+                    .await
+                    .map_err(|error| format!("peer socket ended early: {error:?}"))?;
+                match message {
+                    PeerMessage::Unknown { id: 6, payload } if payload.len() == 10 => {
+                        pieces.push(u32::from_be_bytes(payload[4..8].try_into().unwrap()) as u64);
+                    }
+                    other => return Err(format!("unexpected outbound message: {other:?}")),
+                }
+            }
+            Ok(pieces)
+        })
+        .await;
+        result
+            .unwrap_or_else(|_| Err("peer did not receive 128 requests within two seconds".into()))
+    });
+    let mut pool = tokio::spawn(async move {
+        let mut continuity = Some(continuity);
+        follow_peer_pool(
+            vec![ConnectedUpstream {
+                session: PeerSession::new(client),
+                addr,
+                window: live_pos(1, 256),
+                unchoked: true,
+                yourip: None,
+            }],
+            &info,
+            &identity,
+            1,
+            &output_tx,
+            &downloaded,
+            &uploaded,
+            &peers_served,
+            &seed,
+            &store,
+            &mut continuity,
+            vec![],
+            vec![],
+            completed_discovery(|_| Box::pin(async { vec![] })),
+            &mut candidates,
+            &peer_count,
+            None,
+        )
+        .await
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let server_result = (&mut server).await;
+        let pool_result = (&mut pool).await;
+        (server_result, pool_result)
+    })
+    .await;
+    let timed_out_cleanup = if result.is_err() {
+        server.abort();
+        pool.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let _ = (&mut server).await;
+            let _ = (&mut pool).await;
+        })
+        .await
+        .is_ok()
+    } else {
+        true
+    };
+    drop(output_rx);
+    let (server_result, pool_result) = result.expect("pool/local peer exceeded three seconds");
+    let pieces = server_result
+        .expect("local peer task panicked")
+        .expect("local peer failed before receiving 128 requests");
+    let end = pool_result.expect("pool task panicked");
+    let elapsed = started_at.elapsed();
+
+    assert!(timed_out_cleanup);
+    assert_eq!(pieces, (1..=128).collect::<Vec<_>>());
+    assert!(
+        elapsed < policy.request_timeout(),
+        "no request retransmit deadline should fire during idle refill: {elapsed:?}"
+    );
+    assert!(matches!(end, FollowEnd::PeerLost(1)));
+}
+
+#[tokio::test]
 async fn pex_source_recovers_after_pool_stale() {
     learned_source_recovers_after_outage(false, true, false).await;
 }

@@ -308,6 +308,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
     let mut refill_closed = false;
     let mut observed_capacity = (peers.len(), learned_pending.len());
     let mut observed_retry = Instant::now();
+    let mut closed_peer_events = BTreeMap::new();
     loop {
         let mut released_failed_slot = false;
         while let Some(Ok(result)) = learned_connects.try_join_next() {
@@ -344,7 +345,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
             let lost = advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
             record_pool_losses(candidates, &mut loss_count, lost);
         }
-        // Release scheduling may await channel I/O; grant the full interval afterward.
+        // Re-evaluate the budget after startup scheduling.
         let now = Instant::now();
         let Some(stale_budget) = pool_progress_budget(
             &mut first_output_deadline,
@@ -373,13 +374,17 @@ pub(super) async fn follow_peer_pool_with_discovery(
         let newly_lost =
             retransmit_stalled_requests(&mut peers, continuity, chunks_per_piece, now).await;
         record_pool_losses(candidates, &mut loss_count, newly_lost);
+        // Workers can drain command slots without an incoming event or a
+        // retransmit change. Reconsider deferred requests on every timed turn.
+        let newly_lost = advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
+        record_pool_losses(candidates, &mut loss_count, newly_lost);
         if peers.is_empty() {
             return FollowEnd::PeerLost(loss_count);
         }
         peer_count.store(peers.len() as u32, Ordering::Relaxed);
 
-        // Wake at least every configured request-check interval so the sweep above runs even
-        // while no peer sends anything.
+        // Wake at least every configured request-check interval for credit
+        // admission and retransmit checks, even while no peer sends anything.
         let wait = stale_budget
             .min(live_recovery.request_check_interval())
             .min(
@@ -398,25 +403,38 @@ pub(super) async fn follow_peer_pool_with_discovery(
         } else {
             None
         };
-        let event = match tokio::time::timeout(wait, async {
-            tokio::select! {
-                _ = tx.closed() => PoolWake::ConsumerGone,
-                event = event_rx.recv() => PoolWake::Peer(event),
-                result=learned_connects.join_next(), if !learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
-                _ = async {
-                    tokio::time::sleep_until(retry_deadline.expect("enabled retry deadline").into()).await;
-                }, if retry_deadline.is_some() => PoolWake::CandidateRetry,
-                peer=next_discovery_peer(discovery_run), if discovery_run.is_some()=>PoolWake::Discovery(peer),
-                upstream = refill_rx.recv(), if !refill_closed && (peers.len() < live_recovery.max_active_upstreams || continuity.startup_deadline.is_some()) => {
-                    PoolWake::Refill(upstream)
+        if tx.is_closed() {
+            return FollowEnd::ConsumerGone;
+        }
+        let pending_event = poll_closed_peer_event(&peers, &mut event_rx, &mut closed_peer_events);
+        let event_was_polled = pending_event.is_some();
+        let event = match pending_event {
+            Some(event) => PoolWake::Peer(Some(event)),
+            None => match tokio::time::timeout(wait, async {
+                tokio::select! {
+                    _ = tx.closed() => PoolWake::ConsumerGone,
+                    event = event_rx.recv() => PoolWake::Peer(event),
+                    result=learned_connects.join_next(), if !learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
+                    _ = async {
+                        tokio::time::sleep_until(retry_deadline.expect("enabled retry deadline").into()).await;
+                    }, if retry_deadline.is_some() => PoolWake::CandidateRetry,
+                    peer=next_discovery_peer(discovery_run), if discovery_run.is_some()=>PoolWake::Discovery(peer),
+                    upstream = refill_rx.recv(), if !refill_closed && (peers.len() < live_recovery.max_active_upstreams || continuity.startup_deadline.is_some()) => {
+                        PoolWake::Refill(upstream)
+                    }
                 }
-            }
-        })
-        .await
-        {
-            Ok(event) => event,
-            Err(_) => continue, // sweep tick: re-check stale budget and retransmit
+            })
+            .await
+            {
+                Ok(event) => event,
+                Err(_) => continue, // sweep tick: re-check stale budget and retransmit
+            },
         };
+        if !event_was_polled && matches!(&event, PoolWake::Peer(Some(_))) {
+            for (_, remaining) in closed_peer_events.values_mut() {
+                *remaining = remaining.saturating_sub(1);
+            }
+        }
 
         let event = match event {
             PoolWake::ConsumerGone => return FollowEnd::ConsumerGone,
@@ -621,40 +639,18 @@ pub(super) async fn follow_peer_pool_with_discovery(
         };
 
         let (peer_id, addr, msg) = match event {
-            PeerEvent::Lost { peer_id, addr } => {
-                let lost_producer = peers.get(&peer_id).is_some_and(|peer| peer.produced_output);
-                if let Some(lost) = drop_peer_runtime(peer_id, &mut peers, continuity) {
-                    crate::alog!("[ace] {addr}: upstream peer lost");
-                    record_pool_losses(candidates, &mut loss_count, [lost]);
-                    let newly_lost =
-                        advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
-                    record_pool_losses(candidates, &mut loss_count, newly_lost);
-                    peer_count.store(peers.len() as u32, Ordering::Relaxed);
-                }
-                if lost_producer && !peers.values().any(|peer| peer.produced_output) {
-                    let cursor = continuity.reasm.next_needed();
-                    let stale_sources: Vec<_> = peers
-                        .iter()
-                        .filter_map(|(&id, peer)| {
-                            (peer.max_piece < cursor
-                                && candidates.kind(peer.addr) == CandidateKind::Source)
-                                .then_some(id)
-                        })
-                        .collect();
-                    for id in stale_sources {
-                        if let Some(source) = drop_peer_runtime(id, &mut peers, continuity) {
-                            // This transport still works but its old window cannot cover
-                            // the cursor. Refresh current source priority after the last
-                            // producer is lost; retain all usable fallback transports.
-                            candidates.refresh_stale_transport(source, Instant::now());
-                            crate::alog!(
-                                "[ace] refreshing stale source window after producer loss"
-                            );
-                        }
-                    }
-                    peer_count.store(peers.len() as u32, Ordering::Relaxed);
-                }
-                if peers.is_empty() {
+            PeerEvent::Lost { peer_id, .. } => {
+                if handle_pool_peer_loss(
+                    peer_id,
+                    &mut peers,
+                    continuity,
+                    chunks_per_piece,
+                    candidates,
+                    &mut loss_count,
+                    peer_count,
+                )
+                .await
+                {
                     return FollowEnd::PeerLost(loss_count);
                 }
                 continue;
@@ -864,23 +860,19 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     false
                 };
                 if should_unchoke {
-                    if let Some(lost) =
+                    let _ =
                         send_peer_command(peer_id, PeerMessage::Unchoke, &mut peers, continuity)
-                            .await
-                    {
-                        record_pool_losses(candidates, &mut loss_count, [lost]);
-                    }
+                            .await;
                 }
             }
             request @ PeerMessage::Unknown { id: 6, .. } if seed.enabled => {
                 if let Some(reply) =
                     prepare_reply(&request, Some(store), ServeProfile::Reciprocal).await
                 {
-                    if let Some(lost) =
-                        send_peer_command(peer_id, reply.message, &mut peers, continuity).await
+                    if send_peer_command(peer_id, reply.message, &mut peers, continuity)
+                        .await
+                        .is_none()
                     {
-                        record_pool_losses(candidates, &mut loss_count, [lost]);
-                    } else {
                         uploaded.fetch_add(reply.media_bytes as u64, Ordering::Relaxed);
                         peers_served.store(peers.len() as u32, Ordering::Relaxed);
                     }
