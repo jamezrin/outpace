@@ -67,6 +67,10 @@ pub(super) async fn ace_getstream(
                 token,
             }),
         ),
+        Err(ProviderError::CapacityExhausted) => {
+            s.ace_sessions.revoke(&playback_id, &token);
+            super::streams::capacity_error()
+        }
         Err(_) => {
             s.ace_sessions.revoke(&playback_id, &token);
             StatusCode::NOT_FOUND.into_response()
@@ -106,6 +110,13 @@ pub(super) async fn ace_manifest(
         .await
     {
         Ok(started) => started,
+        Err(ProviderError::CapacityExhausted) => {
+            return if format == "json" {
+                Json(json!({"response": null, "error": "session capacity reached"})).into_response()
+            } else {
+                super::streams::capacity_error()
+            };
+        }
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
     let token = s
@@ -264,6 +275,7 @@ pub(super) async fn ace_playback(
             // Provider messages may embed identifiers or credentials. Log only the typed
             // category, and keep both logs and response bodies independent of that text.
             let (status, category, reason) = match error {
+                ProviderError::CapacityExhausted => return super::streams::capacity_error(),
                 ProviderError::NotFound => (StatusCode::NOT_FOUND, "NotFound", ""),
                 ProviderError::Backend(_) => {
                     (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
@@ -389,7 +401,13 @@ pub(super) async fn server_api(
                 .expect("version JSON is serializable");
             return ([(header::CONTENT_TYPE, "application/json")], body).into_response();
         }
-        api::Method::GetStatus => api::ok(api::status_result(s.manager.list().await.len())),
+        api::Method::GetStatus => {
+            let mut result = api::status_result(s.manager.list().await.len());
+            let (occupied, max) = s.manager.admission_status();
+            result["occupied_sessions"] = json!(occupied);
+            result["max_sessions"] = json!(max);
+            api::ok(result)
+        }
         api::Method::GetNetworkConnectionStatus => api::ok(api::network_status_result(&s.networks)),
         // `get_content_id` only echoes an id the caller already gave; it can't derive one from a
         // bare infohash/url, so it never resolves.

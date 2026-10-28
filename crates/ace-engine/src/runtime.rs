@@ -82,6 +82,13 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(dir) = std::env::var("OUTPACE_DATA_DIR") {
         config.data_dir = dir.into();
     }
+    if let Some(v) = std::env::var_os("OUTPACE_MAX_SESSIONS") {
+        config.max_sessions = v
+            .to_str()
+            .ok_or("invalid OUTPACE_MAX_SESSIONS")?
+            .parse()
+            .map_err(|_| "invalid OUTPACE_MAX_SESSIONS: expected nonnegative integer")?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_PEER_LISTEN") {
         config.peer_listen = v.parse()?;
     }
@@ -667,8 +674,13 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager =
-        StreamManager::with_normalizer(registry, config.session_buffer, config.hls, normalizer);
+    let manager = StreamManager::with_admission_config(
+        registry,
+        config.session_buffer,
+        config.hls,
+        normalizer,
+        config.max_sessions,
+    );
     manager.spawn_reaper();
     if config.seed_ttl_secs > 0 {
         let seed_registry_reap = seed_registry.clone();
@@ -1765,6 +1777,23 @@ mod tests {
         let err = config_from_env().err();
         std::env::remove_var("OUTPACE_SESSION_BUFFER");
         assert!(err.is_some(), "session_buffer=0 must be rejected");
+    }
+
+    #[test]
+    fn admission_config_default_zero_positive_invalid() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let key = "OUTPACE_MAX_SESSIONS";
+        std::env::remove_var(key);
+        assert_eq!(config_from_env().unwrap().max_sessions, 0);
+        for (value, expected) in [("0", 0), ("3", 3)] {
+            std::env::set_var(key, value);
+            assert_eq!(config_from_env().unwrap().max_sessions, expected);
+        }
+        for value in ["-1", "no", "", "999999999999999999999999999999999999999"] {
+            std::env::set_var(key, value);
+            assert!(config_from_env().is_err());
+        }
+        std::env::remove_var(key);
     }
 
     #[test]

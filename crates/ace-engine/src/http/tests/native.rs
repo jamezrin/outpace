@@ -983,3 +983,43 @@ async fn compat_getstream_mints_urls_for_an_infohash_with_a_verified_descriptor(
     assert!(json["error"].is_null(), "{json}");
     assert_eq!(json["response"]["infohash"], ih);
 }
+
+#[tokio::test]
+async fn admission_http_native_live_hls_vod_return_503_retry_after() {
+    let mut state = fixture_state(0);
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(FixtureProvider { skip: 0 }));
+    state.manager = StreamManager::with_session_limit(registry, 1);
+    let held = state.manager.get_or_start("fix", "held").await.unwrap();
+    let app = router(state.clone());
+    for path in [
+        "/streams/fix/extra.ts",
+        "/streams/fix/extra.m3u8",
+        "/vod/fix/extra",
+        "/vod/fix/extra/manifest.m3u8",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
+    let response = app
+        .oneshot(
+            Request::get("/streams/fix/held/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 10000)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["occupied_sessions"], 1);
+    assert_eq!(value["max_sessions"], 1);
+    drop(held);
+    state.manager.shutdown().await;
+}

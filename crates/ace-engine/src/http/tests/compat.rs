@@ -1178,3 +1178,89 @@ async fn measured_stats_schema_idle_unknown_and_invalid_token_do_not_start() {
         Some(&serde_json::Value::Null)
     );
 }
+
+#[tokio::test]
+async fn admission_compat_errors_lazy_negotiation_and_service_status() {
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let mut state = ace_hls_state(Duration::from_secs(60), 8);
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(PacedPacketProvider));
+    state.manager = StreamManager::with_session_limit(registry, 1);
+    let held = state.manager.get_or_start("hlsfix", "held").await.unwrap();
+    let app = router(state.clone());
+    for path in [
+        format!("/ace/getstream?infohash={id}"),
+        format!("/ace/manifest.m3u8?infohash={id}"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/ace/manifest.m3u8?format=json&infohash={id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 10000)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value,
+        json!({"response": null, "error": "session capacity reached"})
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/ace/getstream?format=json&infohash={id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 10000)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["error"].is_null(),
+        "metadata-only negotiation remains available"
+    );
+    let playback = value["response"]["playback_url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://127.0.0.1:6878")
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(Request::get(playback).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    let response = app
+        .oneshot(
+            Request::get("/webui/api/service?method=get_status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 10000)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["result"]["occupied_sessions"], 1);
+    assert_eq!(value["result"]["max_sessions"], 1);
+    assert_eq!(value["result"]["active_sessions"], 1);
+    drop(held);
+    state.manager.shutdown().await;
+}

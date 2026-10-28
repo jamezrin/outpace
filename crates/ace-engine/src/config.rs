@@ -319,6 +319,8 @@ macro_rules! config_with_root_redaction {
 config_with_root_redaction! {
     /// Address the HTTP API binds to.
     pub bind: SocketAddr,
+    /// Provider resources; zero is unlimited.
+    pub max_sessions: usize,
     /// Address the RTMP ingest listener binds to.
     pub rtmp_bind: SocketAddr,
     /// Directory for the persistent identity seed and any caches.
@@ -413,6 +415,7 @@ impl Default for Config {
             .join("outpace");
         let cache_dir = data_dir.join("cache");
         Config {
+            max_sessions: 0,
             bind: "127.0.0.1:6878".parse().unwrap(),
             rtmp_bind: "127.0.0.1:1935".parse().unwrap(),
             data_dir,
