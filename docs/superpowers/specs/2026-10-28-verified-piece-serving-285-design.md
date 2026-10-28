@@ -1,13 +1,13 @@
 # Issue 285: publish accepted whole live pieces
 
-Status: root accepts test-first implementation, subject to the playback-preservation boundary below.
+Status: implemented and independently reviewed, preserving the playback boundary below. Integration validation and PR CI govern publication.
 Issue: https://github.com/jamezrin/outpace/issues/285 (public unauthenticated read, 2026-10-28: open, unassigned, zero comments).
 
 ## Evidence and scope
 
 The actual full-pool RSA rejection regression reports rejected-state `((true, true), true, true)` for store completeness/list membership and inbound/reciprocal reply preparation, where all must be false. Valid retry playback and the one-rejection control completed before failure. This is behavioral RED, not observed wire advertisement evidence. Private evidence remains in ignored `re/sdd/issue285-red-result.md`; the authentication test belongs to root and must be preserved.
 
-Fix untrusted live download publication without changing playback output, defaults, seeding policy, queue admission, or public API visibility for test convenience. No dependence on unpublished #284 (reviewed separately at beca4d8); integrate it deliberately after publication.
+Fix untrusted live download publication without changing playback output, defaults, seeding policy, queue admission, or public API visibility for test convenience. Queue admission remains the separately reviewed #284 behavior, now merged into this branch from main; whole-piece publication is confined to the accepted-message path.
 
 ## Approaches and decision
 

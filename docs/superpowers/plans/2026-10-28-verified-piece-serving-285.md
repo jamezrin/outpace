@@ -1,6 +1,8 @@
 # Verified piece serving Implementation Plan
 
-> **For agentic workers:** Use superpowers:executing-plans after root accepts this design. No delegates or implementation are authorized by this design-only handoff.
+> **Status:** Implementation and independent product review are complete. The pre-integration workspace passed 1,487 tests; final contract, lint, formatting and hygiene gates passed. Published #284 is integrated cleanly; combined workspace validation is running before PR publication. CI, merge and deployment remain pending.
+
+The task lists below preserve the original test-first proposal, not a completion checklist. Some proposed coverage was narrowed during review: actual seeder frames and both reply preparations are covered, but full-pool inbound BT serving, an independent first-chunk barrier, explicit rename-error injection, actor-shutdown joining and eviction/read stress remain outside the evidence. See the reviewed implementation and protocol note 73 for the final contract.
 
 **Goal:** Make signed live seed bytes visible only after successful whole-piece authentication.
 
@@ -12,7 +14,7 @@
 
 ## Global constraints
 
-Root acceptance is required before implementation. Preserve root's authentication RED and all unrelated dirty work. No dependence on unpublished #284. No queue redesign, default changes, public API widening for tests, real identifiers, registry reads or live testing. Preserve trusted broadcast/VOD semantics and local playback bytes. New interfaces and exact policy are defined in the spec.
+Root accepted the design and implementation. Preserve root's authentication RED and all unrelated dirty work. Queue admission is implemented by the separately reviewed and merged #284. No queue redesign, default changes, public API widening for tests, real identifiers, registry reads or live testing. Preserve trusted broadcast/VOD semantics and local playback bytes. New interfaces and exact policy are defined in the spec.
 
 ## Review focus
 
@@ -51,6 +53,6 @@ Root acceptance is required before implementation. Preserve root's authenticatio
 - [ ] Run focused authentication, store, seed and reassembly tests; require all new negative and positive controls pass. Run existing engine broadcast/VOD tests to preserve writer fences and final-piece compatibility.
 - [ ] Write the protocol policy note; describe unsigned acceptance, signed wire retention, trusted writer scope, cancellation and cache-failure limits. Supply #208 gate evidence in local handoff without public checklist writes.
 - [ ] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and `python3 tools/hygiene/check_identifiers.py`. Format only touched Rust files if needed; do not sweep unrelated formatting.
-- [ ] Root reviews diff and verification evidence before any separately authorized commit/publication. GitHub writes remain blocked; do not change credentials or claim assignment. Reconcile #284 separately after it publishes.
+- [ ] Root reviews diff and verification evidence before any separately authorized commit/publication. Publication follows passing integration gates; do not change credentials or claim assignment. #284 was reconciled through a clean merge of current main.
 
-Self-review: each spec invariant maps to Tasks 1–3; all five review-focus conditions have explicit controls. Design-only phase ran no tests/builds/checks and performed no Git mutation. This plan does not grant implementation or publication approval.
+The original design-only phase performed no execution. Subsequent implementation, validation and independent review are recorded in private handoffs; the scope limits above remain in force.
