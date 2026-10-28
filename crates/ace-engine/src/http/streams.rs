@@ -94,6 +94,8 @@ pub(super) async fn stream_status(
                 "network": network,
                 "id": native_public_stream_id(&network, &id),
                 "clients": session.subscriber_count(),
+                "occupied_sessions": s.manager.admission_status().0,
+                "max_sessions": s.manager.admission_status().1,
                 "peers": stats.peers,
                 "bitrate": stats.bitrate,
                 "livepos": live_position_json(stats.livepos.as_ref()),
@@ -134,9 +136,10 @@ pub(super) async fn stream_segment(
 
 /// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
 /// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
-/// that text; every other failure keeps the historical bodiless `404`.
+/// that text. Capacity returns 503 with Retry-After; other failures retain bodiless 404.
 fn stream_start_error(e: ProviderError) -> Response {
     match e {
+        ProviderError::CapacityExhausted => capacity_error(),
         ProviderError::Unresolvable(reason) => {
             (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response()
         }
@@ -297,4 +300,13 @@ pub(super) fn ace_stream_session_response(
 
 pub(super) fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
     gate.reset_for_discontinuity();
+}
+
+pub(super) fn capacity_error() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        "session capacity reached",
+    )
+        .into_response()
 }

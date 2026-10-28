@@ -584,3 +584,22 @@ scope unless a specific issue narrows that work.
 ## License
 
 outpace is licensed under `AGPL-3.0-or-later`. See `LICENSE`.
+
+Provider admission is unlimited by default. Set `OUTPACE_MAX_SESSIONS=8` for
+an opt-in daemon-wide cap; unset or `0` keeps it unlimited. Negative, malformed
+or overflowing values fail startup. Pending live opens and VOD resolutions count
+alongside retained resources. Direct TS and HLS viewers of one live source share
+one slot; cached VOD content and all of its ranges share one slot. Existing
+same-key viewers can join at capacity. Metadata-only negotiation can succeed
+before later playback admission fails.
+
+New resources at capacity receive HTTP 503 with `Retry-After: 1`; compatibility
+JSON start errors retain the response/error envelope. Native stream status and
+service `get_status` expose numeric `occupied_sessions` and `max_sessions`
+(`null` for unlimited), without changing `active_sessions`. Occupancy includes
+pending work and retained owners after stop or cache expiry. Pump abort is
+asynchronous: reuse is possible only after actual source destruction, and VOD
+ranges retain their content owner until the last range is dropped. This limits
+provider ownership, not RSS or exact socket counts during asynchronous cleanup.
+There is no separate aggregate seed-store byte budget. CLI `outpace play` is
+unaffected.

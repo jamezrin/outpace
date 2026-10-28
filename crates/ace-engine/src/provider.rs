@@ -159,6 +159,7 @@ pub trait StreamProvider: Send + Sync {
 
 #[derive(Debug)]
 pub enum ProviderError {
+    CapacityExhausted,
     NotFound,
     Backend(String),
     /// The id is well-formed, but the provider holds no verified metadata to open it with and
@@ -171,6 +172,7 @@ pub enum ProviderError {
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProviderError::CapacityExhausted => f.write_str("session capacity reached"),
             ProviderError::NotFound => f.write_str("not found"),
             ProviderError::Backend(msg) | ProviderError::Unresolvable(msg) => f.write_str(msg),
         }

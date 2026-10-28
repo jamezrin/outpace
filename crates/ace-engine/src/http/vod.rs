@@ -160,6 +160,7 @@ pub(super) async fn resolve_vod(
 ) -> Result<Arc<dyn VodContent>, Box<Response>> {
     match s.manager.resolve_vod(network, id).await {
         Ok(v) => Ok(v),
+        Err(ProviderError::CapacityExhausted) => Err(Box::new(super::streams::capacity_error())),
         Err(ProviderError::NotFound) => Err(Box::new(
             (StatusCode::NOT_FOUND, "unknown network").into_response(),
         )),

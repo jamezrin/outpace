@@ -342,3 +342,22 @@ The checked-in log rotation bounds Docker JSON logs independently of the piece-c
 
 For bounded playback validation and the limits of soak evidence, use the
 [live gateway checklist](testing/live-gateway-checklist.md).
+
+### Provider session admission
+
+`OUTPACE_MAX_SESSIONS` defaults to unlimited (unset or `0`). Opt in with,
+for example, `OUTPACE_MAX_SESSIONS=8`; invalid or overflowing values reject
+daemon startup. This shared live/VOD resource cap includes pending provider
+work. Existing same-key fans and HLS wrappers reuse their source slot. Resolved
+VOD handles and active ranges keep their shared slot through cache expiry.
+
+At saturation new native/direct playback starts return 503 and
+`Retry-After: 1`. Compatibility JSON preserves its error envelope; metadata-only
+negotiation can precede a later playback refusal. Native stream status and
+service `get_status` show `occupied_sessions` and `max_sessions` (null when
+unlimited). `active_sessions` retains its existing meaning.
+
+Stopping or reaping a map entry does not promise immediate capacity: retained
+owners and asynchronous pump destruction still count. The cap bounds ownership,
+not exact socket counts, RSS, or aggregate seed-store bytes. No cache, seeding,
+bind, container, or CLI play defaults change.

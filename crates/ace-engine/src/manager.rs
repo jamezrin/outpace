@@ -259,6 +259,7 @@ impl CleanupTracker {
 
 pub struct StreamManager {
     registry: ProviderRegistry,
+    admission: Arc<crate::admission::Admission>,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
     packagers: Mutex<HashMap<(String, String), HlsEntry>>,
     /// Synchronous pending/cancellation bookkeeping so a dropped future cleans up in `Drop`.
@@ -274,9 +275,8 @@ pub struct StreamManager {
     /// transport descriptor once and reuse downloaded pieces instead of re-fetching per request.
     /// Entries expire after `grace` of no access. Value: (handle, last-access time).
     vod_cache: Mutex<HashMap<(String, String), VodCacheEntry>>,
-    /// Serializes VOD *resolution* so concurrent first reads for the same id (a manifest fetch
-    /// racing an eager segment fetch) trigger exactly one `provider.resolve_vod()`.
-    vod_resolve_lock: Mutex<()>,
+    /// Per-key VOD resolution serialization; unrelated provider work remains concurrent.
+    vod_resolve_locks: StdMutex<HashMap<StreamKey, Weak<Mutex<()>>>>,
     buffer: usize,
     hls: HlsConfig,
     normalizer: Option<crate::hls_audio::PreparedNormalizer>,
@@ -309,15 +309,26 @@ impl StreamManager {
         hls: HlsConfig,
         normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     ) -> Arc<StreamManager> {
+        Self::with_admission_config(registry, buffer, hls, normalizer, 0)
+    }
+
+    pub fn with_admission_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        max_sessions: usize,
+    ) -> Arc<Self> {
         Arc::new(StreamManager {
             registry,
+            admission: crate::admission::Admission::new(max_sessions),
             sessions: Mutex::new(HashMap::new()),
             packagers: Mutex::new(HashMap::new()),
             hls_transitions: Arc::new(StdMutex::new(HlsLifecycleState::default())),
             hls_finalization: Mutex::new(()),
             session_start_locks: StdMutex::new(HashMap::new()),
             vod_cache: Mutex::new(HashMap::new()),
-            vod_resolve_lock: Mutex::new(()),
+            vod_resolve_locks: StdMutex::new(HashMap::new()),
             buffer,
             hls,
             normalizer,
@@ -374,6 +385,16 @@ impl StreamManager {
         }
     }
 
+    /// Construct a manager with a provider resource cap; zero is unlimited.
+    pub fn with_session_limit(registry: ProviderRegistry, max: usize) -> Arc<Self> {
+        Self::with_admission_config(registry, 256, HlsConfig::default(), None, max)
+    }
+
+    /// Occupied includes pending opens and resources retained outside manager maps.
+    pub fn admission_status(&self) -> (usize, Option<usize>) {
+        self.admission.snapshot()
+    }
+
     /// Resolve `id` to a single-file VOD, caching the resolved handle per `(network, id)` so a
     /// whole playback — the HLS manifest plus every segment read — shares one resolution (and, for
     /// the ace provider, one piece cache + one peer discovery) instead of re-resolving per request.
@@ -384,17 +405,56 @@ impl StreamManager {
         id: &str,
     ) -> Result<Arc<dyn VodContent>, ProviderError> {
         let key = (network.to_string(), id.to_string());
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
         if let Some(v) = self.cached_vod(&key).await {
             return Ok(v);
         }
         // Serialize resolution and re-check: a concurrent request may have resolved this id while
         // we waited, so we must not resolve (and discover) a second time.
-        let _resolving = self.vod_resolve_lock.lock().await;
+        let resolve_lock = {
+            let mut locks = self.vod_resolve_locks.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _resolving = resolve_lock.lock().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
         if let Some(v) = self.cached_vod(&key).await {
             return Ok(v);
         }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-        let vod: Arc<dyn VodContent> = Arc::from(provider.resolve_vod(id).await?);
+        let reservation = self.admission.reserve()?;
+        let inner = provider.resolve_vod(id).await?;
+        let _finalizing = self.hls_finalization.lock().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Keep reservation alive until provider content destruction.
+            drop(inner);
+            return Err(ProviderError::NotFound);
+        }
+        let vod: Arc<dyn VodContent> = Arc::new(crate::admission::Content(Arc::new(
+            crate::admission::ContentOwner {
+                inner,
+                _reservation: reservation,
+            },
+        )));
         self.vod_cache
             .lock()
             .await
@@ -434,6 +494,13 @@ impl StreamManager {
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
         let key = (network.to_string(), id.to_string());
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
+        let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map.get(&key) {
@@ -444,6 +511,13 @@ impl StreamManager {
         // unrelated provider opens remain concurrent.
         let start_lock = self.session_start_lock(&key);
         let _starting = start_lock.lock().await;
+        if transition.is_cancelled()
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map.get(&key) {
@@ -451,7 +525,19 @@ impl StreamManager {
             }
         }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-        let source = provider.open(id).await?;
+        let reservation = self.admission.reserve()?;
+        let source: Box<dyn TsSource> = Box::new(crate::admission::Source {
+            inner: provider.open(id).await?,
+            _reservation: reservation,
+        });
+        let _finalizing = self.hls_finalization.lock().await;
+        if transition.finish()
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
         let session = StreamSession::start(source, self.buffer);
         let mut map = self.sessions.lock().await;
         Ok(map.entry(key).or_insert(session).clone())
@@ -506,14 +592,22 @@ impl StreamManager {
 
         // Serialize only starts for this key. Unrelated provider opens, reap, and stop proceed.
         let _starting = start_lock.lock().await;
-        if transition.is_cancelled() {
+        if transition.is_cancelled()
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(ProviderError::NotFound);
         }
 
         let existing_session = self.sessions.lock().await.get(&key).cloned();
         let mut source: Option<Box<dyn TsSource>> = if existing_session.is_none() {
             let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-            Some(provider.open(id).await?)
+            let reservation = self.admission.reserve()?;
+            Some(Box::new(crate::admission::Source {
+                inner: provider.open(id).await?,
+                _reservation: reservation,
+            }))
         } else {
             None
         };
@@ -724,6 +818,7 @@ impl StreamManager {
             }
             controls.extend(entries.drain().map(|(_, entry)| entry.control));
             self.sessions.lock().await.clear();
+            self.vod_cache.lock().await.clear();
         }
         for control in controls {
             control.join().await;
@@ -1382,6 +1477,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admission_pending_refuses_before_provider_and_cancel_releases() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(BlockingProvider {
+            started: started.clone(),
+            release,
+        }));
+        let m = StreamManager::with_session_limit(registry, 1);
+        let pending = tokio::spawn({
+            let m = m.clone();
+            async move { m.get_or_start("blocking", "slow").await }
+        });
+        started.notified().await;
+        assert!(
+            m.get_or_start("blocking", "fast").await.is_err(),
+            "a pending provider open must occupy the sole slot"
+        );
+        pending.abort();
+        let _ = pending.await;
+        assert!(m.get_or_start("blocking", "fast").await.is_ok());
+        m.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn same_key_returns_same_session() {
         let m = StreamManager::new(registry());
         let s1 = m.get_or_start("test", "abc").await.unwrap();
@@ -2036,3 +2156,7 @@ mod tests {
         assert!(m.get_hls("test", "stale-hls").await.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "session_admission_tests.rs"]
+mod admission_tests;
