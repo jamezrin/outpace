@@ -1,6 +1,6 @@
 # Issue 287: staged PoolActor refactor
 
-Status: user approved stage 1 implementation. Main baseline c8d0cbe. Stage 2 remains a later, separately reviewed change. Stage 1 extraction implemented and locally verified in the root-owned worktree; fresh independent review and integration pending. Issue #287 remains open.
+Status: user approved stage 1 implementation. Main baseline c8d0cbe. Stage 2 remains a later, separately reviewed change. Stage 1 extraction, independent review and local validation are complete; PR #295 is published, with updated documentation CI and merge pending. Issue #287 remains open.
 
 ## Stage 1: behavior-preserving extraction
 
@@ -18,7 +18,7 @@ Start from merged stage 1. Replace inline stale-gossip harvesting in the active 
 
 Worker tasks may borrow no mutable actor state: return bounded validated observations, then merge decisions on the actor. No detached tasks, unbounded result queue, unbounded upstream accumulation or concurrent writes to candidate history. Own cancellation and joins across consumer departure, stale teardown, reconnect, errors and drop; late results must not revive a retired generation. Exact job concurrency, result payload cap and cancellation ownership must be designed from stage-1 code before implementation, preserving current configuration bounds rather than inventing an unlimited side pool.
 
-Add deterministic tests: a stalled gossip harvest does not prevent healthy-peer event/request/output progress; deadline remains unchanged; capped work and results; cancellation destroys/reaps owned workers; late results cannot cross generations; ordinary gossip still learns candidates. Maintain all prior tests and a matched bounded runtime smoke through CT107 Mullvad after merge. Runtime source must pass the unencrypted gate; never CT115/117.
+Add deterministic tests: a stalled gossip harvest does not prevent healthy-peer event/request/output progress; deadline remains unchanged; capped work and results; cancellation destroys/reaps owned workers; late results cannot cross generations; ordinary gossip still learns candidates. Maintain all prior tests and a matched bounded runtime smoke through the approved private VPN-routed test environment after merge. Runtime source must pass the unencrypted gate; never use excluded environments.
 
 ## Await and acceptance limits
 
