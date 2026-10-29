@@ -1,4 +1,6 @@
 use super::*;
+mod publication;
+use publication::PublicationOperation;
 
 type ConnectCompletion =
     Option<Result<(SocketAddrV4, Option<PeerConnectFailure>, bool), tokio::task::JoinError>>;
@@ -18,6 +20,7 @@ enum WakeOutcome {
 // Fields owning resources follow the original locals' reverse declaration order.
 // In particular peers retire before connect tasks, channel endpoints, then stats.
 pub(super) struct PoolActor<'a> {
+    pub(super) publication: Option<PublicationOperation>,
     pub(super) closed_peer_events: BTreeMap<u64, (SocketAddrV4, usize)>,
     pub(super) observed_retry: Instant,
     pub(super) observed_capacity: (usize, usize),
@@ -62,6 +65,20 @@ impl PoolActor<'_> {
         self.observed_capacity = (self.peers.len(), self.learned_pending.len());
         self.observed_retry = Instant::now();
         loop {
+            if self.tx.is_closed() {
+                return FollowEnd::ConsumerGone;
+            }
+            self.start_publication();
+            let ready =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(self.poll_publication(cx))).await;
+            if ready {
+                self.start_publication();
+                if !self.continuity.publication_hold() {
+                    if let PieceOutcome::End(end) = self.drain_output().await {
+                        return end;
+                    }
+                }
+            }
             let mut released_failed_slot = false;
             while let Some(Ok(result)) = self.learned_connects.try_join_next() {
                 released_failed_slot |=
@@ -170,9 +187,11 @@ impl PoolActor<'_> {
             let event_was_polled = pending_event.is_some();
             let event = match pending_event {
             Some(event) => PoolWake::Peer(Some(event)),
+            None if ready => PoolWake::Publication,
             None => match tokio::time::timeout(wait, async {
                 tokio::select! {
                     _ = self.tx.closed() => PoolWake::ConsumerGone,
+                    _ = std::future::poll_fn(|cx| publication::poll_operation(&mut self.publication, self.continuity, self.store, cx).then_some(()).map_or(std::task::Poll::Pending, std::task::Poll::Ready)), if self.publication.is_some() => PoolWake::Publication,
                     learned = async { self.gossip.as_mut().expect("enabled gossip").await }, if self.gossip.is_some() => PoolWake::Gossip(learned),
                     event = self.event_rx.recv() => PoolWake::Peer(event),
                     result=self.learned_connects.join_next(), if !self.learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
@@ -240,6 +259,15 @@ impl PoolActor<'_> {
                     self.candidates.learn(addr, kind);
                 }
                 self.maybe_refill(true);
+                WakeOutcome::Continue
+            }
+            PoolWake::Publication => {
+                self.start_publication();
+                if !self.continuity.publication_hold() {
+                    if let PieceOutcome::End(end) = self.drain_output().await {
+                        return WakeOutcome::End(end);
+                    }
+                }
                 WakeOutcome::Continue
             }
             PoolWake::ConsumerGone => WakeOutcome::End(FollowEnd::ConsumerGone),
@@ -700,16 +728,10 @@ impl PoolActor<'_> {
                         ace_wire::reassembly::LiveAcceptance::SourceVerified
                             | ace_wire::reassembly::LiveAcceptance::UnsignedAssemblyAccepted
                     ) {
-                        if let Err(e) = PieceStore::shared_put_complete_piece(
-                            self.store,
-                            piece,
-                            done.header,
-                            done.wire,
-                        )
-                        .await
-                        {
-                            crate::alog!("[cache] whole live piece publication failed: {e}");
-                        }
+                        self.continuity
+                            .publication
+                            .entry(piece)
+                            .or_insert(PublicationStatus::Needed);
                     }
                 }
             }
@@ -726,78 +748,26 @@ impl PoolActor<'_> {
             }
             // Request receipt/activity accounting is independent of durable byte
             // provenance; retain its existing behavior for completed-piece no-ops.
-            self.continuity
-                .note_chunk(piece, lc.chunk, self.chunks_per_piece);
+            if outcome.contributed && !outcome.completed {
+                self.continuity
+                    .note_chunk(piece, lc.chunk, self.chunks_per_piece);
+            } else if self.continuity.reasm.completed_live_piece(piece).is_some() {
+                self.continuity.received_chunks.remove(&piece);
+                self.continuity.scheduler.on_complete(piece);
+                self.continuity.active_peers.complete_everywhere(piece);
+                self.continuity.requested_at.remove(&piece);
+            }
             made_activity = true;
             #[cfg(test)]
             if let Some(observer) = &self.continuity.contribution_observer {
                 let _ = observer.send((piece, addr));
             }
-            let before = self.continuity.reasm.next_needed();
-            let ready =
-                take_ready_with_stats(self.continuity, self.seed.metrics.as_ref(), self.info);
-            let after = self.continuity.reasm.next_needed();
-            let productive: Vec<_> = self
-                .continuity
-                .piece_producers
-                .range(before..after)
-                .filter_map(|(_, producer)| *producer)
-                .collect();
-            self.continuity
-                .piece_producers
-                .retain(|&piece, _| piece >= after);
-            if !ready.is_empty() {
-                if !self.continuity.authenticated_logged
-                    && self.info.sig_len > 0
-                    && ace_wire::live_auth::signature_len_from_pubkey_der(&self.info.source_pubkey)
-                        == Some(self.info.sig_len)
-                {
-                    self.continuity.authenticated_logged = true;
-                    crate::alog!("[ace] discovery stage=authenticated-contiguous");
-                }
-                for output in self.continuity.resync_output(&ready) {
-                    let aligned = output.bytes;
-                    if self.continuity.emitted == 0 {
-                        crate::alog!("[ace] discovery stage=first-source-output");
-                    }
-                    self.continuity.emitted += aligned.len() as u64;
-                    if self.continuity.emitted >= self.continuity.next_log {
-                        crate::alog!(
-                            "[ace] {addr}: served {} MiB (head={}, next piece needed={})",
-                            self.continuity.emitted >> 20,
-                            self.continuity.head,
-                            self.continuity.reasm.next_needed()
-                        );
-                        self.continuity.next_log = self.continuity.emitted + (4 << 20);
-                    }
-                    let len = aligned.len() as u64;
-                    if self
-                        .tx
-                        .send(LiveOutput {
-                            bytes: aligned,
-                            discontinuity: output.discontinuity,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        shutdown_peer_runtimes(&mut self.peers);
-                        return PieceOutcome::End(FollowEnd::ConsumerGone);
-                    }
-                    self.downloaded.fetch_add(len, Ordering::Relaxed);
-                    made_output = true;
-                }
-            }
-            if made_output
-                && self.info.sig_len > 0
-                && ace_wire::live_auth::signature_len_from_pubkey_der(&self.info.source_pubkey)
-                    == Some(self.info.sig_len)
-            {
-                for producer in productive {
-                    self.seed.warm_peers.record_productive(
-                        self.info.infohash,
-                        producer,
-                        self.candidates.kind(producer),
-                    );
+            self.start_publication();
+            if !self.continuity.publication_hold() {
+                match self.drain_output().await {
+                    PieceOutcome::End(end) => return PieceOutcome::End(end),
+                    PieceOutcome::Progress { output, .. } => made_output = output,
+                    PieceOutcome::Skip => {}
                 }
             }
             let newly_lost =
@@ -807,6 +777,97 @@ impl PoolActor<'_> {
         }
         PieceOutcome::Progress {
             activity: made_activity,
+            output: made_output,
+        }
+    }
+    async fn drain_output(&mut self) -> PieceOutcome {
+        let mut made_output = false;
+        let addr = self.peers.values().next().expect("active pool").addr;
+        let before = self.continuity.reasm.next_needed();
+        let ready = take_ready_with_stats(self.continuity, self.seed.metrics.as_ref(), self.info);
+        let after = self.continuity.reasm.next_needed();
+        let productive: Vec<_> = self
+            .continuity
+            .piece_producers
+            .range(before..after)
+            .filter_map(|(_, producer)| *producer)
+            .collect();
+        self.continuity
+            .piece_producers
+            .retain(|&piece, _| piece >= after);
+        if !ready.is_empty() {
+            if !self.continuity.authenticated_logged
+                && self.info.sig_len > 0
+                && ace_wire::live_auth::signature_len_from_pubkey_der(&self.info.source_pubkey)
+                    == Some(self.info.sig_len)
+            {
+                self.continuity.authenticated_logged = true;
+                crate::alog!("[ace] discovery stage=authenticated-contiguous");
+            }
+            for output in self.continuity.resync_output(&ready) {
+                let aligned = output.bytes;
+                if self.continuity.emitted == 0 {
+                    crate::alog!("[ace] discovery stage=first-source-output");
+                }
+                self.continuity.emitted += aligned.len() as u64;
+                if self.continuity.emitted >= self.continuity.next_log {
+                    crate::alog!(
+                        "[ace] {addr}: served {} MiB (head={}, next piece needed={})",
+                        self.continuity.emitted >> 20,
+                        self.continuity.head,
+                        self.continuity.reasm.next_needed()
+                    );
+                    self.continuity.next_log = self.continuity.emitted + (4 << 20);
+                }
+                let len = aligned.len() as u64;
+                if self
+                    .tx
+                    .send(LiveOutput {
+                        bytes: aligned,
+                        discontinuity: output.discontinuity,
+                    })
+                    .await
+                    .is_err()
+                {
+                    shutdown_peer_runtimes(&mut self.peers);
+                    return PieceOutcome::End(FollowEnd::ConsumerGone);
+                }
+                self.downloaded.fetch_add(len, Ordering::Relaxed);
+                made_output = true;
+            }
+        }
+        if made_output {
+            for producer in &productive {
+                self.candidates.productive(*producer);
+                for peer in self
+                    .peers
+                    .values_mut()
+                    .filter(|peer| peer.addr == *producer)
+                {
+                    peer.produced_output = true;
+                }
+            }
+        }
+        if made_output
+            && self.info.sig_len > 0
+            && ace_wire::live_auth::signature_len_from_pubkey_der(&self.info.source_pubkey)
+                == Some(self.info.sig_len)
+        {
+            for producer in productive {
+                self.seed.warm_peers.record_productive(
+                    self.info.infohash,
+                    producer,
+                    self.candidates.kind(producer),
+                );
+            }
+        }
+
+        if made_output {
+            self.last_progress = Instant::now();
+            self.continuity.next_needed_since = Instant::now();
+        }
+        PieceOutcome::Progress {
+            activity: false,
             output: made_output,
         }
     }

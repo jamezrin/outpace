@@ -230,6 +230,9 @@ pub(super) async fn advance_pool_requests(
     continuity: &mut Continuity,
     chunks_per_piece: u16,
 ) -> Vec<SocketAddrV4> {
+    if continuity.publication_hold() {
+        return Vec::new();
+    }
     continuity.skip_far_behind_live(Instant::now());
     if continuity.startup_deadline.is_some() {
         return Vec::new();
@@ -401,7 +404,12 @@ pub(super) fn take_ready_with_stats(
     info: &StreamInfo,
 ) -> Vec<u8> {
     publish_live_stats(c, metrics, info);
+    if c.publication_hold() {
+        return Vec::new();
+    }
     let ready = c.reasm.take_ready();
+    let next = c.reasm.next_needed();
+    c.publication.retain(|&piece, _| piece >= next);
     if let Some(metrics) = metrics {
         metrics.received_bytes(ready.len() as u64);
     }
@@ -422,6 +430,9 @@ pub(super) async fn retransmit_stalled_requests(
     chunks_per_piece: u16,
     now: Instant,
 ) -> Vec<SocketAddrV4> {
+    if continuity.publication_hold() {
+        return Vec::new();
+    }
     let mut changed = false;
     let head = continuity.head;
     if let Some(target) = continuity.skip_far_behind_live(now) {
