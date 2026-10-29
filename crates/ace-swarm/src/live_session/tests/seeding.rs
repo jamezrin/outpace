@@ -191,13 +191,13 @@ async fn disabled_pool_reciprocal_seed_does_not_unchoke_or_serve_id6() {
 }
 
 #[tokio::test]
-async fn failed_pool_reply_enqueue_does_not_increment_counters() {
+async fn closed_peer_waiting_reply_does_not_increment_counters() {
     let mut caller = start_pool(true).await;
     let store = caller.store.clone();
     let guard = store.lock().await;
     caller.peer.send(&id6_request()).await.unwrap();
-    // A remote write-half close makes the real peer worker see EOF after its queued id6
-    // event. The held store lock lets that worker drop its command receiver first.
+    // A remote write-half close queues Lost after id6. While the store is locked,
+    // the actor must retire this generation without sending or accounting its reply.
     caller.control.shutdown().await.unwrap();
     let mut byte = [0u8; 1];
     let n = tokio::time::timeout(Duration::from_secs(2), caller.control.read(&mut byte))
@@ -205,15 +205,10 @@ async fn failed_pool_reply_enqueue_does_not_increment_counters() {
         .expect("the local worker should close its socket after receiving EOF")
         .unwrap();
     assert_eq!(n, 0, "the remote read half should observe worker EOF");
-    assert!(
-        !caller.task.is_finished(),
-        "reply preparation should wait on the held store lock"
-    );
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut caller.task).await;
     drop(guard);
-
-    let result = tokio::time::timeout(Duration::from_secs(2), &mut caller.task)
-        .await
-        .expect("the failed enqueue should retire the closed peer")
+    let result = result
+        .expect("a waiting reply must not prevent closed-peer retirement")
         .unwrap();
     assert!(matches!(result, FollowEnd::PeerLost(1)));
     assert_eq!(caller.downloaded.load(Ordering::Relaxed), 0);
