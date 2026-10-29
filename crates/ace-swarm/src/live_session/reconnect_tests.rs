@@ -2476,3 +2476,166 @@ async fn cancelling_reconnect_selection_closes_pending_socket_without_advancing_
 }
 
 mod fairness;
+
+#[tokio::test]
+async fn owned_gossip_limits_messages_and_retained_pex() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let server = tokio::spawn(async move {
+        let mut session = PeerSession::new(server);
+        assert!(matches!(
+            session.read_message().await.unwrap(),
+            PeerMessage::Extended { ext_id: 0, .. }
+        ));
+        let mut payload = vec![0; 16 + 1100 * 108];
+        payload[1..3].copy_from_slice(&1100u16.to_be_bytes());
+        payload[7..11].copy_from_slice(&108u32.to_be_bytes());
+        for i in 0..1100usize {
+            let offset = 16 + i * 108 + 11;
+            payload[offset..offset + 4].copy_from_slice(&[127, 0, 0, 1]);
+            payload[offset + 4..offset + 6].copy_from_slice(&(1000 + i as u16).to_be_bytes());
+        }
+        session
+            .send(&PeerMessage::Unknown { id: 12, payload })
+            .await
+            .unwrap();
+        for _ in 1..32 {
+            session.send(&PeerMessage::KeepAlive).await.unwrap();
+        }
+        // This source is the 33rd message: it must not be learned.
+        let mut payload = vec![0; 14];
+        payload[8..12].copy_from_slice(&[127, 0, 0, 1]);
+        payload[12..14].copy_from_slice(&30000u16.to_be_bytes());
+        let _ = session
+            .send(&PeerMessage::Unknown { id: 36, payload })
+            .await;
+        while let Ok(message) = session.read_message().await {
+            assert!(!matches!(
+                message,
+                PeerMessage::Interested | PeerMessage::Unknown { id: 6, .. }
+            ));
+        }
+    });
+    let learned = pool_support::stale_gossip_job(
+        ConnectedUpstream {
+            session: PeerSession::new(client),
+            addr,
+            window: live_pos(1, 1),
+            unchoked: false,
+            yourip: None,
+        },
+        &Identity::generate(),
+        tokio::time::Instant::now() + STALE_GOSSIP_BUDGET,
+    )
+    .await;
+    let learned = learned.into_learned();
+    assert_eq!(learned.len(), 1024);
+    assert!(learned
+        .iter()
+        .all(|(addr, kind)| addr.port() < 2100 && *kind == CandidateKind::Pex));
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn owned_gossip_drop_before_poll_closes_socket() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (mut server, _) = listener.accept().await.unwrap();
+    let job = pool_support::stale_gossip_job(
+        ConnectedUpstream {
+            session: PeerSession::new(client),
+            addr,
+            window: live_pos(1, 1),
+            unchoked: false,
+            yourip: None,
+        },
+        &Identity::generate(),
+        tokio::time::Instant::now() + STALE_GOSSIP_BUDGET,
+    );
+    drop(job);
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), server.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn owned_gossip_chatter_does_not_renew_absolute_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let server = tokio::spawn(async move {
+        let mut session = PeerSession::new(server);
+        session.read_message().await.unwrap();
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if session.send(&PeerMessage::KeepAlive).await.is_err() {
+                break;
+            }
+        }
+    });
+    let start = tokio::time::Instant::now();
+    let deadline = start + Duration::from_millis(80);
+    pool_support::stale_gossip_job(
+        ConnectedUpstream {
+            session: PeerSession::new(client),
+            addr,
+            window: live_pos(1, 1),
+            unchoked: false,
+            yourip: None,
+        },
+        &Identity::generate(),
+        deadline,
+    )
+    .await;
+    assert!(start.elapsed() >= Duration::from_millis(80));
+    assert!(start.elapsed() < Duration::from_millis(250));
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_gossip_deadline_starts_at_admission_not_first_poll() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (_server, _) = listener.accept().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+    let job = pool_support::stale_gossip_job(
+        ConnectedUpstream {
+            session: PeerSession::new(client),
+            addr,
+            window: live_pos(1, 1),
+            unchoked: false,
+            yourip: None,
+        },
+        &Identity::generate(),
+        deadline,
+    );
+    tokio::time::advance(Duration::from_millis(30)).await;
+    let before = tokio::time::Instant::now();
+    assert!(job.await.into_learned().is_empty());
+    assert_eq!(tokio::time::Instant::now(), before);
+}

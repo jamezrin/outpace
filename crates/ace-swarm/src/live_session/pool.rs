@@ -334,6 +334,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
     let observed_retry = Instant::now();
     let closed_peer_events = BTreeMap::new();
     PoolActor {
+        gossip: None,
         closed_peer_events,
         observed_retry,
         observed_capacity,

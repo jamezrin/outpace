@@ -583,6 +583,7 @@ pub(super) enum PoolRefill {
 type CandidateConnectCompletion = (SocketAddrV4, Option<PeerConnectFailure>, bool);
 
 enum PoolWake {
+    Gossip(SessionCandidates),
     ConsumerGone,
     Peer(Option<PeerEvent>),
     Refill(Option<PoolRefill>),
