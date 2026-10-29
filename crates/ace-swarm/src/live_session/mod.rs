@@ -589,6 +589,7 @@ pub(super) enum PoolRefill {
 type CandidateConnectCompletion = (SocketAddrV4, Option<PeerConnectFailure>, bool);
 
 enum PoolWake {
+    Reciprocal(Option<(u64, Option<crate::seed::protocol::PreparedReply>)>),
     Publication,
     Gossip(SessionCandidates),
     ConsumerGone,

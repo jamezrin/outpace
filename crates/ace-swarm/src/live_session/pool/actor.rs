@@ -1,5 +1,6 @@
 use super::*;
 mod publication;
+mod reciprocal;
 use publication::PublicationOperation;
 
 type ConnectCompletion =
@@ -20,6 +21,7 @@ enum WakeOutcome {
 // Fields owning resources follow the original locals' reverse declaration order.
 // In particular peers retire before connect tasks, channel endpoints, then stats.
 pub(super) struct PoolActor<'a> {
+    pub(super) reciprocal: reciprocal::Reciprocal,
     pub(super) publication: Option<PublicationOperation>,
     pub(super) closed_peer_events: BTreeMap<u64, (SocketAddrV4, usize)>,
     pub(super) observed_retry: Instant,
@@ -67,6 +69,24 @@ impl PoolActor<'_> {
         loop {
             if self.tx.is_closed() {
                 return FollowEnd::ConsumerGone;
+            }
+            #[cfg(test)]
+            {
+                self.reciprocal.turn += 1;
+            }
+            self.start_reciprocal();
+            let reciprocal_ready = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(match reciprocal::poll_job(&mut self.reciprocal, cx) {
+                    std::task::Poll::Ready(result) => Some(result),
+                    std::task::Poll::Pending => None,
+                })
+            })
+            .await;
+            let reciprocal_completed = reciprocal_ready.is_some();
+            if let Some((id, reply)) = reciprocal_ready {
+                #[cfg(test)]
+                self.reciprocal.observe(1);
+                self.finish_reciprocal(id, reply).await;
             }
             self.start_publication();
             let ready =
@@ -187,9 +207,16 @@ impl PoolActor<'_> {
             let event_was_polled = pending_event.is_some();
             let event = match pending_event {
             Some(event) => PoolWake::Peer(Some(event)),
+            None if reciprocal_completed => PoolWake::Reciprocal(None),
             None if ready => PoolWake::Publication,
             None => match tokio::time::timeout(wait, async {
                 tokio::select! {
+                    result = std::future::poll_fn(|cx| {
+                        let result = reciprocal::poll_job(&mut self.reciprocal, cx);
+                        #[cfg(test)]
+                        if result.is_pending() && self.reciprocal.job.is_some() { self.reciprocal.observe(3); }
+                        result
+                    }), if !reciprocal_completed => PoolWake::Reciprocal(Some(result)),
                     _ = self.tx.closed() => PoolWake::ConsumerGone,
                     _ = std::future::poll_fn(|cx| publication::poll_operation(&mut self.publication, self.continuity, self.store, cx).then_some(()).map_or(std::task::Poll::Pending, std::task::Poll::Ready)), if self.publication.is_some() => PoolWake::Publication,
                     learned = async { self.gossip.as_mut().expect("enabled gossip").await }, if self.gossip.is_some() => PoolWake::Gossip(learned),
@@ -253,6 +280,14 @@ impl PoolActor<'_> {
 
     async fn on_wake(&mut self, event: PoolWake) -> WakeOutcome {
         match event {
+            PoolWake::Reciprocal(result) => {
+                if let Some((id, reply)) = result {
+                    #[cfg(test)]
+                    self.reciprocal.observe(2);
+                    self.finish_reciprocal(id, reply).await;
+                }
+                WakeOutcome::Continue
+            }
             PoolWake::Gossip(learned) => {
                 self.gossip = None;
                 for (addr, kind) in learned.into_learned() {
@@ -554,20 +589,8 @@ impl PoolActor<'_> {
                     .await;
                 }
             }
-            request @ PeerMessage::Unknown { id: 6, .. } if self.seed.enabled => {
-                if let Some(reply) =
-                    prepare_reply(&request, Some(self.store), ServeProfile::Reciprocal).await
-                {
-                    if send_peer_command(peer_id, reply.message, &mut self.peers, self.continuity)
-                        .await
-                        .is_none()
-                    {
-                        self.uploaded
-                            .fetch_add(reply.media_bytes as u64, Ordering::Relaxed);
-                        self.peers_served
-                            .store(self.peers.len() as u32, Ordering::Relaxed);
-                    }
-                }
+            PeerMessage::Unknown { id: 6, payload } if self.seed.enabled => {
+                self.queue_reciprocal(peer_id, &payload);
             }
             PeerMessage::Unknown { id: 4, ref payload } if payload.len() == 8 => {
                 let piece =

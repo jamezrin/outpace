@@ -33,8 +33,19 @@ pub(crate) async fn prepare_reply(
             let requested_stream = u32::from_be_bytes(payload[0..4].try_into().ok()?);
             let piece = u32::from_be_bytes(payload[4..8].try_into().ok()?);
             let chunk = u16::from_be_bytes(payload[8..10].try_into().ok()?);
-            let (data, stored_header) =
-                PieceStore::shared_chunk(store, piece as u64, chunk).await?;
+            let reciprocal;
+            let ordinary;
+            let (data, stored_header) = match profile {
+                ServeProfile::Reciprocal => {
+                    reciprocal =
+                        PieceStore::shared_reciprocal_chunk(store, piece as u64, chunk).await?;
+                    (&reciprocal.data, reciprocal.header)
+                }
+                ServeProfile::Inbound { .. } => {
+                    ordinary = PieceStore::shared_chunk(store, piece as u64, chunk).await?;
+                    (&ordinary.0, ordinary.1)
+                }
+            };
             let (stream, header) = match profile {
                 ServeProfile::Inbound { fallback_header } => (
                     requested_stream,
@@ -47,7 +58,7 @@ pub(crate) async fn prepare_reply(
                 ServeProfile::Reciprocal => (0, stored_header),
             };
             Some(PreparedReply {
-                message: build_piece(stream, piece, chunk, header, &data),
+                message: build_piece(stream, piece, chunk, header, data),
                 media_bytes: data.len(),
             })
         }

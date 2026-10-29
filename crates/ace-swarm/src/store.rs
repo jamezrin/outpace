@@ -13,6 +13,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+// Declaration order ensures payload storage is released before disk admission.
+pub(crate) struct ReciprocalChunk {
+    pub(crate) data: Vec<u8>,
+    pub(crate) header: [u8; 8],
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// Maximum request block accepted from a standard BitTorrent peer (BEP 3 convention).
 pub const MAX_BT_REQUEST_LEN: u32 = 16 * 1024;
 
@@ -352,6 +359,32 @@ impl PieceStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn reciprocal_admission_witness(&self, notify: Arc<tokio::sync::Notify>) {
+        if let Backend::Disk(disk) = &self.backend {
+            disk.admission_witness(notify);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn reciprocal_available(&self) -> usize {
+        match &self.backend {
+            Backend::Disk(disk) => disk.reciprocal_available(),
+            _ => 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_read(
+        &self,
+        reached: Arc<tokio::sync::Notify>,
+        gate: std::sync::mpsc::Receiver<()>,
+    ) {
+        match &self.backend {
+            Backend::Disk(disk) => disk.pause_read(reached, gate),
+            _ => panic!("disk fixture required"),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn publication_budget(&self) -> (usize, usize) {
         match &self.backend {
             Backend::Disk(disk) => disk.publication_budget(),
@@ -382,6 +415,41 @@ impl PieceStore {
             }
         };
         handle.get(piece, chunk).await
+    }
+
+    pub(crate) async fn shared_reciprocal_chunk(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<ReciprocalChunk> {
+        let handle = {
+            #[cfg(not(test))]
+            let guard = store.lock().await;
+            #[cfg(test)]
+            let guard = {
+                use std::future::Future;
+                let mut lock = std::pin::pin!(store.lock());
+                std::future::poll_fn(|cx| {
+                    let result = lock.as_mut().poll(cx);
+                    if result.is_pending() {
+                        reciprocal_lock_witness::pending(store);
+                    }
+                    result
+                })
+                .await
+            };
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    return Some(ReciprocalChunk {
+                        data: guard.chunk(piece, chunk)?.into_owned(),
+                        header: guard.piece_header(piece).unwrap_or([0; 8]),
+                        _permit: None,
+                    })
+                }
+                Backend::Disk(disk) => disk.handle(),
+            }
+        };
+        handle.reciprocal_get(piece, chunk).await
     }
 
     /// Read a standard BitTorrent byte block from a piece stored as request-sized chunks.
@@ -1324,5 +1392,32 @@ mod generation_contract {
             b"abcdefgh"
         );
         assert_eq!(store.lock().await.publication_budget(), (0, 1));
+    }
+}
+
+// Test-only registration is keyed by the exact shared store, never by global timing.
+#[cfg(test)]
+pub(crate) mod reciprocal_lock_witness {
+    use super::*;
+    static HOOKS: std::sync::Mutex<BTreeMap<usize, Arc<tokio::sync::Notify>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    pub(crate) struct Registration(usize);
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            HOOKS.lock().unwrap().remove(&self.0);
+        }
+    }
+    pub(crate) fn register(
+        store: &Arc<Mutex<PieceStore>>,
+    ) -> (Registration, Arc<tokio::sync::Notify>) {
+        let key = Arc::as_ptr(store) as usize;
+        let notify = Arc::new(tokio::sync::Notify::new());
+        assert!(HOOKS.lock().unwrap().insert(key, notify.clone()).is_none());
+        (Registration(key), notify)
+    }
+    pub(super) fn pending(store: &Arc<Mutex<PieceStore>>) {
+        if let Some(notify) = HOOKS.lock().unwrap().get(&(Arc::as_ptr(store) as usize)) {
+            notify.notify_one();
+        }
     }
 }

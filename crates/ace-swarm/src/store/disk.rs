@@ -32,6 +32,8 @@ struct PublicationHooks {
     // Actor takes this gate outside every metadata/store lock.
     pause: Option<(Arc<tokio::sync::Notify>, mpsc::Receiver<()>)>,
     fail_next_write: bool,
+    admission_pending: Option<Arc<tokio::sync::Notify>>,
+    read_pause: Option<(Arc<tokio::sync::Notify>, mpsc::Receiver<()>)>,
 }
 
 const MAX_OPEN_PIECES: usize = 64;
@@ -72,6 +74,12 @@ enum Command {
         chunk: u16,
         reply: tokio::sync::oneshot::Sender<Option<(Vec<u8>, [u8; 8])>>,
     },
+    ReciprocalGet {
+        piece: u64,
+        chunk: u16,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        reply: tokio::sync::oneshot::Sender<Option<super::ReciprocalChunk>>,
+    },
     SyncPut {
         piece: u64,
         chunk: u16,
@@ -97,6 +105,7 @@ pub(super) struct DiskBackend {
     tx: mpsc::Sender<Command>,
     state: Arc<Mutex<State>>,
     publication: Arc<tokio::sync::Semaphore>,
+    reciprocal: Arc<tokio::sync::Semaphore>,
     pending: Arc<AtomicUsize>,
     #[cfg(test)]
     hooks: Arc<Mutex<PublicationHooks>>,
@@ -104,8 +113,11 @@ pub(super) struct DiskBackend {
 
 #[derive(Clone)]
 pub(crate) struct DiskHandle {
+    #[cfg(test)]
+    hooks: Arc<Mutex<PublicationHooks>>,
     tx: mpsc::Sender<Command>,
     publication: Arc<tokio::sync::Semaphore>,
+    reciprocal: Arc<tokio::sync::Semaphore>,
     pending: Arc<AtomicUsize>,
 }
 
@@ -120,6 +132,11 @@ impl DiskBackend {
     }
 
     #[cfg(test)]
+    pub(super) fn pause_read(&self, reached: Arc<tokio::sync::Notify>, gate: mpsc::Receiver<()>) {
+        self.hooks.lock().unwrap().read_pause = Some((reached, gate));
+    }
+
+    #[cfg(test)]
     pub(super) fn publication_budget(&self) -> (usize, usize) {
         (
             self.pending.load(Ordering::Acquire),
@@ -131,8 +148,11 @@ impl DiskBackend {
         #[cfg(test)]
         let _ = &self.hooks; // Kept on the backend for colocated test configuration.
         DiskHandle {
+            #[cfg(test)]
+            hooks: self.hooks.clone(),
             tx: self.tx.clone(),
             publication: Arc::clone(&self.publication),
+            reciprocal: Arc::clone(&self.reciprocal),
             pending: Arc::clone(&self.pending),
         }
     }
@@ -163,10 +183,20 @@ impl DiskBackend {
             tx,
             state,
             publication: Arc::new(tokio::sync::Semaphore::new(1)),
+            reciprocal: Arc::new(tokio::sync::Semaphore::new(1)),
             pending: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             hooks,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn admission_witness(&self, notify: Arc<tokio::sync::Notify>) {
+        self.hooks.lock().unwrap().admission_pending = Some(notify);
+    }
+    #[cfg(test)]
+    pub(super) fn reciprocal_available(&self) -> usize {
+        self.reciprocal.available_permits()
     }
 
     pub(super) fn retained_bytes(&self) -> u64 {
@@ -338,6 +368,40 @@ impl DiskHandle {
             let _ = done.await;
         }
     }
+    pub(super) async fn reciprocal_get(
+        &self,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<super::ReciprocalChunk> {
+        #[cfg(not(test))]
+        let permit = self.reciprocal.clone().acquire_owned().await.ok()?;
+        #[cfg(test)]
+        let permit = {
+            use std::future::Future;
+            let mut acquire = std::pin::pin!(self.reciprocal.clone().acquire_owned());
+            std::future::poll_fn(|cx| {
+                let result = acquire.as_mut().poll(cx);
+                if result.is_pending() {
+                    if let Some(notify) = self.hooks.lock().unwrap().admission_pending.take() {
+                        notify.notify_one();
+                    }
+                }
+                result
+            })
+            .await
+            .ok()?
+        };
+        let (reply, done) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Command::ReciprocalGet {
+                piece,
+                chunk,
+                permit,
+                reply,
+            })
+            .ok()?;
+        done.await.ok().flatten()
+    }
     pub(super) async fn get(&self, piece: u64, chunk: u16) -> Option<(Vec<u8>, [u8; 8])> {
         let (reply, done) = tokio::sync::oneshot::channel();
         self.tx
@@ -362,6 +426,17 @@ struct Actor {
 }
 
 impl Actor {
+    fn pause_read(&self) {
+        #[cfg(test)]
+        {
+            let pause = self.hooks.lock().unwrap().read_pause.take();
+            if let Some((reached, release)) = pause {
+                reached.notify_one();
+                let _ = release.recv();
+            }
+        }
+    }
+
     fn new(dir: PathBuf, chunk_length: u64, state: Arc<Mutex<State>>) -> Self {
         Self {
             dir,
@@ -407,7 +482,24 @@ impl Actor {
                     chunk,
                     reply,
                 } => {
+                    self.pause_read();
                     let _ = reply.send(self.get(piece, chunk));
+                }
+                Command::ReciprocalGet {
+                    piece,
+                    chunk,
+                    permit,
+                    reply,
+                } => {
+                    self.pause_read();
+                    let result =
+                        self.get(piece, chunk)
+                            .map(|(data, header)| super::ReciprocalChunk {
+                                data,
+                                header,
+                                _permit: Some(permit),
+                            });
+                    let _ = reply.send(result);
                 }
                 Command::SyncPut {
                     piece,
@@ -697,6 +789,72 @@ fn read_exact_at(file: &File, data: &mut [u8], offset: u64) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reciprocal_admission_survives_execution_and_buffered_cancellation() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DiskBackend::new(dir.path().join("cache"), 4).unwrap();
+        let first = backend.handle();
+        let next_generation = backend.handle();
+        first
+            .put_complete(1, [0; 8], b"abcdefgh", 64, 16, None)
+            .await
+            .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let (release, gate) = mpsc::channel();
+        backend.hooks.lock().unwrap().read_pause = Some((reached.clone(), gate));
+        let mut read = Box::pin(first.reciprocal_get(1, 1));
+        let pending = read
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending();
+        let reached_read = tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .is_ok();
+        let mut waiting = Box::pin(next_generation.reciprocal_get(1, 0));
+        let waits = waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending();
+        drop(waiting); // Before-admission cancellation.
+        drop(read); // Executing command still owns admission.
+        let held = backend.reciprocal.available_permits();
+        let publication_free = backend.publication.available_permits();
+        drop(release);
+        let drain = first.get(1, 0).await;
+        let restored = backend.reciprocal.available_permits();
+        // Drive admission once, then leave its oneshot result unconsumed.
+        let mut buffered = Box::pin(first.reciprocal_get(1, 1));
+        let _ = buffered
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        let drain2 = first.get(1, 0).await;
+        let buffered_held = backend.reciprocal.available_permits();
+        let mut successor = Box::pin(next_generation.reciprocal_get(1, 0));
+        let successor_waits = successor
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending();
+        // Publication admission is independent even with a buffered read result.
+        let publication = first.reserve_complete().await;
+        drop(publication);
+        drop(buffered);
+        let reply = successor.await;
+        let bytes = reply.as_ref().map(|r| (r.data.clone(), r.header));
+        let result_held = backend.reciprocal.available_permits();
+        drop(reply);
+        assert!(pending && reached_read && waits && successor_waits);
+        assert_eq!(
+            (held, publication_free, restored, buffered_held, result_held),
+            (0, 1, 1, 0, 0)
+        );
+        assert_eq!(drain, Some((b"abcd".to_vec(), [0; 8])));
+        assert_eq!(drain2, drain);
+        assert_eq!(bytes, drain);
+        assert_eq!(backend.reciprocal.available_permits(), 1);
+    }
 
     #[tokio::test]
     async fn contract_whole_cancel_admission_keeps_one_owned_buffer_and_atomic_budget() {
