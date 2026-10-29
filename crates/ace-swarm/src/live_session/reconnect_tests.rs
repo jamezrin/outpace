@@ -854,22 +854,22 @@ async fn retired_same_address_worker_events_cannot_target_fresh_source_runtime()
                 while session.read_message().await.is_ok() {}
             }
         });
-        let (mut runtime, _) = activate_upstream_peer(
+        let (mut runtime, _) = activate_upstream_peer(ActivationInputs {
             peer_id,
-            ConnectedUpstream {
+            upstream: ConnectedUpstream {
                 session: PeerSession::new(client),
                 addr,
                 window: live_pos(7, 10),
                 unchoked: false,
                 yourip: None,
             },
-            9,
-            &identity,
-            &mut continuity,
-            &events,
-            None,
-            None,
-        )
+            start: 9,
+            identity: &identity,
+            continuity: &mut continuity,
+            event_tx: &events,
+            reachability: None,
+            replacing: None,
+        })
         .await
         .unwrap();
         if peer_id == 41 {
@@ -1365,16 +1365,16 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
     candidates.learn(addrs[2], CandidateKind::Discovered);
     let mut tasks = tokio::task::JoinSet::new();
     let mut pending = HashSet::new();
-    spawn_candidate_connects(
-        &mut candidates,
-        &BTreeMap::new(),
-        [0; 20],
-        2,
-        &tx,
-        &mut tasks,
-        &mut pending,
-        true,
-    );
+    spawn_candidate_connects(CandidateConnectInputs {
+        candidates: &mut candidates,
+        peers: &BTreeMap::new(),
+        infohash: [0; 20],
+        max_parallel: 2,
+        tx: &tx,
+        tasks: &mut tasks,
+        pending: &mut pending,
+        include_discovered: true,
+    });
     tokio::time::timeout(Duration::from_secs(1), async {
         while waiting.load(Ordering::Relaxed) != 2 {
             tokio::task::yield_now().await;
@@ -1397,16 +1397,16 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
         assert!(failure.is_none() && queued);
     }
     assert_eq!(rx.len(), 2); // Both actual learned connections are ready and owned.
-    spawn_candidate_connects(
-        &mut candidates,
-        &BTreeMap::new(),
-        [0; 20],
-        2,
-        &tx,
-        &mut tasks,
-        &mut pending,
-        true,
-    );
+    spawn_candidate_connects(CandidateConnectInputs {
+        candidates: &mut candidates,
+        peers: &BTreeMap::new(),
+        infohash: [0; 20],
+        max_parallel: 2,
+        tx: &tx,
+        tasks: &mut tasks,
+        pending: &mut pending,
+        include_discovered: true,
+    });
     let unexpected = tokio::time::timeout(Duration::from_millis(100), c.accept()).await;
     let exceeds_cap = unexpected.is_ok();
     drop(unexpected);
@@ -1441,16 +1441,16 @@ async fn discovered_refill_reports_completed_transport_failure() {
     candidates.learn(addr, CandidateKind::Discovered);
     let mut pending = HashSet::new();
     let mut tasks = tokio::task::JoinSet::new();
-    spawn_candidate_connects(
-        &mut candidates,
-        &BTreeMap::new(),
-        [0; 20],
-        1,
-        &tx,
-        &mut tasks,
-        &mut pending,
-        true,
-    );
+    spawn_candidate_connects(CandidateConnectInputs {
+        candidates: &mut candidates,
+        peers: &BTreeMap::new(),
+        infohash: [0; 20],
+        max_parallel: 1,
+        tx: &tx,
+        tasks: &mut tasks,
+        pending: &mut pending,
+        include_discovered: true,
+    });
     assert!(pending.contains(&addr));
     let completion = tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
         .await
