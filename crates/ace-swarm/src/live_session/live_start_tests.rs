@@ -859,22 +859,22 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
     let (mut c, _) = Continuity::fresh(&info, 7, 8, 1, seed.live_recovery);
     let identity = Identity::generate();
     let (events, mut event_rx) = mpsc::channel(16);
-    let (runtime, _) = activate_upstream_peer(
-        1,
-        ConnectedUpstream {
+    let (runtime, _) = activate_upstream_peer(ActivationInputs {
+        peer_id: 1,
+        upstream: ConnectedUpstream {
             session: PeerSession::new(client),
             addr,
             window: window(7, 8),
             unchoked: false,
             yourip: None,
         },
-        7,
-        &identity,
-        &mut c,
-        &events,
-        None,
-        None,
-    )
+        start: 7,
+        identity: &identity,
+        continuity: &mut c,
+        event_tx: &events,
+        reachability: None,
+        replacing: None,
+    })
     .await
     .unwrap();
     let mut peers = BTreeMap::from([(1, runtime)]);
@@ -893,22 +893,22 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
     let (_bad_server, _) = listener.accept().await.unwrap();
     // This half-close deterministically rejects candidate writes without TCP timing races.
     client.shutdown().await.unwrap();
-    let result = activate_upstream_peer(
-        2,
-        ConnectedUpstream {
+    let result = activate_upstream_peer(ActivationInputs {
+        peer_id: 2,
+        upstream: ConnectedUpstream {
             session: PeerSession::new(client),
             addr: bad_addr,
             window: window(7, 8),
             unchoked: true,
             yourip: None,
         },
-        7,
-        &identity,
-        &mut c,
-        &events,
-        None,
-        Some((&mut peers, 1)),
-    )
+        start: 7,
+        identity: &identity,
+        continuity: &mut c,
+        event_tx: &events,
+        reachability: None,
+        replacing: Some((&mut peers, 1)),
+    })
     .await;
     assert!(result.is_err());
     assert!(

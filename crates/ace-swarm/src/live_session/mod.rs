@@ -151,7 +151,7 @@ mod pool;
 use pool::follow_peer_pool;
 use pool::follow_peer_pool_with_discovery;
 #[cfg(test)]
-use pool::{activate_upstream_peer, recovery_channel_capacities};
+use pool::{activate_upstream_peer, recovery_channel_capacities, ActivationInputs};
 mod pool_support;
 #[cfg(test)]
 use pool_support::ready_buffer_snapshot;
@@ -277,32 +277,7 @@ pub struct LiveSessionInputs {
 
 /// Follow authenticated live media, owning discovery, upstream workers and the producer lease.
 pub async fn follow_live(session: LiveSessionInputs) {
-    let LiveSessionInputs {
-        info,
-        peers,
-        identity,
-        output,
-        counters,
-        seed,
-        discovery,
-        reachability,
-        initial_run,
-    } = session;
-    follow_live_session_with_run(
-        info,
-        peers,
-        identity,
-        output,
-        counters.peers,
-        counters.downloaded,
-        counters.uploaded,
-        counters.peers_served,
-        seed,
-        discovery,
-        reachability,
-        initial_run,
-    )
-    .await;
+    follow_live_session_with_run(session).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,38 +295,43 @@ pub(super) async fn follow_live_session(
     discovery: PeerDiscovery,
     reachability: Option<Arc<ReachabilityMonitor>>,
 ) {
-    follow_live_session_with_run(
+    follow_live_session_with_run(LiveSessionInputs {
         info,
         peers,
         identity,
-        tx,
-        peer_count,
-        downloaded,
-        uploaded,
-        peers_served,
+        output: tx,
+        counters: LiveCounters {
+            peers: peer_count,
+            downloaded,
+            uploaded,
+            peers_served,
+        },
         seed,
         discovery,
         reachability,
-        None,
-    )
+        initial_run: None,
+    })
     .await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn follow_live_session_with_run(
-    info: StreamInfo,
-    peers: Vec<SocketAddrV4>,
-    identity: Arc<Identity>,
-    tx: mpsc::Sender<LiveOutput>,
-    peer_count: Arc<AtomicU32>,
-    downloaded: Arc<AtomicU64>,
-    uploaded: Arc<AtomicU64>,
-    peers_served: Arc<AtomicU32>,
-    seed: SeedConfig,
-    discovery: PeerDiscovery,
-    reachability: Option<Arc<ReachabilityMonitor>>,
-    mut rediscovery: Option<DiscoveryRun>,
-) {
+async fn follow_live_session_with_run(session: LiveSessionInputs) {
+    let LiveSessionInputs {
+        info,
+        peers,
+        identity,
+        output: tx,
+        counters,
+        seed,
+        discovery,
+        reachability,
+        initial_run: mut rediscovery,
+    } = session;
+    let LiveCounters {
+        peers: peer_count,
+        downloaded,
+        uploaded,
+        peers_served,
+    } = counters;
     let _stats_guard = LiveStatsGuard(seed.metrics.clone());
     let _peer_count_guard = SessionPeerCount(peer_count.clone());
     let _warm_flush = WarmFlush(seed.warm_peers.clone());
@@ -486,26 +466,25 @@ async fn follow_live_session_with_run(
         peer_count.store(upstreams.len() as u32, Ordering::Relaxed);
         let end = tokio::select! {
             _ = tx.closed() => return,
-            end = follow_peer_pool_with_discovery(
-            upstreams,
-            &info,
-            &identity,
-            chunks_per_piece,
-            &tx,
-            &downloaded,
-            &uploaded,
-            &peers_served,
-            &seed,
-            &store,
-            &mut continuity,
-            refill_candidates,
-            known_refill_peers,
-            discovery.clone(),
-            &mut candidates,
-            &peer_count,
-            reachability.as_ref(),
-            &mut rediscovery,
-        )
+            end = follow_peer_pool_with_discovery(upstreams, pool::PoolContext {
+                info: &info,
+                identity: &identity,
+                chunks_per_piece,
+                tx: &tx,
+                downloaded: &downloaded,
+                uploaded: &uploaded,
+                peers_served: &peers_served,
+                seed: &seed,
+                store: &store,
+                continuity: &mut continuity,
+                refill_candidates,
+                known_refill_peers,
+                discovery: discovery.clone(),
+                candidates: &mut candidates,
+                peer_count: &peer_count,
+                reachability: reachability.as_ref(),
+                discovery_run: &mut rediscovery,
+            })
         => end,
         };
         match end {

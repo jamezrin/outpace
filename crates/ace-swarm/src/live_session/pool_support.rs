@@ -50,7 +50,7 @@ pub(super) fn spawn_learned_connects(
     tasks: &mut tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>, bool)>,
     pending: &mut HashSet<SocketAddrV4>,
 ) {
-    spawn_candidate_connects(
+    spawn_candidate_connects(CandidateConnectInputs {
         candidates,
         peers,
         infohash,
@@ -58,8 +58,8 @@ pub(super) fn spawn_learned_connects(
         tx,
         tasks,
         pending,
-        false,
-    );
+        include_discovered: false,
+    });
 }
 
 pub(super) fn finish_candidate_connect(
@@ -78,17 +78,29 @@ pub(super) fn finish_candidate_connect(
     false
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn spawn_candidate_connects(
-    candidates: &mut SessionCandidates,
-    peers: &BTreeMap<u64, PeerRuntime>,
-    infohash: [u8; 20],
-    max_parallel: usize,
-    tx: &mpsc::Sender<PoolRefill>,
-    tasks: &mut tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>, bool)>,
-    pending: &mut HashSet<SocketAddrV4>,
-    include_discovered: bool,
-) {
+pub(super) struct CandidateConnectInputs<'a> {
+    pub(super) candidates: &'a mut SessionCandidates,
+    pub(super) peers: &'a BTreeMap<u64, PeerRuntime>,
+    pub(super) infohash: [u8; 20],
+    pub(super) max_parallel: usize,
+    pub(super) tx: &'a mpsc::Sender<PoolRefill>,
+    pub(super) tasks:
+        &'a mut tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>, bool)>,
+    pub(super) pending: &'a mut HashSet<SocketAddrV4>,
+    pub(super) include_discovered: bool,
+}
+
+pub(super) fn spawn_candidate_connects(inputs: CandidateConnectInputs<'_>) {
+    let CandidateConnectInputs {
+        candidates,
+        peers,
+        infohash,
+        max_parallel,
+        tx,
+        tasks,
+        pending,
+        include_discovered,
+    } = inputs;
     let (sources, pex) = candidates.learned_counts();
     if !include_discovered && sources + pex == 0 {
         return;
