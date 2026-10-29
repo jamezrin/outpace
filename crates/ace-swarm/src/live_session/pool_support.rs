@@ -163,55 +163,66 @@ pub(super) async fn harvest_stale_gossip_with_budget(
 ) {
     let deadline = tokio::time::Instant::now() + budget;
     let mut tasks = tokio::task::JoinSet::new();
-    for mut upstream in upstreams {
-        let hs = OutgoingExtendedHandshake {
-            ace_metadata_version: 1,
-            ut_metadata_id: 2,
-            mi: None,
-            node: NodeFields::default(),
-            peer_ip: Some(upstream.addr.ip().octets()),
-            metadata_size: None,
-        };
-        let handshake = PeerMessage::Extended {
-            ext_id: 0,
-            payload: hs.sign_and_encode(identity),
-        };
-        tasks.spawn(async move {
-            let mut learned = SessionCandidates::default();
-            let _ = tokio::time::timeout_at(deadline, async {
-                if upstream.session.send(&handshake).await.is_err() {
-                    return;
-                }
-                for _ in 0..32 {
-                    match upstream.session.read_message().await {
-                        Ok(PeerMessage::Unknown { id: 12, payload }) => {
-                            for addr in ace_wire::peer_exchange::parse_peer_exchange(&payload) {
-                                learned.learn(addr, CandidateKind::Pex);
-                            }
-                        }
-                        Ok(PeerMessage::Unknown { id: 36, payload }) => {
-                            if let Some(addr) =
-                                ace_wire::peer_exchange::parse_peer_announce(&payload)
-                            {
-                                learned.learn(addr, CandidateKind::Source);
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(_) => return,
-                    }
-                }
-            })
-            .await;
-            learned.into_learned()
-        });
+    for upstream in upstreams {
+        tasks.spawn(stale_gossip_job(upstream, identity, deadline));
     }
     while let Some(joined) = tasks.join_next().await {
         if let Ok(learned) = joined {
-            for (addr, kind) in learned {
+            for (addr, kind) in learned.into_learned() {
                 candidates.learn(addr, kind);
             }
         }
     }
+}
+
+pub(super) type GossipJob =
+    std::pin::Pin<Box<dyn std::future::Future<Output = SessionCandidates> + Send>>;
+
+// Owns the socket and signed bytes, never candidate or actor state. Dropping this
+// future closes IO immediately, including when it has never been polled.
+pub(super) fn stale_gossip_job(
+    mut upstream: ConnectedUpstream,
+    identity: &Identity,
+    deadline: tokio::time::Instant,
+) -> GossipJob {
+    let hs = OutgoingExtendedHandshake {
+        ace_metadata_version: 1,
+        ut_metadata_id: 2,
+        mi: None,
+        node: NodeFields::default(),
+        peer_ip: Some(upstream.addr.ip().octets()),
+        metadata_size: None,
+    };
+    let handshake = PeerMessage::Extended {
+        ext_id: 0,
+        payload: hs.sign_and_encode(identity),
+    };
+    Box::pin(async move {
+        let mut learned = SessionCandidates::default();
+        let _ = tokio::time::timeout_at(deadline, async {
+            if upstream.session.send(&handshake).await.is_err() {
+                return;
+            }
+            for _ in 0..32 {
+                match upstream.session.read_message().await {
+                    Ok(PeerMessage::Unknown { id: 12, payload }) => {
+                        for addr in ace_wire::peer_exchange::parse_peer_exchange(&payload) {
+                            learned.learn(addr, CandidateKind::Pex);
+                        }
+                    }
+                    Ok(PeerMessage::Unknown { id: 36, payload }) => {
+                        if let Some(addr) = ace_wire::peer_exchange::parse_peer_announce(&payload) {
+                            learned.learn(addr, CandidateKind::Source);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        })
+        .await;
+        learned
+    })
 }
 
 pub(super) async fn advance_pool_requests(

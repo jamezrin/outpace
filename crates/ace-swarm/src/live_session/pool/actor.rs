@@ -27,6 +27,8 @@ pub(super) struct PoolActor<'a> {
     pub(super) next_peer_id: u64,
     pub(super) loss_count: usize,
     pub(super) peers: BTreeMap<u64, PeerRuntime>,
+    // Drops after peer workers and before connection tasks and channel endpoints.
+    pub(super) gossip: Option<pool_support::GossipJob>,
     pub(super) learned_pending: HashSet<SocketAddrV4>,
     pub(super) learned_connects:
         tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>, bool)>,
@@ -145,7 +147,8 @@ impl PoolActor<'_> {
             let active = self.peers.values().map(|peer| peer.addr).collect();
             let retry_deadline = if (self.peers.len() < self.live_recovery.max_active_upstreams
                 || self.continuity.startup_deadline.is_some())
-                && self.learned_pending.len() < self.live_recovery.max_parallel_connect
+                && self.learned_pending.len() + usize::from(self.gossip.is_some())
+                    < self.live_recovery.max_parallel_connect
                 && self.learned_connects.len() < self.live_recovery.max_parallel_connect
             {
                 self.candidates.retry_deadline_after(
@@ -170,13 +173,14 @@ impl PoolActor<'_> {
             None => match tokio::time::timeout(wait, async {
                 tokio::select! {
                     _ = self.tx.closed() => PoolWake::ConsumerGone,
+                    learned = async { self.gossip.as_mut().expect("enabled gossip").await }, if self.gossip.is_some() => PoolWake::Gossip(learned),
                     event = self.event_rx.recv() => PoolWake::Peer(event),
                     result=self.learned_connects.join_next(), if !self.learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
                     _ = async {
                         tokio::time::sleep_until(retry_deadline.expect("enabled retry deadline").into()).await;
                     }, if retry_deadline.is_some() => PoolWake::CandidateRetry,
                     peer=next_discovery_peer(self.discovery_run), if self.discovery_run.is_some()=>PoolWake::Discovery(peer),
-                    upstream = self.refill_rx.recv(), if !self.refill_closed && (self.peers.len() < self.live_recovery.max_active_upstreams || self.continuity.startup_deadline.is_some()) => {
+                    upstream = self.refill_rx.recv(), if self.gossip.is_none() && !self.refill_closed && (self.peers.len() < self.live_recovery.max_active_upstreams || self.continuity.startup_deadline.is_some()) => {
                         PoolWake::Refill(upstream)
                     }
                 }
@@ -215,7 +219,11 @@ impl PoolActor<'_> {
                 candidates: self.candidates,
                 peers: &self.peers,
                 infohash: self.info.infohash,
-                max_parallel: self.live_recovery.max_parallel_connect,
+                // The held gossip socket still consumes a transport slot.
+                max_parallel: self
+                    .live_recovery
+                    .max_parallel_connect
+                    .saturating_sub(usize::from(self.gossip.is_some())),
                 tx: &self.pex_tx,
                 tasks: &mut self.learned_connects,
                 pending: &mut self.learned_pending,
@@ -226,6 +234,14 @@ impl PoolActor<'_> {
 
     async fn on_wake(&mut self, event: PoolWake) -> WakeOutcome {
         match event {
+            PoolWake::Gossip(learned) => {
+                self.gossip = None;
+                for (addr, kind) in learned.into_learned() {
+                    self.candidates.learn(addr, kind);
+                }
+                self.maybe_refill(true);
+                WakeOutcome::Continue
+            }
             PoolWake::ConsumerGone => WakeOutcome::End(FollowEnd::ConsumerGone),
             PoolWake::CandidateRetry => self.on_candidate_retry(),
             PoolWake::ConnectCompletion(result) => self.on_connect_completion(result),
@@ -297,11 +313,12 @@ impl PoolActor<'_> {
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .unwrap_or(STALE_GOSSIP_BUDGET)
                 .min(STALE_GOSSIP_BUDGET);
-            tokio::select! {
-                _ = self.tx.closed() => return WakeOutcome::End(FollowEnd::ConsumerGone),
-                _ = harvest_stale_gossip_with_budget(vec![upstream],self.identity,self.candidates,gossip_budget) => {},
-            }
-            self.maybe_refill(true);
+            debug_assert!(self.gossip.is_none());
+            self.gossip = Some(pool_support::stale_gossip_job(
+                upstream,
+                self.identity,
+                tokio::time::Instant::now() + gossip_budget,
+            ));
             return WakeOutcome::Continue;
         }
         let active = self.peers.values().map(|peer| peer.addr).collect();

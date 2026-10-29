@@ -1013,3 +1013,219 @@ async fn stale_refill_gossip_shares_the_start_decision_deadline() {
 async fn matching_independent_window_keeps_the_single_healthy_provisional_peer() {
     stale_then_source(1, true).await;
 }
+
+/// The stale handshake is a read barrier: the healthy peer cannot unchoke until
+/// the production stale-refill handler has entered its gossip read.
+#[tokio::test]
+async fn silent_stale_refill_allows_authenticated_actor_output() {
+    stale_refill_actor_contract(false).await;
+}
+
+#[tokio::test]
+async fn completed_stale_gossip_merges_source_on_actor() {
+    stale_refill_actor_contract(true).await;
+}
+
+async fn stale_refill_actor_contract(complete: bool) {
+    let learned_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let learned_addr = v4(learned_listener.local_addr().unwrap());
+    let queued_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let queued_addr = v4(queued_listener.local_addr().unwrap());
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let stale_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stale_addr = v4(stale_listener.local_addr().unwrap());
+    let stale = tokio::spawn(async move {
+        let (socket, _) = stale_listener.accept().await.unwrap();
+        let mut session = PeerSession::new(socket);
+        session.accept_handshake([0; 20], |_| true).await.unwrap();
+        session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(window(1, 1)),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .unwrap();
+        loop {
+            if matches!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Extended { ext_id: 0, .. }
+            ) {
+                break;
+            }
+        }
+        entered_tx.send(Instant::now()).unwrap();
+        if complete {
+            release_rx.await.unwrap();
+            let mut payload = vec![0; 14];
+            payload[8..12].copy_from_slice(&learned_addr.ip().octets());
+            payload[12..14].copy_from_slice(&learned_addr.port().to_be_bytes());
+            session
+                .send(&PeerMessage::Unknown { id: 36, payload })
+                .await
+                .unwrap();
+            for _ in 1..32 {
+                session.send(&PeerMessage::KeepAlive).await.unwrap();
+            }
+        }
+        while let Ok(message) = session.read_message().await {
+            assert!(
+                !matches!(
+                    message,
+                    PeerMessage::Interested | PeerMessage::Unknown { id: 6, .. }
+                ),
+                "stale transport received media admission"
+            );
+        }
+    });
+    let (mut info, seed) = fixture(2);
+    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+    info.sig_len = auth.signature_len();
+    info.source_pubkey = auth.pubkey_der();
+    let media = packet_piece(0x66);
+    let mut signed = media.clone();
+    signed.extend(auth.sign(&media));
+    info.piece_length = signed.len() as u64;
+    info.chunk_length = signed.len() as u64;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = v4(listener.local_addr().unwrap());
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+    let healthy = tokio::spawn(async move {
+        let mut session = PeerSession::new(socket);
+        let entered = entered_rx.await.unwrap();
+        barrier_tx.send(entered).unwrap();
+        if complete {
+            let mut payload = vec![0; 14];
+            payload[8..12].copy_from_slice(&queued_addr.ip().octets());
+            payload[12..14].copy_from_slice(&queued_addr.port().to_be_bytes());
+            session
+                .send(&PeerMessage::Unknown { id: 36, payload })
+                .await
+                .unwrap();
+        }
+        session.send(&PeerMessage::Unchoke).await.unwrap();
+        while let Ok(message) = session.read_message().await {
+            if let PeerMessage::Unknown { id: 6, payload } = message {
+                let piece = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                if session
+                    .send(&build_piece(0, piece, 0, [0; 8], &signed))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    let (tx, mut rx) = mpsc::channel(16);
+    let pool = tokio::spawn(async move {
+        let mut candidates = SessionCandidates::default();
+        let (c, _) = Continuity::fresh(&info, 1000, 1001, 1, seed.live_recovery);
+        follow_peer_pool(
+            vec![ConnectedUpstream {
+                session: PeerSession::new(client),
+                addr,
+                window: window(1000, 1001),
+                unchoked: false,
+                yourip: None,
+            }],
+            &info,
+            &Identity::generate(),
+            1,
+            &tx,
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU32::new(0)),
+            &seed,
+            &Arc::new(tokio::sync::Mutex::new(PieceStore::new(
+                info.piece_length,
+                info.chunk_length,
+                4096,
+            ))),
+            &mut Some(c),
+            vec![stale_addr],
+            vec![],
+            completed_discovery(|_| Box::pin(async { vec![] })),
+            &mut candidates,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .await
+    });
+    let entered = tokio::time::timeout(Duration::from_secs(2), barrier_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_millis(400), rx.recv()).await;
+    let elapsed = entered.elapsed();
+    if complete {
+        let (socket, _) = tokio::time::timeout(Duration::from_secs(1), queued_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut queued = PeerSession::new(socket);
+        queued.accept_handshake([0; 20], |_| true).await.unwrap();
+        queued
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(window(1, 1)),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .unwrap();
+        // This connected refill cannot receive its gossip handshake while the
+        // first job holds the sole gossip slot. Keep the read future intact.
+        let read = queued.read_message();
+        tokio::pin!(read);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut read)
+            .await
+            .is_err());
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(400), &mut read)
+                .await
+                .unwrap()
+                .unwrap(),
+            PeerMessage::Extended { ext_id: 0, .. }
+        ));
+
+        // Accepting a new connection proves the completion result was merged and
+        // made eligible by the owning actor, rather than merely collected.
+        let (_socket, _) = tokio::time::timeout(Duration::from_secs(1), learned_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    drop(rx);
+    let end = tokio::time::timeout(Duration::from_secs(1), pool)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), stale)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), healthy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(end, FollowEnd::ConsumerGone));
+    let output = output
+        .expect("healthy authenticated output must progress while stale gossip is silent")
+        .unwrap();
+    assert!(elapsed < STALE_GOSSIP_BUDGET);
+    // TS alignment may retain the final packet until the next input block.
+    assert!(!output.bytes.is_empty());
+    assert_eq!(output.bytes.len() % 188, 0);
+    assert_eq!(output.bytes, media[..output.bytes.len()]);
+}
