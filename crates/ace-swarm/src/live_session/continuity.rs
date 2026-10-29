@@ -33,6 +33,16 @@ pub(super) fn prefetch_start(min_piece: u64, max_piece: u64, prefetch: u64) -> u
 }
 
 impl Continuity {
+    pub(super) fn publication_hold(&self) -> bool {
+        self.publication.values().any(|status| match status {
+            PublicationStatus::Needed => true,
+            PublicationStatus::Terminal(result) => {
+                let _ = result;
+                false
+            }
+        })
+    }
+
     pub(super) fn recovery_event(&self, event: RecoveryEvent) {
         if let Some(observer) = &self.observer {
             observer.recovery_event(event);
@@ -65,6 +75,7 @@ impl Continuity {
             .with_max_pieces_ahead(live_recovery.max_reasm_pieces_ahead);
         (
             Continuity {
+                publication: BTreeMap::new(),
                 observer: None,
                 has_admitted_pool: false,
                 reconnect_pool: false,
@@ -110,7 +121,11 @@ impl Continuity {
         self.requested_at.clear();
         self.next_needed_since = Instant::now();
         let next = self.reasm.next_needed();
-        let resume = next.max(min_piece);
+        let resume = if self.publication_hold() {
+            next
+        } else {
+            next.max(min_piece)
+        };
         if resume > next {
             crate::alog!(
                 "[ace] {addr}: reconnect gap — peer's window already evicted pieces {next}..{}; skipping ahead",
@@ -118,6 +133,7 @@ impl Continuity {
             );
             self.recovery_event(RecoveryEvent::SkippedEvictedGap);
             self.reasm.skip_to(resume);
+            self.publication.retain(|&piece, _| piece >= resume);
             self.arm_output_gate();
         }
         self.piece_producers.retain(|&piece, _| piece >= resume);
@@ -180,6 +196,9 @@ impl Continuity {
     /// does have. Returns the skip target if it skipped. This is the mid-session analogue of
     /// [`resume`](Self::resume)'s reconnect-gap skip — recovering without a full teardown.
     pub(super) fn skip_evicted_gap(&mut self, now: Instant) -> Option<u64> {
+        if self.publication_hold() {
+            return None;
+        }
         let next = self.reasm.next_needed();
         if now.duration_since(self.next_needed_since) < self.live_recovery.request_timeout()
             || self.active_peers.any_unchoked_covers(next)
@@ -192,6 +211,7 @@ impl Continuity {
         }
         self.recovery_event(RecoveryEvent::SkippedEvictedGap);
         self.reasm.skip_to(floor);
+        self.publication.retain(|&piece, _| piece >= floor);
         self.arm_output_gate();
         self.active_peers.prune_below(floor);
         self.requested_at.retain(|&p, _| p >= floor);
@@ -207,6 +227,9 @@ impl Continuity {
     /// the same fresh discontinuity gate as an unknown whole-piece loss (issue #169).
     /// Provisional startup positioning has no previously published stream to interrupt.
     pub(super) fn skip_far_behind_live(&mut self, now: Instant) -> Option<u64> {
+        if self.publication_hold() {
+            return None;
+        }
         self.request_floor
             .fetch_max(self.head.saturating_sub(self.prefetch), Ordering::Relaxed);
         let next = self.reasm.next_needed();
@@ -215,6 +238,7 @@ impl Continuity {
         }
         let target = self.head.saturating_sub(self.prefetch);
         self.reasm.skip_to(target);
+        self.publication.retain(|&piece, _| piece >= target);
         if self.emitted > 0 {
             self.arm_output_gate();
         } else {

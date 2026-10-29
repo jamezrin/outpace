@@ -215,6 +215,19 @@ pub(super) async fn follow_peer_pool_with_discovery(
         discovery_run,
     } = context;
     let _stats_guard = LiveStatsGuard(seed.metrics.clone());
+    // Custom/internal entries must obey the same existing live geometry limits.
+    if info.piece_length == 0
+        || info.piece_length > crate::resolve::MAX_PIECE_LENGTH
+        || info.chunk_length == 0
+        || !info.piece_length.is_multiple_of(info.chunk_length)
+        || info.piece_length / info.chunk_length > u16::MAX as u64
+        || usize::try_from(info.piece_length).is_err()
+        || u32::try_from(info.chunk_length).is_err()
+        || u64::from(chunks_per_piece) != info.piece_length / info.chunk_length
+    {
+        crate::alog!("[ace] invalid live pool piece geometry");
+        return FollowEnd::ConsumerGone;
+    }
     debug_assert!(!upstreams.is_empty());
     let lone_fresh = continuity.is_none() && upstreams.len() == 1;
     let primary = upstreams[0].window;
@@ -334,6 +347,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
     let observed_retry = Instant::now();
     let closed_peer_events = BTreeMap::new();
     PoolActor {
+        publication: None,
         gossip: None,
         closed_peer_events,
         observed_retry,

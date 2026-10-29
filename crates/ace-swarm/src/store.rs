@@ -209,6 +209,117 @@ impl MemoryBackend {
 }
 
 impl PieceStore {
+    /// Admission owns metadata and handles only; wire remains with the caller.
+    pub(crate) async fn begin_complete_admission(
+        store: Arc<Mutex<Self>>,
+        piece: u64,
+        wire_len: usize,
+    ) -> std::io::Result<CompleteAdmission> {
+        let guard = store.lock_owned().await;
+        let length = guard.piece_length;
+        let chunk = guard.chunk_length;
+        if length == 0
+            || chunk == 0
+            || length % chunk != 0
+            || length / chunk > u16::MAX as u64
+            || usize::try_from(length).ok() != Some(wire_len)
+            || u32::try_from(chunk).is_err()
+        {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        if guard.max_bytes < length {
+            return Ok(CompleteAdmission::Immediate {
+                result: CompletePut::NotRetained,
+                wire_len,
+            });
+        }
+        let Backend::Disk(disk) = &guard.backend else {
+            return Ok(CompleteAdmission::Memory {
+                guard,
+                piece,
+                wire_len,
+            });
+        };
+        let handle = disk.handle();
+        let max = guard.max_bytes;
+        let chunks = (length / chunk) as u16;
+        let retention = guard.retention;
+        drop(guard);
+        let permit = handle.reserve_complete().await?;
+        Ok(CompleteAdmission::Disk {
+            handle,
+            permit,
+            piece,
+            wire_len,
+            max,
+            chunks,
+            retention,
+        })
+    }
+
+    fn put_complete_memory(
+        &mut self,
+        piece: u64,
+        header: [u8; 8],
+        wire: &[u8],
+    ) -> std::io::Result<CompletePut> {
+        let guard = self;
+        let length = guard.piece_length;
+        let chunk = guard.chunk_length;
+        let chunks = (length / chunk) as u16;
+        let Backend::Memory(memory) = &mut guard.backend else {
+            unreachable!()
+        };
+        if memory.has_piece(piece, chunks) {
+            return Ok(CompletePut::AlreadyPresent);
+        }
+        let complete = wire
+            .chunks_exact(chunk as usize)
+            .enumerate()
+            .map(|(i, bytes)| (i as u16, bytes.to_vec()))
+            .collect();
+        let removed = memory
+            .pieces
+            .insert(piece, complete)
+            .map_or(0, |old| old.values().map(|b| b.len() as u64).sum());
+        memory.headers.insert(piece, header);
+        guard.cur_bytes = guard.cur_bytes - removed + length;
+        let now = Instant::now();
+        if guard.retention.is_some() {
+            guard.first_seen.entry(piece).or_insert(now);
+            guard.newest_seen = Some(guard.newest_seen.map_or(now, |old| old.max(now)));
+        }
+        while guard.cur_bytes > guard.max_bytes {
+            let Some(freed) = guard.evict_lowest_tracked() else {
+                break;
+            };
+            guard.cur_bytes -= freed;
+        }
+        if let (Some(age), Some(newest)) = (guard.retention, guard.newest_seen) {
+            while guard
+                .first_seen
+                .first_key_value()
+                .is_some_and(|(_, seen)| newest.saturating_duration_since(*seen) >= age)
+            {
+                let Some(freed) = guard.evict_lowest_tracked() else {
+                    break;
+                };
+                guard.cur_bytes -= freed;
+            }
+        }
+        Ok(if guard.has_piece(piece) {
+            CompletePut::Published
+        } else {
+            CompletePut::NotRetained
+        })
+    }
+
+    pub(crate) fn refresh_complete_accounting(&mut self) {
+        if let Backend::Disk(disk) = &self.backend {
+            self.cur_bytes = disk.retained_bytes();
+        }
+    }
+
     /// Publish trusted full wire bytes atomically. Authentication belongs to the caller.
     pub async fn shared_put_complete_piece(
         store: &Arc<Mutex<Self>>,
@@ -216,81 +327,36 @@ impl PieceStore {
         header: [u8; 8],
         wire: &[u8],
     ) -> std::io::Result<CompletePut> {
-        let (handle, max, chunks, retention) = {
-            let mut guard = store.lock().await;
-            let length = guard.piece_length;
-            let chunk = guard.chunk_length;
-            if length == 0
-                || chunk == 0
-                || length % chunk != 0
-                || length / chunk > u16::MAX as u64
-                || usize::try_from(length).ok() != Some(wire.len())
-                || u32::try_from(chunk).is_err()
-            {
-                return Err(std::io::ErrorKind::InvalidInput.into());
-            }
-            let chunks = (length / chunk) as u16;
-            if guard.max_bytes < length {
-                return Ok(CompletePut::NotRetained);
-            }
-            if let Backend::Memory(memory) = &mut guard.backend {
-                if memory.has_piece(piece, chunks) {
-                    return Ok(CompletePut::AlreadyPresent);
-                }
-                let complete = wire
-                    .chunks_exact(chunk as usize)
-                    .enumerate()
-                    .map(|(i, bytes)| (i as u16, bytes.to_vec()))
-                    .collect();
-                let removed = memory
-                    .pieces
-                    .insert(piece, complete)
-                    .map_or(0, |old| old.values().map(|b| b.len() as u64).sum());
-                memory.headers.insert(piece, header);
-                guard.cur_bytes = guard.cur_bytes - removed + length;
-                let now = Instant::now();
-                if guard.retention.is_some() {
-                    guard.first_seen.entry(piece).or_insert(now);
-                    guard.newest_seen = Some(guard.newest_seen.map_or(now, |old| old.max(now)));
-                }
-                while guard.cur_bytes > guard.max_bytes {
-                    let Some(freed) = guard.evict_lowest_tracked() else {
-                        break;
-                    };
-                    guard.cur_bytes -= freed;
-                }
-                if let (Some(age), Some(newest)) = (guard.retention, guard.newest_seen) {
-                    while guard
-                        .first_seen
-                        .first_key_value()
-                        .is_some_and(|(_, seen)| newest.saturating_duration_since(*seen) >= age)
-                    {
-                        let Some(freed) = guard.evict_lowest_tracked() else {
-                            break;
-                        };
-                        guard.cur_bytes -= freed;
-                    }
-                }
-                return Ok(if guard.has_piece(piece) {
-                    CompletePut::Published
-                } else {
-                    CompletePut::NotRetained
-                });
-            }
-            let Backend::Disk(disk) = &guard.backend else {
-                unreachable!()
-            };
-            (disk.handle(), guard.max_bytes, chunks, guard.retention)
+        let admission =
+            Self::begin_complete_admission(Arc::clone(store), piece, wire.len()).await?;
+        let result = match admission.submit(header, wire)? {
+            CompleteReceipt::Ready(result) => return Ok(result),
+            CompleteReceipt::Awaiting(done) => done
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::BrokenPipe.into())),
         };
-        let result = handle
-            .put_complete(piece, header, wire, max, chunks, retention)
-            .await;
-        // Disk actor state is authoritative, including after cancellation of this caller.
-        let mut guard = store.lock().await;
-        if let Backend::Disk(disk) = &guard.backend {
-            guard.cur_bytes = disk.retained_bytes();
-        }
+        store.lock().await.refresh_complete_accounting();
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_publication(
+        &self,
+        reached: Arc<tokio::sync::Notify>,
+        gate: std::sync::mpsc::Receiver<()>,
+    ) {
+        match &self.backend {
+            Backend::Disk(disk) => disk.pause_publication(reached, gate),
+            _ => panic!("disk fixture required"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publication_budget(&self) -> (usize, usize) {
+        match &self.backend {
+            Backend::Disk(disk) => disk.publication_budget(),
+            _ => panic!("disk fixture required"),
+        }
     }
 
     /// Read a chunk from a shared store without running disk I/O on a Tokio worker thread.
@@ -1081,5 +1147,182 @@ mod tests {
             !s.has_piece(3),
             "partial piece (1 of 2 chunks) not complete"
         );
+    }
+}
+
+// These tickets never contain borrowed or owned wire bytes.
+pub(crate) enum CompleteAdmission {
+    Immediate {
+        result: CompletePut,
+        wire_len: usize,
+    },
+    Memory {
+        guard: tokio::sync::OwnedMutexGuard<PieceStore>,
+        piece: u64,
+        wire_len: usize,
+    },
+    Disk {
+        handle: disk::DiskHandle,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        piece: u64,
+        wire_len: usize,
+        max: u64,
+        chunks: u16,
+        retention: Option<Duration>,
+    },
+}
+pub(crate) enum CompleteReceipt {
+    Ready(CompletePut),
+    Awaiting(tokio::sync::oneshot::Receiver<std::io::Result<CompletePut>>),
+}
+impl CompleteAdmission {
+    pub(crate) fn submit(self, header: [u8; 8], wire: &[u8]) -> std::io::Result<CompleteReceipt> {
+        match self {
+            Self::Immediate { result, wire_len } => {
+                if wire.len() != wire_len {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+                Ok(CompleteReceipt::Ready(result))
+            }
+            Self::Memory {
+                mut guard,
+                piece,
+                wire_len,
+            } => {
+                if wire.len() != wire_len {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+                guard
+                    .put_complete_memory(piece, header, wire)
+                    .map(CompleteReceipt::Ready)
+            }
+            Self::Disk {
+                handle,
+                permit,
+                piece,
+                wire_len,
+                max,
+                chunks,
+                retention,
+            } => {
+                if wire.len() != wire_len {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+                handle
+                    .submit_complete(permit, piece, header, wire, max, chunks, retention)
+                    .map(CompleteReceipt::Awaiting)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod admission_contracts {
+    use super::*;
+    use std::future::Future;
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn mutex_wait_cancel_and_reserved_memory_submit_keep_original_immutable() {
+        let store = Arc::new(Mutex::new(PieceStore::new(8, 4, 16)));
+        let held = store.lock().await;
+        let mut admission = Box::pin(PieceStore::begin_complete_admission(store.clone(), 1, 8));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(admission.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        drop(admission);
+        drop(held);
+        let reservation = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        assert!(store.try_lock().is_err());
+        drop(reservation);
+        assert!(store.try_lock().is_ok());
+        let reservation = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reservation.submit([1; 8], b"abcdefgh").unwrap(),
+            CompleteReceipt::Ready(CompletePut::Published)
+        ));
+        assert_eq!(
+            PieceStore::shared_block(&store, 1, 0, 8).await.unwrap(),
+            b"abcdefgh"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_disk_reservation_never_copies_and_returns_shared_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            PieceStore::new_disk(8, 4, 16, dir.path().join("cache")).unwrap(),
+        ));
+        let reservation = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        assert_eq!(store.lock().await.publication_budget(), (0, 0));
+        let mut next_generation =
+            Box::pin(PieceStore::begin_complete_admission(store.clone(), 1, 8));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(next_generation.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        assert_eq!(store.lock().await.publication_budget(), (0, 0));
+        drop(next_generation);
+        drop(reservation);
+        assert_eq!(store.lock().await.publication_budget(), (0, 1));
+        let reservation = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        assert!(reservation.submit([0; 8], b"short").is_err());
+        assert_eq!(store.lock().await.publication_budget(), (0, 1));
+    }
+}
+
+#[cfg(test)]
+mod generation_contract {
+    use super::*;
+    use std::{future::Future, task::Poll};
+    #[tokio::test]
+    async fn cancelled_admitted_command_keeps_shared_store_wire_until_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            PieceStore::new_disk(8, 4, 16, dir.path().join("cache")).unwrap(),
+        ));
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let (release, gate) = std::sync::mpsc::channel();
+        store.lock().await.pause_publication(reached.clone(), gate);
+        let admission = PieceStore::begin_complete_admission(store.clone(), 1, 8)
+            .await
+            .unwrap();
+        let receipt = admission.submit([1; 8], b"abcdefgh").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        drop(receipt);
+        assert_eq!(store.lock().await.publication_budget(), (8, 0));
+        assert!(!store.lock().await.has_piece(1));
+        let mut next = Box::pin(PieceStore::begin_complete_admission(store.clone(), 1, 8));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        assert_eq!(store.lock().await.publication_budget(), (8, 0));
+        drop(release);
+        let admission = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.lock().await.publication_budget(), (0, 0));
+        let CompleteReceipt::Awaiting(done) = admission.submit([9; 8], b"XXXXXXXX").unwrap() else {
+            panic!("disk receipt")
+        };
+        assert_eq!(done.await.unwrap().unwrap(), CompletePut::AlreadyPresent);
+        assert_eq!(
+            PieceStore::shared_block(&store, 1, 0, 8).await.unwrap(),
+            b"abcdefgh"
+        );
+        assert_eq!(store.lock().await.publication_budget(), (0, 1));
     }
 }

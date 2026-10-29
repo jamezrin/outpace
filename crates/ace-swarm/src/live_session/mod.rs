@@ -530,7 +530,13 @@ impl Drop for WarmFlush {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PublicationStatus {
+    Needed,
+    Terminal(Result<crate::store::CompletePut, ()>),
+}
 pub(super) struct Continuity {
+    publication: BTreeMap<u64, PublicationStatus>,
     observer: Option<Arc<dyn LiveObserver>>,
     has_admitted_pool: bool,
     reconnect_pool: bool,
@@ -583,6 +589,7 @@ pub(super) enum PoolRefill {
 type CandidateConnectCompletion = (SocketAddrV4, Option<PeerConnectFailure>, bool);
 
 enum PoolWake {
+    Publication,
     Gossip(SessionCandidates),
     ConsumerGone,
     Peer(Option<PeerEvent>),

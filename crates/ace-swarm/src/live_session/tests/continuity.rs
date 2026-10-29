@@ -860,3 +860,47 @@ fn prefetch_start_bounds_huge_depth_and_peer_window() {
     assert_eq!(prefetch_start(180, 200, 64), 180);
     assert_eq!(prefetch_start(0, 20, u64::MAX), 0);
 }
+
+#[test]
+fn publication_batch_freezes_all_cursor_paths_and_bounds_duplicate_metadata() {
+    let config = LiveRecoveryConfig {
+        max_reasm_pieces_ahead: 16,
+        ..LiveRecoveryConfig::default()
+    };
+    let (mut c, start) = Continuity::fresh(&info(), 10, 10, PREFETCH_PIECES, config);
+    for piece in start..start + 16 {
+        c.reasm.add_live_chunk(piece, 0, 2, [0; 8], b"ab").unwrap();
+        c.reasm.add_live_chunk(piece, 1, 2, [0; 8], b"cd").unwrap();
+        c.publication
+            .entry(piece)
+            .or_insert(PublicationStatus::Needed);
+    }
+    let floor = c.request_floor.load(Ordering::Relaxed);
+    let addr = SocketAddrV4::new([127, 0, 0, 1].into(), 1);
+    for head in 100..1000 {
+        c.head = head;
+        assert_eq!(c.skip_far_behind_live(Instant::now()), None);
+        assert_eq!(c.skip_evicted_gap(Instant::now()), None);
+        assert_eq!(c.resume(addr, head, head), start);
+        assert_eq!(c.request_floor.load(Ordering::Relaxed), floor);
+        let duplicate = c
+            .reasm
+            .add_live_chunk(start, u16::MAX, 0, [9; 8], b"garbage")
+            .unwrap();
+        assert!(!duplicate.completed && !duplicate.contributed);
+        assert!(c.reasm.add_live_chunk(head, 0, 2, [0; 8], b"ab").is_err());
+        assert!(take_ready_with_stats(&mut c, None, &info()).is_empty());
+        assert_eq!(c.publication.len(), 16);
+        assert_eq!(c.reasm.next_needed(), start);
+    }
+    for status in c.publication.values_mut() {
+        *status = PublicationStatus::Terminal(Ok(crate::store::CompletePut::NotRetained));
+    }
+    assert_eq!(
+        take_ready_with_stats(&mut c, None, &info()),
+        b"abcd".repeat(16)
+    );
+    assert!(c.publication.is_empty());
+    assert_eq!(c.reasm.next_needed(), start + 16);
+    assert!(c.skip_far_behind_live(Instant::now()).is_some());
+}

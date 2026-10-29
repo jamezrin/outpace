@@ -103,13 +103,30 @@ pub(super) struct DiskBackend {
 }
 
 #[derive(Clone)]
-pub(super) struct DiskHandle {
+pub(crate) struct DiskHandle {
     tx: mpsc::Sender<Command>,
     publication: Arc<tokio::sync::Semaphore>,
     pending: Arc<AtomicUsize>,
 }
 
 impl DiskBackend {
+    #[cfg(test)]
+    pub(super) fn pause_publication(
+        &self,
+        reached: Arc<tokio::sync::Notify>,
+        gate: mpsc::Receiver<()>,
+    ) {
+        self.hooks.lock().unwrap().pause = Some((reached, gate));
+    }
+
+    #[cfg(test)]
+    pub(super) fn publication_budget(&self) -> (usize, usize) {
+        (
+            self.pending.load(Ordering::Acquire),
+            self.publication.available_permits(),
+        )
+    }
+
     pub(super) fn handle(&self) -> DiskHandle {
         #[cfg(test)]
         let _ = &self.hooks; // Kept on the backend for colocated test configuration.
@@ -239,6 +256,7 @@ impl DiskBackend {
 }
 
 impl DiskHandle {
+    #[cfg(test)]
     pub(super) async fn put_complete(
         &self,
         piece: u64,
@@ -248,10 +266,32 @@ impl DiskHandle {
         chunks: u16,
         retention: Option<Duration>,
     ) -> std::io::Result<CompletePut> {
-        let permit = Arc::clone(&self.publication)
+        let permit = self.reserve_complete().await?;
+        self.submit_complete(permit, piece, header, data, max_bytes, chunks, retention)?
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+    }
+
+    pub(super) async fn reserve_complete(
+        &self,
+    ) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.publication)
             .acquire_owned()
             .await
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+            .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn submit_complete(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        piece: u64,
+        header: [u8; 8],
+        data: &[u8],
+        max_bytes: u64,
+        chunks: u16,
+        retention: Option<Duration>,
+    ) -> std::io::Result<tokio::sync::oneshot::Receiver<std::io::Result<CompletePut>>> {
         let data = data.to_vec();
         self.pending.store(data.len(), Ordering::Release);
         let wire = PendingWire {
@@ -271,8 +311,7 @@ impl DiskHandle {
                 reply,
             })
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-        done.await
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+        Ok(done)
     }
 
     pub(super) async fn put(
