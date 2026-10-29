@@ -179,7 +179,7 @@ const HTTP_RECOVERY_RESUME_KEYFRAME: usize = 9_400;
 const HTTP_RECOVERY_PREFIX_BARRIER: usize = 5_640;
 const HTTP_RECOVERY_FINAL_WITNESS: usize = 6_204;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum HttpReconnectWindow {
     EvictedOne,
     Contiguous,
@@ -565,7 +565,7 @@ async fn extend_http_body_until(
     }
 }
 
-async fn run_http_reconnect_composition(mode: HttpReconnectWindow) {
+async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool) {
     let auth = Arc::new(ace_wire::live_auth::LiveSourceAuth::generate());
     let mut info = ace_swarm::types::StreamInfo {
         infohash: [0; 20],
@@ -663,6 +663,7 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow) {
         });
         run_http_reconnect_case(
             mode,
+            decode,
             info,
             HttpReconnectPeers {
                 tasks: peer_tasks,
@@ -696,6 +697,7 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow) {
     });
     run_http_reconnect_case(
         mode,
+        decode,
         info,
         HttpReconnectPeers {
             tasks: peer_tasks,
@@ -726,6 +728,7 @@ struct HttpReconnectPeers {
 
 async fn run_http_reconnect_case(
     mode: HttpReconnectWindow,
+    decode: bool,
     info: ace_swarm::types::StreamInfo,
     peers: HttpReconnectPeers,
 ) {
@@ -1175,6 +1178,20 @@ async fn run_http_reconnect_case(
             assert_eq!(recovery.skipped_evicted_gaps, 0);
         }
 
+        if decode {
+            // Frame packet offsets, rather than total frames alone, distinguish
+            // decoded post-reconnect data from the already consumed HTTP prefix.
+            let before = probe_http_video_positions(&pre_gap).await;
+            assert!(!before.is_empty(), "pre-gap HTTP body decodes video");
+            assert!(before.iter().all(|&pos| pos < pre_gap.len()));
+            let boundary = pre_gap.len();
+            let mut complete = pre_gap.clone();
+            complete.extend_from_slice(&recovered);
+            let positions = probe_http_video_positions(&complete).await;
+            let post = positions.iter().filter(|&&pos| pos >= boundary).count();
+            assert!(post > 0, "actual HTTP body decodes video after reconnect");
+            eprintln!("HTTP recovery decode mode={mode:?} prefix_bytes={boundary} prefix_frames={} post_frames={post}", before.len());
+        }
         drop(body);
         drop(raw);
         HttpCompositionObservation {
@@ -1318,15 +1335,98 @@ struct HttpCompositionObservation {
 
 #[tokio::test]
 async fn real_evicted_reconnect_marker_reaches_native_http_body() {
-    run_http_reconnect_composition(HttpReconnectWindow::EvictedOne).await;
+    run_http_reconnect_composition(HttpReconnectWindow::EvictedOne, false).await;
 }
 
 #[tokio::test]
 async fn real_contiguous_reconnect_keeps_native_http_body_unmarked() {
-    run_http_reconnect_composition(HttpReconnectWindow::Contiguous).await;
+    run_http_reconnect_composition(HttpReconnectWindow::Contiguous, false).await;
 }
 
 #[tokio::test]
 async fn real_http_body_cancellation_reaps_peer_and_discovery() {
-    run_http_reconnect_composition(HttpReconnectWindow::CancelAfterStale).await;
+    run_http_reconnect_composition(HttpReconnectWindow::CancelAfterStale, false).await;
+}
+
+// Offline finite-body decoding is deliberately separate from real-time player
+// progress: packet positions bind decoded video frames to the recovered suffix.
+async fn probe_http_video_positions(bytes: &[u8]) -> Vec<usize> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    assert!(bytes.len() <= 2 << 20, "bounded synthetic HTTP capture");
+    let mut child = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "mpegts",
+            "-show_frames",
+            "-show_entries",
+            "frame=media_type,pkt_pos",
+            "-of",
+            "json",
+            "pipe:0",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("available offline ffprobe");
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(bytes).await?;
+        drop(input);
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .take((1 << 20) + 1)
+            .read_to_end(&mut output)
+            .await?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, output))
+    })
+    .await;
+    if !matches!(&result, Ok(Ok(_))) {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    let (status, output) = result
+        .expect("bounded decoder observation")
+        .expect("decoder pipes");
+    assert!(status.success(), "decoder succeeded");
+    assert!(output.len() <= 1 << 20, "bounded frame report");
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    value["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|frame| frame["media_type"] == "video")
+        .filter_map(|frame| frame["pkt_pos"].as_str().and_then(|pos| pos.parse().ok()))
+        .collect()
+}
+
+fn http_decode_available() -> bool {
+    let available = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|path| path.join("ffprobe").is_file())
+    });
+    if !available {
+        eprintln!("skipping offline HTTP decode control: ffprobe unavailable");
+    }
+    available
+}
+
+#[tokio::test]
+async fn evicted_http_recovery_decodes_post_gap_video() {
+    if http_decode_available() {
+        run_http_reconnect_composition(HttpReconnectWindow::EvictedOne, true).await;
+    }
+}
+
+#[tokio::test]
+async fn contiguous_http_recovery_decodes_post_gap_video() {
+    if http_decode_available() {
+        run_http_reconnect_composition(HttpReconnectWindow::Contiguous, true).await;
+    }
 }
