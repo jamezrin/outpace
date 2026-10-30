@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+mod activation_tests;
 mod publication;
 mod reciprocal;
 use publication::PublicationOperation;
@@ -21,6 +23,7 @@ enum WakeOutcome {
 // Fields owning resources follow the original locals' reverse declaration order.
 // In particular peers retire before connect tasks, channel endpoints, then stats.
 pub(super) struct PoolActor<'a> {
+    pub(super) activation: Option<activation::Activation>,
     pub(super) reciprocal: reciprocal::Reciprocal,
     pub(super) publication: Option<PublicationOperation>,
     pub(super) closed_peer_events: BTreeMap<u64, (SocketAddrV4, usize)>,
@@ -61,6 +64,15 @@ pub(super) struct PoolActor<'a> {
 
 impl PoolActor<'_> {
     pub(super) async fn run(mut self) -> FollowEnd {
+        #[cfg(test)]
+        let _ = ACTIVATION_PROBE.try_with(|probe| {
+            if let Some(candidate) = probe.candidate.borrow_mut().take() {
+                self.learned_pending.insert(candidate.addr);
+                self.pex_tx
+                    .try_send(PoolRefill::ReservedDiscovered(candidate))
+                    .unwrap();
+            }
+        });
         self.maybe_refill(false);
         // Start progress/retry clocks after initial refill, as in the adapter before extraction.
         self.last_progress = Instant::now();
@@ -73,6 +85,11 @@ impl PoolActor<'_> {
             #[cfg(test)]
             {
                 self.reciprocal.turn += 1;
+            }
+            let completed =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(self.poll_activation(cx))).await;
+            if let Some(result) = completed {
+                self.finish_activation(result).await;
             }
             self.start_reciprocal();
             let reciprocal_ready = std::future::poll_fn(|cx| {
@@ -181,10 +198,17 @@ impl PoolActor<'_> {
                         .map(|deadline| deadline.saturating_duration_since(now))
                         .unwrap_or(stale_budget),
                 );
-            let active = self.peers.values().map(|peer| peer.addr).collect();
+            let active = self
+                .peers
+                .values()
+                .map(|peer| peer.addr)
+                .chain(self.activation.as_ref().map(|job| job.addr))
+                .collect();
             let retry_deadline = if (self.peers.len() < self.live_recovery.max_active_upstreams
                 || self.continuity.startup_deadline.is_some())
-                && self.learned_pending.len() + usize::from(self.gossip.is_some())
+                && self.learned_pending.len()
+                    + usize::from(self.gossip.is_some())
+                    + usize::from(self.activation.is_some())
                     < self.live_recovery.max_parallel_connect
                 && self.learned_connects.len() < self.live_recovery.max_parallel_connect
             {
@@ -217,6 +241,7 @@ impl PoolActor<'_> {
                         if result.is_pending() && self.reciprocal.job.is_some() { self.reciprocal.observe(3); }
                         result
                     }), if !reciprocal_completed => PoolWake::Reciprocal(Some(result)),
+                    result = std::future::poll_fn(|cx| self.activation.as_mut().expect("enabled activation").write.as_mut().poll(cx)), if self.activation.is_some() => PoolWake::Activation(result),
                     _ = self.tx.closed() => PoolWake::ConsumerGone,
                     _ = std::future::poll_fn(|cx| publication::poll_operation(&mut self.publication, self.continuity, self.store, cx).then_some(()).map_or(std::task::Poll::Pending, std::task::Poll::Ready)), if self.publication.is_some() => PoolWake::Publication,
                     learned = async { self.gossip.as_mut().expect("enabled gossip").await }, if self.gossip.is_some() => PoolWake::Gossip(learned),
@@ -226,7 +251,7 @@ impl PoolActor<'_> {
                         tokio::time::sleep_until(retry_deadline.expect("enabled retry deadline").into()).await;
                     }, if retry_deadline.is_some() => PoolWake::CandidateRetry,
                     peer=next_discovery_peer(self.discovery_run), if self.discovery_run.is_some()=>PoolWake::Discovery(peer),
-                    upstream = self.refill_rx.recv(), if self.gossip.is_none() && !self.refill_closed && (self.peers.len() < self.live_recovery.max_active_upstreams || self.continuity.startup_deadline.is_some()) => {
+                    upstream = self.refill_rx.recv(), if self.activation.is_none() && self.gossip.is_none() && !self.refill_closed && (self.peers.len() < self.live_recovery.max_active_upstreams || self.continuity.startup_deadline.is_some()) => {
                         PoolWake::Refill(upstream)
                     }
                 }
@@ -262,14 +287,14 @@ impl PoolActor<'_> {
             || self.continuity.startup_deadline.is_some()
         {
             spawn_candidate_connects(CandidateConnectInputs {
+                held: self.activation.as_ref().map(|job| job.addr),
                 candidates: self.candidates,
                 peers: &self.peers,
                 infohash: self.info.infohash,
                 // The held gossip socket still consumes a transport slot.
-                max_parallel: self
-                    .live_recovery
-                    .max_parallel_connect
-                    .saturating_sub(usize::from(self.gossip.is_some())),
+                max_parallel: self.live_recovery.max_parallel_connect.saturating_sub(
+                    usize::from(self.gossip.is_some()) + usize::from(self.activation.is_some()),
+                ),
                 tx: &self.pex_tx,
                 tasks: &mut self.learned_connects,
                 pending: &mut self.learned_pending,
@@ -280,6 +305,10 @@ impl PoolActor<'_> {
 
     async fn on_wake(&mut self, event: PoolWake) -> WakeOutcome {
         match event {
+            PoolWake::Activation(result) => {
+                self.finish_activation(result).await;
+                WakeOutcome::Continue
+            }
             PoolWake::Reciprocal(result) => {
                 if let Some((id, reply)) = result {
                     #[cfg(test)]
@@ -426,25 +455,101 @@ impl PoolActor<'_> {
             .learn(upstream.addr, CandidateKind::Discovered);
         let peer_id = self.next_peer_id;
         self.next_peer_id += 1;
-        let addr = upstream.addr;
         self.continuity.head = self
             .continuity
             .head
             .max(upstream.window.max_piece.max(0) as u64);
         self.continuity.skip_far_behind_live(Instant::now());
-        match activate_upstream_peer(ActivationInputs {
+        self.activation = Some(activation::Activation {
+            addr: upstream.addr,
             peer_id,
-            upstream,
-            start: self.continuity.reasm.next_needed(),
-            identity: self.identity,
-            continuity: self.continuity,
-            event_tx: &self.event_tx,
-            reachability: self.reachability,
-            replacing: replacement.map(|id| (&mut self.peers, id)),
-        })
-        .await
-        {
-            Ok((runtime, replaced)) => {
+            replacement,
+            write: activation::prepare(
+                peer_id,
+                upstream,
+                self.continuity.reasm.next_needed(),
+                self.continuity.head,
+                self.identity,
+                self.reachability,
+            ),
+        });
+        WakeOutcome::Continue
+    }
+
+    fn poll_activation(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Option<activation::WriteResult> {
+        match self.activation.as_mut()?.write.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => None,
+        }
+    }
+
+    async fn finish_activation(&mut self, result: activation::WriteResult) {
+        let job = self.activation.take().expect("completed activation");
+        if self.tx.is_closed() {
+            return;
+        }
+        let peer_id = job.peer_id;
+        let replacement = job.replacement;
+        let result = result.map(|upstream| {
+            let active = self.peers.values().map(|peer| peer.addr).collect();
+            let corroborates = self.continuity.startup_deadline.is_some()
+                && upstream.window.max_piece.max(0) as u64 >= self.continuity.head;
+            let eligible = self.continuity.window_can_resume(&upstream.window)
+                && !self.peers.values().any(|peer| peer.addr == upstream.addr)
+                && !self
+                    .candidates
+                    .exploration_cohort(Instant::now(), &active, &self.learned_pending)
+                    .is_some_and(|cohort| self.candidates.explorations(upstream.addr) > cohort);
+            if !eligible {
+                return None;
+            }
+            let candidate_max = upstream.window.max_piece.max(0) as u64;
+            let full = self.peers.len() == self.live_recovery.max_active_upstreams;
+            if full
+                && corroborates
+                && candidate_max == self.continuity.head
+                && replacement
+                    .and_then(|id| self.peers.get(&id))
+                    .is_some_and(|peer| peer.max_piece == candidate_max)
+            {
+                // The provisional caught up while writes were Pending. Preserve
+                // the existing matching-window corroboration/retention policy.
+                self.continuity.startup_deadline = None;
+                self.last_progress = Instant::now();
+                return None;
+            }
+            let valid = match replacement {
+                None => self.peers.len() < self.live_recovery.max_active_upstreams,
+                Some(id) => {
+                    full && corroborates
+                        && self
+                            .peers
+                            .get(&id)
+                            .is_some_and(|peer| peer.max_piece < candidate_max)
+                }
+            };
+            if !valid {
+                return None;
+            }
+            let runtime = commit_upstream_peer(ActivationInputs {
+                peer_id,
+                upstream,
+                start: 0,
+                identity: self.identity,
+                continuity: self.continuity,
+                event_tx: &self.event_tx,
+                reachability: self.reachability,
+                replacing: replacement.map(|id| (&mut self.peers, id)),
+            });
+            Some((runtime, corroborates))
+        });
+        match result {
+            Ok(Some(((runtime, replaced), corroborates))) => {
+                let addr = runtime.addr;
+
                 if let Some(replaced) = replaced {
                     // Already admitted once: no extra exploration or physical-loss
                     // event for retiring a provisional, nonproducing transport.
@@ -468,12 +573,15 @@ impl PoolActor<'_> {
                         .await;
                 record_pool_losses(self.candidates, &mut self.loss_count, newly_lost);
             }
+            Ok(None) => (),
             Err(addr) => {
                 self.candidates.explored(addr);
                 record_pool_losses(self.candidates, &mut self.loss_count, [addr]);
             }
         }
-        WakeOutcome::Continue
+        // Reservation consumption may have been observed on an earlier busy
+        // turn. Completion itself releases the held transport slot.
+        self.maybe_refill(false);
     }
 
     async fn on_peer_event(&mut self, event: PeerEvent) -> Option<FollowEnd> {

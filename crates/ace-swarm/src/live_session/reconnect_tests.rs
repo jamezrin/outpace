@@ -1366,6 +1366,7 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
     let mut tasks = tokio::task::JoinSet::new();
     let mut pending = HashSet::new();
     spawn_candidate_connects(CandidateConnectInputs {
+        held: None,
         candidates: &mut candidates,
         peers: &BTreeMap::new(),
         infohash: [0; 20],
@@ -1398,6 +1399,7 @@ async fn discovered_refill_preserves_overlapping_learned_reservation() {
     }
     assert_eq!(rx.len(), 2); // Both actual learned connections are ready and owned.
     spawn_candidate_connects(CandidateConnectInputs {
+        held: None,
         candidates: &mut candidates,
         peers: &BTreeMap::new(),
         infohash: [0; 20],
@@ -1442,6 +1444,7 @@ async fn discovered_refill_reports_completed_transport_failure() {
     let mut pending = HashSet::new();
     let mut tasks = tokio::task::JoinSet::new();
     spawn_candidate_connects(CandidateConnectInputs {
+        held: None,
         candidates: &mut candidates,
         peers: &BTreeMap::new(),
         infohash: [0; 20],

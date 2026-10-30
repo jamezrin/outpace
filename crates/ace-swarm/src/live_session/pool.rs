@@ -1,7 +1,21 @@
+mod activation;
 mod actor;
 use super::*;
 use crate::seed::protocol::{prepare_reply, ServeProfile};
 use actor::PoolActor;
+
+// Task-local scope keeps parallel actors and activation attempts isolated. These
+// witnesses only observe polling; they never suspend or replace a transport.
+#[cfg(test)]
+pub(super) struct ActivationProbe {
+    pub candidate: std::cell::RefCell<Option<ConnectedUpstream>>,
+    pub addr: SocketAddrV4,
+    pub pending: Arc<tokio::sync::Notify>,
+}
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static ACTIVATION_PROBE: ActivationProbe;
+}
 
 fn receive_pool_refill(
     refill: PoolRefill,
@@ -31,7 +45,7 @@ pub(super) async fn activate_upstream_peer(
 ) -> Result<(PeerRuntime, Option<SocketAddrV4>), SocketAddrV4> {
     let ActivationInputs {
         peer_id,
-        mut upstream,
+        upstream,
         start,
         identity,
         continuity,
@@ -39,43 +53,38 @@ pub(super) async fn activate_upstream_peer(
         reachability,
         replacing,
     } = inputs;
-    // Harvest the public IP this peer echoed to us in `yourip` (issue #22). This is the single
-    // funnel every activated outbound upstream passes through, so recording here captures the
-    // observation once per live peer. Inert when no monitor is supplied (inbound serving off).
-    if let (Some(monitor), Some(ip)) = (reachability, upstream.yourip) {
-        monitor.observe_yourip(ip);
-    }
+    let upstream = activation::prepare(
+        peer_id,
+        upstream,
+        start,
+        continuity.head,
+        identity,
+        reachability,
+    )
+    .await?;
+    Ok(commit_upstream_peer(ActivationInputs {
+        peer_id,
+        upstream,
+        start,
+        identity,
+        continuity,
+        event_tx,
+        reachability,
+        replacing,
+    }))
+}
+
+fn commit_upstream_peer(inputs: ActivationInputs<'_>) -> (PeerRuntime, Option<SocketAddrV4>) {
+    let ActivationInputs {
+        peer_id,
+        upstream,
+        continuity,
+        event_tx,
+        replacing,
+        ..
+    } = inputs;
     let peer_min = upstream.window.min_piece.max(0) as u64;
     let peer_max = upstream.window.max_piece.max(0) as u64;
-    let hs = OutgoingExtendedHandshake {
-        ace_metadata_version: 1,
-        ut_metadata_id: 2,
-        mi: Some(WireLivePosition {
-            min_piece: start as i64,
-            max_piece: continuity.head as i64,
-            position: -1,
-            distance_from_source: 1,
-        }),
-        node: NodeFields {
-            ts: 5000 + peer_id as i64,
-            ..NodeFields::default()
-        },
-        peer_ip: Some(upstream.addr.ip().octets()),
-        metadata_size: None,
-    };
-    if upstream
-        .session
-        .send_signed_extended_handshake(&hs, identity)
-        .await
-        .is_err()
-        || upstream
-            .session
-            .send(&PeerMessage::Interested)
-            .await
-            .is_err()
-    {
-        return Err(upstream.addr);
-    }
     // Only successful writes consume the old provisional transport. A failed candidate
     // leaves its runtime, gossip reader, and request slots intact.
     let replaced = replacing.and_then(|(peers, id)| drop_peer_runtime(id, peers, continuity));
@@ -96,7 +105,7 @@ pub(super) async fn activate_upstream_peer(
         event_tx.clone(),
         continuity.request_floor.clone(),
     ));
-    Ok((
+    (
         PeerRuntime {
             addr: upstream.addr,
             min_piece: peer_min,
@@ -109,7 +118,7 @@ pub(super) async fn activate_upstream_peer(
             worker,
         },
         replaced,
-    ))
+    )
 }
 
 pub(super) fn recovery_channel_capacities(
@@ -347,6 +356,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
     let observed_retry = Instant::now();
     let closed_peer_events = BTreeMap::new();
     PoolActor {
+        activation: None,
         reciprocal: Default::default(),
         publication: None,
         gossip: None,
