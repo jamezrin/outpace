@@ -105,6 +105,62 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_interrupted(second_launch_fails=True), 2)
 
 
+class OwnedPlaybackTests(unittest.TestCase):
+    def args(self):
+        return SimpleNamespace(vlc="cvlc", engine_url="http://127.0.0.1:6878",
+                               outpace_url="http://127.0.0.1:16879", client_warp="off",
+                               server_warp="unknown", network_caching=1000,
+                               seconds=10, poll_seconds=5)
+
+    def urls(self):
+        identity = "0123456789abcdef0123456789abcdef01234567"
+        return {"engine": f"http://127.0.0.1:6878/ace/r/{identity}/" + "a" * 32,
+                "outpace": f"http://127.0.0.1:16879/ace/r/{identity}/" + "b" * 64}
+
+    def test_owned_urls_only_enter_private_playlists_and_clients_are_reaped(self):
+        processes = [Mock(), Mock()]
+        for process in processes:
+            process.poll.return_value = None
+            process.wait.return_value = 0
+        urls = self.urls()
+        with tempfile.TemporaryDirectory() as root:
+            output = io.StringIO()
+            with patch.object(vlc.tempfile, "mkdtemp", return_value=root), \
+                    patch.object(vlc.subprocess, "run", return_value=SimpleNamespace(stdout=b"VLC test\n")), \
+                    patch.object(vlc.subprocess, "Popen", side_effect=processes) as launch, \
+                    patch.object(vlc, "status_request", side_effect=KeyboardInterrupt), redirect_stdout(output):
+                code = vlc.compare(self.args(), None, playback_urls=urls)
+            self.assertEqual(code, 130)
+            for role, url in urls.items():
+                playlist = Path(root, role + ".m3u")
+                self.assertEqual(playlist.read_text(), "#EXTM3U\n" + url + "\n")
+                self.assertEqual(playlist.stat().st_mode & 0o777, 0o600)
+                self.assertNotIn(url, output.getvalue())
+                self.assertNotIn(url, Path(root, "config.json").read_text())
+                self.assertNotIn(url, Path(root, "comparison.json").read_text())
+                self.assertNotIn(url, str(launch.call_args_list))
+            for process in processes:
+                process.terminate.assert_called_once()
+                process.wait.assert_called_once()
+
+    def test_invalid_owned_inputs_fail_before_launch_or_artifact_creation(self):
+        good = self.urls()
+        bad = [dict(engine=good['engine']), dict(good, extra=good['engine'])]
+        for role in good:
+            for suffix in ('#', '?', '/extra', '?method=stop', '%2f', '\\x'):
+                bad.append(dict(good, **{role: good[role] + suffix}))
+            bad.append(dict(good, **{role: good[role].replace('127.0.0.1', '127.0.0.2')}))
+            bad.append(dict(good, **{role: good[role].replace('/ace/r/', '/ace/cmd/')}))
+            bad.append(dict(good, **{role: good[role][:-1]}))
+        for urls in bad:
+            with self.subTest(urls=urls), patch.object(vlc.tempfile, 'mkdtemp') as directory, \
+                    patch.object(vlc.subprocess, 'run') as version:
+                with self.assertRaises(ValueError):
+                    vlc.compare(self.args(), None, playback_urls=urls)
+                directory.assert_not_called()
+                version.assert_not_called()
+
+
 class ArgumentsTests(unittest.TestCase):
     def test_origins_reject_credentials_paths_and_query(self):
         for value in ("http://user:pass@localhost", "http://localhost/ace",

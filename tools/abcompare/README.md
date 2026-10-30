@@ -312,3 +312,15 @@ remain in the analyzer summary for review; this gate adds no integrity threshold
 PCR jumps invalidate the timing model. Shared pauses do not prove a source-wide
 outage. Retain private summary/policy/gate links in release provenance and link that
 review from #208 after merge; follow #210 for longer observation requirements.
+
+
+For orchestration that already owns validated metadata leases, the Python callable
+`vlc_compare.compare(args, None, playback_urls={"engine": official_url,
+"outpace": candidate_url})` accepts tokenized playback URLs. Both are required;
+validation requires the configured origin and role-specific `/ace/r/` capability
+shape before launching VLC. URLs enter private mode-0600 playlists, not process
+arguments or summary/config fields. The caller must verify unencrypted scope and
+source identity, retain ownership and stop each exact lease on every exit path.
+This option does not negotiate or stop leases. The CLI and default direct-ID
+comparison behavior remain unchanged. Sampled VLC counters retain their existing
+measurement limits.
