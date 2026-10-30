@@ -13,6 +13,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -149,9 +150,26 @@ def playback_targets(args, content_id, playback_urls):
     return targets
 
 
-def compare(args, content_id, *, playback_urls=None):
+def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
+            artifact_parent=None):
     targets = playback_targets(args, content_id, playback_urls)
-    root = Path(tempfile.mkdtemp(prefix="outpace-vlc-"))
+    if cancel_requested is not None and not callable(cancel_requested):
+        raise ValueError("cancellation callback must be callable")
+    def cancelled():
+        return cancel_requested is not None and bool(cancel_requested())
+    if artifact_parent is not None:
+        artifact_parent = Path(artifact_parent).absolute()
+        try:
+            info = artifact_parent.stat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700
+                    or any(p.is_symlink() for p in (artifact_parent, *artifact_parent.parents))):
+                raise ValueError("private artifact parent required")
+        except OSError:
+            raise ValueError("private artifact parent required") from None
+    if cancelled():
+        return 130
+    root = Path(tempfile.mkdtemp(prefix="outpace-vlc-", dir=artifact_parent))
     # mkdtemp is private (0700); logs/playlists/status may contain stream metadata.
     clients = []
     started = time.monotonic()
@@ -172,6 +190,9 @@ def compare(args, content_id, *, playback_urls=None):
     print(f"Private artifacts: {root}", flush=True)
     try:
         for name, base in (("engine", args.engine_url), ("outpace", args.outpace_url)):
+            if cancelled():
+                interrupted = True
+                break
             playlist = root / f"{name}.m3u"
             playlist.touch(mode=0o600, exist_ok=False)
             playlist.write_text("#EXTM3U\n" + targets[name] + "\n")
@@ -190,10 +211,19 @@ def compare(args, content_id, *, playback_urls=None):
             clients.append({"name": name, "process": process, "port": port,
                             "password": password, "observation": Observation(),
                             "launch_seconds": time.monotonic() - started})
+            if cancelled():
+                interrupted = True
+                break
         deadline = started + args.seconds
         next_poll = started
-        while time.monotonic() < deadline:
+        while not interrupted and time.monotonic() < deadline:
+            if cancelled():
+                interrupted = True
+                break
             for client in clients:
+                if cancelled():
+                    interrupted = True
+                    break
                 if client["process"].poll() is not None:
                     failure = "client_exited_early"
                     break
@@ -211,12 +241,14 @@ def compare(args, content_id, *, playback_urls=None):
                         out.write(json.dumps({"seconds": elapsed, "status": status}) + "\n")
                 except (OSError, ValueError):
                     client["observation"].errors += 1
-            if failure:
+            if failure or interrupted:
                 break
             next_poll += args.poll_seconds
             # Skip missed slots instead of issuing a burst of catch-up requests.
             next_poll = max(next_poll, time.monotonic())
             time.sleep(max(0, min(next_poll, deadline) - time.monotonic()))
+        if cancelled():
+            interrupted = True
     except KeyboardInterrupt:
         interrupted = True
     except (OSError, ValueError):
@@ -229,6 +261,10 @@ def compare(args, content_id, *, playback_urls=None):
             except (OSError, subprocess.TimeoutExpired):
                 client["exit_code"] = None
                 failure = "client_cleanup_failed"
+    # Completion boundary: reconcile cancellation through all owned cleanup.
+    # Keep cleanup failures even when cancellation determines the exit status.
+    if cancelled():
+        interrupted = True
     reports = {}
     for client in clients:
         report = client["observation"].report(observed_seconds)
@@ -278,17 +314,20 @@ def main():
     if not shutil.which(args.vlc):
         parser.error("VLC executable not found; install VLC or use --vlc")
 
+    cancelled = False
     def terminate(_signum, _frame):
-        raise KeyboardInterrupt
+        nonlocal cancelled
+        cancelled = True
 
-    old_handler = signal.signal(signal.SIGTERM, terminate)
+    old_handlers = {sig: signal.signal(sig, terminate) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
-        return compare(args, content_id)
+        return compare(args, content_id, cancel_requested=lambda: cancelled)
     except (OSError, subprocess.SubprocessError):
         print("Unable to initialize VLC comparison; verify VLC installation and permissions.")
         return 2
     finally:
-        signal.signal(signal.SIGTERM, old_handler)
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
