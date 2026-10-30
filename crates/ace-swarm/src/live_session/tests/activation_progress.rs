@@ -214,7 +214,6 @@ async fn diagnostic(pressure: bool, close: bool, media: bool) {
         })
         .await
         .unwrap_or(false);
-        eprintln!("media barrier={barrier} output={output_before_release}");
         output_before_release &= barrier;
     }
     // Unconditional release before any desired-progress assertion. Drain exactly
@@ -304,15 +303,13 @@ async fn diagnostic(pressure: bool, close: bool, media: bool) {
     .is_ok();
     drop(remote);
     drop(healthy);
-    eprintln!("activation pressure={pressure} close={close} padding={padding} real_send_pending={} control_before={control} exit_before={exit_before} drain={release} activated={activated} recovered={recovered} cleanup={cleanup} eof={eof}", pressure && witnessed);
     assert!(
         observation_before_release && observed.observed().is_some_and(|value| value.total == 1),
         "exactly one echoed-IP observation even for cancelled writes"
     );
-    eprintln!("media={media} output_before_release={output_before_release} obsolete_closed={obsolete_closed}");
     assert!(
         !media || (output_before_release && obsolete_closed),
-        "timer/output before release, then obsolete candidate EOF while pool stays live"
+        "timer/output before release: output={output_before_release}, obsolete_closed={obsolete_closed}"
     );
     assert!(
         witnessed
@@ -321,11 +318,11 @@ async fn diagnostic(pressure: bool, close: bool, media: bool) {
             && recovered
             && cleanup
             && eof,
-        "fixture/release controls"
+        "fixture/release: pressure={pressure} close={close} padding={padding} witnessed={witnessed} release={release} activated={activated} recovered={recovered} cleanup={cleanup} eof={eof}"
     );
     assert!(
         if close { exit_before } else { control },
-        "desired actor progress within 250ms while real activation write is Pending"
+        "actor progress within 250ms while activation Pending: control={control}, exit={exit_before}"
     );
 }
 
