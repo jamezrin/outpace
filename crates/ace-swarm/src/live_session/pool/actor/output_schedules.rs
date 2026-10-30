@@ -301,7 +301,6 @@ async fn schedule(piece_length: usize, pieces: usize, full: bool, close: bool) {
         discovery_run: &mut discovery,
         continuity: &mut c,
     };
-    let start = Instant::now();
     COUNTS.scope(RefCell::new(vec![]), async {
         let run = actor.run();
         tokio::pin!(run);
@@ -367,9 +366,6 @@ async fn schedule(piece_length: usize, pieces: usize, full: bool, close: bool) {
                 assert!(output_bytes > pieces * (piece_length / 188 * 188), "actual table insertion");
                 assert!(v.iter().any(|t|t.causal_refs > 0));
             }
-            eprintln!("retained_bytes_max={} segments_max={} causal_refs_max={} output_bytes={output_bytes}",v.iter().map(|t|t.retained_bytes).max().unwrap(),v.iter().map(|t|t.segments).max().unwrap(),v.iter().map(|t|t.causal_refs).max().unwrap());
-            eprintln!("max_prepare_us={} reserve_pending={}",v.iter().map(|t|t.prepare_us).max().unwrap(),v.iter().map(|t|t.pending).sum::<usize>());
-            eprintln!("actor schedule piece_bytes={piece_length} pieces={pieces} full={full} turns={} prepares={} enqueues={} packets={} transitions={} wall_us={}", v.len(), v.iter().map(|t|t.prepares).sum::<usize>(), v.iter().map(|t|t.enqueues).sum::<usize>(), v.iter().map(|t|t.packets).sum::<usize>(),v.iter().map(|t|t.transitions).sum::<usize>(),start.elapsed().as_micros());
         });
     }).await;
     worker_abort.abort();

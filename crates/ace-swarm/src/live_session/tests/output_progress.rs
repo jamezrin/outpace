@@ -270,7 +270,6 @@ async fn diagnostic(mode: u8) {
     let stored = store.lock().await;
     let verified = stored.has_piece(7) && (mode == 1 || stored.has_piece(8));
     drop(stored);
-    eprintln!("output discriminator mode={mode} pending={witnessed} control={control} joined250={} marker={marker} media_bytes={} verified={verified} cleanup={cleanup} raw_eof={eof}", joined.is_some(), output.len());
     assert!(
         fixture && (mode == 2 || witnessed) && cleanup && eof && verified,
         "fixture and cleanup"
