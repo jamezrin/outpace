@@ -181,6 +181,7 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
     version = subprocess.run([args.vlc, "--version"], capture_output=True,
                              timeout=10, env=env, check=True).stdout.decode(errors="replace")
     config = {
+        "origin_monotonic": started,
         "engine_url": args.engine_url, "outpace_url": args.outpace_url,
         "client_warp": args.client_warp, "server_warp": args.server_warp,
         "network_caching_ms": args.network_caching, "seconds": args.seconds,
@@ -279,6 +280,7 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
                 and all(r["samples"] and any(v is not None for v in
                         r["first_decode_observed_seconds"].values()) for r in reports.values()))
     summary = {
+        "origin_monotonic": started,
         "schema_version": 1, "observation_complete": bool(complete),
         "interrupted": interrupted, "failure": failure,
         "observed_seconds": round(observed_seconds, 3),
