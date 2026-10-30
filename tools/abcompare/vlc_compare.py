@@ -246,7 +246,12 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
             next_poll += args.poll_seconds
             # Skip missed slots instead of issuing a burst of catch-up requests.
             next_poll = max(next_poll, time.monotonic())
-            time.sleep(max(0, min(next_poll, deadline) - time.monotonic()))
+            wake = min(next_poll, deadline)
+            while not cancelled():
+                remaining = wake - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(remaining, 0.25))
         if cancelled():
             interrupted = True
     except KeyboardInterrupt:
