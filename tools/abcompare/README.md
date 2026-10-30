@@ -340,3 +340,10 @@ client cleanup, before the report is finalized. Requests received through that
 completion boundary produce interrupted status and exit 130; cleanup errors stay
 visible in the report. A later signal does not retroactively change a completed
 observation.
+
+Both `config.json` and `comparison.json` expose `origin_monotonic`, the exact
+local Python monotonic timestamp used as zero for relative sample and launch
+seconds. It is captured before the VLC version probe and client launches, so
+setup time is included. It remains present in partial reports. Use it only with
+samples from the same machine and monotonic clock domain; it is neither UTC nor
+a cross-host clock or an exact first-decode measurement.

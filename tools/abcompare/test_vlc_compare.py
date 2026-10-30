@@ -143,6 +143,22 @@ class OwnedPlaybackTests(unittest.TestCase):
                 process.terminate.assert_called_once()
                 process.wait.assert_called_once()
 
+    def test_absolute_origin_uses_initial_clock_even_when_launch_fails(self):
+        ticks = iter(12345.125 + i * 0.25 for i in range(100))
+        with tempfile.TemporaryDirectory() as parent, \
+                patch.object(vlc.time, 'monotonic', side_effect=lambda: next(ticks)), \
+                patch.object(vlc.subprocess, 'run', return_value=SimpleNamespace(stdout=b'VLC fixture\n')), \
+                patch.object(vlc.subprocess, 'Popen', side_effect=OSError('fixture launch')), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(vlc.compare(self.args(), None, playback_urls=self.urls(),
+                                        artifact_parent=Path(parent)), 2)
+            root, = Path(parent).iterdir()
+            config = json.loads((root / 'config.json').read_text())
+            report = json.loads((root / 'comparison.json').read_text())
+            self.assertEqual(config['origin_monotonic'], 12345.125)
+            self.assertEqual(report['origin_monotonic'], config['origin_monotonic'])
+            self.assertEqual(report['observed_seconds'], 0.25)
+
     def test_cancel_after_first_launch_registers_and_reaps_before_second(self):
         cancelled = False
         process = Mock()
