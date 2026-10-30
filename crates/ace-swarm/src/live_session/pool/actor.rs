@@ -1,16 +1,27 @@
 use super::*;
 #[cfg(test)]
 mod activation_tests;
+#[cfg(test)]
+mod drain_tests;
+#[cfg(test)]
+mod output_schedules;
 mod publication;
 mod reciprocal;
 use publication::PublicationOperation;
+
+type OutputReservation = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>,
+            > + Send,
+    >,
+>;
 
 type ConnectCompletion =
     Option<Result<(SocketAddrV4, Option<PeerConnectFailure>, bool), tokio::task::JoinError>>;
 
 enum PieceOutcome {
     Skip,
-    End(FollowEnd),
     Progress { activity: bool, output: bool },
 }
 
@@ -23,6 +34,7 @@ enum WakeOutcome {
 // Fields owning resources follow the original locals' reverse declaration order.
 // In particular peers retire before connect tasks, channel endpoints, then stats.
 pub(super) struct PoolActor<'a> {
+    pub(super) output_reservation: Option<OutputReservation>,
     pub(super) activation: Option<activation::Activation>,
     pub(super) reciprocal: reciprocal::Reciprocal,
     pub(super) publication: Option<PublicationOperation>,
@@ -30,8 +42,6 @@ pub(super) struct PoolActor<'a> {
     pub(super) observed_retry: Instant,
     pub(super) observed_capacity: (usize, usize),
     pub(super) refill_closed: bool,
-    pub(super) last_progress: Instant,
-    pub(super) first_output_deadline: Option<Instant>,
     pub(super) next_peer_id: u64,
     pub(super) loss_count: usize,
     pub(super) peers: BTreeMap<u64, PeerRuntime>,
@@ -75,10 +85,20 @@ impl PoolActor<'_> {
         });
         self.maybe_refill(false);
         // Start progress/retry clocks after initial refill, as in the adapter before extraction.
-        self.last_progress = Instant::now();
+        if !self.continuity.has_delivery_work() {
+            self.continuity.last_progress = self.continuity.output_clock.now(Instant::now());
+            self.continuity.first_output = if self.continuity.emitted > 0 {
+                FirstOutput::Done
+            } else {
+                FirstOutput::AwaitCorroboration
+            };
+        }
+        self.continuity.output_budget(Instant::now());
         self.observed_capacity = (self.peers.len(), self.learned_pending.len());
         self.observed_retry = Instant::now();
         loop {
+            #[cfg(test)]
+            output_schedules::turn();
             if self.tx.is_closed() {
                 return FollowEnd::ConsumerGone;
             }
@@ -110,11 +130,18 @@ impl PoolActor<'_> {
                 std::future::poll_fn(|cx| std::task::Poll::Ready(self.poll_publication(cx))).await;
             if ready {
                 self.start_publication();
-                if !self.continuity.publication_hold() {
-                    if let PieceOutcome::End(end) = self.drain_output().await {
-                        return end;
-                    }
+            }
+            self.start_output();
+            let output_ready = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(poll_output(&mut self.output_reservation, cx))
+            })
+            .await;
+            let output_completed = output_ready.is_some();
+            if let Some(result) = output_ready {
+                if let Some(end) = self.finish_output(result) {
+                    return end;
                 }
+                tokio::task::yield_now().await;
             }
             let mut released_failed_slot = false;
             while let Some(Ok(result)) = self.learned_connects.try_join_next() {
@@ -128,6 +155,11 @@ impl PoolActor<'_> {
             }
             self.observed_capacity = (self.peers.len(), self.learned_pending.len());
             let now = Instant::now();
+            let _stats_work = self
+                .continuity
+                .advance_stats(self.seed.metrics.is_some(), self.info.metadata.bitrate);
+            #[cfg(test)]
+            output_schedules::stats(_stats_work);
             publish_live_stats(self.continuity, self.seed.metrics.as_ref(), self.info);
             if self
                 .continuity
@@ -135,8 +167,11 @@ impl PoolActor<'_> {
                 .is_some_and(|deadline| now >= deadline)
             {
                 self.continuity.startup_deadline = None;
-                self.last_progress = now;
-                crate::alog!("[ace] live start: corroboration deadline reached; using best known window without freshness proof");
+                self.continuity.output_budget(Instant::now());
+                self.continuity.last_progress = self.continuity.output_clock.now(now);
+                crate::alog!(
+                    "[ace] live start: corroboration deadline reached; using best known window without freshness proof"
+                );
                 let lost =
                     advance_pool_requests(&mut self.peers, self.continuity, self.chunks_per_piece)
                         .await;
@@ -144,27 +179,21 @@ impl PoolActor<'_> {
             }
             // Re-evaluate the budget after startup scheduling.
             let now = Instant::now();
-            let Some(stale_budget) = pool_progress_budget(
-                &mut self.first_output_deadline,
-                self.continuity.emitted,
-                self.continuity.startup_deadline,
-                self.last_progress,
-                now,
-                self.live_recovery.stale_upstream_timeout(),
-            ) else {
+            let budget = self.continuity.output_budget(now);
+            if budget == OutputBudget::Expired {
                 let stalled = self.peers.values().map(|p| p.addr).collect::<Vec<_>>();
                 crate::alog!(
-                "[ace] upstream pool stale — no live progress for {:?}; reconnecting {} peer(s)",
-                self.live_recovery.stale_upstream_timeout(),
-                stalled.len()
-            );
+                    "[ace] upstream pool stale — no live progress for {:?}; reconnecting {} peer(s)",
+                    self.live_recovery.stale_upstream_timeout(),
+                    stalled.len()
+                );
                 shutdown_peer_runtimes(&mut self.peers);
                 self.continuity.recovery_event(RecoveryEvent::StaleTeardown);
                 return FollowEnd::PoolStale {
                     stalled,
                     lost: self.loss_count,
                 };
-            };
+            }
             // Self-heal a single stuck piece well before the whole-pool stale timeout: re-request
             // pieces outstanding past the request timeout (to a faster peer where possible) and
             // skip a piece evicted from every upstream window.
@@ -182,7 +211,7 @@ impl PoolActor<'_> {
                 advance_pool_requests(&mut self.peers, self.continuity, self.chunks_per_piece)
                     .await;
             record_pool_losses(self.candidates, &mut self.loss_count, newly_lost);
-            if self.peers.is_empty() {
+            if self.peers.is_empty() && !self.continuity.has_delivery_work() {
                 return FollowEnd::PeerLost(self.loss_count);
             }
             self.peer_count
@@ -190,14 +219,13 @@ impl PoolActor<'_> {
 
             // Wake at least every configured request-check interval for credit
             // admission and retransmit checks, even while no peer sends anything.
-            let wait = stale_budget
-                .min(self.live_recovery.request_check_interval())
-                .min(
-                    self.continuity
-                        .startup_deadline
-                        .map(|deadline| deadline.saturating_duration_since(now))
-                        .unwrap_or(stale_budget),
-                );
+            let mut wait = self.live_recovery.request_check_interval();
+            if let OutputBudget::Remaining(remaining) = budget {
+                wait = wait.min(remaining);
+            }
+            if let Some(deadline) = self.continuity.startup_deadline {
+                wait = wait.min(deadline.saturating_duration_since(now));
+            }
             let active = self
                 .peers
                 .values()
@@ -233,8 +261,11 @@ impl PoolActor<'_> {
             Some(event) => PoolWake::Peer(Some(event)),
             None if reciprocal_completed => PoolWake::Reciprocal(None),
             None if ready => PoolWake::Publication,
+            None if output_completed => PoolWake::Stats,
             None => match tokio::time::timeout(wait, async {
                 tokio::select! {
+                    result = std::future::poll_fn(|cx| poll_output(&mut self.output_reservation, cx).map_or(std::task::Poll::Pending, std::task::Poll::Ready)), if !output_completed && self.output_reservation.is_some() => PoolWake::Output(result),
+                    _ = tokio::task::yield_now(), if self.continuity.stats_pending(self.seed.metrics.is_some()) => PoolWake::Stats,
                     result = std::future::poll_fn(|cx| {
                         let result = reciprocal::poll_job(&mut self.reciprocal, cx);
                         #[cfg(test)]
@@ -245,7 +276,7 @@ impl PoolActor<'_> {
                     _ = self.tx.closed() => PoolWake::ConsumerGone,
                     _ = std::future::poll_fn(|cx| publication::poll_operation(&mut self.publication, self.continuity, self.store, cx).then_some(()).map_or(std::task::Poll::Pending, std::task::Poll::Ready)), if self.publication.is_some() => PoolWake::Publication,
                     learned = async { self.gossip.as_mut().expect("enabled gossip").await }, if self.gossip.is_some() => PoolWake::Gossip(learned),
-                    event = self.event_rx.recv() => PoolWake::Peer(event),
+                    event = self.event_rx.recv(), if !self.peers.is_empty() => PoolWake::Peer(event),
                     result=self.learned_connects.join_next(), if !self.learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
                     _ = async {
                         tokio::time::sleep_until(retry_deadline.expect("enabled retry deadline").into()).await;
@@ -305,6 +336,13 @@ impl PoolActor<'_> {
 
     async fn on_wake(&mut self, event: PoolWake) -> WakeOutcome {
         match event {
+            PoolWake::Output(result) => {
+                if let Some(end) = self.finish_output(result) {
+                    return WakeOutcome::End(end);
+                }
+                tokio::task::yield_now().await;
+                WakeOutcome::Continue
+            }
             PoolWake::Activation(result) => {
                 self.finish_activation(result).await;
                 WakeOutcome::Continue
@@ -325,13 +363,9 @@ impl PoolActor<'_> {
                 self.maybe_refill(true);
                 WakeOutcome::Continue
             }
+            PoolWake::Stats => WakeOutcome::Continue,
             PoolWake::Publication => {
                 self.start_publication();
-                if !self.continuity.publication_hold() {
-                    if let PieceOutcome::End(end) = self.drain_output().await {
-                        return WakeOutcome::End(end);
-                    }
-                }
                 WakeOutcome::Continue
             }
             PoolWake::ConsumerGone => WakeOutcome::End(FollowEnd::ConsumerGone),
@@ -344,7 +378,11 @@ impl PoolActor<'_> {
             PoolWake::Peer(Some(_)) => WakeOutcome::Continue,
             PoolWake::Peer(None) => {
                 shutdown_peer_runtimes(&mut self.peers);
-                WakeOutcome::End(FollowEnd::PeerLost(self.loss_count))
+                if self.continuity.has_delivery_work() {
+                    WakeOutcome::Continue
+                } else {
+                    WakeOutcome::End(FollowEnd::PeerLost(self.loss_count))
+                }
             }
             PoolWake::Refill(Some(upstream)) => self.on_refill(upstream).await,
             PoolWake::Refill(None) => {
@@ -391,18 +429,25 @@ impl PoolActor<'_> {
         }
         if !self.continuity.window_can_resume(&upstream.window) {
             crate::alog!(
-                        "[ace] {}: background refill stale window min={} max={} cannot cover next needed piece {}; dropping",
-                        upstream.addr,
-                        upstream.window.min_piece,
-                        upstream.window.max_piece,
-                        self.continuity.reasm.next_needed()
-                    );
+                "[ace] {}: background refill stale window min={} max={} cannot cover next needed piece {}; dropping",
+                upstream.addr,
+                upstream.window.min_piece,
+                upstream.window.max_piece,
+                self.continuity.reasm.next_needed()
+            );
             self.candidates.explored(upstream.addr);
             self.candidates.failed(upstream.addr, Instant::now());
+            let now = Instant::now();
+            let output_remaining = match self.continuity.output_budget(now) {
+                OutputBudget::Remaining(remaining) => Some(remaining),
+                OutputBudget::Expired => Some(Duration::ZERO),
+                OutputBudget::Suspended => None,
+            };
             let gossip_budget = self
                 .continuity
                 .startup_deadline
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .or(output_remaining)
                 .unwrap_or(STALE_GOSSIP_BUDGET)
                 .min(STALE_GOSSIP_BUDGET);
             debug_assert!(self.gossip.is_none());
@@ -432,8 +477,11 @@ impl PoolActor<'_> {
             // Independent matching evidence is enough to start. Keep the sole
             // healthy provisional transport rather than churn it for capacity.
             self.continuity.startup_deadline = None;
-            self.last_progress = Instant::now();
-            crate::alog!("[ace] live start: matching independent window confirmed; retaining current upstream");
+            self.continuity.output_budget(Instant::now());
+            self.continuity.last_progress = self.continuity.output_clock.now(Instant::now());
+            crate::alog!(
+                "[ace] live start: matching independent window confirmed; retaining current upstream"
+            );
             let lost =
                 advance_pool_requests(&mut self.peers, self.continuity, self.chunks_per_piece)
                     .await;
@@ -459,7 +507,8 @@ impl PoolActor<'_> {
             .continuity
             .head
             .max(upstream.window.max_piece.max(0) as u64);
-        self.continuity.skip_far_behind_live(Instant::now());
+        self.continuity
+            .skip_far_behind_live(self.continuity.output_clock.now(Instant::now()));
         self.activation = Some(activation::Activation {
             addr: upstream.addr,
             peer_id,
@@ -518,7 +567,8 @@ impl PoolActor<'_> {
                 // The provisional caught up while writes were Pending. Preserve
                 // the existing matching-window corroboration/retention policy.
                 self.continuity.startup_deadline = None;
-                self.last_progress = Instant::now();
+                self.continuity.output_budget(Instant::now());
+                self.continuity.last_progress = self.continuity.output_clock.now(Instant::now());
                 return None;
             }
             let valid = match replacement {
@@ -557,8 +607,12 @@ impl PoolActor<'_> {
                 }
                 if corroborates {
                     self.continuity.startup_deadline = None;
-                    self.last_progress = Instant::now();
-                    crate::alog!("[ace] live start: independent upstream window confirmed; starting at best known head");
+                    self.continuity.output_budget(Instant::now());
+                    self.continuity.last_progress =
+                        self.continuity.output_clock.now(Instant::now());
+                    crate::alog!(
+                        "[ace] live start: independent upstream window confirmed; starting at best known head"
+                    );
                 }
                 self.candidates.admitted(runtime.addr);
                 crate::alog!(
@@ -597,6 +651,7 @@ impl PoolActor<'_> {
                     self.peer_count,
                 )
                 .await
+                    && !self.continuity.has_delivery_work()
                 {
                     return Some(FollowEnd::PeerLost(self.loss_count));
                 }
@@ -668,7 +723,6 @@ impl PoolActor<'_> {
             }
             m @ PeerMessage::Piece { .. } => match self.on_piece(addr, m).await {
                 PieceOutcome::Skip => return None,
-                PieceOutcome::End(end) => return Some(end),
                 PieceOutcome::Progress { activity, output } => {
                     made_activity = activity;
                     made_output = output;
@@ -795,11 +849,11 @@ impl PoolActor<'_> {
             }
             _ => {}
         }
-        if self.peers.is_empty() {
+        if self.peers.is_empty() && !self.continuity.has_delivery_work() {
             return Some(FollowEnd::PeerLost(self.loss_count));
         }
         if should_refresh_stale_deadline(self.continuity.emitted, made_output, made_activity) {
-            self.last_progress = Instant::now();
+            self.continuity.last_progress = self.continuity.output_clock.now(Instant::now());
         }
         if made_output {
             if let Some(peer) = self.peers.get_mut(&peer_id) {
@@ -808,18 +862,23 @@ impl PoolActor<'_> {
             self.candidates.productive(addr);
             // Contiguous output means the playback cursor advanced: reset the per-piece
             // eviction-skip timer so it only fires when the cursor is genuinely stuck.
-            self.continuity.next_needed_since = Instant::now();
+            self.continuity.next_needed_since = self.continuity.output_clock.now(Instant::now());
         }
         None
     }
     async fn on_piece(&mut self, addr: SocketAddrV4, m: PeerMessage) -> PieceOutcome {
         let mut made_activity = false;
-        let mut made_output = false;
+        let made_output = false;
 
         if let Some(lc) = LiveChunk::from_message(&m) {
-            self.continuity.skip_far_behind_live(Instant::now());
+            self.continuity
+                .skip_far_behind_live(self.continuity.output_clock.now(Instant::now()));
             let piece = lc.piece as u64;
             if self.continuity.startup_deadline.is_some()
+                || self
+                    .continuity
+                    .output_ceiling
+                    .is_some_and(|ceiling| piece >= ceiling)
                 || piece < self.continuity.reasm.next_needed()
             {
                 return PieceOutcome::Skip;
@@ -853,6 +912,9 @@ impl PoolActor<'_> {
                 }
             };
             if outcome.completed {
+                if !self.continuity.stats_scan.pending() {
+                    self.continuity.invalidate_stats();
+                }
                 if let Some(done) = self.continuity.reasm.completed_live_piece(piece) {
                     if matches!(
                         done.acceptance,
@@ -894,13 +956,6 @@ impl PoolActor<'_> {
                 let _ = observer.send((piece, addr));
             }
             self.start_publication();
-            if !self.continuity.publication_hold() {
-                match self.drain_output().await {
-                    PieceOutcome::End(end) => return PieceOutcome::End(end),
-                    PieceOutcome::Progress { output, .. } => made_output = output,
-                    PieceOutcome::Skip => {}
-                }
-            }
             let newly_lost =
                 advance_pool_requests(&mut self.peers, self.continuity, self.chunks_per_piece)
                     .await;
@@ -911,95 +966,229 @@ impl PoolActor<'_> {
             output: made_output,
         }
     }
-    async fn drain_output(&mut self) -> PieceOutcome {
-        let mut made_output = false;
-        let addr = self.peers.values().next().expect("active pool").addr;
-        let before = self.continuity.reasm.next_needed();
-        let ready = take_ready_with_stats(self.continuity, self.seed.metrics.as_ref(), self.info);
-        let after = self.continuity.reasm.next_needed();
-        let productive: Vec<_> = self
-            .continuity
-            .piece_producers
-            .range(before..after)
-            .filter_map(|(_, producer)| *producer)
-            .collect();
-        self.continuity
-            .piece_producers
-            .retain(|&piece, _| piece >= after);
-        if !ready.is_empty() {
-            if !self.continuity.authenticated_logged
-                && self.info.sig_len > 0
-                && ace_wire::live_auth::signature_len_from_pubkey_der(&self.info.source_pubkey)
-                    == Some(self.info.sig_len)
-            {
-                self.continuity.authenticated_logged = true;
-                crate::alog!("[ace] discovery stage=authenticated-contiguous");
-            }
-            for output in self.continuity.resync_output(&ready) {
-                let aligned = output.bytes;
-                if self.continuity.emitted == 0 {
-                    crate::alog!("[ace] discovery stage=first-source-output");
-                }
-                self.continuity.emitted += aligned.len() as u64;
-                if self.continuity.emitted >= self.continuity.next_log {
-                    crate::alog!(
-                        "[ace] {addr}: served {} MiB (head={}, next piece needed={})",
-                        self.continuity.emitted >> 20,
-                        self.continuity.head,
-                        self.continuity.reasm.next_needed()
-                    );
-                    self.continuity.next_log = self.continuity.emitted + (4 << 20);
-                }
-                let len = aligned.len() as u64;
-                if self
-                    .tx
-                    .send(LiveOutput {
-                        bytes: aligned,
-                        discontinuity: output.discontinuity,
-                    })
-                    .await
-                    .is_err()
-                {
-                    shutdown_peer_runtimes(&mut self.peers);
-                    return PieceOutcome::End(FollowEnd::ConsumerGone);
-                }
-                self.downloaded.fetch_add(len, Ordering::Relaxed);
-                made_output = true;
-            }
+    fn start_output(&mut self) {
+        if self.output_reservation.is_none() && self.continuity.output_demand() {
+            self.continuity.output_ceiling.get_or_insert_with(|| {
+                self.continuity
+                    .reasm
+                    .next_needed()
+                    .saturating_add(self.live_recovery.max_reasm_pieces_ahead)
+            });
+            self.continuity.output_clock.begin(Instant::now());
+            self.output_reservation = Some(Box::pin(self.tx.clone().reserve_owned()));
         }
-        if made_output {
-            for producer in &productive {
-                self.candidates.productive(*producer);
-                for peer in self
-                    .peers
+    }
+
+    fn finish_output(
+        &mut self,
+        result: Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>,
+    ) -> Option<FollowEnd> {
+        finish_output_step(
+            self.continuity,
+            self.candidates,
+            &mut self.peers,
+            self.info,
+            self.seed,
+            self.downloaded,
+            self.tx,
+            result,
+        )
+    }
+}
+
+fn poll_output(
+    reservation: &mut Option<OutputReservation>,
+    cx: &mut std::task::Context<'_>,
+) -> Option<Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>> {
+    let future = reservation.as_mut()?;
+    match future.as_mut().poll(cx) {
+        std::task::Poll::Pending => {
+            #[cfg(test)]
+            output_schedules::pending();
+            #[cfg(test)]
+            let _ = crate::live_session::tests::output_progress::OUTPUT_SEND_PENDING
+                .try_with(|seen| seen.notify_one());
+            None
+        }
+        std::task::Poll::Ready(result) => {
+            *reservation = None;
+            Some(result)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_output_step(
+    continuity: &mut Continuity,
+    candidates: &mut SessionCandidates,
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+    info: &StreamInfo,
+    seed: &SeedConfig,
+    downloaded: &Arc<AtomicU64>,
+    tx: &mpsc::Sender<LiveOutput>,
+    result: Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>,
+) -> Option<FollowEnd> {
+    let Ok(permit) = result else {
+        return Some(FollowEnd::ConsumerGone);
+    };
+    if tx.is_closed() {
+        return Some(FollowEnd::ConsumerGone);
+    }
+    if continuity.pending_output.is_empty() {
+        if !continuity.output_demand() {
+            continuity.output_ceiling = None;
+            continuity.output_clock.end(Instant::now());
+            return None;
+        }
+        let piece = continuity.reasm.take_ready_piece()?;
+        #[cfg(test)]
+        output_schedules::prepare();
+        continuity.publication.remove(&piece.index);
+        let credit = continuity
+            .piece_producers
+            .remove(&piece.index)
+            .flatten()
+            .map(|producer| {
+                Arc::new(OutputCredit {
+                    producer,
+                    kind: candidates.kind(producer),
+                    credited: std::sync::atomic::AtomicBool::new(false),
+                })
+            });
+        continuity.invalidate_stats();
+        if let Some(metrics) = &seed.metrics {
+            metrics.received_bytes(piece.bytes.len() as u64);
+        }
+        #[cfg(test)]
+        let preparation_start = Instant::now();
+        let segments = continuity.resync_output_credited(&piece.bytes, credit);
+        #[cfg(test)]
+        output_schedules::prepared_in(preparation_start.elapsed());
+        continuity.pending_output.extend(segments);
+        #[cfg(test)]
+        output_schedules::retained(continuity);
+        if continuity.pending_output.is_empty() {
+            continuity.output_ceiling = None;
+            continuity.output_clock.end(Instant::now());
+            return None;
+        }
+    }
+    if let Some(output) = continuity.pending_output.pop_front() {
+        let len = output.bytes.len() as u64;
+        drop(permit.send(output));
+        #[cfg(test)]
+        output_schedules::enqueue();
+        for credit in continuity.pending_credit.pop_front().unwrap_or_default() {
+            if !credit.credited.swap(true, Ordering::Relaxed) {
+                candidates.productive(credit.producer);
+                for peer in peers
                     .values_mut()
-                    .filter(|peer| peer.addr == *producer)
+                    .filter(|peer| peer.addr == credit.producer)
                 {
                     peer.produced_output = true;
                 }
+                if info.sig_len > 0
+                    && ace_wire::live_auth::signature_len_from_pubkey_der(&info.source_pubkey)
+                        == Some(info.sig_len)
+                {
+                    seed.warm_peers
+                        .record_productive(info.infohash, credit.producer, credit.kind);
+                }
             }
         }
-        if made_output
-            && self.info.sig_len > 0
-            && ace_wire::live_auth::signature_len_from_pubkey_der(&self.info.source_pubkey)
-                == Some(self.info.sig_len)
+        if !continuity.authenticated_logged
+            && info.sig_len > 0
+            && ace_wire::live_auth::signature_len_from_pubkey_der(&info.source_pubkey)
+                == Some(info.sig_len)
         {
-            for producer in productive {
-                self.seed.warm_peers.record_productive(
-                    self.info.infohash,
-                    producer,
-                    self.candidates.kind(producer),
-                );
+            continuity.authenticated_logged = true;
+            crate::alog!("[ace] discovery stage=authenticated-contiguous");
+        }
+        if continuity.emitted == 0 {
+            crate::alog!("[ace] discovery stage=first-source-output");
+        }
+        continuity.first_output = FirstOutput::Done;
+        continuity.emitted += len;
+        if continuity.emitted >= continuity.next_log {
+            crate::alog!(
+                "[ace] served {} MiB (head={}, next piece needed={})",
+                continuity.emitted >> 20,
+                continuity.head,
+                continuity.reasm.next_needed()
+            );
+            continuity.next_log = continuity.emitted + (4 << 20);
+        }
+        downloaded.fetch_add(len, Ordering::Relaxed);
+        continuity.last_progress = continuity.output_clock.now(Instant::now());
+        continuity.next_needed_since = continuity.output_clock.now(Instant::now());
+    }
+    if continuity.pending_output.is_empty() && continuity.reasm.ready_chunks().next().is_none() {
+        continuity.output_ceiling = None;
+        continuity.output_clock.end(Instant::now());
+    }
+    None
+}
+
+/// Drain only already accepted work, before discovery or any resume mutation.
+pub(in crate::live_session) async fn drain_retained(
+    c: &mut Continuity,
+    candidates: &mut SessionCandidates,
+    info: &StreamInfo,
+    seed: &SeedConfig,
+    store: &Arc<tokio::sync::Mutex<PieceStore>>,
+    downloaded: &Arc<AtomicU64>,
+    tx: &mpsc::Sender<LiveOutput>,
+) -> bool {
+    let mut reservation = None;
+    let mut publication = None;
+    let mut peers = BTreeMap::new();
+    while c.has_delivery_work() {
+        if tx.is_closed() {
+            return false;
+        }
+        if c.startup_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            c.startup_deadline = None;
+        }
+        c.output_budget(Instant::now());
+        c.advance_stats(seed.metrics.is_some(), info.metadata.bitrate);
+        publish_live_stats(c, seed.metrics.as_ref(), info);
+        publication::start_operation(&mut publication, c, store);
+        if reservation.is_none() && c.output_demand() {
+            c.output_ceiling.get_or_insert(
+                c.reasm
+                    .next_needed()
+                    .saturating_add(c.live_recovery.max_reasm_pieces_ahead),
+            );
+            c.output_clock.begin(Instant::now());
+            reservation = Some(Box::pin(tx.clone().reserve_owned()) as OutputReservation);
+        }
+        let corroboration = c.startup_deadline;
+        let stats_pending = c.stats_pending(seed.metrics.is_some());
+        tokio::select! {
+            _ = tx.closed() => return false,
+            _ = tokio::task::yield_now(), if stats_pending => {},
+            _ = async {
+                if let Some(deadline) = corroboration {
+                    tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+                } else { std::future::pending::<()>().await; }
+            } => {},
+            result = std::future::poll_fn(|cx| {
+                if publication::poll_operation(&mut publication, c, store, cx) {
+                    return std::task::Poll::Ready(None);
+                }
+                match poll_output(&mut reservation, cx) {
+                    Some(result) => std::task::Poll::Ready(Some(result)),
+                    None => std::task::Poll::Pending,
+                }
+            }) => {
+                if let Some(result) = result {
+                    if finish_output_step(c, candidates, &mut peers, info, seed, downloaded, tx, result).is_some() { return false; }
+                }
             }
         }
-
-        if made_output {
-            self.last_progress = Instant::now();
-            self.continuity.next_needed_since = Instant::now();
-        }
-        PieceOutcome::Progress {
-            activity: false,
-            output: made_output,
-        }
+        tokio::task::yield_now().await;
     }
+    true
 }

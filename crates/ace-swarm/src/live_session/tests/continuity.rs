@@ -399,7 +399,7 @@ fn timed_out_requests_returns_only_aged_pieces_and_prunes_passed_ones() {
         PREFETCH_PIECES,
         LiveRecoveryConfig::default(),
     ); // next_needed = 7
-    let base = Instant::now();
+    let base = EffectiveInstant(Instant::now());
     c.requested_at.insert(4, base); // below cursor -> pruned, not returned
     c.requested_at.insert(8, base); // aged
     let request_timeout = default_live_recovery().request_timeout();
@@ -879,8 +879,11 @@ fn publication_batch_freezes_all_cursor_paths_and_bounds_duplicate_metadata() {
     let addr = SocketAddrV4::new([127, 0, 0, 1].into(), 1);
     for head in 100..1000 {
         c.head = head;
-        assert_eq!(c.skip_far_behind_live(Instant::now()), None);
-        assert_eq!(c.skip_evicted_gap(Instant::now()), None);
+        assert_eq!(
+            c.skip_far_behind_live(c.output_clock.now(Instant::now())),
+            None
+        );
+        assert_eq!(c.skip_evicted_gap(c.output_clock.now(Instant::now())), None);
         assert_eq!(c.resume(addr, head, head), start);
         assert_eq!(c.request_floor.load(Ordering::Relaxed), floor);
         let duplicate = c
@@ -902,5 +905,71 @@ fn publication_batch_freezes_all_cursor_paths_and_bounds_duplicate_metadata() {
     );
     assert!(c.publication.is_empty());
     assert_eq!(c.reasm.next_needed(), start + 16);
-    assert!(c.skip_far_behind_live(Instant::now()).is_some());
+    assert!(c
+        .skip_far_behind_live(c.output_clock.now(Instant::now()))
+        .is_some());
+}
+
+#[test]
+fn output_partition_preserves_bytes_and_marker_offsets_with_loss_and_common_suffix() {
+    fn packet(counter: u8) -> Vec<u8> {
+        let mut p = vec![0x55; 188];
+        p[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | (counter & 15)]);
+        p
+    }
+    fn run(parts: &[&[u8]], suffix: &[u8]) -> (Vec<u8>, Vec<usize>) {
+        let (mut c, _) = Continuity::fresh(
+            &info(),
+            0,
+            0,
+            PREFETCH_PIECES,
+            LiveRecoveryConfig::default(),
+        );
+        c.output_gate = ace_media::mpegts::KeyframeGate::with_max_scan_packets(3);
+        let mut bytes = Vec::new();
+        let mut markers = Vec::new();
+        for part in parts.iter().copied().chain(std::iter::once(suffix)) {
+            for segment in c.resync_output(part) {
+                if segment.discontinuity {
+                    markers.push(bytes.len());
+                }
+                c.emitted += segment.bytes.len() as u64;
+                bytes.extend_from_slice(&segment.bytes);
+            }
+        }
+        (bytes, markers)
+    }
+    let mut input: Vec<u8> = (0..6).flat_map(packet).collect();
+    input.extend(vec![0x22; 803]);
+    input.extend((6..14).flat_map(packet));
+    input.extend(vec![0x33; 417]);
+    input.extend((14..21).flat_map(packet));
+    let suffix: Vec<u8> = (21..29).flat_map(packet).collect();
+    let expected = run(&[&input], &suffix);
+    assert!(!expected.0.is_empty());
+    assert_eq!(expected.1.len(), 2);
+    for split in 0..=input.len() {
+        let actual = run(&[&input[..split], &input[split..]], &suffix);
+        assert_eq!(actual, expected, "partition at byte {split}");
+    }
+    let parts: Vec<_> = input.chunks(1).collect();
+    assert_eq!(run(&parts, &suffix), expected, "one-byte pieces");
+}
+
+#[test]
+fn retained_output_resume_preserves_request_age() {
+    let (mut c, _) = Continuity::fresh(
+        &info(),
+        10,
+        20,
+        PREFETCH_PIECES,
+        LiveRecoveryConfig::default(),
+    );
+    let before = EffectiveInstant(Instant::now() - Duration::from_secs(2));
+    c.requested_at.insert(c.reasm.next_needed(), before);
+    c.next_needed_since = before;
+    c.output_ceiling = Some(100);
+    c.resume("127.0.0.1:1234".parse().unwrap(), 30, 40);
+    assert_eq!(c.requested_at.get(&c.reasm.next_needed()), Some(&before));
+    assert_eq!(c.next_needed_since, before);
 }

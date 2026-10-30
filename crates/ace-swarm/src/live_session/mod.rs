@@ -1,5 +1,7 @@
 //! Production live follower: [`follow_live`] accepts [`LiveSessionInputs`] and emits
 //! authenticated, contiguous media as [`LiveOutput`], including discontinuity markers.
+mod output_clock;
+use output_clock::{EffectiveInstant, FirstOutput, OutputBudget, OutputBudgetClock};
 mod observation;
 mod options;
 
@@ -161,15 +163,15 @@ use pool_support::*;
 use pool_support::{
     advance_pool_requests, drop_peer_runtime, finish_candidate_connect, harvest_stale_gossip,
     observe_live_window, publish_live_stats, retransmit_stalled_requests, shutdown_peer_runtimes,
-    spawn_candidate_connects, take_ready_with_stats,
+    spawn_candidate_connects,
 };
 mod support;
 #[cfg(test)]
-use support::{advance_head_from_window, schedule_piece_assignments, stale_upstream_budget};
 use support::{
-    hex_preview, pool_progress_budget, read_peer_window, read_window_max,
-    should_refresh_stale_deadline,
+    advance_head_from_window, pool_progress_budget, schedule_piece_assignments,
+    stale_upstream_budget,
 };
+use support::{hex_preview, read_peer_window, read_window_max, should_refresh_stale_deadline};
 
 mod reconnect;
 use reconnect::{CandidateKind, SessionCandidates};
@@ -357,6 +359,21 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
         if tx.is_closed() {
             return;
         }
+        if let Some(c) = &mut continuity {
+            if !pool::actor::drain_retained(
+                c,
+                &mut candidates,
+                &info,
+                &seed,
+                &store,
+                &downloaded,
+                &tx,
+            )
+            .await
+            {
+                return;
+            }
+        }
         drain_discovery(&mut rediscovery, &mut candidates);
         let ready = candidates.eligible(Instant::now());
         let (sources, pex) = candidates.learned_counts();
@@ -387,7 +404,13 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
             }
             if !stale.is_empty() {
                 for upstream in &stale {
-                    crate::alog!("[ace] {}: stale advertised window min={} max={} cannot cover next needed piece {}; harvesting gossip only",upstream.addr,upstream.window.min_piece,upstream.window.max_piece,c.reasm.next_needed());
+                    crate::alog!(
+                        "[ace] {}: stale advertised window min={} max={} cannot cover next needed piece {}; harvesting gossip only",
+                        upstream.addr,
+                        upstream.window.min_piece,
+                        upstream.window.max_piece,
+                        c.reasm.next_needed()
+                    );
                     candidates.explored(upstream.addr);
                     candidates.failed(upstream.addr, Instant::now());
                 }
@@ -491,14 +514,22 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost(lost) => {
                 peer_count.store(0, Ordering::Relaxed);
-                crate::alog!("[ace] rebuilding upstream pool: reason=PeerLost lost={lost} learned_source={} learned_pex={}",candidates.learned_counts().0,candidates.learned_counts().1);
+                crate::alog!(
+                    "[ace] rebuilding upstream pool: reason=PeerLost lost={lost} learned_source={} learned_pex={}",
+                    candidates.learned_counts().0,
+                    candidates.learned_counts().1
+                );
             }
             FollowEnd::PoolStale { stalled, lost } => {
                 peer_count.store(0, Ordering::Relaxed);
                 for addr in stalled {
                     candidates.failed(addr, Instant::now());
                 }
-                crate::alog!("[ace] rebuilding upstream pool: reason=PoolStale lost={lost} learned_source={} learned_pex={}",candidates.learned_counts().0,candidates.learned_counts().1);
+                crate::alog!(
+                    "[ace] rebuilding upstream pool: reason=PoolStale lost={lost} learned_source={} learned_pex={}",
+                    candidates.learned_counts().0,
+                    candidates.learned_counts().1
+                );
             }
         }
     }
@@ -536,6 +567,15 @@ enum PublicationStatus {
     Terminal(Result<crate::store::CompletePut, ()>),
 }
 pub(super) struct Continuity {
+    pending_output: std::collections::VecDeque<LiveOutput>,
+    pending_credit: std::collections::VecDeque<Vec<Arc<OutputCredit>>>,
+    resync_credit: Vec<(std::ops::Range<usize>, Arc<OutputCredit>)>,
+    resync_tail: usize,
+    output_ceiling: Option<u64>,
+    output_clock: OutputBudgetClock,
+    first_output: FirstOutput,
+    last_progress: EffectiveInstant,
+    stats_scan: pool_support::BufferScan,
     publication: BTreeMap<u64, PublicationStatus>,
     observer: Option<Arc<dyn LiveObserver>>,
     has_admitted_pool: bool,
@@ -556,11 +596,11 @@ pub(super) struct Continuity {
     pub(super) contribution_observer: Option<mpsc::UnboundedSender<(u64, SocketAddrV4)>>,
     /// When each still-outstanding piece was (re-)requested — drives per-piece retransmission
     /// independent of the whole-pool stale timer.
-    pub(super) requested_at: HashMap<u64, Instant>,
+    requested_at: HashMap<u64, EffectiveInstant>,
     /// When the playback cursor (`reasm.next_needed()`) last advanced. If it stays put past the
     /// configured request timeout and no upstream window still covers it, the piece was evicted
     /// and we skip forward rather than freeze.
-    pub(super) next_needed_since: Instant,
+    next_needed_since: EffectiveInstant,
     pub(super) head: u64,
     /// Only a fresh lone-window pool delays media; reconnect continuity stays authoritative.
     startup_deadline: Option<Instant>,
@@ -571,6 +611,12 @@ pub(super) struct Continuity {
     pub(super) emitted: u64,
     next_log: u64,
     authenticated_logged: bool,
+}
+
+pub(super) struct OutputCredit {
+    producer: SocketAddrV4,
+    kind: CandidateKind,
+    credited: std::sync::atomic::AtomicBool,
 }
 
 pub(super) struct TransportRecovery {
@@ -589,6 +635,8 @@ pub(super) enum PoolRefill {
 type CandidateConnectCompletion = (SocketAddrV4, Option<PeerConnectFailure>, bool);
 
 enum PoolWake {
+    Output(Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>),
+    Stats,
     Activation(Result<ConnectedUpstream, SocketAddrV4>),
     Reciprocal(Option<(u64, Option<crate::seed::protocol::PreparedReply>)>),
     Publication,
@@ -691,6 +739,7 @@ impl LiveObserver for TestObserver {
             p.live_first = None;
             p.live_last = None;
             p.buffer_pieces = 0;
+            p.buffer_complete = false;
         }
         position.1 = 0;
     }

@@ -1,5 +1,5 @@
 mod activation;
-mod actor;
+pub(super) mod actor;
 use super::*;
 use crate::seed::protocol::{prepare_reply, ServeProfile};
 use actor::PoolActor;
@@ -343,19 +343,18 @@ pub(super) async fn follow_peer_pool_with_discovery(
         let newly_lost = advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
         record_pool_losses(candidates, &mut loss_count, newly_lost);
     }
-    if peers.is_empty() {
+    if peers.is_empty() && !continuity.has_delivery_work() {
         return FollowEnd::PeerLost(loss_count);
     }
     peer_count.store(peers.len() as u32, Ordering::Relaxed);
 
     // One opportunity per pool after activation/scheduling and corroboration release.
-    let first_output_deadline = None;
-    let last_progress = Instant::now();
     let refill_closed = false;
     let observed_capacity = (peers.len(), learned_pending.len());
     let observed_retry = Instant::now();
     let closed_peer_events = BTreeMap::new();
     PoolActor {
+        output_reservation: None,
         activation: None,
         reciprocal: Default::default(),
         publication: None,
@@ -364,8 +363,6 @@ pub(super) async fn follow_peer_pool_with_discovery(
         observed_retry,
         observed_capacity,
         refill_closed,
-        last_progress,
-        first_output_deadline,
         next_peer_id,
         loss_count,
         peers,

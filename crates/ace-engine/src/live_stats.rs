@@ -149,6 +149,7 @@ impl ace_swarm::live_session::LiveObserver for LiveMetrics {
                 live_first: position.live_first,
                 live_last: position.live_last,
                 buffer_pieces: position.buffer_pieces,
+                buffer_complete: position.buffer_complete,
             }),
             buffer_ms,
         );
@@ -160,6 +161,7 @@ impl ace_swarm::live_session::LiveObserver for LiveMetrics {
             position.live_first = None;
             position.live_last = None;
             position.buffer_pieces = 0;
+            position.buffer_complete = false;
         }
         measured.buffer_ms = 0;
         measured.recovery.active_upstreams = 0;
@@ -238,6 +240,7 @@ mod tests {
             live_first: Some(29),
             live_last: Some(31),
             buffer_pieces: 37,
+            buffer_complete: true,
         };
         LiveObserver::publish_position(metrics.as_ref(), Some(position), 41);
         for event in [
@@ -267,6 +270,7 @@ mod tests {
         assert_eq!(snapshot.peers_served, 5);
         assert_eq!(snapshot.buffer_ms, 41);
         let position = snapshot.livepos.unwrap();
+        assert!(position.buffer_complete);
         assert_eq!(
             (
                 position.pos,
@@ -290,6 +294,7 @@ mod tests {
             })
         );
         let position = snapshot.livepos.unwrap();
+        assert!(!position.buffer_complete);
         assert_eq!((position.pos, position.last), (Some(19), Some(23)));
         assert_eq!(
             (

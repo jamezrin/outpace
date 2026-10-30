@@ -200,6 +200,10 @@ pub struct TsResyncBoundary {
 }
 
 pub struct TsResyncOutput {
+    /// Selected original ranges in the previous retained tail followed by this input.
+    pub selected: Vec<std::ops::Range<usize>>,
+    /// Prefix removed from that combined input, including discarded bytes.
+    pub consumed: usize,
     pub bytes: Vec<u8>,
     pub discarded_bytes: usize,
     pub boundaries: Vec<TsResyncBoundary>,
@@ -229,6 +233,7 @@ impl TsResync {
         self.buf.extend_from_slice(data);
         let n = self.buf.len();
         let mut out = Vec::new();
+        let mut selected: Vec<std::ops::Range<usize>> = Vec::new();
         let mut discarded_bytes = 0;
         let mut boundaries: Vec<TsResyncBoundary> = Vec::new();
         let mut report_loss = |offset, count| {
@@ -245,6 +250,11 @@ impl TsResync {
         let mut i = 0;
         while i + 2 * TS_PACKET_LEN <= n {
             if self.buf[i] == TS_SYNC && (self.locked || self.buf[i + TS_PACKET_LEN] == TS_SYNC) {
+                if let Some(last) = selected.last_mut().filter(|last| last.end == i) {
+                    last.end += TS_PACKET_LEN;
+                } else {
+                    selected.push(i..i + TS_PACKET_LEN);
+                }
                 out.extend_from_slice(&self.buf[i..i + TS_PACKET_LEN]);
                 self.locked = true;
                 self.acquired_sync = true;
@@ -273,6 +283,7 @@ impl TsResync {
         // past the sync lookahead, everything before the last `MAX_UNSYNCED_TAIL` bytes has
         // already been scan-rejected (its `+TS_PACKET_LEN` neighbor is present) and can never
         // re-lock, so drop it. Bounds memory against a non-TS junk flood (#14).
+        let mut consumed = i;
         if self.buf.len() > MAX_UNSYNCED_TAIL {
             let excess = self.buf.len() - MAX_UNSYNCED_TAIL;
             if self.acquired_sync {
@@ -280,8 +291,11 @@ impl TsResync {
             }
             self.locked = false;
             self.buf.drain(0..excess);
+            consumed += excess;
         }
         TsResyncOutput {
+            selected,
+            consumed,
             bytes: out,
             discarded_bytes,
             boundaries,
@@ -429,6 +443,8 @@ pub enum GateResume {
 }
 
 pub struct KeyframeGateOutput {
+    /// Original packet ranges forwarded by this call; generated tables/markers excluded.
+    pub forwarded: Vec<std::ops::Range<usize>>,
     pub bytes: Vec<u8>,
     /// Input bytes actually withheld, excluding the resumed packet and inserted tables/marker.
     pub withheld_bytes: usize,
@@ -526,6 +542,7 @@ impl KeyframeGate {
     pub fn push_report(&mut self, data: &[u8]) -> KeyframeGateOutput {
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
+        let mut forwarded: Vec<std::ops::Range<usize>> = Vec::new();
         let mut withheld_bytes = 0;
         let mut resumed = None;
         let mut i = 0;
@@ -546,6 +563,11 @@ impl KeyframeGate {
                 let access_point = self.access.observe(pkt);
                 if self.filter_sdt && access_point {
                     append_gate_tables(&self.access, &mut self.next_sdt_counter, &mut out);
+                }
+                if let Some(last) = forwarded.last_mut().filter(|last| last.end == i) {
+                    last.end += TS_PACKET_LEN;
+                } else {
+                    forwarded.push(i..i + TS_PACKET_LEN);
                 }
                 out.extend_from_slice(pkt);
                 i += TS_PACKET_LEN;
@@ -574,11 +596,19 @@ impl KeyframeGate {
             } else {
                 withheld_bytes += TS_PACKET_LEN;
             }
+            if self.locked {
+                if let Some(last) = forwarded.last_mut().filter(|last| last.end == i) {
+                    last.end += TS_PACKET_LEN;
+                } else {
+                    forwarded.push(i..i + TS_PACKET_LEN);
+                }
+            }
             // otherwise: drop this prefix packet and keep scanning.
             i += TS_PACKET_LEN;
         }
         self.buf.drain(0..i);
         KeyframeGateOutput {
+            forwarded,
             bytes: out,
             withheld_bytes,
             resumed,
@@ -2998,5 +3028,117 @@ mod tests {
             "must re-lock on the aligned run after junk"
         );
         assert!(packet_count(&out) >= 3, "should emit the recovered packets");
+    }
+
+    // Supplemental parser-loop provenance proofs, independent of actor scheduling.
+    mod output_parser_proof {
+        use super::*;
+
+        fn fixture() -> Vec<u8> {
+            [
+                pat(0x100),
+                pmt(0x100, 0x101),
+                upstream_sdt(),
+                ts(0x101, true, false, &pes_nal(&[0x67, 1, 2])),
+                ts(0x101, true, false, &pes_nal(&[0x65, 3, 4])),
+                ts(0x101, false, false, &[8; 30]),
+                ts(0x101, true, true, &pes_nal(&[0x65, 5])),
+            ]
+            .concat()
+        }
+
+        #[test]
+        fn selected_ranges_reconstruct_actual_resync_output() {
+            let run = fixture();
+            let input = [
+                vec![0x23; 19],
+                run.clone(),
+                vec![0x23; 801],
+                run.clone(),
+                vec![0x24; 397],
+                run.clone(),
+                vec![0x25; 401],
+            ]
+            .concat();
+            let mut cuts = vec![0, input.len()];
+            for base in (0..input.len()).step_by(188) {
+                for delta in [0, 1, 3, 4, 5, 13, 187] {
+                    if base + delta < input.len() {
+                        cuts.push(base + delta);
+                    }
+                }
+            }
+            for split in cuts {
+                let mut parser = TsResync::new();
+                let mut retained = Vec::new();
+                for part in [&input[..split], &input[split..], run.as_slice()] {
+                    retained.extend_from_slice(part);
+                    let report = parser.push_report(part);
+                    let mut last = 0;
+                    let mut selected = Vec::new();
+                    for range in report.selected {
+                        assert!(last <= range.start && range.start < range.end);
+                        assert!(range.end <= report.consumed && range.end <= retained.len());
+                        assert_eq!(range.len() % 188, 0);
+                        selected.extend_from_slice(&retained[range.clone()]);
+                        last = range.end;
+                    }
+                    assert_eq!(selected, report.bytes, "split={split}");
+                    retained.drain(..report.consumed);
+                    assert_eq!(retained, parser.buf);
+                    assert!(retained.len() <= MAX_UNSYNCED_TAIL);
+                }
+            }
+        }
+
+        fn gated(parts: &[&[u8]]) -> Vec<u8> {
+            let mut gate = KeyframeGate::with_service_name(Some("Synthetic proof".into()));
+            let mut out = Vec::new();
+            for part in parts {
+                let mut combined = gate.buf.clone();
+                combined.extend_from_slice(part);
+                let report = gate.push_report(part);
+                let mut last = 0;
+                let mut cursor = 0;
+                for range in report.forwarded {
+                    assert!(last <= range.start && range.start < range.end);
+                    assert!(range.end <= combined.len());
+                    assert_eq!(range.start % 188, 0);
+                    assert_eq!(range.len() % 188, 0);
+                    for packet in combined[range.clone()].as_chunks::<188>().0 {
+                        // Forwarded original packets occur unchanged and in order;
+                        // generated cached tables/SDT may lie between them.
+                        let at = report.bytes[cursor..]
+                            .windows(188)
+                            .position(|p| p == packet)
+                            .expect("forwarded packet absent");
+                        cursor += at + 188;
+                    }
+                    last = range.end;
+                }
+                out.extend(report.bytes);
+            }
+            out
+        }
+
+        #[test]
+        fn titled_gate_partition_bytes_and_forwarded_ranges() {
+            let input = [fixture(), fixture(), ts(0x101, false, false, &[9; 23])].concat();
+            let suffix = fixture();
+            let baseline = gated(&[&input, &suffix]);
+            assert!(!baseline.is_empty());
+            for base in (0..input.len()).step_by(188) {
+                for delta in [0, 1, 3, 4, 5, 6, 9, 13, 14, 15, 16, 187] {
+                    let split = base + delta;
+                    if split <= input.len() {
+                        assert_eq!(
+                            gated(&[&input[..split], &input[split..], &suffix]),
+                            baseline,
+                            "split={split}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

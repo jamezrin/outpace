@@ -33,6 +33,53 @@ pub(super) fn prefetch_start(min_piece: u64, max_piece: u64, prefetch: u64) -> u
 }
 
 impl Continuity {
+    pub(super) fn advance_stats(&mut self, enabled: bool, bitrate: Option<u64>) -> (usize, usize) {
+        if enabled {
+            self.stats_scan.advance(&self.reasm, bitrate)
+        } else {
+            (0, 0)
+        }
+    }
+
+    pub(super) fn stats_pending(&self, enabled: bool) -> bool {
+        enabled && self.stats_scan.pending()
+    }
+
+    pub(super) fn invalidate_stats(&mut self) {
+        self.stats_scan = pool_support::BufferScan::new();
+        if let Some(observer) = &self.observer {
+            let bounds = self.active_peers.coverage_bounds();
+            observer.publish_position(
+                Some(LivePosition {
+                    pos: Some(self.reasm.next_needed()),
+                    last: Some(self.head),
+                    live_first: bounds.map(|b| b.0),
+                    live_last: bounds.map(|b| b.1),
+                    buffer_pieces: 0,
+                    buffer_complete: false,
+                }),
+                0,
+            );
+        }
+    }
+
+    pub(super) fn playback_hold(&self) -> bool {
+        self.output_ceiling.is_some() || self.publication_hold()
+    }
+
+    pub(super) fn has_delivery_work(&self) -> bool {
+        self.output_ceiling.is_some()
+            || !self.pending_output.is_empty()
+            || self.reasm.ready_chunks().next().is_some()
+    }
+
+    pub(super) fn output_demand(&self) -> bool {
+        !self.pending_output.is_empty()
+            || (self.startup_deadline.is_none()
+                && !self.publication_hold()
+                && self.reasm.ready_chunks().next().is_some())
+    }
+
     pub(super) fn publication_hold(&self) -> bool {
         self.publication.values().any(|status| match status {
             PublicationStatus::Needed => true,
@@ -73,8 +120,19 @@ impl Continuity {
             .with_piece_trailer(info.sig_len as u64)
             .with_source_pubkey(info.source_pubkey.clone())
             .with_max_pieces_ahead(live_recovery.max_reasm_pieces_ahead);
+        let now = Instant::now();
+        let output_clock = OutputBudgetClock::new(now);
         (
             Continuity {
+                pending_output: Default::default(),
+                pending_credit: Default::default(),
+                resync_credit: Vec::new(),
+                resync_tail: 0,
+                output_ceiling: None,
+                last_progress: output_clock.now(now),
+                first_output: FirstOutput::AwaitCorroboration,
+                output_clock,
+                stats_scan: pool_support::BufferScan::new(),
                 publication: BTreeMap::new(),
                 observer: None,
                 has_admitted_pool: false,
@@ -93,7 +151,7 @@ impl Continuity {
                 #[cfg(test)]
                 contribution_observer: None,
                 requested_at: HashMap::new(),
-                next_needed_since: Instant::now(),
+                next_needed_since: EffectiveInstant(now),
                 head: max_piece,
                 startup_deadline: None,
                 request_floor: Arc::new(AtomicU64::new(start)),
@@ -118,10 +176,12 @@ impl Continuity {
         self.active_peers = ActivePeers::new();
         self.received_chunks.clear();
         // Retained partial and authenticated ahead pieces keep their producer evidence.
-        self.requested_at.clear();
-        self.next_needed_since = Instant::now();
+        if !self.has_delivery_work() {
+            self.requested_at.clear();
+            self.next_needed_since = self.output_clock.now(Instant::now());
+        }
         let next = self.reasm.next_needed();
-        let resume = if self.publication_hold() {
+        let resume = if self.playback_hold() {
             next
         } else {
             next.max(min_piece)
@@ -133,6 +193,7 @@ impl Continuity {
             );
             self.recovery_event(RecoveryEvent::SkippedEvictedGap);
             self.reasm.skip_to(resume);
+            self.invalidate_stats();
             self.publication.retain(|&piece, _| piece >= resume);
             self.arm_output_gate();
         }
@@ -181,7 +242,7 @@ impl Continuity {
 
     /// Pieces still outstanding past the configured request timeout — candidates to re-request.
     /// Also prunes timer bookkeeping for pieces the cursor has already advanced past.
-    pub(super) fn timed_out_requests(&mut self, now: Instant) -> Vec<u64> {
+    pub(super) fn timed_out_requests(&mut self, now: EffectiveInstant) -> Vec<u64> {
         let next = self.reasm.next_needed();
         self.requested_at.retain(|&p, _| p >= next);
         self.requested_at
@@ -195,8 +256,8 @@ impl Continuity {
     /// upstream can still serve (evicted from every window), skip forward to the lowest piece some peer
     /// does have. Returns the skip target if it skipped. This is the mid-session analogue of
     /// [`resume`](Self::resume)'s reconnect-gap skip — recovering without a full teardown.
-    pub(super) fn skip_evicted_gap(&mut self, now: Instant) -> Option<u64> {
-        if self.publication_hold() {
+    pub(super) fn skip_evicted_gap(&mut self, now: EffectiveInstant) -> Option<u64> {
+        if self.playback_hold() {
             return None;
         }
         let next = self.reasm.next_needed();
@@ -211,6 +272,7 @@ impl Continuity {
         }
         self.recovery_event(RecoveryEvent::SkippedEvictedGap);
         self.reasm.skip_to(floor);
+        self.invalidate_stats();
         self.publication.retain(|&piece, _| piece >= floor);
         self.arm_output_gate();
         self.active_peers.prune_below(floor);
@@ -226,8 +288,8 @@ impl Continuity {
     /// a newly learned head outruns the cursor. Once output exists, a forward skip uses
     /// the same fresh discontinuity gate as an unknown whole-piece loss (issue #169).
     /// Provisional startup positioning has no previously published stream to interrupt.
-    pub(super) fn skip_far_behind_live(&mut self, now: Instant) -> Option<u64> {
-        if self.publication_hold() {
+    pub(super) fn skip_far_behind_live(&mut self, now: EffectiveInstant) -> Option<u64> {
+        if self.playback_hold() {
             return None;
         }
         self.request_floor
@@ -238,12 +300,15 @@ impl Continuity {
         }
         let target = self.head.saturating_sub(self.prefetch);
         self.reasm.skip_to(target);
+        self.invalidate_stats();
         self.publication.retain(|&piece, _| piece >= target);
         if self.emitted > 0 {
             self.arm_output_gate();
         } else {
             // No published stream exists to mark discontinuous at provisional startup.
             self.resync = ace_media::mpegts::TsResync::new();
+            self.resync_credit.clear();
+            self.resync_tail = 0;
         }
         self.active_peers.prune_below(target);
         self.requested_at.retain(|&p, _| p >= target);
@@ -265,10 +330,16 @@ impl Continuity {
         }
         self.output_gate = ace_media::mpegts::KeyframeGate::new();
         self.resync = ace_media::mpegts::TsResync::new();
+        self.resync_credit.clear();
+        self.resync_tail = 0;
         self.discontinuity_pending = true;
     }
 
-    fn filter_output_after_discontinuity(&mut self, aligned: &[u8]) -> Option<LiveOutput> {
+    fn filter_output_after_discontinuity(
+        &mut self,
+        aligned: &[u8],
+        spans: &[(std::ops::Range<usize>, Arc<OutputCredit>)],
+    ) -> Option<LiveOutput> {
         let output = self.output_gate.push_report(aligned);
         if let Some(recovery) = &mut self.transport_recovery {
             recovery.withheld_bytes += output.withheld_bytes;
@@ -284,21 +355,83 @@ impl Continuity {
                 );
             }
         }
+        if !output.bytes.is_empty() {
+            let mut credits = Vec::new();
+            let mut at = 0;
+            for range in &output.forwarded {
+                while at < spans.len() && spans[at].0.end <= range.start {
+                    at += 1;
+                }
+                let mut j = at;
+                while j < spans.len() && spans[j].0.start < range.end {
+                    if !credits.iter().any(|old| Arc::ptr_eq(old, &spans[j].1)) {
+                        credits.push(spans[j].1.clone());
+                    }
+                    j += 1;
+                }
+            }
+            self.pending_credit.push_back(credits);
+        }
         (!output.bytes.is_empty()).then(|| LiveOutput {
             bytes: Bytes::from(output.bytes),
             discontinuity: self.take_discontinuity(),
         })
     }
 
+    #[cfg(test)]
     pub(super) fn resync_output(&mut self, bytes: &[u8]) -> Vec<LiveOutput> {
+        let output = self.resync_output_credited(bytes, None);
+        self.pending_credit.clear();
+        output
+    }
+
+    pub(super) fn resync_output_credited(
+        &mut self,
+        bytes: &[u8],
+        credit: Option<Arc<OutputCredit>>,
+    ) -> Vec<LiveOutput> {
+        if let Some(credit) = credit.filter(|_| !bytes.is_empty()) {
+            self.resync_credit
+                .push((self.resync_tail..self.resync_tail + bytes.len(), credit));
+        }
+        let total = self.resync_tail + bytes.len();
         let output = self.resync.push_report(bytes);
+        let mut spans = Vec::new();
+        let mut at = 0;
+        let mut offset = 0;
+        for range in &output.selected {
+            while at < self.resync_credit.len() && self.resync_credit[at].0.end <= range.start {
+                at += 1;
+            }
+            let mut j = at;
+            while j < self.resync_credit.len() && self.resync_credit[j].0.start < range.end {
+                let (source, credit) = &self.resync_credit[j];
+                let start = source.start.max(range.start);
+                let end = source.end.min(range.end);
+                spans.push((
+                    offset + start - range.start..offset + end - range.start,
+                    credit.clone(),
+                ));
+                j += 1;
+            }
+            offset += range.len();
+        }
+        self.resync_credit.retain_mut(|(range, _)| {
+            if range.end <= output.consumed {
+                return false;
+            }
+            *range = range.start.saturating_sub(output.consumed)..range.end - output.consumed;
+            true
+        });
+        self.resync_tail = total - output.consumed;
         let mut chunks = Vec::new();
         let mut start = 0;
         let mut emitted = self.emitted;
         for boundary in output.boundaries {
-            if let Some(prefix) =
-                self.filter_output_after_discontinuity(&output.bytes[start..boundary.output_offset])
-            {
+            if let Some(prefix) = self.filter_output_after_discontinuity(
+                &output.bytes[start..boundary.output_offset],
+                &slice_credit(&spans, start..boundary.output_offset),
+            ) {
                 emitted += prefix.bytes.len() as u64;
                 chunks.push(prefix);
             }
@@ -322,7 +455,10 @@ impl Continuity {
             self.discontinuity_pending = true;
             start = boundary.output_offset;
         }
-        if let Some(suffix) = self.filter_output_after_discontinuity(&output.bytes[start..]) {
+        if let Some(suffix) = self.filter_output_after_discontinuity(
+            &output.bytes[start..],
+            &slice_credit(&spans, start..output.bytes.len()),
+        ) {
             chunks.push(suffix);
         }
         chunks
@@ -353,4 +489,20 @@ impl Continuity {
     pub(super) fn update_peer_window(&mut self, id: u64, min_piece: u64, max_piece: u64) {
         self.active_peers.update_window(id, min_piece, max_piece);
     }
+}
+
+fn slice_credit(
+    spans: &[(std::ops::Range<usize>, Arc<OutputCredit>)],
+    range: std::ops::Range<usize>,
+) -> Vec<(std::ops::Range<usize>, Arc<OutputCredit>)> {
+    let first = spans.partition_point(|(source, _)| source.end <= range.start);
+    let last = spans.partition_point(|(source, _)| source.start < range.end);
+    spans[first..last]
+        .iter()
+        .filter_map(|(source, credit)| {
+            let start = source.start.max(range.start);
+            let end = source.end.min(range.end);
+            (start < end).then(|| (start - range.start..end - range.start, credit.clone()))
+        })
+        .collect()
 }

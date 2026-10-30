@@ -45,6 +45,7 @@ pub struct LivePositionStats {
     pub live_first: Option<u64>,
     pub live_last: Option<u64>,
     pub buffer_pieces: u64,
+    pub buffer_complete: bool,
 }
 
 /// Independently readable; implementations must never lock the source across an await.

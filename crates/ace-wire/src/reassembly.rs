@@ -34,6 +34,12 @@ pub struct CompletedLivePiece<'a> {
     pub acceptance: LiveAcceptance,
 }
 
+/// One completed media piece, retaining its original allocation without its trailer.
+pub struct ReadyPiece {
+    pub index: u64,
+    pub bytes: Vec<u8>,
+}
+
 struct Complete {
     buf: Vec<u8>,
     live: Option<LiveMetadata>,
@@ -279,6 +285,12 @@ impl PieceReassembler {
         self.partial.remove(&index);
     }
 
+    /// Borrow exactly one immutable completed media payload without its trailer.
+    pub fn ready_piece(&self, index: u64) -> Option<&[u8]> {
+        let bytes = &self.complete.get(&index)?.buf;
+        Some(&bytes[..bytes.len().saturating_sub(self.piece_trailer as usize)])
+    }
+
     /// Observe consecutive complete payloads at the cursor without consuming them.
     pub fn ready_chunks(&self) -> impl Iterator<Item = &[u8]> {
         let mut next = self.next_emit;
@@ -286,6 +298,22 @@ impl PieceReassembler {
             let bytes = &self.complete.get(&next)?.buf;
             next = next.checked_add(1)?;
             Some(&bytes[..bytes.len().saturating_sub(self.piece_trailer as usize)])
+        })
+    }
+
+    /// Move only the next completed piece, stripping its trailer in place.
+    /// A trailer-only piece is still progress. If the cursor cannot advance, leave
+    /// the completed piece and its publication metadata untouched.
+    pub fn take_ready_piece(&mut self) -> Option<ReadyPiece> {
+        let index = self.next_emit;
+        let next = index.checked_add(1)?;
+        let mut done = self.complete.remove(&index)?;
+        done.buf
+            .truncate(done.buf.len().saturating_sub(self.piece_trailer as usize));
+        self.next_emit = next;
+        Some(ReadyPiece {
+            index,
+            bytes: done.buf,
         })
     }
 
@@ -326,6 +354,45 @@ impl PieceReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_piece_extraction_preserves_backlog_and_allocation() {
+        let mut r = PieceReassembler::new(4, 7).with_piece_trailer(1);
+        r.add_block(7, 0, b"abcS").unwrap();
+        r.add_block(8, 0, b"defS").unwrap();
+        let allocation = r.complete.get(&7).unwrap().buf.as_ptr();
+        let ReadyPiece { index, bytes } = r.take_ready_piece().unwrap();
+        assert_eq!(index, 7);
+        assert_eq!(bytes, b"abc", "only one piece may leave reassembly");
+        assert_eq!(bytes.as_ptr(), allocation, "move the authenticated buffer");
+        assert_eq!(r.next_needed(), 8);
+        assert!(r.complete.contains_key(&8));
+    }
+
+    #[test]
+    fn single_piece_extraction_gap_empty_and_endpoint_are_transactional() {
+        let mut r = PieceReassembler::new(1, 7).with_piece_trailer(1);
+        r.add_live_chunk(8, 0, 1, [0; 8], b"S").unwrap();
+        assert!(r.take_ready_piece().is_none());
+        assert_eq!(r.next_needed(), 7);
+        assert!(r.completed_live_piece(8).is_some());
+        r.add_live_chunk(7, 0, 1, [0; 8], b"S").unwrap();
+        let ready = r.take_ready_piece().unwrap();
+        assert_eq!(ready.index, 7);
+        assert!(ready.bytes.is_empty());
+        assert!(r.completed_live_piece(7).is_none());
+        assert!(r.completed_live_piece(8).is_some());
+        assert!(r.take_ready_piece().unwrap().bytes.is_empty());
+        assert!(r.take_ready_piece().is_none());
+
+        let mut r = PieceReassembler::new(1, u64::MAX - 1);
+        r.add_block(u64::MAX - 1, 0, b"x").unwrap();
+        assert_eq!(r.take_ready_piece().unwrap().index, u64::MAX - 1);
+        assert_eq!(r.next_needed(), u64::MAX);
+        assert!(r.add_block(u64::MAX, 0, b"y").is_err());
+        assert!(r.take_ready_piece().is_none());
+        assert_eq!(r.next_needed(), u64::MAX);
+    }
 
     #[test]
     fn contract_invalid_publication_geometry_preserves_generic_playback() {
