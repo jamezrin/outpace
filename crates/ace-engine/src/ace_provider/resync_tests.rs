@@ -1190,7 +1190,6 @@ async fn run_http_reconnect_case(
             let positions = probe_http_video_positions(&complete).await;
             let post = positions.iter().filter(|&&pos| pos >= boundary).count();
             assert!(post > 0, "actual HTTP body decodes video after reconnect");
-            eprintln!("HTTP recovery decode mode={mode:?} prefix_bytes={boundary} prefix_frames={} post_frames={post}", before.len());
         }
         drop(body);
         drop(raw);
