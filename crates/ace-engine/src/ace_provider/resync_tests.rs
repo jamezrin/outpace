@@ -269,6 +269,63 @@ fn http_live_position(min_piece: i64, max_piece: i64) -> ace_wire::extended::Liv
     }
 }
 
+// The owner must close this boundary before dropping body/session consumers.
+async fn owned_http_peer(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    peer: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        biased;
+        result = shutdown.wait_for(|stopping| *stopping) => {
+            result.expect("fixture shutdown owner must outlive peer tasks");
+        }
+        () = peer => {}
+    }
+}
+
+#[tokio::test]
+async fn http_peer_shutdown_cancels_queued_reply_but_preserves_active_failure() {
+    // A completion fence holds the same failing reply pending on either side of
+    // the ownership boundary. No socket timing or scheduler sleeps are required.
+    for shutting_down in [true, false] {
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(owned_http_peer(receiver, async move {
+            queued_tx.send(()).unwrap();
+            let reply: std::io::Result<()> = release_rx.await.unwrap();
+            reply.expect("queued fixture reply failed before owned shutdown");
+        }));
+        tokio::time::timeout(Duration::from_secs(3), queued_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        if shutting_down {
+            shutdown.send(true).unwrap();
+        }
+        let delivered = release_tx.send(Err(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        if !shutting_down {
+            assert!(delivered.is_ok(), "active peer still owns its queued reply");
+        }
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("fixture task must join naturally");
+        if shutting_down {
+            assert!(
+                result.is_ok(),
+                "owned shutdown must cancel queued reply: {result:?}"
+            );
+        } else {
+            assert!(
+                result.unwrap_err().is_panic(),
+                "active reply errors remain fatal"
+            );
+        }
+    }
+}
+
 async fn http_recovery_peer(
     listener: tokio::net::TcpListener,
     pieces: Arc<Vec<Vec<u8>>>,
@@ -300,7 +357,12 @@ async fn http_recovery_peer(
         start.notified().await;
     }
 
-    while let Ok(message) = peer.read_message().await {
+    loop {
+        let message = match peer.read_message().await {
+            Ok(message) => message,
+            Err(ace_peer::PeerError::Closed) => break,
+            Err(error) => panic!("HTTP recovery fixture read failed before shutdown: {error:?}"),
+        };
         if let PeerMessage::Unknown { id: 6, payload } = message {
             if payload.len() < 8 {
                 continue;
@@ -605,11 +667,12 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool)
     let started_for_discovery = discovery_started.clone();
     let finished_for_discovery = discovery_finished.clone();
     let (sent_tx, sent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (peer_shutdown, _) = tokio::sync::watch::channel(false);
     let mut peer_tasks = tokio::task::JoinSet::new();
     let initial_pieces = pieces.clone();
     let initial_start = Some(start_peer.clone());
     let initial_sent = sent_tx.clone();
-    peer_tasks.spawn(async move {
+    peer_tasks.spawn(owned_http_peer(peer_shutdown.subscribe(), async move {
         http_recovery_peer(
             initial_listener,
             initial_pieces,
@@ -620,7 +683,7 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool)
             initial_sent,
         )
         .await
-    });
+    }));
     if let (Some(listener), Some(_addr)) = (reconnect_listener, reconnect_addr) {
         let reconnect_pieces = pieces.clone();
         let reconnect_sent = sent_tx.clone();
@@ -629,7 +692,7 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool)
         } else {
             9
         };
-        peer_tasks.spawn(async move {
+        peer_tasks.spawn(owned_http_peer(peer_shutdown.subscribe(), async move {
             http_recovery_peer(
                 listener,
                 reconnect_pieces,
@@ -640,7 +703,7 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool)
                 reconnect_sent,
             )
             .await
-        });
+        }));
         let release_for_discovery = release_for_discovery.clone();
         let started_for_discovery = started_for_discovery.clone();
         let finished_for_discovery = finished_for_discovery.clone();
@@ -667,6 +730,7 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool)
             info,
             HttpReconnectPeers {
                 tasks: peer_tasks,
+                peer_shutdown,
                 sent_rx,
                 start_peer,
                 discovery,
@@ -701,6 +765,7 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool)
         info,
         HttpReconnectPeers {
             tasks: peer_tasks,
+            peer_shutdown,
             sent_rx,
             start_peer,
             discovery,
@@ -716,6 +781,7 @@ async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool)
 
 struct HttpReconnectPeers {
     tasks: tokio::task::JoinSet<()>,
+    peer_shutdown: tokio::sync::watch::Sender<bool>,
     sent_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
     start_peer: Arc<tokio::sync::Notify>,
     discovery: PeerDiscovery,
@@ -734,6 +800,7 @@ async fn run_http_reconnect_case(
 ) {
     let HttpReconnectPeers {
         tasks: mut peer_tasks,
+        peer_shutdown,
         mut sent_rx,
         start_peer,
         discovery,
@@ -868,6 +935,7 @@ async fn run_http_reconnect_case(
             let stale =
                 wait_http_recovery_stats(&session, |stats| stats.stale_teardowns >= 1).await;
             assert_eq!(stale.stale_teardowns, 1);
+            peer_shutdown.send_replace(true);
             drop(body);
             drop(raw);
             return HttpCompositionObservation {
@@ -1191,6 +1259,7 @@ async fn run_http_reconnect_case(
             let post = positions.iter().filter(|&&pos| pos >= boundary).count();
             assert!(post > 0, "actual HTTP body decodes video after reconnect");
         }
+        peer_shutdown.send_replace(true);
         drop(body);
         drop(raw);
         HttpCompositionObservation {
@@ -1205,6 +1274,7 @@ async fn run_http_reconnect_case(
     // loopback tasks. The test future owns only its body/raw receivers and local session.
     let run_result = std::panic::AssertUnwindSafe(run).catch_unwind().await;
     let run_panicked = run_result.is_err();
+    peer_shutdown.send_replace(true);
     let owned_session = owner.is_some();
     discovery_release.notify_one();
     let stop_result =
