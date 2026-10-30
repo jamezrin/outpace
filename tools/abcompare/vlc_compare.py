@@ -120,7 +120,37 @@ def status_request(opener, port, password, timeout):
         return json.loads(response.read(1024 * 1024))
 
 
-def compare(args, content_id):
+def playback_targets(args, content_id, playback_urls):
+    bases = {"engine": args.engine_url, "outpace": args.outpace_url}
+    if playback_urls is None:
+        return {name: base + "/ace/getstream?" + urllib.parse.urlencode({"id": content_id})
+                for name, base in bases.items()}
+    if not isinstance(playback_urls, dict) or set(playback_urls) != set(bases):
+        raise ValueError("supply both owned playback URLs")
+    targets = {}
+    for name, base in bases.items():
+        raw = playback_urls[name]
+        if (not isinstance(raw, str) or len(raw) > 4096
+                or any(ord(c) <= 32 or ord(c) >= 127 for c in raw)
+                or any(c in raw for c in "?#%\\")):
+            raise ValueError("invalid owned playback URL")
+        parsed, origin = urllib.parse.urlsplit(raw), urllib.parse.urlsplit(base)
+        try:
+            same_origin = (parsed.scheme, parsed.hostname, parsed.port) == (
+                origin.scheme, origin.hostname, origin.port)
+        except ValueError:
+            raise ValueError("invalid owned playback origin") from None
+        width = 32 if name == "engine" else 64
+        if (not same_origin or parsed.scheme not in ("http", "https")
+                or parsed.username is not None or parsed.password is not None
+                or not re.fullmatch(r"/ace/r/[0-9a-fA-F]{40}/[0-9a-fA-F]{" + str(width) + "}", parsed.path)):
+            raise ValueError("invalid owned playback route")
+        targets[name] = raw
+    return targets
+
+
+def compare(args, content_id, *, playback_urls=None):
+    targets = playback_targets(args, content_id, playback_urls)
     root = Path(tempfile.mkdtemp(prefix="outpace-vlc-"))
     # mkdtemp is private (0700); logs/playlists/status may contain stream metadata.
     clients = []
@@ -143,8 +173,8 @@ def compare(args, content_id):
     try:
         for name, base in (("engine", args.engine_url), ("outpace", args.outpace_url)):
             playlist = root / f"{name}.m3u"
-            playlist.write_text("#EXTM3U\n" + base + "/ace/getstream?" +
-                                urllib.parse.urlencode({"id": content_id}) + "\n")
+            playlist.touch(mode=0o600, exist_ok=False)
+            playlist.write_text("#EXTM3U\n" + targets[name] + "\n")
             port, password = free_port(), secrets.token_urlsafe(24)
             log = (root / f"{name}-vlc.log").open("wb")
             try:
