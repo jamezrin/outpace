@@ -143,6 +143,132 @@ class OwnedPlaybackTests(unittest.TestCase):
                 process.terminate.assert_called_once()
                 process.wait.assert_called_once()
 
+    def test_cancel_after_first_launch_registers_and_reaps_before_second(self):
+        cancelled = False
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        def spawn(*args, **kwargs):
+            nonlocal cancelled
+            cancelled = True
+            return process
+        with tempfile.TemporaryDirectory() as parent, \
+                patch.object(vlc.subprocess, 'run', return_value=SimpleNamespace(stdout=b'VLC fixture\n')), \
+                patch.object(vlc.subprocess, 'Popen', side_effect=spawn) as launch, \
+                redirect_stdout(io.StringIO()):
+            code = vlc.compare(self.args(), None, playback_urls=self.urls(),
+                               cancel_requested=lambda: cancelled, artifact_parent=Path(parent))
+            self.assertEqual(code, 130)
+            launch.assert_called_once()
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once()
+            roots = list(Path(parent).iterdir())
+            self.assertEqual(len(roots), 1)
+            self.assertEqual(roots[0].stat().st_mode & 0o777, 0o700)
+            report = json.loads((roots[0] / 'comparison.json').read_text())
+            self.assertTrue(report['interrupted'])
+            self.assertEqual(set(report['clients']), {'engine'})
+
+    def test_cli_signals_latch_through_first_launch_and_restore_handlers(self):
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        old = {sig: vlc.signal.getsignal(sig) for sig in (vlc.signal.SIGINT, vlc.signal.SIGTERM)}
+        def spawn(*args, **kwargs):
+            vlc.os.kill(vlc.os.getpid(), vlc.signal.SIGTERM)
+            vlc.os.kill(vlc.os.getpid(), vlc.signal.SIGINT)
+            return process
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(vlc.tempfile, 'mkdtemp', return_value=root), \
+                patch.object(vlc.subprocess, 'run', return_value=SimpleNamespace(stdout=b'VLC fixture\n')), \
+                patch.object(vlc.subprocess, 'Popen', side_effect=spawn) as launch, \
+                patch.object(vlc.shutil, 'which', return_value='/fixture/cvlc'), \
+                patch.dict(vlc.os.environ, ACE_CONTENT_ID='0123456789abcdef0123456789abcdef01234567'), \
+                patch('sys.argv', ['vlc_compare.py', '--engine-url', self.args().engine_url,
+                                   '--outpace-url', self.args().outpace_url]), redirect_stdout(io.StringIO()):
+            self.assertEqual(vlc.main(), 130)
+            launch.assert_called_once()
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once()
+        for sig, handler in old.items():
+            self.assertEqual(vlc.signal.getsignal(sig), handler)
+
+    def terminal_cancel(self, when):
+        clock = [0.0]
+        cancelled = [False]
+        sleeps = []
+        args = self.args()
+        if when == 'long_sleep':
+            args.seconds = 600
+            args.poll_seconds = 300
+        processes = [Mock(), Mock()]
+        for process in processes:
+            process.poll.return_value = None
+            process.wait.return_value = 0
+        old = {sig: vlc.signal.getsignal(sig) for sig in (vlc.signal.SIGINT, vlc.signal.SIGTERM)}
+        def sleep(_seconds):
+            sleeps.append(_seconds)
+            clock[0] = clock[0] + _seconds if when == 'long_sleep' else 10.0
+            if when in ('sleep', 'long_sleep'):
+                cancelled[0] = True
+        def cleanup_wait(*args, **kwargs):
+            vlc.os.kill(vlc.os.getpid(), vlc.signal.SIGTERM)
+            return 0
+        if when == 'cleanup':
+            processes[0].wait.side_effect = cleanup_wait
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(vlc.tempfile, 'mkdtemp', return_value=root), \
+                patch.object(vlc.subprocess, 'run', return_value=SimpleNamespace(stdout=b'VLC fixture\n')), \
+                patch.object(vlc.subprocess, 'Popen', side_effect=processes), \
+                patch.object(vlc, 'status_request', return_value=status(10, 20)), \
+                patch.object(vlc.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(vlc.time, 'sleep', side_effect=sleep), \
+                patch.object(vlc.shutil, 'which', return_value='/fixture/cvlc'), \
+                patch.dict(vlc.os.environ, ACE_CONTENT_ID='0123456789abcdef0123456789abcdef01234567'), \
+                patch('sys.argv', ['vlc_compare.py', '--engine-url', self.args().engine_url,
+                                   '--outpace-url', self.args().outpace_url, '--seconds', '10']), \
+                redirect_stdout(io.StringIO()):
+            code = (vlc.main() if when == 'cleanup' else
+                    vlc.compare(args, None, playback_urls=self.urls(), cancel_requested=lambda: cancelled[0]))
+            report = json.loads(Path(root, 'comparison.json').read_text())
+        for sig, handler in old.items():
+            self.assertEqual(vlc.signal.getsignal(sig), handler)
+        for process in processes:
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once()
+        self.assertEqual(code, 130)
+        self.assertTrue(report['interrupted'])
+        self.assertFalse(report['observation_complete'])
+        if when == 'long_sleep':
+            self.assertTrue(sleeps)
+            self.assertLessEqual(max(sleeps), .25)
+
+    def test_long_poll_wait_checks_cancel_in_bounded_slices(self):
+        self.terminal_cancel('long_sleep')
+
+    def test_cancel_in_final_sleep_is_reported(self):
+        self.terminal_cancel('sleep')
+
+    def test_cli_cancel_during_cleanup_is_reported_after_both_reaps(self):
+        self.terminal_cancel('cleanup')
+
+    def test_precancel_and_unsafe_parent_do_not_launch(self):
+        with patch.object(vlc.tempfile, 'mkdtemp') as directory, patch.object(vlc.subprocess, 'run') as version:
+            self.assertEqual(vlc.compare(self.args(), None, playback_urls=self.urls(), cancel_requested=lambda: True), 130)
+            directory.assert_not_called()
+            version.assert_not_called()
+        with tempfile.TemporaryDirectory() as root:
+            bad = Path(root, 'public')
+            bad.mkdir()
+            bad.chmod(0o755)
+            link = Path(root, 'link'); link.symlink_to(Path(root), target_is_directory=True)
+            for parent in [bad, link, Path(root, 'missing')]:
+                with self.subTest(parent=parent), patch.object(vlc.tempfile, 'mkdtemp') as directory, patch.object(vlc.subprocess, 'run') as version:
+                    with self.assertRaises(ValueError):
+                        vlc.compare(self.args(), None, playback_urls=self.urls(), artifact_parent=parent)
+                    directory.assert_not_called()
+                    version.assert_not_called()
+
     def test_invalid_owned_inputs_fail_before_launch_or_artifact_creation(self):
         good = self.urls()
         bad = [dict(engine=good['engine']), dict(good, extra=good['engine'])]

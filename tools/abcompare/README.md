@@ -324,3 +324,19 @@ source identity, retain ownership and stop each exact lease on every exit path.
 This option does not negotiate or stop leases. The CLI and default direct-ID
 comparison behavior remain unchanged. Sampled VLC counters retain their existing
 measurement limits.
+
+For owned orchestration, `compare` also accepts `cancel_requested`, a cooperative
+callback, and `artifact_parent`, an existing owner-only mode-0700 directory with
+no symlink ancestors. Artifacts are created in a fresh private child beneath that
+parent; omitting it preserves the system temporary-directory default. The callback
+is checked before setup, around registered client launches, between bounded
+control requests and between polls. Poll waits check the latch at most every 250 ms, subject to scheduling. It does
+not interrupt an in-progress request, version probe or operating-system call. A cancelled observation exits
+130 and uses the existing targeted client cleanup. The CLI latches SIGINT/SIGTERM
+through client registration and cleanup using this same path. Metadata scope,
+lease lifetime, exact stops and redirect policy still belong to the caller.
+Cancellation is reconciled after the observation loop and again after all owned
+client cleanup, before the report is finalized. Requests received through that
+completion boundary produce interrupted status and exit 130; cleanup errors stay
+visible in the report. A later signal does not retroactively change a completed
+observation.
