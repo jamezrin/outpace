@@ -984,13 +984,15 @@ impl PoolActor<'_> {
         result: Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>,
     ) -> Option<FollowEnd> {
         finish_output_step(
-            self.continuity,
-            self.candidates,
-            &mut self.peers,
-            self.info,
-            self.seed,
-            self.downloaded,
-            self.tx,
+            OutputContext {
+                continuity: self.continuity,
+                candidates: self.candidates,
+                peers: &mut self.peers,
+                info: self.info,
+                seed: self.seed,
+                downloaded: self.downloaded,
+                tx: self.tx,
+            },
             result,
         )
     }
@@ -1017,17 +1019,29 @@ fn poll_output(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct OutputContext<'a> {
+    continuity: &'a mut Continuity,
+    candidates: &'a mut SessionCandidates,
+    peers: &'a mut BTreeMap<u64, PeerRuntime>,
+    info: &'a StreamInfo,
+    seed: &'a SeedConfig,
+    downloaded: &'a Arc<AtomicU64>,
+    tx: &'a mpsc::Sender<LiveOutput>,
+}
+
 fn finish_output_step(
-    continuity: &mut Continuity,
-    candidates: &mut SessionCandidates,
-    peers: &mut BTreeMap<u64, PeerRuntime>,
-    info: &StreamInfo,
-    seed: &SeedConfig,
-    downloaded: &Arc<AtomicU64>,
-    tx: &mpsc::Sender<LiveOutput>,
+    context: OutputContext<'_>,
     result: Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>,
 ) -> Option<FollowEnd> {
+    let OutputContext {
+        continuity,
+        candidates,
+        peers,
+        info,
+        seed,
+        downloaded,
+        tx,
+    } = context;
     let Ok(permit) = result else {
         return Some(FollowEnd::ConsumerGone);
     };
@@ -1184,7 +1198,7 @@ pub(in crate::live_session) async fn drain_retained(
                 }
             }) => {
                 if let Some(result) = result {
-                    if finish_output_step(c, candidates, &mut peers, info, seed, downloaded, tx, result).is_some() { return false; }
+                    if finish_output_step(OutputContext { continuity: c, candidates, peers: &mut peers, info, seed, downloaded, tx }, result).is_some() { return false; }
                 }
             }
         }

@@ -882,17 +882,7 @@ async fn review_credit(signed: bool, completions: bool, close: bool, publication
         None => std::task::Poll::Pending,
     })
     .await;
-    assert!(finish_output_step(
-        actor.continuity,
-        actor.candidates,
-        &mut actor.peers,
-        &info,
-        &seed,
-        &downloaded,
-        &tx,
-        result
-    )
-    .is_none());
+    assert!(actor.finish_output(result).is_none());
     assert!(actor.continuity.pending_output.is_empty());
     assert_eq!(downloaded.load(Ordering::Relaxed), 0);
     assert!(seed.warm_peers.hints(&info.infohash).is_empty());
@@ -1159,17 +1149,7 @@ async fn review_credit(signed: bool, completions: bool, close: bool, publication
         None => std::task::Poll::Pending,
     })
     .await;
-    assert!(finish_output_step(
-        actor.continuity,
-        actor.candidates,
-        &mut actor.peers,
-        &info,
-        &seed,
-        &downloaded,
-        &tx,
-        result
-    )
-    .is_none());
+    assert!(actor.finish_output(result).is_none());
     assert!(actor.peers[&1].produced_output);
     assert!(!actor.peers[&3].produced_output);
     assert_eq!(actor.candidates.explorations(addr), 0);
@@ -1217,17 +1197,7 @@ async fn review_credit(signed: bool, completions: bool, close: bool, publication
         None => std::task::Poll::Pending,
     })
     .await;
-    assert!(finish_output_step(
-        actor.continuity,
-        actor.candidates,
-        &mut actor.peers,
-        &info,
-        &seed,
-        &downloaded,
-        &tx,
-        result
-    )
-    .is_none());
+    assert!(actor.finish_output(result).is_none());
     assert_eq!(
         actor.candidates.explorations(addr),
         1,
