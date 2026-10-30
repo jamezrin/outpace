@@ -12,6 +12,7 @@ pub(super) fn advance_head_from_window(payload: &[u8], head: u64) -> Option<u64>
     read_window_max(payload).filter(|&max_piece| max_piece > head)
 }
 
+#[cfg(test)]
 pub(super) fn stale_upstream_budget(
     last_progress: Instant,
     now: Instant,
@@ -26,6 +27,7 @@ pub(super) fn stale_upstream_budget(
 }
 
 /// Bound each never-emitted pool independently of startup activity bookkeeping.
+#[cfg(test)]
 pub(super) fn pool_progress_budget(
     first_output_deadline: &mut Option<Instant>,
     emitted: u64,

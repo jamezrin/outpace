@@ -95,34 +95,40 @@ pub(super) fn poll_operation(
 }
 impl PoolActor<'_> {
     pub(super) fn start_publication(&mut self) {
-        if self.publication.is_some() {
-            return;
-        }
-        if let Some((&piece, _)) = self
-            .continuity
-            .publication
-            .iter()
-            .find(|(_, terminal)| matches!(terminal, PublicationStatus::Needed))
-        {
-            let wire_len = self
-                .continuity
-                .reasm
-                .completed_live_piece(piece)
-                .expect("held wire")
-                .wire
-                .len();
-            self.publication = Some(PublicationOperation::Acquiring {
-                piece,
-                future: Box::pin(PieceStore::begin_complete_admission(
-                    Arc::clone(self.store),
-                    piece,
-                    wire_len,
-                )),
-            });
-        }
+        start_operation(&mut self.publication, self.continuity, self.store);
     }
     pub(super) fn poll_publication(&mut self, cx: &mut Context<'_>) -> bool {
         poll_operation(&mut self.publication, self.continuity, self.store, cx)
+    }
+}
+
+pub(super) fn start_operation(
+    op: &mut Option<PublicationOperation>,
+    c: &mut Continuity,
+    store: &Arc<Mutex<PieceStore>>,
+) {
+    if op.is_some() {
+        return;
+    }
+    if let Some((&piece, _)) = c
+        .publication
+        .iter()
+        .find(|(_, terminal)| matches!(terminal, PublicationStatus::Needed))
+    {
+        let wire_len = c
+            .reasm
+            .completed_live_piece(piece)
+            .expect("held wire")
+            .wire
+            .len();
+        *op = Some(PublicationOperation::Acquiring {
+            piece,
+            future: Box::pin(PieceStore::begin_complete_admission(
+                Arc::clone(store),
+                piece,
+                wire_len,
+            )),
+        });
     }
 }
 

@@ -133,3 +133,31 @@ reliability across all sources or resolve the separate startup/recovery work.
 Cleanup stopped the owned candidate and reference container, restored the host
 WARP route, and left only the pre-existing BuildKit container running. Raw media,
 status, tokens and logs remain private under `/tmp/outpace-stats-171-cid20-wqa4__m3`.
+
+
+### Incremental ready-buffer measurements
+
+Native status adds `livepos.buffer_complete`. When true, `buffer_ms` and
+`buffer_pieces` describe one completed coherent measurement at the reported cursor.
+When false, both numeric measurements are zero and unavailable; this does not
+establish that the buffer is empty. Cursor movement and completed-piece additions
+invalidate measurements synchronously. A fast-moving cursor may prevent a scan
+from completing. These metrics never gate media admission or readiness.
+
+The compatibility position object retains its existing keys and numeric types,
+without `buffer_complete`; its zero values therefore cannot distinguish unavailable
+from empty. Non-live provider statistics are unchanged.
+
+The actor scans at most 2048 complete TS packets and 64 piece transitions per turn,
+using borrowed per-piece media slices and the existing selected-PCR clock and
+bitrate fallback. Publication and extraction callbacks do not scan media. Useful
+unfinished work yields cooperatively; completed scans and absent observers do not
+schedule stats continuations. Output capacity reservation is a separate dependency:
+the existing blocking send still prevents progress while that send is pending.
+
+Output backpressure uses a retained playback clock: time waiting for consumer
+capacity does not consume first-output, stale-progress, request or cursor-age
+budgets. Independent startup corroboration and network deadlines continue in
+real time. Rebuilding a peer generation drains already accepted media before
+new discovery or connection work; only successful enqueue counts as output
+progress. Publication waiting alone retains the existing timeout policy.

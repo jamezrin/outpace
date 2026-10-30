@@ -380,6 +380,11 @@ fn positions_clear_active_bounds_on_reconnect_and_reject_negative_windows() {
     c.set_peer_unchoked(1, true);
     publish_live_stats(&c, Some(&(metrics.clone() as Arc<dyn LiveObserver>)), &info);
     assert_eq!(metrics.snapshot().livepos.unwrap().live_first, None);
+    assert_eq!(metrics.snapshot().buffer_ms, 0);
+    // Publication alone must not perform a media scan.
+    c.reasm.add_block(0, 0, b"abcd").unwrap();
+    publish_live_stats(&c, Some(&(metrics.clone() as Arc<dyn LiveObserver>)), &info);
+    assert_eq!(metrics.snapshot().livepos.unwrap().buffer_pieces, 0);
     c.active_peers.observe_window(1, Some((2, 7)));
     publish_live_stats(&c, Some(&(metrics.clone() as Arc<dyn LiveObserver>)), &info);
     assert_eq!(metrics.snapshot().livepos.unwrap().live_last, Some(7));
@@ -459,4 +464,136 @@ fn sliding_window_observations_do_not_change_scheduler_coverage() {
     assert_eq!(c.active_peers.coverage_bounds(), Some((180, 250)));
     observe_live_window(&mut c, 1, b"d9:max_piecei250e9:min_piecei-1ee");
     assert_eq!(c.active_peers.coverage_bounds(), None);
+}
+
+#[test]
+fn bounded_stats_pcr_differential_and_invalidation() {
+    fn packet(pid: u16, pcr: u64, discontinuity: bool) -> Vec<u8> {
+        let mut p = vec![0; 188];
+        p[0] = 0x47;
+        p[1] = (pid >> 8) as u8;
+        p[2] = pid as u8;
+        p[3] = 0x20;
+        p[4] = 7;
+        p[5] = 0x10 | if discontinuity { 0x80 } else { 0 };
+        p[6] = (pcr >> 25) as u8;
+        p[7] = (pcr >> 17) as u8;
+        p[8] = (pcr >> 9) as u8;
+        p[9] = (pcr >> 1) as u8;
+        p[10] = (pcr << 7) as u8;
+        p
+    }
+    for events in [
+        vec![(1, 0, false), (2, 900000, false), (1, 180000, false)],
+        vec![(1, (1 << 33) - 90000, false), (1, 90000, false)],
+        vec![
+            (1, 180000, false),
+            (1, 90000, false),
+            (2, 0, false),
+            (2, 270000, false),
+        ],
+        vec![
+            (1, 0, false),
+            (2, 1, true),
+            (2, 90000, false),
+            (2, 180000, false),
+        ],
+        vec![(1, 0, false), (1, 0, false)],
+    ] {
+        for bitrate in [None, Some(0), Some(1000)] {
+            let media: Vec<u8> = events
+                .iter()
+                .flat_map(|&(pid, pcr, d)| packet(pid, pcr, d))
+                .collect();
+            let mut bytes = vec![0; 188 * 2050];
+            bytes.extend(media);
+            bytes.extend([1, 2, 3]);
+            let info = StreamInfo {
+                infohash: [0; 20],
+                piece_length: bytes.len() as u64,
+                chunk_length: bytes.len() as u64,
+                sig_len: 0,
+                source_pubkey: vec![],
+                trackers: vec![],
+                metadata: StreamMetadata::default(),
+            };
+            let (mut c, _) = Continuity::fresh(&info, 0, 0, 0, LiveRecoveryConfig::default());
+            c.reasm.add_block(0, 0, &bytes).unwrap();
+            c.stats_scan.advance(&c.reasm, bitrate);
+            assert!(c.stats_scan.pending());
+            // An immutable ahead completion must not reset the active clock/offset.
+            c.reasm.add_block(1, 0, &bytes).unwrap();
+            while c.stats_scan.pending() {
+                c.stats_scan.advance(&c.reasm, bitrate);
+            }
+            assert_eq!(
+                c.stats_scan.result(0),
+                Some(ready_buffer_snapshot(&c, bitrate))
+            );
+            c.invalidate_stats();
+            assert!(c.stats_scan.pending());
+            c.stats_scan.advance(&c.reasm, bitrate);
+            c.reasm.take_ready_piece();
+            c.stats_scan.advance(&c.reasm, bitrate);
+            while c.stats_scan.pending() {
+                c.stats_scan.advance(&c.reasm, bitrate);
+            }
+            assert_eq!(
+                c.stats_scan.result(1),
+                Some(ready_buffer_snapshot(&c, bitrate))
+            );
+        }
+    }
+}
+
+#[test]
+fn bounded_stats_gap_cache_and_synchronous_unknown() {
+    let info = StreamInfo {
+        infohash: [0; 20],
+        piece_length: 4,
+        chunk_length: 2,
+        sig_len: 0,
+        source_pubkey: vec![],
+        trackers: vec![],
+        metadata: StreamMetadata::default(),
+    };
+    let (mut c, _) = Continuity::fresh(&info, 0, 0, 0, LiveRecoveryConfig::default());
+    let observer = TestObserver::new(
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    );
+    c.observer = Some(observer.clone());
+    assert_eq!(c.advance_stats(false, Some(2)), (0, 0));
+    assert_eq!(c.stats_scan.result(0), None);
+    assert!(!c.stats_pending(false));
+    assert!(c.stats_pending(true));
+    c.stats_scan.advance(&c.reasm, None);
+    publish_live_stats(&c, c.observer.as_ref(), &info);
+    assert!(observer.snapshot().livepos.unwrap().buffer_complete);
+    assert_eq!(c.stats_scan.result(0), Some((0, 0)));
+    assert!(!c.stats_pending(true));
+    let partial = c.reasm.add_live_chunk(0, 0, 2, [0; 8], b"ab").unwrap();
+    assert!(!partial.completed);
+    assert!(!c.stats_scan.pending());
+    let done = c.reasm.add_live_chunk(0, 1, 2, [0; 8], b"cd").unwrap();
+    assert!(done.completed);
+    c.invalidate_stats();
+    assert!(!observer.snapshot().livepos.unwrap().buffer_complete);
+    assert_eq!(observer.snapshot().buffer_ms, 0);
+    c.stats_scan.advance(&c.reasm, Some(2));
+    assert_eq!(c.stats_scan.result(0), Some((2000, 1)));
+    let duplicate = c.reasm.add_live_chunk(0, 1, 2, [0; 8], b"cd").unwrap();
+    assert!(!duplicate.completed);
+    assert!(!c.stats_scan.pending());
+    c.reasm.add_block(2, 0, b"abcd").unwrap();
+    c.invalidate_stats();
+    c.stats_scan.advance(&c.reasm, Some(2));
+    assert_eq!(c.stats_scan.result(0), Some((2000, 1)));
+    c.reasm.add_block(1, 0, b"abcd").unwrap();
+    c.invalidate_stats();
+    c.stats_scan.advance(&c.reasm, Some(2));
+    assert_eq!(c.stats_scan.result(0), Some((6000, 3)));
 }

@@ -2534,7 +2534,7 @@ async fn rejected_piece_releases_duplicate_assignments_without_dropping_other_re
         c.register_active_peer(2, addr, live_pos(7, 7));
         c.set_peer_unchoked(2, true);
         let now = Instant::now() + policy.request_timeout();
-        c.requested_at.insert(8, now);
+        c.requested_at.insert(8, c.output_clock.now(now));
         retransmit_stalled_requests(&mut peers, &mut c, 32, now).await;
         assert!(matches!(
             rejecting.try_recv(),
@@ -2552,7 +2552,7 @@ async fn rejected_piece_releases_duplicate_assignments_without_dropping_other_re
         assert!(!c.received_chunks.contains_key(&7));
         assert!(!c.requested_at.contains_key(&7));
         assert_eq!(c.received_chunks.get(&8).unwrap().len(), 1);
-        assert_eq!(c.requested_at.get(&8), Some(&now));
+        assert_eq!(c.requested_at.get(&8), Some(&c.output_clock.now(now)));
         advance_pool_requests(&mut peers, &mut c, 32).await;
         let retry = original.try_recv();
         let unexpected = rejecting.try_recv();

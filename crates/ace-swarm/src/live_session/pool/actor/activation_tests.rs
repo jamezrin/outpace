@@ -99,6 +99,7 @@ async fn activation_obsolete_completion_preserves_current_peers_and_counters() {
             );
         }
         let mut actor = PoolActor {
+            output_reservation: None,
             activation: None,
             reciprocal: Default::default(),
             publication: None,
@@ -107,8 +108,6 @@ async fn activation_obsolete_completion_preserves_current_peers_and_counters() {
             observed_retry: Instant::now(),
             observed_capacity: (2, 0),
             refill_closed: true,
-            last_progress: Instant::now(),
-            first_output_deadline: None,
             next_peer_id: 3,
             loss_count: 0,
             peers: BTreeMap::from([(1, peer1), (2, peer2)]),

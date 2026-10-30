@@ -9,6 +9,7 @@ pub struct LivePosition {
     pub live_first: Option<u64>,
     pub live_last: Option<u64>,
     pub buffer_pieces: u64,
+    pub buffer_complete: bool,
 }
 
 /// Source-session recovery occurrences, independent of presentation.

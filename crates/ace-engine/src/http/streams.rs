@@ -98,7 +98,7 @@ pub(super) async fn stream_status(
                 "max_sessions": s.manager.admission_status().1,
                 "peers": stats.peers,
                 "bitrate": stats.bitrate,
-                "livepos": live_position_json(stats.livepos.as_ref()),
+                "livepos": native_live_position_json(stats.livepos.as_ref()),
                 "recovery": stats.recovery,
                 "buffer_ms": stats.buffer_ms,
                 "uploaded": stats.uploaded,
@@ -309,4 +309,38 @@ pub(super) fn capacity_error() -> Response {
         "session capacity reached",
     )
         .into_response()
+}
+
+fn native_live_position_json(
+    position: Option<&crate::provider::LivePositionStats>,
+) -> serde_json::Value {
+    let mut value = live_position_json(position);
+    if let (Some(position), Some(object)) = (position, value.as_object_mut()) {
+        object.insert("buffer_complete".into(), json!(position.buffer_complete));
+    }
+    value
+}
+
+#[cfg(test)]
+mod buffer_contract_tests {
+    use super::*;
+    #[test]
+    fn native_completion_is_absent_from_compatibility() {
+        let p = crate::provider::LivePositionStats {
+            pos: Some(1),
+            last: Some(2),
+            live_first: None,
+            live_last: None,
+            buffer_pieces: 0,
+            buffer_complete: false,
+        };
+        assert_eq!(
+            native_live_position_json(Some(&p))["buffer_complete"],
+            false
+        );
+        assert!(live_position_json(Some(&p))
+            .get("buffer_complete")
+            .is_none());
+        assert!(native_live_position_json(None).is_null());
+    }
 }

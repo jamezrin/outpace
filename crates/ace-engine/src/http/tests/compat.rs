@@ -1105,6 +1105,7 @@ fn measured_state(position: bool) -> AppState {
             live_first: Some(2),
             live_last: Some(9),
             buffer_pieces: 1,
+            buffer_complete: true,
         }),
         recovery: Some(crate::provider::LiveRecoveryStats {
             upstream_reconnects: 2,
@@ -1137,7 +1138,10 @@ async fn measured_stats_schema_reports_units_positions_and_null_timestamps() {
     let response = stream_status(State(st), Path(("fix".into(), "stats".into()))).await;
     let native: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
     assert_eq!(native["bitrate"], 12288);
-    assert_eq!(native["livepos"], *pos);
+    assert!(pos.get("buffer_complete").is_none());
+    let mut expected_native = pos.clone();
+    expected_native["buffer_complete"] = serde_json::json!(true);
+    assert_eq!(native["livepos"], expected_native);
     assert_eq!(native["recovery"]["upstream_reconnects"], 2);
     assert_eq!(native["recovery"]["stale_teardowns"], 3);
     assert_eq!(native["recovery"]["skipped_evicted_gaps"], 4);
