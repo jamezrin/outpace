@@ -62,6 +62,7 @@ mod tests {
             );
         }
         let mut actor = PoolActor {
+            activation: None,
             reciprocal: Default::default(),
             publication: None,
             gossip: None,

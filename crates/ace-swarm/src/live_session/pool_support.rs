@@ -51,6 +51,7 @@ pub(super) fn spawn_learned_connects(
     pending: &mut HashSet<SocketAddrV4>,
 ) {
     spawn_candidate_connects(CandidateConnectInputs {
+        held: None,
         candidates,
         peers,
         infohash,
@@ -79,6 +80,7 @@ pub(super) fn finish_candidate_connect(
 }
 
 pub(super) struct CandidateConnectInputs<'a> {
+    pub(super) held: Option<SocketAddrV4>,
     pub(super) candidates: &'a mut SessionCandidates,
     pub(super) peers: &'a BTreeMap<u64, PeerRuntime>,
     pub(super) infohash: [u8; 20],
@@ -92,6 +94,7 @@ pub(super) struct CandidateConnectInputs<'a> {
 
 pub(super) fn spawn_candidate_connects(inputs: CandidateConnectInputs<'_>) {
     let CandidateConnectInputs {
+        held,
         candidates,
         peers,
         infohash,
@@ -105,7 +108,7 @@ pub(super) fn spawn_candidate_connects(inputs: CandidateConnectInputs<'_>) {
     if !include_discovered && sources + pex == 0 {
         return;
     }
-    let active = peers.values().map(|peer| peer.addr).collect();
+    let active = peers.values().map(|peer| peer.addr).chain(held).collect();
     let cohort = candidates.exploration_cohort(Instant::now(), &active, pending);
     let eligible = if include_discovered {
         candidates.eligible(Instant::now())
@@ -119,7 +122,7 @@ pub(super) fn spawn_candidate_connects(inputs: CandidateConnectInputs<'_>) {
         if tasks.len() >= max_parallel || pending.len() >= max_parallel {
             break;
         }
-        if peers.values().any(|p| p.addr == addr) || !pending.insert(addr) {
+        if held == Some(addr) || peers.values().any(|p| p.addr == addr) || !pending.insert(addr) {
             continue;
         }
         // Reserve a retry slot before spawning: gossip floods cannot duplicate pending work.
