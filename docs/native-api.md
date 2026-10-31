@@ -440,6 +440,16 @@ wall-clock timestamps is available. These observations are not a client's
 playhead or an authenticated source clock. Other providers without independent
 readers retain their existing post-output cached statistics behavior.
 
+Native `livepos.buffer_complete` distinguishes a completed buffer measurement
+from unavailable numeric zeros. When false, `buffer_ms` and `buffer_pieces` are
+unavailable; when true, numeric zeros are completed measurements.
+`buffer_pieces=0` indicates no complete contiguous pieces; `buffer_ms=0` alone
+does not establish emptiness. Cursor
+movement and completed-piece additions invalidate measurements while an
+incremental scan catches up. These metrics do not gate media readiness. The
+compatibility position object omits `buffer_complete`, so its numeric zeros alone
+cannot distinguish unavailable from empty.
+
 `recovery` is null for providers without recovery observations. Observed live
 sources expose all five numeric fields from session creation, initially zero.
 Counters last for one source session, survive upstream pool rebuilds, and reset
