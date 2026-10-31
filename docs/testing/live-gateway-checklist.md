@@ -19,14 +19,48 @@ a successful startup. API field meanings are in [native-api.md](../native-api.md
   variable such as `ACE_CONTENT_ID`. The gitignored registry is LLM context only:
   no code, test or harness may read it. Keep values, derived infohashes, stream
   names, URLs, raw logs and media out of tracked files and shared output.
-- Use fresh private artifacts, bounded logs and HTTP deadlines, an absolute
-  7,500-second budget including cleanup, and terminate only owned children whose
-  identity is verified. Do not attach to an unrelated daemon.
+- For the matched two-hour profile, request a 7,500-second player observation
+  and enforce an 8,100-second total deadline with an outer supervisor. Budget at
+  most 120 seconds for preflight, 7,800 seconds for metadata negotiation, the
+  player observation and owned cleanup, and 180 seconds for postflight. The
+  requested observation includes player setup/startup; do not shorten it to
+  absorb preflight, metadata negotiation or cleanup. Exceeding a phase or total
+  deadline leaves the run incomplete. The comparator's `--seconds` selects the
+  requested observation, not the outer total deadline.
+- Use fresh private artifacts, bounded logs and HTTP deadlines. Terminate only
+  owned children whose identity is verified. Do not attach to an unrelated daemon.
+
+## Admission and cleanup
+
+- Record `OUTPACE_MAX_SESSIONS` and the effective memory envelope before starting.
+  Unset or `0` keeps admission unlimited; a positive value caps shared live/VOD
+  provider resources. Existing sessions remain joinable and HLS reuses its
+  source slot. Pending work and retained VOD owners can keep a slot occupied
+  after a stop. Use `occupied_sessions` and `max_sessions`, rather than assuming
+  `active_sessions` is the admission count. See
+  [provider session admission](../deployment.md#provider-session-admission).
+- A session cap is not a hard RSS or aggregate cache-byte limit. Inspect all
+  applicable cgroup ancestors: a child `memory.max=max` can hide a finite parent.
+  Compare current usage and limit at the same scope; distinguish unlimited,
+  unavailable and finite measurements. Record missed samples and scope changes.
+- Negotiate public, explicitly unencrypted content before media acquisition.
+  Register returned command capabilities before logging or later gates can fail.
+  Close/reap owned clients before stopping their exact leases, including on
+  cancellation and artifact failures. Never substitute a global or guessed stop.
+- Prove a redirected media reader belongs to the registered lease before following
+  it when independent ownership proof is required. Same origin, matching content
+  identity, HTTP success and an idle postflight do not establish that relationship.
+  If the relationship is unresolved, leave the observation inconclusive.
+- Keep local child cleanup and remote lease cleanup separate. Reaping a launcher
+  does not establish descendant termination, and local termination does not prove
+  that a remote exact stop succeeded. Preserve explicit uncertainty on forced exits.
 
 ## Two-hour decode observation
 
-- Require a first decoded frame within 90 seconds, then a full 7,200 seconds of
-  active observation with continuing decoded-frame progress. A 60-second frame
+- Observe decoded video, decoded audio, displayed pictures and played audio
+  buffers separately when using VLC. Require initial progress within 90 seconds,
+  then at least 7,200 seconds of active progress within the 7,500-second requested
+  observation. A 60-second frame
   watchdog detects stalls; bytes or FFmpeg timestamps alone do not establish
   decoded-frame progress. Keep sufficient valid status coverage across the whole
   active window and its tail; startup samples do not substitute for active time.
@@ -44,7 +78,10 @@ a successful startup. API field meanings are in [native-api.md](../native-api.md
   evidence of playback.
 - Interpret `buffer_ms` as the engine's computed reservoir/reassembler coverage,
   not a player buffer. After draining, zero `buffer_ms` and `buffer_pieces` can be
-  correct; positive steady-state buffer is not an acceptance requirement.
+  correct; positive steady-state buffer is not an acceptance requirement. Native
+  `livepos.buffer_complete=false` makes numeric buffer zeros unavailable, not a
+  measured empty reservoir. With `buffer_complete=true`, zero is a valid completed
+  measurement. Compatibility position responses omit that availability flag.
 - Report complete only with the full decode window, valid coverage and successful
   cleanup. Use CLI exit 0 for complete, 1 for failure, and 2 for inconclusive or
   internal error. Report measured decode progress, gaps and errors explicitly.
@@ -56,7 +93,7 @@ a successful startup. API field meanings are in [native-api.md](../native-api.md
 ## Separate recovery and memory evidence
 
 Keep deterministic offline gap/recovery tests separate from natural live logs
-and sampled counters. The four offline gap tests exercise controlled cases;
+and sampled counters. The focused offline gap tests exercise controlled cases;
 zero sampled event counters do not exclude an event after the last saved sample.
 Record the observation window and counter semantics before attributing a recovery
 or an outage.
@@ -65,11 +102,19 @@ Run memory churn as a separate, explicitly budgeted procedure: fix the build,
 cache/retention limits, source count, viewers, start/stop cycle count, dwell and
 settling times, and total duration before starting. Record baseline, per-cycle
 and settled RSS plus `GET /debug/memstats` live-heap/resident observations, and
-verify session/child cleanup. Compare repeated settled measurements under the
+verify session/child cleanup. Jemalloc resident memory is not process RSS; label
+the metrics separately and leave unsupported fields unavailable. Compare repeated
+settled measurements under the
 same workload. A bounded trend is evidence for that budget, not proof of no leak;
 a decode soak without memory measurements makes no memory claim.
 
 ## Current evidence and acceptance
+
+The observations below are historical evidence, not acceptance of every later
+merged artifact. A new validation must record the exact shipped build, and unmet
+runtime criteria remain open. A passing synthetic recovery test, a short playback
+window or a corrected harness does not close the multi-hour acceptance criterion.
+
 
 The cid20 attempt decoded 93,045 frames over roughly 62 minutes and retained 741
 status samples: one active upstream and zero sampled recovery event counters.
