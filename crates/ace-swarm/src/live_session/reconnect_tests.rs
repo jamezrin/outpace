@@ -2029,6 +2029,174 @@ fn read_window_max_preserves_live_window_parser_compatibility() {
     assert_eq!(read_window_max(b"d9:max_piecei4294967296ee"), None);
 }
 
+/// Real TCP multi-wave coverage. Internal JoinSet occupancy and completed diagnostic
+/// totals are private to connect_pool; socket acceptance is not a task-admission hook.
+#[tokio::test]
+async fn initial_selection_second_wave_gets_fresh_attempt_budget() {
+    let mut listeners = Vec::new();
+    for _ in 0..4 {
+        listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    }
+    listeners.sort_by_key(|listener| listener.local_addr().unwrap());
+    let addrs: Vec<_> = listeners
+        .iter()
+        .map(|listener| {
+            let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+                unreachable!()
+            };
+            addr
+        })
+        .collect();
+    let mut candidates = SessionCandidates::default();
+    for addr in &addrs {
+        candidates.learn(*addr, CandidateKind::Pex);
+    }
+    assert_eq!(
+        candidates.eligible(Instant::now()),
+        addrs,
+        "explicit fixture order"
+    );
+    let first_requests = Arc::new(tokio::sync::Barrier::new(3));
+    let second_requests = Arc::new(tokio::sync::Barrier::new(2));
+    let mut servers = tokio::task::JoinSet::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let first_requests = first_requests.clone();
+        let second_requests = second_requests.clone();
+        servers.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let accepted = Instant::now();
+            let response;
+            if index == 2 {
+                // Both first-wave requests and the silent second-wave request must
+                // have reached real TCP before the healthy peer responds.
+                first_requests.wait().await;
+                second_requests.wait().await;
+                tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    accepted + Duration::from_millis(500),
+                ))
+                .await;
+                let mut session = PeerSession::new(stream);
+                session.accept_handshake([0; 20], |_| true).await.unwrap();
+                session
+                    .send_extended_handshake(&OutgoingExtendedHandshake {
+                        ace_metadata_version: 1,
+                        ut_metadata_id: 2,
+                        mi: Some(live_pos(1, 8)),
+                        node: NodeFields::default(),
+                        peer_ip: None,
+                        metadata_size: None,
+                    })
+                    .await
+                    .unwrap();
+                response = Some(Instant::now());
+                while session.read_message().await.is_ok() {}
+            } else {
+                let mut request = [0; 66];
+                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut request)
+                    .await
+                    .unwrap();
+                if index < 2 {
+                    first_requests.wait().await;
+                } else {
+                    second_requests.wait().await;
+                }
+                response = None;
+                let mut remaining = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut remaining)
+                    .await
+                    .unwrap();
+            }
+            (index, accepted, response, Instant::now())
+        });
+    }
+    let (info, seed) = cancellation_fixture();
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        connect_pool(
+            info.infohash,
+            &mut candidates,
+            LiveRecoveryConfig {
+                max_parallel_connect: 2,
+                max_active_upstreams: 2,
+                ..seed.live_recovery
+            },
+            &mut None,
+            None,
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let selected: Vec<_> = result
+        .as_ref()
+        .map(|peers| peers.iter().map(|p| p.addr).collect())
+        .unwrap_or_default();
+    drop(result); // Close the retained healthy socket before the separate cleanup watchdog.
+    let cleanup = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut outcomes = Vec::new();
+        while let Some(outcome) = servers.join_next().await {
+            outcomes.push(outcome);
+        }
+        outcomes
+    })
+    .await;
+    if cleanup.is_err() {
+        servers.abort_all();
+        while servers.join_next().await.is_some() {}
+    }
+    let mut outcomes: Vec<_> = cleanup
+        .expect("all accepted sockets/tasks must close within cleanup budget")
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    outcomes.sort_by_key(|outcome| outcome.0);
+    assert_eq!(outcomes.len(), 4);
+    assert_eq!(
+        selected,
+        vec![addrs[2]],
+        "second-wave peer must receive its own attempt budget"
+    );
+    assert!(elapsed > CONNECT_TIMEOUT && elapsed < Duration::from_secs(6));
+    for outcome in &outcomes[..2] {
+        assert!(outcome.3.duration_since(started) >= CONNECT_TIMEOUT);
+    }
+    // Acceptance witnesses the second wave after the first wave's deadline;
+    // it cannot timestamp the selector's private join_next completion event.
+    // The budget starts before server accept; use the pre-selection timestamp
+    // rather than incorrectly treating accept as the timeout start.
+    let original_deadline = started + CONNECT_TIMEOUT;
+    assert!(outcomes[2].1 >= original_deadline);
+    assert!(outcomes[3].1 >= original_deadline);
+    let response = outcomes[2].2.unwrap();
+    assert!(response.duration_since(outcomes[2].1) >= Duration::from_millis(500));
+    assert!(response > original_deadline);
+    assert!(outcomes[3].3 >= response + UPSTREAM_SELECTION_GRACE);
+    assert!(
+        outcomes[3].3.duration_since(outcomes[3].1) < CONNECT_TIMEOUT,
+        "silent fourth peer must be cancelled before completing its timeout"
+    );
+    for addr in &addrs[..2] {
+        assert_eq!(candidates.explorations(*addr), 1);
+        let (failures, retry_at) = candidates.failure_snapshot(*addr).unwrap();
+        assert_eq!(failures, 1, "one completed timeout is one failure");
+        assert!(
+            !candidates
+                .eligible(retry_at - Duration::from_nanos(1))
+                .contains(addr),
+            "completed timeout remains in cooldown before its exact boundary"
+        );
+        assert!(candidates.eligible(retry_at).contains(addr));
+    }
+    assert_eq!(
+        candidates.explorations(addrs[3]),
+        0,
+        "aborted work is not completed exploration"
+    );
+    let (failures, retry_at) = candidates.failure_snapshot(addrs[3]).unwrap();
+    assert_eq!(failures, 0, "cancelled attempt is not a completed failure");
+    assert!(candidates.eligible(retry_at).contains(&addrs[3]));
+}
+
 #[tokio::test]
 async fn initial_selection_keeps_first_protocol_success_grace() {
     let (info, seed) = cancellation_fixture();
