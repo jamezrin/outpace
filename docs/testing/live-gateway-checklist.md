@@ -59,8 +59,8 @@ a successful startup. API field meanings are in [native-api.md](../native-api.md
 
 - Observe decoded video, decoded audio, displayed pictures and played audio
   buffers separately when using VLC. Require initial progress within 90 seconds,
-  then a full 7,200 seconds of
-  active observation with continuing decoded-frame progress. A 60-second frame
+  then at least 7,200 seconds of active progress within the 7,500-second requested
+  observation. A 60-second frame
   watchdog detects stalls; bytes or FFmpeg timestamps alone do not establish
   decoded-frame progress. Keep sufficient valid status coverage across the whole
   active window and its tail; startup samples do not substitute for active time.
