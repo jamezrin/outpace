@@ -825,11 +825,22 @@ mod tests {
         drop(release);
         let drain = first.get(1, 0).await;
         let restored = backend.reciprocal.available_permits();
-        // Drive admission once, then leave its oneshot result unconsumed.
+        // Hold the worker until admission has explicitly returned Pending.
+        let buffered_reached = Arc::new(tokio::sync::Notify::new());
+        let (buffered_release, buffered_gate) = mpsc::channel();
+        backend.hooks.lock().unwrap().read_pause = Some((buffered_reached.clone(), buffered_gate));
         let mut buffered = Box::pin(first.reciprocal_get(1, 1));
-        let _ = buffered
+        let buffered_pending = buffered
             .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()));
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending();
+        let buffered_executing =
+            tokio::time::timeout(Duration::from_secs(5), buffered_reached.notified())
+                .await
+                .is_ok();
+        // Release before any assertion can unwind.
+        drop(buffered_release);
+        // FIFO drain proves the oneshot is ready; leave that result unconsumed.
         let drain2 = first.get(1, 0).await;
         let buffered_held = backend.reciprocal.available_permits();
         let mut successor = Box::pin(next_generation.reciprocal_get(1, 0));
@@ -845,6 +856,7 @@ mod tests {
         let bytes = reply.as_ref().map(|r| (r.data.clone(), r.header));
         let result_held = backend.reciprocal.available_permits();
         drop(reply);
+        assert!(buffered_pending && buffered_executing);
         assert!(pending && reached_read && waits && successor_waits);
         assert_eq!(
             (held, publication_free, restored, buffered_held, result_held),
