@@ -139,6 +139,14 @@ impl SessionCandidates {
             .map_or(0, |c| c.explorations)
     }
 
+    #[cfg(test)]
+    pub(super) fn failure_snapshot(&self, addr: SocketAddrV4) -> Option<(u32, Instant)> {
+        self.entries
+            .iter()
+            .find(|c| c.addr == addr)
+            .map(|c| (c.failures, c.retry_at))
+    }
+
     // A completed opportunity advances exploration even when its window is stale.
     // Cancelled, duplicate and unselected transports consume no opportunity.
     pub(super) fn explored(&mut self, addr: SocketAddrV4) {
