@@ -159,6 +159,63 @@ class OwnedPlaybackTests(unittest.TestCase):
             self.assertEqual(report['origin_monotonic'], config['origin_monotonic'])
             self.assertEqual(report['observed_seconds'], 0.25)
 
+    def test_serialized_endpoint_preserves_terminal_samples_and_stall_gap(self):
+        # Rounding the endpoint down must not put a real terminal sample after it.
+        for stalled in (False, True):
+            with self.subTest(stalled=stalled):
+                origin = 128.0
+                clock = [origin]
+                args = self.args()
+                args.seconds = 65.0004
+                args.poll_seconds = 5
+                processes = [Mock(), Mock()]
+                for process in processes:
+                    process.poll.return_value = None
+                    process.wait.return_value = 0
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                def sample(*_args):
+                    if clock[0] >= origin + 65:
+                        clock[0] = origin + 65.00031
+                        return status(10 if stalled else 140, 20 if stalled else 280)
+                    count = 10 if stalled else 10 + int(clock[0] - origin) * 2
+                    return status(count, count * 2)
+
+                with tempfile.TemporaryDirectory() as root, \
+                        patch.object(vlc.tempfile, 'mkdtemp', return_value=root), \
+                        patch.object(vlc.subprocess, 'run', return_value=SimpleNamespace(stdout=b'VLC fixture\n')), \
+                        patch.object(vlc.subprocess, 'Popen', side_effect=processes), \
+                        patch.object(vlc, 'free_port', side_effect=[18001, 18002]), \
+                        patch.object(vlc, 'status_request', side_effect=sample), \
+                        patch.object(vlc.time, 'monotonic', side_effect=lambda: clock[0]), \
+                        patch.object(vlc.time, 'sleep', side_effect=sleep), \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(vlc.compare(args, None, playback_urls=self.urls()), 0)
+                    report = json.loads(Path(root, 'comparison.json').read_text())
+                    endpoint = report['observed_seconds']
+                    self.assertEqual(report['origin_monotonic'], origin)
+                    for role in ('engine', 'outpace'):
+                        samples = [json.loads(line) for line in
+                                   Path(root, role + '-status.jsonl').read_text().splitlines()]
+                        self.assertEqual(len(samples), 14)
+                        terminal = samples[-1]['seconds']
+                        self.assertGreater(terminal, round(args.seconds, 3))
+                        self.assertLessEqual(terminal, endpoint)
+                        # An exact boundary needs no tolerance that admits future samples.
+                        self.assertGreater(65.0005, endpoint)
+                        gaps = report['clients'][role]['max_sampled_progress_gap_seconds']
+                        for key in vlc.PROGRESS:
+                            if stalled:
+                                self.assertGreater(gaps[key], 60)
+                            else:
+                                self.assertLess(gaps[key], 60)
+                    self.assertEqual(endpoint, (origin + 65.0004) - origin)
+                    self.assertNotEqual(endpoint, round(endpoint, 3))
+                    # Completion is an observation result, never a playback quality pass.
+                    self.assertIn('no quality pass/fail', report['limits'])
+
     def test_cancel_after_first_launch_registers_and_reaps_before_second(self):
         cancelled = False
         process = Mock()
