@@ -19,11 +19,16 @@ a successful startup. API field meanings are in [native-api.md](../native-api.md
   variable such as `ACE_CONTENT_ID`. The gitignored registry is LLM context only:
   no code, test or harness may read it. Keep values, derived infohashes, stream
   names, URLs, raw logs and media out of tracked files and shared output.
-- Use fresh private artifacts, bounded logs and HTTP deadlines, an absolute
-  observation budget and a separate total deadline that reserves setup and cleanup
-  time. A 7,500-second observation must not be shortened to absorb cleanup.
-  Terminate only owned children whose identity is verified. Do not attach to an
-  unrelated daemon.
+- For the matched two-hour profile, request a 7,500-second player observation
+  and enforce an 8,100-second total deadline with an outer supervisor. Budget at
+  most 120 seconds for preflight, 7,800 seconds for metadata negotiation, the
+  player observation and owned cleanup, and 180 seconds for postflight. The
+  requested observation includes player setup/startup; do not shorten it to
+  absorb preflight, metadata negotiation or cleanup. Exceeding a phase or total
+  deadline leaves the run incomplete. The comparator's `--seconds` selects the
+  requested observation, not the outer total deadline.
+- Use fresh private artifacts, bounded logs and HTTP deadlines. Terminate only
+  owned children whose identity is verified. Do not attach to an unrelated daemon.
 
 ## Admission and cleanup
 
