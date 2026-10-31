@@ -30,7 +30,7 @@ env:
 jobs:
   cross-build:
     name: Cross-build ARMv7 release binary
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -56,7 +56,7 @@ jobs:
   container-smoke:
     name: ARMv7 container startup and health smoke
     if: github.event_name == 'workflow_dispatch' && inputs.run_container_smoke
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - name: Checkout
