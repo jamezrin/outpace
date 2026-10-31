@@ -347,3 +347,43 @@ seconds. It is captured before the VLC version probe and client launches, so
 setup time is included. It remains present in partial reports. Use it only with
 samples from the same machine and monotonic clock domain; it is neither UTC nor
 a cross-host clock or an exact first-decode measurement.
+
+### Optional timestamped client diagnostics
+
+`vlc_compare.py --timestamped-diagnostics` (or keyword-only
+`compare(..., diagnostics=True)`) captures both clients' stdout and stderr through
+one owned selector thread. Disabled mode retains direct regular-file logging.
+VLC argv and verbosity are unchanged; the version probe still uses `--vlc` and
+has a cancellable ten-second timeout. No media proxy is inserted.
+
+In this mode `engine-vlc.log`, `outpace-vlc.log`, and `probe-vlc.log` are private
+0600 JSONL files containing base64 raw byte prefixes. They are persisted only
+after owned children are reaped and capture has finished. A crash can lose buffered
+evidence. Receipt timestamps share `origin_monotonic` with status observations;
+they bracket parent pipe receipt, never VLC emission or server delivery. Order is
+per stream only. Cleanup records are explicitly marked and do not extend the
+reported observation endpoint.
+
+Playback retention is at most 1 MiB encoded JSONL and 4096 records per role;
+the probe has 64 KiB/64 records. Records are admitted whole, at most 16 KiB,
+with at most 4096 raw prefix bytes per line and reads of at most 8192 bytes.
+After a cap, draining continues without parsing further messages. Summary
+counters saturate at signed 64-bit maximum. Missing/capped records cannot prove
+message absence; `diagnostics.complete` is false for exhausted retention, forced
+pipe closure, capture or persistence failure. This is separate from playback
+quality and the existing observation-complete flag.
+
+The fixed executable wrapper's RLIMIT_FSIZE remains installed, but limits on
+regular-file writes do not bound parent memory capture from pipes. Parent limits
+replace direct regular-file retention in opt-in mode. Encoded storage is bounded
+by 2 MiB + 64 KiB, plus bounded prefixes, chunks, and at most 64 KiB of added
+numeric/enum metadata. Python/runtime overhead is additional; this is no exact
+RSS bound. Drain CPU remains proportional to output and can perturb scheduling.
+No CPU/latency performance guarantee is claimed.
+
+Bounded sample intervals report normalized state and selected counter deltas;
+invalid/missing counters are unknown and decreases are resets. Flat input/decode
+or advancing-input/flat-decode labels describe sampled counters only. They cannot
+establish TCP delivery, pause provenance, source failure, or causal ordering with
+client messages. Raw version/status/log data remain private. No new live acceptance
+or server-wire evidence follows from this diagnostic option.
