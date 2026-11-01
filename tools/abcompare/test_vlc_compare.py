@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -384,7 +385,7 @@ class DiagnosticIntegrationTests(unittest.TestCase):
         import os
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / 'fake-vlc'
-            executable.write_text('#!/usr/bin/python3\nimport os,sys,time\n'
+            executable.write_text(f'#!{sys.executable}\nimport os,sys,time\n'
                                   'if "--version" in sys.argv:\n'
                                   ' print("private-version"); sys.exit(0)\n'
                                   'os.write(1,b"private-message\\n"); time.sleep(10)\n')
@@ -408,6 +409,7 @@ class DiagnosticIntegrationTests(unittest.TestCase):
                 result = vlc.compare(args, '0123456789abcdef0123456789abcdef01234567',
                                      diagnostics=True)
             self.assertEqual(result, 2)
+            self.assertEqual(len(children), 2, 'probe and first client launched before second-client failure')
             self.assertTrue(all(child.poll() is not None for child in children))
             summary = json.loads((Path(directory) / 'comparison.json').read_text())
             self.assertIn('diagnostics', summary)
@@ -421,7 +423,7 @@ class DiagnosticIntegrationTests(unittest.TestCase):
         for scenario in ('nonzero', 'cancel', 'timeout', 'disk', 'short', 'close', 'abrupt'):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 executable = Path(directory) / 'fake-vlc'
-                executable.write_text('#!/usr/bin/python3\nimport os,sys,time\n'
+                executable.write_text(f'#!{sys.executable}\nimport os,sys,time\n'
                     'if "--version" in sys.argv:\n'
                     + (' sys.exit(3)\n' if scenario == 'nonzero' else
                        ' time.sleep(20)\n' if scenario in ('cancel', 'timeout') else
@@ -471,6 +473,13 @@ class DiagnosticIntegrationTests(unittest.TestCase):
                         diagnostics=True, cancel_requested=(
                             lambda: time.monotonic() - start > 0.1) if scenario == 'cancel' else None)
                 self.assertEqual(result, 130 if scenario == 'cancel' else 2)
+                self.assertTrue(children, 'fixture must launch a real probe')
+                if scenario == 'nonzero':
+                    self.assertEqual(len(children), 1)
+                    self.assertEqual(children[0].returncode, 3)
+                if scenario == 'abrupt':
+                    self.assertEqual(len(children), 3)
+                    self.assertEqual(children[0].returncode, 0)
                 self.assertTrue(all(c.poll() is not None and c.stdout.closed and c.stderr.closed
                                     for c in children))
                 self.assertTrue(all(s.closed for s in sinks))
