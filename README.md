@@ -545,16 +545,36 @@ Start with these durable docs instead of a session resume file:
 - `docs/superpowers/plans/` and `docs/superpowers/specs/` - implementation plans
   and design specs retained as historical project records.
 
-The issue tracker is the canonical backlog:
+### Roadmap
 
-- #1 live robustness validation;
-- #2 PEX advertised-window peer ranking;
-- #3 broadcast persistence and ingest-resume continuity;
-- #4 inbound seeding lifecycle and policy;
-- #5 disk-backed piece cache;
-- #6 native CLI/API polish;
-- #7 SRT ingest;
-- #8 removal of the old resume workflow.
+GitHub milestones track release scope and remaining work; coordination epics link
+related issues. Closed milestone history:
+
+- [v0.3.0](https://github.com/jamezrin/outpace/milestone/1).
+- [v0.4.0](https://github.com/jamezrin/outpace/milestone/2) — architecture realignment
+  ([#189](https://github.com/jamezrin/outpace/issues/189)).
+- [v0.6.0](https://github.com/jamezrin/outpace/milestone/4) — media and VOD
+  ([#199](https://github.com/jamezrin/outpace/issues/199)).
+- [v0.7.0](https://github.com/jamezrin/outpace/milestone/5) — supported Ace HTTP compatibility
+  ([#201](https://github.com/jamezrin/outpace/issues/201)).
+- [v0.8.0](https://github.com/jamezrin/outpace/milestone/6) — broadcast and seeding
+  ([#205](https://github.com/jamezrin/outpace/issues/205)).
+
+Active work and next steps:
+
+- [v0.9.0](https://github.com/jamezrin/outpace/milestone/3) — live gateway hardening
+  ([#195](https://github.com/jamezrin/outpace/issues/195)). The
+  [release is published](https://github.com/jamezrin/outpace/releases/tag/v0.9.0),
+  but the milestone remains open for follow-up work.
+- [v1.0.0](https://github.com/jamezrin/outpace/milestone/7) — production replacement
+  gate ([#208](https://github.com/jamezrin/outpace/issues/208)); the milestone and
+  gate remain open.
+- [Post-1.0](https://github.com/jamezrin/outpace/milestone/8) — deferred work beyond
+  the v1.0 scope.
+
+See [Scope Boundaries](#scope-boundaries) for the supported target and
+[#212](https://github.com/jamezrin/outpace/issues/212) for the permanent
+non-goals and compatibility scope contract.
 
 ## Operational Notes
 
