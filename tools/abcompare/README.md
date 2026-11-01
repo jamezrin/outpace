@@ -355,8 +355,10 @@ a cross-host clock or an exact first-decode measurement.
 one owned selector thread. Disabled mode retains direct regular-file logging.
 Default VLC argv and verbosity are unchanged. With timestamped diagnostics,
 `--diagnostic-verbosity 1` or `2` explicitly adds that verbosity to playback
-clients only; the selected level is retained in private configuration. The version
-probe remains unchanged, uses `--vlc` and has a cancellable ten-second timeout.
+clients only; the selected level is retained in private configuration. An explicit
+nonzero level removes inherited `VLC_VERBOSE` from playback clients so that the
+selected option takes effect; the probe and zero-level environment are preserved.
+The version probe remains unchanged, uses `--vlc` and has a cancellable ten-second timeout.
 Programmatic callers may supply `args.diagnostic_verbosity`; absent means zero.
 Nonzero verbosity without timestamped diagnostics is rejected before launch.
 No media proxy is inserted.

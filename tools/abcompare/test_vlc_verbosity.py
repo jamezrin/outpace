@@ -47,19 +47,30 @@ class VerbosityTests(unittest.TestCase):
                 args = self.args(level)
                 args.vlc = str(executable)
                 real_launch = subprocess.Popen
-                calls, children = [], []
+                calls, children, environments = [], [], []
                 def launch(argv, **kwargs):
                     calls.append(argv)
+                    environments.append(dict(kwargs["env"]))
                     if len(calls) == 3:
                         raise OSError('controlled second launch failure')
                     child = real_launch(argv, **kwargs)
                     children.append(child)
                     return child
-                with patch.object(vlc.subprocess, 'Popen', side_effect=launch), \
+                with patch.dict(vlc.os.environ, {'VLC_VERBOSE': '0', 'OUTPACE_TEST_PRESERVED': 'yes'}), \
+                        patch.object(vlc.subprocess, 'Popen', side_effect=launch), \
                         patch.object(vlc.tempfile, 'mkdtemp', return_value=directory), \
                         redirect_stdout(io.StringIO()):
                     self.assertEqual(vlc.compare(args, '0123456789abcdef0123456789abcdef01234567', diagnostics=True), 2)
                 self.assertEqual(calls[0], [str(executable), '--version'])
+                self.assertEqual(environments[0]['VLC_VERBOSE'], '0')
+                for environment in environments[1:]:
+                    self.assertEqual(environment['OUTPACE_TEST_PRESERVED'], 'yes')
+                    if level:
+                        self.assertFalse(
+                            'VLC_VERBOSE' in environment,
+                            'explicit playback verbosity must override inherited setting')
+                    else:
+                        self.assertEqual(environment['VLC_VERBOSE'], '0')
                 self.assertEqual(len(children), 2)
                 self.assertTrue(all(child.poll() is not None for child in children))
                 for argv in calls[1:]:

@@ -185,6 +185,10 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     env = dict(os.environ)
     env.pop("ACE_CONTENT_ID", None)
+    playback_env = dict(env) if verbosity else env
+    if verbosity:
+        # VLC's console logger prioritizes this variable over its --verbose option.
+        playback_env.pop("VLC_VERBOSE", None)
     collector = Collector(started) if diagnostics else None
     diagnostic_failure = None
     capture_stopped = False
@@ -261,7 +265,7 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
                     *([f"--verbose={verbosity}"] if verbosity else []),
                     "--stats", str(playlist),
                 ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if diagnostics else log,
-                   stderr=subprocess.PIPE if diagnostics else log, env=env)
+                   stderr=subprocess.PIPE if diagnostics else log, env=playback_env)
             finally:
                 if log is not None:
                     log.close()
