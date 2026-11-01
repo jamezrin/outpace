@@ -296,6 +296,8 @@ manual aarch64 16 KiB-page qualification procedure.
 For a checked-in production Compose deployment, safe exposure defaults, leecher/disk/broadcast
 examples, DNS overrides, and upgrade guidance, see
 [`docs/deployment.md`](docs/deployment.md).
+For an engine replacement checklist and standalone migration profiles, see
+[`docs/engine-migration.md`](docs/engine-migration.md).
 
 ## Cutting a Release
 
