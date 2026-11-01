@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -377,3 +378,166 @@ class ArgumentsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiagnosticIntegrationTests(unittest.TestCase):
+    def test_real_fake_executable_probe_capture_and_second_launch_failure(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'fake-vlc'
+            executable.write_text(f'#!{sys.executable}\nimport os,sys,time\n'
+                                  'if "--version" in sys.argv:\n'
+                                  ' print("private-version"); sys.exit(0)\n'
+                                  'os.write(1,b"private-message\\n"); time.sleep(10)\n')
+            executable.chmod(0o700)
+            args = SimpleNamespace(vlc=str(executable), engine_url='http://localhost:1',
+                                   outpace_url='http://localhost:2', client_warp='off',
+                                   server_warp='unknown', network_caching=1000,
+                                   seconds=0.2, poll_seconds=0.05)
+            real_popen = subprocess.Popen
+            children = []
+            def launch(argv, **kwargs):
+                if len(children) == 2:
+                    raise OSError('private-error')
+                child = real_popen(argv, **kwargs)
+                children.append(child)
+                return child
+            output = io.StringIO()
+            with patch.object(vlc.subprocess, 'Popen', side_effect=launch), \
+                    patch.object(vlc.tempfile, 'mkdtemp', return_value=directory), \
+                    redirect_stdout(output):
+                result = vlc.compare(args, '0123456789abcdef0123456789abcdef01234567',
+                                     diagnostics=True)
+            self.assertEqual(result, 2)
+            self.assertEqual(len(children), 2, 'probe and first client launched before second-client failure')
+            self.assertTrue(all(child.poll() is not None for child in children))
+            summary = json.loads((Path(directory) / 'comparison.json').read_text())
+            self.assertIn('diagnostics', summary)
+            self.assertNotIn('private-', json.dumps(summary) + output.getvalue())
+            log = Path(directory) / 'engine-vlc.log'
+            self.assertEqual(os.stat(log).st_mode & 0o777, 0o600)
+
+    def test_probe_failure_cancel_timeout_and_persistence_cleanup(self):
+        import time
+        import threading
+        for scenario in ('nonzero', 'cancel', 'timeout', 'disk', 'short', 'close', 'abrupt'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                executable = Path(directory) / 'fake-vlc'
+                executable.write_text(f'#!{sys.executable}\nimport os,sys,time\n'
+                    'if "--version" in sys.argv:\n'
+                    + (' sys.exit(3)\n' if scenario == 'nonzero' else
+                       ' time.sleep(20)\n' if scenario in ('cancel', 'timeout') else
+                       ' print("version"); sys.exit(0)\n') +
+                    ('sys.exit(4)\n' if scenario == 'abrupt' else 'time.sleep(20)\n'))
+                executable.chmod(0o700)
+                args = SimpleNamespace(vlc=str(executable), engine_url='http://localhost:1',
+                                       outpace_url='http://localhost:2', client_warp='off',
+                                       server_warp='unknown', network_caching=1000,
+                                       seconds=0.25, poll_seconds=0.05)
+                children = []
+                real_popen = subprocess.Popen
+                def launch(*argv, **kwargs):
+                    child = real_popen(*argv, **kwargs)
+                    children.append(child)
+                    return child
+                start = time.monotonic()
+                real_open = Path.open
+                class FailedSink:
+                    def __init__(self, sink):
+                        self.sink = sink
+                    def fileno(self):
+                        return self.sink.fileno()
+                    def write(self, data):
+                        if scenario == 'short':
+                            return max(0, len(data) - 1)
+                        if scenario == 'close':
+                            return self.sink.write(data)
+                        raise OSError('private-disk-error')
+                    def close(self):
+                        self.sink.close()
+                        if scenario == 'close':
+                            raise OSError('private-close-error')
+                sinks = []
+                def open_file(path, *args, **kwargs):
+                    sink = real_open(path, *args, **kwargs)
+                    if scenario in ('disk', 'short', 'close') and path.name.endswith('-vlc.log'):
+                        sinks.append(sink)
+                        return FailedSink(sink)
+                    return sink
+                with patch.object(vlc.subprocess, 'Popen', side_effect=launch), \
+                        patch.object(vlc.tempfile, 'mkdtemp', return_value=directory), \
+                        patch.object(Path, 'open', open_file), \
+                        patch.object(vlc, 'status_request', return_value=status(1, 1)), \
+                        redirect_stdout(io.StringIO()):
+                    result = vlc.compare(args, '0123456789abcdef0123456789abcdef01234567',
+                        diagnostics=True, cancel_requested=(
+                            lambda: time.monotonic() - start > 0.1) if scenario == 'cancel' else None)
+                self.assertEqual(result, 130 if scenario == 'cancel' else 2)
+                self.assertTrue(children, 'fixture must launch a real probe')
+                if scenario == 'nonzero':
+                    self.assertEqual(len(children), 1)
+                    self.assertEqual(children[0].returncode, 3)
+                if scenario == 'abrupt':
+                    self.assertEqual(len(children), 3)
+                    self.assertEqual(children[0].returncode, 0)
+                self.assertTrue(all(c.poll() is not None and c.stdout.closed and c.stderr.closed
+                                    for c in children))
+                self.assertTrue(all(s.closed for s in sinks))
+                self.assertFalse(any(t.name == 'vlc-diagnostics' for t in threading.enumerate()))
+                summary = json.loads((Path(directory) / 'comparison.json').read_text())
+                self.assertNotIn('private-', json.dumps(summary))
+                if scenario in ('disk', 'short', 'close'):
+                    self.assertEqual(summary['diagnostics']['failure'], 'persistence_failed')
+
+
+class DiagnosticFinishFaultTests(unittest.TestCase):
+    def test_finish_fault_preserves_cancel_and_closes_all_logs(self):
+        collector = Mock()
+        collector.finish.side_effect = RuntimeError('private-cleanup')
+        collector.thread.is_alive.return_value = False
+        collector.snapshot.return_value = {}
+        collector.data = {}
+        opened = []
+        original_open = Path.open
+        def capture_open(path, *a, **kw):
+            file = original_open(path, *a, **kw)
+            if a and a[0] == 'xb':opened.append(file)
+            return file
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(vlc.tempfile, 'mkdtemp', return_value=root), \
+                patch.object(vlc, 'Collector', return_value=collector), \
+                patch.object(vlc.subprocess, 'Popen', side_effect=KeyboardInterrupt), \
+                patch.object(Path, 'open', capture_open), redirect_stdout(io.StringIO()):
+            args = OwnedPlaybackTests().args()
+            code = vlc.compare(args, None, playback_urls=OwnedPlaybackTests().urls(), diagnostics=True)
+            summary = json.loads(Path(root, 'comparison.json').read_text())
+        self.assertEqual(code, 130)
+        self.assertEqual(len(opened), 3)
+        self.assertTrue(all(file.closed for file in opened))
+        self.assertFalse(summary['diagnostics']['complete'])
+        self.assertEqual(summary['diagnostics']['failure'], 'cleanup_failed')
+
+    def test_real_owner_stops_when_finish_reports_fault_after_join(self):
+        from vlc_diagnostics import Collector
+        owners = []
+        class FailingFinish(Collector):
+            def __init__(self, origin):
+                super().__init__(origin)
+                owners.append(self)
+            def finish(self):
+                super().finish()
+                raise RuntimeError('private-finalization')
+        for primary in (KeyboardInterrupt, OSError('private-primary')):
+            with self.subTest(primary=type(primary).__name__), tempfile.TemporaryDirectory() as root, \
+                    patch.object(vlc.tempfile, 'mkdtemp', return_value=root), \
+                    patch.object(vlc, 'Collector', FailingFinish), \
+                    patch.object(vlc.subprocess, 'Popen', side_effect=primary), \
+                    redirect_stdout(io.StringIO()):
+                code = vlc.compare(OwnedPlaybackTests().args(), None,
+                                   playback_urls=OwnedPlaybackTests().urls(), diagnostics=True)
+                summary = json.loads(Path(root, 'comparison.json').read_text())
+                self.assertEqual(code, 130 if primary is KeyboardInterrupt else 2)
+                self.assertEqual(summary['diagnostics']['failure'], 'cleanup_failed')
+                self.assertFalse(owners[-1].thread.is_alive())
+                if primary is not KeyboardInterrupt:
+                    self.assertEqual(summary['failure'], 'runner_error_see_private_logs')

@@ -20,6 +20,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from vlc_diagnostics import Collector, Correlation
+
 
 COUNTERS = (
     "decodedvideo", "displayedpictures", "decodedaudio", "playedabuffers",
@@ -151,7 +153,7 @@ def playback_targets(args, content_id, playback_urls):
 
 
 def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
-            artifact_parent=None):
+            artifact_parent=None, diagnostics=False):
     targets = playback_targets(args, content_id, playback_urls)
     if cancel_requested is not None and not callable(cancel_requested):
         raise ValueError("cancellation callback must be callable")
@@ -178,27 +180,73 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     env = dict(os.environ)
     env.pop("ACE_CONTENT_ID", None)
-    version = subprocess.run([args.vlc, "--version"], capture_output=True,
-                             timeout=10, env=env, check=True).stdout.decode(errors="replace")
-    config = {
-        "origin_monotonic": started,
-        "engine_url": args.engine_url, "outpace_url": args.outpace_url,
-        "client_warp": args.client_warp, "server_warp": args.server_warp,
-        "network_caching_ms": args.network_caching, "seconds": args.seconds,
-        "poll_seconds": args.poll_seconds, "vlc_version": version.splitlines()[0],
-    }
-    (root / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    print(f"Private artifacts: {root}", flush=True)
+    collector = Collector(started) if diagnostics else None
+    diagnostic_failure = None
+    capture_stopped = False
+    private_logs = {}
+    probe = None
+    if not diagnostics:
+        version = subprocess.run([args.vlc, "--version"], capture_output=True,
+                                 timeout=10, env=env, check=True).stdout.decode(errors="replace")
     try:
+        if diagnostics:
+            # Precreate every private sink before any owned process is launched.
+            for role in ("probe", "engine", "outpace"):
+                private_logs[role] = (root / f"{role}-vlc.log").open("xb")
+                os.fchmod(private_logs[role].fileno(), 0o600)
+            probe = subprocess.Popen([args.vlc, "--version"], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            collector.attach("probe", probe)
+            probe_deadline = time.monotonic() + 10
+            while probe.poll() is None:
+                if cancelled():
+                    interrupted = True
+                    break
+                if collector.failed.is_set():
+                    raise OSError("diagnostic capture failed")
+                if time.monotonic() >= probe_deadline:
+                    raise subprocess.TimeoutExpired("version probe", 10)
+                time.sleep(0.05)
+            if not interrupted and probe.wait() != 0:
+                raise subprocess.CalledProcessError(probe.returncode, "version probe")
+        if diagnostics:
+            # The probe is reaped before playback; allow receipt of its final EOF.
+            stop_client(probe)
+            until = time.monotonic() + 0.25
+            while time.monotonic() < until:
+                with collector.lock:
+                    if not any(c.role == "probe" for c in collector.pipes.values()):
+                        break
+                time.sleep(0.01)
+            collector.close_role("probe")
+            with collector.lock:
+                rows = bytes(collector.data.get("probe", b""))
+            first = next((json.loads(row) for row in rows.splitlines()
+                          if json.loads(row)["stream"] == "stdout"), None)
+            version = (base64.b64decode(first["raw_base64"]).decode(errors="replace")
+                       if first else "unknown")
+            version_truncated = bool(first and first["oversized"])
+        config = {
+            "origin_monotonic": started,
+            "engine_url": args.engine_url, "outpace_url": args.outpace_url,
+            "client_warp": args.client_warp, "server_warp": args.server_warp,
+            "network_caching_ms": args.network_caching, "seconds": args.seconds,
+            "poll_seconds": args.poll_seconds, "vlc_version": (version.splitlines() or ["unknown"])[0],
+        }
+        if diagnostics:
+            config["diagnostics"] = {"schema_version": 1, "origin_monotonic": started,
+                                     "probe_version_truncated": version_truncated}
+        (root / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        print(f"Private artifacts: {root}", flush=True)
         for name, base in (("engine", args.engine_url), ("outpace", args.outpace_url)):
-            if cancelled():
+            if interrupted or cancelled():
                 interrupted = True
                 break
             playlist = root / f"{name}.m3u"
             playlist.touch(mode=0o600, exist_ok=False)
             playlist.write_text("#EXTM3U\n" + targets[name] + "\n")
             port, password = free_port(), secrets.token_urlsafe(24)
-            log = (root / f"{name}-vlc.log").open("wb")
+            log = None if diagnostics else (root / f"{name}-vlc.log").open("wb")
             try:
                 process = subprocess.Popen([
                     args.vlc, "--ignore-config", "--no-one-instance", "--intf=dummy",
@@ -206,12 +254,17 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
                     f"--http-password={password}", "--vout=vdummy", "--aout=adummy",
                     f"--network-caching={args.network_caching}", "--no-video-title-show",
                     "--stats", str(playlist),
-                ], stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
+                ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if diagnostics else log,
+                   stderr=subprocess.PIPE if diagnostics else log, env=env)
             finally:
-                log.close()
+                if log is not None:
+                    log.close()
             clients.append({"name": name, "process": process, "port": port,
                             "password": password, "observation": Observation(),
                             "launch_seconds": time.monotonic() - started})
+            if diagnostics:
+                clients[-1]["correlation"] = Correlation()
+                collector.attach(name, process)
             if cancelled():
                 interrupted = True
                 break
@@ -220,6 +273,9 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
         while not interrupted and time.monotonic() < deadline:
             if cancelled():
                 interrupted = True
+                break
+            if collector is not None and collector.failed.is_set():
+                failure = "diagnostic_capture_failed"
                 break
             for client in clients:
                 if cancelled():
@@ -237,11 +293,18 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
                     if not isinstance(status, dict):
                         raise ValueError("invalid status")
                     elapsed = time.monotonic() - started
-                    client["observation"].sample(elapsed, status)
+                    if diagnostics:
+                        client["correlation"].sample(elapsed, status)
+                        observed_status = dict(status, state=client["correlation"].previous[1])
+                    else:
+                        observed_status = status
+                    client["observation"].sample(elapsed, observed_status)
                     with (root / f'{client["name"]}-status.jsonl').open("a") as out:
                         out.write(json.dumps({"seconds": elapsed, "status": status}) + "\n")
                 except (OSError, ValueError):
                     client["observation"].errors += 1
+                    if diagnostics:
+                        client["correlation"].sample(time.monotonic() - started, {})
             if failure or interrupted:
                 break
             next_poll += args.poll_seconds
@@ -249,6 +312,8 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
             next_poll = max(next_poll, time.monotonic())
             wake = min(next_poll, deadline)
             while not cancelled():
+                if collector is not None and collector.failed.is_set():
+                    break
                 remaining = wake - time.monotonic()
                 if remaining <= 0:
                     break
@@ -257,16 +322,52 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
             interrupted = True
     except KeyboardInterrupt:
         interrupted = True
-    except (OSError, ValueError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         failure = "runner_error_see_private_logs"
     finally:
         observed_seconds = time.monotonic() - started
+        if collector is not None:
+            collector.endpoint = started + observed_seconds
+        if probe is not None:
+            try:
+                stop_client(probe)
+            except (OSError, subprocess.TimeoutExpired):
+                failure = failure or "probe_cleanup_failed"
         for client in clients:
             try:
                 client["exit_code"] = stop_client(client["process"])
             except (OSError, subprocess.TimeoutExpired):
                 client["exit_code"] = None
-                failure = "client_cleanup_failed"
+                failure = failure or "client_cleanup_failed"
+        if collector is not None:
+            try:
+                collector.finish()
+            except (Exception, KeyboardInterrupt) as error:
+                interrupted |= isinstance(error, KeyboardInterrupt)
+                diagnostic_failure = "cleanup_failed"
+                collector.stop.set()
+                try:
+                    collector.thread.join(1)
+                except (Exception, KeyboardInterrupt) as error:
+                    interrupted |= isinstance(error, KeyboardInterrupt)
+            capture_stopped = not collector.thread.is_alive()
+            if not capture_stopped:
+                diagnostic_failure = "cleanup_failed"
+            if collector.failed.is_set() and diagnostic_failure is None:
+                diagnostic_failure = "capture_failed"
+            for role, log in private_logs.items():
+                try:
+                    # Never read mutable buffers while their owner may still run.
+                    data = collector.data.get(role, b"") if capture_stopped else b""
+                    if log.write(data) != len(data):
+                        diagnostic_failure = "persistence_failed"
+                except OSError:
+                    diagnostic_failure = "persistence_failed"
+                finally:
+                    try:
+                        log.close()
+                    except OSError:
+                        diagnostic_failure = "persistence_failed"
     # Completion boundary: reconcile cancellation through all owned cleanup.
     # Keep cleanup failures even when cancellation determines the exit status.
     if cancelled():
@@ -275,6 +376,8 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
     for client in clients:
         report = client["observation"].report(observed_seconds)
         report.update(launch_seconds=client["launch_seconds"], cleanup_exit_code=client["exit_code"])
+        if diagnostics:
+            report["diagnostic_correlation"] = client["correlation"].report()
         reports[client["name"]] = report
     complete = (len(reports) == 2 and not interrupted and failure is None
                 and all(r["samples"] and any(v is not None for v in
@@ -290,16 +393,39 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
         "limits": "Sampled dummy-output VLC decode observations; no quality pass/fail, "
                   "exact startup, sub-poll stall, content identity or live-position claim.",
     }
-    (root / "comparison.json").write_text(json.dumps(summary, indent=2) + "\n")
+    if diagnostics:
+        capture = collector.snapshot() if capture_stopped else {}
+        summary["diagnostics"] = {
+            "schema_version": 1, "origin_monotonic": started,
+            "failure": diagnostic_failure,
+            "complete": not diagnostic_failure and set(capture) == {"probe", "engine", "outpace"} and all(
+                not r["retention_exhausted"] and not r["forced_close"] and r["eof_streams"] == 2
+                for r in capture.values()),
+            "capture": capture, "metadata_truncated": any(
+                c["correlation"].omitted for c in clients),
+        }
+    try:
+        (root / "comparison.json").write_text(json.dumps(summary, indent=2) + "\n")
+    except OSError:
+        if not diagnostics:
+            raise
+        print("Unable to persist diagnostic comparison.")
+        return 130 if interrupted else 2
     lines = [f"Observation complete: {bool(complete)} (no quality verdict)"]
     for name, report in reports.items():
         lines.append(f"{name}: counters={report['last_counters']}; "
                      f"max sampled gaps={report['max_sampled_progress_gap_seconds']}; "
                      f"control errors={report['control_errors']}; resets={report['counter_resets']}")
     lines.append(summary["limits"])
-    (root / "comparison.txt").write_text("\n".join(lines) + "\n")
+    try:
+        (root / "comparison.txt").write_text("\n".join(lines) + "\n")
+    except OSError:
+        if not diagnostics:
+            raise
+        print("Unable to persist diagnostic comparison.")
+        return 130 if interrupted else 2
     print("\n".join(lines))
-    return 130 if interrupted else (0 if complete else 2)
+    return 130 if interrupted else (0 if complete and diagnostic_failure is None else 2)
 
 
 def main():
@@ -310,6 +436,7 @@ def main():
     parser.add_argument("--poll-seconds", type=positive, default=5)
     parser.add_argument("--network-caching", type=int, default=1000, metavar="MS")
     parser.add_argument("--vlc", default="cvlc")
+    parser.add_argument("--timestamped-diagnostics", action="store_true")
     parser.add_argument("--client-warp", choices=("on", "off", "unknown"), default="unknown")
     parser.add_argument("--server-warp", choices=("on", "off", "mixed", "unknown"), default="unknown")
     args = parser.parse_args()
@@ -328,7 +455,8 @@ def main():
 
     old_handlers = {sig: signal.signal(sig, terminate) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
-        return compare(args, content_id, cancel_requested=lambda: cancelled)
+        return compare(args, content_id, cancel_requested=lambda: cancelled,
+                       diagnostics=args.timestamped_diagnostics)
     except (OSError, subprocess.SubprocessError):
         print("Unable to initialize VLC comparison; verify VLC installation and permissions.")
         return 2
