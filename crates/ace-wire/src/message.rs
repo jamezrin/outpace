@@ -161,7 +161,7 @@ impl PeerMessage {
             }),
             _ => None,
         };
-        let msg = typed.unwrap_or(PeerMessage::Unknown {
+        let msg = typed.unwrap_or_else(|| PeerMessage::Unknown {
             id,
             payload: p.to_vec(),
         });
