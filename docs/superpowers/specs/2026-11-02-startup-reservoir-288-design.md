@@ -1,6 +1,6 @@
 # Packet-slice startup observation (#288)
 
-Status: implemented and independently reviewed; 21 focused startup tests, the full engine suite (708 passed, zero failures, one ignored benchmark), and repository lint/format/hygiene gates pass. PR integration is pending. Independent increment from the peer receive-buffer PR.
+Status: implemented and independently reviewed; 21 focused startup tests, the full engine suite (708 passed, zero failures, one ignored benchmark), and repository lint/format/hygiene gates pass. Merged through PR #316 after successful CI. Independent increment from the peer receive-buffer PR.
 
 Replace StartupReservoir's byte-at-a-time observation loop with borrowed complete 188-byte packet slices. Fill only an existing partial packet, then observe aligned slices directly, and retain a trailing partial packet. Use checked slice-to-array references for ts_timing; no unsafe code or new parser, dependency, configuration or public interface.
 

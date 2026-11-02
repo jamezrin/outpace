@@ -35,14 +35,14 @@ pub(crate) async fn prepare_reply(
             let chunk = u16::from_be_bytes(payload[8..10].try_into().ok()?);
             let reciprocal;
             let ordinary;
-            let (data, stored_header) = match profile {
+            let (data, stored_header): (&[u8], [u8; 8]) = match profile {
                 ServeProfile::Reciprocal => {
                     reciprocal =
                         PieceStore::shared_reciprocal_chunk(store, piece as u64, chunk).await?;
-                    (&reciprocal.data, reciprocal.header)
+                    (reciprocal.data(), reciprocal.header)
                 }
                 ServeProfile::Inbound { .. } => {
-                    ordinary = PieceStore::shared_chunk(store, piece as u64, chunk).await?;
+                    ordinary = PieceStore::shared_serving_chunk(store, piece as u64, chunk).await?;
                     (&ordinary.0, ordinary.1)
                 }
             };
@@ -80,3 +80,9 @@ pub(crate) async fn prepare_reply(
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod serving_bench;
+
+#[cfg(test)]
+mod shared_reply_tests;

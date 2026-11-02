@@ -7,6 +7,7 @@
 //! piece so operators can retain far more reseed data without paying RAM. Both share the same
 //! `max_bytes` budget and public API; only the disk backend touches the filesystem, and only in
 //! [`chunk`](PieceStore::chunk) / the `put_chunk*` writers.
+use bytes::Bytes;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,9 +16,16 @@ use tokio::sync::Mutex;
 
 // Declaration order ensures payload storage is released before disk admission.
 pub(crate) struct ReciprocalChunk {
-    pub(crate) data: Vec<u8>,
+    data: Bytes,
     pub(crate) header: [u8; 8],
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ReciprocalChunk {
+    /// Borrow payload while its disk admission remains owned by this result.
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 /// Maximum request block accepted from a standard BitTorrent peer (BEP 3 convention).
@@ -143,11 +151,11 @@ impl Backend {
     }
 }
 
-/// In-RAM backend: today's `BTreeMap` piece store, moved verbatim behind the backend boundary.
+/// In-RAM backend with independently allocated immutable chunk payloads.
 #[derive(Debug, Default)]
 struct MemoryBackend {
     /// piece index -> (chunk index -> TS payload bytes)
-    pieces: BTreeMap<u64, BTreeMap<u16, Vec<u8>>>,
+    pieces: BTreeMap<u64, BTreeMap<u16, Bytes>>,
     /// piece index -> Acestream's 8-byte live piece header.
     headers: BTreeMap<u64, [u8; 8]>,
 }
@@ -164,7 +172,7 @@ impl MemoryBackend {
             .or_insert(header);
         let entry = self.pieces.entry(piece).or_default();
         let removed = entry
-            .insert(chunk, data.to_vec())
+            .insert(chunk, Bytes::copy_from_slice(data))
             .map_or(0, |old| old.len() as u64);
         Stored {
             added: data.len() as u64,
@@ -176,7 +184,7 @@ impl MemoryBackend {
         self.pieces
             .get(&piece)?
             .get(&chunk)
-            .map(|v| Cow::Borrowed(v.as_slice()))
+            .map(|v| Cow::Borrowed(v.as_ref()))
     }
 
     fn header(&self, piece: u64) -> Option<[u8; 8]> {
@@ -283,7 +291,7 @@ impl PieceStore {
         let complete = wire
             .chunks_exact(chunk as usize)
             .enumerate()
-            .map(|(i, bytes)| (i as u16, bytes.to_vec()))
+            .map(|(i, bytes)| (i as u16, Bytes::copy_from_slice(bytes)))
             .collect();
         let removed = memory
             .pieces
@@ -393,8 +401,8 @@ impl PieceStore {
     }
 
     /// Read a chunk from a shared store without running disk I/O on a Tokio worker thread.
-    /// Memory stores take the ordinary async lock and preserve their zero-copy internal path;
-    /// disk stores perform the synchronous compatibility operation on the blocking pool.
+    /// Memory stores return an owned compatibility copy under the ordinary async lock;
+    /// internal serving uses shared payload handles instead. Disk reads run on the blocking pool.
     pub async fn shared_chunk(
         store: &Arc<Mutex<Self>>,
         piece: u64,
@@ -415,6 +423,30 @@ impl PieceStore {
             }
         };
         handle.get(piece, chunk).await
+    }
+
+    /// Internal owned view; memory clones an independent stored chunk handle.
+    pub(crate) async fn shared_serving_chunk(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<(Bytes, [u8; 8])> {
+        let handle = {
+            let guard = store.lock().await;
+            match &guard.backend {
+                Backend::Memory(memory) => {
+                    return Some((
+                        memory.pieces.get(&piece)?.get(&chunk)?.clone(),
+                        guard.piece_header(piece).unwrap_or([0; 8]),
+                    ));
+                }
+                Backend::Disk(disk) => disk.handle(),
+            }
+        };
+        handle
+            .get(piece, chunk)
+            .await
+            .map(|(data, header)| (Bytes::from(data), header))
     }
 
     pub(crate) async fn shared_reciprocal_chunk(
@@ -439,9 +471,9 @@ impl PieceStore {
                 .await
             };
             match &guard.backend {
-                Backend::Memory(_) => {
+                Backend::Memory(memory) => {
                     return Some(ReciprocalChunk {
-                        data: guard.chunk(piece, chunk)?.into_owned(),
+                        data: memory.pieces.get(&piece)?.get(&chunk)?.clone(),
                         header: guard.piece_header(piece).unwrap_or([0; 8]),
                         _permit: None,
                     })
@@ -477,7 +509,8 @@ impl PieceStore {
         let last = end.div_ceil(chunk_length);
         let mut piece_bytes = Vec::new();
         for chunk in first..last {
-            let (data, _) = Self::shared_chunk(store, piece, u16::try_from(chunk).ok()?).await?;
+            let (data, _) =
+                Self::shared_serving_chunk(store, piece, u16::try_from(chunk).ok()?).await?;
             piece_bytes.extend_from_slice(&data);
         }
         let offset = (u64::from(begin) % chunk_length) as usize;
@@ -1421,3 +1454,6 @@ pub(crate) mod reciprocal_lock_witness {
         }
     }
 }
+
+#[cfg(test)]
+mod shared_serving_tests;
