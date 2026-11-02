@@ -51,5 +51,5 @@
 - [x] Run affected all-target Clippy with warnings denied, formatting, identifier hygiene and diff checks. Broaden tests only for a justified dependency/interface effect.
 - [x] Obtain independent correctness/performance/test-fidelity review; resolve concrete findings.
 - [x] Update design/plan status to reflect actual evidence and remaining #288 items.
-- [ ] Commit with normal hooks, push the compliant branch, open/link the PR, handle review/CI, and merge when all required checks succeed.
+- [x] Commit with normal hooks, push the compliant branch, open/link the PR, handle review/CI, and merge when all required checks succeed.
 - [x] Keep #288 open for store/message copying, startup scan and dependency follow-ups unless separately reconciled. No deployment or readiness claim from this change.

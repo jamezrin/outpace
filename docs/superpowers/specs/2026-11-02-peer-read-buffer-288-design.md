@@ -1,6 +1,6 @@
 # Persistent peer receive buffer (#288, first increment)
 
-Status: implemented and independently reviewed; local validation passed, CI and integration pending. This increment leaves the other #288 items open.
+Status: implemented, independently reviewed and merged through PR #315 after successful CI. This increment leaves the other #288 items open.
 
 ## Intent and scope
 
