@@ -49,63 +49,75 @@ pub enum PeerMessage {
 
 impl PeerMessage {
     pub fn encode(&self) -> Vec<u8> {
-        let mut body = Vec::new();
+        let body_len = match self {
+            PeerMessage::KeepAlive => 0,
+            PeerMessage::Choke
+            | PeerMessage::Unchoke
+            | PeerMessage::Interested
+            | PeerMessage::NotInterested => 1,
+            PeerMessage::Have(_) => 5,
+            PeerMessage::Bitfield(bytes) => 1 + bytes.len(),
+            PeerMessage::Request { .. } | PeerMessage::Cancel { .. } => 13,
+            PeerMessage::Piece { block, .. } => 9 + block.len(),
+            PeerMessage::Extended { payload, .. } => 2 + payload.len(),
+            PeerMessage::Unknown { payload, .. } => 1 + payload.len(),
+        };
+        let mut out = Vec::with_capacity(4 + body_len);
+        out.extend_from_slice(&(body_len as u32).to_be_bytes());
         match self {
             PeerMessage::KeepAlive => {}
-            PeerMessage::Choke => body.push(0),
-            PeerMessage::Unchoke => body.push(1),
-            PeerMessage::Interested => body.push(2),
-            PeerMessage::NotInterested => body.push(3),
+            PeerMessage::Choke => out.push(0),
+            PeerMessage::Unchoke => out.push(1),
+            PeerMessage::Interested => out.push(2),
+            PeerMessage::NotInterested => out.push(3),
             PeerMessage::Have(i) => {
-                body.push(4);
-                body.extend_from_slice(&i.to_be_bytes());
+                out.push(4);
+                out.extend_from_slice(&i.to_be_bytes());
             }
             PeerMessage::Bitfield(b) => {
-                body.push(5);
-                body.extend_from_slice(b);
+                out.push(5);
+                out.extend_from_slice(b);
             }
             PeerMessage::Request {
                 index,
                 begin,
                 length,
             } => {
-                body.push(6);
-                body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes());
-                body.extend_from_slice(&length.to_be_bytes());
+                out.push(6);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&begin.to_be_bytes());
+                out.extend_from_slice(&length.to_be_bytes());
             }
             PeerMessage::Piece {
                 index,
                 begin,
                 block,
             } => {
-                body.push(7);
-                body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes());
-                body.extend_from_slice(block);
+                out.push(7);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&begin.to_be_bytes());
+                out.extend_from_slice(block);
             }
             PeerMessage::Cancel {
                 index,
                 begin,
                 length,
             } => {
-                body.push(8);
-                body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes());
-                body.extend_from_slice(&length.to_be_bytes());
+                out.push(8);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&begin.to_be_bytes());
+                out.extend_from_slice(&length.to_be_bytes());
             }
             PeerMessage::Extended { ext_id, payload } => {
-                body.push(20);
-                body.push(*ext_id);
-                body.extend_from_slice(payload);
+                out.push(20);
+                out.push(*ext_id);
+                out.extend_from_slice(payload);
             }
             PeerMessage::Unknown { id, payload } => {
-                body.push(*id);
-                body.extend_from_slice(payload);
+                out.push(*id);
+                out.extend_from_slice(payload);
             }
         }
-        let mut out = (body.len() as u32).to_be_bytes().to_vec();
-        out.extend_from_slice(&body);
         out
     }
 

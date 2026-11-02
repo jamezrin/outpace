@@ -27,3 +27,10 @@ Preserve wrong-length known IDs as Unknown, empty payloads, incomplete and overs
 - [x] Run workspace all-target Clippy, formatting, identifier hygiene and diff checks.
 - [x] Obtain independent review of semantics, allocator safety and test fidelity; correct concrete findings.
 - [ ] Commit with normal hooks; push/open/link PR; merge after CI succeeds.
+
+## Task 3: Single-buffer encoder (before publication)
+
+- [x] Add independent golden-frame and one-allocation contracts for every modeled variant, unknown IDs and empty/large payloads in decode_allocations.rs. Retain RED against the two-buffer encoder.
+- [x] In message.rs compute variant body length, allocate prefix+body once and append the existing exact bytes directly. Keep public owned messages and decoder semantics unchanged.
+- [x] Run wire/vector tests, workspace Clippy/fmt/hygiene and independent whole-change review.
+- [ ] Refresh merged base and integrate this coherent wire-allocation PR.
