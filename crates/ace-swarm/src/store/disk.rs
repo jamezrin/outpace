@@ -495,7 +495,7 @@ impl Actor {
                     let result =
                         self.get(piece, chunk)
                             .map(|(data, header)| super::ReciprocalChunk {
-                                data,
+                                data: data.into(),
                                 header,
                                 _permit: Some(permit),
                             });
@@ -853,7 +853,7 @@ mod tests {
         drop(publication);
         drop(buffered);
         let reply = successor.await;
-        let bytes = reply.as_ref().map(|r| (r.data.clone(), r.header));
+        let bytes = reply.as_ref().map(|r| (r.data.to_vec(), r.header));
         let result_held = backend.reciprocal.available_permits();
         drop(reply);
         assert!(buffered_pending && buffered_executing);

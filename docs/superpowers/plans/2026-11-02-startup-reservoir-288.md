@@ -41,5 +41,5 @@
 - [x] Run affected tests, repository lint/format/hygiene/diff gates; avoid redundant unchanged suites.
 - [x] Obtain independent correctness/performance/test-fidelity review and fix concrete findings.
 - [x] Refresh base after the receive-buffer PR merges if necessary; preserve unrelated work and normal hooks.
-- [ ] Commit, push/open/link PR, resolve CI/review and merge only when ready.
+- [x] Commit, push/open/link PR, resolve CI/review and merge only when ready.
 - [x] Keep remaining #288 items and unmet readiness criteria open; no automatic deployment or live run.
