@@ -1636,3 +1636,52 @@ async fn compat_catalog_ttl_expiry_refetches_without_rekeying() {
     assert!(manager.get("ace", &first_alias).await.is_none());
     assert!(manager.get("ace", &fresh_alias).await.is_none());
 }
+
+#[tokio::test]
+async fn protection_refusals_never_mint_compat_leases_even_with_fallback() {
+    for invalid in [false, true] {
+        let provider =
+            AceProvider::new(Arc::new(Identity::generate()), 0).with_bep9_content_id_fallback(true);
+        let state = ace_state(provider, true);
+        let leases = state.ace_sessions.clone();
+        let manager = state.manager.clone();
+        let fetch: CatalogFetch = Arc::new(move |_| {
+            Box::pin(async move {
+                if invalid {
+                    return Err(ResolveError::InvalidProtection);
+                }
+                let (bytes, _) = synthetic_transport_with_auth(65_536);
+                let mut info = stream_info_from_transport(&bytes).unwrap();
+                info.protection = Some(ace_wire::protection::Protection::Protected);
+                Ok(info)
+            })
+        });
+        let request = Request::get(format!(
+            "/ace/getstream?format=json&content_id={SYNTHETIC_CID}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::ace_provider::with_catalog_fetch_for_test(fetch, router(state).oneshot(request)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(body["response"], serde_json::Value::Null);
+        assert_eq!(
+            body["error"],
+            if invalid {
+                "invalid content protection metadata"
+            } else {
+                "encrypted content is not supported"
+            }
+        );
+        assert_eq!(leases.active_count(), 0);
+        assert!(manager.list().await.is_empty());
+        for key in ["playback_url", "stat_url", "command_url"] {
+            assert!(!body.to_string().contains(key));
+        }
+    }
+}

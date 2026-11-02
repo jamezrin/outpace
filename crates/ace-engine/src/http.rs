@@ -7,7 +7,7 @@ use crate::manager::StreamManager;
 use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::{StreamEvent, StreamSession};
 use ace_swarm::listen::SeedRegistry;
-use ace_swarm::resolve::{infohash_hex, resolve_via_catalog, stream_info_from_transport_url};
+use ace_swarm::resolve::infohash_hex;
 use ace_swarm::types::StreamMetadata;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -26,6 +26,19 @@ use std::time::{Duration, Instant};
 tokio::task_local! {
     static HLS_AFTER_READY: Box<dyn Fn(&HlsPackager) + Send + Sync>;
 }
+#[cfg(test)]
+tokio::task_local! {
+    static URL_DESCRIPTOR_BYTES: Vec<u8>;
+}
+
+async fn url_descriptor_bytes(url: &str) -> Result<Vec<u8>, ace_swarm::resolve::ResolveError> {
+    #[cfg(test)]
+    if let Ok(bytes) = URL_DESCRIPTOR_BYTES.try_with(Clone::clone) {
+        return Ok(bytes);
+    }
+    ace_swarm::resolve::transport_bytes_from_url(url).await
+}
+
 use tokio::sync::broadcast::error::RecvError;
 
 mod broadcast;

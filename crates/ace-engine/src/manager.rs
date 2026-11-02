@@ -385,6 +385,12 @@ impl StreamManager {
         }
     }
 
+    pub(crate) fn remember_transport_url(&self, network: &str, id: &str, info: &StreamInfo) {
+        if let Some(provider) = self.registry.get(network) {
+            provider.remember_transport_url(id, info);
+        }
+    }
+
     /// Construct a manager with a provider resource cap; zero is unlimited.
     pub fn with_session_limit(registry: ProviderRegistry, max: usize) -> Arc<Self> {
         Self::with_admission_config(registry, 256, HlsConfig::default(), None, max)
@@ -404,6 +410,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<dyn VodContent>, ProviderError> {
+        self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
         if self
             .shutting_down
@@ -493,6 +500,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
+        self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
         if self
             .shutting_down
@@ -580,6 +588,7 @@ impl StreamManager {
         id: &str,
         native: bool,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
+        self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
         if self
             .shutting_down

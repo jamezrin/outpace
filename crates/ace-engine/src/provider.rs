@@ -156,10 +156,15 @@ pub trait StreamProvider: Send + Sync {
     /// use it (#164). Callers must pass only descriptors resolved through the signed catalog
     /// (never BEP-9 or a transport url): the index trusts them as-is. Defaults to ignoring it.
     fn remember_live_descriptor(&self, _info: &StreamInfo) {}
+
+    /// Cache caller-supplied URL metadata without granting catalog provenance.
+    fn remember_transport_url(&self, _id: &str, _info: &StreamInfo) {}
 }
 
 #[derive(Debug)]
 pub enum ProviderError {
+    ProtectedContent,
+    InvalidProtection,
     CapacityExhausted,
     NotFound,
     Backend(String),
@@ -173,6 +178,8 @@ pub enum ProviderError {
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProviderError::ProtectedContent => f.write_str("encrypted content is not supported"),
+            ProviderError::InvalidProtection => f.write_str("invalid content protection metadata"),
             ProviderError::CapacityExhausted => f.write_str("session capacity reached"),
             ProviderError::NotFound => f.write_str("not found"),
             ProviderError::Backend(msg) | ProviderError::Unresolvable(msg) => f.write_str(msg),
@@ -200,6 +207,16 @@ impl ProviderRegistry {
         let mut v: Vec<_> = self.providers.keys().copied().collect();
         v.sort();
         v
+    }
+}
+
+impl From<ace_swarm::resolve::ResolveError> for ProviderError {
+    fn from(error: ace_swarm::resolve::ResolveError) -> Self {
+        match error {
+            ace_swarm::resolve::ResolveError::ProtectedContent => Self::ProtectedContent,
+            ace_swarm::resolve::ResolveError::InvalidProtection => Self::InvalidProtection,
+            other => Self::Backend(format!("descriptor resolution: {other:?}")),
+        }
     }
 }
 

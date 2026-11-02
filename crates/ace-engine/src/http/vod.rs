@@ -152,7 +152,8 @@ fn vod_partial_response(
 }
 
 /// Resolve `id` on `network` to a single-file VOD via the manager's shared cache, or the HTTP
-/// error response to return: `404` for an unknown network, `502` if resolution fails.
+/// error response to return: `404` for an unknown network, `422` for protection
+/// policy refusal, `502` for other resolution failures.
 pub(super) async fn resolve_vod(
     s: &AppState,
     network: &str,
@@ -161,6 +162,9 @@ pub(super) async fn resolve_vod(
     match s.manager.resolve_vod(network, id).await {
         Ok(v) => Ok(v),
         Err(ProviderError::CapacityExhausted) => Err(Box::new(super::streams::capacity_error())),
+        Err(e @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection)) => Err(
+            Box::new((StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()),
+        ),
         Err(ProviderError::NotFound) => Err(Box::new(
             (StatusCode::NOT_FOUND, "unknown network").into_response(),
         )),

@@ -149,6 +149,7 @@ impl LiveObserver for Observer {
 // No sockets or sleeps: consumer capacity and observer notification are barriers.
 async fn schedule(piece_length: usize, pieces: usize, full: bool, close: bool) {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: piece_length as u64,
         chunk_length: piece_length as u64,
@@ -402,6 +403,7 @@ async fn actor_full_channel_close_preserves_unextracted_output() {
 async fn actor_capture_fence_freeze_and_retained_operation_recreation() {
     let piece_length = 188 * 8 + 48;
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: piece_length as u64,
         chunk_length: piece_length as u64,
@@ -714,6 +716,7 @@ async fn review_credit(signed: bool, completions: bool, close: bool, publication
     }
     let piece_length = wire.len();
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: piece_length as u64,
         chunk_length: piece_length as u64,

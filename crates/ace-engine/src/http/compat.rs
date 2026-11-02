@@ -277,6 +277,16 @@ pub(super) async fn ace_playback(
             let (status, category, reason) = match error {
                 ProviderError::CapacityExhausted => return super::streams::capacity_error(),
                 ProviderError::NotFound => (StatusCode::NOT_FOUND, "NotFound", ""),
+                ProviderError::ProtectedContent => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ProtectedContent",
+                    "encrypted content is not supported",
+                ),
+                ProviderError::InvalidProtection => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "InvalidProtection",
+                    "invalid content protection metadata",
+                ),
                 ProviderError::Backend(_) => {
                     (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
                 }
@@ -419,7 +429,13 @@ pub(super) async fn server_api(
         method @ (api::Method::AnalyzeContent | api::Method::GetMediaFiles) => {
             match resolve_server_api_selector(&s, api::selector(&params)).await {
                 Ok(content) => match method {
-                    api::Method::AnalyzeContent => api::ok(api::analyze_result(&content)),
+                    api::Method::AnalyzeContent => {
+                        if content.protection.is_none() {
+                            api::err("descriptor metadata is unavailable")
+                        } else {
+                            api::ok(api::analyze_result(&content))
+                        }
+                    }
                     api::Method::GetMediaFiles => api::ok(api::media_files_result(&content)),
                     _ => unreachable!("outer match restricts these two variants"),
                 },
@@ -439,7 +455,7 @@ async fn resolve_server_api_selector(
     s: &AppState,
     sel: crate::server_api::Selector,
 ) -> Result<crate::server_api::ResolvedContent, String> {
-    use crate::server_api::{ResolvedContent, Selector};
+    use crate::server_api::Selector;
 
     if let Some(resolved) = crate::server_api::resolve_offline(&sel) {
         return resolved;
@@ -449,39 +465,41 @@ async fn resolve_server_api_selector(
             if !s.resolve_content_ids_in_getstream {
                 return Err("content-id catalog resolution is disabled".to_string());
             }
-            match resolve_via_catalog(&cid).await {
-                Ok(info) => {
-                    // `resolve_via_catalog` is the signed catalog, so this descriptor is indexable.
-                    if let Some(network) = ace_network(s) {
-                        s.manager.remember_live_descriptor(&network, &info);
-                    }
-                    Ok(ResolvedContent {
-                        infohash: infohash_hex(&info.infohash),
-                        content_id: Some(cid),
-                        is_live: true,
-                    })
-                }
-                Err(e) => Err(format!("content-id resolution failed: {e:?}")),
-            }
+            let bytes = ace_swarm::resolve::catalog_transport_bytes(&cid)
+                .await
+                .map_err(|e| ProviderError::from(e).to_string())?;
+            inspect_server_api_descriptor(&bytes, Some(cid))
         }
         Selector::Url(url) => {
             if !s.resolve_content_ids_in_getstream {
                 return Err("transport-url resolution is disabled".to_string());
             }
-            match stream_info_from_transport_url(&url).await {
-                Ok(info) => Ok(ResolvedContent {
-                    infohash: infohash_hex(&info.infohash),
-                    content_id: None,
-                    is_live: true,
-                }),
-                Err(e) => Err(format!("transport-url resolution failed: {e:?}")),
-            }
+            let bytes = url_descriptor_bytes(&url)
+                .await
+                .map_err(|e| ProviderError::from(e).to_string())?;
+            inspect_server_api_descriptor(&bytes, None)
         }
+
         Selector::Missing => Err("missing content_id/infohash/url/magnet".to_string()),
         Selector::Infohash(_) | Selector::Magnet(_) => {
             unreachable!("infohash/magnet selectors resolve offline")
         }
     }
+}
+
+/// Inspection alone carries no playback state or catalog authority.
+pub(super) fn inspect_server_api_descriptor(
+    bytes: &[u8],
+    content_id: Option<String>,
+) -> Result<crate::server_api::ResolvedContent, String> {
+    let (hash, is_live, protection) = ace_swarm::resolve::inspect_descriptor(bytes)
+        .map_err(|e| ProviderError::from(e).to_string())?;
+    Ok(crate::server_api::ResolvedContent {
+        protection: Some(protection),
+        infohash: infohash_hex(&hash),
+        content_id,
+        is_live,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -531,6 +549,8 @@ async fn resolve_ace_selection(
             };
             match preparation {
                 ContentIdPreparation::Catalog(info) => {
+                    info.ensure_playable()
+                        .map_err(|e| ProviderError::from(e).to_string())?;
                     selection =
                         selection.with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
                 }
@@ -538,6 +558,8 @@ async fn resolve_ace_selection(
                 ContentIdPreparation::Unsupported => {
                     match crate::ace_provider::catalog_live_info(content_id).await {
                         Ok(info) => {
+                            info.ensure_playable()
+                                .map_err(|e| ProviderError::from(e).to_string())?;
                             // Legacy providers still receive only signed-catalog descriptors.
                             if let Some(network) = network.as_deref() {
                                 s.manager.remember_live_descriptor(network, &info);
@@ -545,6 +567,11 @@ async fn resolve_ace_selection(
                             selection = selection
                                 .with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
                         }
+                        Err(
+                            e @ (ace_swarm::resolve::ResolveError::ProtectedContent
+                            | ace_swarm::resolve::ResolveError::InvalidProtection
+                            | ace_swarm::resolve::ResolveError::Transport(_)),
+                        ) => return Err(ProviderError::from(e).to_string()),
                         Err(e) => crate::alog!(
                             "[ace] content-id catalog resolution failed, falling back to cid: {e:?}"
                         ),
@@ -553,13 +580,32 @@ async fn resolve_ace_selection(
             }
         }
     }
+    if s.resolve_content_ids_in_getstream {
+        if let Some(url) = crate::transport_url::decode_transport_url(&selection.playback_id) {
+            let bytes = url_descriptor_bytes(&url)
+                .await
+                .map_err(|e| ProviderError::from(e).to_string())?;
+            let info = ace_swarm::resolve::stream_info_from_transport(&bytes)
+                .map_err(|e| ProviderError::from(e).to_string())?;
+            info.ensure_playable()
+                .map_err(|e| ProviderError::from(e).to_string())?;
+            if let Some(network) = network.as_deref() {
+                s.manager
+                    .remember_transport_url(network, &selection.playback_id, &info);
+            }
+            selection.metadata = info.metadata;
+        }
+    }
     // The provider may reject a selector synchronously. Cold Ace infohashes proceed to
     // asynchronous authenticated catalog resolution when the playback URL is opened.
     if let Some(network) = network.as_deref() {
-        if let Err(ProviderError::Unresolvable(reason)) =
-            s.manager.check_openable(network, &selection.session_key)
+        if let Err(
+            e @ (ProviderError::ProtectedContent
+            | ProviderError::InvalidProtection
+            | ProviderError::Unresolvable(_)),
+        ) = s.manager.check_openable(network, &selection.session_key)
         {
-            return Err(reason);
+            return Err(e.to_string());
         }
     }
     Ok(selection)

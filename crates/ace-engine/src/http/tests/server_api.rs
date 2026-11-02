@@ -80,17 +80,20 @@ async fn webui_service_get_version_matches_server_api() {
 }
 
 #[tokio::test]
-async fn server_api_analyze_content_echoes_a_direct_infohash_lowercased() {
-    let upper = "50E93529D3EB46A50506B14464185A15292D6E47";
-    let (status, json) = server_api_json(
-        ace_compat_state(0),
-        &format!("method=analyze_content&infohash={upper}"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["error"], serde_json::Value::Null);
-    assert_eq!(json["result"]["infohash"], upper.to_lowercase());
-    assert_eq!(json["result"]["is_live"], 1);
+async fn server_api_analyze_content_requires_descriptor_metadata() {
+    for query in [
+        "infohash=0123456789abcdef0123456789abcdef01234567",
+        "magnet=magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let (status, json) = server_api_json(
+            ace_compat_state(0),
+            &format!("method=analyze_content&{query}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["result"], serde_json::Value::Null);
+        assert_eq!(json["error"], "descriptor metadata is unavailable");
+    }
 }
 
 #[tokio::test]

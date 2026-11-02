@@ -20,6 +20,8 @@ const MAX_TRACKER_BYTES: usize = 2_048;
 /// Validated geometry, piece integrity and discovery data for a single-file VOD.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Metainfo {
+    /// Content protection from the authoritative info dictionary.
+    pub protection: crate::protection::Protection,
     pub infohash: [u8; 20],
     pub piece_length: u64,
     pub total_length: u64,
@@ -73,6 +75,7 @@ pub fn decode_metainfo(bytes: &[u8]) -> Result<Metainfo> {
         .info_span
         .ok_or(WireError::Invalid("metainfo missing info span"))?;
     Ok(Metainfo {
+        protection: crate::protection::classify(info.get(b"premium"))?,
         infohash: Sha1::digest(&bytes[span]).into(),
         piece_length,
         total_length,

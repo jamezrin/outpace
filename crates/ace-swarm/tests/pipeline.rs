@@ -7,6 +7,7 @@ async fn full_pipeline_mock_peer_to_mpegts() {
     let expected = 4 * piece_length;
     let content = common::ts_content(6 * piece_length);
     let info = ace_swarm::types::StreamInfo {
+        protection: None,
         infohash: [0x42; 20],
         piece_length: piece_length as u64,
         chunk_length: 188,

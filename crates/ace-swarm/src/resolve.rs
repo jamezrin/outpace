@@ -77,6 +77,8 @@ const CATALOG_RESPONSE_KEY: &[u8] = b"CNVU\\\\w5S/HGg\"pSzY&O\"`uGCD18\\x0cfS|h2
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResolveError {
+    ProtectedContent,
+    InvalidProtection,
     BadInfohash,
     Transport(&'static str),
     /// A signed catalog request/response step failed during content-id resolution.
@@ -85,6 +87,13 @@ pub enum ResolveError {
     Peer(&'static str),
     /// A transport-file `url=` fetch failed a safety check or the network step.
     Url(&'static str),
+}
+
+fn protection_wire_error(error: ace_wire::WireError) -> ResolveError {
+    match error {
+        ace_wire::WireError::InvalidProtection => ResolveError::InvalidProtection,
+        _ => ResolveError::Transport("decode failed"),
+    }
 }
 
 fn normalized_title(value: &str) -> Option<String> {
@@ -102,7 +111,15 @@ fn normalized_title(value: &str) -> Option<String> {
 /// Build a [`StreamInfo`] from raw `AceStreamTransport` file bytes (the pure half of
 /// content-id resolution): official swarm infohash + geometry + trackers from the descriptor.
 pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveError> {
-    let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    if !ace_wire::infohash::is_transport_file(bytes) {
+        // Inspect supported VOD formats even at a live entry point: a protection refusal
+        // must not be obscured as a format failure and retried without metadata.
+        let info = vod_info_from_transport(bytes)?;
+        info.ensure_playable()?;
+        return Err(ResolveError::Transport("not a live transport"));
+    }
+    let d = decode_transport(bytes).map_err(protection_wire_error)?;
+    let protection = d.protection().map_err(protection_wire_error)?;
     validate_geometry(d.piece_length, d.chunk_length)?;
     // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip *and* a key
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
@@ -119,6 +136,7 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
         categories: d.categories,
     };
     Ok(StreamInfo {
+        protection: Some(protection),
         infohash,
         piece_length: d.piece_length,
         chunk_length: d.chunk_length,
@@ -149,9 +167,16 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
         } else {
             ace_wire::metainfo::decode_metainfo(bytes)
         }
-        .map_err(|_| ResolveError::Transport("invalid single-file metainfo"))?;
+        .map_err(|e| {
+            if matches!(e, ace_wire::WireError::InvalidProtection) {
+                ResolveError::InvalidProtection
+            } else {
+                ResolveError::Transport("invalid single-file metainfo")
+            }
+        })?;
         validate_geometry(metainfo.piece_length, DEFAULT_CHUNK_LENGTH)?;
         return Ok(VodInfo {
+            protection: Some(metainfo.protection),
             infohash: metainfo.infohash,
             peer_protocol: ace_wire::handshake::HandshakeProtocol::BitTorrent,
             piece_length: metainfo.piece_length,
@@ -161,7 +186,8 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
             total_length: metainfo.total_length,
         });
     }
-    let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    let d = decode_transport(bytes).map_err(protection_wire_error)?;
+    let protection = d.protection().map_err(protection_wire_error)?;
     if d.is_live {
         return Err(ResolveError::Transport("not a VOD transport (no pieces)"));
     }
@@ -173,6 +199,7 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
         .vod_total_length()
         .ok_or(ResolveError::Transport("VOD descriptor missing length"))?;
     Ok(VodInfo {
+        protection: Some(protection),
         infohash: infohash_of_decoded_transport(&d)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
         peer_protocol: ace_wire::handshake::HandshakeProtocol::AceStream,
@@ -182,6 +209,27 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
         piece_hashes: d.pieces,
         total_length,
     })
+}
+
+/// Inspect supported descriptor identity and protection without joining its swarm.
+pub fn inspect_descriptor(
+    bytes: &[u8],
+) -> Result<([u8; 20], bool, ace_wire::protection::Protection), ResolveError> {
+    if ace_wire::infohash::is_transport_file(bytes) {
+        let descriptor = decode_transport(bytes).map_err(protection_wire_error)?;
+        let protection = descriptor.protection().map_err(protection_wire_error)?;
+        validate_geometry(descriptor.piece_length, descriptor.chunk_length)?;
+        let hash = infohash_of_decoded_transport(&descriptor)
+            .map_err(|_| ResolveError::Transport("infohash failed"))?;
+        Ok((hash, descriptor.is_live, protection))
+    } else {
+        let info = vod_info_from_transport(bytes)?;
+        Ok((
+            info.infohash,
+            false,
+            info.protection.expect("decoded metainfo inspection"),
+        ))
+    }
 }
 
 /// Validate untrusted transport geometry before it becomes a [`StreamInfo`].
@@ -1296,6 +1344,70 @@ mod tests {
     }
 
     #[test]
+    fn protected_raw_metainfo_is_terminal_even_on_live_entry() {
+        use ace_wire::bencode::Bencode;
+        let fixture =
+            include_bytes!("../../../tests/vectors/metainfo/single-file-unsorted.torrent");
+        let mut descriptor = Bencode::parse(fixture).unwrap();
+        let Bencode::Dict(root) = &mut descriptor else {
+            unreachable!()
+        };
+        let Bencode::Dict(info) = root.get_mut(b"info".as_slice()).unwrap() else {
+            unreachable!()
+        };
+        info.insert(b"premium".to_vec(), Bencode::Int(1));
+        let bytes = descriptor.encode();
+        assert_eq!(
+            stream_info_from_transport(&bytes),
+            Err(ResolveError::ProtectedContent)
+        );
+        assert_eq!(
+            vod_info_from_transport(&bytes).unwrap().ensure_playable(),
+            Err(ResolveError::ProtectedContent)
+        );
+        assert_eq!(
+            inspect_descriptor(&bytes).unwrap().2,
+            ace_wire::protection::Protection::Protected
+        );
+    }
+
+    #[test]
+    fn protection_inspection_survives_resolution_and_cache() {
+        use ace_wire::protection::Protection;
+        for (premium, expected) in [
+            ("", Protection::Public),
+            ("7:premiumi0e", Protection::Public),
+            ("7:premiumi1e", Protection::Protected),
+        ] {
+            let bytes = make_transport(format!("d10:authmethod3:RSA7:bitratei100e12:chunk_lengthi16384e4:name9:synthetic12:piece_lengthi65536e6:pubkey3:abc{premium}e").as_bytes());
+            let info = stream_info_from_transport(&bytes).unwrap();
+            assert_eq!(info.protection, Some(expected));
+            let cache = ResolveCache::new(Duration::from_secs(10));
+            cache.put("synthetic", info);
+            let cached = cache.get("synthetic").unwrap();
+            assert_eq!(cached.protection, Some(expected));
+            assert_eq!(
+                cached.ensure_playable(),
+                if expected == Protection::Protected {
+                    Err(ResolveError::ProtectedContent)
+                } else {
+                    Ok(())
+                }
+            );
+        }
+        for premium in ["i2e", "i-1e", "1:1", "le"] {
+            let bytes = make_transport(
+                format!("d12:chunk_lengthi16384e12:piece_lengthi65536e7:premium{premium}e")
+                    .as_bytes(),
+            );
+            assert_eq!(
+                stream_info_from_transport(&bytes),
+                Err(ResolveError::InvalidProtection)
+            );
+        }
+    }
+
+    #[test]
     fn transport_yields_stream_info() {
         let tf = make_transport(
             b"d10:authmethod3:RSA7:bitratei100000e12:chunk_lengthi16384e4:name4:Test12:piece_lengthi1048576e6:pubkey3:abc8:trackersl18:udp://t.example:80ee",
@@ -1644,6 +1756,7 @@ mod tests {
     fn cache_returns_stored_value_then_expires() {
         let c = ResolveCache::new(Duration::from_millis(40));
         let info = StreamInfo {
+            protection: None,
             infohash: [7; 20],
             piece_length: 1,
             chunk_length: 1,
@@ -1661,6 +1774,7 @@ mod tests {
 
     fn indexed_info(infohash: [u8; 20], piece_length: u64) -> StreamInfo {
         StreamInfo {
+            protection: None,
             infohash,
             piece_length,
             chunk_length: 16_384,

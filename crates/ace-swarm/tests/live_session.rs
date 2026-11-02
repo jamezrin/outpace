@@ -7,6 +7,7 @@ async fn live_session_emits_contiguous_ts_from_one_peer() {
     let expected = 3 * piece_length;
     let content = common::ts_content(5 * piece_length);
     let info = ace_swarm::types::StreamInfo {
+        protection: None,
         infohash: [0x42; 20],
         piece_length: piece_length as u64,
         chunk_length: 188,
@@ -40,6 +41,7 @@ async fn live_session_verifies_signed_pieces_and_emits_only_media() {
         })
         .collect();
     let info = ace_swarm::types::StreamInfo {
+        protection: None,
         infohash: [0x24; 20],
         piece_length: piece_length as u64,
         chunk_length: piece_length as u64,

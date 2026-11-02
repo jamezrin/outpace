@@ -34,6 +34,7 @@ async fn diagnostic(close: bool) {
     let mut authentic = payload.clone();
     authentic.extend(auth.sign(&payload));
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: authentic.len() as u64,
         chunk_length: authentic.len() as u64 / 2,

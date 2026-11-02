@@ -34,6 +34,7 @@ async fn diagnostic(close: bool) {
     let mut authentic = payload.clone();
     authentic.extend(auth.sign(&payload));
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: authentic.len() as u64,
         chunk_length: authentic.len() as u64 / 2,
@@ -319,6 +320,7 @@ async fn two_full_generations_share_cancelled_disk_admission() {
     let mut wire = vec![0x47; 752];
     wire.extend(auth.sign(&wire));
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: wire.len() as u64,
         chunk_length: wire.len() as u64,

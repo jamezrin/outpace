@@ -12,6 +12,8 @@ pub struct StreamMetadata {
 /// What a stream needs to be downloaded, from the transport file (or known directly).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamInfo {
+    /// None denotes a selector without inspected descriptor metadata.
+    pub protection: Option<ace_wire::protection::Protection>,
     /// 20-byte BitTorrent infohash of the live stream.
     pub infohash: [u8; 20],
     /// Bytes per piece (e.g. 1_048_576).
@@ -34,6 +36,15 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
+    /// Shared admission policy, including descriptors restored from caches.
+    pub fn ensure_playable(&self) -> Result<(), crate::resolve::ResolveError> {
+        if self.protection == Some(ace_wire::protection::Protection::Protected) {
+            Err(crate::resolve::ResolveError::ProtectedContent)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Number of chunks per piece (`piece_length / chunk_length`).
     pub fn chunks_per_piece(&self) -> u16 {
         (self.piece_length / self.chunk_length) as u16
@@ -45,6 +56,8 @@ impl StreamInfo {
 /// transport's SHA-1 `pieces` list — standard BitTorrent piece hashing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VodInfo {
+    /// None denotes a selector without inspected descriptor metadata.
+    pub protection: Option<ace_wire::protection::Protection>,
     /// 20-byte BitTorrent infohash of the VOD swarm.
     pub infohash: [u8; 20],
     /// Peer handshake selected by the descriptor format, never by retrying a failed exchange.
@@ -62,6 +75,15 @@ pub struct VodInfo {
 }
 
 impl VodInfo {
+    /// Shared admission policy, including descriptors restored from caches.
+    pub fn ensure_playable(&self) -> Result<(), crate::resolve::ResolveError> {
+        if self.protection == Some(ace_wire::protection::Protection::Protected) {
+            Err(crate::resolve::ResolveError::ProtectedContent)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Chunks (request blocks) per full piece (`piece_length / chunk_length`).
     pub fn chunks_per_piece(&self) -> u16 {
         (self.piece_length / self.chunk_length) as u16
@@ -86,6 +108,7 @@ mod tests {
     #[test]
     fn chunks_per_piece_is_64_for_1mib_pieces() {
         let si = StreamInfo {
+            protection: None,
             infohash: [0; 20],
             piece_length: 1_048_576,
             chunk_length: 16_384,

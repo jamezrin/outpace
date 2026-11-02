@@ -396,3 +396,136 @@ async fn catalog_resolution_cid_namespace_does_not_seed_arbitrary_infohash() {
         .verified_info_for_infohash(&infohash_hex(&catalog_info.infohash))
         .is_err());
 }
+
+#[tokio::test]
+async fn protected_cached_descriptor_cannot_open_or_prepare() {
+    use ace_wire::protection::Protection;
+    let p = provider();
+    let mut info = stream_info_from_transport(&vod_transport()).unwrap();
+    info.protection = Some(Protection::Protected);
+    p.resolve_cache.put(CID, info.clone());
+    p.infohash_index.put(info.clone());
+    assert_eq!(
+        p.check_openable(&infohash_hex(&info.infohash))
+            .unwrap_err()
+            .to_string(),
+        "encrypted content is not supported"
+    );
+    assert_eq!(
+        p.open(&format!("cid:{CID}"))
+            .await
+            .err()
+            .unwrap()
+            .to_string(),
+        "encrypted content is not supported"
+    );
+    assert_eq!(
+        p.resolve_content_id_prepared(CID)
+            .await
+            .err()
+            .unwrap()
+            .to_string(),
+        "encrypted content is not supported"
+    );
+}
+
+#[tokio::test]
+async fn typed_protection_catalog_errors_are_terminal_for_vod_fallback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let p = provider()
+        .with_bep9_content_id_fallback(true)
+        .with_bootstrap_peers(vec![addr]);
+    for error in [
+        ResolveError::ProtectedContent,
+        ResolveError::InvalidProtection,
+    ] {
+        let expected = if error == ResolveError::ProtectedContent {
+            "encrypted content is not supported"
+        } else {
+            "invalid content protection metadata"
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            p.resolve_vod_info_with_catalog(&format!("cid:{CID}"), ready(Err(error))),
+        )
+        .await;
+        assert_eq!(
+            result
+                .expect("terminal metadata error tried peer fallback")
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn parsed_vod_protection_refuses_before_store_with_public_control() {
+    for disk in [false, true] {
+        for premium in [1, 2, 0] {
+            let bytes = test_support::protection_vod_bytes(premium, disk);
+            // Disk-store creation is a durable first-forbidden-boundary sentinel:
+            // even a transient lease would create this directory.
+            let cache = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "../../target/acceptance279-{}-{disk}-{premium}",
+                std::process::id()
+            ));
+            assert!(!cache.exists());
+            let p = provider()
+                .with_bep9_content_id_fallback(true)
+                .with_cache(CacheType::Disk, cache.clone());
+            let hash = ace_swarm::resolve::inspect_descriptor(&bytes)
+                .ok()
+                .map(|v| v.0);
+            let result = p
+                .resolve_vod_inner_with_catalog(&format!("cid:{CID}"), ready(Ok(bytes)))
+                .await;
+            if premium == 0 {
+                let content = result.unwrap();
+                assert_eq!(content.content_length(), 1);
+                assert!(cache.is_dir(), "public control crosses store sentinel");
+                assert!(p.seed_registry.get(&hash.unwrap()).is_some());
+            } else {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    if premium == 1 {
+                        "encrypted content is not supported"
+                    } else {
+                        "invalid content protection metadata"
+                    }
+                );
+                if let Some(hash) = hash {
+                    assert!(p.seed_registry.get(&hash).is_none());
+                }
+                assert!(!cache.exists(), "refusal crossed disk store sentinel");
+            }
+            drop(p);
+        }
+    }
+}
+
+#[tokio::test]
+async fn url_cache_metadata_does_not_authenticate_bare_hash_with_fallback() {
+    let p = provider().with_bep9_content_id_fallback(true);
+    let (bytes, _) = test_support::synthetic_live_transport(524_288);
+    let info = stream_info_from_transport(&bytes).unwrap();
+    let url =
+        crate::transport_url::encode_transport_url("https://example.invalid/synthetic").unwrap();
+    p.remember_transport_url(&url, &info);
+    assert_eq!(
+        p.resolve_live_info(&url).await.unwrap().infohash,
+        info.infohash
+    );
+    assert!(p
+        .verified_info_for_infohash(&infohash_hex(&info.infohash))
+        .is_err());
+    assert!(p.infohash_index.get(&info.infohash).is_none());
+}

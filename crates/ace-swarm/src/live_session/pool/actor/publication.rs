@@ -137,6 +137,7 @@ mod tests {
     use super::*;
     fn continuity() -> Continuity {
         let info = StreamInfo {
+            protection: None,
             infohash: [0; 20],
             piece_length: 4,
             chunk_length: 2,

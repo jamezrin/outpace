@@ -18,6 +18,7 @@ mod compat;
 mod compat_catalog;
 mod compat_hls;
 mod native;
+mod protection;
 mod server_api;
 mod vod;
 

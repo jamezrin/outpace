@@ -196,7 +196,7 @@ Both aliases use `{"result": <value>, "error": null}` on success and
 | `get_version` | `version` is Outpace's crate version, `code` is `MAJOR*10000 + MINOR*100 + PATCH`, `platform` is the target OS. Successful JSON on both aliases includes the literal `"error": null` for the sampled healthcheck. It does not identify an official engine build. |
 | `get_status` | `status: "dl"` when the manager has sessions, otherwise `"idle"`; `active_sessions` is that count, not a viewer count. |
 | `get_network_connection_status` | `status`, boolean `connected`, and `networks` reflect registered provider networks, not measured Internet or peer reachability. |
-| `analyze_content` | `infohash`, nullable `content_id`, integer `is_live`/`is_encrypted`, and `status: "complete"`. Bare infohash/magnet parsing is offline; content-id/URL selectors resolve a live descriptor. Flags do not qualify arbitrary encrypted or VOD inputs. |
+| `analyze_content` | `infohash`, nullable `content_id`, integer `is_live`/`is_encrypted`, and `status: "complete"`. Bare infohash/magnet analysis returns the error envelope `descriptor metadata is unavailable`. Content-id/URL analysis inspects supported wrapped live/historical VOD or single-file raw/disk metainfo without joining a swarm. Inspected public reports `is_encrypted: 0`; protected reports `1`. Malformed protection is an error. |
 | `get_content_id` | **Echo only:** returns a nonempty caller `content_id`/`query` unchanged, even malformed strings, without 40-hex validation or catalog lookup. Cannot derive a content id from an infohash/URL/magnet. |
 | `get_media_files` | Best-effort `infohash` and one synthetic `files[]` entry with `infohash`, `index: 0`, `is_live`. Same resolution as analysis; no multi-file or selection contract. `dump_transport_file` does not produce a raw dump. |
 
@@ -315,3 +315,18 @@ Historical notes are not a promise that every observed engine feature is impleme
 Static client sources and offline fixtures do not establish deployed routing, startup
 time, source availability, decoding continuity, playback smoothness or full official
 error parity.
+
+## Descriptor protection (#279, implementation under review)
+
+Recognized wrapped descriptors use root `premium`; single-file raw/disk metainfo uses
+`info/premium`. Missing/integer zero is public, integer one is protected, and other
+values are invalid metadata. Transport encryption and live signatures remain separate.
+Playback refusal text is `encrypted content is not supported`; malformed protection
+uses `invalid content protection metadata`. Catalog protection/format errors are terminal,
+including when raw-hash fallback is enabled. Inspection does not grant authorization.
+
+The current patch gates Ace provider live discovery and VOD store creation, manager cached
+session admission, and compatibility catalog/URL preparation before lease minting.
+Uninspected playback retains existing policy and legacy zero flags. Complete route-level
+acceptance (especially VOD compatibility selection and explicit discovery counters)
+is still pending; this table is not a claim that #279 is ready to close.

@@ -306,6 +306,7 @@ fn reply_stats_omit_attempts_before_sent_and_classify_typed_errors() {
 #[test]
 fn received_payload_is_counted_once_before_output_gating() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 4,
@@ -351,6 +352,7 @@ fn received_payload_is_counted_once_before_output_gating() {
 #[test]
 fn positions_clear_active_bounds_on_reconnect_and_reject_negative_windows() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 4,
@@ -434,6 +436,7 @@ async fn aborting_live_session_retains_recovery_history_and_clears_active_gauge(
 #[test]
 fn sliding_window_observations_do_not_change_scheduler_coverage() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 4,
@@ -509,6 +512,7 @@ fn bounded_stats_pcr_differential_and_invalidation() {
             bytes.extend(media);
             bytes.extend([1, 2, 3]);
             let info = StreamInfo {
+                protection: None,
                 infohash: [0; 20],
                 piece_length: bytes.len() as u64,
                 chunk_length: bytes.len() as u64,
@@ -549,6 +553,7 @@ fn bounded_stats_pcr_differential_and_invalidation() {
 #[test]
 fn bounded_stats_gap_cache_and_synchronous_unknown() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 2,

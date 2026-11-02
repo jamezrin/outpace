@@ -533,7 +533,24 @@ impl StreamProvider for AceProvider {
             })
     }
 
-    fn check_openable(&self, _id: &str) -> Result<(), ProviderError> {
+    fn check_openable(&self, id: &str) -> Result<(), ProviderError> {
+        if let Some(info) = self.peer_resolve_cache.get(id) {
+            info.ensure_playable().map_err(ProviderError::from)?;
+        }
+        if let Some(info) = id
+            .strip_prefix("cid:")
+            .and_then(|cid| self.resolve_cache.get(cid))
+        {
+            info.ensure_playable().map_err(ProviderError::from)?;
+        }
+        if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if let Some(info) = hex20(id)
+                .ok()
+                .and_then(|hash| self.infohash_index.get(&hash))
+            {
+                info.ensure_playable().map_err(ProviderError::from)?;
+            }
+        }
         // Cold infohash lookup is asynchronous. Actual resolution still requires an
         // authenticated descriptor bound to the requested infohash before discovery.
         Ok(())
@@ -543,12 +560,17 @@ impl StreamProvider for AceProvider {
         self.infohash_index.put(info.clone());
     }
 
+    fn remember_transport_url(&self, id: &str, info: &StreamInfo) {
+        self.peer_resolve_cache.put(id, info.clone());
+    }
+
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
         // One resolver for every live entry point. A bare infohash without a verified
         // descriptor fails closed here, before any discovery (#164).
         let opening = Instant::now();
         crate::alog!("[ace] discovery stage=open-request");
         let info = self.resolve_live_info(id).await?;
+        info.ensure_playable().map_err(ProviderError::from)?;
         crate::alog!(
             "[ace] discovery stage=resolved resolve_ms={}",
             opening.elapsed().as_millis()
@@ -588,6 +610,44 @@ pub(crate) mod test_support {
     /// A synthetic live `AceStreamTransport` built with outpace's own encoder and a freshly
     /// generated RSA source key (#164). Nothing is derived from a real stream; callers compute
     /// its infohash at test time. Returns `(transport_bytes, pubkey_der)`.
+    /// Synthetic raw/disk VOD descriptors; no external source metadata.
+    pub(crate) fn protection_vod_bytes(premium: i64, disk: bool) -> Vec<u8> {
+        let raw = format!("d4:infod6:lengthi1e4:name9:synthetic12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrst7:premiumi{premium}eee").into_bytes();
+        if !disk {
+            return raw;
+        }
+        match premium {
+            0 => vec![
+                1, 2, 3, 4, 17, 2, 101, 46, 225, 99, 91, 41, 87, 157, 137, 176, 119, 253, 250, 128,
+                31, 95, 95, 35, 45, 26, 110, 158, 157, 179, 98, 99, 188, 49, 248, 220, 222, 23,
+                202, 36, 129, 61, 135, 219, 190, 27, 73, 36, 185, 61, 57, 227, 245, 121, 110, 62,
+                80, 139, 230, 174, 45, 208, 221, 180, 131, 248, 207, 243, 149, 87, 168, 250, 210,
+                249, 157, 107, 152, 119, 58, 95, 185, 83, 103, 190, 121, 194, 179, 164, 229, 76,
+                250, 137, 203, 80, 23, 26, 16, 39, 9, 53, 142, 185, 201, 77, 236, 46, 96, 115, 130,
+                179, 157, 168, 255, 142, 246, 83, 209, 174, 66, 170,
+            ],
+            1 => vec![
+                1, 2, 3, 4, 17, 2, 101, 46, 225, 99, 91, 41, 87, 157, 137, 176, 119, 253, 250, 128,
+                31, 95, 95, 35, 45, 26, 110, 158, 157, 179, 98, 99, 188, 49, 248, 220, 222, 23,
+                202, 36, 129, 61, 135, 219, 190, 27, 73, 36, 185, 61, 57, 227, 245, 121, 110, 62,
+                80, 139, 230, 174, 45, 208, 221, 180, 131, 248, 207, 243, 149, 87, 168, 250, 210,
+                249, 157, 107, 152, 119, 58, 95, 185, 83, 103, 190, 121, 194, 179, 164, 229, 76,
+                250, 137, 203, 80, 23, 26, 16, 39, 9, 53, 142, 185, 201, 77, 169, 197, 140, 205,
+                103, 219, 50, 89, 164, 101, 113, 23, 85, 55, 198, 155,
+            ],
+            2 => vec![
+                1, 2, 3, 4, 17, 2, 101, 46, 225, 99, 91, 41, 87, 157, 137, 176, 119, 253, 250, 128,
+                31, 95, 95, 35, 45, 26, 110, 158, 157, 179, 98, 99, 188, 49, 248, 220, 222, 23,
+                202, 36, 129, 61, 135, 219, 190, 27, 73, 36, 185, 61, 57, 227, 245, 121, 110, 62,
+                80, 139, 230, 174, 45, 208, 221, 180, 131, 248, 207, 243, 149, 87, 168, 250, 210,
+                249, 157, 107, 152, 119, 58, 95, 185, 83, 103, 190, 121, 194, 179, 164, 229, 76,
+                250, 137, 203, 80, 23, 26, 16, 39, 9, 53, 142, 185, 201, 77, 133, 85, 187, 255,
+                170, 202, 21, 133, 166, 247, 61, 154, 140, 150, 124, 137,
+            ],
+            _ => panic!("synthetic premium value"),
+        }
+    }
+
     pub(crate) fn synthetic_live_transport(piece_length: i64) -> (Vec<u8>, Vec<u8>) {
         let pubkey = ace_wire::live_auth::LiveSourceAuth::generate().pubkey_der();
         let mut d: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
