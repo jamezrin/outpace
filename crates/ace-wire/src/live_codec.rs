@@ -76,25 +76,45 @@ pub struct LiveChunk {
     pub data: Vec<u8>,
 }
 
+/// A live chunk view borrowing its untrusted payload from a decoded message.
+/// Parsing validates framing only; authentication and geometry remain caller policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveChunkRef<'a> {
+    pub piece: u32,
+    pub piece_header: [u8; 8],
+    pub chunk: u16,
+    pub data: &'a [u8],
+}
+
 impl LiveChunk {
-    /// Interpret a decoded `Piece` message as a live chunk: `begin` = piece, `block` =
-    /// `[8B piece hdr][chunk u16][data]`. Returns None if not a piece / block too short.
-    pub fn from_message(msg: &PeerMessage) -> Option<LiveChunk> {
+    /// Inspect a `Piece` message without allocating or copying its payload.
+    /// Returns None for other variants or blocks shorter than the ten-byte live header.
+    pub fn borrow_from_message(msg: &PeerMessage) -> Option<LiveChunkRef<'_>> {
         if let PeerMessage::Piece { begin, block, .. } = msg {
             if block.len() < 10 {
                 return None;
             }
-            let chunk = u16::from_be_bytes([block[8], block[9]]);
-            let piece_header: [u8; 8] = block[..8].try_into().expect("length checked");
-            Some(LiveChunk {
+            Some(LiveChunkRef {
                 piece: *begin,
-                piece_header,
-                chunk,
-                data: block[10..].to_vec(),
+                piece_header: block[..8].try_into().expect("length checked"),
+                chunk: u16::from_be_bytes([block[8], block[9]]),
+                data: &block[10..],
             })
         } else {
             None
         }
+    }
+
+    /// Interpret a decoded `Piece` message as an owned live chunk: `begin` = piece,
+    /// `block` = `[8B piece hdr][chunk u16][data]`. The payload is copied independently.
+    pub fn from_message(msg: &PeerMessage) -> Option<LiveChunk> {
+        let view = Self::borrow_from_message(msg)?;
+        Some(LiveChunk {
+            piece: view.piece,
+            piece_header: view.piece_header,
+            chunk: view.chunk,
+            data: view.data.to_vec(),
+        })
     }
 }
 
@@ -207,3 +227,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod inspection_bench;
+
+#[cfg(test)]
+mod borrowed_tests;

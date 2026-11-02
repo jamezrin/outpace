@@ -509,9 +509,11 @@ async fn parsed_vod_protection_refuses_before_store_with_public_control() {
                 std::process::id()
             ));
             assert!(!cache.exists());
-            let p = provider()
-                .with_bep9_content_id_fallback(true)
-                .with_cache(CacheType::Disk, cache.clone());
+            let mut p = provider().with_bep9_content_id_fallback(true);
+            // Isolate the store boundary: with_cache also starts an independent
+            // warm-peer writer that creates its directory before any resolution.
+            p.cache_type = CacheType::Disk;
+            p.cache_dir = cache.clone();
             let hash = ace_swarm::resolve::inspect_descriptor(&bytes)
                 .ok()
                 .map(|v| v.0);
