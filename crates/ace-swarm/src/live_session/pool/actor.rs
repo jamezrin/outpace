@@ -870,7 +870,7 @@ impl PoolActor<'_> {
         let mut made_activity = false;
         let made_output = false;
 
-        if let Some(lc) = LiveChunk::from_message(&m) {
+        if let Some(lc) = LiveChunk::borrow_from_message(&m) {
             self.continuity
                 .skip_far_behind_live(self.continuity.output_clock.now(Instant::now()));
             let piece = lc.piece as u64;
@@ -888,7 +888,7 @@ impl PoolActor<'_> {
                 lc.chunk,
                 self.info.chunk_length,
                 lc.piece_header,
-                &lc.data,
+                lc.data,
             ) {
                 Ok(outcome) => outcome,
                 Err(e) => {
