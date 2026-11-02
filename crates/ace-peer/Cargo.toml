@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes = "1"
 ace-wire = { path = "../ace-wire" }
 tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
 

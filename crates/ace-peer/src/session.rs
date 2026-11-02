@@ -4,6 +4,7 @@ use ace_wire::handshake::{
     Handshake, HandshakeProtocol, BITTORRENT_HANDSHAKE_LEN, HANDSHAKE_LEN, HANDSHAKE_PREFIX_LEN,
 };
 use ace_wire::message::PeerMessage;
+use bytes::{Buf, BufMut, BytesMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -60,7 +61,9 @@ impl<S: AsyncRead + Unpin, F: FnMut(HandshakeProgress)> AsyncRead
 pub struct PeerSession<S> {
     stream: S,
     /// Bytes read from the stream but not yet consumed into a message.
-    buf: Vec<u8>,
+    buf: BytesMut,
+    #[cfg(test)]
+    receive_peak_capacity: usize,
     /// Ceiling applied to each individual I/O await (handshake, send, read).
     timeout: Duration,
     protocol: HandshakeProtocol,
@@ -70,7 +73,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     pub fn new(stream: S) -> Self {
         PeerSession {
             stream,
-            buf: Vec::with_capacity(32 * 1024),
+            buf: BytesMut::with_capacity(32 * 1024),
+            #[cfg(test)]
+            receive_peak_capacity: 32 * 1024,
             timeout: DEFAULT_PEER_TIMEOUT,
             protocol: HandshakeProtocol::default(),
         }
@@ -360,16 +365,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// Read exactly one peer message, buffering until a full frame is available.
     pub async fn read_message(&mut self) -> Result<PeerMessage> {
         loop {
+            #[cfg(test)]
+            {
+                self.receive_peak_capacity = self.receive_peak_capacity.max(self.buf.capacity());
+            }
             if let Some((msg, consumed)) = PeerMessage::decode(&self.buf)? {
-                self.buf.drain(..consumed);
+                self.buf.advance(consumed);
                 return Ok(msg);
             }
-            let mut chunk = [0u8; 16 * 1024];
-            let n = with_timeout(self.timeout, self.stream.read(&mut chunk)).await??;
+            // reserve() takes additional bytes beyond len, not a spare deficit.
+            // Keep each poll bounded even if BytesMut has a larger allocation.
+            if self.buf.capacity() - self.buf.len() < 16 * 1024 {
+                self.buf.reserve(16 * 1024);
+            }
+            let mut writable = (&mut self.buf).limit(16 * 1024);
+            let n = with_timeout(self.timeout, self.stream.read_buf(&mut writable)).await??;
             if n == 0 {
                 return Err(PeerError::Closed);
             }
-            self.buf.extend_from_slice(&chunk[..n]);
         }
     }
 }
@@ -1460,3 +1473,6 @@ mod tests {
         client_task.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod receive_bench;
