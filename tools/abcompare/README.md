@@ -353,8 +353,15 @@ a cross-host clock or an exact first-decode measurement.
 `vlc_compare.py --timestamped-diagnostics` (or keyword-only
 `compare(..., diagnostics=True)`) captures both clients' stdout and stderr through
 one owned selector thread. Disabled mode retains direct regular-file logging.
-VLC argv and verbosity are unchanged; the version probe still uses `--vlc` and
-has a cancellable ten-second timeout. No media proxy is inserted.
+Default VLC argv and verbosity are unchanged. With timestamped diagnostics,
+`--diagnostic-verbosity 1` or `2` explicitly adds that verbosity to playback
+clients only; the selected level is retained in private configuration. An explicit
+nonzero level removes inherited `VLC_VERBOSE` from playback clients so that the
+selected option takes effect; the probe and zero-level environment are preserved.
+The version probe remains unchanged, uses `--vlc` and has a cancellable ten-second timeout.
+Programmatic callers may supply `args.diagnostic_verbosity`; absent means zero.
+Nonzero verbosity without timestamped diagnostics is rejected before launch.
+No media proxy is inserted.
 
 In this mode `engine-vlc.log`, `outpace-vlc.log`, and `probe-vlc.log` are private
 0600 JSONL files containing base64 raw byte prefixes. They are persisted only
@@ -387,3 +394,13 @@ or advancing-input/flat-decode labels describe sampled counters only. They canno
 establish TCP delivery, pause provenance, source failure, or causal ordering with
 client messages. Raw version/status/log data remain private. No new live acceptance
 or server-wire evidence follows from this diagnostic option.
+
+Verbose input diagnostics remain evidence, not automatic error classification.
+Decode each JSONL record's `raw_base64` before interpreting it. EOF-like messages
+during cleanup may result from cancellation; distinguish the record phase and
+receipt interval before describing observation EOF. Per-stream receipt order is
+not cross-stream emission order, and a diagnostic message alone does not prove
+wire EOF or the cause of stalled decode. Increased verbosity adds drain CPU and
+can exhaust the unchanged retention cap sooner; incomplete capture cannot prove
+message absence. Assess those costs for a concrete bounded profile before live
+use. This option does not authorize another observation or change player buffering.

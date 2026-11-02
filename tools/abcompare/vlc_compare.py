@@ -154,6 +154,11 @@ def playback_targets(args, content_id, playback_urls):
 
 def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
             artifact_parent=None, diagnostics=False):
+    verbosity = getattr(args, "diagnostic_verbosity", 0)
+    if type(verbosity) is not int or not 0 <= verbosity <= 2:
+        raise ValueError("diagnostic verbosity must be an integer from 0 to 2")
+    if verbosity and not diagnostics:
+        raise ValueError("diagnostic verbosity requires timestamped diagnostics")
     targets = playback_targets(args, content_id, playback_urls)
     if cancel_requested is not None and not callable(cancel_requested):
         raise ValueError("cancellation callback must be callable")
@@ -180,6 +185,10 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     env = dict(os.environ)
     env.pop("ACE_CONTENT_ID", None)
+    playback_env = dict(env) if verbosity else env
+    if verbosity:
+        # VLC's console logger prioritizes this variable over its --verbose option.
+        playback_env.pop("VLC_VERBOSE", None)
     collector = Collector(started) if diagnostics else None
     diagnostic_failure = None
     capture_stopped = False
@@ -235,7 +244,7 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
         }
         if diagnostics:
             config["diagnostics"] = {"schema_version": 1, "origin_monotonic": started,
-                                     "probe_version_truncated": version_truncated}
+                                     "probe_version_truncated": version_truncated, "verbosity": verbosity}
         (root / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         print(f"Private artifacts: {root}", flush=True)
         for name, base in (("engine", args.engine_url), ("outpace", args.outpace_url)):
@@ -253,9 +262,10 @@ def compare(args, content_id, *, playback_urls=None, cancel_requested=None,
                     "--extraintf=http", "--http-host=127.0.0.1", f"--http-port={port}",
                     f"--http-password={password}", "--vout=vdummy", "--aout=adummy",
                     f"--network-caching={args.network_caching}", "--no-video-title-show",
+                    *([f"--verbose={verbosity}"] if verbosity else []),
                     "--stats", str(playlist),
                 ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if diagnostics else log,
-                   stderr=subprocess.PIPE if diagnostics else log, env=env)
+                   stderr=subprocess.PIPE if diagnostics else log, env=playback_env)
             finally:
                 if log is not None:
                     log.close()
@@ -437,9 +447,12 @@ def main():
     parser.add_argument("--network-caching", type=int, default=1000, metavar="MS")
     parser.add_argument("--vlc", default="cvlc")
     parser.add_argument("--timestamped-diagnostics", action="store_true")
+    parser.add_argument("--diagnostic-verbosity", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--client-warp", choices=("on", "off", "unknown"), default="unknown")
     parser.add_argument("--server-warp", choices=("on", "off", "mixed", "unknown"), default="unknown")
     args = parser.parse_args()
+    if args.diagnostic_verbosity and not args.timestamped_diagnostics:
+        parser.error("--diagnostic-verbosity requires --timestamped-diagnostics")
     content_id = os.environ.get("ACE_CONTENT_ID", "")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", content_id):
         parser.error("supply a current public content id privately in ACE_CONTENT_ID")
