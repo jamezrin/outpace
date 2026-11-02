@@ -45,6 +45,7 @@ name = "ace-peer"
 version = "0.9.0"
 dependencies = [
  "ace-wire",
+ "bytes",
  "hex",
  "tokio",
 ]
