@@ -75,17 +75,15 @@ impl AceProvider {
             }
             Err(CatalogLookupError::Catalog(error)) => error,
         };
-        if matches!(
-            *catalog_error,
-            ResolveError::ProtectedContent
-                | ResolveError::InvalidProtection
-                | ResolveError::Transport(_)
-        ) {
-            return Err(match *catalog_error {
-                ResolveError::ProtectedContent => ProviderError::ProtectedContent,
-                ResolveError::InvalidProtection => ProviderError::InvalidProtection,
-                _ => ProviderError::Backend("invalid descriptor metadata".into()),
-            });
+        match catalog_error.as_ref() {
+            ResolveError::ProtectedContent => return Err(ProviderError::ProtectedContent),
+            ResolveError::InvalidProtection => return Err(ProviderError::InvalidProtection),
+            ResolveError::Transport(reason) => {
+                return Err(ProviderError::Backend(format!(
+                    "invalid descriptor metadata: {reason}"
+                )));
+            }
+            _ => {}
         }
         if !self.bep9_content_id_fallback {
             return Err(disabled_content_id_fallback(&catalog_error));

@@ -180,8 +180,11 @@ index, then the authenticated catalog. Response authentication and requested-has
 verification must succeed before discovery; Outpace does not guess live geometry.
 Failures are briefly cached. Only signed-catalog descriptors populate the shared
 provenance index: neither BEP-9 nor a caller-supplied transport URL qualifies.
-Successful content-id analysis may populate that index; offline infohash/magnet
-analysis only parses the hash and does **not** establish playability. See
+Content-id analysis inspects descriptor metadata but does **not** populate that
+index. Opening a content id for playback (`/ace/getstream`, `/streams`) does.
+Offline infohash/magnet analysis returns `descriptor metadata is unavailable`
+and does **not** establish playability; later playback may still resolve through
+the authenticated catalog. See
 [native infohash inputs](../native-api.md#infohash-inputs) and the
 [catalog trust boundary](notes/62-catalog-response-authentication.md).
 

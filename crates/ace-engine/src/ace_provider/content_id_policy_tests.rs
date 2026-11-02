@@ -430,6 +430,36 @@ async fn protected_cached_descriptor_cannot_open_or_prepare() {
 }
 
 #[tokio::test]
+async fn malformed_catalog_descriptor_preserves_reason_without_peer_fallback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    for fallback in [false, true] {
+        for reason in ["unexpected chunk_length", "piece_length too large"] {
+            let p = provider()
+                .with_bep9_content_id_fallback(fallback)
+                .with_bootstrap_peers(vec![addr]);
+            let result = tokio::time::timeout(
+                Duration::from_millis(100),
+                p.resolve_content_id_with_catalog(CID, ready(Err(ResolveError::Transport(reason)))),
+            )
+            .await
+            .expect("malformed descriptor tried peer fallback");
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("invalid descriptor metadata: {reason}")
+            );
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn typed_protection_catalog_errors_are_terminal_for_vod_fallback() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
