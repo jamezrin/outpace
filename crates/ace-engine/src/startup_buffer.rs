@@ -1,6 +1,6 @@
 use crate::config::StartupBufferConfig;
 use crate::provider::{SourceStats, StatsHandle, StatsReader, TsSource};
-use ace_media::mpegts::{ts_timing, ClockObservation, SelectedPcrClock, TS_PACKET_LEN};
+use ace_media::mpegts::{ts_timing, ClockObservation, SelectedPcrClock, TsTiming, TS_PACKET_LEN};
 use ace_swarm::types::StreamMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -103,26 +103,49 @@ impl StartupReservoir {
     fn observe_bytes(&mut self, bytes: &[u8]) -> Option<usize> {
         let prior_bytes = self.queued_bytes;
         let mut retain_from = None;
-        for (index, &byte) in bytes.iter().enumerate() {
-            self.partial.push(byte);
-            if self.partial.len() != TS_PACKET_LEN {
-                continue;
+        let mut consumed = 0;
+        if !self.partial.is_empty() {
+            let fill = (TS_PACKET_LEN - self.partial.len()).min(bytes.len());
+            self.partial.extend_from_slice(&bytes[..fill]);
+            consumed = fill;
+            if self.partial.len() < TS_PACKET_LEN {
+                return None;
             }
-            let mut packet = [0_u8; TS_PACKET_LEN];
-            packet.copy_from_slice(&self.partial);
+            let timing = ts_timing(
+                self.partial
+                    .as_slice()
+                    .try_into()
+                    .expect("completed partial packet has exactly 188 bytes"),
+            );
             self.partial.clear();
-            let timing = ts_timing(&packet);
-            if self.clock.observe(timing) == ClockObservation::Reset {
-                retain_from = Some(prior_bytes + index + 1 - TS_PACKET_LEN);
-                self.first_clean_byte = None;
-                self.release_clock_duration = None;
-                self.release_bytes = 0;
-                if !timing.discontinuity {
-                    let _ = self.clock.observe(timing);
-                }
+            if self.observe_timing(timing) {
+                retain_from = Some(prior_bytes + consumed - TS_PACKET_LEN);
             }
         }
+        let (packets, remainder) = bytes[consumed..].as_chunks::<TS_PACKET_LEN>();
+        for packet in packets {
+            consumed += TS_PACKET_LEN;
+            let timing = ts_timing(packet);
+            if self.observe_timing(timing) {
+                retain_from = Some(prior_bytes + consumed - TS_PACKET_LEN);
+            }
+        }
+        self.partial.extend_from_slice(remainder);
         retain_from
+    }
+
+    /// Return whether this packet starts a new retained startup epoch.
+    fn observe_timing(&mut self, timing: TsTiming) -> bool {
+        if self.clock.observe(timing) != ClockObservation::Reset {
+            return false;
+        }
+        self.first_clean_byte = None;
+        self.release_clock_duration = None;
+        self.release_bytes = 0;
+        if !timing.discontinuity {
+            let _ = self.clock.observe(timing);
+        }
+        true
     }
 
     fn discard_prefix(&mut self, retain_from: usize, chunk: &mut Bytes) {
@@ -812,3 +835,6 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
     }
 }
+
+#[cfg(test)]
+mod scan_tests;
