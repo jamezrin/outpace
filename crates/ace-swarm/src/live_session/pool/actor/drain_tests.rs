@@ -12,6 +12,7 @@ async fn cancel_at_pending(future: impl Future<Output = bool>) {
 #[tokio::test]
 async fn peerless_drain_survives_cancel_between_segments_and_closes_promptly() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 2,
@@ -121,6 +122,7 @@ async fn peerless_drain_survives_cancel_between_segments_and_closes_promptly() {
 #[tokio::test]
 async fn peerless_publication_before_extraction_and_withheld_does_not_complete_first_output() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 2,
@@ -171,6 +173,7 @@ async fn peerless_publication_before_extraction_and_withheld_does_not_complete_f
 #[tokio::test]
 async fn peerless_cancel_before_extract_preserves_wire_and_older_pending_bypasses_publication() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 2,

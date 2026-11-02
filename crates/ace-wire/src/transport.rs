@@ -54,6 +54,11 @@ pub struct TransportDescriptor {
 }
 
 impl TransportDescriptor {
+    /// Inspect the wrapped descriptor's authoritative root protection field.
+    pub fn protection(&self) -> Result<crate::protection::Protection> {
+        crate::protection::classify(self.raw.get(b"premium"))
+    }
+
     /// Total content byte length for a single-file VOD (`length` key), if present.
     ///
     /// Historical synthetic compatibility schema for the legacy ASCII-wrapped descriptor,

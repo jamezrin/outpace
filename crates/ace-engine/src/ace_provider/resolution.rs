@@ -43,24 +43,27 @@ impl AceProvider {
         catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>> + Send + 'static,
     ) -> Result<ResolvedContentId, ProviderError> {
         if let Some(info) = self.resolve_cache.get(content_id) {
+            info.ensure_playable().map_err(ProviderError::from)?;
             // Re-record: the bounded infohash index may have evicted it since (#164).
             self.infohash_index.put(info.clone());
             return Ok(ResolvedContentId::Catalog(info));
         }
         let key = hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
         if let Some(bytes) = self.seed_registry.broadcast_transport_for_content_id(&key) {
-            return stream_info_from_transport(&bytes)
-                .map(ResolvedContentId::Provider)
-                .map_err(|e| ProviderError::Backend(format!("local broadcast descriptor: {e:?}")));
+            let info = stream_info_from_transport(&bytes).map_err(ProviderError::from)?;
+            info.ensure_playable().map_err(ProviderError::from)?;
+            return Ok(ResolvedContentId::Provider(info));
         }
         if self.bep9_content_id_fallback {
             if let Some(info) = self.peer_resolve_cache.get(content_id) {
+                info.ensure_playable().map_err(ProviderError::from)?;
                 return Ok(ResolvedContentId::Provider(info));
             }
         }
 
         let catalog_error = match self.resolve_cache.resolve_with(content_id, catalog).await {
             Ok(info) => {
+                info.ensure_playable().map_err(ProviderError::from)?;
                 crate::alog!("[ace] resolved content id via catalog");
                 self.infohash_index.put(info.clone());
                 return Ok(ResolvedContentId::Catalog(info));
@@ -72,6 +75,16 @@ impl AceProvider {
             }
             Err(CatalogLookupError::Catalog(error)) => error,
         };
+        match catalog_error.as_ref() {
+            ResolveError::ProtectedContent => return Err(ProviderError::ProtectedContent),
+            ResolveError::InvalidProtection => return Err(ProviderError::InvalidProtection),
+            ResolveError::Transport(reason) => {
+                return Err(ProviderError::Backend(format!(
+                    "invalid descriptor metadata: {reason}"
+                )));
+            }
+            _ => {}
+        }
         if !self.bep9_content_id_fallback {
             return Err(disabled_content_id_fallback(&catalog_error));
         }
@@ -103,11 +116,15 @@ impl AceProvider {
             let mut session = session.with_timeout(RESOLVE_PEER_TIMEOUT);
             match resolve_via_peer(&mut session, key, &self.identity).await {
                 Ok(info) => {
+                    info.ensure_playable().map_err(ProviderError::from)?;
                     crate::alog!("[ace] resolved raw-hash content id via metadata peer");
                     // A raw transport hash is not catalog authentication: keep the descriptor
                     // out of the infohash index (#164).
                     self.peer_resolve_cache.put(content_id, info.clone());
                     return Ok(ResolvedContentId::Provider(info));
+                }
+                Err(error @ (ResolveError::ProtectedContent | ResolveError::InvalidProtection)) => {
+                    return Err(ProviderError::from(error))
                 }
                 Err(ResolveError::Peer(why)) => crate::alog!("[ace] resolve {addr}: {why}"),
                 Err(e) => crate::alog!("[ace] resolve {addr}: {e:?}"),
@@ -136,11 +153,19 @@ impl AceProvider {
             return self.resolve_content_id(content_id).await;
         }
         if let Some(url) = crate::transport_url::decode_transport_url(id) {
+            if let Some(info) = self.peer_resolve_cache.get(id) {
+                return Ok(info);
+            }
             // Not recorded in the index: a transport URL is caller-supplied, and the index is
             // shared state whose trackers the infohash does not bind (#164).
             return stream_info_from_transport_url(&url)
                 .await
-                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")));
+                .map_err(|e| match e {
+                    ResolveError::ProtectedContent | ResolveError::InvalidProtection => {
+                        ProviderError::from(e)
+                    }
+                    other => ProviderError::Backend(format!("transport url: {other:?}")),
+                });
         }
         if is_bare_hex40(id) {
             return self
@@ -202,6 +227,9 @@ impl AceProvider {
         }
         let info = match catalog.await {
             Ok(info) => info,
+            Err(error @ (ResolveError::ProtectedContent | ResolveError::InvalidProtection)) => {
+                return Err(ProviderError::from(error))
+            }
             Err(error) => {
                 self.remember_infohash_failure(requested);
                 return Err(ProviderError::Unresolvable(format!(
@@ -243,7 +271,20 @@ impl AceProvider {
         &self,
         id: &str,
     ) -> Result<Box<dyn VodContent>, ProviderError> {
-        let info = self.resolve_vod_info(id).await?;
+        self.resolve_vod_inner_with_catalog(
+            id,
+            catalog_transport_bytes(id.strip_prefix("cid:").unwrap_or_default()),
+        )
+        .await
+    }
+
+    pub(super) async fn resolve_vod_inner_with_catalog(
+        &self,
+        id: &str,
+        catalog: impl std::future::Future<Output = Result<Vec<u8>, ResolveError>>,
+    ) -> Result<Box<dyn VodContent>, ProviderError> {
+        let info = self.resolve_vod_info_with_catalog(id, catalog).await?;
+        info.ensure_playable().map_err(ProviderError::from)?;
         let infohash = info.infohash;
         let piece_length = info.piece_length;
         let chunk_length = info.chunk_length;
@@ -273,14 +314,6 @@ impl AceProvider {
     /// `cid:<40hex>` content-id (local broadcast or catalog; raw-hash peers require opt-in)
     /// or a transport-url id; a
     /// bare infohash is rejected (it carries no descriptor / piece hashes).
-    async fn resolve_vod_info(&self, id: &str) -> Result<VodInfo, ProviderError> {
-        self.resolve_vod_info_with_catalog(
-            id,
-            catalog_transport_bytes(id.strip_prefix("cid:").unwrap_or_default()),
-        )
-        .await
-    }
-
     pub(super) async fn resolve_vod_info_with_catalog(
         &self,
         id: &str,
@@ -293,7 +326,7 @@ impl AceProvider {
         } else if let Some(url) = crate::transport_url::decode_transport_url(id) {
             transport_bytes_from_url(&url)
                 .await
-                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")))?
+                .map_err(ProviderError::from)?
         } else if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(ProviderError::Backend(
                 "a bare infohash is not a VOD target (no descriptor with piece hashes)".into(),
@@ -303,8 +336,7 @@ impl AceProvider {
                 "id must be cid:<40hex> or a transport-url id for VOD".into(),
             ));
         };
-        vod_info_from_transport(&bytes)
-            .map_err(|e| ProviderError::Backend(format!("vod descriptor: {e:?}")))
+        vod_info_from_transport(&bytes).map_err(ProviderError::from)
     }
 
     async fn content_id_transport_with_catalog(
@@ -317,6 +349,11 @@ impl AceProvider {
         }
         match catalog.await {
             Ok(bytes) => Ok(bytes),
+            Err(
+                error @ (ResolveError::ProtectedContent
+                | ResolveError::InvalidProtection
+                | ResolveError::Transport(_)),
+            ) => Err(ProviderError::from(error)),
             Err(error) if !self.bep9_content_id_fallback => {
                 Err(disabled_content_id_fallback(&error))
             }

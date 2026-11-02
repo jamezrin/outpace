@@ -1054,6 +1054,7 @@ async fn queued_worker_message_remains_current_before_terminal_loss_is_drained()
     let mut signed_piece = payload.clone();
     signed_piece.extend(auth.sign(&payload));
     let stream = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: signed_piece.len() as u64,
         chunk_length: signed_piece.len() as u64,
@@ -1364,6 +1365,7 @@ async fn another_verified_producer_suppresses_stale_source_refresh() {
     let (_first_payload, first_signed) = make_signed_piece(0x55);
     let (_second_payload, second_signed) = make_signed_piece(0x66);
     let stream = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: first_signed.len() as u64,
         chunk_length: first_signed.len() as u64,

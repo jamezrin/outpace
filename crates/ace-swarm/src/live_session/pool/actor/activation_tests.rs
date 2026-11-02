@@ -45,6 +45,7 @@ fn runtime(
 async fn activation_obsolete_completion_preserves_current_peers_and_counters() {
     for case in 0..12 {
         let info = StreamInfo {
+            protection: None,
             infohash: [0; 20],
             piece_length: 4,
             chunk_length: 2,

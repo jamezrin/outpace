@@ -130,6 +130,7 @@ async fn schedule(replace: bool) {
         })
         .collect();
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: wires[0].len() as u64,
         chunk_length: (wires[0].len() / 2) as u64,

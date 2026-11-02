@@ -136,10 +136,14 @@ pub(super) async fn stream_segment(
 
 /// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
 /// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
-/// that text. Capacity returns 503 with Retry-After; other failures retain bodiless 404.
+/// that text. Protection policy failures also return 422 with their stable message.
+/// Capacity returns 503 with Retry-After; other failures retain bodiless 404.
 fn stream_start_error(e: ProviderError) -> Response {
     match e {
         ProviderError::CapacityExhausted => capacity_error(),
+        e @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
+        }
         ProviderError::Unresolvable(reason) => {
             (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response()
         }

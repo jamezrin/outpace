@@ -14,6 +14,7 @@ pub mod live_codec;
 pub mod message;
 pub mod metainfo;
 pub mod peer_exchange;
+pub mod protection;
 pub mod reassembly;
 pub mod signing_chunker;
 pub mod transport;
@@ -24,6 +25,8 @@ pub mod ut_metadata;
 pub enum WireError {
     /// Buffer ended before a complete structure was parsed.
     Truncated,
+    /// Descriptor protection is outside the explicitly supported zero/one policy.
+    InvalidProtection,
     /// An assembled live piece split successfully but its source signature did not verify.
     SignatureRejected,
     /// Bytes did not match the expected format.

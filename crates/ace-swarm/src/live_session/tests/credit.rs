@@ -23,6 +23,7 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
     }
     let relay_signed = signed.clone();
     let descriptor = StreamInfo {
+        protection: None,
         piece_length: signed.len() as u64,
         chunk_length: if mode == CacheProducer::Mixed {
             signed.len() as u64 / 2
@@ -416,6 +417,7 @@ async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
             .collect::<Vec<_>>(),
     );
     let descriptor = StreamInfo {
+        protection: None,
         piece_length: pieces[0].len() as u64,
         chunk_length: pieces[0].len() as u64 / 2,
         sig_len: auth.signature_len(),

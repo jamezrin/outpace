@@ -9,6 +9,7 @@ const CID_B: &str = "1123456789abcdef0123456789abcdef01234567";
 
 fn info(marker: u8) -> StreamInfo {
     StreamInfo {
+        protection: None,
         infohash: [marker; 20],
         piece_length: 524_288,
         chunk_length: 16_384,

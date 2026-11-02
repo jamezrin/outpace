@@ -630,6 +630,7 @@ async fn extend_http_body_until(
 async fn run_http_reconnect_composition(mode: HttpReconnectWindow, decode: bool) {
     let auth = Arc::new(ace_wire::live_auth::LiveSourceAuth::generate());
     let mut info = ace_swarm::types::StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 752,
         chunk_length: 752,

@@ -101,6 +101,7 @@ pub fn selector(params: &HashMap<String, String>) -> Selector {
 /// `get_media_files` methods report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedContent {
+    pub protection: Option<ace_wire::protection::Protection>,
     /// Canonical lowercase 40-hex infohash.
     pub infohash: String,
     /// The acestream content id, when the selector carried or resolved one.
@@ -118,6 +119,7 @@ pub fn resolve_offline(sel: &Selector) -> Option<Result<ResolvedContent, String>
     match sel {
         Selector::Infohash(h) => Some(match hex20(h) {
             Ok(bytes) => Ok(ResolvedContent {
+                protection: None,
                 infohash: infohash_hex(&bytes),
                 content_id: None,
                 is_live: true,
@@ -126,6 +128,7 @@ pub fn resolve_offline(sel: &Selector) -> Option<Result<ResolvedContent, String>
         }),
         Selector::Magnet(m) => Some(match crate::magnet::parse_magnet_infohash(m) {
             Ok(hex) => Ok(ResolvedContent {
+                protection: None,
                 infohash: hex,
                 content_id: None,
                 is_live: true,
@@ -179,7 +182,7 @@ pub fn analyze_result(c: &ResolvedContent) -> Value {
         "infohash": c.infohash,
         "content_id": c.content_id,
         "is_live": bool_flag(c.is_live),
-        "is_encrypted": 0,
+        "is_encrypted": bool_flag(c.protection == Some(ace_wire::protection::Protection::Protected)),
         "status": "complete",
     })
 }
@@ -318,6 +321,7 @@ mod tests {
     #[test]
     fn analyze_result_exposes_infohash_and_flags() {
         let c = ResolvedContent {
+            protection: Some(ace_wire::protection::Protection::Public),
             infohash: "aa".repeat(20),
             content_id: Some("cid".to_string()),
             is_live: true,
@@ -332,6 +336,7 @@ mod tests {
     #[test]
     fn media_files_result_lists_the_single_file_by_infohash() {
         let c = ResolvedContent {
+            protection: Some(ace_wire::protection::Protection::Public),
             infohash: "bb".repeat(20),
             content_id: None,
             is_live: false,

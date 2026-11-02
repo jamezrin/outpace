@@ -16,6 +16,7 @@ async fn rejected_signed_piece_retries_through_full_peer_pool() {
         let mut corrupt = authentic.clone();
         corrupt[0] ^= 1;
         let info = StreamInfo {
+            protection: None,
             infohash: [0; 20],
             piece_length: authentic.len() as u64,
             chunk_length: authentic.len() as u64 / 2,

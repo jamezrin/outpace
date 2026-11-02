@@ -105,6 +105,7 @@ fn forward_request_is_bounded_against_a_bogus_head() {
 #[test]
 fn continuity_uses_configured_live_recovery_bounds() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0x01; 20],
         piece_length: 1_048_576,
         chunk_length: 16_384,

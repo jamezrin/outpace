@@ -119,6 +119,7 @@ mod tests {
     fn confirmation_and_expiry_arm_once_while_held_withheld_is_not_done() {
         for expiry in [false, true] {
             let info = StreamInfo {
+                protection: None,
                 infohash: [0; 20],
                 piece_length: 4,
                 chunk_length: 2,

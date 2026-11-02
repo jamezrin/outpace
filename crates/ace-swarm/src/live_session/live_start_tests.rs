@@ -21,6 +21,7 @@ fn packet_piece(marker: u8) -> Vec<u8> {
 fn fixture(max_active: usize) -> (StreamInfo, SeedConfig) {
     (
         StreamInfo {
+            protection: None,
             infohash: [0; 20],
             piece_length: 752,
             chunk_length: 752,

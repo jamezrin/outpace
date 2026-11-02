@@ -11,6 +11,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn actor_fifo_overflow_retry_round_robin_stale_generation_and_ready_drain() {
         let info = StreamInfo {
+            protection: None,
             infohash: [0; 20],
             piece_length: 4,
             chunk_length: 2,
