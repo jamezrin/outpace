@@ -1,6 +1,23 @@
 //! Offline comparison contracts using the actual private production walker.
 use super::*;
 
+fn record_batch(history: &mut Vec<usize>, count: &mut usize, size: usize) {
+    *count = count.saturating_add(1);
+    if history.len() < 64 {
+        history.push(size);
+    }
+}
+#[test]
+fn batch_history_remains_bounded() {
+    let mut history = Vec::new();
+    let mut count = 0;
+    for _ in 0..65 {
+        record_batch(&mut history, &mut count, 0);
+    }
+    assert_eq!(history, vec![0; 64]);
+    assert_eq!(count, 65);
+}
+
 /// Observe the private walker without changing its response batching or peer policy.
 async fn run_comparison(infohash: &[u8; 20], seeds: Vec<SocketAddrV4>) -> serde_json::Value {
     let start = std::time::Instant::now();
@@ -10,6 +27,7 @@ async fn run_comparison(infohash: &[u8; 20], seeds: Vec<SocketAddrV4>) -> serde_
         Err(_) => {
             return serde_json::json!({
                 "terminal": "adapter_error", "peer_count": 0,
+                "batch_sizes": [], "batches_observed": 0, "batch_history_truncated": false, "target_overshoot": 0,
                 "first_peer_seconds": null, "elapsed_seconds": start.elapsed().as_secs_f64(),
             })
         }
@@ -20,12 +38,20 @@ async fn run_comparison(infohash: &[u8; 20], seeds: Vec<SocketAddrV4>) -> serde_
     else {
         return serde_json::json!({
             "terminal": "deadline", "peer_count": 0,
+            "batch_sizes": [], "batches_observed": 0, "batch_history_truncated": false, "target_overshoot": 0,
             "first_peer_seconds": null, "elapsed_seconds": start.elapsed().as_secs_f64(),
         });
     };
     let mut peers = BTreeSet::new();
     let mut first_peer = None;
+    let mut batch_sizes = Vec::new();
+    let mut batches_observed = 0;
     let metrics = dht_walk_from_seeds(infohash, remaining, &socket, seeds, |_, response| {
+        record_batch(
+            &mut batch_sizes,
+            &mut batches_observed,
+            response.peers.len(),
+        );
         collect_response_peers(response, &mut peers, 8, &mut |_| {
             first_peer.get_or_insert_with(|| start.elapsed().as_secs_f64());
             true
@@ -41,6 +67,10 @@ async fn run_comparison(infohash: &[u8; 20], seeds: Vec<SocketAddrV4>) -> serde_
     };
     serde_json::json!({
         "terminal": terminal,
+        "batch_sizes": batch_sizes,
+        "batches_observed": batches_observed,
+        "batch_history_truncated": batches_observed>batch_sizes.len(),
+        "target_overshoot": peers.len().saturating_sub(8),
         "peer_count": peers.len(),
         "first_peer_seconds": first_peer,
         "elapsed_seconds": start.elapsed().as_secs_f64(),
@@ -113,6 +143,10 @@ async fn custom_real_udp_target() {
     let result = result.expect("custom walker missed fixture bound");
     assert_eq!(result["terminal"], "target");
     assert_eq!(result["peer_count"], 10);
+    assert_eq!(result["batch_sizes"], serde_json::json!([10]));
+    assert_eq!(result["batches_observed"], 1);
+    assert_eq!(result["target_overshoot"], 2);
+    assert_eq!(result["batch_history_truncated"], false);
     assert!(result["first_peer_seconds"].as_f64().is_some());
 }
 

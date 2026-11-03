@@ -93,6 +93,10 @@ async fn fixture(candidate: Candidate) {
         record.peer_count, 10,
         "crossing batch must be retained atomically"
     );
+    assert_eq!(record.batch_sizes, vec![10]);
+    assert_eq!(record.batches_observed, 1);
+    assert_eq!(record.target_overshoot, 2);
+    assert!(!record.batch_history_truncated);
     assert!(record.first_peer.is_some());
     assert!(record.elapsed < Duration::from_secs(4));
     assert!(queries.lock().unwrap().iter().any(|q| q == b"get_peers"));

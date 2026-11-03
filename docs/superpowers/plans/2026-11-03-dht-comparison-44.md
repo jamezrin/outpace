@@ -66,3 +66,18 @@ pending; no live measurement or issue-closure claim follows.
   SIGKILL statuses and namespace cleanup, through a fixed 40-second offline profile.
 - [x] Independent review found no scoped P1/P2; integration gates recorded privately.
 - [ ] Late UDP replies, destination policy and the live comparison remain outstanding.
+
+## Bounded emission-record follow-up
+
+- [x] Retain the first 64 adapter-emission sizes, total observations and explicit
+  history truncation; preserve unique-peer cap and target-crossing batches.
+- [x] Expose unique target overshoot in upstream records and custom JSON.
+- [x] Missing-interface REDs and real custom JSON missing-field behavioral RED retained.
+- [x] All three actual isolated UDP target cases assert batch size, total and overshoot.
+- [x] Independent review found no scoped P1/P2; workspace/tool tests, Clippy,
+  formatting, hygiene and whitespace checks passed. PR/CI integration remains pending.
+
+Custom response-parser and upstream stream boundaries differ; these counts are
+not raw-wire equivalence or a live performance comparison. The custom callback's
+absolute-deadline observation semantics still require reconciliation before live
+comparison; this telemetry increment does not claim that issue resolved.
