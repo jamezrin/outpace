@@ -155,6 +155,24 @@ mod accounting_tests {
         assert_eq!(count.first_peer(), Some(Duration::ZERO));
     }
     #[test]
+    fn emission_metadata_is_bounded_and_keeps_atomic_overshoot() {
+        let mut count = Accounting::new(2, 1024);
+        assert!(count.observe(&[peer(1), peer(1), peer(2), peer(3)], Duration::ZERO));
+        assert_eq!(count.batch_sizes(), &[4]);
+        assert_eq!(count.batches_observed(), 1);
+        assert_eq!(count.target_overshoot(), 1);
+        assert!(!count.batch_history_truncated());
+        let mut empty = Accounting::new(8, 1024);
+        for _ in 0..65 {
+            assert!(!empty.observe(&[], Duration::ZERO));
+        }
+        assert_eq!(empty.batch_sizes(), &[0; 64]);
+        assert_eq!(empty.batches_observed(), 65);
+        assert!(empty.batch_history_truncated());
+        assert_eq!(empty.count(), 0);
+        assert!(empty.first_peer().is_none());
+    }
+    #[test]
     fn empty_observation_is_not_a_zero_first_peer_time() {
         let mut count = Accounting::new(8, 1024);
         assert!(!count.observe(&[], Duration::from_secs(1)));
@@ -174,6 +192,8 @@ pub struct Accounting {
     first: Option<Duration>,
     target: usize,
     cap: usize,
+    batch_sizes: Vec<usize>,
+    batches_observed: usize,
 }
 impl Accounting {
     pub fn new(target: usize, cap: usize) -> Self {
@@ -182,9 +202,15 @@ impl Accounting {
             first: None,
             target: target.clamp(1, 1024),
             cap: cap.clamp(1, 1024),
+            batch_sizes: Vec::new(),
+            batches_observed: 0,
         }
     }
     pub fn observe(&mut self, batch: &[SocketAddrV4], elapsed: Duration) -> bool {
+        self.batches_observed = self.batches_observed.saturating_add(1);
+        if self.batch_sizes.len() < 64 {
+            self.batch_sizes.push(batch.len());
+        }
         for &peer in batch {
             if self.peers.len() >= self.cap {
                 break;
@@ -194,6 +220,19 @@ impl Accounting {
             }
         }
         self.peers.len() >= self.target || self.peers.len() >= self.cap
+    }
+    /// Sizes are stream emissions, before this collector filters duplicates/zero ports.
+    pub fn batch_sizes(&self) -> &[usize] {
+        &self.batch_sizes
+    }
+    pub fn batches_observed(&self) -> usize {
+        self.batches_observed
+    }
+    pub fn batch_history_truncated(&self) -> bool {
+        self.batches_observed > self.batch_sizes.len()
+    }
+    pub fn target_overshoot(&self) -> usize {
+        self.peers.len().saturating_sub(self.target)
     }
     pub fn count(&self) -> usize {
         self.peers.len()

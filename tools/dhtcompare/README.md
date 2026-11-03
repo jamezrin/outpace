@@ -148,3 +148,19 @@ Adapter clock tests separately cover consumed construction budget and a stream
 poll ending after its deadline. A blocking poll cannot be preempted by a Tokio
 timeout; the external process deadline remains the hard bound. Late network
 replies, allowed destinations, live workers and live results remain pending.
+
+## Emission accounting
+
+Adapter records include `batch_sizes` (the first 64 emission sizes),
+`batches_observed` (a saturating total), `batch_history_truncated`, and
+`target_overshoot` (unique retained peers beyond the target). Empty and duplicate
+emissions still consume history entries; retaining 64 entries never stops lookup.
+The unique-peer cap and atomic target-crossing behavior remain unchanged.
+
+These are adapter-boundary sizes, not raw UDP records. The custom walker counts
+peers parsed from correlated responses, after its compact-endpoint parser filters
+invalid entries. The upstream adapters count vectors yielded by each library,
+after any library-specific filtering. The common collector then excludes zero
+ports and duplicate endpoints. Equal batch sizes do not prove equal parser policy,
+reachability, packet counts or discovery quality. Target overshoot explains a
+crossing batch; it is not a ranking. No identifiers are retained in these fields.

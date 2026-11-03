@@ -24,6 +24,10 @@ pub struct Record {
     pub first_peer: Option<Duration>,
     pub elapsed: Duration,
     pub terminal: Terminal,
+    pub batch_sizes: Vec<usize>,
+    pub batches_observed: usize,
+    pub batch_history_truncated: bool,
+    pub target_overshoot: usize,
 }
 fn empty(start: Instant, terminal: Terminal) -> Record {
     Record {
@@ -31,6 +35,10 @@ fn empty(start: Instant, terminal: Terminal) -> Record {
         first_peer: None,
         elapsed: start.elapsed(),
         terminal,
+        batch_sizes: Vec::new(),
+        batches_observed: 0,
+        batch_history_truncated: false,
+        target_overshoot: 0,
     }
 }
 async fn harvest<S: Stream<Item = Vec<SocketAddrV4>> + Unpin>(
@@ -63,6 +71,10 @@ async fn harvest<S: Stream<Item = Vec<SocketAddrV4>> + Unpin>(
         first_peer: counts.first_peer(),
         elapsed: start.elapsed(),
         terminal,
+        batch_sizes: counts.batch_sizes().to_vec(),
+        batches_observed: counts.batches_observed(),
+        batch_history_truncated: counts.batch_history_truncated(),
+        target_overshoot: counts.target_overshoot(),
     }
 }
 
@@ -124,6 +136,22 @@ mod clock_tests {
         WorkerInput::parse("0123456789abcdef0123456789abcdef01234567", "127.0.0.1:9001").unwrap()
     }
 
+    #[tokio::test]
+    async fn record_keeps_batch_sizes_and_target_overshoot() {
+        let peers = (10001..=10010)
+            .map(|port| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port))
+            .collect();
+        let record = harvest(
+            futures_lite::stream::iter([peers]),
+            &input(),
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(record.batch_sizes, vec![10]);
+        assert_eq!(record.batches_observed, 1);
+        assert_eq!(record.target_overshoot, 2);
+        assert!(!record.batch_history_truncated);
+    }
     #[tokio::test]
     async fn consumed_constructor_budget_does_not_poll_results() {
         let stream = futures_lite::stream::poll_fn(|_| -> Poll<Option<Vec<SocketAddrV4>>> {
