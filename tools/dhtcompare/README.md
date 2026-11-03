@@ -84,6 +84,42 @@ They then release the normal target response. They require the same offline
 namespace helper; they do not prove permanently disabled serving. The custom
 walker does not emit the read-only flag; its wire behavior is recorded separately.
 
+Run the two cold-client observations from the repository root, substituting the
+absolute `client_mode` executable path and its SHA-256 build pin:
+
+```sh
+python3.11 - /absolute/path/to/client_mode-test-binary CLIENT_MODE_BUILD_SHA256 <<'PYTHON'
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path("tools/dhtcompare").resolve()))
+from isolation import run_offline
+from qualification import Artifact
+
+binary = Path(sys.argv[1])
+artifact = Artifact(binary, sys.argv[2])
+for name in ("mainline_cold_client_mode", "n0_cold_client_mode"):
+    artifact.verify()
+    result = run_offline(
+        [str(binary), "--exact", name, "--ignored", "--nocapture"], timeout=8
+    )
+    passed = (
+        result.exit_code == 0 and result.cleanup_complete
+        and not result.timed_out and not result.truncated
+        and f"test {name} ... ok\n".encode() in result.stdout
+        and b"test result: ok. 1 passed; 0 failed; 0 ignored;" in result.stdout
+    )
+    print(name, {"passed": passed, "exit": result.exit_code,
+                 "cleanup_complete": result.cleanup_complete})
+    if not passed:
+        raise SystemExit(1)
+PYTHON
+```
+
+Both cases must execute exactly one test, exit zero and confirm namespace cleanup
+without timeout or truncated output. Their assertions require read-only outgoing
+queries, no unsolicited-ping reply during the 250 ms unfinished-lookup window,
+and subsequent normal target completion. A zero-test match is a failure.
+
 For the fixed external-cancellation block, pass the `client_mode` executable as
 `--upstream` (instead of `real_udp`) with its own build pin. Keep the custom
 ace-swarm test executable and its current build pin:
