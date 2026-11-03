@@ -61,6 +61,27 @@ class QualificationTests(unittest.TestCase):
             self.assertFalse(report['passed']);self.assertEqual(run.call_count,1)
             self.assertEqual(report['cases'][0]['exit_code'],result.exit_code)
             self.assertTrue(report['cases'][0]['executed_exact_case'])
+    def test_external_cancel_block_requires_query_witness_and_signal_exit(self):
+        result=self.result(stdout=b"running 1 test\ndht_lookup_query_witness\n",exit_code=-9,cancelled_on_witness=True)
+        with mock.patch('qualification.run_offline',return_value=result) as run:
+            report=qualify(*self.artifacts,output=self.root/'run',mode='lookup-cancellation')
+        self.assertTrue(report['passed']);self.assertEqual(run.call_count,3)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs['cancel_on_stdout'],b'dht_lookup_query_witness\n')
+            self.assertEqual(call.kwargs['timeout'],8)
+        self.assertTrue(all(case['query_witness'] for case in report['cases']))
+    def test_external_cancel_does_not_accept_panic_timeout_or_early_return(self):
+        valid=dict(stdout=b"running 1 test\ndht_lookup_query_witness\n",exit_code=-9,cancelled_on_witness=True)
+        for changes in [dict(exit_code=101),dict(timed_out=True),dict(cleanup_complete=False),dict(cancelled_on_witness=False),dict(stdout=valid['stdout']+b'dht_lookup_returned_before_cancel\n')]:
+            result=self.result(**(valid|changes))
+            with self.subTest(changes=changes),mock.patch('qualification.run_offline',return_value=result) as run:
+                report=qualify(*self.artifacts,output=self.root/('run'+str(id(result))),mode='lookup-cancellation')
+                self.assertFalse(report['passed']);self.assertEqual(run.call_count,1)
+    def test_unknown_mode_denies_before_artifact_access_or_spawn(self):
+        with mock.patch('qualification.run_offline') as run,mock.patch.object(Artifact,'verify') as verify:
+            with self.assertRaisesRegex(ValueError,'qualification_mode'):
+                qualify(*self.artifacts,output=self.root/'run',mode='live')
+        run.assert_not_called();verify.assert_not_called()
     def test_pin_verification_cannot_extend_launch_deadline(self):
         with mock.patch('qualification.time.monotonic',side_effect=[0,0,179,179,179]),mock.patch('qualification.run_offline') as run:
             report=qualify(*self.artifacts,output=self.root/'run')

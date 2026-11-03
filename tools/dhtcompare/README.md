@@ -69,3 +69,46 @@ failure, not a skip. Operator-supplied binaries are trusted: pins catch stale bu
 not hostile concurrent edits. Results and diagnostics use private file modes.
 The runner accepts no live target, seed, registry or public-network mode. Its report
 qualifies these tests only and cannot satisfy #44's live-results acceptance criterion.
+
+## Client-mode and external lookup cancellation
+
+Build the additional ignored fixtures without executing them:
+
+```sh
+cargo test --manifest-path tools/dhtcompare/Cargo.toml --all-features --offline --locked --test client_mode --no-run
+```
+
+The two `cold_client_mode` cases observe read-only flags on outgoing queries and
+no reply to one unsolicited ping during a 250 ms window with an unfinished lookup.
+They then release the normal target response. They require the same offline
+namespace helper; they do not prove permanently disabled serving. The custom
+walker does not emit the read-only flag; its wire behavior is recorded separately.
+
+For the fixed external-cancellation block, pass the `client_mode` executable as
+`--upstream` (instead of `real_udp`) with its own build pin. Keep the custom
+ace-swarm test executable and its current build pin:
+
+```sh
+python3.11 tools/dhtcompare/qualification.py --offline --mode lookup-cancellation \
+  --custom /absolute/path/to/ace_swarm-test-binary --custom-sha256 CUSTOM_BUILD_SHA256 \
+  --upstream /absolute/path/to/client_mode-test-binary --upstream-sha256 CLIENT_MODE_BUILD_SHA256 \
+  --output /private/path/to/new-cancellation-run
+```
+
+This profile has a 40-second whole-block deadline and three eight-second execution
+timeouts, reserving another 2.1 seconds per worker for cleanup. After a real `get_peers`
+query reaches the synthetic server, its flushed marker requests termination of the
+owned namespace. Qualification requires that marker, a cancellation request,
+SIGKILL status, confirmed cleanup and no early-return marker. Panic, normal exit,
+ordinary timeout, truncation and cleanup uncertainty fail the profile. These
+fixtures intentionally cannot pass as normal `--ignored` test runs; their success
+is the external owner's witnessed cancellation result.
+
+This proves process containment after a query witness and before any observed
+return marker. Completion can race signal delivery, so it does not atomically prove
+that the lookup remained pending at that instruction. It does not prove that
+dropping a library stream joins its actor or interrupt a real constructor.
+Adapter clock tests separately cover consumed construction budget and a stream
+poll ending after its deadline. A blocking poll cannot be preempted by a Tokio
+timeout; the external process deadline remains the hard bound. Late network
+replies, allowed destinations, live workers and live results remain pending.

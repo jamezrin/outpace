@@ -39,6 +39,26 @@ print(json.dumps({'net':os.stat('/proc/self/ns/net').st_ino,'pid':os.getpid()}))
         self.assertTrue(result.cleanup_complete)
         self.assertIsNotNone(result.exit_code)
 
+    def test_query_witness_cancels_owned_namespace_before_deadline(self):
+        result=run_offline([sys.executable,'-I','-c','import sys,time;sys.stdout.write("query-");sys.stdout.flush();time.sleep(.02);print("witness",flush=True);time.sleep(60)'],timeout=3,cancel_on_stdout=b'query-witness\n')
+        self.assertTrue(result.cancelled_on_witness)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(result.cleanup_complete)
+        self.assertNotEqual(result.exit_code,0)
+        self.assertIn(b'query-witness',result.stdout)
+
+    def test_stderr_marker_does_not_trigger_witness_cancellation(self):
+        result=run_offline([sys.executable,'-I','-c','import sys,time;print("query-witness",file=sys.stderr,flush=True);time.sleep(60)'],timeout=.3,cancel_on_stdout=b'query-witness\n')
+        self.assertFalse(result.cancelled_on_witness)
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.cleanup_complete)
+    def test_invalid_witness_bounds_deny_before_spawn(self):
+        with mock.patch('isolation.subprocess.Popen') as spawn:
+            for marker in [b'',b'x'*257,'query-witness',True]:
+                with self.subTest(marker=marker),self.assertRaises(ValueError):
+                    run_offline(['/usr/bin/true'],timeout=1,cancel_on_stdout=marker)
+        spawn.assert_not_called()
+
     def test_both_pipes_are_drained_after_prefix_retention(self):
         result = self.run_python('import os\nfor _ in range(64):\n os.write(1,b"x"*4096);os.write(2,b"y"*4096)', cap=1024)
         self.assertEqual(result.exit_code, 0)

@@ -45,6 +45,7 @@ async fn harvest<S: Stream<Item = Vec<SocketAddrV4>> + Unpin>(
         };
         match tokio::time::timeout(left, stream.next()).await {
             Err(_) => break Terminal::Deadline,
+            Ok(None) if remaining_budget(start.elapsed()).is_none() => break Terminal::Deadline,
             Ok(None) => break Terminal::Exhausted,
             Ok(Some(batch)) => {
                 let elapsed = start.elapsed();
@@ -104,5 +105,84 @@ pub async fn run(candidate: Candidate, input: &WorkerInput) -> Record {
                 Ok(Ok(stream)) => harvest(stream, input, start).await,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        task::{Context, Poll},
+    };
+
+    fn input() -> WorkerInput {
+        WorkerInput::parse("0123456789abcdef0123456789abcdef01234567", "127.0.0.1:9001").unwrap()
+    }
+
+    #[tokio::test]
+    async fn consumed_constructor_budget_does_not_poll_results() {
+        let stream = futures_lite::stream::poll_fn(|_| -> Poll<Option<Vec<SocketAddrV4>>> {
+            panic!("results polled after whole lookup budget expired")
+        });
+        let record = harvest(stream, &input(), Instant::now() - Duration::from_secs(16)).await;
+        assert_eq!(record.terminal, Terminal::Deadline);
+        assert_eq!(record.peer_count, 0);
+        assert!(record.first_peer.is_none());
+    }
+
+    #[tokio::test]
+    async fn deadline_wins_over_late_end_of_stream() {
+        let start = Instant::now() - Duration::from_secs(14);
+        let deadline = start + Duration::from_secs(15);
+        let stream = futures_lite::stream::poll_fn(move |_| -> Poll<Option<Vec<SocketAddrV4>>> {
+            // A stream poll can finish after the timeout's deadline. Tokio polls
+            // the inner future first; an elapsed deadline must still win.
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+            );
+            Poll::Ready(None)
+        });
+        let record = harvest(stream, &input(), start).await;
+        assert_eq!(record.terminal, Terminal::Deadline);
+        assert_eq!(record.peer_count, 0);
+        assert!(record.first_peer.is_none());
+    }
+
+    struct PendingStream {
+        dropped: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+    }
+    impl Stream for PendingStream {
+        type Item = Vec<SocketAddrV4>;
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+    impl Drop for PendingStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    #[tokio::test]
+    async fn cancelling_harvest_releases_its_stream_without_claiming_actor_join() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stream = PendingStream {
+            dropped: dropped.clone(),
+            polls: polls.clone(),
+        };
+        let input = input();
+        let mut future = Box::pin(harvest(stream, &input, Instant::now()));
+        assert!(futures_lite::future::poll_once(&mut future).await.is_none());
+        assert!(polls.load(Ordering::SeqCst) > 0);
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(future);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
