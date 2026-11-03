@@ -49,6 +49,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: DHT comparison formatting
+        run: cargo fmt --manifest-path tools/dhtcompare/Cargo.toml --check
+
+      - name: DHT comparison Clippy
+        run: cargo clippy --manifest-path tools/dhtcompare/Cargo.toml --all-features --all-targets --locked -- -D warnings
+
   test:
     name: Rust test
     runs-on: ubuntu-24.04
@@ -74,6 +80,10 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # Real UDP cases require the separately owned offline namespace runner.
+      - name: DHT comparison contracts
+        run: cargo test --manifest-path tools/dhtcompare/Cargo.toml --all-features --locked
+
   abcompare:
     name: A/B harness test
     runs-on: ubuntu-24.04
@@ -87,6 +97,10 @@ jobs:
       # Standard-library fixtures and loopback HTTP only; no public stream or Docker.
       - name: Test A/B capture and analysis
         run: python3 -m unittest discover -s tools/abcompare -v
+
+      # Pure coordinator fault tests do not start namespaces or UDP workers.
+      - name: Test DHT comparison qualification coordinator
+        run: python3 -m unittest discover -s tools/dhtcompare -p test_qualification.py -v
 
       - name: Test release archive verification
         run: python3 -m unittest discover -s tools/release -v
