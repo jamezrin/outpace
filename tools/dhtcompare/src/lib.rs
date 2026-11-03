@@ -8,7 +8,6 @@ const LOOKUP_BUDGET: Duration = Duration::from_secs(15);
 pub struct WorkerInput {
     pub(crate) infohash: [u8; 20],
     pub(crate) seeds: Vec<SocketAddrV4>,
-    pub(crate) budget: Duration,
     pub(crate) target: usize,
     pub(crate) result_cap: usize,
 }
@@ -18,7 +17,7 @@ impl fmt::Debug for WorkerInput {
         // Neither target identity nor endpoint values belong in diagnostic output.
         f.debug_struct("WorkerInput")
             .field("seed_count", &self.seeds.len())
-            .field("budget", &self.budget)
+            .field("budget", &LOOKUP_BUDGET)
             .field("target", &self.target)
             .field("result_cap", &self.result_cap)
             .finish_non_exhaustive()
@@ -65,7 +64,6 @@ impl WorkerInput {
         Ok(Self {
             infohash,
             seeds: parsed,
-            budget: LOOKUP_BUDGET,
             target: 8,
             result_cap: 1024,
         })
@@ -96,7 +94,6 @@ mod tests {
         );
         assert!(!format!("{input:?}").contains(HASH));
         assert!(!format!("{input:?}").contains("127.0.0.1"));
-        assert_eq!(input.budget.as_secs(), 15);
         assert_eq!(input.target, 8);
         assert_eq!(input.result_cap, 1024);
     }
