@@ -18,6 +18,65 @@ fn batch_history_remains_bounded() {
     assert_eq!(count, 65);
 }
 
+#[derive(Default)]
+struct Observation {
+    peers: BTreeSet<SocketAddrV4>,
+    first_peer: Option<f64>,
+    batch_sizes: Vec<usize>,
+    batches_observed: usize,
+}
+impl Observation {
+    fn observe(
+        &mut self,
+        response: &GetPeersResponse,
+        elapsed: Duration,
+        budget: Duration,
+    ) -> bool {
+        if elapsed >= budget {
+            return true;
+        }
+        record_batch(
+            &mut self.batch_sizes,
+            &mut self.batches_observed,
+            response.peers.len(),
+        );
+        collect_response_peers(response, &mut self.peers, 8, &mut |_| {
+            self.first_peer.get_or_insert(elapsed.as_secs_f64());
+            true
+        })
+    }
+}
+#[test]
+fn custom_observation_rejects_post_deadline_batch() {
+    let mut state = Observation::default();
+    let response = GetPeersResponse {
+        peers: (10001..=10010)
+            .map(|port| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port))
+            .collect(),
+        ..Default::default()
+    };
+    assert!(state.observe(&response, Duration::from_secs(15), Duration::from_secs(15)));
+    assert!(state.peers.is_empty());
+    assert!(state.first_peer.is_none());
+    assert!(state.batch_sizes.is_empty());
+    assert_eq!(state.batches_observed, 0);
+}
+
+#[test]
+fn custom_observation_preserves_earlier_peers_at_deadline() {
+    let mut state = Observation::default();
+    let response = GetPeersResponse {
+        peers: vec![SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 10001)],
+        ..Default::default()
+    };
+    assert!(!state.observe(&response, Duration::from_secs(2), Duration::from_secs(15)));
+    assert!(state.observe(&response, Duration::from_secs(15), Duration::from_secs(15)));
+    assert_eq!(state.peers.len(), 1);
+    assert_eq!(state.first_peer, Some(2.0));
+    assert_eq!(state.batch_sizes, vec![1]);
+    assert_eq!(state.batches_observed, 1);
+}
+
 /// Observe the private walker without changing its response batching or peer policy.
 async fn run_comparison(infohash: &[u8; 20], seeds: Vec<SocketAddrV4>) -> serde_json::Value {
     let start = std::time::Instant::now();
@@ -42,37 +101,26 @@ async fn run_comparison(infohash: &[u8; 20], seeds: Vec<SocketAddrV4>) -> serde_
             "first_peer_seconds": null, "elapsed_seconds": start.elapsed().as_secs_f64(),
         });
     };
-    let mut peers = BTreeSet::new();
-    let mut first_peer = None;
-    let mut batch_sizes = Vec::new();
-    let mut batches_observed = 0;
+    let mut state = Observation::default();
     let metrics = dht_walk_from_seeds(infohash, remaining, &socket, seeds, |_, response| {
-        record_batch(
-            &mut batch_sizes,
-            &mut batches_observed,
-            response.peers.len(),
-        );
-        collect_response_peers(response, &mut peers, 8, &mut |_| {
-            first_peer.get_or_insert_with(|| start.elapsed().as_secs_f64());
-            true
-        })
+        state.observe(response, start.elapsed(), budget)
     })
     .await;
-    let terminal = if peers.len() >= 8 {
+    let terminal = if state.peers.len() >= 8 {
         "target"
-    } else if metrics.frontier_exhausted {
+    } else if start.elapsed() < budget && metrics.frontier_exhausted {
         "exhausted"
     } else {
         "deadline"
     };
     serde_json::json!({
         "terminal": terminal,
-        "batch_sizes": batch_sizes,
-        "batches_observed": batches_observed,
-        "batch_history_truncated": batches_observed>batch_sizes.len(),
-        "target_overshoot": peers.len().saturating_sub(8),
-        "peer_count": peers.len(),
-        "first_peer_seconds": first_peer,
+        "batch_sizes": state.batch_sizes,
+        "batches_observed": state.batches_observed,
+        "batch_history_truncated": state.batches_observed>state.batch_sizes.len(),
+        "target_overshoot": state.peers.len().saturating_sub(8),
+        "peer_count": state.peers.len(),
+        "first_peer_seconds": state.first_peer,
         "elapsed_seconds": start.elapsed().as_secs_f64(),
         "nodes_queried": metrics.nodes_queried,
         "valid_responses": metrics.valid_responses,
