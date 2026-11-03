@@ -4,6 +4,7 @@ use crate::scheduler::{ActivePeers, PeerAssignment};
 mod continuity;
 mod pool;
 mod seeding;
+mod support_lifecycle;
 fn default_live_recovery() -> LiveRecoveryConfig {
     LiveRecoveryConfig::default()
 }
