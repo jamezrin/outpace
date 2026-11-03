@@ -4,12 +4,47 @@ import os
 from unittest import mock
 from pathlib import Path
 import sys
+import tempfile
+import threading
+import time
 import unittest
 from isolation import run_offline
 
 class IsolationTests(unittest.TestCase):
     def run_python(self, code, timeout=3, cap=65536):
         return run_offline([sys.executable, '-I', '-c', code], timeout=timeout, prefix_cap=cap)
+
+    def assert_heartbeat_stopped(self, path):
+        size = path.stat().st_size
+        self.assertGreater(size, 1, 'writer never demonstrated heartbeat progress')
+        # Several heartbeat intervals: independent bounded liveness evidence,
+        # supplementing (not replacing) the namespace-init termination witness.
+        for _ in range(4):
+            time.sleep(.05)
+            self.assertEqual(path.stat().st_size, size, 'heartbeat continued after cleanup')
+
+    def test_heartbeat_probe_rejects_a_live_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'heartbeat'
+            path.write_bytes(b'x')
+            stop = threading.Event()
+            ready = threading.Event()
+            def beat():
+                while not stop.is_set():
+                    with path.open('ab') as output:
+                        output.write(b'x')
+                    ready.set()
+                    stop.wait(.01)
+            writer = threading.Thread(target=beat)
+            writer.start()
+            try:
+                self.assertTrue(ready.wait(1))
+                with self.assertRaises(AssertionError):
+                    self.assert_heartbeat_stopped(path)
+            finally:
+                stop.set()
+                writer.join(1)
+                self.assertFalse(writer.is_alive())
 
     def test_private_pid_and_network_namespace_with_loopback_udp(self):
         code = '''import os,socket,subprocess,json
@@ -75,13 +110,35 @@ print(json.dumps({'net':os.stat('/proc/self/ns/net').st_ino,'pid':os.getpid()}))
         self.assertTrue(result.cleanup_complete)
 
     def test_timeout_reaps_namespace_with_detached_closed_pipes(self):
-        code = 'import os,time\nif os.fork()==0:\n os.setsid();os.close(1);os.close(2);time.sleep(60)\nelse:\n print("ready",flush=True);time.sleep(60)'
-        with mock.patch('isolation.os.killpg', wraps=os.killpg) as fallback:
-            result = self.run_python(code, timeout=.5)
-        self.assertIn(b'ready', result.stdout)
-        fallback.assert_not_called()
-        self.assertTrue(result.timed_out)
-        self.assertTrue(result.cleanup_complete)
+        with tempfile.TemporaryDirectory() as directory:
+            heartbeat = Path(directory) / 'heartbeat'
+            code = f'''import os,time
+if os.fork()==0:
+ os.setsid();os.close(1);os.close(2)
+ time.sleep(.75) # Deliberately delay writer startup past the old deadline.
+ fd=os.open({str(heartbeat)!r},os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+ end=time.monotonic()+5
+ try:
+  while time.monotonic()<end:
+   os.write(fd,b"x");time.sleep(.01)
+ finally:os.close(fd)
+else:
+ ready_by=time.monotonic()+1.5
+ while time.monotonic()<ready_by:
+  try:
+   if os.path.getsize({str(heartbeat)!r})>1:break
+  except FileNotFoundError:pass
+  time.sleep(.01)
+ else:raise RuntimeError("heartbeat startup deadline")
+ print("ready",flush=True);time.sleep(60)'''
+            with mock.patch('isolation.os.killpg', wraps=os.killpg) as fallback:
+                result = self.run_python(code, timeout=2)
+            self.assertIn(b'ready', result.stdout)
+            fallback.assert_not_called()
+            self.assertTrue(result.timed_out)
+            self.assertTrue(result.cleanup_complete)
+            self.assertTrue(heartbeat.exists(), 'ready preceded heartbeat progress')
+            self.assert_heartbeat_stopped(heartbeat)
 
     def test_namespace_launcher_denial_preserves_failure(self):
         import subprocess
