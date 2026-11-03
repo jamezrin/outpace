@@ -115,6 +115,7 @@ print(json.dumps({'net':os.stat('/proc/self/ns/net').st_ino,'pid':os.getpid()}))
             code = f'''import os,time
 if os.fork()==0:
  os.setsid();os.close(1);os.close(2)
+ time.sleep(.75) # Deliberately delay writer startup past the old deadline.
  fd=os.open({str(heartbeat)!r},os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
  end=time.monotonic()+5
  try:
@@ -122,13 +123,21 @@ if os.fork()==0:
    os.write(fd,b"x");time.sleep(.01)
  finally:os.close(fd)
 else:
+ ready_by=time.monotonic()+1.5
+ while time.monotonic()<ready_by:
+  try:
+   if os.path.getsize({str(heartbeat)!r})>1:break
+  except FileNotFoundError:pass
+  time.sleep(.01)
+ else:raise RuntimeError("heartbeat startup deadline")
  print("ready",flush=True);time.sleep(60)'''
             with mock.patch('isolation.os.killpg', wraps=os.killpg) as fallback:
-                result = self.run_python(code, timeout=.5)
+                result = self.run_python(code, timeout=2)
             self.assertIn(b'ready', result.stdout)
             fallback.assert_not_called()
             self.assertTrue(result.timed_out)
             self.assertTrue(result.cleanup_complete)
+            self.assertTrue(heartbeat.exists(), 'ready preceded heartbeat progress')
             self.assert_heartbeat_stopped(heartbeat)
 
     def test_namespace_launcher_denial_preserves_failure(self):
