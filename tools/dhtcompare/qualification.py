@@ -33,15 +33,19 @@ def _write(path,data):
         out.write(data)
 
 
-def qualify(custom,upstream,*,output):
-    """Run nine fixed cases, each in its own owned offline namespace.
+def qualify(custom,upstream,*,output,mode="qualification"):
+    """Run fixed qualification or witnessed cancellation in owned offline namespaces.
 
     The 180-second qualification deadline covers all cases and cleanup; it is
     separate from the proposed 120-second live block, which this module cannot run.
+    The optional three-case lookup-cancellation block has a 40-second deadline.
     Artifacts are trusted operator-supplied test binaries; pins detect stale builds,
     not concurrent hostile modification of the operator's files.
     """
-    start=time.monotonic();deadline=start+180
+    if mode not in ('qualification','lookup-cancellation'):
+        raise ValueError('qualification_mode')
+    cancellation=mode=='lookup-cancellation'
+    start=time.monotonic();deadline=start+(40 if cancellation else 180)
     custom.verify();upstream.verify()
     output=Path(output)
     output.mkdir(mode=0o700,parents=False,exist_ok=False)
@@ -52,6 +56,10 @@ def qualify(custom,upstream,*,output):
                 ('mainline',upstream,''),('n0',upstream,'')):
             name=('n0' if role=='n0' else role)+'_real_udp_'+suffix
             schedule.append((artifact,prefix+name,8 if suffix=='target' else 20))
+    if cancellation:
+        schedule=[(custom,'dht::comparison::custom_external_lookup_cancel',8),
+                  (upstream,'mainline_external_lookup_cancel',8),
+                  (upstream,'n0_external_lookup_cancel',8)]
     cases=[];reason='complete'
     for artifact,name,timeout in schedule:
         if deadline-time.monotonic()<timeout+2.1:
@@ -61,7 +69,8 @@ def qualify(custom,upstream,*,output):
         if deadline-time.monotonic()<timeout+2.1:
             reason="deadline";break
         begin=time.monotonic()
-        result=run_offline([str(artifact.path),'--exact',name,'--ignored','--nocapture'],timeout=timeout)
+        options={'cancel_on_stdout':b'dht_lookup_query_witness\n'} if cancellation else {}
+        result=run_offline([str(artifact.path),'--exact',name,'--ignored','--nocapture'],timeout=timeout,**options)
         elapsed=time.monotonic()-begin
         index=len(cases)
         _write(output/f'{index}.stdout.private',result.stdout)
@@ -70,7 +79,13 @@ def qualify(custom,upstream,*,output):
                   and b"test result: ok. 1 passed; 0 failed; 0 ignored;" in result.stdout)
         passed=(executed and result.exit_code==0 and result.cleanup_complete
                 and not result.timed_out and not result.truncated)
-        cases.append(dict(test=name,exit_code=result.exit_code,
+        witness=b'dht_lookup_query_witness\n' in result.stdout
+        if cancellation:
+            passed=(witness and result.cancelled_on_witness and result.exit_code in (-9,137)
+                    and b'dht_lookup_returned_before_cancel' not in result.stdout
+                    and result.cleanup_complete and not result.timed_out and not result.truncated)
+        cases.append(dict(test=name,exit_code=result.exit_code,query_witness=witness,
+                          cancelled_on_witness=result.cancelled_on_witness,
                           elapsed_seconds=elapsed,cleanup_complete=result.cleanup_complete,
                           timed_out=result.timed_out,truncated=result.truncated,
                           executed_exact_case=executed,stdout_bytes=result.stdout_bytes,stderr_bytes=result.stderr_bytes,
@@ -78,7 +93,7 @@ def qualify(custom,upstream,*,output):
         if not passed:
             reason='case_failed';break
     if time.monotonic()>deadline: reason='deadline'
-    report=dict(mode='offline_qualification',passed=reason=='complete' and len(cases)==9,
+    report=dict(mode='offline_'+mode,passed=reason=='complete' and len(cases)==len(schedule),
                 stop_reason=reason,elapsed_seconds=time.monotonic()-start,cases=cases,
                 custom_sha256=custom.sha256,upstream_sha256=upstream.sha256)
     _write(output/'report.private.json',(json.dumps(report,indent=2)+'\n').encode())
@@ -88,6 +103,7 @@ def qualify(custom,upstream,*,output):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--offline',action='store_true',required=True)
+    parser.add_argument('--mode',choices=('qualification','lookup-cancellation'),default='qualification')
     parser.add_argument('--custom',type=Path,required=True)
     parser.add_argument('--custom-sha256',required=True)
     parser.add_argument('--upstream',type=Path,required=True)
@@ -95,7 +111,7 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
     report=qualify(Artifact(args.custom,args.custom_sha256),
-                   Artifact(args.upstream,args.upstream_sha256),output=args.output)
+                   Artifact(args.upstream,args.upstream_sha256),output=args.output,mode=args.mode)
     print(json.dumps({'passed':report['passed'],'stop_reason':report['stop_reason'],
                       'completed_cases':len(report['cases'])}))
     return 0 if report['passed'] else 1

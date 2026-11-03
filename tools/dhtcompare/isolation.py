@@ -26,11 +26,15 @@ class Result:
     timed_out: bool
     cleanup_complete: bool
     truncated: bool
+    cancelled_on_witness: bool = False
 
-def run_offline(argv, *, timeout, prefix_cap=65536, env=None):
+def run_offline(argv, *, timeout, prefix_cap=65536, env=None, cancel_on_stdout=None):
     """Run in fresh user/network/PID namespaces; retain prefixes and drain both pipes.
 
     Timeout must leave the caller's outer deadline at least 2.1 seconds for cleanup.
+    A bounded optional stdout marker requests cancellation through the same owned
+    PID-1 path as timeout. The witness flag alone does not prove signal delivery;
+    inspect original exit and cleanup_complete as well.
     Missing namespace support fails through the original nonzero launcher exit.
     This does not prove an adapter's network behavior or join its internal actors.
     """
@@ -39,7 +43,9 @@ def run_offline(argv, *, timeout, prefix_cap=65536, env=None):
             or type(prefix_cap) is not int or not 0 < prefix_cap <= 65536
             or not argv or len(argv)>32
             or any(not isinstance(a,str) or not a or len(a)>16384 for a in argv)
-            or not Path(argv[0]).is_absolute()):
+            or not Path(argv[0]).is_absolute()
+            or (cancel_on_stdout is not None and
+                (type(cancel_on_stdout) is not bytes or not 0<len(cancel_on_stdout)<=256))):
         raise ValueError('invalid_offline_worker')
     command = ['/usr/bin/unshare','--user','--map-root-user','--net','--pid',
                '--fork','--kill-child=KILL','--mount-proc',sys.executable,
@@ -48,6 +54,7 @@ def run_offline(argv, *, timeout, prefix_cap=65536, env=None):
     selector=selectors.DefaultSelector(); proc=None
     retained=[bytearray(),bytearray()]; counts=[0,0]
     timed_out=False; uncertain=False; init_fd=None; init_terminal=False
+    cancelled_on_witness=False; witness_tail=b''
     def find_init():
         nonlocal init_fd
         if init_fd is not None or proc is None: return
@@ -105,6 +112,12 @@ def run_offline(argv, *, timeout, prefix_cap=65536, env=None):
                     selector.unregister(key.fileobj)
                     continue
                 index=key.data; counts[index]+=len(chunk)
+                if index==0 and cancel_on_stdout is not None and not cancelled_on_witness:
+                    combined=witness_tail+chunk
+                    if cancel_on_stdout in combined and proc.poll() is None:
+                        cancelled_on_witness=True
+                        kill()
+                    witness_tail=combined[-(len(cancel_on_stdout)-1):] if len(cancel_on_stdout)>1 else b''
                 room=prefix_cap-len(retained[index])
                 retained[index].extend(chunk[:room])
     finally:
@@ -124,4 +137,4 @@ def run_offline(argv, *, timeout, prefix_cap=65536, env=None):
     if reaped and proc.returncode < 0 and not init_terminal: uncertain=True
     return Result(proc.returncode,bytes(retained[0]),bytes(retained[1]),*counts,
                   timed_out,reaped and not uncertain,
-                  any(count>prefix_cap for count in counts))
+                  any(count>prefix_cap for count in counts),cancelled_on_witness)

@@ -201,3 +201,32 @@ async fn custom_real_udp_silent() {
 async fn custom_real_udp_malformed_uncorrelated_duplicates() {
     custom_fault_fixture(false).await
 }
+
+#[tokio::test]
+#[ignore = "requires witness-triggered external namespace cancellation"]
+async fn custom_external_lookup_cancel() {
+    use std::io::Write;
+    require_offline();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(seed) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let server = tokio::spawn(async move {
+        let mut packet = [0; 65536];
+        let (n, _) = socket.recv_from(&mut packet).await.unwrap();
+        let query = Bencode::parse(&packet[..n]).unwrap();
+        assert_eq!(
+            query.get(b"q").and_then(Bencode::as_bytes),
+            Some(b"get_peers".as_slice())
+        );
+        println!("dht_lookup_query_witness");
+        std::io::stdout().flush().unwrap();
+        std::future::pending::<()>().await;
+    });
+    let _ = run_comparison(&[1; 20], vec![seed]).await;
+    println!("dht_lookup_returned_before_cancel");
+    std::io::stdout().flush().unwrap();
+    server.abort();
+    let _ = server.await;
+    panic!("external owner did not cancel unresolved lookup");
+}

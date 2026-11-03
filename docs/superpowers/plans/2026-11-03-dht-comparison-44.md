@@ -53,3 +53,16 @@ real namespace qualification remains an explicit operator-run suite.
 
 These gates qualify the offline increment only. Commit/PR/CI integration remains
 pending; no live measurement or issue-closure claim follows.
+
+## Client-mode and cancellation follow-up
+
+- [x] PR #320 merged the initial offline increment after CI and review fixes.
+- [x] Two actual upstream cold-client probes: read-only query flags, unfinished
+  lookup across a 250 ms unsolicited-ping observation, then normal target completion.
+- [x] Behavioral RED/GREEN for a late stream-end reported as exhausted after deadline.
+- [x] Consumed-construction-budget and stream-drop ownership contracts; these do not
+  claim interruption inside a real constructor or internal actor joining.
+- [x] Witness-triggered external cancellation of all three actual lookups with original
+  SIGKILL statuses and namespace cleanup, through a fixed 40-second offline profile.
+- [x] Independent review found no scoped P1/P2; integration gates recorded privately.
+- [ ] Late UDP replies, destination policy and the live comparison remain outstanding.
