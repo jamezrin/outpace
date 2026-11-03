@@ -12,6 +12,19 @@ Real-UDP integration tests are ignored by default and reject execution outside
 a PID-1, loopback-only, unrouted namespace before opening sockets.
 
 This is a standalone Cargo workspace to avoid production dependency/lockfile changes.
+Before entering an offline environment, prefetch both workspaces' locked dependencies
+while online. These commands preserve the committed lockfiles and do not perform
+DHT lookups:
+
+```sh
+cargo fetch --manifest-path Cargo.toml --locked
+cargo fetch --manifest-path tools/dhtcompare/Cargo.toml --locked
+```
+
+Use the repository's pinned Rust toolchain. The qualification scripts require Linux
+and **Python 3.11 or newer** (`hashlib.file_digest` is required). The commands below
+use `python3.11`; substitute a newer interpreter when appropriate.
+
 Run offline contract tests with:
 
 ```sh
@@ -35,14 +48,14 @@ Build both ignored-test binaries without executing them:
 ```sh
 cargo test -p ace-swarm --lib --offline --locked --no-run
 cargo test --manifest-path tools/dhtcompare/Cargo.toml --all-features --offline --locked --test real_udp --no-run
-python3 -m unittest discover -s tools/dhtcompare -p 'test_*.py'
+python3.11 -m unittest discover -s tools/dhtcompare -p 'test_*.py'
 ```
 
 Use the exact absolute executable paths printed by Cargo and their SHA-256 build
 pins. The output directory must not exist and its parent must be private. Run:
 
 ```sh
-python3 tools/dhtcompare/qualification.py --offline \
+python3.11 tools/dhtcompare/qualification.py --offline \
   --custom /absolute/path/to/ace_swarm-test-binary --custom-sha256 CUSTOM_BUILD_SHA256 \
   --upstream /absolute/path/to/real_udp-test-binary --upstream-sha256 UPSTREAM_BUILD_SHA256 \
   --output /private/path/to/new-run
