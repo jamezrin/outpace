@@ -78,6 +78,7 @@ impl TestSourceBody for ChannelBody {
 fn attached_state(registry: Arc<BroadcastRegistry>, policy: FetchPolicy) -> BroadcastState {
     registry.set_source_policy(policy);
     BroadcastState {
+        peer_policy: Default::default(),
         registry,
         seed_registry: SeedRegistry::new(),
         trackers: vec![],

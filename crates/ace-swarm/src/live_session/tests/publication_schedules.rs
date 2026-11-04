@@ -32,6 +32,7 @@ fn run(
     let (tx, rx) = mpsc::channel(16);
     let task = tokio::spawn(async move {
         let seed = SeedConfig {
+            peer_policy: Default::default(),
             metrics: None,
             registry: SeedRegistry::new(),
             store_factory: test_store_factory(16384, None),

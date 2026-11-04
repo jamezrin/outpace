@@ -848,6 +848,7 @@ async fn run_http_reconnect_case(
     ))));
     let manager = crate::manager::StreamManager::new(registry);
     let app = crate::http::router(crate::http::AppState {
+        peer_policy: Default::default(),
         manager: manager.clone(),
         networks: vec!["ace".into()],
         resolve_content_ids_in_getstream: false,

@@ -28,11 +28,24 @@ struct Candidate {
 #[derive(Default)]
 pub(super) struct SessionCandidates {
     entries: Vec<Candidate>,
+    policy: crate::peer_policy::PeerPolicy,
 }
 
 impl SessionCandidates {
+    pub(super) fn with_policy(policy: crate::peer_policy::PeerPolicy) -> Self {
+        Self {
+            entries: Vec::new(),
+            policy,
+        }
+    }
+
+    pub(super) fn policy(&self) -> &crate::peer_policy::PeerPolicy {
+        &self.policy
+    }
+
     pub(super) fn learn(&mut self, addr: SocketAddrV4, mut kind: CandidateKind) {
-        if addr.port() == 0
+        if !self.policy.permits(addr)
+            || addr.port() == 0
             || addr.ip().is_unspecified()
             || addr.ip().is_multicast()
             || addr.ip().is_broadcast()
@@ -313,5 +326,27 @@ mod tests {
                 .count(),
             MAX_SOURCES
         );
+    }
+}
+
+#[cfg(test)]
+mod private_policy_tests {
+    use super::*;
+    #[test]
+    fn private_candidates_reject_poisoned_source_pex_and_discovery() {
+        let allowed = "127.0.0.1:1234".parse().unwrap();
+        let denied = "127.0.0.1:4321".parse().unwrap();
+        let policy =
+            crate::peer_policy::PeerPolicy::from_private_peers(Some("127.0.0.1:1234")).unwrap();
+        let mut candidates = SessionCandidates::with_policy(policy);
+        for kind in [
+            CandidateKind::Source,
+            CandidateKind::Pex,
+            CandidateKind::Discovered,
+        ] {
+            candidates.learn(denied, kind);
+        }
+        candidates.learn(allowed, CandidateKind::Discovered);
+        assert_eq!(candidates.eligible(Instant::now()), vec![allowed]);
     }
 }

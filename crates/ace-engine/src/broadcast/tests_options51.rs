@@ -381,6 +381,7 @@ async fn options51_resumed_announcer_uses_stored_trackers_for_both_keys() {
         }));
         let (_port_tx, port) = watch::channel(Some(4661));
         let state = crate::http::BroadcastState {
+            peer_policy: Default::default(),
             registry: registry.clone(),
             seed_registry: seed,
             trackers: process,

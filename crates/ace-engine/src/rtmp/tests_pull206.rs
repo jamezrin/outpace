@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 fn state() -> BroadcastState {
     BroadcastState {
+        peer_policy: Default::default(),
         registry: BroadcastRegistry::new(),
         seed_registry: SeedRegistry::new(),
         trackers: vec![],

@@ -301,6 +301,18 @@ pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
     handshake_infohash: [u8; 20],
     identity: &Identity,
 ) -> Result<Vec<u8>, ResolveError> {
+    transport_bytes_via_peer_with_policy(session, handshake_infohash, identity, &Default::default())
+        .await
+}
+
+/// Fetch metadata with the immutable outbound policy's advertised node fields.
+/// The caller remains responsible for policy-checking the already-connected socket.
+pub async fn transport_bytes_via_peer_with_policy<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut PeerSession<S>,
+    handshake_infohash: [u8; 20],
+    identity: &Identity,
+    policy: &crate::peer_policy::PeerPolicy,
+) -> Result<Vec<u8>, ResolveError> {
     session
         .perform_handshake(handshake_infohash, random_peer_id())
         .await
@@ -312,7 +324,7 @@ pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
         mi: None,
         node: NodeFields {
             ts: 5000,
-            ..NodeFields::default()
+            ..policy.node_fields()
         },
         peer_ip: None,
         metadata_size: None,
@@ -1852,5 +1864,46 @@ mod tests {
         let index = InfohashIndex::new(8);
         index.put(info.clone());
         assert_eq!(index.get(&info.infohash), Some(info));
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn private_metadata_wire_does_not_advertise_inbound_port() {
+    for private in [false, true] {
+        let payload = tokio::time::timeout(Duration::from_secs(2), async {
+            let (client, remote) = tokio::io::duplex(8192);
+            let policy = if private {
+                crate::peer_policy::PeerPolicy::from_private_peers(Some("127.0.0.1:1234")).unwrap()
+            } else {
+                Default::default()
+            };
+            let identity = Identity::generate();
+            let mut client = PeerSession::new(client);
+            let fetch =
+                transport_bytes_via_peer_with_policy(&mut client, [0; 20], &identity, &policy);
+            let capture = async {
+                let mut remote = PeerSession::new(remote);
+                remote
+                    .accept_handshake(random_peer_id(), |hash| hash == &[0; 20])
+                    .await
+                    .unwrap();
+                let PeerMessage::Extended { ext_id: 0, payload } =
+                    remote.read_message().await.unwrap()
+                else {
+                    panic!("signed metadata extension")
+                };
+                payload
+            };
+            let (result, payload) = tokio::join!(fetch, capture);
+            assert!(
+                result.is_err(),
+                "capture peer deliberately closes before metadata"
+            );
+            payload
+        })
+        .await
+        .expect("bounded metadata capture");
+        crate::peer_policy::assert_signed_listen_port(&payload, if private { 0 } else { 8621 });
     }
 }

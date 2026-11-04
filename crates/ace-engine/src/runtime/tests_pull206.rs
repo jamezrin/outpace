@@ -26,6 +26,7 @@ fn state(
     inbound: Option<u16>,
 ) -> BroadcastState {
     BroadcastState {
+        peer_policy: Default::default(),
         registry,
         seed_registry,
         trackers: vec![],
@@ -545,4 +546,319 @@ async fn pull206_startup_failure_unwinds_prior_worker_and_releases_http_listener
             let _ = std::fs::remove_dir_all(dir);
         })
         .await;
+}
+
+#[tokio::test]
+async fn private_runtime_serves_without_binding_peer_port_and_joins_on_shutdown() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = temp_dir();
+        // Holding this port makes accidental inbound startup observable.
+        let peer_guard = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_guard.local_addr().unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let mut config = serving_config(dir.clone(), false);
+        config.bind = http_addr;
+        config.networks = vec!["ace".into()];
+        config.enable_port_mapping = false;
+        config.peer_listen = peer_addr;
+        config.peer_policy = ace_swarm::peer_policy::PeerPolicy::from_private_peers(
+            Some(&peer_addr.to_string()),
+        ).unwrap();
+        let runtime = crate::runtime::build_runtime(config, vec![]).await.unwrap();
+        assert!(runtime.reachability.is_none());
+        assert!(runtime.broadcasts.trackers.is_empty());
+        assert!(runtime.broadcasts.inbound_peer_port.borrow().is_none());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::task::spawn_local(async move {
+            crate::runtime::serve_http_until(runtime, async { let _ = stopped.await; })
+                .await.map_err(|error| error.to_string())
+        });
+        let observation = timeout(Duration::from_secs(3), async {
+            let mut socket = loop {
+                match tokio::net::TcpStream::connect(http_addr).await {
+                    Ok(socket) => break socket,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            };
+            socket.write_all(b"GET /network-policy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut bytes = Vec::new();
+            socket.take(8192).read_to_end(&mut bytes).await.unwrap();
+            bytes
+        }).await;
+        // Always stop and join before inspecting the request result.
+        let _ = stop.send(());
+        let joined = timeout(Duration::from_secs(5), serving).await;
+        let rebound = tokio::net::TcpListener::bind(http_addr).await;
+        drop(peer_guard);
+        std::fs::remove_dir_all(dir).unwrap();
+        joined.expect("private runtime shutdown deadline").unwrap().unwrap();
+        assert!(rebound.is_ok(), "HTTP listener must be released after shutdown");
+        let bytes = observation.expect("private runtime HTTP startup deadline");
+        let response = std::str::from_utf8(&bytes).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let policy: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(policy["mode"], "private");
+        assert_eq!(policy["allowed_peer_count"], 1);
+        assert_eq!(policy["inbound_peer_connections"], false);
+        assert_eq!(policy["public_discovery"], false);
+        assert_eq!(policy["public_advertising"], false);
+        assert!(!body.contains(&peer_addr.to_string()));
+    }).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn private_runtime_local_vod_alias_delivers_allowed_peer_bytes_over_native_http() {
+    use ace_wire::message::PeerMessage;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use sha1::{Digest, Sha1};
+    use std::os::unix::fs::PermissionsExt;
+    use tower::ServiceExt;
+
+    let dir = temp_dir();
+    let expected = b"synthetic private fixture";
+    let mut descriptor = format!(
+        "d4:infod6:lengthi{}e4:name9:synthetic12:piece lengthi16384e6:pieces20:",
+        expected.len()
+    )
+    .into_bytes();
+    descriptor.extend_from_slice(&Sha1::digest(expected));
+    descriptor.extend_from_slice(b"ee");
+    let info = ace_swarm::resolve::vod_info_from_transport(&descriptor).unwrap();
+    let path = dir.join("fixture.torrent");
+    std::fs::write(&path, descriptor).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let mut server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        let mut peer =
+            ace_peer::session::PeerSession::new(socket).with_protocol(info.peer_protocol);
+        peer.accept_handshake(ace_wire::handshake::random_peer_id(), |hash| {
+            hash == &info.infohash
+        })
+        .await?;
+        peer.send(&PeerMessage::Bitfield(vec![0x80])).await?;
+        peer.send(&PeerMessage::Unchoke).await?;
+        loop {
+            match peer.read_message().await {
+                Ok(PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                }) => {
+                    if index != 0 || begin as usize + length as usize > expected.len() {
+                        return Err(ace_peer::PeerError::Protocol("invalid fixture request"));
+                    }
+                    peer.send(&PeerMessage::Piece {
+                        index,
+                        begin,
+                        block: expected[begin as usize..(begin + length) as usize].to_vec(),
+                    })
+                    .await?;
+                }
+                Ok(_) => {}
+                Err(ace_peer::PeerError::Closed) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    });
+    let mut config = serving_config(dir.clone(), false);
+    config.networks = vec!["ace".into()];
+    config.enable_port_mapping = false;
+    config.cache_dir = PathBuf::new();
+    config.peer_policy =
+        ace_swarm::peer_policy::PeerPolicy::from_private_peers(Some(&endpoint.to_string()))
+            .unwrap();
+    config.private_descriptors = crate::local_descriptors::DescriptorPaths::from_config(Some(
+        &serde_json::json!({"fixture": path}).to_string(),
+    ))
+    .unwrap();
+    let runtime = crate::runtime::build_runtime(config, vec![]).await.unwrap();
+    // Startup snapshots the file; requests must not reopen it.
+    std::fs::remove_file(&path).unwrap();
+    let manager = runtime.manager.clone();
+    let broadcasts = runtime.broadcasts.clone();
+    let state = crate::http::AppState {
+        peer_policy: runtime.config.peer_policy,
+        manager: manager.clone(),
+        networks: runtime.networks,
+        resolve_content_ids_in_getstream: true,
+        ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
+        experimental_ace_compat: false,
+        broadcasts: Some(broadcasts.clone()),
+    };
+    let observed = timeout(Duration::from_secs(5), async {
+        let response = crate::http::router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/vod/ace/local:fixture")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        (status, body)
+    })
+    .await;
+    broadcasts.shutdown().await.unwrap();
+    manager.shutdown().await;
+    let closed = timeout(Duration::from_secs(2), &mut server).await;
+    if closed.is_err() {
+        server.abort();
+        let _ = server.await;
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(
+        matches!(closed, Ok(Ok(Ok(())))),
+        "owned peer cleanup: {closed:?}"
+    );
+    let (status, body) = observed.expect("bounded local alias playback");
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body.as_ref(), expected);
+    assert_eq!(manager.admission_status().0, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn private_runtime_local_live_alias_delivers_authenticated_source_and_cancels() {
+    use ace_wire::bencode::Bencode;
+    use axum::{body::Body, http::Request};
+    use futures::StreamExt;
+    use std::os::unix::fs::PermissionsExt;
+    use tower::ServiceExt;
+
+    let dir = temp_dir();
+    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(b"name".to_vec(), Bencode::Bytes(b"synthetic".to_vec()));
+    fields.insert(b"piece_length".to_vec(), Bencode::Int(32768));
+    fields.insert(b"chunk_length".to_vec(), Bencode::Int(16384));
+    fields.insert(b"bitrate".to_vec(), Bencode::Int(1000000));
+    fields.insert(b"authmethod".to_vec(), Bencode::Bytes(b"RSA".to_vec()));
+    fields.insert(b"pubkey".to_vec(), Bencode::Bytes(auth.pubkey_der()));
+    let descriptor = ace_wire::transport::encode_transport(&Bencode::Dict(fields));
+    let info = ace_swarm::resolve::stream_info_from_transport(&descriptor).unwrap();
+    let fixture = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/vectors/media/h264-keyframes.ts"
+    ));
+    let payload: Vec<u8> = fixture
+        .iter()
+        .copied()
+        .cycle()
+        .take(32768 - auth.signature_len())
+        .collect();
+    let mut wire = payload.clone();
+    wire.extend(auth.sign(&payload));
+    let registry = SeedRegistry::new();
+    let (store, lease) = registry.lease_store(info.infohash, || {
+        ace_swarm::store::PieceStore::new(32768, 16384, 32768 * 4)
+    });
+    let header = ace_wire::live_codec::piece_header_from_unix_seconds(1700000000.0);
+    for piece in [7, 8] {
+        ace_swarm::store::PieceStore::shared_put_complete_piece(&store, piece, header, &wire)
+            .await
+            .unwrap();
+    }
+    let path = dir.join("fixture.acelive");
+    std::fs::write(&path, descriptor).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let admission = ace_swarm::listen::InboundPolicy {
+        max_inbound: 1,
+        max_per_stream: 1,
+        max_unchoked: 1,
+    }
+    .admission();
+    let mut source = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        admission
+            .accept(
+                socket,
+                registry,
+                ace_wire::handshake::random_peer_id(),
+                [0; 8],
+                Arc::new(ace_wire::identity::Identity::generate()),
+                [127, 0, 0, 1],
+            )
+            .unwrap()
+            .await
+    });
+    let mut config = serving_config(dir.clone(), false);
+    config.networks = vec!["ace".into()];
+    config.enable_port_mapping = false;
+    config.cache_dir = PathBuf::new();
+    config.prefetch_pieces = Some(1);
+    config.startup_buffer.target_ms = 0;
+    config.peer_policy =
+        ace_swarm::peer_policy::PeerPolicy::from_private_peers(Some(&endpoint.to_string()))
+            .unwrap();
+    config.private_descriptors = crate::local_descriptors::DescriptorPaths::from_config(Some(
+        &serde_json::json!({"fixture": path}).to_string(),
+    ))
+    .unwrap();
+    let runtime = crate::runtime::build_runtime(config, vec![]).await.unwrap();
+    let manager = runtime.manager.clone();
+    let broadcasts = runtime.broadcasts.clone();
+    let state = crate::http::AppState {
+        peer_policy: runtime.config.peer_policy,
+        manager: manager.clone(),
+        networks: runtime.networks,
+        resolve_content_ids_in_getstream: true,
+        ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
+        experimental_ace_compat: false,
+        broadcasts: Some(broadcasts.clone()),
+    };
+    let observed = timeout(Duration::from_secs(8), async {
+        let response = crate::http::router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/streams/ace/local:fixture.ts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await;
+        drop(body);
+        (status, first)
+    })
+    .await;
+    broadcasts.shutdown().await.unwrap();
+    manager.shutdown().await;
+    let closed = timeout(Duration::from_secs(2), &mut source).await;
+    if closed.is_err() {
+        source.abort();
+        let _ = source.await;
+    }
+    drop(lease);
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(
+        matches!(closed, Ok(Ok(Err(ace_peer::PeerError::Closed)))),
+        "signed source cleanup: {closed:?}"
+    );
+    let (status, first) = observed.expect("bounded signed live local alias");
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let first = first.expect("live output").unwrap();
+    assert!(!first.is_empty());
+    assert_eq!(first.len() % 188, 0);
+    assert!(first
+        .as_chunks::<188>()
+        .0
+        .iter()
+        .all(|packet| packet[0] == 0x47));
+    assert_eq!(manager.admission_status().0, 0);
 }

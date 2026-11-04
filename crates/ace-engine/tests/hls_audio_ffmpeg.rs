@@ -437,6 +437,7 @@ async fn wait_ready(media: &ace_engine::hls::HlsPackager) {
 
 fn synthetic_app(manager: Arc<StreamManager>) -> axum::Router {
     router(AppState {
+        peer_policy: Default::default(),
         manager,
         networks: vec!["synthetic".into()],
         resolve_content_ids_in_getstream: false,
@@ -516,6 +517,7 @@ async fn vod_http_contract_is_identical_with_normalization_enabled_or_disabled()
             }),
         );
         let app = router(AppState {
+            peer_policy: Default::default(),
             manager: manager.clone(),
             networks: vec!["synthetic".into()],
             resolve_content_ids_in_getstream: false,

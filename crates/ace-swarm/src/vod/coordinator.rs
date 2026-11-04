@@ -97,6 +97,12 @@ impl Credit {
     }
 }
 
+pub(super) struct DownloadOptions {
+    pub(super) timeouts: VodTimeouts,
+    pub(super) concurrency: usize,
+    pub(super) peer_policy: crate::peer_policy::PeerPolicy,
+}
+
 pub(super) async fn download_vod_pieces_with_policy(
     info: VodInfo,
     peers: Vec<SocketAddrV4>,
@@ -106,15 +112,46 @@ pub(super) async fn download_vod_pieces_with_policy(
     timeouts: VodTimeouts,
     concurrency: usize,
 ) -> Result<(), VodError> {
-    let end = end.min(info.piece_count());
+    download_with_network_policy(
+        info,
+        peers,
+        tx,
+        first..end,
+        DownloadOptions {
+            timeouts,
+            concurrency,
+            peer_policy: Default::default(),
+        },
+    )
+    .await
+}
+
+pub(super) async fn download_with_network_policy(
+    info: VodInfo,
+    peers: Vec<SocketAddrV4>,
+    tx: mpsc::Sender<Bytes>,
+    range: std::ops::Range<u64>,
+    options: DownloadOptions,
+) -> Result<(), VodError> {
+    let DownloadOptions {
+        timeouts,
+        concurrency,
+        peer_policy,
+    } = options;
+    let first = range.start;
+    let end = range.end.min(info.piece_count());
     if first >= end {
         return Ok(());
     }
+    let supplied = peers.len();
     let mut unique = HashSet::new();
     let peers: Vec<_> = peers
         .into_iter()
-        .filter(|peer| unique.insert(*peer))
+        .filter(|peer| peer_policy.permits(*peer) && unique.insert(*peer))
         .collect();
+    if supplied > 0 && peers.is_empty() {
+        return Err(VodError::PeerPolicyDenied);
+    }
     let info = Arc::new(info);
     let notify = Arc::new(Notify::new());
     let (results, mut completions) = mpsc::channel::<Completion>(4);
@@ -175,11 +212,13 @@ pub(super) async fn download_vod_pieces_with_policy(
             let worker_notify = notify.clone();
             let worker_results = results.clone();
             let addr = peers[address];
+            let worker_policy = peer_policy.clone();
             tasks.spawn(async move {
                 let result = run_worker(
                     WorkerContext {
                         id,
                         address: addr,
+                        peer_policy: worker_policy,
                         info: worker_info,
                         results: worker_results,
                         state: worker_state,
@@ -275,6 +314,7 @@ pub(super) async fn download_vod_pieces_with_policy(
 }
 
 struct WorkerContext {
+    peer_policy: crate::peer_policy::PeerPolicy,
     id: u64,
     address: SocketAddrV4,
     info: Arc<VodInfo>,
@@ -289,6 +329,7 @@ async fn run_worker(
     mut commands: mpsc::Receiver<Job>,
 ) -> Result<(), Failure> {
     let WorkerContext {
+        peer_policy,
         id,
         address,
         info,
@@ -297,10 +338,15 @@ async fn run_worker(
         notify,
         timeouts,
     } = context;
-    let session = tokio::time::timeout(timeouts.connect, connect(&address.to_string()))
-        .await
-        .map_err(|_| Failure::Peer)?
-        .map_err(|_| Failure::Peer)?;
+    let session = tokio::time::timeout(
+        timeouts.connect,
+        peer_policy.dial_with(address, |endpoint| async move {
+            connect(&endpoint.to_string()).await
+        }),
+    )
+    .await
+    .map_err(|_| Failure::Peer)?
+    .map_err(|_| Failure::Peer)?;
     let mut session = session.with_protocol(info.peer_protocol);
     tokio::time::timeout(
         timeouts.handshake,

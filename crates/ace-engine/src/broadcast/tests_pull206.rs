@@ -64,6 +64,7 @@ fn test_broadcast_state(
 ) -> crate::http::BroadcastState {
     registry.set_source_policy(policy);
     crate::http::BroadcastState {
+        peer_policy: Default::default(),
         registry,
         seed_registry: SeedRegistry::new(),
         trackers: vec![],
@@ -943,6 +944,7 @@ async fn pull206_queued_http_attach_returns_503_while_detach_holds_real_disk_fen
 
     let manager = crate::manager::StreamManager::new(crate::provider::ProviderRegistry::new());
     let app = crate::http::router(crate::http::AppState {
+        peer_policy: Default::default(),
         manager,
         networks: vec![],
         resolve_content_ids_in_getstream: false,

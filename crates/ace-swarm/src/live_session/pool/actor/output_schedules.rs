@@ -160,6 +160,7 @@ async fn schedule(piece_length: usize, pieces: usize, full: bool, close: bool) {
     };
     let observer = Arc::new(Observer::default());
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: Some(observer.clone()),
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),
@@ -414,6 +415,7 @@ async fn actor_capture_fence_freeze_and_retained_operation_recreation() {
     };
     let observer = Arc::new(Observer::default());
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: Some(observer.clone()),
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),
@@ -742,6 +744,7 @@ async fn review_credit(signed: bool, completions: bool, close: bool, publication
         .collect();
     let observer = Arc::new(Observer::default());
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: Some(observer.clone()),
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),

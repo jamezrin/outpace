@@ -40,6 +40,7 @@ async fn start_pool(enabled: bool) -> PoolCaller {
     let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(4, 2, 1024)));
     store.lock().await.put_chunk_with_header(7, 0, HEADER, DATA);
     let seed = LiveSeedOptions {
+        peer_policy: Default::default(),
         metrics: None,
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),

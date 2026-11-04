@@ -81,6 +81,7 @@ async fn diagnostic(close: bool) {
         Arc::new(AtomicU32::new(0)),
     );
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: Some(recovery_observer.clone()),
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),

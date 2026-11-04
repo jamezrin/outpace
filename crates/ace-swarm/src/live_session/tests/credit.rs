@@ -494,6 +494,7 @@ async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
     let make_cache = || WarmPeerCache::new(&cache_dir, true);
     let first = make_cache();
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: None,
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(16384, None),
@@ -694,6 +695,7 @@ async fn open_cached_session(
     let piece_length = info.piece_length;
     let chunk_length = info.chunk_length;
     let seed = LiveSeedOptions {
+        peer_policy: Default::default(),
         metrics: None,
         registry: SeedRegistry::new(),
         store_factory: Arc::new(move |_| {

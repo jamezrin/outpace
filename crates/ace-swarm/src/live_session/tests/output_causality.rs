@@ -176,6 +176,7 @@ fn boundary_packet_provenance_tracks_both_sources_without_crediting_preparation(
 async fn causal_enqueue_credit_survives_cancel_between_segments_and_repeated_tokens() {
     let info = info();
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: None,
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),

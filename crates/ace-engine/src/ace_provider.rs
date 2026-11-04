@@ -15,6 +15,8 @@ mod catalog_resolution;
 mod content_id_policy_tests;
 #[cfg(test)]
 mod discovery_tests;
+#[cfg(test)]
+mod private_policy_tests;
 use announce::announce_seeder_periodically;
 pub use announce::{announce_infohash_periodically, announce_infohash_periodically_dynamic};
 use catalog_resolution::{CatalogLookupError, CatalogResolutionCache};
@@ -47,13 +49,11 @@ use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::reachability::ReachabilityMonitor;
 use ace_swarm::resolve::{
     catalog_transport_bytes, hex20, infohash_hex, resolve_infohash_via_catalog,
-    resolve_via_catalog, resolve_via_peer, stream_info_from_transport,
-    stream_info_from_transport_url, transport_bytes_from_url, transport_bytes_via_peer,
-    vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
+    resolve_via_catalog, stream_info_from_transport, stream_info_from_transport_url,
+    transport_bytes_from_url, vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
 };
 use ace_swarm::store::{BackendKind, PieceStore};
 use ace_swarm::types::{StreamInfo, StreamMetadata, VodInfo};
-use ace_swarm::vod::download_vod_pieces;
 #[cfg(test)]
 use ace_wire::extended::{LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
@@ -248,6 +248,8 @@ impl AceProvider {
 }
 
 pub struct AceProvider {
+    peer_policy: ace_swarm::peer_policy::PeerPolicy,
+    local_descriptors: crate::local_descriptors::LocalDescriptors,
     identity: Arc<Identity>,
     /// External inbound endpoint to advertise as a dial-able seeder on the periodic tracker +
     /// DHT self-announce. `None` when inbound seeding is disabled — we run no listener, so we
@@ -296,6 +298,8 @@ impl AceProvider {
     /// advertise an inbound endpoint (a pure leecher / one-shot CLI play has no listener).
     pub fn new(identity: Arc<Identity>, _peer_port: u16) -> Self {
         AceProvider {
+            peer_policy: Default::default(),
+            local_descriptors: Default::default(),
             identity,
             announce_peer_port: tokio::sync::watch::channel(None).1,
             default_trackers: DEFAULT_ACE_TRACKERS.iter().map(|s| s.to_string()).collect(),
@@ -319,6 +323,32 @@ impl AceProvider {
         }
     }
 
+    /// Install already validated operator metadata; requests cannot modify this snapshot.
+    pub fn with_local_descriptors(
+        mut self,
+        descriptors: crate::local_descriptors::LocalDescriptors,
+    ) -> Self {
+        self.local_descriptors = descriptors;
+        self
+    }
+
+    /// Install one immutable peer boundary before opening provider resources.
+    pub fn with_peer_policy(mut self, policy: ace_swarm::peer_policy::PeerPolicy) -> Self {
+        if policy.is_private() {
+            self.bootstrap_peers = policy.endpoints();
+            self.default_trackers.clear();
+            self.announce_peer_port = tokio::sync::watch::channel(None).1;
+            self.reachability = None;
+            self.warm_peers = WarmPeerCache::memory();
+            self.resolve_cache = CatalogResolutionCache::new(RESOLVE_CACHE_TTL);
+            self.peer_resolve_cache = ResolveCache::new(RESOLVE_CACHE_TTL);
+            self.infohash_index = InfohashIndex::new(INFOHASH_INDEX_CAPACITY);
+            self.infohash_failures.lock().unwrap().clear();
+        }
+        self.peer_policy = policy;
+        self
+    }
+
     /// Opt into resolving content ids as raw wrapped-transport hashes over BEP-9.
     pub fn with_bep9_content_id_fallback(mut self, enabled: bool) -> Self {
         self.bep9_content_id_fallback = enabled;
@@ -330,7 +360,11 @@ impl AceProvider {
     /// (the default) to disable harvesting entirely — the engine only supplies a monitor when
     /// inbound serving is on.
     pub fn with_reachability(mut self, reachability: Option<Arc<ReachabilityMonitor>>) -> Self {
-        self.reachability = reachability;
+        self.reachability = if self.peer_policy.is_private() {
+            None
+        } else {
+            reachability
+        };
         self
     }
 
@@ -341,7 +375,12 @@ impl AceProvider {
     /// broadcast paths advertise the identical endpoint (the mapped external port once #20
     /// lands). `None` disables the self-announce entirely.
     pub fn with_inbound_announce_port(mut self, port: Option<u16>) -> Self {
-        self.announce_peer_port = tokio::sync::watch::channel(port).1;
+        self.announce_peer_port = tokio::sync::watch::channel(if self.peer_policy.is_private() {
+            None
+        } else {
+            port
+        })
+        .1;
         self
     }
 
@@ -352,7 +391,9 @@ impl AceProvider {
         mut self,
         port: tokio::sync::watch::Receiver<Option<u16>>,
     ) -> Self {
-        self.announce_peer_port = port;
+        if !self.peer_policy.is_private() {
+            self.announce_peer_port = port;
+        }
         self
     }
 
@@ -372,7 +413,9 @@ impl AceProvider {
     /// has none (a bare infohash opens only from a verified descriptor). Transport files supply
     /// their own. Operators can extend this; DHT discovery runs alongside.
     pub fn with_trackers(mut self, trackers: Vec<String>) -> Self {
-        self.default_trackers = trackers;
+        if !self.peer_policy.is_private() {
+            self.default_trackers = trackers;
+        }
         self
     }
 
@@ -380,7 +423,11 @@ impl AceProvider {
     /// path (a directly-supplied `ip:port`), letting the daemon serve a stream before DHT /
     /// ut_metadata discovery is wired.
     pub fn with_bootstrap_peers(mut self, peers: Vec<SocketAddrV4>) -> Self {
-        self.bootstrap_peers = peers;
+        self.bootstrap_peers = if self.peer_policy.is_private() {
+            self.peer_policy.endpoints()
+        } else {
+            peers
+        };
         self
     }
 
@@ -414,7 +461,11 @@ impl AceProvider {
     /// Defaults to `Memory`.
     pub fn with_cache(mut self, cache_type: CacheType, cache_dir: PathBuf) -> Self {
         self.cache_type = cache_type;
-        self.warm_peers = WarmPeerCache::new(&cache_dir, false);
+        self.warm_peers = if self.peer_policy.is_private() {
+            WarmPeerCache::memory()
+        } else {
+            WarmPeerCache::new(&cache_dir, false)
+        };
         self.cache_dir = cache_dir;
         self
     }
@@ -534,6 +585,20 @@ impl StreamProvider for AceProvider {
     }
 
     fn check_openable(&self, id: &str) -> Result<(), ProviderError> {
+        if id.starts_with("local:") {
+            return match self.local_descriptors.get(id) {
+                Some(crate::local_descriptors::LocalDescriptor::Live(info)) => {
+                    info.ensure_playable().map_err(ProviderError::from)
+                }
+                Some(crate::local_descriptors::LocalDescriptor::Vod(info)) => {
+                    info.ensure_playable().map_err(ProviderError::from)
+                }
+                None => Err(ProviderError::Unresolvable(
+                    "local_descriptor_unknown".into(),
+                )),
+            };
+        }
+
         if let Some(info) = self.peer_resolve_cache.get(id) {
             info.ensure_playable().map_err(ProviderError::from)?;
         }

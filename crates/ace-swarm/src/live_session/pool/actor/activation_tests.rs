@@ -60,6 +60,7 @@ async fn activation_obsolete_completion_preserves_current_peers_and_counters() {
             policy.max_active_upstreams = 2;
         }
         let seed = SeedConfig {
+            peer_policy: Default::default(),
             metrics: None,
             registry: SeedRegistry::new(),
             store_factory: test_store_factory(4096, None),

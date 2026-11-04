@@ -45,6 +45,15 @@ async fn join_or_reap<T: Send + 'static>(task: &mut JoinHandle<T>) -> Option<T> 
 
 #[tokio::test]
 async fn signed_support_reseeds_without_playback_and_releases_its_producer() {
+    signed_support_lifecycle(false).await;
+}
+
+#[tokio::test]
+async fn private_follower_uses_allowlist_without_public_discovery_or_warm_cache() {
+    signed_support_lifecycle(true).await;
+}
+
+async fn signed_support_lifecycle(private: bool) {
     let auth = ace_wire::live_auth::LiveSourceAuth::generate();
     let payload: Vec<u8> = (0..4)
         .flat_map(|cc| {
@@ -80,7 +89,22 @@ async fn signed_support_reseeds_without_playback_and_releases_its_producer() {
         sig_len: auth.signature_len(),
         source_pubkey: auth.pubkey_der(),
     };
+    let warm = WarmPeerCache::new(std::path::Path::new(""), true);
+    warm.record_productive(
+        [0; 20],
+        "127.0.0.1:1".parse().unwrap(),
+        CandidateKind::Discovered,
+    );
+    let initial_hints = warm.hints(&[0; 20]);
+    let discovery_calls = Arc::new(AtomicU32::new(0));
+    let calls = discovery_calls.clone();
     let seed = SeedConfig {
+        peer_policy: if private {
+            crate::peer_policy::PeerPolicy::from_private_peers(Some(&source_addr.to_string()))
+                .unwrap()
+        } else {
+            Default::default()
+        },
         metrics: None,
         registry: support_registry.clone(),
         store_factory: Arc::new(move |_| {
@@ -97,7 +121,7 @@ async fn signed_support_reseeds_without_playback_and_releases_its_producer() {
             stale_upstream_timeout_ms: 30_000,
             ..default_live_recovery()
         },
-        warm_peers: WarmPeerCache::memory(),
+        warm_peers: warm.clone(),
     };
     // The service owns this bounded receiver. No player or drain task consumes it.
     let (tx, rx) = mpsc::channel(1);
@@ -105,7 +129,7 @@ async fn signed_support_reseeds_without_playback_and_releases_its_producer() {
     let downloaded = Arc::new(AtomicU64::new(0));
     let mut follower = tokio::spawn(follow_live(LiveSessionInputs {
         info,
-        peers: vec![source_addr],
+        peers: if private { vec![] } else { vec![source_addr] },
         identity: Arc::new(Identity::generate()),
         output: tx,
         counters: LiveCounters {
@@ -115,7 +139,10 @@ async fn signed_support_reseeds_without_playback_and_releases_its_producer() {
             peers_served: Arc::new(AtomicU32::new(0)),
         },
         seed,
-        discovery: completed_discovery(|_| async { vec![] }),
+        discovery: completed_discovery(move |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async move { vec![source_addr] }
+        }),
         reachability: None,
         initial_run: None,
     }));
@@ -132,6 +159,9 @@ async fn signed_support_reseeds_without_playback_and_releases_its_producer() {
                 }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        while rx.is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let mut leecher = PeerSession::new(TcpStream::connect(support_addr).await?);
         leecher.perform_handshake([0; 20], random_peer_id()).await?;
@@ -197,6 +227,17 @@ async fn signed_support_reseeds_without_playback_and_releases_its_producer() {
     assert!(support_removed, "follower must release its producer lease");
     assert!(!source_registry.serves(&[0; 20]));
     assert_eq!(peers.load(Ordering::Relaxed), 0);
+    if private {
+        assert_eq!(
+            discovery_calls.load(Ordering::Relaxed),
+            0,
+            "private follower invoked public discovery factory"
+        );
+        assert!(
+            warm.hints(&[0; 20]) == initial_hints,
+            "private output persisted productive peer hints"
+        );
+    }
     // Playback-output accounting is not a wire-acquisition counter. Exact reseeding below
     // proves acquisition independently of the undrained playback receiver.
     assert!(

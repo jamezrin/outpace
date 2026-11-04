@@ -416,6 +416,7 @@ pub(super) async fn server_api(
             let (occupied, max) = s.manager.admission_status();
             result["occupied_sessions"] = json!(occupied);
             result["max_sessions"] = json!(max);
+            result["peer_policy"] = crate::private_network::policy_status(&s.peer_policy);
             api::ok(result)
         }
         api::Method::GetNetworkConnectionStatus => api::ok(api::network_status_result(&s.networks)),
@@ -451,11 +452,18 @@ pub(super) async fn server_api(
 /// infohashes and magnets resolve offline; `content_id`/`url` need a catalog/transport fetch,
 /// which is gated by the same `resolve_content_ids_in_getstream` switch tests use to stay offline
 /// (production enables it). A best-effort failure is reported in-band, never as an HTTP error.
-async fn resolve_server_api_selector(
+pub(super) async fn resolve_server_api_selector(
     s: &AppState,
     sel: crate::server_api::Selector,
 ) -> Result<crate::server_api::ResolvedContent, String> {
     use crate::server_api::Selector;
+    if s.peer_policy.is_private() {
+        match &sel {
+            Selector::ContentId(_) => return Err("catalog_disabled_in_private_mode".into()),
+            Selector::Url(_) => return Err("remote_descriptor_disabled_in_private_mode".into()),
+            _ => {}
+        }
+    }
 
     if let Some(resolved) = crate::server_api::resolve_offline(&sel) {
         return resolved;
@@ -531,11 +539,16 @@ impl AceStreamSelection {
     }
 }
 
-async fn resolve_ace_selection(
+pub(super) async fn resolve_ace_selection(
     s: &AppState,
     params: &HashMap<String, String>,
 ) -> Result<AceStreamSelection, String> {
     let mut selection = ace_selected_stream(params)?;
+    if s.peer_policy.is_private()
+        && crate::transport_url::decode_transport_url(&selection.playback_id).is_some()
+    {
+        return Err("remote_descriptor_disabled_in_private_mode".into());
+    }
     let network = ace_network(s);
     if s.resolve_content_ids_in_getstream {
         if let Some(content_id) = selection.content_id.as_deref() {
@@ -556,6 +569,9 @@ async fn resolve_ace_selection(
                 }
                 ContentIdPreparation::ProviderResolved => {}
                 ContentIdPreparation::Unsupported => {
+                    if s.peer_policy.is_private() {
+                        return Err("catalog_disabled_in_private_mode".into());
+                    }
                     match crate::ace_provider::catalog_live_info(content_id).await {
                         Ok(info) => {
                             info.ensure_playable()
@@ -635,6 +651,20 @@ pub(super) fn ace_selected_stream(
         });
     }
     // The legacy `id=` spelling denotes an AceStream content id, not a swarm infohash.
+    if let Some(id) = ace_nonempty_param(params, "id") {
+        if let Some(alias) = id.strip_prefix("local:") {
+            if !crate::local_descriptors::alias_valid(alias) {
+                return Err("invalid local descriptor alias");
+            }
+            return Ok(AceStreamSelection {
+                public_id: id.to_owned(),
+                playback_id: id.to_owned(),
+                session_key: id.to_owned(),
+                content_id: None,
+                metadata: StreamMetadata::default(),
+            });
+        }
+    }
     if let Some(content_id) = ace_nonempty_param(params, "id") {
         let content_id = ace_normalized_hex_id(content_id).ok_or("invalid id")?;
         return Ok(AceStreamSelection {

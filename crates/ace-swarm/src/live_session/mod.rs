@@ -124,6 +124,7 @@ const BACKGROUND_DISCOVERY_PEER_TARGET: usize = 64;
 /// Storage, recovery and optional observations for one production session.
 #[derive(Clone)]
 pub struct LiveSeedOptions {
+    pub peer_policy: crate::peer_policy::PeerPolicy,
     pub metrics: Option<Arc<dyn LiveObserver>>,
     pub registry: SeedRegistry,
     pub store_factory: StoreFactory,
@@ -140,9 +141,11 @@ use connect_diagnostics::{ConnectPhase, PeerConnectProgress, PeerConnectStats, P
 
 mod peer;
 #[cfg(test)]
+use peer::connect_upstream;
+#[cfg(test)]
 use peer::prefer_window;
 use peer::{
-    background_discovery_options, connect_pool, connect_upstream, peer_worker,
+    background_discovery_options, connect_pool, connect_upstream_with_policy, peer_worker,
     pool_refill_candidates,
 };
 mod continuity;
@@ -171,7 +174,7 @@ use support::{
     advance_head_from_window, pool_progress_budget, schedule_piece_assignments,
     stale_upstream_budget,
 };
-use support::{hex_preview, read_peer_window, read_window_max, should_refresh_stale_deadline};
+use support::{read_peer_window, read_window_max, should_refresh_stale_deadline};
 
 mod reconnect;
 use reconnect::{CandidateKind, SessionCandidates};
@@ -202,6 +205,7 @@ pub(super) struct PeerConnectFailure {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PeerConnectStage {
+    PolicyDenied,
     Tcp,
     Handshake,
     Window,
@@ -334,11 +338,21 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
         uploaded,
         peers_served,
     } = counters;
+    let mut seed = seed;
+    let (peers, reachability) = if seed.peer_policy.is_private() {
+        // No inherited public discovery/cache may influence this private session.
+        // The provider must also avoid constructing public work before this entrypoint.
+        drop(rediscovery.take());
+        seed.warm_peers = WarmPeerCache::memory();
+        (seed.peer_policy.endpoints(), None)
+    } else {
+        (peers, reachability)
+    };
     let _stats_guard = LiveStatsGuard(seed.metrics.clone());
     let _peer_count_guard = SessionPeerCount(peer_count.clone());
     let _warm_flush = WarmFlush(seed.warm_peers.clone());
     let chunks_per_piece = info.chunks_per_piece();
-    let mut candidates = SessionCandidates::default();
+    let mut candidates = SessionCandidates::with_policy(seed.peer_policy.clone());
     for addr in peers {
         candidates.learn(addr, CandidateKind::Discovered);
     }
@@ -406,7 +420,7 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
                 for upstream in &stale {
                     crate::alog!(
                         "[ace] {}: stale advertised window min={} max={} cannot cover next needed piece {}; harvesting gossip only",
-                        upstream.addr,
+                        seed.peer_policy.log_endpoint(upstream.addr),
                         upstream.window.min_piece,
                         upstream.window.max_piece,
                         c.reasm.next_needed()
@@ -443,7 +457,7 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
                 }
                 continue;
             }
-            if rediscovery.is_none() {
+            if rediscovery.is_none() && !seed.peer_policy.is_private() {
                 let options = if candidates.learned_counts() == (0, 0) {
                     background_discovery_options()
                 } else {
@@ -467,7 +481,14 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
         }
         let windows = upstreams
             .iter()
-            .map(|u| format!("{}:{}..{}", u.addr, u.window.min_piece, u.window.max_piece))
+            .map(|u| {
+                format!(
+                    "{}:{}..{}",
+                    seed.peer_policy.log_endpoint(u.addr),
+                    u.window.min_piece,
+                    u.window.max_piece
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let active_addrs: HashSet<SocketAddrV4> = upstreams.iter().map(|u| u.addr).collect();

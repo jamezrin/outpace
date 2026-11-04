@@ -42,7 +42,11 @@ impl AceProvider {
         content_id: &str,
         catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>> + Send + 'static,
     ) -> Result<ResolvedContentId, ProviderError> {
-        if let Some(info) = self.resolve_cache.get(content_id) {
+        if let Some(info) = self
+            .resolve_cache
+            .get(content_id)
+            .filter(|_| !self.peer_policy.is_private())
+        {
             info.ensure_playable().map_err(ProviderError::from)?;
             // Re-record: the bounded infohash index may have evicted it since (#164).
             self.infohash_index.put(info.clone());
@@ -61,36 +65,48 @@ impl AceProvider {
             }
         }
 
-        let catalog_error = match self.resolve_cache.resolve_with(content_id, catalog).await {
-            Ok(info) => {
-                info.ensure_playable().map_err(ProviderError::from)?;
-                crate::alog!("[ace] resolved content id via catalog");
-                self.infohash_index.put(info.clone());
-                return Ok(ResolvedContentId::Catalog(info));
-            }
-            Err(CatalogLookupError::Capacity) => {
-                return Err(ProviderError::Backend(
-                    "content-id catalog resolution capacity exceeded".into(),
+        if self.peer_policy.is_private() {
+            if !self.bep9_content_id_fallback {
+                return Err(ProviderError::Unresolvable(
+                    "catalog_disabled_in_private_mode".into(),
                 ));
             }
-            Err(CatalogLookupError::Catalog(error)) => error,
-        };
-        match catalog_error.as_ref() {
-            ResolveError::ProtectedContent => return Err(ProviderError::ProtectedContent),
-            ResolveError::InvalidProtection => return Err(ProviderError::InvalidProtection),
-            ResolveError::Transport(reason) => {
-                return Err(ProviderError::Backend(format!(
-                    "invalid descriptor metadata: {reason}"
-                )));
+        } else {
+            let catalog_error = match self.resolve_cache.resolve_with(content_id, catalog).await {
+                Ok(info) => {
+                    info.ensure_playable().map_err(ProviderError::from)?;
+                    crate::alog!("[ace] resolved content id via catalog");
+                    self.infohash_index.put(info.clone());
+                    return Ok(ResolvedContentId::Catalog(info));
+                }
+                Err(CatalogLookupError::Capacity) => {
+                    return Err(ProviderError::Backend(
+                        "content-id catalog resolution capacity exceeded".into(),
+                    ));
+                }
+                Err(CatalogLookupError::Catalog(error)) => error,
+            };
+            match catalog_error.as_ref() {
+                ResolveError::ProtectedContent => return Err(ProviderError::ProtectedContent),
+                ResolveError::InvalidProtection => return Err(ProviderError::InvalidProtection),
+                ResolveError::Transport(reason) => {
+                    return Err(ProviderError::Backend(format!(
+                        "invalid descriptor metadata: {reason}"
+                    )));
+                }
+                _ => {}
             }
-            _ => {}
+            if !self.bep9_content_id_fallback {
+                return Err(disabled_content_id_fallback(&catalog_error));
+            }
+            crate::alog!(
+                "[ace] catalog resolution failed; trying opted-in raw-hash BEP-9 fallback"
+            );
         }
-        if !self.bep9_content_id_fallback {
-            return Err(disabled_content_id_fallback(&catalog_error));
-        }
-        crate::alog!("[ace] catalog resolution failed; trying opted-in raw-hash BEP-9 fallback");
 
-        let all = if self.bootstrap_peers.is_empty() {
+        let all = if self.peer_policy.is_private() {
+            self.peer_policy.endpoints()
+        } else if self.bootstrap_peers.is_empty() {
             discover_peers(
                 &self.default_trackers,
                 &key,
@@ -107,14 +123,31 @@ impl AceProvider {
         );
 
         for addr in all {
-            let Ok(Ok(session)) =
-                tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
+            let Ok(Ok(session)) = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                self.peer_policy.dial_with(addr, |endpoint| async move {
+                    connect(&endpoint.to_string()).await
+                }),
+            )
+            .await
             else {
                 continue; // unreachable peer; don't waste the log on it
             };
             // Bound each peer's reads so a connected-but-silent peer doesn't stall resolution.
             let mut session = session.with_timeout(RESOLVE_PEER_TIMEOUT);
-            match resolve_via_peer(&mut session, key, &self.identity).await {
+            match async {
+                stream_info_from_transport(
+                    &ace_swarm::resolve::transport_bytes_via_peer_with_policy(
+                        &mut session,
+                        key,
+                        &self.identity,
+                        &self.peer_policy,
+                    )
+                    .await?,
+                )
+            }
+            .await
+            {
                 Ok(info) => {
                     info.ensure_playable().map_err(ProviderError::from)?;
                     crate::alog!("[ace] resolved raw-hash content id via metadata peer");
@@ -126,8 +159,20 @@ impl AceProvider {
                 Err(error @ (ResolveError::ProtectedContent | ResolveError::InvalidProtection)) => {
                     return Err(ProviderError::from(error))
                 }
-                Err(ResolveError::Peer(why)) => crate::alog!("[ace] resolve {addr}: {why}"),
-                Err(e) => crate::alog!("[ace] resolve {addr}: {e:?}"),
+                Err(ResolveError::Peer(why)) => {
+                    if self.peer_policy.is_private() {
+                        crate::alog!("[ace] private metadata peer failed");
+                    } else {
+                        crate::alog!("[ace] resolve {addr}: {why}");
+                    }
+                }
+                Err(e) => {
+                    if self.peer_policy.is_private() {
+                        crate::alog!("[ace] private metadata peer failed");
+                    } else {
+                        crate::alog!("[ace] resolve {addr}: {e:?}");
+                    }
+                }
             }
         }
         Err(ProviderError::Backend(
@@ -149,10 +194,27 @@ impl AceProvider {
     /// Every signed-catalog content-id descriptor resolved here is recorded in the infohash
     /// index, so the stream can later be opened by its infohash too (BEP-9 results are not). outpace never guesses live geometry.
     pub(super) async fn resolve_live_info(&self, id: &str) -> Result<StreamInfo, ProviderError> {
+        if id.starts_with("local:") {
+            return match self.local_descriptors.get(id) {
+                Some(crate::local_descriptors::LocalDescriptor::Live(info)) => Ok(info.clone()),
+                Some(_) => Err(ProviderError::Unresolvable(
+                    "local_descriptor_is_not_live".into(),
+                )),
+                None => Err(ProviderError::Unresolvable(
+                    "local_descriptor_unknown".into(),
+                )),
+            };
+        }
+
         if let Some(content_id) = id.strip_prefix("cid:") {
             return self.resolve_content_id(content_id).await;
         }
         if let Some(url) = crate::transport_url::decode_transport_url(id) {
+            if self.peer_policy.is_private() {
+                return Err(ProviderError::Unresolvable(
+                    "remote_descriptor_disabled_in_private_mode".into(),
+                ));
+            }
             if let Some(info) = self.peer_resolve_cache.get(id) {
                 return Ok(info);
             }
@@ -198,7 +260,11 @@ impl AceProvider {
                 }
             }
         }
-        if let Some(info) = self.infohash_index.get(&infohash) {
+        if let Some(info) = self
+            .infohash_index
+            .get(&infohash)
+            .filter(|_| !self.peer_policy.is_private())
+        {
             return Ok(info);
         }
         Err(ProviderError::Unresolvable(unresolved_infohash_message(id)))
@@ -212,6 +278,11 @@ impl AceProvider {
         let requested = hex20(id).map_err(|_| ProviderError::Backend("bad infohash".into()))?;
         if let Ok(info) = self.verified_info_for_infohash(id) {
             return Ok(info);
+        }
+        if self.peer_policy.is_private() {
+            return Err(ProviderError::Unresolvable(
+                "catalog_disabled_in_private_mode".into(),
+            ));
         }
         if self
             .infohash_failures
@@ -301,6 +372,7 @@ impl AceProvider {
             )
         });
         Ok(Box::new(AceVodContent {
+            peer_policy: self.peer_policy.clone(),
             info,
             bootstrap_peers: self.bootstrap_peers.clone(),
             announce_peer_port: self.announce_peer_port.clone(),
@@ -319,11 +391,27 @@ impl AceProvider {
         id: &str,
         catalog: impl std::future::Future<Output = Result<Vec<u8>, ResolveError>>,
     ) -> Result<VodInfo, ProviderError> {
+        if id.starts_with("local:") {
+            return match self.local_descriptors.get(id) {
+                Some(crate::local_descriptors::LocalDescriptor::Vod(info)) => Ok(info.clone()),
+                Some(_) => Err(ProviderError::Unresolvable(
+                    "local_descriptor_is_not_vod".into(),
+                )),
+                None => Err(ProviderError::Unresolvable(
+                    "local_descriptor_unknown".into(),
+                )),
+            };
+        }
         let bytes = if let Some(content_id) = id.strip_prefix("cid:") {
             let key =
                 hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
             self.content_id_transport_with_catalog(key, catalog).await?
         } else if let Some(url) = crate::transport_url::decode_transport_url(id) {
+            if self.peer_policy.is_private() {
+                return Err(ProviderError::Unresolvable(
+                    "remote_descriptor_disabled_in_private_mode".into(),
+                ));
+            }
             transport_bytes_from_url(&url)
                 .await
                 .map_err(ProviderError::from)?
@@ -346,6 +434,14 @@ impl AceProvider {
     ) -> Result<Vec<u8>, ProviderError> {
         if let Some(bytes) = self.seed_registry.broadcast_transport_for_content_id(&key) {
             return Ok(bytes.as_ref().clone());
+        }
+        if self.peer_policy.is_private() {
+            if !self.bep9_content_id_fallback {
+                return Err(ProviderError::Unresolvable(
+                    "catalog_disabled_in_private_mode".into(),
+                ));
+            }
+            return self.vod_transport_via_peers(key).await;
         }
         match catalog.await {
             Ok(bytes) => Ok(bytes),
@@ -370,7 +466,9 @@ impl AceProvider {
     /// discovered/bootstrap peer in turn — the VOD analogue of the peer fallback in
     /// [`Self::resolve_content_id`].
     async fn vod_transport_via_peers(&self, key: [u8; 20]) -> Result<Vec<u8>, ProviderError> {
-        let all = if self.bootstrap_peers.is_empty() {
+        let all = if self.peer_policy.is_private() {
+            self.peer_policy.endpoints()
+        } else if self.bootstrap_peers.is_empty() {
             discover_peers(
                 &self.default_trackers,
                 &key,
@@ -382,15 +480,33 @@ impl AceProvider {
             self.bootstrap_peers.clone()
         };
         for addr in all {
-            let Ok(Ok(session)) =
-                tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
+            let Ok(Ok(session)) = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                self.peer_policy.dial_with(addr, |endpoint| async move {
+                    connect(&endpoint.to_string()).await
+                }),
+            )
+            .await
             else {
                 continue;
             };
             let mut session = session.with_timeout(RESOLVE_PEER_TIMEOUT);
-            match transport_bytes_via_peer(&mut session, key, &self.identity).await {
+            match ace_swarm::resolve::transport_bytes_via_peer_with_policy(
+                &mut session,
+                key,
+                &self.identity,
+                &self.peer_policy,
+            )
+            .await
+            {
                 Ok(b) => return Ok(b),
-                Err(e) => crate::alog!("[ace] vod resolve {addr}: {e:?}"),
+                Err(e) => {
+                    if self.peer_policy.is_private() {
+                        crate::alog!("[ace] private VOD metadata peer failed");
+                    } else {
+                        crate::alog!("[ace] vod resolve {addr}: {e:?}");
+                    }
+                }
             }
         }
         Err(ProviderError::Backend(

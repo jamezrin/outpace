@@ -100,6 +100,7 @@ async fn await_hls_playlist(
 
 #[derive(Clone)]
 pub struct AppState {
+    pub peer_policy: ace_swarm::peer_policy::PeerPolicy,
     pub manager: Arc<StreamManager>,
     pub networks: Vec<String>,
     /// Resolve `content_id=` to the official infohash before returning `/ace/getstream`
@@ -121,6 +122,7 @@ pub struct AppState {
 /// piece-store registry the S1/S2 serve path already reads from, and minting parameters.
 #[derive(Clone)]
 pub struct BroadcastState {
+    pub peer_policy: ace_swarm::peer_policy::PeerPolicy,
     pub registry: Arc<BroadcastRegistry>,
     pub seed_registry: SeedRegistry,
     pub trackers: Vec<String>,
@@ -203,6 +205,9 @@ impl BroadcastState {
         &self,
         name: &str,
     ) -> Result<(), crate::broadcast::BroadcastError> {
+        if self.peer_policy.is_private() {
+            return Ok(());
+        }
         self.registry
             .ensure_announcing(name, self.inbound_peer_port.clone())
             .await
@@ -250,12 +255,17 @@ async fn debug_memstats() -> Response {
     Json(body).into_response()
 }
 
+async fn network_policy(State(s): State<AppState>) -> Json<serde_json::Value> {
+    Json(crate::private_network::policy_status(&s.peer_policy))
+}
+
 pub fn router(state: AppState) -> Router {
     let compat = state.experimental_ace_compat;
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/debug/memstats", get(debug_memstats))
         .route("/networks", get(networks))
+        .route("/network-policy", get(network_policy))
         .route("/streams", get(list_streams))
         .route(
             "/streams/{network}/{file}",

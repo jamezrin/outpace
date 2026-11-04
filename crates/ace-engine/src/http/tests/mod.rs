@@ -26,6 +26,7 @@ fn state() -> AppState {
     let mut r = ProviderRegistry::new();
     r.register(std::sync::Arc::new(TestProvider { chunks: 10 }));
     AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::new(r),
         networks: vec!["test".into()],
         resolve_content_ids_in_getstream: false,
@@ -130,6 +131,7 @@ fn fixture_state(skip: usize) -> AppState {
     let mut r = ProviderRegistry::new();
     r.register(std::sync::Arc::new(FixtureProvider { skip }));
     AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::with_config(
             r,
             256,
@@ -280,6 +282,7 @@ fn ace_hls_state(ttl: Duration, capacity: usize) -> AppState {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(PacedPacketProvider));
     AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::with_config(
             registry,
             32,
@@ -307,6 +310,7 @@ fn stalled_hls_state_with(ttl: Duration, capacity: usize) -> AppState {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(StalledProvider));
     AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::with_config(
             registry,
             32,
@@ -445,3 +449,5 @@ async fn body_text(resp: Response) -> String {
         .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
+
+mod private_policy;

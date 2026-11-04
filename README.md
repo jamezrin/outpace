@@ -349,7 +349,15 @@ client evidence; it does not claim full engine or application parity.
 
 ## Configuration
 
+[Outbound-only private peer mode](docs/private-peer-mode.md) restricts peer traffic to
+an exact operator allowlist and disables public discovery and advertising.
+
 Environment variables parsed by the daemon include:
+
+- `OUTPACE_PRIVATE_PEERS` - unset preserves public mode; a nonempty bounded numeric
+  IPv4 endpoint list selects strict outbound-only private mode.
+- `OUTPACE_PRIVATE_DESCRIPTORS` - operator-owned local descriptor alias/path JSON
+  admitted at startup in private mode; see the guide for file and size limits.
 
 - `OUTPACE_BEP9_CONTENT_ID_FALLBACK` - raw transport-hash BEP-9 fallback for content-id
   resolution after catalog failure, default off. Set to `1` on the receiving daemon or

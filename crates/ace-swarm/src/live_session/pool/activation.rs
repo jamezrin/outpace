@@ -8,13 +8,33 @@ pub(super) struct Activation {
     pub replacement: Option<u64>,
     pub write: WriteJob,
 }
+#[cfg(test)]
 pub(super) fn prepare(
+    peer_id: u64,
+    upstream: ConnectedUpstream,
+    start: u64,
+    head: u64,
+    identity: &Identity,
+    reachability: Option<&Arc<ReachabilityMonitor>>,
+) -> WriteJob {
+    prepare_with_policy(
+        peer_id,
+        upstream,
+        start,
+        head,
+        identity,
+        reachability,
+        &Default::default(),
+    )
+}
+pub(super) fn prepare_with_policy(
     peer_id: u64,
     mut upstream: ConnectedUpstream,
     start: u64,
     head: u64,
     identity: &Identity,
     reachability: Option<&Arc<ReachabilityMonitor>>,
+    policy: &crate::peer_policy::PeerPolicy,
 ) -> WriteJob {
     // Observe the already-received echo exactly once, before any write can fail
     // or be cancelled. The returned future owns no observer/identity borrow.
@@ -32,7 +52,7 @@ pub(super) fn prepare(
         }),
         node: NodeFields {
             ts: 5000 + peer_id as i64,
-            ..NodeFields::default()
+            ..policy.node_fields()
         },
         peer_ip: Some(upstream.addr.ip().octets()),
         metadata_size: None,
@@ -124,6 +144,72 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(bytes.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn private_activation_and_gossip_wire_do_not_advertise_inbound_port() {
+    for private in [false, true] {
+        for gossip in [false, true] {
+            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+                    unreachable!()
+                };
+                let client = TcpStream::connect(addr).await.unwrap();
+                let (remote, _) = listener.accept().await.unwrap();
+                let policy = if private {
+                    crate::peer_policy::PeerPolicy::from_private_peers(Some(&addr.to_string()))
+                        .unwrap()
+                } else {
+                    Default::default()
+                };
+                let upstream = ConnectedUpstream {
+                    session: PeerSession::new(client),
+                    addr,
+                    window: WireLivePosition {
+                        min_piece: 1,
+                        max_piece: 2,
+                        position: 1,
+                        distance_from_source: 1,
+                    },
+                    unchoked: false,
+                    yourip: None,
+                };
+                let identity = Identity::generate();
+                let mut remote = PeerSession::new(remote);
+                let capture = async {
+                    let PeerMessage::Extended { ext_id: 0, payload } =
+                        remote.read_message().await.unwrap()
+                    else {
+                        panic!("signed extension")
+                    };
+                    payload
+                };
+                if gossip {
+                    let job = pool_support::stale_gossip_job_with_policy(
+                        upstream,
+                        &identity,
+                        tokio::time::Instant::now() + Duration::from_millis(50),
+                        &policy,
+                    );
+                    let (_, payload) = tokio::join!(job, capture);
+                    payload
+                } else {
+                    let job = prepare_with_policy(1, upstream, 1, 2, &identity, None, &policy);
+                    let (written, payload) = tokio::join!(job, capture);
+                    drop(written.unwrap());
+                    payload
+                }
+            })
+            .await
+            .expect("bounded activation/gossip capture");
+            crate::peer_policy::assert_signed_listen_port(
+                &observed,
+                if private { 0 } else { 8621 },
+            );
         }
     }
 }

@@ -216,6 +216,7 @@ impl PeerConnectProgress {
 pub(super) struct PeerConnectStats {
     pub(super) connected: usize,
     pub(super) tcp: usize,
+    pub(super) policy_denied: usize,
     pub(super) handshake: usize,
     pub(super) window: usize,
     pub(super) total_timeout: usize,
@@ -247,6 +248,7 @@ impl PeerConnectStats {
     pub(super) fn record_failure(&mut self, failure: PeerConnectFailure) {
         self.record_timing(failure.timing);
         match failure.stage {
+            PeerConnectStage::PolicyDenied => self.policy_denied += 1,
             PeerConnectStage::Tcp => self.tcp += 1,
             PeerConnectStage::Handshake => self.handshake += 1,
             PeerConnectStage::Window => self.window += 1,
@@ -262,18 +264,28 @@ impl PeerConnectStats {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.connected + self.tcp + self.handshake + self.window + self.total_timeout + self.task
+        self.connected
+            + self.policy_denied
+            + self.tcp
+            + self.handshake
+            + self.window
+            + self.total_timeout
+            + self.task
             > 0
     }
 
     pub(super) fn summary(&self) -> String {
         let attempted = self.connected
+            + self.policy_denied
             + self.tcp
             + self.handshake
             + self.window
             + self.total_timeout
             + self.task;
         let mut parts = vec![format!("attempted={attempted}")];
+        if self.policy_denied > 0 {
+            parts.push(format!("policy_denied={}", self.policy_denied));
+        }
         if self.connected > 0 {
             parts.push(format!("connected={}", self.connected));
         }

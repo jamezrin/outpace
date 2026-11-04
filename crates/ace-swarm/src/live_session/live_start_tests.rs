@@ -31,6 +31,7 @@ fn fixture(max_active: usize) -> (StreamInfo, SeedConfig) {
             source_pubkey: vec![],
         },
         SeedConfig {
+            peer_policy: Default::default(),
             metrics: Some(TestObserver::new(
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),

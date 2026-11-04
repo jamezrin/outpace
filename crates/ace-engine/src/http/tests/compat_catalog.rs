@@ -69,6 +69,7 @@ fn ace_app_state(
     let mut registry = ProviderRegistry::new();
     registry.register(provider);
     AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::new(registry),
         networks: vec!["ace".into()],
         resolve_content_ids_in_getstream,

@@ -165,6 +165,9 @@ pub(super) async fn resolve_vod(
         Err(e @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection)) => Err(
             Box::new((StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()),
         ),
+        Err(ProviderError::Unresolvable(reason)) if s.peer_policy.is_private() => Err(Box::new(
+            (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response(),
+        )),
         Err(ProviderError::NotFound) => Err(Box::new(
             (StatusCode::NOT_FOUND, "unknown network").into_response(),
         )),

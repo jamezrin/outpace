@@ -105,6 +105,8 @@ impl PieceBuffer {
 /// Error from a VOD download.
 #[derive(Debug)]
 pub enum VodError {
+    /// Every supplied endpoint was denied before any peer socket was created.
+    PeerPolicyDenied,
     /// No peer could supply a verifying copy of the piece at this index.
     Unrecoverable(u64),
     /// The consumer dropped the receiver before the download finished.
@@ -146,6 +148,29 @@ pub async fn download_vod_pieces(
         first_piece,
         end_piece,
         DEFAULT_VOD_TIMEOUTS,
+    )
+    .await
+}
+
+/// Download a range under an immutable endpoint policy, retained through worker retries.
+pub async fn download_vod_pieces_with_peer_policy(
+    info: VodInfo,
+    peers: Vec<SocketAddrV4>,
+    tx: mpsc::Sender<Bytes>,
+    first_piece: u64,
+    end_piece: u64,
+    peer_policy: crate::peer_policy::PeerPolicy,
+) -> Result<(), VodError> {
+    coordinator::download_with_network_policy(
+        info,
+        peers,
+        tx,
+        first_piece..end_piece,
+        coordinator::DownloadOptions {
+            timeouts: DEFAULT_VOD_TIMEOUTS,
+            concurrency: 4,
+            peer_policy,
+        },
     )
     .await
 }
@@ -703,6 +728,114 @@ mod seeder_tests {
         assert!(
             result.is_err(),
             "a tampered, unrecoverable piece must fail the download"
+        );
+    }
+    #[tokio::test]
+    async fn private_vod_downloads_verified_range_from_allowed_owned_peer() {
+        let (content, info) = make_content(1024, 512, 1024);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(endpoint) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let policy =
+            crate::peer_policy::PeerPolicy::from_private_peers(Some(&endpoint.to_string()))
+                .unwrap();
+        let expected = content.clone();
+        let server_info = info.clone();
+        let mut server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let mut peer = ace_peer::session::PeerSession::new(socket)
+                .with_protocol(server_info.peer_protocol);
+            peer.accept_handshake(ace_wire::handshake::random_peer_id(), |hash| {
+                hash == &server_info.infohash
+            })
+            .await?;
+            peer.send(&PeerMessage::Bitfield(vec![0x80])).await?;
+            peer.send(&PeerMessage::Unchoke).await?;
+            loop {
+                match peer.read_message().await {
+                    Ok(PeerMessage::Request {
+                        index,
+                        begin,
+                        length,
+                    }) => {
+                        if index != 0 || begin as usize + length as usize > content.len() {
+                            return Err(ace_peer::PeerError::Protocol("invalid fixture request"));
+                        }
+                        peer.send(&PeerMessage::Piece {
+                            index,
+                            begin,
+                            block: content[begin as usize..(begin + length) as usize].to_vec(),
+                        })
+                        .await?;
+                    }
+                    Ok(_) => {}
+                    Err(ace_peer::PeerError::Closed) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut download = tokio::spawn(download_vod_pieces_with_peer_policy(
+            info,
+            vec![endpoint],
+            tx,
+            0,
+            1,
+            policy,
+        ));
+        let observed = tokio::time::timeout(Duration::from_secs(3), async {
+            let bytes = rx.recv().await;
+            let result = (&mut download).await;
+            (bytes, result)
+        })
+        .await;
+        drop(rx);
+        if observed.is_err() {
+            download.abort();
+            let _ = download.await;
+        }
+        let server_result = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+        if server_result.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        assert!(
+            matches!(server_result, Ok(Ok(Ok(())))),
+            "owned seeder did not close: {server_result:?}"
+        );
+        let (bytes, result) = observed.expect("bounded private transfer");
+        assert_eq!(bytes.as_deref(), Some(expected.as_slice()));
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "private range failed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_vod_denies_unlisted_range_peer_without_connecting() {
+        let (_, info) = make_content(1024, 512, 1024);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(endpoint) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let port = if endpoint.port() == 1 { 2 } else { 1 };
+        let policy =
+            crate::peer_policy::PeerPolicy::from_private_peers(Some(&format!("127.0.0.1:{port}")))
+                .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            download_vod_pieces_with_peer_policy(info, vec![endpoint], tx, 0, 1, policy),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(VodError::PeerPolicyDenied)));
+        assert!(rx.recv().await.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
         );
     }
 }

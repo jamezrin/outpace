@@ -23,6 +23,7 @@ mod tests {
         let identity = Identity::generate();
         let policy = LiveRecoveryConfig::default();
         let seed = SeedConfig {
+            peer_policy: Default::default(),
             metrics: None,
             registry: SeedRegistry::new(),
             store_factory: test_store_factory(4096, None),

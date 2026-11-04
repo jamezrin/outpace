@@ -61,7 +61,9 @@ impl AceProvider {
         // Bootstrap peers are the proven/direct path and must be tried without waiting for
         // tracker/DHT discovery. Background refill can still discover more peers after start.
         let mut initial_run = None;
-        let peers = if self.bootstrap_peers.is_empty() {
+        let peers = if self.peer_policy.is_private() {
+            self.peer_policy.endpoints()
+        } else if self.bootstrap_peers.is_empty() {
             // One budget covers warm-cache initialization, both generations and the gap.
             let deadline = tokio::time::Instant::now() + INITIAL_DISCOVERY_BUDGET;
             let acquired = tokio::select! {
@@ -147,6 +149,7 @@ impl AceProvider {
         let startup_buffer = self.startup_buffer;
         let bitrate = info.metadata.bitrate;
         let seed = LiveSeedOptions {
+            peer_policy: self.peer_policy.clone(),
             metrics: Some(metrics.clone()),
             registry: self.seed_registry.clone(),
             store_factory: self.store_factory(&info),
@@ -159,13 +162,14 @@ impl AceProvider {
         let metadata = info.metadata.clone();
         let announce_port = self.announce_peer_port.clone();
         let reachability = self.reachability.clone();
+        let private = self.peer_policy.is_private();
         tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
             // whichever ends first (normally `follow_live`, when the consumer drops) tears
             // down the other — no separate lifecycle to manage.
             tokio::select! {
                 _ = follow_live(LiveSessionInputs { info, peers, identity, output: tx, counters: LiveCounters { peers: stats_peers, downloaded, uploaded, peers_served }, seed, discovery, reachability, initial_run }) => {},
-                _ = announce_seeder_periodically(announce_info, announce_port) => {},
+                _ = async { if private { std::future::pending::<()>().await; } else { announce_seeder_periodically(announce_info, announce_port).await; } } => {},
             }
         });
         let source = AceSource {
