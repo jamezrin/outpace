@@ -1,6 +1,6 @@
 # Autonomous MPEG-TS support service (#270)
 
-This design completes Post-1.0 milestone issue #270. The merged baseline proves
+This document defines the staged design for Post-1.0 milestone issue #270. The merged baseline proves
 signed acquisition and verified reseeding with a finite service-owned receiver;
 it does not supply daemon configuration, restart or stop ownership. Root selected
 the following design under delegated routine design authority.
