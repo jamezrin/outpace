@@ -183,8 +183,8 @@ as a proxy. Cleanup completion transfers immediately, independently of result po
 
 ## Current acceptance evidence
 
-Implementation and local acceptance controls are complete; final scoped review,
-commit, PR, CI and merge remain pending. This is stage 1 only and does not close
+Implementation and local acceptance controls are complete; final scoped review
+passed and PR #328 is open. CI and merge remain pending. This is stage 1 only and does not close
 #270 or provide an autonomous service.
 
 - Corrected full workspace: 1,709 passed, zero failed, 15 ignored. Latest admitted-
