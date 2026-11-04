@@ -74,6 +74,26 @@ pub(super) struct PoolActor<'a> {
 
 impl PoolActor<'_> {
     pub(super) async fn run(mut self) -> FollowEnd {
+        let result = catch_owned_panic(self.run_inner()).await;
+        self.activation.take();
+        self.gossip.take();
+        self.learned_connects.abort_all();
+        pool_support::shutdown_peer_pool(&mut self.peers, self.continuity).await;
+        while self.learned_connects.join_next().await.is_some() {}
+        match result {
+            Ok(end) => end,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    async fn run_inner(&mut self) -> FollowEnd {
+        #[cfg(test)]
+        if worker_ownership::lifetime_probe::PANIC_POOL
+            .try_with(|_| ())
+            .is_ok()
+        {
+            panic!("synthetic admitted pool failure");
+        }
         #[cfg(test)]
         let _ = ACTIVATION_PROBE.try_with(|probe| {
             if let Some(candidate) = probe.candidate.borrow_mut().take() {
@@ -99,6 +119,10 @@ impl PoolActor<'_> {
         loop {
             #[cfg(test)]
             output_schedules::turn();
+            let worker_cleanup_completed = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(self.continuity.workers.poll_retired(cx).is_ready())
+            })
+            .await;
             if self.tx.is_closed() {
                 return FollowEnd::ConsumerGone;
             }
@@ -187,7 +211,7 @@ impl PoolActor<'_> {
                     self.live_recovery.stale_upstream_timeout(),
                     stalled.len()
                 );
-                shutdown_peer_runtimes(&mut self.peers);
+                pool_support::shutdown_current_workers(&mut self.peers, self.continuity).await;
                 self.continuity.recovery_event(RecoveryEvent::StaleTeardown);
                 return FollowEnd::PoolStale {
                     stalled,
@@ -274,7 +298,15 @@ impl PoolActor<'_> {
                     }), if !reciprocal_completed => PoolWake::Reciprocal(Some(result)),
                     result = std::future::poll_fn(|cx| self.activation.as_mut().expect("enabled activation").write.as_mut().poll(cx)), if self.activation.is_some() => PoolWake::Activation(result),
                     _ = self.tx.closed() => PoolWake::ConsumerGone,
-                    _ = std::future::poll_fn(|cx| publication::poll_operation(&mut self.publication, self.continuity, self.store, cx).then_some(()).map_or(std::task::Poll::Pending, std::task::Poll::Ready)), if self.publication.is_some() => PoolWake::Publication,
+                    event = std::future::poll_fn(|cx| {
+                        if !worker_cleanup_completed && self.continuity.workers.poll_retired(cx).is_ready() {
+                            return std::task::Poll::Ready(PoolWake::WorkerCleanup);
+                        }
+                        if publication::poll_operation(&mut self.publication, self.continuity, self.store, cx) {
+                            return std::task::Poll::Ready(PoolWake::Publication);
+                        }
+                        std::task::Poll::Pending
+                    }), if self.publication.is_some() || (!worker_cleanup_completed && self.continuity.workers.has_retired()) => event,
                     learned = async { self.gossip.as_mut().expect("enabled gossip").await }, if self.gossip.is_some() => PoolWake::Gossip(learned),
                     event = self.event_rx.recv(), if !self.peers.is_empty() => PoolWake::Peer(event),
                     result=self.learned_connects.join_next(), if !self.learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
@@ -363,7 +395,7 @@ impl PoolActor<'_> {
                 self.maybe_refill(true);
                 WakeOutcome::Continue
             }
-            PoolWake::Stats => WakeOutcome::Continue,
+            PoolWake::Stats | PoolWake::WorkerCleanup => WakeOutcome::Continue,
             PoolWake::Publication => {
                 self.start_publication();
                 WakeOutcome::Continue
@@ -377,7 +409,7 @@ impl PoolActor<'_> {
             }
             PoolWake::Peer(Some(_)) => WakeOutcome::Continue,
             PoolWake::Peer(None) => {
-                shutdown_peer_runtimes(&mut self.peers);
+                pool_support::shutdown_current_workers(&mut self.peers, self.continuity).await;
                 if self.continuity.has_delivery_work() {
                     WakeOutcome::Continue
                 } else {
@@ -515,13 +547,16 @@ impl PoolActor<'_> {
             peer_id,
             replacement,
             write: activation::prepare_with_policy(
-                peer_id,
+                activation::Start {
+                    peer_id,
+                    cursor: self.continuity.reasm.next_needed(),
+                    head: self.continuity.head,
+                },
                 upstream,
-                self.continuity.reasm.next_needed(),
-                self.continuity.head,
                 self.identity,
                 self.reachability,
                 self.candidates.policy(),
+                self.continuity.workers.admission(),
             ),
         });
         WakeOutcome::Continue
@@ -544,7 +579,7 @@ impl PoolActor<'_> {
         }
         let peer_id = job.peer_id;
         let replacement = job.replacement;
-        let result = result.map(|upstream| {
+        let result = result.map(|activation::Prepared { upstream, permit }| {
             let active = self.peers.values().map(|peer| peer.addr).collect();
             let corroborates = self.continuity.startup_deadline.is_some()
                 && upstream.window.max_piece.max(0) as u64 >= self.continuity.head;
@@ -586,16 +621,19 @@ impl PoolActor<'_> {
             if !valid {
                 return None;
             }
-            let runtime = commit_upstream_peer(ActivationInputs {
-                peer_id,
-                upstream,
-                start: 0,
-                identity: self.identity,
-                continuity: self.continuity,
-                event_tx: &self.event_tx,
-                reachability: self.reachability,
-                replacing: replacement.map(|id| (&mut self.peers, id)),
-            });
+            let runtime = commit_upstream_peer(
+                ActivationInputs {
+                    peer_id,
+                    upstream,
+                    start: 0,
+                    identity: self.identity,
+                    continuity: self.continuity,
+                    event_tx: &self.event_tx,
+                    reachability: self.reachability,
+                    replacing: replacement.map(|id| (&mut self.peers, id)),
+                },
+                permit,
+            );
             Some((runtime, corroborates))
         });
         match result {

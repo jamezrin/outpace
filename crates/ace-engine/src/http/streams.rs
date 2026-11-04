@@ -57,7 +57,7 @@ fn native_public_stream_id<'a>(network: &str, id: &'a str) -> Cow<'a, str> {
 }
 
 /// `DELETE /streams/{network}/{id}` — force-stop a running session (admin). 204 if it was
-/// running, 404 otherwise. The `{id}` may carry a `.ts`/`.m3u8` suffix (mirroring the GET
+/// running, 404 if absent, or 500 when owned cleanup cannot be confirmed. The `{id}` may carry a `.ts`/`.m3u8` suffix (mirroring the GET
 /// URL); it's stripped so either form stops the same session.
 pub(super) async fn delete_stream(
     State(s): State<AppState>,
@@ -71,10 +71,10 @@ pub(super) async fn delete_stream(
         Ok(id) => id,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
-    if s.manager.stop(&network, &id).await {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    match s.manager.stop_checked(&network, &id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "stream cleanup failed").into_response(),
     }
 }
 

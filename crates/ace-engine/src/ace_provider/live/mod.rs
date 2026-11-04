@@ -6,7 +6,8 @@ const EMPTY_DISCOVERY_RETRY_GAP: Duration = Duration::from_secs(1);
 
 pub(super) struct AceSource {
     pub(super) metrics: Option<Arc<crate::live_stats::LiveMetrics>>,
-    pub(super) _sampler: Option<crate::live_stats::MetricsSampler>,
+    pub(super) sampler: Option<crate::live_stats::MetricsSampler>,
+    pub(super) worker: Option<tokio::task::JoinHandle<()>>,
     pub(super) rx: mpsc::Receiver<LiveOutput>,
     pub(super) discontinuity: bool,
     pub(super) peers: Arc<AtomicU32>,
@@ -16,12 +17,39 @@ pub(super) struct AceSource {
     pub(super) metadata: StreamMetadata,
 }
 
+impl Drop for AceSource {
+    fn drop(&mut self) {
+        // Explicit shutdown owns successful completion. Drop only contains a caller
+        // that failed to use that contract; it must not leave acquisition running.
+        self.rx.close();
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
+    }
+}
+
 #[async_trait]
 impl TsSource for AceSource {
     async fn next(&mut self) -> Option<Bytes> {
         let output = self.rx.recv().await?;
         self.discontinuity = output.discontinuity;
         Some(output.bytes)
+    }
+    async fn shutdown(&mut self) {
+        self.rx.close();
+        if let Some(worker) = self.worker.as_mut() {
+            if let Err(error) = worker.await {
+                crate::alog!("[ace] source owner ended unexpectedly during shutdown");
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+                panic!("ACE source owner cleanup is unconfirmed");
+            }
+            self.worker.take();
+        }
+        if let Some(sampler) = self.sampler.as_mut() {
+            sampler.shutdown().await;
+        }
     }
     fn take_discontinuity(&mut self) -> bool {
         std::mem::take(&mut self.discontinuity)
@@ -66,11 +94,13 @@ impl AceProvider {
         } else if self.bootstrap_peers.is_empty() {
             // One budget covers warm-cache initialization, both generations and the gap.
             let deadline = tokio::time::Instant::now() + INITIAL_DISCOVERY_BUDGET;
+            // Keep the task owner outside the deadline-selected future so timeout can
+            // close and join it before the provider releases its opening reservation.
+            let mut run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
             let acquired = tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(deadline) => None,
                 result = async {
-                    let mut run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
                     self.warm_peers.initialized().await;
                     let mut peers = self.warm_peers.candidate_addresses(&info.infohash);
                     let mut retried = false;
@@ -83,11 +113,11 @@ impl AceProvider {
                             peers.push(peer);
                         }
                         if !peers.is_empty() || retried {
-                            break Some((peers, run));
+                            break Some(peers);
                         }
-                        // Release the empty generation before waiting; cancellation owns
-                        // both the active run and the gap through this opening future.
-                        drop(run);
+                        // Join the empty generation before replacing it. The manager owns
+                        // this opening future through requester cancellation.
+                        run.shutdown().await;
                         tokio::time::sleep(EMPTY_DISCOVERY_RETRY_GAP).await;
                         if tokio::time::Instant::now() >= deadline {
                             break None;
@@ -100,13 +130,16 @@ impl AceProvider {
             // The deadline also wins if acquisition becomes ready in the same poll, or
             // synchronous candidate collection crosses expiry before the timer is polled again.
             match acquired {
-                Some((peers, run)) if tokio::time::Instant::now() < deadline => {
-                    if !peers.is_empty() {
+                Some(peers) if tokio::time::Instant::now() < deadline => {
+                    if peers.is_empty() {
+                        run.shutdown().await;
+                    } else {
                         initial_run = Some(run);
                     }
                     peers
                 }
                 _ => {
+                    run.shutdown().await;
                     return Err(ProviderError::Backend(
                         "initial peer discovery timed out".into(),
                     ));
@@ -163,7 +196,7 @@ impl AceProvider {
         let announce_port = self.announce_peer_port.clone();
         let reachability = self.reachability.clone();
         let private = self.peer_policy.is_private();
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
             // whichever ends first (normally `follow_live`, when the consumer drops) tears
             // down the other — no separate lifecycle to manage.
@@ -174,7 +207,8 @@ impl AceProvider {
         });
         let source = AceSource {
             metrics: Some(metrics),
-            _sampler: Some(sampler),
+            sampler: Some(sampler),
+            worker: Some(worker),
             rx,
             discontinuity: false,
             peers: peer_count,

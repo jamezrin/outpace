@@ -1014,23 +1014,27 @@ async fn review_credit(signed: bool, completions: bool, close: bool, publication
         let (_remote, _) = listener.accept().await.unwrap();
         actor.live_recovery.max_active_upstreams = 4;
         actor.continuity.startup_deadline = Some(Instant::now() + Duration::from_secs(60));
+        let admission = actor.continuity.workers.admission();
         actor.activation = Some(activation::Activation {
             addr: candidate,
             peer_id: 4,
             replacement: None,
             write: Box::pin(async move {
                 wait.await.unwrap();
-                Ok(ConnectedUpstream {
-                    session: PeerSession::new(socket),
-                    addr: candidate,
-                    window: WireLivePosition {
-                        min_piece: 0,
-                        max_piece: 10,
-                        position: 0,
-                        distance_from_source: 1,
+                Ok(activation::Prepared {
+                    upstream: ConnectedUpstream {
+                        session: PeerSession::new(socket),
+                        addr: candidate,
+                        window: WireLivePosition {
+                            min_piece: 0,
+                            max_piece: 10,
+                            position: 0,
+                            distance_from_source: 1,
+                        },
+                        unchoked: false,
+                        yourip: None,
                     },
-                    unchoked: false,
-                    yourip: None,
+                    permit: admission.acquire().await,
                 })
             }),
         });

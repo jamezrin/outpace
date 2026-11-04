@@ -1,4 +1,4 @@
-mod activation;
+pub(super) mod activation;
 pub(super) mod actor;
 use super::*;
 use crate::seed::protocol::{prepare_reply, ServeProfile};
@@ -60,29 +60,38 @@ pub(super) async fn activate_upstream_peer_with_policy(
         reachability,
         replacing,
     } = inputs;
-    let upstream = activation::prepare_with_policy(
-        peer_id,
+    let activation::Prepared { upstream, permit } = activation::prepare_with_policy(
+        activation::Start {
+            peer_id,
+            cursor: start,
+            head: continuity.head,
+        },
         upstream,
-        start,
-        continuity.head,
         identity,
         reachability,
         policy,
+        continuity.workers.admission(),
     )
     .await?;
-    Ok(commit_upstream_peer(ActivationInputs {
-        peer_id,
-        upstream,
-        start,
-        identity,
-        continuity,
-        event_tx,
-        reachability,
-        replacing,
-    }))
+    Ok(commit_upstream_peer(
+        ActivationInputs {
+            peer_id,
+            upstream,
+            start,
+            identity,
+            continuity,
+            event_tx,
+            reachability,
+            replacing,
+        },
+        permit,
+    ))
 }
 
-fn commit_upstream_peer(inputs: ActivationInputs<'_>) -> (PeerRuntime, Option<SocketAddrV4>) {
+fn commit_upstream_peer(
+    inputs: ActivationInputs<'_>,
+    permit: WorkerPermit,
+) -> (PeerRuntime, Option<SocketAddrV4>) {
     let ActivationInputs {
         peer_id,
         upstream,
@@ -91,6 +100,7 @@ fn commit_upstream_peer(inputs: ActivationInputs<'_>) -> (PeerRuntime, Option<So
         replacing,
         ..
     } = inputs;
+    continuity.workers.register(peer_id, permit);
     let peer_min = upstream.window.min_piece.max(0) as u64;
     let peer_max = upstream.window.max_piece.max(0) as u64;
     // Only successful writes consume the old provisional transport. A failed candidate
@@ -105,14 +115,23 @@ fn commit_upstream_peer(inputs: ActivationInputs<'_>) -> (PeerRuntime, Option<So
     continuity.admitted_upstreams += 1;
     continuity.publish_upstreams();
     let (command_tx, command_rx) = mpsc::channel(64);
-    let worker = tokio::spawn(peer_worker(
+    #[cfg(test)]
+    let lifetime = worker_ownership::lifetime_probe::capture();
+    let worker_future = peer_worker(
         peer_id,
         upstream.addr,
         upstream.session,
         command_rx,
         event_tx.clone(),
         continuity.request_floor.clone(),
-    ));
+    );
+    #[cfg(test)]
+    let worker = tokio::spawn(async move {
+        let _lifetime = lifetime;
+        worker_future.await;
+    });
+    #[cfg(not(test))]
+    let worker = tokio::spawn(worker_future);
     (
         PeerRuntime {
             addr: upstream.addr,
@@ -322,7 +341,13 @@ pub(super) async fn follow_peer_pool_with_discovery(
     for upstream in upstreams {
         let peer_id = next_peer_id;
         next_peer_id += 1;
-        match activate_upstream_peer_with_policy(
+        let activated = tokio::select! {
+            biased;
+            _ = tx.closed() => {
+                pool_support::shutdown_peer_pool(&mut peers, continuity).await;
+                return FollowEnd::ConsumerGone;
+            }
+            result = activate_upstream_peer_with_policy(
             ActivationInputs {
                 peer_id,
                 upstream,
@@ -334,9 +359,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
                 replacing: None,
             },
             &seed.peer_policy,
-        )
-        .await
-        {
+            ) => result,
+        };
+        match activated {
             Ok((runtime, _)) => {
                 candidates.admitted(runtime.addr);
                 peers.insert(peer_id, runtime);

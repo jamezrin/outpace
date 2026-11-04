@@ -1033,6 +1033,70 @@ async fn consumer_close_cancels_owned_rediscovery() {
 }
 
 #[tokio::test]
+async fn consumer_close_joins_owned_rediscovery_before_returning() {
+    struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            let _ = self.0.take().unwrap().send(());
+        }
+    }
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
+    let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, dropped_tx))));
+    let discovery: PeerDiscovery = completed_discovery(move |_| {
+        let (started, dropped) = signals
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one owned discovery at a time");
+        Box::pin(async move {
+            let _guard = Dropped(Some(dropped));
+            started.send(()).unwrap();
+            std::future::pending().await
+        })
+    });
+    let (info, seed) = cancellation_fixture();
+    let (tx, rx) = mpsc::channel(1);
+    let mut session = Box::pin(follow_live_session(
+        info,
+        vec![],
+        Arc::new(Identity::generate()),
+        tx,
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        seed,
+        discovery,
+        None,
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            _ = &mut session => panic!("session ended before discovery started"),
+            started = started_rx => started.unwrap(),
+        }
+    })
+    .await
+    .unwrap();
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(1), &mut session)
+        .await
+        .unwrap();
+    let joined_before_return = dropped_rx.try_recv().is_ok();
+    if !joined_before_return {
+        // Yield for fallback abort cleanup before asserting the ownership contract.
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        joined_before_return,
+        "follower returned before owned discovery destruction"
+    );
+}
+
+#[tokio::test]
 async fn active_source_loss_enters_cooldown_before_another_announcement() {
     let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2813,4 +2877,245 @@ async fn owned_gossip_deadline_starts_at_admission_not_first_poll() {
     let before = tokio::time::Instant::now();
     assert!(job.await.into_learned().is_empty());
     assert_eq!(tokio::time::Instant::now(), before);
+}
+
+#[tokio::test]
+async fn consumer_close_joins_real_peer_worker_before_follower_returns() {
+    use worker_ownership::lifetime_probe::{Probe, CURRENT};
+    let SelectionPeer {
+        addr, mut server, ..
+    } = selection_peer(Duration::ZERO, live_pos(7, 7)).await;
+    let (info, seed) = cancellation_fixture();
+    let (tx, rx) = mpsc::channel(1);
+    let probe = Arc::new(Probe::default());
+    let mut follower = Box::pin(CURRENT.scope(
+        probe.clone(),
+        follow_live_session(
+            info,
+            vec![addr],
+            Arc::new(Identity::generate()),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            seed,
+            completed_discovery(|_| async { vec![] }),
+            None,
+        ),
+    ));
+    let mut follower_finished = false;
+    let worker_started = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = follower.as_mut() => { follower_finished = true; false },
+            _ = probe.spawned.notified() => true,
+        }
+    })
+    .await
+    .unwrap_or(false);
+    let active_before_close = probe.active.load(Ordering::SeqCst);
+    drop(rx);
+    let joined = follower_finished
+        || tokio::time::timeout(Duration::from_secs(1), follower.as_mut())
+            .await
+            .is_ok();
+    let active_at_return = probe.active.load(Ordering::SeqCst);
+    drop(follower);
+    let server_result = reap_selection_peer(&mut server, Duration::from_secs(1)).await;
+    assert!(
+        worker_started && active_before_close == 1,
+        "must reach the actual admitted peer worker"
+    );
+    assert!(joined, "consumer close must finish the real follower");
+    assert_eq!(
+        active_at_return, 0,
+        "follower returned before real peer worker destruction"
+    );
+    assert!(
+        server_result.is_some_and(|result| result.socket_closed),
+        "peer fixture must terminate after socket closure"
+    );
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn consumer_close_joins_real_connect_attempt_before_follower_returns() {
+    use worker_ownership::lifetime_probe::{Probe, CONNECT};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let (info, seed) = cancellation_fixture();
+    let (tx, rx) = mpsc::channel(1);
+    let probe = Arc::new(Probe::default());
+    let mut follower = Box::pin(CONNECT.scope(
+        probe.clone(),
+        follow_live_session(
+            info,
+            vec![addr],
+            Arc::new(Identity::generate()),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            seed,
+            completed_discovery(|_| async { vec![] }),
+            None,
+        ),
+    ));
+    let accepted = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut handshake = [0; 66];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut handshake)
+            .await
+            .unwrap();
+        stream
+    };
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = follower.as_mut() => panic!("follower ended before real handshake attempt"),
+            stream = accepted => stream,
+        }
+    })
+    .await
+    .unwrap();
+    let active_before_close = probe.active.load(Ordering::SeqCst);
+    drop(rx);
+    let joined = tokio::time::timeout(Duration::from_secs(1), follower.as_mut())
+        .await
+        .is_ok();
+    let active_at_return = probe.active.load(Ordering::SeqCst);
+    drop(follower);
+    let mut remaining = Vec::new();
+    let eof = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut remaining),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    assert_eq!(active_before_close, 1);
+    assert!(
+        joined && eof,
+        "close must finish follower and exact owned connection"
+    );
+    assert_eq!(
+        active_at_return, 0,
+        "follower returned before connect-attempt destruction"
+    );
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn selected_pool_joins_unused_real_connection_attempts_before_returning() {
+    use worker_ownership::lifetime_probe::{Probe, CONNECT};
+    let SelectionPeer {
+        addr: fast_addr,
+        mut server,
+        ..
+    } = selection_peer(Duration::from_millis(50), live_pos(7, 7)).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(slow_addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let mut slow = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let result = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut bytes).await;
+        result.is_ok() && bytes.len() >= 66
+    });
+    let mut candidates = SessionCandidates::default();
+    candidates.learn(fast_addr, CandidateKind::Discovered);
+    candidates.learn(slow_addr, CandidateKind::Discovered);
+    let config = LiveRecoveryConfig {
+        max_active_upstreams: 1,
+        max_parallel_connect: 2,
+        ..Default::default()
+    };
+    let probe = Arc::new(Probe::default());
+    let selected = CONNECT
+        .scope(
+            probe.clone(),
+            connect_pool([0; 20], &mut candidates, config, &mut None, None),
+        )
+        .await;
+    let active_at_return = probe.active.load(Ordering::SeqCst);
+    let selected_fast = selected.len() == 1 && selected[0].addr == fast_addr;
+    drop(selected);
+    let fast_closed = reap_selection_peer(&mut server, Duration::from_secs(1))
+        .await
+        .is_some();
+    let slow_closed = match tokio::time::timeout(Duration::from_secs(1), &mut slow).await {
+        Ok(Ok(closed)) => closed,
+        _ => {
+            slow.abort();
+            let _ = slow.await;
+            false
+        }
+    };
+    assert!(
+        selected_fast && fast_closed && slow_closed,
+        "selection must retain the fast peer and close the actual unused attempt"
+    );
+    assert_eq!(
+        active_at_return, 0,
+        "selection returned before unused attempt destruction"
+    );
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pool_panic_joins_real_peer_before_propagating() {
+    use worker_ownership::lifetime_probe::{Probe, CURRENT, PANIC_POOL};
+    let SelectionPeer {
+        addr, mut server, ..
+    } = selection_peer(Duration::ZERO, live_pos(7, 7)).await;
+    let (info, seed) = cancellation_fixture();
+    let (tx, rx) = mpsc::channel(1);
+    let probe = Arc::new(Probe::default());
+    let mut follower = Box::pin(CURRENT.scope(
+        probe.clone(),
+        PANIC_POOL.scope(
+            (),
+            follow_live_session(
+                info,
+                vec![addr],
+                Arc::new(Identity::generate()),
+                tx,
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU32::new(0)),
+                seed,
+                completed_discovery(|_| async { vec![] }),
+                None,
+            ),
+        ),
+    ));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        std::future::poll_fn(|cx| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                follower.as_mut().poll(cx)
+            })) {
+                Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(false),
+                Err(_) => std::task::Poll::Ready(true),
+            }
+        }),
+    )
+    .await;
+    drop(follower);
+    let active_at_panic = probe.active.load(Ordering::SeqCst);
+    drop(rx);
+    let socket_terminated = reap_selection_peer(&mut server, Duration::from_secs(1))
+        .await
+        .is_some();
+    assert!(
+        matches!(outcome, Ok(true)),
+        "injected failure must still propagate"
+    );
+    assert!(socket_terminated);
+    assert_eq!(active_at_panic, 0, "pool panic bypassed owned peer cleanup");
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
 }

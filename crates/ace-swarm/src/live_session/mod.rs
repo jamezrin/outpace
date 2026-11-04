@@ -1,5 +1,7 @@
 //! Production live follower: [`follow_live`] accepts [`LiveSessionInputs`] and emits
 //! authenticated, contiguous media as [`LiveOutput`], including discontinuity markers.
+mod worker_ownership;
+use worker_ownership::{WorkerAdmission, WorkerOwnership, WorkerPermit};
 mod output_clock;
 use output_clock::{EffectiveInstant, FirstOutput, OutputBudget, OutputBudgetClock};
 mod observation;
@@ -95,10 +97,9 @@ fn drain_discovery(run: &mut Option<DiscoveryRun>, candidates: &mut SessionCandi
         match discovery.receiver.try_recv() {
             Ok(peer) => candidates.learn(peer, CandidateKind::Discovered),
             Err(mpsc::error::TryRecvError::Empty) => return,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                *run = None;
-                return;
-            }
+            // The terminal async poll owns the worker join; a closed channel alone
+            // does not mean that the producer's resources have been destroyed.
+            Err(mpsc::error::TryRecvError::Disconnected) => return,
         }
     }
 }
@@ -106,7 +107,7 @@ async fn next_discovery_peer(run: &mut Option<DiscoveryRun>) -> Option<SocketAdd
     let Some(discovery) = run.as_mut() else {
         return std::future::pending().await;
     };
-    let peer = discovery.receiver.recv().await;
+    let peer = discovery.next_candidate().await;
     if peer.is_none() {
         *run = None;
     }
@@ -141,13 +142,13 @@ use connect_diagnostics::{ConnectPhase, PeerConnectProgress, PeerConnectStats, P
 
 mod peer;
 #[cfg(test)]
-use peer::connect_upstream;
-#[cfg(test)]
 use peer::prefer_window;
 use peer::{
-    background_discovery_options, connect_pool, connect_upstream_with_policy, peer_worker,
-    pool_refill_candidates,
+    background_discovery_options, connect_pool_with_cancel, connect_upstream_with_policy,
+    peer_worker, pool_refill_candidates,
 };
+#[cfg(test)]
+use peer::{connect_pool, connect_upstream};
 mod continuity;
 #[cfg(test)]
 use continuity::prefetch_start;
@@ -159,15 +160,14 @@ use pool::follow_peer_pool_with_discovery;
 use pool::{activate_upstream_peer, recovery_channel_capacities, ActivationInputs};
 mod pool_support;
 #[cfg(test)]
-use pool_support::ready_buffer_snapshot;
-#[cfg(test)]
 use pool_support::spawn_learned_connects;
 use pool_support::*;
 use pool_support::{
     advance_pool_requests, drop_peer_runtime, finish_candidate_connect, harvest_stale_gossip,
-    observe_live_window, publish_live_stats, retransmit_stalled_requests, shutdown_peer_runtimes,
-    spawn_candidate_connects,
+    observe_live_window, publish_live_stats, retransmit_stalled_requests, spawn_candidate_connects,
 };
+#[cfg(test)]
+use pool_support::{ready_buffer_snapshot, shutdown_peer_runtimes};
 mod support;
 #[cfg(test)]
 use support::{
@@ -320,7 +320,37 @@ pub(super) async fn follow_live_session(
     .await;
 }
 
-async fn follow_live_session_with_run(session: LiveSessionInputs) {
+// Catch a polling panic while its enclosing owner still retains descendant handles.
+// No new task, allocation or dependency is needed for this unwind boundary.
+async fn catch_owned_panic<F: Future>(
+    future: F,
+) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Ready(result)) => std::task::Poll::Ready(Ok(result)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    })
+    .await
+}
+
+async fn follow_live_session_with_run(mut session: LiveSessionInputs) {
+    let mut discovery = session.initial_run.take();
+    let result = catch_owned_panic(follow_live_session_inner(session, &mut discovery)).await;
+    if let Some(run) = discovery.as_mut() {
+        run.shutdown().await;
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn follow_live_session_inner(
+    session: LiveSessionInputs,
+    rediscovery: &mut Option<DiscoveryRun>,
+) {
     let LiveSessionInputs {
         info,
         peers,
@@ -330,7 +360,7 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
         seed,
         discovery,
         reachability,
-        initial_run: mut rediscovery,
+        initial_run: _,
     } = session;
     let LiveCounters {
         peers: peer_count,
@@ -342,7 +372,10 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
     let (peers, reachability) = if seed.peer_policy.is_private() {
         // No inherited public discovery/cache may influence this private session.
         // The provider must also avoid constructing public work before this entrypoint.
-        drop(rediscovery.take());
+        if let Some(run) = rediscovery.as_mut() {
+            run.shutdown().await;
+        }
+        rediscovery.take();
         seed.warm_peers = WarmPeerCache::memory();
         (seed.peer_policy.endpoints(), None)
     } else {
@@ -388,7 +421,7 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
                 return;
             }
         }
-        drain_discovery(&mut rediscovery, &mut candidates);
+        drain_discovery(rediscovery, &mut candidates);
         let ready = candidates.eligible(Instant::now());
         let (sources, pex) = candidates.learned_counts();
         crate::alog!(
@@ -396,16 +429,18 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
             ready.len()
         );
         let resume = continuity.as_ref().map(Continuity::resume_cursor);
-        let mut upstreams = tokio::select! {
-            _ = tx.closed() => return,
-            connected = connect_pool(
-                info.infohash,
-                &mut candidates,
-                seed.live_recovery,
-                &mut rediscovery,
-                resume,
-            ) => connected,
-        };
+        let mut upstreams = connect_pool_with_cancel(
+            info.infohash,
+            &mut candidates,
+            seed.live_recovery,
+            rediscovery,
+            resume,
+            Some(&tx),
+        )
+        .await;
+        if tx.is_closed() {
+            return;
+        }
         if let Some(c) = &continuity {
             let mut usable = Vec::new();
             let mut stale = Vec::new();
@@ -451,7 +486,7 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
                 tokio::select! {
                     _=tx.closed()=>return,
                     _=tokio::time::sleep(delay)=>{},
-                    peer=next_discovery_peer(&mut rediscovery), if rediscovery.is_some()=> {
+                    peer=next_discovery_peer(rediscovery), if rediscovery.is_some()=> {
                         if let Some(peer)=peer {candidates.learn(peer,CandidateKind::Discovered);}
                     }
                 }
@@ -468,12 +503,12 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
                     options.peer_target,
                     options.dht_budget
                 );
-                rediscovery = Some(DiscoveryRun::start(&discovery, options));
+                *rediscovery = Some(DiscoveryRun::start(&discovery, options));
             }
             tokio::select! {
                 _=tx.closed()=>return,
                 _=tokio::time::sleep(delay)=>{},
-                peer=next_discovery_peer(&mut rediscovery)=> {
+                peer=next_discovery_peer(rediscovery)=> {
                     if let Some(peer)=peer {candidates.learn(peer,CandidateKind::Discovered);}
                 }
             }
@@ -508,9 +543,11 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
             upstreams.len()
         );
         peer_count.store(upstreams.len() as u32, Ordering::Relaxed);
-        let end = tokio::select! {
-            _ = tx.closed() => return,
-            end = follow_peer_pool_with_discovery(upstreams, pool::PoolContext {
+        // The pool owns cancellation and joins. Dropping it from an outer select
+        // would bypass its asynchronous worker finalization.
+        let end = follow_peer_pool_with_discovery(
+            upstreams,
+            pool::PoolContext {
                 info: &info,
                 identity: &identity,
                 chunks_per_piece,
@@ -527,10 +564,10 @@ async fn follow_live_session_with_run(session: LiveSessionInputs) {
                 candidates: &mut candidates,
                 peer_count: &peer_count,
                 reachability: reachability.as_ref(),
-                discovery_run: &mut rediscovery,
-            })
-        => end,
-        };
+                discovery_run: rediscovery,
+            },
+        )
+        .await;
         match end {
             FollowEnd::ConsumerGone => return,
             FollowEnd::PeerLost(lost) => {
@@ -588,6 +625,7 @@ enum PublicationStatus {
     Terminal(Result<crate::store::CompletePut, ()>),
 }
 pub(super) struct Continuity {
+    workers: WorkerOwnership,
     pending_output: std::collections::VecDeque<LiveOutput>,
     pending_credit: std::collections::VecDeque<Vec<Arc<OutputCredit>>>,
     resync_credit: Vec<(std::ops::Range<usize>, Arc<OutputCredit>)>,
@@ -658,7 +696,8 @@ type CandidateConnectCompletion = (SocketAddrV4, Option<PeerConnectFailure>, boo
 enum PoolWake {
     Output(Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>),
     Stats,
-    Activation(Result<ConnectedUpstream, SocketAddrV4>),
+    Activation(pool::activation::WriteResult),
+    WorkerCleanup,
     Reciprocal(Option<(u64, Option<crate::seed::protocol::PreparedReply>)>),
     Publication,
     Gossip(SessionCandidates),

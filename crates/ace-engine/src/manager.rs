@@ -18,6 +18,12 @@ use tokio::task::JoinHandle;
 /// A resolved VOD plus its last-access time (for idle expiry), keyed by `(network, id)`.
 type VodCacheEntry = (Arc<dyn VodContent>, Instant);
 type StreamKey = (String, String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopError {
+    CleanupUnconfirmed,
+}
+pub(crate) type FailedSources = Arc<StdMutex<Vec<Box<dyn TsSource>>>>;
+type StopCompletions = HashMap<StreamKey, Vec<watch::Receiver<bool>>>;
 
 #[derive(Default)]
 struct HlsLifecycleState {
@@ -126,7 +132,27 @@ pub(crate) struct WorkerControl {
     cleanup: tokio::sync::mpsc::UnboundedSender<CleanupJob>,
 }
 
+/// False plus a closed sender denotes failed/unknown cleanup, never completion.
+pub(crate) async fn wait_cleanup(completed: &mut watch::Receiver<bool>) -> bool {
+    loop {
+        if *completed.borrow_and_update() {
+            return true;
+        }
+        if completed.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
 impl WorkerControl {
+    pub(crate) fn cancellation_signal(&self) -> watch::Sender<bool> {
+        self.cancel.clone()
+    }
+
+    pub(crate) fn completion_receiver(&self) -> watch::Receiver<bool> {
+        self.completed.clone()
+    }
+
     fn cancel(&self) {
         self.cancel.send_replace(true);
     }
@@ -141,13 +167,9 @@ impl WorkerControl {
         }
     }
 
-    async fn join(mut self) {
+    async fn join(mut self) -> bool {
         self.transfer();
-        while !*self.completed.borrow_and_update() {
-            if self.completed.changed().await.is_err() {
-                break;
-            }
-        }
+        wait_cleanup(&mut self.completed).await
     }
 }
 
@@ -164,10 +186,47 @@ impl Drop for WorkerControl {
 #[derive(Default)]
 pub(crate) struct CleanupTracker {
     pending: StdMutex<Vec<watch::Receiver<bool>>>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    failed_sources: FailedSources,
     coordinator: StdMutex<Option<CleanupCoordinator>>,
 }
 
+/// Transfer a failed source intact; partial shutdown must not free its reservation.
+pub(crate) async fn shutdown_source(
+    mut source: Box<dyn TsSource>,
+    failed_sources: &FailedSources,
+) -> Result<(), Box<dyn std::any::Any + Send>> {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(source.shutdown())
+        .catch_unwind()
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(panic) => {
+            failed_sources.lock().unwrap().push(source);
+            crate::alog!(
+                "[session] source cleanup failed; reservation retained until manager destruction"
+            );
+            Err(panic)
+        }
+    }
+}
+
 impl CleanupTracker {
+    async fn dispose_source(&self, source: Box<dyn TsSource>) -> bool {
+        if shutdown_source(source, &self.failed_sources).await.is_err() {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn failed_sources(&self) -> FailedSources {
+        self.failed_sources.clone()
+    }
+
     fn coordinator(&self) -> tokio::sync::mpsc::UnboundedSender<CleanupJob> {
         use futures::future::BoxFuture;
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -176,6 +235,7 @@ impl CleanupTracker {
         coordinator
             .get_or_insert_with(|| {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CleanupJob>();
+                let failed = self.failed.clone();
                 let task = tokio::spawn(async move {
                     let mut joins: FuturesUnordered<BoxFuture<'static, ()>> =
                         FuturesUnordered::new();
@@ -183,10 +243,17 @@ impl CleanupTracker {
                     loop {
                         tokio::select! {
                             job = rx.recv(), if !closed => match job {
-                                Some(CleanupJob::Join(join, done)) => joins.push(Box::pin(async move {
-                                    let _ = join.await;
-                                    done.send_replace(true);
-                                })),
+                                Some(CleanupJob::Join(join, done)) => {
+                                    let failed = failed.clone();
+                                    joins.push(Box::pin(async move {
+                                        if join.await.is_ok() {
+                                            done.send_replace(true);
+                                        } else {
+                                            failed.store(true, std::sync::atomic::Ordering::Release);
+                                            crate::alog!("[session] owned worker failed; cleanup is unconfirmed");
+                                        }
+                                    }));
+                                },
                                 Some(CleanupJob::Close) => rx.close(),
                                 None => closed = true,
                             },
@@ -226,14 +293,13 @@ impl CleanupTracker {
         }
     }
 
-    pub(crate) async fn drain(&self) {
+    pub(crate) async fn drain(&self) -> bool {
         loop {
             let pending = self.pending.lock().unwrap().clone();
             for mut done in pending {
-                while !*done.borrow_and_update() {
-                    if done.changed().await.is_err() {
-                        break;
-                    }
+                if !wait_cleanup(&mut done).await {
+                    self.failed
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
             }
             let mut pending = self.pending.lock().unwrap();
@@ -254,6 +320,7 @@ impl CleanupTracker {
         if let Some(join) = join {
             join.await;
         }
+        !self.failed.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -261,6 +328,8 @@ pub struct StreamManager {
     registry: ProviderRegistry,
     admission: Arc<crate::admission::Admission>,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
+    // Completion handles only: never retain media or cancel a replacement generation.
+    stopping: StdMutex<StopCompletions>,
     packagers: Mutex<HashMap<(String, String), HlsEntry>>,
     /// Synchronous pending/cancellation bookkeeping so a dropped future cleans up in `Drop`.
     hls_transitions: Arc<StdMutex<HlsLifecycleState>>,
@@ -323,6 +392,7 @@ impl StreamManager {
             registry,
             admission: crate::admission::Admission::new(max_sessions),
             sessions: Mutex::new(HashMap::new()),
+            stopping: StdMutex::new(HashMap::new()),
             packagers: Mutex::new(HashMap::new()),
             hls_transitions: Arc::new(StdMutex::new(HlsLifecycleState::default())),
             hls_finalization: Mutex::new(()),
@@ -493,6 +563,40 @@ impl StreamManager {
         lock
     }
 
+    /// Keep initialization and its same-key lock owned after the caller is canceled.
+    async fn owned_live_start<T, F, Fut>(&self, key: StreamKey, run: F) -> Result<T, ProviderError>
+    where
+        T: Send + 'static,
+        F: FnOnce(watch::Receiver<bool>, HlsTransition) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, ProviderError>> + Send + 'static,
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let control = {
+            let _finalizing = self.hls_finalization.lock().await;
+            if self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(ProviderError::NotFound);
+            }
+            // Register the generation before the spawned task can first be polled.
+            // A stop after this public call becomes pending must already see it.
+            let transition = HlsTransition::begin(self.hls_transitions.clone(), key);
+            let mut control = self.cleanup.spawn(move |cancel| async move {
+                let result = run(cancel, transition).await;
+                let _ = sender.send(result);
+            });
+            // Completion must not depend on the HTTP caller polling its result again.
+            control.transfer();
+            control
+        };
+        let result = receiver
+            .await
+            .map_err(|_| ProviderError::Backend("live initializer failed".into()))?;
+        control.join().await;
+        result
+    }
+
     /// Get the running session for `(network, id)` or start one via the provider. Returns
     /// `NotFound` if the network is unregistered.
     pub async fn get_or_start(
@@ -501,14 +605,46 @@ impl StreamManager {
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
         self.check_openable(network, id)?;
-        let key = (network.to_string(), id.to_string());
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(ProviderError::NotFound);
         }
-        let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
+        if let Some(session) = self.sessions.lock().await.get(&(network.into(), id.into())) {
+            return Ok(session.clone());
+        }
+        let manager = self.clone();
+        let network = network.to_owned();
+        let id = id.to_owned();
+        self.owned_live_start(
+            (network.clone(), id.clone()),
+            move |cancel, transition| async move {
+                manager
+                    .get_or_start_owned(&network, &id, cancel, transition)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn get_or_start_owned(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+        mut cancel: watch::Receiver<bool>,
+        mut transition: HlsTransition,
+    ) -> Result<Arc<StreamSession>, ProviderError> {
+        self.check_openable(network, id)?;
+        let key = (network.to_string(), id.to_string());
+        if transition.is_cancelled()
+            || *cancel.borrow()
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map.get(&key) {
@@ -518,8 +654,13 @@ impl StreamManager {
         // Serialize same-key starts and re-check: direct and HLS callers share this lock, while
         // unrelated provider opens remain concurrent.
         let start_lock = self.session_start_lock(&key);
-        let _starting = start_lock.lock().await;
-        if transition.is_cancelled()
+        let _starting = tokio::select! {
+            biased;
+            _ = cancel.changed() => return Err(ProviderError::NotFound),
+            guard = start_lock.lock() => guard,
+        };
+        if *cancel.borrow()
+            || transition.is_cancelled()
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -539,14 +680,19 @@ impl StreamManager {
             _reservation: reservation,
         });
         let _finalizing = self.hls_finalization.lock().await;
-        if transition.finish()
+        if *cancel.borrow()
+            || transition.finish()
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
         {
+            drop(_finalizing);
+            if !self.cleanup.dispose_source(source).await {
+                return Err(ProviderError::Backend("source cleanup failed".into()));
+            }
             return Err(ProviderError::NotFound);
         }
-        let session = StreamSession::start(source, self.buffer);
+        let session = StreamSession::start_with_cleanup(source, self.buffer, &self.cleanup);
         let mut map = self.sessions.lock().await;
         Ok(map.entry(key).or_insert(session).clone())
     }
@@ -589,19 +735,48 @@ impl StreamManager {
         native: bool,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
         self.check_openable(network, id)?;
+        let manager = self.clone();
+        let network = network.to_owned();
+        let id = id.to_owned();
+        self.owned_live_start(
+            (network.clone(), id.clone()),
+            move |cancel, transition| async move {
+                manager
+                    .get_or_start_pinned_hls_owned(&network, &id, native, cancel, transition)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn get_or_start_pinned_hls_owned(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+        native: bool,
+        mut cancel: watch::Receiver<bool>,
+        mut transition: HlsTransition,
+    ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
+        self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
-        if self
-            .shutting_down
-            .load(std::sync::atomic::Ordering::Acquire)
+        if transition.is_cancelled()
+            || *cancel.borrow()
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(ProviderError::NotFound);
         }
-        let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
         let start_lock = self.session_start_lock(&key);
 
         // Serialize only starts for this key. Unrelated provider opens, reap, and stop proceed.
-        let _starting = start_lock.lock().await;
-        if transition.is_cancelled()
+        let _starting = tokio::select! {
+            biased;
+            _ = cancel.changed() => return Err(ProviderError::NotFound),
+            guard = start_lock.lock() => guard,
+        };
+        if *cancel.borrow()
+            || transition.is_cancelled()
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -623,11 +798,18 @@ impl StreamManager {
 
         // Finalization is atomic with reap/stop, but contains no provider or other long I/O.
         let _finalizing = self.hls_finalization.lock().await;
-        if transition.finish()
+        if *cancel.borrow()
+            || transition.finish()
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
         {
+            drop(_finalizing);
+            if let Some(source) = source.take() {
+                if !self.cleanup.dispose_source(source).await {
+                    return Err(ProviderError::Backend("source cleanup failed".into()));
+                }
+            }
             return Err(ProviderError::NotFound);
         }
 
@@ -636,11 +818,12 @@ impl StreamManager {
             if let Some(session) = sessions.get(&key) {
                 session.clone()
             } else {
-                let session = StreamSession::start(
+                let session = StreamSession::start_with_cleanup(
                     source
                         .take()
                         .expect("an absent HLS session must have an opened source"),
                     self.buffer,
+                    &self.cleanup,
                 );
                 sessions.insert(key.clone(), session.clone());
                 session
@@ -680,12 +863,38 @@ impl StreamManager {
             .map(|entry| entry.media.clone())
     }
 
+    fn record_stop(&self, key: &StreamKey, completion: watch::Receiver<bool>) {
+        let mut stopping = self.stopping.lock().unwrap();
+        Self::prune_stops(&mut stopping);
+        if !*completion.borrow() {
+            stopping.entry(key.clone()).or_default().push(completion);
+        }
+    }
+
+    fn prune_stops(stopping: &mut StopCompletions) {
+        stopping.retain(|_, completions| {
+            completions.retain(|done| !*done.borrow() && done.has_changed().is_ok());
+            !completions.is_empty()
+        });
+    }
+
+    fn stop_completions(&self, key: &StreamKey) -> Vec<watch::Receiver<bool>> {
+        let mut stopping = self.stopping.lock().unwrap();
+        Self::prune_stops(&mut stopping);
+        stopping.get(key).cloned().unwrap_or_default()
+    }
+
     /// Force-stop a session: remove it (and any HLS packager) so the shared download is torn
-    /// down — the session's `Drop` aborts its background pull task. Returns `true` if a session
-    /// for `(network, id)` existed. Connected clients see the stream end.
+    /// down through its owned cancellation and join, independent of retained media handles.
+    /// Returns `true` only if a session existed and cleanup was confirmed. Connected clients
+    /// see EOF before cleanup finishes. Use checked stop to distinguish absence from failure.
     pub async fn stop(&self, network: &str, id: &str) -> bool {
+        self.stop_checked(network, id).await.unwrap_or(false)
+    }
+
+    pub(crate) async fn stop_checked(&self, network: &str, id: &str) -> Result<bool, StopError> {
         let key = (network.to_string(), id.to_string());
-        let (entry, existed) = {
+        let (entry, session, completions) = {
             let _finalizing = self.hls_finalization.lock().await;
             {
                 let mut lifecycle = self.hls_transitions.lock().unwrap();
@@ -702,16 +911,34 @@ impl StreamManager {
             }
             let entry = self.packagers.lock().await.remove(&key);
             if let Some(entry) = &entry {
+                self.record_stop(&key, entry.control.completion_receiver());
                 entry.media.stop();
                 entry.control.cancel();
             }
-            let existed = self.sessions.lock().await.remove(&key).is_some();
-            (entry, existed)
+            let session = self.sessions.lock().await.remove(&key);
+            if let Some(session) = &session {
+                self.record_stop(&key, session.completion_receiver());
+                session.cancel();
+            }
+            (entry, session, self.stop_completions(&key))
         };
-        if let Some(entry) = entry {
-            entry.control.join().await;
+        let mut success = true;
+        let existed = session.is_some() || !completions.is_empty();
+        if let Some(session) = session {
+            success &= session.stop().await;
         }
-        existed
+        if let Some(entry) = entry {
+            success &= entry.control.join().await;
+        }
+        for mut completion in completions {
+            success &= wait_cleanup(&mut completion).await;
+        }
+        self.stop_completions(&key);
+        if success {
+            Ok(existed)
+        } else {
+            Err(StopError::CleanupUnconfirmed)
+        }
     }
 
     /// Active sessions as `(network, id, subscriber_count, metadata)`.
@@ -746,7 +973,7 @@ impl StreamManager {
         // Content destruction may release the final provider reservation; never do it
         // while holding the cache lock. Active handles/ranges retain their own owner.
         drop(expired);
-        let controls = {
+        let (controls, retired_sessions) = {
             let _finalizing = self.hls_finalization.lock().await;
             let pending_hls: HashSet<_> = self
                 .hls_transitions
@@ -765,13 +992,25 @@ impl StreamManager {
                     .collect()
             };
 
+            let mut retired_sessions = Vec::new();
             let retained_sessions: HashSet<_> = {
                 let mut sessions = self.sessions.lock().await;
-                sessions.retain(|key, session| {
-                    session.subscriber_count() > 0
-                        || active_hls.contains(key)
-                        || pending_hls.contains(key)
-                });
+                let expired: Vec<_> = sessions
+                    .iter()
+                    .filter(|(key, session)| {
+                        session.subscriber_count() == 0
+                            && !active_hls.contains(*key)
+                            && !pending_hls.contains(*key)
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in expired {
+                    if let Some(session) = sessions.remove(&key) {
+                        self.record_stop(&key, session.completion_receiver());
+                        session.cancel();
+                        retired_sessions.push(session);
+                    }
+                }
                 sessions.keys().cloned().collect()
             };
 
@@ -784,13 +1023,17 @@ impl StreamManager {
             let mut controls = Vec::new();
             for key in removed {
                 if let Some(entry) = entries.remove(&key) {
+                    self.record_stop(&key, entry.control.completion_receiver());
                     entry.media.stop();
                     entry.control.cancel();
                     controls.push(entry.control);
                 }
             }
-            controls
+            (controls, retired_sessions)
         };
+        for session in retired_sessions {
+            session.stop().await;
+        }
         for control in controls {
             control.join().await;
         }
@@ -824,8 +1067,11 @@ impl StreamManager {
     }
 
     /// Fence publication and transfer cancellation under locks; join outside every lifecycle lock.
-    pub async fn shutdown(&self) {
+    /// False means at least one owned cleanup failed; failed source owners remain retained.
+    pub async fn shutdown(&self) -> bool {
+        let mut success = true;
         let mut controls = Vec::new();
+        let mut sessions = Vec::new();
         {
             let _finalizing = self.hls_finalization.lock().await;
             self.shutting_down
@@ -840,13 +1086,27 @@ impl StreamManager {
                 entry.control.cancel();
             }
             controls.extend(entries.drain().map(|(_, entry)| entry.control));
-            self.sessions.lock().await.clear();
+            sessions.extend(
+                self.sessions
+                    .lock()
+                    .await
+                    .drain()
+                    .map(|(_, session)| session),
+            );
+            for session in &sessions {
+                session.cancel();
+            }
             self.vod_cache.lock().await.clear();
         }
-        for control in controls {
-            control.join().await;
+        for session in sessions {
+            success &= session.stop().await;
         }
-        self.cleanup.drain().await;
+        for control in controls {
+            success &= control.join().await;
+        }
+        success &= self.cleanup.drain().await;
+        self.stopping.lock().unwrap().clear();
+        success
     }
 }
 
@@ -1500,13 +1760,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_pending_refuses_before_provider_and_cancel_releases() {
+    async fn admission_pending_refuses_until_canceled_open_finishes() {
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(BlockingProvider {
             started: started.clone(),
-            release,
+            release: release.clone(),
         }));
         let m = StreamManager::with_session_limit(registry, 1);
         let pending = tokio::spawn({
@@ -1520,6 +1780,15 @@ mod tests {
         );
         pending.abort();
         let _ = pending.await;
+        assert_eq!(m.admission_status().0, 1);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while m.admission_status().0 != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(m.get_or_start("blocking", "fast").await.is_ok());
         m.shutdown().await;
     }
@@ -1751,8 +2020,12 @@ mod tests {
             })
         };
         started.notified().await;
-        manager.shutdown().await;
+        let mut shutting_down = Box::pin(manager.shutdown());
+        assert!(futures::poll!(shutting_down.as_mut()).is_pending());
         release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), shutting_down)
+            .await
+            .unwrap();
         assert!(initializing.await.unwrap().is_err());
         assert!(manager
             .get_hls("blocking", "shutdown-pending")
@@ -1968,8 +2241,16 @@ mod tests {
         start.abort();
         assert!(matches!(start.await, Err(error) if error.is_cancelled()));
 
+        // The canceled caller no longer destroys the provider's pending future.
+        // Complete that owned generation, then explicitly release the next one.
+        let replacement = tokio::spawn({
+            let m = m.clone();
+            async move { m.get_or_start_hls("blocking", "aborted").await }
+        });
         release.notify_one();
-        let pkg = m.get_or_start_hls("blocking", "aborted").await.unwrap();
+        started.notified().await;
+        release.notify_one();
+        let pkg = replacement.await.unwrap().unwrap();
         pkg.set_last_access_for_test(Instant::now() - m.grace - Duration::from_secs(1));
         m.reap_idle_at(Instant::now()).await;
 

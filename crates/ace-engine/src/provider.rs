@@ -60,6 +60,10 @@ pub type StatsHandle = Arc<dyn StatsReader>;
 pub trait TsSource: Send {
     /// Next contiguous MPEG-TS chunk, or None at end-of-stream.
     async fn next(&mut self) -> Option<Bytes>;
+    /// Finish owned background work before this source is destroyed. Stateful sources
+    /// and owning decorators override this; only stateless sources may use the no-op.
+    /// Pending cleanup retains ownership rather than treating a timeout as completion.
+    async fn shutdown(&mut self) {}
     /// Report a known gap immediately before the most recently returned chunk. Sources that
     /// recover by skipping unavailable media override this; ordinary sources stay contiguous.
     fn take_discontinuity(&mut self) -> bool {
