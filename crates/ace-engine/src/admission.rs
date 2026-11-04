@@ -55,6 +55,9 @@ impl TsSource for Source {
     async fn next(&mut self) -> Option<bytes::Bytes> {
         self.inner.next().await
     }
+    async fn shutdown(&mut self) {
+        self.inner.shutdown().await;
+    }
     fn take_discontinuity(&mut self) -> bool {
         self.inner.take_discontinuity()
     }

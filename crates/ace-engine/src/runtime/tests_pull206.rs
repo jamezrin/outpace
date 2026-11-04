@@ -862,3 +862,59 @@ async fn private_runtime_local_live_alias_delivers_authenticated_source_and_canc
         .all(|packet| packet[0] == 0x47));
     assert_eq!(manager.admission_status().0, 0);
 }
+
+#[tokio::test]
+async fn serving_shutdown_reports_manager_cleanup_failure() {
+    use crate::provider::{ProviderError, ProviderRegistry, SourceStats, StreamProvider, TsSource};
+    use async_trait::async_trait;
+    struct FailedSource;
+    #[async_trait]
+    impl TsSource for FailedSource {
+        async fn next(&mut self) -> Option<bytes::Bytes> {
+            std::future::pending().await
+        }
+        async fn shutdown(&mut self) {
+            panic!("synthetic daemon cleanup failure")
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+    struct Provider;
+    #[async_trait]
+    impl StreamProvider for Provider {
+        fn network(&self) -> &'static str {
+            "cleanup-test"
+        }
+        async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(FailedSource))
+        }
+    }
+    let dir = temp_dir();
+    let mut runtime = crate::runtime::build_runtime(serving_config(dir.clone(), false), vec![])
+        .await
+        .unwrap();
+    assert!(runtime.manager.shutdown().await);
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(Provider));
+    let manager = crate::manager::StreamManager::with_session_limit(registry, 1);
+    let held = manager
+        .get_or_start("cleanup-test", "synthetic")
+        .await
+        .unwrap();
+    runtime.manager = manager.clone();
+    let result = timeout(
+        Duration::from_secs(3),
+        crate::runtime::serve_http_until(runtime, async {}),
+    )
+    .await;
+    let occupancy = manager.admission_status().0;
+    drop(held);
+    drop(manager);
+    std::fs::remove_dir_all(dir).unwrap();
+    let error = result
+        .expect("bounded daemon cleanup")
+        .expect_err("daemon must not exit successfully after unconfirmed manager cleanup");
+    assert_eq!(error.to_string(), "stream manager cleanup failed");
+    assert_eq!(occupancy, 1);
+}

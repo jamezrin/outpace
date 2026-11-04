@@ -941,7 +941,7 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
         matches!(request, PeerMessage::Unknown { id: 6, .. }),
         "retained runtime must still serve real wire requests"
     );
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
 }
 
 #[tokio::test]

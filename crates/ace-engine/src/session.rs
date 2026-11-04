@@ -6,7 +6,7 @@ use ace_swarm::types::StreamMetadata;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
@@ -16,20 +16,22 @@ pub enum StreamEvent {
 
 /// A live session: pulls from one `TsSource` and broadcasts TS chunks to subscribers.
 pub struct StreamSession {
-    tx: broadcast::Sender<StreamEvent>,
+    tx: broadcast::WeakSender<StreamEvent>,
     subscribers: Arc<AtomicU64>,
     stats: Arc<Mutex<SourceStats>>,
     live_stats: Option<StatsHandle>,
     metadata: StreamMetadata,
-    /// The background pull task; aborted when the session is dropped (last `Arc` gone, e.g.
-    /// the manager's idle reaper or an explicit force-stop) so a live download doesn't keep
-    /// running headless.
-    pump: tokio::task::JoinHandle<()>,
+    control: std::sync::Mutex<Option<crate::manager::WorkerControl>>,
+    cancel: watch::Sender<bool>,
+    completed: watch::Receiver<bool>,
+    // Manager-created sessions share its cleanup owner. Standalone sessions retain
+    // a private owner, destroyed only after cancellation has transferred their join.
+    standalone_cleanup: Option<crate::manager::CleanupTracker>,
 }
 
 impl Drop for StreamSession {
     fn drop(&mut self) {
-        self.pump.abort();
+        self.cancel();
     }
 }
 
@@ -49,37 +51,109 @@ impl StreamSession {
     /// Start pulling from `source` in a background task, broadcasting chunks. The pump stops
     /// when the source ends. `buffer` is the broadcast backlog (how far a slow/late receiver
     /// may lag before it drops old chunks).
-    pub fn start(mut source: Box<dyn TsSource>, buffer: usize) -> Arc<StreamSession> {
+    pub fn start(source: Box<dyn TsSource>, buffer: usize) -> Arc<StreamSession> {
+        let cleanup = crate::manager::CleanupTracker::default();
+        let mut session = Self::start_with_cleanup(source, buffer, &cleanup);
+        Arc::get_mut(&mut session).unwrap().standalone_cleanup = Some(cleanup);
+        session
+    }
+
+    pub(crate) fn start_with_cleanup(
+        mut source: Box<dyn TsSource>,
+        buffer: usize,
+        cleanup: &crate::manager::CleanupTracker,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(buffer);
         let stats = Arc::new(Mutex::new(SourceStats::default()));
         let metadata = source.metadata();
         let live_stats = source.stats_handle();
-        let pump_tx = tx.clone();
+        // Media handles must not keep a completed source's output channel alive.
+        // The pump is the sole strong sender; late subscriptions observe EOF.
+        let weak_tx = tx.downgrade();
+        let pump_tx = tx;
         let pump_stats = stats.clone();
-        let pump = tokio::spawn(async move {
-            while let Some(chunk) = source.next().await {
-                *pump_stats.lock().await = source.stats();
-                if source.take_discontinuity() {
-                    let _ = pump_tx.send(StreamEvent::Discontinuity);
+        let failed_sources = cleanup.failed_sources();
+        let control = cleanup.spawn(move |mut cancel| async move {
+            use futures::FutureExt;
+            let pull_result = std::panic::AssertUnwindSafe(async {
+                loop {
+                    let chunk = tokio::select! {
+                        biased;
+                        _ = async {
+                            if *cancel.borrow_and_update() { return; }
+                            let _ = cancel.changed().await;
+                        } => break,
+                        chunk = source.next() => chunk,
+                    };
+                    let Some(chunk) = chunk else { break };
+                    if *cancel.borrow() {
+                        break;
+                    }
+                    *pump_stats.lock().await = source.stats();
+                    if *cancel.borrow() {
+                        break;
+                    }
+                    if source.take_discontinuity() {
+                        let _ = pump_tx.send(StreamEvent::Discontinuity);
+                    }
+                    // Err just means no live receivers right now; keep pulling (live).
+                    let _ = pump_tx.send(StreamEvent::Data(chunk));
                 }
-                // Err just means no live receivers right now; keep pulling (live).
-                let _ = pump_tx.send(StreamEvent::Data(chunk));
+            })
+            .catch_unwind()
+            .await;
+            // EOF is independent of potentially slow source cleanup. Published
+            // broadcast backlog remains drainable by existing receivers.
+            drop(pump_tx);
+            if let Err(panic) = crate::manager::shutdown_source(source, &failed_sources).await {
+                std::panic::resume_unwind(panic);
+            }
+            if pull_result.is_err() {
+                crate::alog!("[session] source pull failed; owned cleanup completed");
             }
         });
+        let cancel = control.cancellation_signal();
+        let completed = control.completion_receiver();
         Arc::new(StreamSession {
-            tx,
+            tx: weak_tx,
             subscribers: Arc::new(AtomicU64::new(0)),
             stats,
             live_stats,
             metadata,
-            pump,
+            control: std::sync::Mutex::new(Some(control)),
+            cancel,
+            completed,
+            standalone_cleanup: None,
         })
+    }
+
+    /// Fence new pump work and transfer its join synchronously, even if a later
+    /// asynchronous stop waiter is canceled or media handles remain alive.
+    pub(crate) fn cancel(&self) {
+        self.cancel.send_replace(true);
+        let control = self.control.lock().unwrap().take();
+        drop(control);
+    }
+
+    pub(crate) fn completion_receiver(&self) -> watch::Receiver<bool> {
+        self.completed.clone()
+    }
+
+    /// True only when owned source cleanup was confirmed.
+    pub async fn stop(&self) -> bool {
+        self.cancel();
+        let mut completed = self.completed.clone();
+        let mut success = crate::manager::wait_cleanup(&mut completed).await;
+        if let Some(cleanup) = &self.standalone_cleanup {
+            success &= cleanup.drain().await;
+        }
+        success
     }
 
     pub fn subscribe(&self) -> Subscription {
         self.subscribers.fetch_add(1, Ordering::SeqCst);
         Subscription {
-            rx: self.tx.subscribe(),
+            rx: self.raw_receiver(),
             count: self.subscribers.clone(),
         }
     }
@@ -91,7 +165,13 @@ impl StreamSession {
     /// A receiver that does NOT count as a client (used by internal consumers like the HLS
     /// packager, which must not pin the session open against idle teardown).
     pub fn raw_receiver(&self) -> broadcast::Receiver<StreamEvent> {
-        self.tx.subscribe()
+        if let Some(tx) = self.tx.upgrade() {
+            tx.subscribe()
+        } else {
+            let (tx, rx) = broadcast::channel(1);
+            drop(tx);
+            rx
+        }
     }
 
     pub async fn stats(&self) -> SourceStats {
@@ -112,6 +192,37 @@ mod tests {
     use crate::provider::StreamProvider;
     use crate::testprovider::TestProvider;
     use ace_swarm::types::StreamMetadata;
+
+    #[tokio::test]
+    async fn cancellation_while_stats_lock_is_pending_prevents_publication() {
+        struct ReadySource(Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl TsSource for ReadySource {
+            async fn next(&mut self) -> Option<Bytes> {
+                self.0.notify_one();
+                Some(Bytes::from_static(b"ready"))
+            }
+            fn stats(&self) -> SourceStats {
+                SourceStats::default()
+            }
+        }
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let session = StreamSession::start(Box::new(ReadySource(ready.clone())), 4);
+        // Current-thread execution takes this uncontended lock before the pump can run.
+        let held_stats = session.stats.lock().await;
+        let mut receiver = session.raw_receiver();
+        ready.notified().await;
+        session.cancel();
+        drop(held_stats);
+        session.stop().await;
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Closed)
+            ),
+            "chunk ready before cancellation was published after the stats await"
+        );
+    }
 
     #[tokio::test]
     async fn session_captures_source_metadata_before_pumping() {

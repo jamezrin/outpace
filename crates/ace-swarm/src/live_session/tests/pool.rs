@@ -233,7 +233,7 @@ async fn saturated_peer_enqueue_does_not_stall_the_live_pool_actor() {
     let worker_still_running = peers.get(&1).is_some_and(|peer| !peer.worker.is_finished());
     let a_worker_abort = peers.get(&1).unwrap().worker.abort_handle();
     let b_worker_abort = peers.get(&2).unwrap().worker.abort_handle();
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     let workers_reaped = tokio::time::timeout(Duration::from_secs(1), async {
         while !a_worker_abort.is_finished() || !b_worker_abort.is_finished() {
             tokio::task::yield_now().await;
@@ -465,7 +465,7 @@ async fn queue_credit_admits_a_default_256_piece_burst_across_worker_turns() {
     let queue_max_capacity = commands.max_capacity();
 
     let worker_abort = peers.get(&1).map(|peer| peer.worker.abort_handle());
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     let worker_reaped = if let Some(worker_abort) = worker_abort {
         tokio::time::timeout(Duration::from_secs(1), async {
             while !worker_abort.is_finished() {
@@ -689,7 +689,7 @@ async fn closed_peer_waits_for_synthetic_terminal_without_clearing_other_state()
         continuity.scheduler.in_flight_count(),
     );
 
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     drop(b_receiver);
     drop(events);
     let workers_reaped = tokio::time::timeout(Duration::from_secs(1), async {
@@ -908,7 +908,7 @@ async fn missing_lost_fallback_drains_bounded_prefix_while_healthy_events_contin
     let pending_pruned =
         poll_closed_peer_event(&peers, &mut event_rx, &mut closed_prefix).is_none();
 
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     drop(event_rx);
     drop(events);
     drop(a_server);
@@ -1013,7 +1013,7 @@ async fn reserved_event_permit_blocks_fallback_and_replacement_prunes_old_genera
     let stale_received = events.recv().await.unwrap();
     let stale_ignored = !stale_received.is_current(&peers);
 
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     drop(new_receiver);
     drop(events);
     drop(event_tx);
@@ -1269,7 +1269,7 @@ async fn queued_worker_message_remains_current_before_terminal_loss_is_drained()
     let fallback_retained_after_terminal = peers.contains_key(&3);
     let stale_source_removed_after_terminal = !peers.contains_key(&2);
 
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     worker_abort.abort();
     drop(stale_receiver);
     drop(fallback_receiver);
@@ -1503,7 +1503,7 @@ async fn another_verified_producer_suppresses_stale_source_refresh() {
     };
     let duplicate_is_stale = !stale_duplicate.is_current(&peers);
 
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     drop(producer_receiver);
     drop(stale_receiver);
     drop(continuing_receiver);
@@ -1659,7 +1659,7 @@ async fn a_send_full_marker_defers_loss_until_terminal_event() {
         && peer_count.load(Ordering::Relaxed) == 1;
     let pending_after_terminal = poll_closed_peer_event(&peers, &mut events, &mut closed_prefix);
 
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     drop(b_receiver);
     drop(events);
     let workers_reaped = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1816,7 +1816,7 @@ async fn a_send_closed_marker_defers_loss_until_terminal_event() {
         && !candidates.eligible(Instant::now()).contains(&a_addr)
         && peer_count.load(Ordering::Relaxed) == 1;
 
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     drop(b_receiver);
     drop(events);
     let workers_reaped = tokio::time::timeout(Duration::from_secs(1), async {
@@ -2063,7 +2063,7 @@ async fn saturated_send_enqueue_does_not_stall_other_peer_commands() {
     let b_runtime_retained = peers.contains_key(&2);
     let pending_pruned =
         poll_closed_peer_event(&peers, &mut event_rx, &mut closed_prefix).is_none();
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     let workers_reaped = tokio::time::timeout(Duration::from_secs(1), async {
         while !a_worker_abort.is_finished() || !b_worker_abort.is_finished() {
             tokio::task::yield_now().await;
@@ -2289,7 +2289,7 @@ async fn saturated_send_enqueue_completes_when_the_peer_resumes_reading() {
 
     let a_worker_abort = peers.get(&1).unwrap().worker.abort_handle();
     let b_worker_abort = peers.get(&2).unwrap().worker.abort_handle();
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     let workers_reaped = tokio::time::timeout(Duration::from_secs(1), async {
         while !a_worker_abort.is_finished() || !b_worker_abort.is_finished() {
             tokio::task::yield_now().await;
@@ -2465,7 +2465,7 @@ async fn timed_out_piece_retries_when_all_peer_slots_are_full() {
     let now = Instant::now() + policy.request_timeout();
     retransmit_stalled_requests(&mut peers, &mut c, 32, now).await;
     let retry = commands.try_recv();
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     assert!(
         matches!(retry, Ok(PeerCommand::RequestPiece { piece: 7, .. })),
         "timeout must queue a retry even when every peer was at capacity"
@@ -2499,7 +2499,7 @@ async fn timed_out_piece_still_prefers_a_peer_with_spare_capacity() {
     .await;
     let retry = faster.try_recv();
     let unexpected = original.try_recv();
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     assert!(matches!(
         retry,
         Ok(PeerCommand::RequestPiece { piece: 7, .. })
@@ -2558,7 +2558,7 @@ async fn rejected_piece_releases_duplicate_assignments_without_dropping_other_re
         advance_pool_requests(&mut peers, &mut c, 32).await;
         let retry = original.try_recv();
         let unexpected = rejecting.try_recv();
-        shutdown_peer_runtimes(&mut peers);
+        shutdown_peer_runtimes(&mut peers).await;
         assert!(matches!(
             retry,
             Ok(PeerCommand::RequestPiece { piece: 7, .. })
@@ -2638,7 +2638,7 @@ async fn timed_out_piece_without_eligible_peer_retries_on_unchoke_and_keeps_part
     c.set_peer_unchoked(1, true);
     advance_pool_requests(&mut peers, &mut c, 2).await;
     let retry = commands.try_recv();
-    shutdown_peer_runtimes(&mut peers);
+    shutdown_peer_runtimes(&mut peers).await;
     assert!(matches!(
         retry,
         Ok(PeerCommand::RequestPiece {
@@ -2842,4 +2842,81 @@ fn recovery_channel_capacities_are_checked() {
         ..LiveRecoveryConfig::default()
     };
     assert!(recovery_channel_capacities(invalid).is_err());
+}
+
+#[tokio::test]
+async fn terminal_peer_shutdown_finishes_worker_destruction_before_return() {
+    peer_destruction_at_pool_return(false).await;
+}
+
+#[tokio::test]
+async fn retired_peer_shutdown_finishes_worker_destruction_before_pool_return() {
+    peer_destruction_at_pool_return(true).await;
+}
+
+async fn peer_destruction_at_pool_return(retire_first: bool) {
+    struct WorkerDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for WorkerDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let destroyed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let worker = tokio::spawn({
+        let destroyed = destroyed.clone();
+        let started = started.clone();
+        async move {
+            let _guard = WorkerDrop(destroyed);
+            started.notify_one();
+            std::future::pending::<()>().await;
+        }
+    });
+    let abort = worker.abort_handle();
+    started.notified().await;
+    let (commands, _) = mpsc::channel(1);
+    let mut peers = BTreeMap::from([(
+        1,
+        PeerRuntime {
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            min_piece: 1,
+            max_piece: 2,
+            unchoked_peer: false,
+            produced_output: false,
+            seen_ids: HashSet::new(),
+            commands,
+            worker,
+        },
+    )]);
+    let (mut continuity, _) = Continuity::fresh(
+        &info(),
+        1,
+        2,
+        PREFETCH_PIECES,
+        LiveRecoveryConfig::default(),
+    );
+    continuity.register_active_peer(1, "127.0.0.1:1234".parse().unwrap(), live_pos(1, 2));
+    let retired = retire_first && drop_peer_runtime(1, &mut peers, &mut continuity).is_some();
+    pool_support::shutdown_peer_pool(&mut peers, &mut continuity).await;
+    // Current-thread scheduling makes this a task-lifetime witness, not a latency test.
+    let destruction_at_return = destroyed.load(Ordering::SeqCst);
+    let cleanup = tokio::time::timeout(Duration::from_secs(1), async {
+        while !abort.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        cleanup.is_ok() && destroyed.load(Ordering::SeqCst),
+        "fixture task did not finish"
+    );
+    assert!(peers.is_empty());
+    assert_eq!(
+        retired, retire_first,
+        "fixture must traverse actual retirement"
+    );
+    assert!(
+        destruction_at_return,
+        "shutdown returned after requesting abort but before worker destruction"
+    );
 }

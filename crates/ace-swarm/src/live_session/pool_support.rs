@@ -563,15 +563,37 @@ pub(super) fn drop_peer_runtime(
     for piece in continuity.active_peers.remove(peer_id) {
         continuity.scheduler.on_drop(piece);
     }
-    let _ = peer.commands.try_send(PeerCommand::Stop);
-    peer.worker.abort();
-    Some(peer.addr)
+    let addr = peer.addr;
+    continuity.workers.retire(peer_id, peer);
+    Some(addr)
 }
 
-pub(super) fn shutdown_peer_runtimes(peers: &mut BTreeMap<u64, PeerRuntime>) {
-    for (_, peer) in std::mem::take(peers) {
+pub(super) async fn shutdown_current_workers(
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+    continuity: &mut Continuity,
+) {
+    shutdown_peer_runtimes(peers).await;
+    continuity.workers.release_joined_current();
+}
+
+pub(super) async fn shutdown_peer_pool(
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+    continuity: &mut Continuity,
+) {
+    shutdown_current_workers(peers, continuity).await;
+    continuity.workers.finish_retired().await;
+}
+
+pub(super) async fn shutdown_peer_runtimes(peers: &mut BTreeMap<u64, PeerRuntime>) {
+    let mut stopped = std::mem::take(peers);
+    // Cancel every worker before waiting for any one of them. Retain each handle
+    // until Tokio has completed destruction of that worker's owned IO and state.
+    for peer in stopped.values() {
         let _ = peer.commands.try_send(PeerCommand::Stop);
         peer.worker.abort();
+    }
+    for peer in stopped.values_mut() {
+        let _ = (&mut peer.worker).await;
     }
 }
 

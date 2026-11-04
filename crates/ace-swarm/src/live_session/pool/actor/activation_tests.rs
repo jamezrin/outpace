@@ -175,8 +175,12 @@ async fn activation_obsolete_completion_preserves_current_peers_and_counters() {
             addr,
             peer_id: 3,
             replacement: target,
-            write: activation::prepare(
-                3,
+            write: activation::prepare_with_policy(
+                activation::Start {
+                    peer_id: 3,
+                    cursor: 0,
+                    head: 10,
+                },
                 ConnectedUpstream {
                     session: PeerSession::new(socket),
                     addr,
@@ -184,10 +188,10 @@ async fn activation_obsolete_completion_preserves_current_peers_and_counters() {
                     unchoked: false,
                     yourip: None,
                 },
-                0,
-                10,
                 actor.identity,
                 None,
+                actor.candidates.policy(),
+                actor.continuity.workers.admission(),
             ),
         });
         let pending =
@@ -426,4 +430,200 @@ async fn activation_obsolete_completion_preserves_current_peers_and_counters() {
         _worker1.await.unwrap();
         _worker2.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn full_worker_budget_keeps_healthy_control_and_cancellation_responsive() {
+    use tokio::io::AsyncReadExt;
+    let info = StreamInfo {
+        protection: None,
+        infohash: [0; 20],
+        piece_length: 4,
+        chunk_length: 2,
+        trackers: vec![],
+        metadata: Default::default(),
+        sig_len: 0,
+        source_pubkey: vec![],
+    };
+    let policy = LiveRecoveryConfig {
+        max_active_upstreams: 1,
+        max_parallel_connect: 1,
+        ..Default::default()
+    };
+    let seed = SeedConfig {
+        peer_policy: Default::default(),
+        metrics: None,
+        registry: SeedRegistry::new(),
+        store_factory: test_store_factory(4096, None),
+        enabled: true,
+        prefetch_pieces: 1,
+        live_recovery: policy,
+        warm_peers: WarmPeerCache::memory(),
+    };
+    let identity = Identity::generate();
+    let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(4, 2, 4096)));
+    let (tx, output) = mpsc::channel(1);
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let uploaded = Arc::new(AtomicU64::new(0));
+    let served = Arc::new(AtomicU32::new(0));
+    let count = Arc::new(AtomicU32::new(1));
+    let (mut continuity, _) = Continuity::fresh(&info, 7, 8, 1, policy);
+    continuity.emitted = 1;
+    let admission = continuity.workers.admission();
+    // Hold the real capacity owner full; no payload or fake viewer is involved.
+    let slots = [
+        admission.clone().acquire().await,
+        admission.clone().acquire().await,
+    ];
+    let mut candidates = SessionCandidates::default();
+    let mut discovery = None;
+    let (events, event_rx) = mpsc::channel(128);
+    let (pex_tx, refill_rx) = mpsc::channel(2);
+    let (mut healthy, mut commands, witness) = runtime(1);
+    healthy.min_piece = 7;
+    healthy.max_piece = 8;
+    let healthy_addr = healthy.addr;
+    continuity.register_active_peer(
+        1,
+        healthy_addr,
+        WireLivePosition {
+            min_piece: 7,
+            max_piece: 8,
+            position: 7,
+            distance_from_source: 1,
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let (mut remote, _) = listener.accept().await.unwrap();
+    let write = activation::prepare_with_policy(
+        activation::Start {
+            peer_id: 2,
+            cursor: 7,
+            head: 8,
+        },
+        ConnectedUpstream {
+            session: PeerSession::new(socket),
+            addr,
+            window: WireLivePosition {
+                min_piece: 7,
+                max_piece: 8,
+                position: 7,
+                distance_from_source: 1,
+            },
+            unchoked: false,
+            yourip: None,
+        },
+        &identity,
+        None,
+        &seed.peer_policy,
+        admission,
+    );
+    let mut actor = PoolActor {
+        output_reservation: None,
+        activation: Some(activation::Activation {
+            addr,
+            peer_id: 2,
+            replacement: None,
+            write,
+        }),
+        reciprocal: Default::default(),
+        publication: None,
+        gossip: None,
+        closed_peer_events: BTreeMap::new(),
+        observed_retry: Instant::now(),
+        observed_capacity: (1, 0),
+        refill_closed: true,
+        next_peer_id: 3,
+        loss_count: 0,
+        peers: BTreeMap::from([(1, healthy)]),
+        learned_pending: HashSet::new(),
+        learned_connects: tokio::task::JoinSet::new(),
+        pex_tx,
+        refill_rx,
+        event_rx,
+        event_tx: events.clone(),
+        _stats_guard: LiveStatsGuard(None),
+        live_recovery: policy,
+        info: &info,
+        identity: &identity,
+        chunks_per_piece: 2,
+        tx: &tx,
+        downloaded: &downloaded,
+        uploaded: &uploaded,
+        peers_served: &served,
+        seed: &seed,
+        store: &store,
+        candidates: &mut candidates,
+        peer_count: &count,
+        reachability: None,
+        discovery_run: &mut discovery,
+        continuity: &mut continuity,
+    };
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let activation = crate::live_session::worker_ownership::WAITING_WORKER_SLOT
+        .scope(
+            waiting.clone(),
+            std::future::poll_fn(|cx| std::task::Poll::Ready(actor.poll_activation(cx))),
+        )
+        .await;
+    let activation_pending = activation.is_none();
+    if let Some(result) = activation {
+        actor.finish_activation(result).await;
+    }
+    let mut notification = std::pin::pin!(waiting.notified());
+    let waiting_observed = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(notification.as_mut().poll(cx).is_ready())
+    })
+    .await;
+    events
+        .send(PeerEvent::Message {
+            peer_id: 1,
+            addr: healthy_addr,
+            msg: PeerMessage::Unchoke,
+        })
+        .await
+        .unwrap();
+    let mut running = Box::pin(actor.run());
+    let command = tokio::time::timeout(Duration::from_millis(250), async {
+        tokio::select! { _ = &mut running => None, command = commands.recv() => command }
+    })
+    .await;
+    drop(output);
+    let joined = tokio::time::timeout(Duration::from_secs(1), running).await;
+    drop(slots);
+    let witness = tokio::time::timeout(Duration::from_secs(1), witness).await;
+    let mut candidate_bytes = Vec::new();
+    let candidate_closed = tokio::time::timeout(
+        Duration::from_secs(1),
+        remote.read_to_end(&mut candidate_bytes),
+    )
+    .await;
+    assert!(
+        activation_pending && waiting_observed,
+        "activation did not reach the real exhausted worker-slot wait"
+    );
+    assert!(
+        matches!(command, Ok(Some(PeerCommand::RequestPiece { .. }))),
+        "healthy peer control stalled: {command:?}"
+    );
+    assert!(
+        matches!(joined, Ok(FollowEnd::ConsumerGone)),
+        "consumer close stalled under worker backpressure"
+    );
+    assert!(
+        matches!(witness, Ok(Ok(()))),
+        "healthy fixture worker survived cancellation"
+    );
+    assert!(
+        matches!(candidate_closed, Ok(Ok(0))),
+        "pending candidate socket did not close cleanly"
+    );
+    assert!(
+        candidate_bytes.is_empty(),
+        "activation wrote before obtaining worker ownership"
+    );
 }

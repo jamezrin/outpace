@@ -2003,10 +2003,17 @@ async fn exact_initial_discovery_deadline_rejects_candidate_ready_before_repoll(
         None => false,
     };
     let result = futures::poll!(open.as_mut());
-    let exact_expiry_rejected = matches!(result, std::task::Poll::Ready(Err(_)));
     let channel_closed = second_sender
         .as_ref()
         .is_some_and(|sender| sender.is_closed());
+    // Selection closes at the exact boundary; returning the error may now wait
+    // for the canceled discovery task's destructor and join to complete.
+    let exact_expiry_rejected = match result {
+        std::task::Poll::Ready(result) => result.is_err(),
+        std::task::Poll::Pending => tokio::time::timeout(Duration::from_secs(1), open.as_mut())
+            .await
+            .is_ok_and(|result| result.is_err()),
+    };
     drop(open);
     let second_dropped = tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
         .await
@@ -3797,4 +3804,50 @@ async fn late_initial_candidate_waits_for_full_connection_capacity() {
 #[tokio::test]
 async fn dropping_initial_connect_cancels_attempts_and_discovery() {
     initial_silent_candidate_control(1, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_discovery_timeout_joins_worker_before_returning_error() {
+    struct Exit(Arc<AtomicBool>);
+    impl Drop for Exit {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let discovery: PeerDiscovery = {
+        let destroyed = destroyed.clone();
+        let entered = entered.clone();
+        Arc::new(move |_, sender| {
+            let exit = Exit(destroyed.clone());
+            let entered = entered.clone();
+            Box::pin(async move {
+                let _sender = sender;
+                let _exit = exit;
+                entered.notify_one();
+                std::future::pending::<()>().await;
+            })
+        })
+    };
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let mut opening = Box::pin(provider.open_resolved("synthetic", info(), discovery));
+    assert!(futures::poll!(opening.as_mut()).is_pending());
+    entered.notified().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let result = opening.await;
+    let destroyed_at_return = destroyed.load(Ordering::SeqCst);
+    // Drive the old abort-only fallback to completion before asserting the new contract.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !destroyed.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    assert!(
+        destroyed_at_return,
+        "discovery timeout released the source-opening owner before worker destruction"
+    );
 }

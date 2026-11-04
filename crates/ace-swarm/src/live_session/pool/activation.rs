@@ -1,6 +1,15 @@
 use super::*;
 use std::{future::Future, pin::Pin};
-pub(super) type WriteResult = Result<ConnectedUpstream, SocketAddrV4>;
+pub(in crate::live_session) struct Prepared {
+    pub upstream: ConnectedUpstream,
+    pub permit: WorkerPermit,
+}
+pub(super) struct Start {
+    pub peer_id: u64,
+    pub cursor: u64,
+    pub head: u64,
+}
+pub(in crate::live_session) type WriteResult = Result<Prepared, SocketAddrV4>;
 pub(super) type WriteJob = Pin<Box<dyn Future<Output = WriteResult> + Send>>;
 pub(super) struct Activation {
     pub addr: SocketAddrV4,
@@ -18,24 +27,31 @@ pub(super) fn prepare(
     reachability: Option<&Arc<ReachabilityMonitor>>,
 ) -> WriteJob {
     prepare_with_policy(
-        peer_id,
+        Start {
+            peer_id,
+            cursor: start,
+            head,
+        },
         upstream,
-        start,
-        head,
         identity,
         reachability,
         &Default::default(),
+        WorkerOwnership::new(1).admission(),
     )
 }
 pub(super) fn prepare_with_policy(
-    peer_id: u64,
+    start: Start,
     mut upstream: ConnectedUpstream,
-    start: u64,
-    head: u64,
     identity: &Identity,
     reachability: Option<&Arc<ReachabilityMonitor>>,
     policy: &crate::peer_policy::PeerPolicy,
+    admission: WorkerAdmission,
 ) -> WriteJob {
+    let Start {
+        peer_id,
+        cursor: start,
+        head,
+    } = start;
     // Observe the already-received echo exactly once, before any write can fail
     // or be cancelled. The returned future owns no observer/identity borrow.
     if let (Some(monitor), Some(ip)) = (reachability, upstream.yourip) {
@@ -62,6 +78,7 @@ pub(super) fn prepare_with_policy(
         payload: hs.sign_and_encode(identity),
     };
     Box::pin(async move {
+        let permit = admission.acquire().await;
         #[cfg(test)]
         let observed_addr = upstream.addr;
         let write = async {
@@ -87,7 +104,7 @@ pub(super) fn prepare_with_policy(
         if write.await.is_err() {
             return Err(upstream.addr);
         }
-        Ok(upstream)
+        Ok(Prepared { upstream, permit })
     })
 }
 
@@ -198,7 +215,18 @@ async fn private_activation_and_gossip_wire_do_not_advertise_inbound_port() {
                     let (_, payload) = tokio::join!(job, capture);
                     payload
                 } else {
-                    let job = prepare_with_policy(1, upstream, 1, 2, &identity, None, &policy);
+                    let job = prepare_with_policy(
+                        Start {
+                            peer_id: 1,
+                            cursor: 1,
+                            head: 2,
+                        },
+                        upstream,
+                        &identity,
+                        None,
+                        &policy,
+                        WorkerOwnership::new(1).admission(),
+                    );
                     let (written, payload) = tokio::join!(job, capture);
                     drop(written.unwrap());
                     payload

@@ -371,6 +371,10 @@ impl TsSource for StartupBufferedSource {
         }
     }
 
+    async fn shutdown(&mut self) {
+        self.inner.shutdown().await;
+    }
+
     fn take_discontinuity(&mut self) -> bool {
         if self.reservoir.phase == Phase::Released {
             self.inner.take_discontinuity()

@@ -121,7 +121,12 @@ impl StreamProvider for ChanneledProvider {
 #[async_trait]
 impl TsSource for GeneratedSource {
     async fn next(&mut self) -> Option<Bytes> {
-        self.data.take()
+        match self.data.take() {
+            Some(data) => Some(data),
+            // These are live HLS fixtures. Keep their source open after the
+            // finite generated payload until the manager explicitly cancels it.
+            None => std::future::pending().await,
+        }
     }
     fn stats(&self) -> SourceStats {
         SourceStats::default()
@@ -145,6 +150,22 @@ impl StreamProvider for GeneratedProvider {
             },
         }))
     }
+}
+
+#[tokio::test]
+async fn generated_live_fixture_waits_after_its_payload() {
+    let mut source = GeneratedSource {
+        data: Some(Bytes::from_static(b"synthetic")),
+        metadata: Default::default(),
+    };
+    assert_eq!(
+        source.next().await.unwrap(),
+        Bytes::from_static(b"synthetic")
+    );
+    assert!(
+        futures::poll!(source.next()).is_pending(),
+        "live fixture must not synthesize EOF before explicit cancellation"
+    );
 }
 
 fn opted_in() -> bool {

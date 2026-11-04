@@ -191,13 +191,25 @@ impl StatsReader for LiveMetrics {
 }
 
 pub(crate) struct MetricsSampler {
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
     metrics: Arc<LiveMetrics>,
+}
+impl MetricsSampler {
+    pub(crate) async fn shutdown(&mut self) {
+        if let Some(task) = self.task.as_mut() {
+            task.abort();
+            let _ = task.await;
+            self.task.take();
+            self.metrics.sample();
+        }
+    }
 }
 impl Drop for MetricsSampler {
     fn drop(&mut self) {
-        self.metrics.sample();
-        self.task.abort();
+        if let Some(task) = &self.task {
+            self.metrics.sample();
+            task.abort();
+        }
     }
 }
 pub(crate) fn spawn_sampler(metrics: Arc<LiveMetrics>) -> MetricsSampler {
@@ -210,12 +222,35 @@ pub(crate) fn spawn_sampler(metrics: Arc<LiveMetrics>) -> MetricsSampler {
             worker.sample();
         }
     });
-    MetricsSampler { task, metrics }
+    MetricsSampler {
+        task: Some(task),
+        metrics,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sampler_shutdown_joins_and_is_idempotent() {
+        let metrics = LiveMetrics::new(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        );
+        let mut sampler = spawn_sampler(metrics);
+        let task = sampler.task.as_ref().unwrap().abort_handle();
+        sampler.shutdown().await;
+        assert!(
+            task.is_finished(),
+            "sampler returned with its task still alive"
+        );
+        assert!(sampler.task.is_none());
+        sampler.shutdown().await;
+    }
 
     #[test]
     fn live_observer_adapter_preserves_history_and_counters() {

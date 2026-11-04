@@ -116,7 +116,8 @@ async fn buffered_provider(config: StartupBufferConfig) -> Box<dyn TsSource> {
     drop(tx);
     let source = Box::new(AceSource {
         metrics: None,
-        _sampler: None,
+        sampler: None,
+        worker: None,
         rx,
         discontinuity: false,
         peers: Arc::new(AtomicU32::new(0)),

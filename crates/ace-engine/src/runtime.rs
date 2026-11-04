@@ -821,7 +821,10 @@ pub(crate) async fn serve_http_until(
     broadcasts.close_admissions();
     let cleanup = broadcasts.shutdown().await;
     // Both listener/startup errors and normal HTTP draining must finish HLS cleanup.
-    manager.shutdown().await;
+    let manager_cleanup = manager.shutdown().await;
+    if !manager_cleanup {
+        crate::alog!("[runtime] stream manager cleanup failed");
+    }
     match (result, cleanup) {
         (Err(error), cleanup) => {
             if let Err(cleanup) = cleanup {
@@ -830,6 +833,9 @@ pub(crate) async fn serve_http_until(
             Err(error)
         }
         (Ok(()), Err(error)) => Err(Box::new(error)),
+        (Ok(()), Ok(())) if !manager_cleanup => Err(Box::new(std::io::Error::other(
+            "stream manager cleanup failed",
+        ))),
         (Ok(()), Ok(())) => Ok(()),
     }
 }

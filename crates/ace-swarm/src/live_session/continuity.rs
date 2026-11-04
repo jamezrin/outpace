@@ -124,6 +124,15 @@ impl Continuity {
         let output_clock = OutputBudgetClock::new(now);
         (
             Continuity {
+                workers: WorkerOwnership::new(
+                    live_recovery
+                        .max_active_upstreams
+                        .saturating_add(live_recovery.max_parallel_connect)
+                        .clamp(
+                            1,
+                            MAX_LIVE_RECOVERY_ACTIVE_UPSTREAMS + MAX_LIVE_RECOVERY_PARALLEL_CONNECT,
+                        ),
+                ),
                 pending_output: Default::default(),
                 pending_credit: Default::default(),
                 resync_credit: Vec::new(),

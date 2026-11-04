@@ -179,6 +179,7 @@ pub(super) fn background_discovery_options() -> DiscoveryOptions {
 /// Finish an exploration cohort before retrying more explored peers, so fast but
 /// unproductive sources cannot repeatedly cancel an untouched alternative. Each address
 /// is attempted at most once per round; failed attempts retain their normal cooldown.
+#[cfg(test)]
 pub(super) async fn connect_pool(
     infohash: [u8; 20],
     candidates: &mut SessionCandidates,
@@ -186,9 +187,23 @@ pub(super) async fn connect_pool(
     discovery: &mut Option<DiscoveryRun>,
     resume: Option<ResumeCursor>,
 ) -> Vec<ConnectedUpstream> {
+    connect_pool_with_cancel(infohash, candidates, live_recovery, discovery, resume, None).await
+}
+
+pub(super) async fn connect_pool_with_cancel(
+    infohash: [u8; 20],
+    candidates: &mut SessionCandidates,
+    live_recovery: LiveRecoveryConfig,
+    discovery: &mut Option<DiscoveryRun>,
+    resume: Option<ResumeCursor>,
+    output: Option<&mpsc::Sender<LiveOutput>>,
+) -> Vec<ConnectedUpstream> {
     let mut attempted = HashSet::new();
     let mut stats = PeerConnectStats::default();
     loop {
+        if output.is_some_and(mpsc::Sender::is_closed) {
+            return Vec::new();
+        }
         drain_discovery(discovery, candidates);
         let Some(cohort) = candidates
             .eligible(Instant::now())
@@ -201,6 +216,7 @@ pub(super) async fn connect_pool(
         let mut set = tokio::task::JoinSet::new();
         let mut connected: Vec<ConnectedUpstream> = Vec::new();
         let mut deadline = None;
+        let mut canceled = false;
         loop {
             drain_discovery(discovery, candidates);
             // New, less-explored addresses may join this cohort. Already pending
@@ -210,17 +226,29 @@ pub(super) async fn connect_pool(
                     break;
                 }
                 if candidates.explorations(addr) <= cohort && attempted.insert(addr) {
-                    set.spawn(connect_upstream_with_policy(
-                        addr,
-                        infohash,
-                        candidates.policy().clone(),
-                    ));
+                    let attempt =
+                        connect_upstream_with_policy(addr, infohash, candidates.policy().clone());
+                    #[cfg(test)]
+                    let lifetime = worker_ownership::lifetime_probe::capture_connect();
+                    #[cfg(test)]
+                    set.spawn(async move {
+                        let _lifetime = lifetime;
+                        attempt.await
+                    });
+                    #[cfg(not(test))]
+                    set.spawn(attempt);
                 }
             }
             if set.is_empty() || connected.len() >= live_recovery.max_active_upstreams {
                 break;
             }
             tokio::select! {
+                _ = async {
+                    match output {
+                        Some(output) => output.closed().await,
+                        None => std::future::pending().await,
+                    }
+                } => { canceled = true; break; },
                 _ = async {
                     match deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -260,6 +288,13 @@ pub(super) async fn connect_pool(
                 }
             }
         }
+        // Abort is only a request. Keep the entire cohort owned until every
+        // attempt future (including its socket) has actually been destroyed.
+        set.abort_all();
+        while set.join_next().await.is_some() {}
+        if canceled {
+            return Vec::new();
+        }
         if connected.is_empty() {
             continue;
         }
@@ -276,8 +311,7 @@ pub(super) async fn connect_pool(
         if stats.has_observations() {
             crate::alog!("[ace] initial upstream selection: {}", stats.summary());
         }
-        // Dropping `set` aborts attempts beyond the selected pool. The caller's
-        // cancellation branch drops this entire future and its pending attempts.
+        // The non-selected attempt cohort has been joined before publication.
         return connected;
     }
     if stats.has_observations() {

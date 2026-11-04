@@ -1024,3 +1024,64 @@ async fn admission_http_native_live_hls_vod_return_503_retry_after() {
     drop(held);
     state.manager.shutdown().await;
 }
+
+#[tokio::test]
+async fn native_delete_reports_unconfirmed_cleanup_as_server_error() {
+    struct FailedSource;
+    #[async_trait]
+    impl TsSource for FailedSource {
+        async fn next(&mut self) -> Option<Bytes> {
+            std::future::pending().await
+        }
+        async fn shutdown(&mut self) {
+            panic!("synthetic private cleanup detail")
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+    struct FailedProvider;
+    #[async_trait]
+    impl StreamProvider for FailedProvider {
+        fn network(&self) -> &'static str {
+            "cleanup-test"
+        }
+        async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(FailedSource))
+        }
+    }
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(FailedProvider));
+    let mut state = state();
+    state.manager = StreamManager::with_session_limit(registry, 1);
+    state.networks = vec!["cleanup-test".into()];
+    let manager = state.manager.clone();
+    let held = manager
+        .get_or_start("cleanup-test", "synthetic")
+        .await
+        .unwrap();
+    let response = router(state)
+        .oneshot(
+            Request::delete("/streams/cleanup-test/synthetic.ts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let occupancy = manager.admission_status().0;
+    let shutdown = manager.shutdown().await;
+    drop(held);
+    drop(manager);
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "cleanup failure is not a missing session"
+    );
+    assert_eq!(&body[..], b"stream cleanup failed");
+    assert_eq!(occupancy, 1);
+    assert!(!shutdown);
+}

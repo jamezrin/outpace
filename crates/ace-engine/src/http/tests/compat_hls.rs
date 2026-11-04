@@ -368,25 +368,14 @@ async fn ace_hls_capacity_eviction_cancels_a_stalled_playlist_wait_with_404() {
     let state = stalled_hls_state_with(Duration::from_secs(60), 1);
     let app = router(state.clone());
     let (playback_id, manifest, _) = mint_stalled_hls(&app, first_id).await;
-    let manager = state.manager.clone();
     let request = spawn_stalled_hls_request(state.clone(), playback_id, manifest);
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(
         !request.is_finished(),
         "playlist request must be waiting for readiness"
     );
-    let (_, key, _, _) = manager.list().await.into_iter().next().unwrap();
-    let pkg = manager.get_hls("stalled", &key).await.unwrap();
-    pkg.begin_generation(
-        crate::hls::GenerationId(1),
-        tokio::time::Instant::now() + Duration::from_secs(5),
-        false,
-    );
-    pkg.fail_generation(
-        crate::hls::GenerationId(1),
-        crate::hls::HlsFailure::ChildExit,
-    );
-
+    // Keep readiness pending until lease eviction. Injecting a terminal failure here
+    // independently permits a 503 before the second lease has been minted.
     let _newer_lease = mint_stalled_hls(&app, second_id).await;
     let response = tokio::time::timeout(Duration::from_millis(100), request)
         .await
