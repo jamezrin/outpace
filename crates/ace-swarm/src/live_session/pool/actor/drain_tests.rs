@@ -22,6 +22,7 @@ async fn peerless_drain_survives_cancel_between_segments_and_closes_promptly() {
         source_pubkey: vec![],
     };
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: None,
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),
@@ -132,6 +133,7 @@ async fn peerless_publication_before_extraction_and_withheld_does_not_complete_f
         source_pubkey: vec![],
     };
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: None,
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),
@@ -183,6 +185,7 @@ async fn peerless_cancel_before_extract_preserves_wire_and_older_pending_bypasse
         source_pubkey: vec![],
     };
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: None,
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),

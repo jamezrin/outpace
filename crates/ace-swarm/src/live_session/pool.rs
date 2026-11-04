@@ -40,8 +40,15 @@ pub(super) struct ActivationInputs<'a> {
     pub(super) replacing: Option<(&'a mut BTreeMap<u64, PeerRuntime>, u64)>,
 }
 
+#[cfg(test)]
 pub(super) async fn activate_upstream_peer(
     inputs: ActivationInputs<'_>,
+) -> Result<(PeerRuntime, Option<SocketAddrV4>), SocketAddrV4> {
+    activate_upstream_peer_with_policy(inputs, &Default::default()).await
+}
+pub(super) async fn activate_upstream_peer_with_policy(
+    inputs: ActivationInputs<'_>,
+    policy: &crate::peer_policy::PeerPolicy,
 ) -> Result<(PeerRuntime, Option<SocketAddrV4>), SocketAddrV4> {
     let ActivationInputs {
         peer_id,
@@ -53,13 +60,14 @@ pub(super) async fn activate_upstream_peer(
         reachability,
         replacing,
     } = inputs;
-    let upstream = activation::prepare(
+    let upstream = activation::prepare_with_policy(
         peer_id,
         upstream,
         start,
         continuity.head,
         identity,
         reachability,
+        policy,
     )
     .await?;
     Ok(commit_upstream_peer(ActivationInputs {
@@ -256,19 +264,17 @@ pub(super) async fn follow_peer_pool_with_discovery(
             c.observer = seed.metrics.clone();
             *continuity = Some(c);
             crate::alog!(
-                "[ace] {primary_addr}: window min={min_piece} max={max_piece} -> start={start} head={max_piece}"
-            );
+                "[ace] {primary_addr}: window min={min_piece} max={max_piece} -> start={start} head={max_piece}", primary_addr = seed.peer_policy.log_endpoint(primary_addr));
             start
         }
         Some(c) => {
             c.observer = seed.metrics.clone();
             c.reconnect_pool = c.has_admitted_pool;
             c.admitted_upstreams = 0;
-            let start = c.resume(primary_addr, min_piece, max_piece);
+            let start = c.resume_with_policy(primary_addr, min_piece, max_piece, &seed.peer_policy);
             crate::alog!(
                 "[ace] {primary_addr}: reconnected; window min={min_piece} max={max_piece} -> resuming from {start} head={}",
-                c.head
-            );
+                c.head, primary_addr = seed.peer_policy.log_endpoint(primary_addr));
             start
         }
     };
@@ -296,7 +302,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
     let learned_connects: tokio::task::JoinSet<(SocketAddrV4, Option<PeerConnectFailure>, bool)> =
         tokio::task::JoinSet::new();
     let learned_pending = HashSet::new();
-    if discovery_run.is_none() && !refill_candidates.is_empty() {
+    if !seed.peer_policy.is_private() && discovery_run.is_none() && !refill_candidates.is_empty() {
         *discovery_run = Some(DiscoveryRun::start(
             &discovery,
             background_discovery_options(),
@@ -316,16 +322,19 @@ pub(super) async fn follow_peer_pool_with_discovery(
     for upstream in upstreams {
         let peer_id = next_peer_id;
         next_peer_id += 1;
-        match activate_upstream_peer(ActivationInputs {
-            peer_id,
-            upstream,
-            start,
-            identity,
-            continuity,
-            event_tx: &event_tx,
-            reachability,
-            replacing: None,
-        })
+        match activate_upstream_peer_with_policy(
+            ActivationInputs {
+                peer_id,
+                upstream,
+                start,
+                identity,
+                continuity,
+                event_tx: &event_tx,
+                reachability,
+                replacing: None,
+            },
+            &seed.peer_policy,
+        )
         .await
         {
             Ok((runtime, _)) => {

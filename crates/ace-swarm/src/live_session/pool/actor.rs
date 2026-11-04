@@ -430,7 +430,7 @@ impl PoolActor<'_> {
         if !self.continuity.window_can_resume(&upstream.window) {
             crate::alog!(
                 "[ace] {}: background refill stale window min={} max={} cannot cover next needed piece {}; dropping",
-                upstream.addr,
+                self.seed.peer_policy.log_endpoint(upstream.addr),
                 upstream.window.min_piece,
                 upstream.window.max_piece,
                 self.continuity.reasm.next_needed()
@@ -451,10 +451,11 @@ impl PoolActor<'_> {
                 .unwrap_or(STALE_GOSSIP_BUDGET)
                 .min(STALE_GOSSIP_BUDGET);
             debug_assert!(self.gossip.is_none());
-            self.gossip = Some(pool_support::stale_gossip_job(
+            self.gossip = Some(pool_support::stale_gossip_job_with_policy(
                 upstream,
                 self.identity,
                 tokio::time::Instant::now() + gossip_budget,
+                self.candidates.policy(),
             ));
             return WakeOutcome::Continue;
         }
@@ -513,13 +514,14 @@ impl PoolActor<'_> {
             addr: upstream.addr,
             peer_id,
             replacement,
-            write: activation::prepare(
+            write: activation::prepare_with_policy(
                 peer_id,
                 upstream,
                 self.continuity.reasm.next_needed(),
                 self.continuity.head,
                 self.identity,
                 self.reachability,
+                self.candidates.policy(),
             ),
         });
         WakeOutcome::Continue
@@ -617,7 +619,8 @@ impl PoolActor<'_> {
                 self.candidates.admitted(runtime.addr);
                 crate::alog!(
                     "[ace] {addr}: added to active upstream pool ({} peer(s))",
-                    self.peers.len() + 1
+                    self.peers.len() + 1,
+                    addr = self.seed.peer_policy.log_endpoint(addr)
                 );
                 self.peers.insert(peer_id, runtime);
                 self.peer_count
@@ -680,7 +683,8 @@ impl PoolActor<'_> {
                 crate::alog!(
                     "[ace] {addr}: UNCHOKE -> scheduling from piece {} toward head {}",
                     self.continuity.reasm.next_needed(),
-                    self.continuity.head
+                    self.continuity.head,
+                    addr = self.seed.peer_policy.log_endpoint(addr)
                 );
                 let newly_lost =
                     advance_pool_requests(&mut self.peers, self.continuity, self.chunks_per_piece)
@@ -797,7 +801,11 @@ impl PoolActor<'_> {
             } => {
                 if let Some(source) = ace_wire::peer_exchange::parse_peer_announce(payload) {
                     self.candidates.learn(source, CandidateKind::Source);
-                    crate::alog!("[ace] source-node announce from {addr}: retained {source}");
+                    crate::alog!(
+                        "[ace] source-node announce from {addr}: retained {source}",
+                        addr = self.seed.peer_policy.log_endpoint(addr),
+                        source = self.seed.peer_policy.log_endpoint(source)
+                    );
                     self.maybe_refill(false);
                 }
             }
@@ -819,7 +827,8 @@ impl PoolActor<'_> {
                     if max_piece > self.continuity.head {
                         crate::alog!(
                             "[ace] {addr}: live window update (msg id={id}) head {} -> {max_piece}",
-                            self.continuity.head
+                            self.continuity.head,
+                            addr = self.seed.peer_policy.log_endpoint(addr)
                         );
                     }
                     self.continuity.head = self.continuity.head.max(max_piece);
@@ -842,7 +851,8 @@ impl PoolActor<'_> {
                         crate::alog!(
                             "[ace] {addr}: unhandled msg id={id} ({} bytes) {}",
                             payload.len(),
-                            hex_preview(payload)
+                            self.seed.peer_policy.log_payload(payload),
+                            addr = self.seed.peer_policy.log_endpoint(addr)
                         );
                     }
                 }
@@ -899,7 +909,10 @@ impl PoolActor<'_> {
                     // A malformed block, or a completed piece whose live-source signature
                     // didn't verify (#10): drop it rather than emit unauthenticated bytes.
                     // The piece stays incomplete, so it's re-requested from the pool.
-                    crate::alog!("[ace] {addr}: dropped piece {piece} block: {e:?}");
+                    crate::alog!(
+                        "[ace] {addr}: dropped piece {piece} block: {e:?}",
+                        addr = self.seed.peer_policy.log_endpoint(addr)
+                    );
                     self.continuity.release_rejected_piece(piece);
                     let newly_lost = advance_pool_requests(
                         &mut self.peers,

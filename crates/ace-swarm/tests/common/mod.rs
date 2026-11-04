@@ -131,6 +131,7 @@ pub async fn follow_prefix(
             peers_served: Arc::new(AtomicU32::new(0)),
         },
         seed: LiveSeedOptions {
+            peer_policy: Default::default(),
             metrics: None,
             registry: SeedRegistry::new(),
             store_factory: Arc::new(move |_| PieceStore::new(piece_length, chunk_length, 1 << 20)),

@@ -136,6 +136,7 @@ fn memvod_router(data: Vec<u8>) -> Router {
     let mut r = ProviderRegistry::new();
     r.register(std::sync::Arc::new(MemVodProvider { data }));
     router(AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::new(r),
         networks: vec!["memvod".into()],
         resolve_content_ids_in_getstream: false,
@@ -231,6 +232,7 @@ fn memvod_hls_router(data: Vec<u8>, seg_packets: usize) -> Router {
         ..crate::config::HlsConfig::default()
     };
     router(AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::with_config(r, 256, hls),
         networks: vec!["memvod".into()],
         resolve_content_ids_in_getstream: false,

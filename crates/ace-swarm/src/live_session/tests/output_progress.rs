@@ -51,6 +51,7 @@ fn run(
     }
     let task = tokio::spawn(OUTPUT_SEND_PENDING.scope(pending, async move {
         let seed = SeedConfig {
+            peer_policy: Default::default(),
             metrics: None,
             registry: SeedRegistry::new(),
             store_factory: test_store_factory(16384, None),

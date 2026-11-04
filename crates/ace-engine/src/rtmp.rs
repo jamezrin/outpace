@@ -304,6 +304,7 @@ mod tests {
 
     fn state() -> BroadcastState {
         BroadcastState {
+            peer_policy: Default::default(),
             registry: crate::broadcast::BroadcastRegistry::new(),
             seed_registry: ace_swarm::listen::SeedRegistry::new(),
             trackers: vec![],

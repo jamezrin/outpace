@@ -190,6 +190,7 @@ async fn open_range_downloads_each_covering_piece_at_most_once() {
     let registry = SeedRegistry::new();
     let store = registry.lease_store(info.infohash, || PieceStore::new(16, 16, 128));
     let vod = AceVodContent {
+        peer_policy: Default::default(),
         info,
         bootstrap_peers: vec![addr],
         announce_peer_port: tokio::sync::watch::channel(None).1,
@@ -221,6 +222,7 @@ async fn open_range_spanning_a_new_piece_downloads_only_the_missing_suffix() {
     let registry = SeedRegistry::new();
     let store = registry.lease_store(info.infohash, || PieceStore::new(16, 16, 128));
     let vod = AceVodContent {
+        peer_policy: Default::default(),
         info,
         bootstrap_peers: vec![addr],
         announce_peer_port: tokio::sync::watch::channel(None).1,
@@ -244,6 +246,7 @@ async fn downloaded_vod_piece_is_served_to_an_inbound_bittorrent_peer() {
     let registry = SeedRegistry::new();
     let store = registry.lease_store(info.infohash, || PieceStore::new(16, 8, 128));
     let vod = AceVodContent {
+        peer_policy: Default::default(),
         info: info.clone(),
         bootstrap_peers: vec![upstream],
         announce_peer_port: tokio::sync::watch::channel(None).1,
@@ -308,6 +311,7 @@ async fn cancelled_range_finishes_background_transaction_before_overlap_download
     let store = registry.lease_store(info.infohash, || PieceStore::new(16, 16, 128));
     let range_lock = Arc::new(tokio::sync::Mutex::new(()));
     let vod = AceVodContent {
+        peer_policy: Default::default(),
         info,
         bootstrap_peers: vec![upstream],
         announce_peer_port: tokio::sync::watch::channel(None).1,
@@ -484,6 +488,7 @@ async fn cancelling_multi_peer_range_is_followed_by_correct_overlapping_range() 
     let shared_store = store.0.clone();
     let range_lock = Arc::new(tokio::sync::Mutex::new(()));
     let vod = Arc::new(AceVodContent {
+        peer_policy: Default::default(),
         info: info.clone(),
         bootstrap_peers: seeders.iter().map(|s| s.addr).collect(),
         announce_peer_port: tokio::sync::watch::channel(None).1,
@@ -566,6 +571,7 @@ async fn out_of_order_and_corrupt_upstream_never_reseed_unverified_bytes() {
     let store = registry.lease_store(info.infohash, || PieceStore::new(16, 16, 128));
     let shared_store = store.0.clone();
     let vod = AceVodContent {
+        peer_policy: Default::default(),
         info: info.clone(),
         bootstrap_peers: seeders.iter().map(|s| s.addr).collect(),
         announce_peer_port: tokio::sync::watch::channel(None).1,

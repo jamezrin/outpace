@@ -475,6 +475,7 @@ async fn ace_direct_and_json_playback_share_source_and_disconnect_independently(
     let manager = StreamManager::new(registry);
     let ace_sessions = Arc::new(AceSessionStore::default());
     let app = router(AppState {
+        peer_policy: Default::default(),
         manager: manager.clone(),
         networks: vec!["fix".into()],
         resolve_content_ids_in_getstream: false,
@@ -596,6 +597,7 @@ async fn ace_getstream_errors_are_deterministic_and_do_not_start_sources() {
 async fn ace_direct_start_failure_revokes_its_hidden_lease() {
     let sessions = Arc::new(AceSessionStore::default());
     let app = router(AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::new(ProviderRegistry::new()),
         networks: vec!["fix".into()],
         resolve_content_ids_in_getstream: false,
@@ -963,6 +965,7 @@ async fn ace_stop_isolates_two_compat_clients_and_preserves_native_consumer() {
     registry.register(Arc::new(PacedFixtureProvider));
     let manager = StreamManager::new(registry);
     let app = router(AppState {
+        peer_policy: Default::default(),
         manager: manager.clone(),
         networks: vec!["fix".into()],
         resolve_content_ids_in_getstream: false,
@@ -1267,4 +1270,30 @@ async fn admission_compat_errors_lazy_negotiation_and_service_status() {
     assert_eq!(value["result"]["active_sessions"], 1);
     drop(held);
     state.manager.shutdown().await;
+}
+
+#[test]
+fn compat_local_alias_remains_an_operator_selector_without_catalog_binding() {
+    let selected = ace_selected_stream(&params(&[("id", "local:fixture")])).unwrap();
+    assert_eq!(selected.playback_id, "local:fixture");
+    assert_eq!(selected.session_key, "local:fixture");
+    assert!(selected.content_id.is_none());
+    for id in ["local:", "local:/etc/passwd", "local:../fixture"] {
+        assert!(ace_selected_stream(&params(&[("id", id)])).is_err());
+    }
+}
+
+#[tokio::test]
+async fn private_compat_denies_eager_remote_descriptor_fetches() {
+    let mut state = state();
+    state.peer_policy =
+        ace_swarm::peer_policy::PeerPolicy::from_private_peers(Some("127.0.0.1:1234")).unwrap();
+    state.resolve_content_ids_in_getstream = true;
+    let (descriptor, _) = crate::ace_provider::test_support::synthetic_live_transport(32768);
+    URL_DESCRIPTOR_BYTES.scope(descriptor, async {
+        let selected = resolve_ace_selection(&state, &params(&[("url", "https://example.invalid/descriptor")])).await;
+        assert!(matches!(selected, Err(ref reason) if reason == "remote_descriptor_disabled_in_private_mode"));
+        let analysis = resolve_server_api_selector(&state, crate::server_api::Selector::Url("https://example.invalid/descriptor".into())).await;
+        assert!(matches!(analysis, Err(ref reason) if reason == "remote_descriptor_disabled_in_private_mode"));
+    }).await;
 }

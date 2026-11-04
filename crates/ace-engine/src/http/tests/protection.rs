@@ -41,6 +41,7 @@ async fn native_protection_refusals_preserve_policy_text_before_source_work() {
         vod_resolutions: vod_resolutions.clone(),
     }));
     let app = router(AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::new(registry),
         networks: vec!["fixture".into()],
         resolve_content_ids_in_getstream: false,
@@ -228,6 +229,7 @@ async fn url_protection_preparation_refuses_raw_and_disk_without_leases_or_opens
             let leases = Arc::new(AceSessionStore::default());
             let manager = StreamManager::new(registry);
             let state = AppState {
+                peer_policy: Default::default(),
                 manager: manager.clone(),
                 networks: vec!["warm".into()],
                 resolve_content_ids_in_getstream: true,

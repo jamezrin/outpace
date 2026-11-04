@@ -28,6 +28,7 @@ pub mod discover;
 pub mod http_fetch;
 pub mod listen;
 pub mod live_session;
+pub mod peer_policy;
 pub mod portmap;
 pub mod reachability;
 pub mod resolve;

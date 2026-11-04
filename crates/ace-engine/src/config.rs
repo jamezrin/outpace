@@ -317,6 +317,11 @@ macro_rules! config_with_root_redaction {
 }
 
 config_with_root_redaction! {
+    /// Operator-only exact peer endpoint policy. Public by default.
+    #[serde(rename = "private_peers")]
+    pub peer_policy: ace_swarm::peer_policy::PeerPolicy,
+    /// Operator file declarations, loaded before network startup.
+    pub private_descriptors: crate::local_descriptors::DescriptorPaths,
     /// Address the HTTP API binds to.
     pub bind: SocketAddr,
     /// Provider resources; zero is unlimited.
@@ -415,6 +420,8 @@ impl Default for Config {
             .join("outpace");
         let cache_dir = data_dir.join("cache");
         Config {
+            peer_policy: Default::default(),
+            private_descriptors: Default::default(),
             max_sessions: 0,
             bind: "127.0.0.1:6878".parse().unwrap(),
             rtmp_bind: "127.0.0.1:1935".parse().unwrap(),

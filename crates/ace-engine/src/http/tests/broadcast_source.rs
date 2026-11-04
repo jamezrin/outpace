@@ -16,6 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 fn source_state() -> AppState {
     let mut app = state();
     app.broadcasts = Some(BroadcastState {
+        peer_policy: Default::default(),
         registry: crate::broadcast::BroadcastRegistry::new(),
         seed_registry: ace_swarm::listen::SeedRegistry::new(),
         trackers: vec![],
@@ -192,6 +193,7 @@ async fn source_runtime() -> (AppState, crate::runtime::EngineRuntime) {
     .await
     .unwrap();
     let app = AppState {
+        peer_policy: Default::default(),
         manager: runtime.manager.clone(),
         networks: runtime.networks.clone(),
         resolve_content_ids_in_getstream: false,
@@ -299,6 +301,7 @@ async fn pull206_source_api_returns_fixed_persistence_and_stopping_errors() {
     });
     let mut app_state = state();
     app_state.broadcasts = Some(BroadcastState {
+        peer_policy: Default::default(),
         registry: registry.clone(),
         seed_registry: ace_swarm::listen::SeedRegistry::new(),
         trackers: vec![],

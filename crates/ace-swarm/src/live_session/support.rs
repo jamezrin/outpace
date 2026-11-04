@@ -68,11 +68,6 @@ pub(super) fn schedule_piece_assignments(
     active_peers.assign(scheduler, next_needed, head)
 }
 
-/// Hex preview of a message prefix for diagnostics (avoids pulling in a hex crate).
-pub(super) fn hex_preview(bytes: &[u8]) -> String {
-    bytes.iter().take(24).map(|b| format!("{b:02x}")).collect()
-}
-
 /// Read messages until the peer's extended handshake arrives; return its live `mi` window and
 /// the `yourip` public address it echoed to us (issue #22 — the swarm telling us how it sees us
 /// on this outbound connection; `None` when the peer sent no usable `yourip`).

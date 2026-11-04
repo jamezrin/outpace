@@ -60,11 +60,20 @@ pub(super) async fn peer_worker<S>(
 
 // Bound the entire handshake/window exchange, not just TCP establishment: a silent
 // preferred source must not monopolize a reconnect batch for the peer I/O timeout.
+#[cfg(test)]
 pub(super) async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> PeerConnectAttempt {
+    connect_upstream_with_policy(addr, infohash, crate::peer_policy::PeerPolicy::default()).await
+}
+
+pub(super) async fn connect_upstream_with_policy(
+    addr: SocketAddrV4,
+    infohash: [u8; 20],
+    policy: crate::peer_policy::PeerPolicy,
+) -> PeerConnectAttempt {
     let mut progress = PeerConnectProgress::new();
     let result = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        connect_upstream_inner(addr, infohash, &mut progress),
+        connect_upstream_inner(addr, infohash, &mut progress, &policy),
     )
     .await
     {
@@ -77,6 +86,7 @@ pub(super) async fn connect_upstream(addr: SocketAddrV4, infohash: [u8; 20]) -> 
     let timing = progress.finish();
     let outcome = match &result {
         Ok(_) => "connected",
+        Err(PeerConnectStage::PolicyDenied) => "policy_denied",
         Err(PeerConnectStage::Tcp) => "tcp",
         Err(PeerConnectStage::Handshake) => "handshake",
         Err(PeerConnectStage::Window) => "window",
@@ -100,12 +110,22 @@ async fn connect_upstream_inner(
     addr: SocketAddrV4,
     infohash: [u8; 20],
     progress: &mut PeerConnectProgress,
+    policy: &crate::peer_policy::PeerPolicy,
 ) -> Result<ConnectedUpstream, PeerConnectStage> {
     crate::alog!("[ace] discovery stage=tcp-attempt");
-    let mut session = match tokio::time::timeout(CONNECT_TIMEOUT, connect(&addr.to_string())).await
+    let mut session = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        policy.dial_with(addr, |endpoint| async move {
+            connect(&endpoint.to_string()).await
+        }),
+    )
+    .await
     {
         Ok(Ok(session)) => session,
-        Ok(Err(_)) | Err(_) => {
+        Ok(Err(crate::peer_policy::PeerDialError::Denied)) => {
+            return Err(PeerConnectStage::PolicyDenied)
+        }
+        Ok(Err(crate::peer_policy::PeerDialError::Transport(_))) | Err(_) => {
             return Err(PeerConnectStage::Tcp);
         }
     };
@@ -190,7 +210,11 @@ pub(super) async fn connect_pool(
                     break;
                 }
                 if candidates.explorations(addr) <= cohort && attempted.insert(addr) {
-                    set.spawn(connect_upstream(addr, infohash));
+                    set.spawn(connect_upstream_with_policy(
+                        addr,
+                        infohash,
+                        candidates.policy().clone(),
+                    ));
                 }
             }
             if set.is_empty() || connected.len() >= live_recovery.max_active_upstreams {

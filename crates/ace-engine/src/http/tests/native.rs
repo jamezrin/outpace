@@ -885,6 +885,7 @@ fn ace_provider_state() -> AppState {
     provider.cache_infohash_failure_for_test(UNRESOLVED_IH);
     registry.register(Arc::new(provider));
     AppState {
+        peer_policy: Default::default(),
         manager: StreamManager::new(registry),
         networks: vec!["ace".into()],
         resolve_content_ids_in_getstream: false,

@@ -447,6 +447,7 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         Arc::new(AtomicU32::new(0)),
     );
     let mut seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: Some(recovery_observer.clone()),
         registry: SeedRegistry::new(),
         store_factory: {
@@ -806,6 +807,7 @@ fn cancellation_fixture() -> (StreamInfo, SeedConfig) {
         source_pubkey: vec![],
     };
     let seed = SeedConfig {
+        peer_policy: Default::default(),
         metrics: None,
         registry: SeedRegistry::new(),
         store_factory: test_store_factory(4096, None),

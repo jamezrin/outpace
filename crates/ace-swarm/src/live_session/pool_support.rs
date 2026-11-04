@@ -129,8 +129,10 @@ pub(super) fn spawn_candidate_connects(inputs: CandidateConnectInputs<'_>) {
         candidates.attempting(addr, Instant::now() + CONNECT_TIMEOUT);
         let discovered = candidates.kind(addr) == CandidateKind::Discovered;
         let tx = tx.clone();
+        let policy = candidates.policy().clone();
         tasks.spawn(async move {
-            let (failure, queued) = match connect_upstream(addr, infohash).await {
+            let (failure, queued) = match connect_upstream_with_policy(addr, infohash, policy).await
+            {
                 PeerConnectAttempt::Connected(upstream, _) => {
                     let receipt = if discovered {
                         PoolRefill::ReservedDiscovered(upstream)
@@ -167,7 +169,12 @@ pub(super) async fn harvest_stale_gossip_with_budget(
     let deadline = tokio::time::Instant::now() + budget;
     let mut tasks = tokio::task::JoinSet::new();
     for upstream in upstreams {
-        tasks.spawn(stale_gossip_job(upstream, identity, deadline));
+        tasks.spawn(stale_gossip_job_with_policy(
+            upstream,
+            identity,
+            deadline,
+            candidates.policy(),
+        ));
     }
     while let Some(joined) = tasks.join_next().await {
         if let Ok(learned) = joined {
@@ -183,16 +190,25 @@ pub(super) type GossipJob =
 
 // Owns the socket and signed bytes, never candidate or actor state. Dropping this
 // future closes IO immediately, including when it has never been polled.
+#[cfg(test)]
 pub(super) fn stale_gossip_job(
+    upstream: ConnectedUpstream,
+    identity: &Identity,
+    deadline: tokio::time::Instant,
+) -> GossipJob {
+    stale_gossip_job_with_policy(upstream, identity, deadline, &Default::default())
+}
+pub(super) fn stale_gossip_job_with_policy(
     mut upstream: ConnectedUpstream,
     identity: &Identity,
     deadline: tokio::time::Instant,
+    policy: &crate::peer_policy::PeerPolicy,
 ) -> GossipJob {
     let hs = OutgoingExtendedHandshake {
         ace_metadata_version: 1,
         ut_metadata_id: 2,
         mi: None,
-        node: NodeFields::default(),
+        node: policy.node_fields(),
         peer_ip: Some(upstream.addr.ip().octets()),
         metadata_size: None,
     };
@@ -504,7 +520,10 @@ pub(super) async fn handle_pool_peer_loss(
 ) -> bool {
     let lost_producer = peers.get(&peer_id).is_some_and(|peer| peer.produced_output);
     if let Some(lost) = drop_peer_runtime(peer_id, peers, continuity) {
-        crate::alog!("[ace] {lost}: upstream peer lost");
+        crate::alog!(
+            "[ace] {lost}: upstream peer lost",
+            lost = candidates.policy().log_endpoint(lost)
+        );
         record_pool_losses(candidates, loss_count, [lost]);
         let newly_lost = advance_pool_requests(peers, continuity, chunks_per_piece).await;
         record_pool_losses(candidates, loss_count, newly_lost);

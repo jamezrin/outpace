@@ -602,3 +602,36 @@ fn bounded_stats_gap_cache_and_synchronous_unknown() {
     c.stats_scan.advance(&c.reasm, Some(2));
     assert_eq!(c.stats_scan.result(0), Some((6000, 3)));
 }
+
+#[tokio::test]
+async fn private_policy_denies_live_socket_before_handshake() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let allowed_port = if addr.port() == 1 { 2 } else { 1 };
+    let policy = crate::peer_policy::PeerPolicy::from_private_peers(Some(&format!(
+        "127.0.0.1:{allowed_port}"
+    )))
+    .unwrap();
+    let attempt = connect_upstream_with_policy(addr, [0; 20], policy).await;
+    let PeerConnectAttempt::Failed(failure) = &attempt else {
+        panic!("denied dial connected")
+    };
+    let mut stats = PeerConnectStats::default();
+    stats.record_failure(*failure);
+    assert!(stats.has_observations());
+    assert!(stats.summary().contains("policy_denied=1"));
+    assert!(matches!(
+        attempt,
+        PeerConnectAttempt::Failed(PeerConnectFailure {
+            stage: PeerConnectStage::PolicyDenied,
+            ..
+        })
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+            .await
+            .is_err()
+    );
+}

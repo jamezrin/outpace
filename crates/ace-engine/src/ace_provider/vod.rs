@@ -30,6 +30,7 @@ async fn cached_prefix(
 /// many range reads of one playback (HLS segments, seeks) resolve peers once and download each
 /// covering piece at most once.
 pub(super) struct AceVodContent {
+    pub(super) peer_policy: ace_swarm::peer_policy::PeerPolicy,
     pub(super) info: VodInfo,
     pub(super) bootstrap_peers: Vec<SocketAddrV4>,
     pub(super) announce_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
@@ -48,6 +49,9 @@ impl AceVodContent {
     /// are used directly. VOD swarms are standard BitTorrent, discovered like the live path.
     async fn peers(&self) -> Vec<SocketAddrV4> {
         let mut guard = self.peers.lock().await;
+        if self.peer_policy.is_private() {
+            return self.peer_policy.endpoints();
+        }
         if let Some(peers) = guard.as_ref() {
             return peers.clone();
         }
@@ -118,9 +122,17 @@ impl VodContent for AceVodContent {
             // downloader runs detached: if the consumer drops (leaving the tee loop, dropping
             // `drx`), `download_vod_pieces` sees `ConsumerGone` on its next send and stops.
             let (dtx, mut drx) = mpsc::channel::<Bytes>(64);
+            let peer_policy = self.peer_policy.clone();
             let downloader = tokio::spawn(async move {
-                if let Err(e) =
-                    download_vod_pieces(info, peers, dtx, download_from, end_piece).await
+                if let Err(e) = ace_swarm::vod::download_vod_pieces_with_peer_policy(
+                    info,
+                    peers,
+                    dtx,
+                    download_from,
+                    end_piece,
+                    peer_policy,
+                )
+                .await
                 {
                     crate::alog!("[ace] vod range download ended: {e:?}");
                 }

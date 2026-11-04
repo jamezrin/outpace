@@ -170,7 +170,23 @@ impl Continuity {
     /// logged gap — if the new peer's window has already evicted the piece we still needed
     /// (we were disconnected longer than the live window covers). Returns the piece index
     /// to advertise as our position in the outgoing handshake.
+    #[cfg(test)]
     pub(super) fn resume(&mut self, addr: SocketAddrV4, min_piece: u64, max_piece: u64) -> u64 {
+        self.resume_with_policy(
+            addr,
+            min_piece,
+            max_piece,
+            &crate::peer_policy::PeerPolicy::default(),
+        )
+    }
+
+    pub(super) fn resume_with_policy(
+        &mut self,
+        addr: SocketAddrV4,
+        min_piece: u64,
+        max_piece: u64,
+        policy: &crate::peer_policy::PeerPolicy,
+    ) -> u64 {
         self.head = self.head.max(max_piece);
         self.scheduler.clear_in_flight();
         self.active_peers = ActivePeers::new();
@@ -189,7 +205,7 @@ impl Continuity {
         if resume > next {
             crate::alog!(
                 "[ace] {addr}: reconnect gap — peer's window already evicted pieces {next}..{}; skipping ahead",
-                resume - 1
+                resume - 1, addr = policy.log_endpoint(addr)
             );
             self.recovery_event(RecoveryEvent::SkippedEvictedGap);
             self.reasm.skip_to(resume);

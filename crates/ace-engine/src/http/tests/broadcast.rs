@@ -3,6 +3,7 @@ use super::*;
 fn broadcast_state() -> AppState {
     let mut st = state();
     st.broadcasts = Some(BroadcastState {
+        peer_policy: Default::default(),
         registry: crate::broadcast::BroadcastRegistry::new(),
         seed_registry: ace_swarm::listen::SeedRegistry::new(),
         trackers: vec![],
@@ -434,4 +435,34 @@ async fn broadcast_delete_purges_and_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(del2.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn private_broadcast_never_constructs_public_announcers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for private in [false, true] {
+        let state = broadcast_state();
+        let mut bs = state.broadcasts.unwrap();
+        if private {
+            bs.peer_policy =
+                ace_swarm::peer_policy::PeerPolicy::from_private_peers(Some("127.0.0.1:1234"))
+                    .unwrap();
+        }
+        bs.inbound_peer_port = tokio::sync::watch::channel(Some(1234)).1;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        bs.registry.set_test_announcer(Arc::new(move |_, _| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Box::pin(std::future::pending())
+        }));
+        bs.mint("policy-fixture").await.unwrap();
+        bs.ensure_announcing("policy-fixture").await.unwrap();
+        let constructed = calls.load(Ordering::Relaxed);
+        bs.close_admissions();
+        tokio::time::timeout(Duration::from_secs(1), bs.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(constructed, if private { 0 } else { 2 });
+    }
 }

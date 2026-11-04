@@ -202,12 +202,43 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_BEP9_CONTENT_ID_FALLBACK")? {
         config.bep9_content_id_fallback = v;
     }
+    // Preserve presence: explicit public-network settings conflict, implicit defaults normalize.
+    let private_peers = optional_private_env("OUTPACE_PRIVATE_PEERS")?;
+    let private_descriptors = optional_private_env("OUTPACE_PRIVATE_DESCRIPTORS")?;
+    crate::private_network::apply_private_env(
+        &mut config,
+        private_peers.as_deref(),
+        private_descriptors.as_deref(),
+        bool_from_env("OUTPACE_ENABLE_INBOUND")?,
+        bool_from_env("OUTPACE_ENABLE_PORT_MAPPING")?,
+        std::env::var_os("OUTPACE_TRACKERS").is_some(),
+    )?;
+    if config.peer_policy.is_private() {
+        if let Some(raw) = optional_private_env("OUTPACE_ACE_PEERS")?.filter(|raw| !raw.is_empty())
+        {
+            let bootstrap = ace_swarm::peer_policy::PeerPolicy::from_private_peers(Some(&raw))
+                .map_err(|_| {
+                    crate::private_network::PrivateConfigError(
+                        "private_mode_invalid_bootstrap_peers",
+                    )
+                })?;
+            crate::private_network::validate_private_config(&config, &bootstrap.endpoints())?;
+        }
+    }
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
     Ok(config)
+}
+
+fn optional_private_env(name: &'static str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match std::env::var(name) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err("invalid private network setting".into()),
+    }
 }
 
 fn apply_broadcast_options_env(
@@ -596,6 +627,7 @@ pub async fn build_runtime(
     mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    crate::private_network::validate_private_config(&config, &bootstrap_peers)?;
     // Validate the complete ordered map before normalizer, filesystem, identity, or
     // runtime side effects, including when Config was constructed directly in Rust.
     let source_policy = FetchPolicy {
@@ -611,6 +643,7 @@ pub async fn build_runtime(
     config.hls.validate()?;
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
+    let local_descriptors = config.private_descriptors.load()?;
     preflight_broadcasts(&config)?;
     preflight_disk_cache_paths(&config)?;
     let normalizer = crate::hls_audio::preflight(&config.hls_audio).await?;
@@ -661,6 +694,8 @@ pub async fn build_runtime(
     let (announce_port_tx, announce_port_rx) = tokio::sync::watch::channel(inbound_peer_port);
     if config.networks.iter().any(|n| n == "ace") {
         let provider = AceProvider::new(identity.clone(), config.peer_listen.port())
+            .with_peer_policy(config.peer_policy.clone())
+            .with_local_descriptors(local_descriptors.clone())
             .with_bootstrap_peers(bootstrap_peers)
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
@@ -710,6 +745,7 @@ pub async fn build_runtime(
         });
     }
     let broadcasts = BroadcastState {
+        peer_policy: config.peer_policy.clone(),
         registry: BroadcastRegistry::with_persist_and_options(
             &config.data_dir,
             config.cache_type,
@@ -719,7 +755,11 @@ pub async fn build_runtime(
         seed_registry: seed_registry.clone(),
         // Process trackers select fresh identities only. Resumed announcements use the
         // validated transport's own list, including an empty list.
-        trackers: broadcast_trackers_from_env(),
+        trackers: if config.peer_policy.is_private() {
+            vec![]
+        } else {
+            broadcast_trackers_from_env()
+        },
         store_bytes: config.seed_store_bytes,
         inbound_peer_port: announce_port_rx,
     };
@@ -821,8 +861,12 @@ async fn serve_http_inner(
         config.data_dir.display()
     );
 
+    if let Some(count) = config.peer_policy.endpoint_count() {
+        eprintln!("outpace: private peer mode ({count} allowed outbound endpoints; inbound peers and public discovery/advertising disabled)");
+    }
     let rtmp_bind = config.rtmp_bind;
     let state = AppState {
+        peer_policy: config.peer_policy.clone(),
         manager,
         networks: networks.clone(),
         resolve_content_ids_in_getstream: true,
@@ -1275,6 +1319,7 @@ mod tests {
         let disabled = !config.experimental_ace_compat;
 
         let app = router(AppState {
+            peer_policy: Default::default(),
             manager: StreamManager::new(ProviderRegistry::new()),
             networks: Vec::new(),
             resolve_content_ids_in_getstream: false,

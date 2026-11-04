@@ -92,6 +92,13 @@ pub struct PlaybackTarget {
 impl PlaybackTarget {
     pub fn parse(input: &str) -> Result<Self, String> {
         let input = input.trim();
+        if let Some(alias) = input.strip_prefix("local:") {
+            return crate::local_descriptors::alias_valid(alias)
+                .then(|| Self {
+                    provider_id: input.to_owned(),
+                })
+                .ok_or_else(|| "invalid local descriptor alias".into());
+        }
         if let Some(rest) = input.strip_prefix("acestream://") {
             let id = rest.split(['?', '#']).next().unwrap_or("");
             return content_id_target(id);
@@ -142,10 +149,19 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
     crate::runtime::serve_http(runtime).await
 }
 
+fn broadcast_config(
+    mut config: crate::config::Config,
+) -> Result<crate::config::Config, &'static str> {
+    if config.peer_policy.is_private() {
+        return Err("private_mode_broadcast_cli_requires_inbound_peers");
+    }
+    config.enable_inbound = true;
+    Ok(config)
+}
+
 async fn run_broadcast(args: BroadcastArgs) -> Result<(), Box<dyn std::error::Error>> {
     let BroadcastArgs { name, public_host } = args;
-    let mut config = crate::runtime::config_from_env()?;
-    config.enable_inbound = true;
+    let config = broadcast_config(crate::runtime::config_from_env()?)?;
     let peers = crate::runtime::bootstrap_peers_from_env();
     let runtime = crate::runtime::build_runtime(config, peers).await?;
     let bc = match crate::runtime::mint_broadcast(&runtime, &name).await {
@@ -227,6 +243,7 @@ fn play_provider_from_config(
     // One-shot leech to stdout: it runs no inbound listener, so it discovers on the peer port
     // (never the HTTP port — issue #21) and does not self-announce as a dial-able seeder.
     crate::ace_provider::AceProvider::new(identity, config.peer_listen.port())
+        .with_peer_policy(config.peer_policy.clone())
         .with_bootstrap_peers(peers)
         .with_seed_registry(seed_registry)
         .with_seed_store_bytes(config.seed_store_bytes)
@@ -248,6 +265,8 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let config = crate::runtime::config_from_env()?;
     let mut peers = crate::runtime::bootstrap_peers_from_env();
     peers.extend(args.peers);
+    crate::private_network::validate_private_config(&config, &peers)?;
+    let local_descriptors = config.private_descriptors.load()?;
 
     let identity = std::sync::Arc::new(crate::config::load_or_create_identity(&config.data_dir)?);
     let provider = play_provider_from_config(
@@ -255,7 +274,8 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
         &config,
         peers,
         ace_swarm::listen::SeedRegistry::new(),
-    );
+    )
+    .with_local_descriptors(local_descriptors);
 
     // User-facing CLI progress: plain `eprintln!` on purpose (a human is watching this run,
     // so no `alog!` timestamp/`[tag]` prefix). See the `ace_log` crate docs.
@@ -797,5 +817,51 @@ mod tests {
     #[test]
     fn invalid_playback_input_is_rejected() {
         assert!(PlaybackTarget::parse("acestream://nothex").is_err());
+    }
+}
+
+#[cfg(test)]
+mod local_alias_tests {
+    use super::PlaybackTarget;
+    #[test]
+    fn local_alias_is_a_selector_not_a_request_path() {
+        assert_eq!(
+            PlaybackTarget::parse("local:fixture").unwrap().provider_id,
+            "local:fixture"
+        );
+        for value in [
+            "local:",
+            "local:../fixture",
+            "local:/etc/passwd",
+            "local:a/b",
+            "local:a?x",
+        ] {
+            assert!(PlaybackTarget::parse(value).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod private_broadcast_tests {
+    use super::*;
+    #[test]
+    fn private_broadcast_cli_never_widens_inbound_policy() {
+        let private = crate::config::Config {
+            peer_policy: ace_swarm::peer_policy::PeerPolicy::from_private_peers(Some(
+                "127.0.0.1:1234",
+            ))
+            .unwrap(),
+            enable_inbound: false,
+            ..Default::default()
+        };
+        assert!(matches!(
+            broadcast_config(private),
+            Err("private_mode_broadcast_cli_requires_inbound_peers")
+        ));
+        let public = crate::config::Config {
+            enable_inbound: false,
+            ..Default::default()
+        };
+        assert!(broadcast_config(public).unwrap().enable_inbound);
     }
 }
