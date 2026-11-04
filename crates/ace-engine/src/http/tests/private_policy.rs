@@ -2,6 +2,12 @@ use super::*;
 use axum::body::to_bytes;
 
 fn private_state() -> AppState {
+    private_state_with_descriptors(Default::default())
+}
+
+fn private_state_with_descriptors(
+    descriptors: crate::local_descriptors::LocalDescriptors,
+) -> AppState {
     let policy =
         ace_swarm::peer_policy::PeerPolicy::from_private_peers(Some("127.0.0.1:1234")).unwrap();
     let mut registry = ProviderRegistry::new();
@@ -10,7 +16,8 @@ fn private_state() -> AppState {
             Arc::new(ace_wire::identity::Identity::generate()),
             0,
         )
-        .with_peer_policy(policy.clone()),
+        .with_peer_policy(policy.clone())
+        .with_local_descriptors(descriptors),
     ));
     AppState {
         peer_policy: policy,
@@ -87,5 +94,53 @@ async fn private_catalog_refusals_remain_explicit_on_native_routes() {
             "private refusal lost on native route"
         );
         assert_eq!(raw.as_ref(), b"catalog_disabled_in_private_mode");
+    }
+}
+
+#[tokio::test]
+async fn private_vod_alias_refuses_live_hls_and_compat_playback_with_422() {
+    for compat in [false, true] {
+        for hls in [false, true] {
+            if compat && hls {
+                continue;
+            }
+            let bytes = crate::ace_provider::test_support::protection_vod_bytes(0, false);
+            let map =
+                crate::local_descriptors::LocalDescriptors::from_test_bytes("fixture", &bytes)
+                    .unwrap();
+            let state = private_state_with_descriptors(map);
+            let manager = state.manager.clone();
+            let path = if compat {
+                let token = state
+                    .ace_sessions
+                    .mint("local:fixture".into(), "local:fixture".into());
+                format!("/ace/r/local:fixture/{token}")
+            } else if hls {
+                "/streams/ace/local:fixture.m3u8".into()
+            } else {
+                "/streams/ace/local:fixture.ts".into()
+            };
+            let response = router(state)
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let raw = to_bytes(response.into_body(), 4096).await.unwrap();
+            manager.shutdown().await;
+            assert_eq!(manager.admission_status().0, 0);
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "compat={compat}, hls={hls}"
+            );
+            assert_eq!(
+                raw.as_ref(),
+                if compat {
+                    b"stream metadata unavailable".as_slice()
+                } else {
+                    b"local_descriptor_is_not_live".as_slice()
+                }
+            );
+        }
     }
 }

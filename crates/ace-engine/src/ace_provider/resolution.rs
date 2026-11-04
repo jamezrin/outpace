@@ -197,7 +197,7 @@ impl AceProvider {
         if id.starts_with("local:") {
             return match self.local_descriptors.get(id) {
                 Some(crate::local_descriptors::LocalDescriptor::Live(info)) => Ok(info.clone()),
-                Some(_) => Err(ProviderError::Backend(
+                Some(_) => Err(ProviderError::Unresolvable(
                     "local_descriptor_is_not_live".into(),
                 )),
                 None => Err(ProviderError::Unresolvable(
