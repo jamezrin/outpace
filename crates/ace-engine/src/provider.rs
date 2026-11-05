@@ -128,6 +128,16 @@ pub trait StreamProvider: Send + Sync {
     /// Open a live TS source for `id` (the provider resolves/discovers internally).
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError>;
 
+    /// Preserve a structured cause for supervised starts; legacy providers default to unknown.
+    async fn open_classified(
+        &self,
+        id: &str,
+    ) -> Result<Box<dyn TsSource>, crate::start_failure::ProviderStartFailure> {
+        self.open(id)
+            .await
+            .map_err(crate::start_failure::ProviderStartFailure::from)
+    }
+
     /// Prepare a live content id using the same policy and cache as [`open`](Self::open).
     /// Only `Catalog` grants catalog provenance. A supported provider's error is terminal
     /// for this selection; `Unsupported` alone permits the caller's legacy preflight.

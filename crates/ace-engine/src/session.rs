@@ -18,6 +18,7 @@ pub enum StreamEvent {
 pub struct StreamSession {
     tx: broadcast::WeakSender<StreamEvent>,
     subscribers: Arc<AtomicU64>,
+    support_pins: AtomicU64,
     stats: Arc<Mutex<SourceStats>>,
     live_stats: Option<StatsHandle>,
     metadata: StreamMetadata,
@@ -41,6 +42,23 @@ pub struct Subscription {
     count: Arc<AtomicU64>,
 }
 
+/// Logical support ownership, separate from playback subscriptions.
+pub struct SupportPin {
+    session: Arc<StreamSession>,
+}
+
+impl Drop for SupportPin {
+    fn drop(&mut self) {
+        self.session.support_pins.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl SupportPin {
+    pub fn session(&self) -> &Arc<StreamSession> {
+        &self.session
+    }
+}
+
 impl Drop for Subscription {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
@@ -48,6 +66,17 @@ impl Drop for Subscription {
 }
 
 impl StreamSession {
+    pub(crate) fn support_pin(self: &Arc<Self>) -> SupportPin {
+        self.support_pins.fetch_add(1, Ordering::SeqCst);
+        SupportPin {
+            session: self.clone(),
+        }
+    }
+
+    pub(crate) fn support_pin_count(&self) -> u64 {
+        self.support_pins.load(Ordering::SeqCst)
+    }
+
     /// Start pulling from `source` in a background task, broadcasting chunks. The pump stops
     /// when the source ends. `buffer` is the broadcast backlog (how far a slow/late receiver
     /// may lag before it drops old chunks).
@@ -73,7 +102,7 @@ impl StreamSession {
         let pump_tx = tx;
         let pump_stats = stats.clone();
         let failed_sources = cleanup.failed_sources();
-        let control = cleanup.spawn(move |mut cancel| async move {
+        let mut control = cleanup.spawn(move |mut cancel| async move {
             use futures::FutureExt;
             let pull_result = std::panic::AssertUnwindSafe(async {
                 loop {
@@ -114,9 +143,13 @@ impl StreamSession {
         });
         let cancel = control.cancellation_signal();
         let completed = control.completion_receiver();
+        // Natural EOF must publish confirmed cleanup without waiting for media
+        // owners to explicitly stop or drop the session.
+        control.transfer();
         Arc::new(StreamSession {
             tx: weak_tx,
             subscribers: Arc::new(AtomicU64::new(0)),
+            support_pins: AtomicU64::new(0),
             stats,
             live_stats,
             metadata,
@@ -137,6 +170,10 @@ impl StreamSession {
 
     pub(crate) fn completion_receiver(&self) -> watch::Receiver<bool> {
         self.completed.clone()
+    }
+
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        *self.cancel.borrow()
     }
 
     /// True only when owned source cleanup was confirmed.

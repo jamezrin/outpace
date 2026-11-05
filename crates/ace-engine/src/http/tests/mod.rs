@@ -20,6 +20,7 @@ mod compat_hls;
 mod native;
 mod protection;
 mod server_api;
+mod support;
 mod vod;
 
 fn state() -> AppState {

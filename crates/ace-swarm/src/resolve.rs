@@ -75,7 +75,7 @@ const CATALOG_SIGNING_SECRET: &[u8] =
 // Public protocol interoperability constant, not a private server credential.
 const CATALOG_RESPONSE_KEY: &[u8] = b"CNVU\\\\w5S/HGg\"pSzY&O\"`uGCD18\\x0cfS|h2H4eJBihWumSD7zSv;8,=z2?<\\tl6ka\\n\\x0c*O<3dzOZ|MT11]f0 Xuc| R\"$D;SsYm\\rw*..8h7d4k";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum ResolveError {
     ProtectedContent,
     InvalidProtection,
@@ -83,10 +83,90 @@ pub enum ResolveError {
     Transport(&'static str),
     /// A signed catalog request/response step failed during content-id resolution.
     Catalog(&'static str),
+    /// Catalog I/O failure, distinct from rejected response/authentication metadata.
+    CatalogNetwork(&'static str),
     /// A peer/network step failed during content-id resolution.
     Peer(&'static str),
     /// A transport-file `url=` fetch failed a safety check or the network step.
     Url(&'static str),
+    /// Original guarded-client cause, retained before legacy diagnostic formatting.
+    Fetch(FetchError),
+    TransportTooLarge,
+}
+
+/// Structured resolution cause; never derive retry behavior from diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveFailureKind {
+    InvalidSelector,
+    InvalidDescriptor,
+    SafetyRefusal,
+    ProtectedContent,
+    InvalidProtection,
+    Network,
+    RejectedMetadata,
+    Cancelled,
+    Unclassified,
+}
+
+impl ResolveError {
+    pub fn failure_kind(&self) -> ResolveFailureKind {
+        use ResolveFailureKind as Kind;
+        match self {
+            Self::ProtectedContent => Kind::ProtectedContent,
+            Self::InvalidProtection => Kind::InvalidProtection,
+            Self::BadInfohash => Kind::InvalidSelector,
+            Self::Transport(_) => Kind::InvalidDescriptor,
+            Self::Catalog(_) | Self::TransportTooLarge => Kind::RejectedMetadata,
+            Self::Peer(_) | Self::CatalogNetwork(_) => Kind::Network,
+            Self::Url(_) => Kind::Unclassified,
+            Self::Fetch(error) => match error {
+                FetchError::InvalidSourceConfig
+                | FetchError::InvalidSourceUrl
+                | FetchError::BadUrl
+                | FetchError::UnsupportedScheme
+                | FetchError::NoHost
+                | FetchError::NoPort => Kind::InvalidSelector,
+                FetchError::SourceAddressBlocked
+                | FetchError::AddressBlocked
+                | FetchError::RedirectRejected => Kind::SafetyRefusal,
+                FetchError::Cancelled => Kind::Cancelled,
+                FetchError::UnsupportedResponse | FetchError::BodyFrameTooLarge => {
+                    Kind::RejectedMetadata
+                }
+                FetchError::DnsTimeout
+                | FetchError::DnsFailed
+                | FetchError::ClientBuildFailed
+                | FetchError::ConnectTimeout
+                | FetchError::ConnectFailed
+                | FetchError::TlsFailed
+                | FetchError::HeadersTimeout
+                | FetchError::HttpStatus
+                | FetchError::BodyFailed => Kind::Network,
+            },
+        }
+    }
+}
+
+// Preserve established diagnostic/HTTP strings while retaining machine-readable causes.
+impl std::fmt::Debug for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtectedContent => f.write_str("ProtectedContent"),
+            Self::InvalidProtection => f.write_str("InvalidProtection"),
+            Self::BadInfohash => f.write_str("BadInfohash"),
+            Self::Transport(reason) => f.debug_tuple("Transport").field(reason).finish(),
+            Self::Catalog(reason) | Self::CatalogNetwork(reason) => {
+                f.debug_tuple("Catalog").field(reason).finish()
+            }
+            Self::Peer(reason) => f.debug_tuple("Peer").field(reason).finish(),
+            Self::Url(reason) => f.debug_tuple("Url").field(reason).finish(),
+            Self::Fetch(error) => f
+                .debug_tuple("Url")
+                .field(&transport_fetch_reason(*error))
+                .finish(),
+            Self::TransportTooLarge => f.debug_tuple("Url").field(&"transport too large").finish(),
+        }
+    }
 }
 
 fn protection_wire_error(error: ace_wire::WireError) -> ResolveError {
@@ -375,7 +455,7 @@ async fn catalog_transport_bytes_query(
     parameter: &str,
     value: &str,
 ) -> Result<Vec<u8>, ResolveError> {
-    let mut last = ResolveError::Catalog("catalog request failed");
+    let mut last = ResolveError::CatalogNetwork("catalog request failed");
     for &(host, port) in CATALOG_HOSTS {
         match tokio::time::timeout(
             CATALOG_HOST_TIMEOUT,
@@ -385,7 +465,7 @@ async fn catalog_transport_bytes_query(
         {
             Ok(Ok(transport)) => return Ok(transport),
             Ok(Err(e)) => last = e,
-            Err(_) => last = ResolveError::Catalog("catalog timeout"),
+            Err(_) => last = ResolveError::CatalogNetwork("catalog timeout"),
         }
     }
     Err(last)
@@ -429,11 +509,11 @@ async fn fetch_catalog_transport_query(
 
     let mut stream = TcpStream::connect((host, port))
         .await
-        .map_err(|_| ResolveError::Catalog("catalog connect failed"))?;
+        .map_err(|_| ResolveError::CatalogNetwork("catalog connect failed"))?;
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(|_| ResolveError::Catalog("catalog write failed"))?;
+        .map_err(|_| ResolveError::CatalogNetwork("catalog write failed"))?;
 
     let mut response = Vec::new();
     let mut buf = [0u8; 8192];
@@ -441,7 +521,7 @@ async fn fetch_catalog_transport_query(
         let n = stream
             .read(&mut buf)
             .await
-            .map_err(|_| ResolveError::Catalog("catalog read failed"))?;
+            .map_err(|_| ResolveError::CatalogNetwork("catalog read failed"))?;
         if n == 0 {
             break;
         }
@@ -817,7 +897,11 @@ fn transport_fetch_limits() -> FetchLimits {
 }
 
 fn transport_fetch_error(error: FetchError) -> ResolveError {
-    ResolveError::Url(match error {
+    ResolveError::Fetch(error)
+}
+
+fn transport_fetch_reason(error: FetchError) -> &'static str {
+    match error {
         FetchError::BadUrl | FetchError::InvalidSourceUrl => "bad url",
         FetchError::UnsupportedScheme => "unsupported scheme",
         FetchError::NoHost => "no host",
@@ -827,14 +911,14 @@ fn transport_fetch_error(error: FetchError) -> ResolveError {
         FetchError::ClientBuildFailed => "client build failed",
         FetchError::HttpStatus | FetchError::RedirectRejected => "http status",
         _ => "fetch failed",
-    })
+    }
 }
 
 async fn collect_transport(mut response: GuardedBody) -> Result<Vec<u8>, ResolveError> {
     let mut body = Vec::new();
     while let Some(chunk) = response.next_chunk().await.map_err(transport_fetch_error)? {
         if body.len() as u64 + chunk.len() as u64 > MAX_TRANSPORT_FILE {
-            return Err(ResolveError::Url("transport too large"));
+            return Err(ResolveError::TransportTooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -1237,7 +1321,7 @@ mod tests {
     async fn ssrf_guard_rejects_loopback_host() {
         assert_eq!(
             resolve_safe_addr("127.0.0.1", 80).await,
-            Err(ResolveError::Url("blocked address"))
+            Err(ResolveError::Fetch(FetchError::AddressBlocked))
         );
     }
 
@@ -1247,7 +1331,7 @@ mod tests {
         // treated as an (always-failing) hostname. Bracketed loopback -> blocked (not dns failed).
         assert_eq!(
             resolve_safe_addr("[::1]", 80).await,
-            Err(ResolveError::Url("blocked address"))
+            Err(ResolveError::Fetch(FetchError::AddressBlocked))
         );
         // A bracketed public IPv6 literal resolves to a safe address.
         let ok = resolve_safe_addr("[2606:2800:220:1:248:1893:25c8:1946]", 443)
@@ -1295,7 +1379,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/big.bin", addr.port());
         assert_eq!(
             fetch_transport_from(&url, "127.0.0.1", addr).await,
-            Err(ResolveError::Url("transport too large"))
+            Err(ResolveError::TransportTooLarge)
         );
     }
 
@@ -1315,7 +1399,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/missing", addr.port());
         assert_eq!(
             fetch_transport_from(&url, "127.0.0.1", addr).await,
-            Err(ResolveError::Url("http status"))
+            Err(ResolveError::Fetch(FetchError::HttpStatus))
         );
     }
 
@@ -1323,11 +1407,11 @@ mod tests {
     async fn transport_url_rejects_unsupported_scheme() {
         assert_eq!(
             stream_info_from_transport_url("file:///etc/passwd").await,
-            Err(ResolveError::Url("unsupported scheme"))
+            Err(ResolveError::Fetch(FetchError::UnsupportedScheme))
         );
         assert_eq!(
             stream_info_from_transport_url("ftp://example.com/x").await,
-            Err(ResolveError::Url("unsupported scheme"))
+            Err(ResolveError::Fetch(FetchError::UnsupportedScheme))
         );
     }
 
@@ -1905,5 +1989,65 @@ async fn private_metadata_wire_does_not_advertise_inbound_port() {
         .await
         .expect("bounded metadata capture");
         crate::peer_policy::assert_signed_listen_port(&payload, if private { 0 } else { 8621 });
+    }
+}
+
+#[cfg(test)]
+mod failure_cause_tests {
+    use super::*;
+    #[tokio::test]
+    async fn catalog_connect_failure_retains_network_cause_before_formatting() {
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            fetch_catalog_transport_query(
+                "127.0.0.1",
+                0,
+                "pid",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(format!("{error:?}"), "Catalog(\"catalog connect failed\")");
+        assert_eq!(error.failure_kind(), ResolveFailureKind::Network);
+    }
+
+    #[test]
+    fn fetch_failure_causes_survive_identical_legacy_diagnostics() {
+        let rejected = transport_fetch_error(FetchError::RedirectRejected);
+        let unavailable = transport_fetch_error(FetchError::HttpStatus);
+        assert_eq!(format!("{rejected:?}"), "Url(\"http status\")");
+        assert_eq!(format!("{unavailable:?}"), "Url(\"http status\")");
+        assert_eq!(rejected.failure_kind(), ResolveFailureKind::SafetyRefusal);
+        assert_eq!(unavailable.failure_kind(), ResolveFailureKind::Network);
+    }
+
+    #[test]
+    fn guarded_fetch_causes_are_classified_without_message_matching() {
+        for (error, expected) in [
+            (FetchError::BadUrl, ResolveFailureKind::InvalidSelector),
+            (
+                FetchError::AddressBlocked,
+                ResolveFailureKind::SafetyRefusal,
+            ),
+            (FetchError::ConnectTimeout, ResolveFailureKind::Network),
+            (FetchError::BodyFailed, ResolveFailureKind::Network),
+            (
+                FetchError::BodyFrameTooLarge,
+                ResolveFailureKind::RejectedMetadata,
+            ),
+            (FetchError::Cancelled, ResolveFailureKind::Cancelled),
+        ] {
+            assert_eq!(transport_fetch_error(error).failure_kind(), expected);
+        }
+        assert_eq!(
+            ResolveError::ProtectedContent.failure_kind(),
+            ResolveFailureKind::ProtectedContent
+        );
+        assert_eq!(
+            ResolveError::InvalidProtection.failure_kind(),
+            ResolveFailureKind::InvalidProtection
+        );
     }
 }

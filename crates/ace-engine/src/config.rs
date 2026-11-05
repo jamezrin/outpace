@@ -322,6 +322,8 @@ config_with_root_redaction! {
     pub peer_policy: ace_swarm::peer_policy::PeerPolicy,
     /// Operator file declarations, loaded before network startup.
     pub private_descriptors: crate::local_descriptors::DescriptorPaths,
+    /// Explicit autonomous live sources; unset/empty never starts support work.
+    pub support_sources: crate::support_config::SupportSources,
     /// Address the HTTP API binds to.
     pub bind: SocketAddr,
     /// Provider resources; zero is unlimited.
@@ -422,6 +424,7 @@ impl Default for Config {
         Config {
             peer_policy: Default::default(),
             private_descriptors: Default::default(),
+            support_sources: Default::default(),
             max_sessions: 0,
             bind: "127.0.0.1:6878".parse().unwrap(),
             rtmp_bind: "127.0.0.1:1935".parse().unwrap(),

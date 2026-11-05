@@ -9,6 +9,7 @@
 //! public content-id derivation (see [`ace_swarm::resolve`]). Cold infohashes use the
 //! authenticated catalog and require a descriptor whose computed hash matches the request.
 
+use crate::start_failure::{ProviderStartFailure, StartFailureKind};
 mod announce;
 mod catalog_resolution;
 #[cfg(test)]
@@ -630,12 +631,18 @@ impl StreamProvider for AceProvider {
     }
 
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        self.open_classified(id)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn open_classified(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderStartFailure> {
         // One resolver for every live entry point. A bare infohash without a verified
         // descriptor fails closed here, before any discovery (#164).
         let opening = Instant::now();
         crate::alog!("[ace] discovery stage=open-request");
-        let info = self.resolve_live_info(id).await?;
-        info.ensure_playable().map_err(ProviderError::from)?;
+        let info = self.resolve_live_info_classified(id).await?;
+        info.ensure_playable().map_err(ProviderStartFailure::from)?;
         crate::alog!(
             "[ace] discovery stage=resolved resolve_ms={}",
             opening.elapsed().as_millis()
@@ -658,7 +665,9 @@ impl StreamProvider for AceProvider {
                 .await
             })
         });
-        self.open_resolved(id, info, discovery).await
+        self.open_resolved(id, info, discovery)
+            .await
+            .map_err(|error| ProviderStartFailure::new(StartFailureKind::Discovery, error))
     }
 }
 

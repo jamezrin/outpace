@@ -94,6 +94,97 @@ async fn empty(m: &StreamManager) {
 }
 
 #[tokio::test]
+async fn support_abandoned_pending_open_is_disposed_without_publishing_pin() {
+    let (manager, provider) = setup(1);
+    let caller = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.acquire_support("synthetic", "pending").await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), provider.entered.notified())
+        .await
+        .unwrap();
+    caller.abort();
+    let _ = caller.await;
+    assert_eq!(manager.admission_status().0, 1);
+    provider.finish.notify_one();
+    empty(&manager).await;
+    assert!(manager.get("synthetic", "pending").await.is_none());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(manager.admission_status().0, 0);
+    assert!(manager.shutdown().await);
+}
+
+#[tokio::test]
+async fn support_force_stop_fences_pending_open_before_pin_delivery() {
+    let (manager, provider) = setup(1);
+    let caller = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.acquire_support("synthetic", "pending").await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), provider.entered.notified())
+        .await
+        .unwrap();
+    // Poll the actual stop through its synchronous pending-generation fence.
+    let mut stopping = Box::pin(manager.stop_checked("synthetic", "pending"));
+    let _ = futures::poll!(stopping.as_mut());
+    assert!(!manager.hls_transitions.lock().unwrap().cancelled.is_empty());
+    assert_eq!(manager.admission_status().0, 1);
+    provider.finish.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(1), caller)
+        .await
+        .unwrap()
+        .unwrap();
+    let refused = matches!(result, Err(ProviderError::NotFound));
+    drop(result);
+    drop(stopping);
+    assert!(manager.shutdown().await);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(manager.admission_status().0, 0);
+    assert!(manager.get("synthetic", "pending").await.is_none());
+    assert!(
+        refused,
+        "force-stopped initialization must not publish a support pin"
+    );
+}
+
+#[tokio::test]
+async fn support_existing_session_acquisition_rechecks_stop_after_map_wait() {
+    let (manager, provider) = setup(1);
+    let retained = manager.get_or_start("synthetic", "live").await.unwrap();
+    let map = manager.sessions.lock().await;
+    let transition = HlsTransition::begin(
+        manager.hls_transitions.clone(),
+        ("synthetic".into(), "live".into()),
+    );
+    let (_cancel, cancel) = watch::channel(false);
+    let mut acquiring = Box::pin(manager.get_or_start_owned(
+        "synthetic",
+        "live",
+        cancel,
+        transition,
+        None,
+        |session| session.support_pin(),
+    ));
+    assert!(futures::poll!(acquiring.as_mut()).is_pending());
+    let mut stopping = Box::pin(manager.stop_checked("synthetic", "live"));
+    assert!(futures::poll!(stopping.as_mut()).is_pending());
+    assert!(!manager.hls_transitions.lock().unwrap().cancelled.is_empty());
+    drop(map);
+    let (acquired, stopped) = tokio::join!(acquiring, stopping);
+    let refused =
+        matches!(&acquired, Err(failure) if matches!(failure.error, ProviderError::NotFound));
+    drop(acquired);
+    assert!(stopped.unwrap());
+    assert!(manager.shutdown().await);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(retained.support_pin_count(), 0);
+    assert!(
+        refused,
+        "existing-session acquisition ignored cancellation while awaiting map access"
+    );
+}
+
+#[tokio::test]
 async fn admission_live_fanout_hls_stop_retained_pump_and_completion() {
     let (m, p) = setup(1);
     let first = m.get_or_start("synthetic", "live").await.unwrap();
@@ -509,6 +600,84 @@ impl StreamProvider for ClosingProvider {
 #[tokio::test]
 async fn paused_live_shutdown_retains_capacity_through_cancelled_stop_waiter() {
     paused_live_cleanup(false).await;
+}
+
+#[tokio::test]
+async fn support_release_waits_for_already_retired_generation_cleanup() {
+    let state = Arc::new(ClosingState::default());
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(ClosingProvider(state.clone())));
+    let manager = StreamManager::with_session_limit(registry, 1);
+    let pin = manager.acquire_support("synthetic", "live").await.unwrap();
+    let stopping = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.stop_checked("synthetic", "live").await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), state.entered.notified())
+        .await
+        .unwrap();
+    let mut releasing = Box::pin(manager.release_support("synthetic", "live", pin));
+    let waited = futures::poll!(releasing.as_mut()).is_pending();
+    let occupied = manager.admission_status().0;
+    stopping.abort();
+    let _ = stopping.await;
+    state.release.notify_one();
+    if waited {
+        assert!(!tokio::time::timeout(Duration::from_secs(1), releasing)
+            .await
+            .unwrap()
+            .unwrap());
+    } else {
+        drop(releasing);
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .unwrap()
+    );
+    assert_eq!(occupied, 1);
+    assert!(state.dropped.load(Ordering::SeqCst));
+    assert_eq!(manager.admission_status().0, 0);
+    assert!(
+        waited,
+        "release must not finish while its retired source cleanup remains pending"
+    );
+}
+
+#[tokio::test]
+async fn support_cancelled_release_keeps_cleanup_and_capacity_owned() {
+    let state = Arc::new(ClosingState::default());
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(ClosingProvider(state.clone())));
+    let manager = StreamManager::with_session_limit(registry, 1);
+    let pin = manager.acquire_support("synthetic", "live").await.unwrap();
+    let releasing = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.release_support("synthetic", "live", pin).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), state.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(manager.admission_status().0, 1);
+    assert!(!releasing.is_finished());
+    releasing.abort();
+    let _ = releasing.await;
+    let refused = matches!(
+        manager.acquire_support("synthetic", "other").await,
+        Err(ProviderError::CapacityExhausted)
+    );
+    state.release.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .unwrap()
+    );
+    assert!(state.dropped.load(Ordering::SeqCst));
+    assert_eq!(manager.admission_status().0, 0);
+    assert!(
+        refused,
+        "canceling release must not release pending source capacity"
+    );
 }
 
 #[tokio::test]
@@ -963,6 +1132,28 @@ impl StreamProvider for FailedShutdownProvider {
         Ok(Box::new(FailedShutdownSource(ClosingLive(self.0.clone()))))
     }
 }
+
+#[tokio::test]
+async fn support_retired_cleanup_failure_is_not_success_or_reusable_capacity() {
+    let state = Arc::new(ClosingState::default());
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(FailedShutdownProvider(state.clone())));
+    let manager = StreamManager::with_session_limit(registry, 1);
+    let pin = manager.acquire_support("synthetic", "live").await.unwrap();
+    assert_eq!(
+        manager.stop_checked("synthetic", "live").await,
+        Err(StopError::CleanupUnconfirmed)
+    );
+    assert_eq!(
+        manager.release_support("synthetic", "live", pin).await,
+        Err(StopError::CleanupUnconfirmed)
+    );
+    assert_eq!(manager.admission_status().0, 1);
+    assert!(!manager.shutdown().await);
+    assert!(!state.dropped.load(Ordering::SeqCst));
+    drop(manager);
+    assert!(state.dropped.load(Ordering::SeqCst));
+}
 #[tokio::test]
 async fn failed_source_shutdown_retains_source_and_admission_until_owner_destruction() {
     let state = Arc::new(ClosingState::default());
@@ -1134,4 +1325,246 @@ async fn retired_generation_completion_does_not_remove_or_cancel_replacement() {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         assert_eq!(manager.admission_status().0, 0);
     }
+}
+
+#[tokio::test]
+async fn support_stale_open_preserves_newer_desired_intent() {
+    let (manager, provider) = setup(1);
+    let control = manager
+        .register_support("synthetic", "pending")
+        .await
+        .unwrap();
+    let initial = control.intent();
+    let opening = tokio::spawn({
+        let manager = manager.clone();
+        let control = control.clone();
+        async move {
+            manager
+                .acquire_declared_support(&control, initial.epoch)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), provider.entered.notified())
+        .await
+        .unwrap();
+    manager.set_support_running(&control, false).await.unwrap();
+    let newer = manager.set_support_running(&control, true).await.unwrap();
+    provider.finish.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(1), opening)
+        .await
+        .unwrap()
+        .unwrap();
+    let refused =
+        matches!(&result, Err(failure) if matches!(failure.error, ProviderError::NotFound));
+    drop(result);
+    let not_published = manager.get("synthetic", "pending").await.is_none();
+    let preserved = control.intent() == newer;
+    manager.reap_idle_at(Instant::now()).await;
+    provider.finish.notify_one();
+    let current = manager
+        .acquire_declared_support(&control, newer.epoch)
+        .await
+        .unwrap();
+    manager
+        .release_support("synthetic", "pending", current)
+        .await
+        .unwrap();
+    assert!(manager.shutdown().await);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(manager.admission_status().0, 0);
+    assert!(refused && not_published && preserved);
+}
+
+#[tokio::test]
+async fn support_stale_existing_map_attempt_cannot_join_after_restart() {
+    let (manager, provider) = setup(1);
+    let held = manager.acquire_support("synthetic", "live").await.unwrap();
+    let control = manager.register_support("synthetic", "live").await.unwrap();
+    let attempt = crate::support_control::SupportAttempt {
+        control: control.clone(),
+        epoch: control.intent().epoch,
+    };
+    let map = manager.sessions.lock().await;
+    let transition = HlsTransition::begin(
+        manager.hls_transitions.clone(),
+        ("synthetic".into(), "live".into()),
+    );
+    let (_cancel, cancel) = watch::channel(false);
+    let mut acquiring = Box::pin(manager.get_or_start_owned(
+        "synthetic",
+        "live",
+        cancel,
+        transition,
+        Some(attempt),
+        |session| session.support_pin(),
+    ));
+    assert!(futures::poll!(acquiring.as_mut()).is_pending());
+    manager.set_support_running(&control, false).await.unwrap();
+    let newer = manager.set_support_running(&control, true).await.unwrap();
+    drop(map);
+    let result = acquiring.await;
+    let refused =
+        matches!(&result, Err(failure) if matches!(failure.error, ProviderError::NotFound));
+    drop(result);
+    let fresh = manager
+        .acquire_declared_support(&control, newer.epoch)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(fresh.session(), held.session()));
+    assert_eq!(held.session().support_pin_count(), 2);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    manager
+        .release_support("synthetic", "live", fresh)
+        .await
+        .unwrap();
+    manager
+        .release_support("synthetic", "live", held)
+        .await
+        .unwrap();
+    assert!(manager.shutdown().await);
+    assert!(refused);
+}
+
+struct PendingFailedProvider {
+    source: Arc<ClosingState>,
+    entered: Notify,
+    release: Notify,
+}
+#[async_trait]
+impl StreamProvider for PendingFailedProvider {
+    fn network(&self) -> &'static str {
+        "synthetic"
+    }
+    async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(Box::new(FailedShutdownSource(ClosingLive(
+            self.source.clone(),
+        ))))
+    }
+}
+#[tokio::test]
+async fn declared_cancelled_open_cleanup_failure_is_terminal_and_keeps_capacity() {
+    let state = Arc::new(ClosingState::default());
+    let provider = Arc::new(PendingFailedProvider {
+        source: state.clone(),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let mut registry = ProviderRegistry::new();
+    registry.register(provider.clone());
+    let manager = StreamManager::with_session_limit(registry, 1);
+    let control = manager.register_support("synthetic", "live").await.unwrap();
+    let opening = tokio::spawn({
+        let manager = manager.clone();
+        let control = control.clone();
+        async move {
+            manager
+                .acquire_declared_support(&control, control.intent().epoch)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), provider.entered.notified())
+        .await
+        .unwrap();
+    manager.set_support_running(&control, false).await.unwrap();
+    provider.release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(1), opening)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .unwrap();
+    let occupied = manager.admission_status().0;
+    assert!(!manager.shutdown().await);
+    assert!(!state.dropped.load(Ordering::SeqCst));
+    drop(manager);
+    assert!(state.dropped.load(Ordering::SeqCst));
+    assert_eq!(occupied, 1);
+    assert_eq!(
+        error.kind,
+        crate::start_failure::StartFailureKind::CleanupUnconfirmed
+    );
+    assert!(!error.kind.retryable());
+}
+
+#[tokio::test]
+async fn declared_start_session_capacity_is_typed_and_does_not_open_provider() {
+    let (manager, provider) = setup(1);
+    let pin = manager.acquire_support("synthetic", "live").await.unwrap();
+    let control = manager
+        .register_support("synthetic", "other")
+        .await
+        .unwrap();
+    let error = manager
+        .acquire_declared_support(&control, control.intent().epoch)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    manager
+        .release_support("synthetic", "live", pin)
+        .await
+        .unwrap();
+    assert!(manager.shutdown().await);
+    assert_eq!(error.kind, crate::start_failure::StartFailureKind::Capacity);
+    assert!(error.kind.retryable());
+    assert_eq!(error.error.to_string(), "session capacity reached");
+}
+
+#[tokio::test]
+async fn completed_support_generation_retires_despite_old_viewers_and_pins() {
+    let (manager, provider) = setup(1);
+    let first = manager
+        .acquire_support("synthetic", "complete")
+        .await
+        .unwrap();
+    let second = manager
+        .acquire_support("synthetic", "complete")
+        .await
+        .unwrap();
+    let viewer = first.session().subscribe();
+    let old = first.session().clone();
+    let mut completed = old.completion_receiver();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), wait_cleanup(&mut completed))
+            .await
+            .unwrap()
+    );
+    assert_eq!(old.subscriber_count(), 1);
+    assert_eq!(old.support_pin_count(), 2);
+    let retired = manager
+        .release_support("synthetic", "complete", first)
+        .await
+        .unwrap();
+    let absent = manager.get("synthetic", "complete").await.is_none();
+    // Restore all owners even against the old release policy before asserting.
+    if !absent {
+        manager.stop_checked("synthetic", "complete").await.unwrap();
+    }
+    let fresh = manager
+        .acquire_support("synthetic", "complete")
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old, fresh.session()));
+    assert!(!manager
+        .release_support("synthetic", "complete", second)
+        .await
+        .unwrap());
+    assert!(Arc::ptr_eq(
+        &manager.get("synthetic", "complete").await.unwrap(),
+        fresh.session()
+    ));
+    manager
+        .release_support("synthetic", "complete", fresh)
+        .await
+        .unwrap();
+    drop(viewer);
+    assert!(manager.shutdown().await);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(manager.admission_status().0, 0);
+    assert!(
+        retired && absent,
+        "completed generation must leave the map without waiting for old media handles"
+    );
 }

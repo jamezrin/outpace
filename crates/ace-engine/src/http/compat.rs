@@ -56,7 +56,7 @@ pub(super) async fn ace_getstream(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match s.manager.get_or_start(&network, &session_key).await {
+    match s.manager.get_or_subscribe(&network, &session_key).await {
         Ok(session) => ace_stream_session_response(
             session,
             expires_at,
@@ -269,7 +269,7 @@ pub(super) async fn ace_playback(
     let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&id, &token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match s.manager.get_or_start(&network, &session_key).await {
+    match s.manager.get_or_subscribe(&network, &session_key).await {
         Ok(session) => ace_stream_session_response(session, expires_at, cancel, None),
         Err(error) => {
             // Provider messages may embed identifiers or credentials. Log only the typed
