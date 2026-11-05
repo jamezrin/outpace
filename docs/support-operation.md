@@ -9,14 +9,16 @@ Set `OUTPACE_SUPPORT_SOURCES` to a JSON object mapping operator names to existin
 selectors, for example:
 
 ```sh
-export OUTPACE_SUPPORT_SOURCES='{"relay":"local:example"}'
+export OUTPACE_SUPPORT_SOURCES='{"relay":"https://example.invalid/source.acelive"}'
 outpace serve
 ```
 
-This example requires an existing local descriptor alias named `example`; it does not create
-one. The CLI's existing content-id, verified-infohash, local-descriptor and transport-URL
-selector grammar applies. Resolution still enforces descriptor provenance and protection
-refusal. VOD is rejected. Never put credentials into declaration names.
+Replace the illustrative URL with a public live transport descriptor, or use an existing
+content-id or verified-infohash selector. The transport fetch guard still applies; loopback
+and private destinations are not admitted by this setting. Local alias syntax is recognized
+by the shared selector parser, but daemon local-descriptor maps require private mode and
+cannot configure this public service. Resolution still enforces descriptor provenance and
+protection refusal. VOD is rejected. Never put credentials into declaration names.
 
 Unset means off. The JSON input is limited to 64 KiB and eight declarations. Names must be
 1–64 ASCII letters, digits, underscores or hyphens. Input selectors are limited to 4096 bytes.
