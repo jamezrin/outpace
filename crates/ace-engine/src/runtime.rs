@@ -2438,3 +2438,7 @@ mod inbound_policy_tests;
 #[cfg(test)]
 #[path = "runtime/support_tests.rs"]
 mod support_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "runtime/support_topology_tests.rs"]
+mod support_topology_tests;

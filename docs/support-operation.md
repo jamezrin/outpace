@@ -81,9 +81,10 @@ global/per-stream limits and unchoke scheduling still apply. Support creates no 
 and does not count as a viewer. It still uses the normal source pump and media processing;
 parser avoidance or a measured throughput improvement is not claimed.
 
-This increment establishes configuration, supervision and native lifecycle controls. Full signed
-source → daemon-owned support → independent leecher validation and comparative resource evidence
-remain issue #270's final integration stage. Earlier signed pool tests do not by themselves prove
-that daemon composition. No official-engine interoperability or sustained readiness claim follows.
+The [offline topology checks](testing/support-topology.md) exercise signed upstream acquisition,
+daemon-owned support, independent peer replies and finite memory/disk restart/cache lifetimes.
+They use synthetic SDK metadata and loopback-only isolation, preserving public descriptor guards.
+Their finite resource observations do not establish official-engine interoperability, sustained
+readiness or statistical performance results. Earlier pool tests alone are not daemon evidence.
 Already admitted inbound snapshot readers and dependency-owned RTMP connections have independent
 lifetimes; joining the support source is not proof that all such consumers have disappeared.
