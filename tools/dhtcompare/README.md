@@ -4,7 +4,9 @@ Work in progress. Strict worker input parsing and bounded batch/deadline account
 All three actual implementations have passed target, silent-node, and
 malformed/uncorrelated/duplicate-response cases inside the offline namespace helper.
 The custom cases exercise ace-swarm's existing numeric-seed seam.
-Late-response, cancellation and whole-harness qualification remain incomplete.
+Fixed offline late-response-opportunity and external lookup-cancellation profiles
+are available. Internal cancellation/actor joining, observed late datagram receipt,
+and whole-harness/live qualification remain incomplete.
 There is no live worker executable, complete live comparison supervisor, public-network mode or library-adoption decision.
 A Linux offline namespace helper has synthetic lifecycle tests; it is not live clearance.
 The `candidates` feature is research-only, not a safe execution entry point.
@@ -146,8 +148,8 @@ that the lookup remained pending at that instruction. It does not prove that
 dropping a library stream joins its actor or interrupt a real constructor.
 Adapter clock tests separately cover consumed construction budget and a stream
 poll ending after its deadline. A blocking poll cannot be preempted by a Tokio
-timeout; the external process deadline remains the hard bound. Late network
-replies, allowed destinations, live workers and live results remain pending.
+timeout; the external process deadline remains the hard bound. Observed late datagram
+receipt, allowed destinations, live workers and live results remain pending.
 
 ## Emission accounting
 
