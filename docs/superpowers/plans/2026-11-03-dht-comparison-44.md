@@ -78,6 +78,22 @@ pending; no live measurement or issue-closure claim follows.
   formatting, hygiene and whitespace checks passed. PR/CI integration remains pending.
 
 Custom response-parser and upstream stream boundaries differ; these counts are
-not raw-wire equivalence or a live performance comparison. The custom callback's
-absolute-deadline observation semantics still require reconciliation before live
-comparison; this telemetry increment does not claim that issue resolved.
+not raw-wire equivalence or a live performance comparison. The custom observer now rejects post-deadline batches before accounting and retains
+earlier peers. Its deterministic controls cover that boundary; actual late UDP
+qualification is recorded in the follow-up below, without a live comparison claim.
+
+## Beyond-budget UDP opportunity follow-up
+
+- [x] Actual custom/mainline/n0 cases observe a get_peers query and send a correlated
+  ten-peer response after16seconds, with zero admitted peers and bounded lookup.
+- [x] Separate fixed80second/three22second-case profile, exact execution and both
+  socket witnesses, known namespace cleanup and failure/truncation controls.
+- [x] Allthree isolated cases pass in48.4seconds; target-positive controls pass.
+- [x] Numeric report query marker selection corrected with a behavioral regression;
+  original socket report/logs retained privately.
+- [ ] Independent review and PR/CI integration of this follow-up.
+
+Early exhaustion can precede the late send. Sending to a no-longer-polled socket
+does not prove delivery or internal rejection. This adds offline record/containment
+evidence only; public destination confinement, live workers/results and an adoption
+recommendation remain outstanding.

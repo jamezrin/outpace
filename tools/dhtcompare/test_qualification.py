@@ -93,4 +93,40 @@ class QualificationTests(unittest.TestCase):
         self.assertFalse(report['passed']);self.assertEqual(report['stop_reason'],'deadline')
         run.assert_not_called()
 
+class LateReplyTests(unittest.TestCase):
+    setUp=QualificationTests.setUp
+    tearDown=QualificationTests.tearDown
+    result=QualificationTests.result
+    def test_three_fixed_late_reply_cases(self):
+        def case(argv,**kw):
+            name=argv[2];out=f"dht_late_query_witness\ndht_late_send_witness\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n".encode()
+            return self.result(stdout=out,stdout_bytes=len(out))
+        with mock.patch('qualification.run_offline',side_effect=case) as run:
+            report=qualify(*self.artifacts,output=self.root/'late',mode='late-replies')
+        self.assertTrue(report['passed']);self.assertEqual(run.call_count,3)
+        self.assertTrue(all(c['query_witness'] and c['late_send_witness'] for c in report['cases']))
+        self.assertEqual([c.args[0][2] for c in run.call_args_list],['dht::comparison::custom_real_udp_late_reply','mainline_real_udp_late_reply','n0_real_udp_late_reply'])
+        self.assertTrue(all(c.kwargs['timeout']==22 for c in run.call_args_list))
+    def test_late_profile_keeps_cleanup_and_exact_test_guards(self):
+        name='dht::comparison::custom_real_udp_late_reply'
+        out=f"dht_late_query_witness\ndht_late_send_witness\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n".encode()
+        for i,changes in enumerate((dict(exit_code=7),dict(cleanup_complete=False),dict(truncated=True),dict(stdout=b'dht_late_query_witness\ndht_late_send_witness\nrunning 0 tests\n'))):
+            with self.subTest(changes=changes),mock.patch('qualification.run_offline',return_value=self.result(**(dict(stdout=out)|changes))) as run:
+                report=qualify(*self.artifacts,output=self.root/str(i),mode='late-replies')
+            self.assertFalse(report['passed']);self.assertEqual(run.call_count,1)
+    def test_late_profile_whole_budget_is_eighty_seconds(self):
+        ticks=iter([0])
+        def clock():return next(ticks,79)
+        with mock.patch('qualification.time.monotonic',side_effect=clock),mock.patch('qualification.run_offline') as run:
+            report=qualify(*self.artifacts,output=self.root/'late',mode='late-replies')
+        self.assertFalse(report['passed']);self.assertEqual(report['stop_reason'],'deadline');run.assert_not_called()
+    def test_late_reply_requires_both_real_socket_witnesses(self):
+        for missing in ('dht_late_query_witness','dht_late_send_witness'):
+            name='dht::comparison::custom_real_udp_late_reply'
+            markers=['dht_late_query_witness','dht_late_send_witness'];markers.remove(missing)
+            out=('\n'.join(markers)+f"\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n").encode()
+            with self.subTest(missing=missing),mock.patch('qualification.run_offline',return_value=self.result(stdout=out)) as run:
+                report=qualify(*self.artifacts,output=self.root/missing,mode='late-replies')
+            self.assertFalse(report['passed']);self.assertEqual(run.call_count,1)
+
 if __name__=='__main__':unittest.main()

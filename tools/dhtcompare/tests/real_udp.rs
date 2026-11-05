@@ -244,3 +244,91 @@ async fn mainline_real_udp_malformed_uncorrelated_duplicates() {
 async fn n0_real_udp_malformed_uncorrelated_duplicates() {
     fault_fixture(Candidate::N0, false).await
 }
+
+// A late send is not proof of receipt by an already exhausted lookup. These
+// cases qualify the adapter record and process boundary, not internal rejection.
+async fn late_fixture(candidate: Candidate) {
+    require_isolation();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let seed = socket.local_addr().unwrap().to_string();
+    let mut server = tokio::spawn(async move {
+        let mut packet = [0; 65536];
+        loop {
+            let (n, from) = socket.recv_from(&mut packet).await.unwrap();
+            let Value::Dict(query) = serde_bencode::from_bytes::<Value>(&packet[..n]).unwrap()
+            else {
+                panic!("not dictionary")
+            };
+            let Some(Value::Bytes(q)) = query.get(b"q".as_slice()) else {
+                continue;
+            };
+            assert!(matches!(
+                q.as_slice(),
+                b"find_node" | b"get_peers" | b"ping"
+            ));
+            let late = q == b"get_peers";
+            let mut response = HashMap::from([
+                (b"id".to_vec(), Value::Bytes(vec![42; 20])),
+                (b"nodes".to_vec(), Value::Bytes(Vec::new())),
+            ]);
+            if late {
+                println!("dht_late_query_witness");
+                let peers = (10001u16..=10010)
+                    .map(|port| {
+                        let mut peer = vec![127, 0, 0, 1];
+                        peer.extend(port.to_be_bytes());
+                        Value::Bytes(peer)
+                    })
+                    .collect();
+                response.insert(b"values".to_vec(), Value::List(peers));
+                response.insert(b"token".to_vec(), Value::Bytes(b"synthetic".to_vec()));
+                tokio::time::sleep(Duration::from_secs(16)).await;
+            }
+            let reply = Value::Dict(HashMap::from([
+                (b"t".to_vec(), query.get(b"t".as_slice()).unwrap().clone()),
+                (b"y".to_vec(), Value::Bytes(b"r".to_vec())),
+                (b"r".to_vec(), Value::Dict(response)),
+            ]));
+            socket
+                .send_to(&serde_bencode::to_bytes(&reply).unwrap(), from)
+                .await
+                .unwrap();
+            if late {
+                println!("dht_late_send_witness");
+                return;
+            }
+        }
+    });
+    let input = WorkerInput::parse("0123456789abcdef0123456789abcdef01234567", &seed).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let record = run(candidate, &input).await;
+        let joined = (&mut server).await;
+        (record, joined)
+    })
+    .await;
+    if result.is_err() {
+        server.abort();
+        let _ = server.await;
+    }
+    let (record, joined) = result.expect("late fixture exceeded bound after cleanup");
+    joined.expect("late fixture server failed");
+    assert_eq!(record.peer_count, 0);
+    assert!(record.first_peer.is_none());
+    assert_ne!(record.terminal, Terminal::Target);
+    assert!(matches!(
+        record.terminal,
+        Terminal::Deadline | Terminal::Exhausted
+    ));
+    assert!(record.elapsed <= Duration::from_millis(15500));
+}
+
+#[tokio::test]
+#[ignore = "run compiled test only via offline namespace helper"]
+async fn mainline_real_udp_late_reply() {
+    late_fixture(Candidate::Mainline).await
+}
+#[tokio::test]
+#[ignore = "run compiled test only via offline namespace helper"]
+async fn n0_real_udp_late_reply() {
+    late_fixture(Candidate::N0).await
+}
