@@ -164,3 +164,33 @@ after any library-specific filtering. The common collector then excludes zero
 ports and duplicate endpoints. Equal batch sizes do not prove equal parser policy,
 reachability, packet counts or discovery quality. Target overshoot explains a
 crossing batch; it is not a ranking. No identifiers are retained in these fields.
+
+## Beyond-budget UDP reply opportunities
+
+The `late-replies` offline profile uses the same `real_udp` upstream binary as
+initial qualification and the custom `ace-swarm` test binary. Build and pin both
+as above, then run:
+
+```sh
+python3.11 tools/dhtcompare/qualification.py --offline --mode late-replies \
+  --custom /absolute/path/to/ace_swarm-test-binary --custom-sha256 CUSTOM_BUILD_SHA256 \
+  --upstream /absolute/path/to/real_udp-test-binary --upstream-sha256 UPSTREAM_BUILD_SHA256 \
+  --output /private/path/to/new-late-reply-run
+```
+
+The fixed block has three cases, 22 seconds per execution, and an 80-second total
+budget including namespace cleanup. Every case must witness an actual `get_peers`
+query and a successful correlated UDP response send delayed 16 seconds after that
+query, beyond the 15-second lookup budget. The result must contain no peers or
+first-peer timestamp, must not report target completion, and must finish the
+lookup within 15.5 seconds. The fixture joins its server before asserting; normal
+socket scheduling tolerance is distinct from the external hard timeout. Missing
+witnesses, zero-test matches, truncation or uncertain cleanup fail qualification.
+
+A lookup may exhaust its frontier before its deadline. A successful send to a
+closed or no-longer-polled socket does not prove receipt or internal library
+rejection. These tests establish result accounting and external containment for a
+late response opportunity, not that all implementations waited the full budget
+or joined internal actors. Existing target cases supply the before-deadline
+positive controls. No public destination policy, live comparison or adoption is
+qualified by this profile.

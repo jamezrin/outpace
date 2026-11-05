@@ -312,3 +312,64 @@ async fn custom_external_lookup_cancel() {
     let _ = server.await;
     panic!("external owner did not cancel unresolved lookup");
 }
+
+#[tokio::test]
+#[ignore = "run compiled test only through offline comparison namespace"]
+async fn custom_real_udp_late_reply() {
+    require_offline();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(seed) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let mut server = tokio::spawn(async move {
+        let mut packet = [0; 65536];
+        let (n, from) = socket.recv_from(&mut packet).await.unwrap();
+        let query = Bencode::parse(&packet[..n]).unwrap();
+        assert_eq!(
+            query.get(b"q").and_then(Bencode::as_bytes),
+            Some(b"get_peers".as_slice())
+        );
+        println!("dht_late_query_witness");
+        let peers = (10001u16..=10010)
+            .map(|port| {
+                let mut peer = vec![127, 0, 0, 1];
+                peer.extend(port.to_be_bytes());
+                Bencode::Bytes(peer)
+            })
+            .collect();
+        let response = Bencode::Dict(BTreeMap::from([
+            (b"t".to_vec(), query.get(b"t").unwrap().clone()),
+            (b"y".to_vec(), Bencode::Bytes(b"r".to_vec())),
+            (
+                b"r".to_vec(),
+                Bencode::Dict(BTreeMap::from([
+                    (b"id".to_vec(), Bencode::Bytes(vec![42; 20])),
+                    (b"values".to_vec(), Bencode::List(peers)),
+                    (b"token".to_vec(), Bencode::Bytes(b"synthetic".to_vec())),
+                ])),
+            ),
+        ]));
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        socket.send_to(&response.encode(), from).await.unwrap();
+        println!("dht_late_send_witness");
+    });
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let record = run_comparison(&[1; 20], vec![seed]).await;
+        let joined = (&mut server).await;
+        (record, joined)
+    })
+    .await;
+    if result.is_err() {
+        server.abort();
+        let _ = server.await;
+    }
+    let (record, joined) = result.expect("late fixture exceeded bound after cleanup");
+    joined.expect("late fixture server failed");
+    assert_eq!(record["peer_count"], 0);
+    assert!(record["first_peer_seconds"].is_null());
+    assert!(matches!(
+        record["terminal"].as_str(),
+        Some("deadline" | "exhausted")
+    ));
+    assert!(record["elapsed_seconds"].as_f64().unwrap() <= 15.5);
+}

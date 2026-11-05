@@ -39,13 +39,15 @@ def qualify(custom,upstream,*,output,mode="qualification"):
     The 180-second qualification deadline covers all cases and cleanup; it is
     separate from the proposed 120-second live block, which this module cannot run.
     The optional three-case lookup-cancellation block has a 40-second deadline.
+    The three-case late-replies block has an 80-second deadline.
     Artifacts are trusted operator-supplied test binaries; pins detect stale builds,
     not concurrent hostile modification of the operator's files.
     """
-    if mode not in ('qualification','lookup-cancellation'):
+    if mode not in ('qualification','lookup-cancellation','late-replies'):
         raise ValueError('qualification_mode')
     cancellation=mode=='lookup-cancellation'
-    start=time.monotonic();deadline=start+(40 if cancellation else 180)
+    late=mode=='late-replies'
+    start=time.monotonic();deadline=start+(40 if cancellation else 80 if late else 180)
     custom.verify();upstream.verify()
     output=Path(output)
     output.mkdir(mode=0o700,parents=False,exist_ok=False)
@@ -60,6 +62,10 @@ def qualify(custom,upstream,*,output,mode="qualification"):
         schedule=[(custom,'dht::comparison::custom_external_lookup_cancel',8),
                   (upstream,'mainline_external_lookup_cancel',8),
                   (upstream,'n0_external_lookup_cancel',8)]
+    if late:
+        schedule=[(custom,'dht::comparison::custom_real_udp_late_reply',22),
+                  (upstream,'mainline_real_udp_late_reply',22),
+                  (upstream,'n0_real_udp_late_reply',22)]
     cases=[];reason='complete'
     for artifact,name,timeout in schedule:
         if deadline-time.monotonic()<timeout+2.1:
@@ -79,12 +85,15 @@ def qualify(custom,upstream,*,output,mode="qualification"):
                   and b"test result: ok. 1 passed; 0 failed; 0 ignored;" in result.stdout)
         passed=(executed and result.exit_code==0 and result.cleanup_complete
                 and not result.timed_out and not result.truncated)
-        witness=b'dht_lookup_query_witness\n' in result.stdout
+        witness=(b'dht_late_query_witness\n' if late else b'dht_lookup_query_witness\n') in result.stdout
+        late_send=b'dht_late_send_witness\n' in result.stdout
         if cancellation:
             passed=(witness and result.cancelled_on_witness and result.exit_code in (-9,137)
                     and b'dht_lookup_returned_before_cancel' not in result.stdout
                     and result.cleanup_complete and not result.timed_out and not result.truncated)
-        cases.append(dict(test=name,exit_code=result.exit_code,query_witness=witness,
+        if late:
+            passed=passed and witness and late_send
+        cases.append(dict(test=name,exit_code=result.exit_code,query_witness=witness,late_send_witness=late_send,
                           cancelled_on_witness=result.cancelled_on_witness,
                           elapsed_seconds=elapsed,cleanup_complete=result.cleanup_complete,
                           timed_out=result.timed_out,truncated=result.truncated,
@@ -103,7 +112,7 @@ def qualify(custom,upstream,*,output,mode="qualification"):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--offline',action='store_true',required=True)
-    parser.add_argument('--mode',choices=('qualification','lookup-cancellation'),default='qualification')
+    parser.add_argument('--mode',choices=('qualification','lookup-cancellation','late-replies'),default='qualification')
     parser.add_argument('--custom',type=Path,required=True)
     parser.add_argument('--custom-sha256',required=True)
     parser.add_argument('--upstream',type=Path,required=True)
