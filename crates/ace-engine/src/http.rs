@@ -45,6 +45,7 @@ mod broadcast;
 mod broadcast_source;
 mod compat;
 mod streams;
+mod support;
 mod vod;
 
 use broadcast::*;
@@ -260,6 +261,13 @@ async fn network_policy(State(s): State<AppState>) -> Json<serde_json::Value> {
 }
 
 pub fn router(state: AppState) -> Router {
+    router_with_support(state, None)
+}
+
+pub fn router_with_support(
+    state: AppState,
+    support_service: Option<Arc<crate::support::SupportService>>,
+) -> Router {
     let compat = state.experimental_ace_compat;
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -300,7 +308,9 @@ pub fn router(state: AppState) -> Router {
             .route("/server/api", get(server_api))
             .route("/webui/api/service", get(server_api));
     }
-    router.with_state(state)
+    router
+        .with_state(state)
+        .merge(support::router(support_service))
 }
 
 #[cfg(test)]

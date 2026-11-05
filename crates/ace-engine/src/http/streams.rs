@@ -218,15 +218,16 @@ pub(super) async fn stream_file_with_hls_timeout(
         Ok(id) => id,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
-    let session = match s.manager.get_or_start(&network, &id).await {
+    let session = match s.manager.get_or_subscribe(&network, &id).await {
         Ok(sess) => sess,
         Err(e) => return stream_start_error(e),
     };
     stream_session_response(session)
 }
 
-fn stream_session_response(session: Arc<StreamSession>) -> Response {
-    let sub = session.subscribe();
+fn stream_session_response(
+    (session, sub): (Arc<StreamSession>, crate::session::Subscription),
+) -> Response {
     // Per-client keyframe gate: holds a mid-GOP joiner until the first clean keyframe (with
     // PAT/PMT — and, when the stream has a resolved title, a synthesized SDT — prepended).
     let gate = ace_media::mpegts::KeyframeGate::with_service_name(session.metadata().title.clone());
@@ -261,12 +262,11 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
 }
 
 pub(super) fn ace_stream_session_response(
-    session: Arc<StreamSession>,
+    (session, sub): (Arc<StreamSession>, crate::session::Subscription),
     expires_at: Instant,
     cancel: tokio::sync::watch::Receiver<bool>,
     direct_lease: Option<AceDirectLeaseGuard>,
 ) -> Response {
-    let sub = session.subscribe();
     let gate = ace_media::mpegts::KeyframeGate::with_service_name(session.metadata().title.clone());
     let stream = futures::stream::unfold(
         (sub, gate, cancel, expires_at, direct_lease),

@@ -10,7 +10,9 @@ use crate::broadcast_pull::{
     ValidatedSourceConfig,
 };
 use crate::config::{load_or_create_identity, safe_in_memory_pool_limit, CacheType, Config};
-use crate::http::{router, AppState, BroadcastState};
+#[cfg(test)]
+use crate::http::router;
+use crate::http::{AppState, BroadcastState};
 use crate::manager::StreamManager;
 use crate::provider::ProviderRegistry;
 use ace_swarm::http_fetch::FetchPolicy;
@@ -59,6 +61,13 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
                 .as_deref(),
         ),
         ..defaults
+    };
+    config.support_sources = match std::env::var("OUTPACE_SUPPORT_SOURCES") {
+        Ok(raw) => crate::support_config::SupportSources::parse(Some(&raw))?,
+        Err(std::env::VarError::NotPresent) => Default::default(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(crate::support_config::SupportConfigError.into());
+        }
     };
     apply_broadcast_options_env(&mut config, std::env::var("OUTPACE_BROADCAST_OPTIONS"))?;
     let raw_sources = match std::env::var("OUTPACE_BROADCAST_SOURCES") {
@@ -230,6 +239,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.hls.validate()?;
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
+    config.support_sources.validate(&config)?;
     Ok(config)
 }
 
@@ -627,6 +637,7 @@ pub async fn build_runtime(
     mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    config.support_sources.validate(&config)?;
     crate::private_network::validate_private_config(&config, &bootstrap_peers)?;
     // Validate the complete ordered map before normalizer, filesystem, identity, or
     // runtime side effects, including when Config was constructed directly in Rust.
@@ -817,7 +828,20 @@ pub(crate) async fn serve_http_until(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manager = runtime.manager.clone();
     let broadcasts = runtime.broadcasts.clone();
-    let result = serve_http_inner(runtime, shutdown).await;
+    let mut support = None;
+    let result = serve_http_inner(runtime, shutdown, &mut support).await;
+    // Retain the service outside the serving future so every returned startup/HTTP
+    // error still joins support before the shared manager is shut down.
+    let support_cleanup = if let Some(service) = support {
+        service.shutdown().await
+    } else {
+        true
+    };
+    let result = if result.is_ok() && !support_cleanup {
+        Err(Box::new(std::io::Error::other("support cleanup failed")) as Box<dyn std::error::Error>)
+    } else {
+        result
+    };
     broadcasts.close_admissions();
     let cleanup = broadcasts.shutdown().await;
     // Both listener/startup errors and normal HTTP draining must finish HLS cleanup.
@@ -843,6 +867,7 @@ pub(crate) async fn serve_http_until(
 async fn serve_http_inner(
     runtime: EngineRuntime,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    support_owner: &mut Option<Arc<crate::support::SupportService>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let EngineRuntime {
         config,
@@ -965,7 +990,11 @@ async fn serve_http_inner(
     // Bind HTTP before starting broadcast-owned network work. RTMP keeps its existing
     // dependency listener/bind behavior; its owned handle is stopped on every exit path.
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    let mut rtmp = OwnedRtmpListener::start(rtmp_bind, broadcasts.clone());
+    let mut rtmp = if config.support_sources.is_empty() {
+        OwnedRtmpListener::start(rtmp_bind, broadcasts.clone())
+    } else {
+        OwnedRtmpListener::start_checked(rtmp_bind, broadcasts.clone()).await?
+    };
     eprintln!(
         "outpace: RTMP ingest listening on rtmp://{}/live/<name>",
         config.rtmp_bind
@@ -1002,12 +1031,33 @@ async fn serve_http_inner(
             () = &mut shutdown => return Ok(()),
             result = startup => result?,
         }
-        axum::serve(listener, router(state))
+        // Bind all required listeners and finish fallible broadcast setup before
+        // autonomous acquisition. No declarations means no supervisor/coordinator.
+        let support = if config.support_sources.is_empty() {
+            None
+        } else {
+            Some(
+                crate::support::SupportService::spawn(
+                    state.manager.clone(),
+                    &config.support_sources,
+                )
+                .await
+                .map_err(|_| std::io::Error::other("support startup failed"))?,
+            )
+        };
+        *support_owner = support.clone();
+        let draining_support = support.clone();
+        axum::serve(listener, crate::http::router_with_support(state, support))
             .with_graceful_shutdown(async move {
                 shutdown.await;
                 // Close/cancel before HTTP graceful drain can wait on a live request body.
                 draining_broadcasts.close_admissions();
                 cancel_rtmp.send_replace(true);
+                if let Some(service) = draining_support {
+                    if !service.shutdown().await {
+                        crate::alog!("[support] shutdown cleanup failed");
+                    }
+                }
                 if let Err(error) = draining_broadcasts.shutdown().await {
                     crate::alog!("[broadcast] shutdown: {}", error.code());
                 }
@@ -1028,10 +1078,36 @@ struct OwnedRtmpListener {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 impl OwnedRtmpListener {
+    async fn start_checked(
+        bind: SocketAddr,
+        broadcasts: BroadcastState,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (sender, ready) = tokio::sync::oneshot::channel();
+        let mut listener = Self::start_with_ready(bind, broadcasts, Some(sender));
+        if ready.await.is_err() {
+            if let Some(task) = listener.task.take() {
+                let _ = task.await;
+            }
+            return Err(Box::new(std::io::Error::other(
+                "RTMP listener failed to start",
+            )));
+        }
+        Ok(listener)
+    }
     fn start(bind: SocketAddr, broadcasts: BroadcastState) -> Self {
+        Self::start_with_ready(bind, broadcasts, None)
+    }
+    fn start_with_ready(
+        bind: SocketAddr,
+        broadcasts: BroadcastState,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Self {
         let (cancel, rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
-            if crate::rtmp::serve_rtmp(bind, broadcasts, rx).await.is_err() {
+            if crate::rtmp::serve_rtmp_with_ready(bind, broadcasts, rx, ready)
+                .await
+                .is_err()
+            {
                 crate::alog!("[rtmp] ingest stopped: listener_failed");
             }
         });
@@ -2358,3 +2434,7 @@ mod tests_pull206;
 
 #[cfg(test)]
 mod inbound_policy_tests;
+
+#[cfg(test)]
+#[path = "runtime/support_tests.rs"]
+mod support_tests;

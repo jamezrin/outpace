@@ -75,7 +75,7 @@ impl FetchUrl {
     }
 
     /// Preserve the transport wrapper's existing URL parser acceptance surface.
-    pub(crate) fn parse_transport(raw: &str) -> Result<Self, FetchError> {
+    pub fn parse_transport(raw: &str) -> Result<Self, FetchError> {
         let url = reqwest::Url::parse(raw).map_err(|_| FetchError::BadUrl)?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(FetchError::UnsupportedScheme);

@@ -1,21 +1,6 @@
 use super::*;
 
 impl AceProvider {
-    /// Resolve a content-id to a [`StreamInfo`] by fetching its `AceStreamTransport` metadata
-    /// from the signed catalog path or this daemon's own broadcast registry. With explicit
-    /// opt-in, BEP-9 peers can resolve raw wrapped-transport hashes (cached with a TTL).
-    /// Only a signed-catalog result is recorded in the
-    /// infohash index; a BEP-9 result goes to `peer_resolve_cache` and never makes its infohash
-    /// openable (#164).
-    async fn resolve_content_id(&self, content_id: &str) -> Result<StreamInfo, ProviderError> {
-        let cid = content_id.to_owned();
-        self.resolve_content_id_with_catalog(
-            content_id,
-            async move { catalog_live_info(&cid).await },
-        )
-        .await
-    }
-
     pub(super) async fn resolve_content_id_prepared(
         &self,
         cid: &str,
@@ -27,6 +12,7 @@ impl AceProvider {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_content_id_with_catalog(
         &self,
         content_id: &str,
@@ -42,62 +28,99 @@ impl AceProvider {
         content_id: &str,
         catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>> + Send + 'static,
     ) -> Result<ResolvedContentId, ProviderError> {
+        self.resolve_content_id_prepared_with_catalog_classified(content_id, catalog)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Resolve a content-id to a [`StreamInfo`] by fetching its `AceStreamTransport` metadata
+    /// from the signed catalog path or this daemon's own broadcast registry. With explicit
+    /// opt-in, BEP-9 peers can resolve raw wrapped-transport hashes (cached with a TTL).
+    /// Only a signed-catalog result is recorded in the
+    /// infohash index; a BEP-9 result goes to `peer_resolve_cache` and never makes its infohash
+    /// openable (#164).
+    async fn resolve_content_id_prepared_with_catalog_classified(
+        &self,
+        content_id: &str,
+        catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>> + Send + 'static,
+    ) -> Result<ResolvedContentId, ProviderStartFailure> {
         if let Some(info) = self
             .resolve_cache
             .get(content_id)
             .filter(|_| !self.peer_policy.is_private())
         {
-            info.ensure_playable().map_err(ProviderError::from)?;
+            info.ensure_playable().map_err(ProviderStartFailure::from)?;
             // Re-record: the bounded infohash index may have evicted it since (#164).
             self.infohash_index.put(info.clone());
             return Ok(ResolvedContentId::Catalog(info));
         }
-        let key = hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
+        let key = hex20(content_id).map_err(|_| {
+            ProviderStartFailure::new(
+                StartFailureKind::Resolution(
+                    ace_swarm::resolve::ResolveFailureKind::InvalidSelector,
+                ),
+                ProviderError::Backend("bad content-id".into()),
+            )
+        })?;
         if let Some(bytes) = self.seed_registry.broadcast_transport_for_content_id(&key) {
-            let info = stream_info_from_transport(&bytes).map_err(ProviderError::from)?;
-            info.ensure_playable().map_err(ProviderError::from)?;
+            let info = stream_info_from_transport(&bytes).map_err(ProviderStartFailure::from)?;
+            info.ensure_playable().map_err(ProviderStartFailure::from)?;
             return Ok(ResolvedContentId::Provider(info));
         }
         if self.bep9_content_id_fallback {
             if let Some(info) = self.peer_resolve_cache.get(content_id) {
-                info.ensure_playable().map_err(ProviderError::from)?;
+                info.ensure_playable().map_err(ProviderStartFailure::from)?;
                 return Ok(ResolvedContentId::Provider(info));
             }
         }
 
         if self.peer_policy.is_private() {
             if !self.bep9_content_id_fallback {
-                return Err(ProviderError::Unresolvable(
-                    "catalog_disabled_in_private_mode".into(),
+                return Err(ProviderStartFailure::new(
+                    StartFailureKind::Resolution(
+                        ace_swarm::resolve::ResolveFailureKind::SafetyRefusal,
+                    ),
+                    ProviderError::Unresolvable("catalog_disabled_in_private_mode".into()),
                 ));
             }
         } else {
             let catalog_error = match self.resolve_cache.resolve_with(content_id, catalog).await {
                 Ok(info) => {
-                    info.ensure_playable().map_err(ProviderError::from)?;
+                    info.ensure_playable().map_err(ProviderStartFailure::from)?;
                     crate::alog!("[ace] resolved content id via catalog");
                     self.infohash_index.put(info.clone());
                     return Ok(ResolvedContentId::Catalog(info));
                 }
                 Err(CatalogLookupError::Capacity) => {
-                    return Err(ProviderError::Backend(
-                        "content-id catalog resolution capacity exceeded".into(),
+                    return Err(ProviderStartFailure::new(
+                        StartFailureKind::Capacity,
+                        ProviderError::Backend(
+                            "content-id catalog resolution capacity exceeded".into(),
+                        ),
                     ));
                 }
                 Err(CatalogLookupError::Catalog(error)) => error,
             };
             match catalog_error.as_ref() {
-                ResolveError::ProtectedContent => return Err(ProviderError::ProtectedContent),
-                ResolveError::InvalidProtection => return Err(ProviderError::InvalidProtection),
+                ResolveError::ProtectedContent => {
+                    return Err(ProviderError::ProtectedContent.into())
+                }
+                ResolveError::InvalidProtection => {
+                    return Err(ProviderError::InvalidProtection.into())
+                }
                 ResolveError::Transport(reason) => {
-                    return Err(ProviderError::Backend(format!(
-                        "invalid descriptor metadata: {reason}"
-                    )));
+                    return Err(ProviderStartFailure::new(
+                        StartFailureKind::Resolution(catalog_error.failure_kind()),
+                        ProviderError::Backend(format!("invalid descriptor metadata: {reason}")),
+                    ));
                 }
                 _ => {}
             }
             if !self.bep9_content_id_fallback {
-                return Err(disabled_content_id_fallback(&catalog_error));
+                return Err(ProviderStartFailure::new(
+                    StartFailureKind::Resolution(catalog_error.failure_kind()),
+                    disabled_content_id_fallback(&catalog_error),
+                ));
             }
             crate::alog!(
                 "[ace] catalog resolution failed; trying opted-in raw-hash BEP-9 fallback"
@@ -149,7 +172,7 @@ impl AceProvider {
             .await
             {
                 Ok(info) => {
-                    info.ensure_playable().map_err(ProviderError::from)?;
+                    info.ensure_playable().map_err(ProviderStartFailure::from)?;
                     crate::alog!("[ace] resolved raw-hash content id via metadata peer");
                     // A raw transport hash is not catalog authentication: keep the descriptor
                     // out of the infohash index (#164).
@@ -157,7 +180,7 @@ impl AceProvider {
                     return Ok(ResolvedContentId::Provider(info));
                 }
                 Err(error @ (ResolveError::ProtectedContent | ResolveError::InvalidProtection)) => {
-                    return Err(ProviderError::from(error))
+                    return Err(ProviderStartFailure::from(error))
                 }
                 Err(ResolveError::Peer(why)) => {
                     if self.peer_policy.is_private() {
@@ -175,8 +198,9 @@ impl AceProvider {
                 }
             }
         }
-        Err(ProviderError::Backend(
-            "content-id resolution: no metadata peer responded".into(),
+        Err(ProviderStartFailure::new(
+            StartFailureKind::Discovery,
+            ProviderError::Backend("content-id resolution: no metadata peer responded".into()),
         ))
     }
 
@@ -193,7 +217,17 @@ impl AceProvider {
     ///
     /// Every signed-catalog content-id descriptor resolved here is recorded in the infohash
     /// index, so the stream can later be opened by its infohash too (BEP-9 results are not). outpace never guesses live geometry.
+    #[cfg(test)]
     pub(super) async fn resolve_live_info(&self, id: &str) -> Result<StreamInfo, ProviderError> {
+        self.resolve_live_info_classified(id)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(super) async fn resolve_live_info_classified(
+        &self,
+        id: &str,
+    ) -> Result<StreamInfo, ProviderStartFailure> {
         if id.starts_with("local:") {
             return match self.local_descriptors.get(id) {
                 Some(crate::local_descriptors::LocalDescriptor::Live(info)) => Ok(info.clone()),
@@ -203,16 +237,35 @@ impl AceProvider {
                 None => Err(ProviderError::Unresolvable(
                     "local_descriptor_unknown".into(),
                 )),
-            };
+            }
+            .map_err(|error| {
+                ProviderStartFailure::new(
+                    StartFailureKind::Resolution(
+                        ace_swarm::resolve::ResolveFailureKind::InvalidSelector,
+                    ),
+                    error,
+                )
+            });
         }
 
         if let Some(content_id) = id.strip_prefix("cid:") {
-            return self.resolve_content_id(content_id).await;
+            let cid = content_id.to_owned();
+            return self
+                .resolve_content_id_prepared_with_catalog_classified(content_id, async move {
+                    catalog_live_info(&cid).await
+                })
+                .await
+                .map(ResolvedContentId::into_info);
         }
         if let Some(url) = crate::transport_url::decode_transport_url(id) {
             if self.peer_policy.is_private() {
-                return Err(ProviderError::Unresolvable(
-                    "remote_descriptor_disabled_in_private_mode".into(),
+                return Err(ProviderStartFailure::new(
+                    StartFailureKind::Resolution(
+                        ace_swarm::resolve::ResolveFailureKind::SafetyRefusal,
+                    ),
+                    ProviderError::Unresolvable(
+                        "remote_descriptor_disabled_in_private_mode".into(),
+                    ),
                 ));
             }
             if let Some(info) = self.peer_resolve_cache.get(id) {
@@ -220,22 +273,27 @@ impl AceProvider {
             }
             // Not recorded in the index: a transport URL is caller-supplied, and the index is
             // shared state whose trackers the infohash does not bind (#164).
-            return stream_info_from_transport_url(&url)
-                .await
-                .map_err(|e| match e {
+            return stream_info_from_transport_url(&url).await.map_err(|error| {
+                let kind = StartFailureKind::Resolution(error.failure_kind());
+                let legacy = match error {
                     ResolveError::ProtectedContent | ResolveError::InvalidProtection => {
-                        ProviderError::from(e)
+                        ProviderError::from(error)
                     }
                     other => ProviderError::Backend(format!("transport url: {other:?}")),
-                });
+                };
+                ProviderStartFailure::new(kind, legacy)
+            });
         }
         if is_bare_hex40(id) {
             return self
-                .resolve_infohash_with_catalog(id, resolve_infohash_via_catalog(id))
+                .resolve_infohash_with_catalog_classified(id, resolve_infohash_via_catalog(id))
                 .await;
         }
-        Err(ProviderError::Backend(
-            "id must be a 40-hex infohash, cid:<40hex>, or a transport-url id".into(),
+        Err(ProviderStartFailure::new(
+            StartFailureKind::Resolution(ace_swarm::resolve::ResolveFailureKind::InvalidSelector),
+            ProviderError::Backend(
+                "id must be a 40-hex infohash, cid:<40hex>, or a transport-url id".into(),
+            ),
         ))
     }
 
@@ -270,18 +328,37 @@ impl AceProvider {
         Err(ProviderError::Unresolvable(unresolved_infohash_message(id)))
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_infohash_with_catalog(
         &self,
         id: &str,
         catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>>,
     ) -> Result<StreamInfo, ProviderError> {
-        let requested = hex20(id).map_err(|_| ProviderError::Backend("bad infohash".into()))?;
+        self.resolve_infohash_with_catalog_classified(id, catalog)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(super) async fn resolve_infohash_with_catalog_classified(
+        &self,
+        id: &str,
+        catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>>,
+    ) -> Result<StreamInfo, ProviderStartFailure> {
+        let requested = hex20(id).map_err(|_| {
+            ProviderStartFailure::new(
+                StartFailureKind::Resolution(
+                    ace_swarm::resolve::ResolveFailureKind::InvalidSelector,
+                ),
+                ProviderError::Backend("bad infohash".into()),
+            )
+        })?;
         if let Ok(info) = self.verified_info_for_infohash(id) {
             return Ok(info);
         }
         if self.peer_policy.is_private() {
-            return Err(ProviderError::Unresolvable(
-                "catalog_disabled_in_private_mode".into(),
+            return Err(ProviderStartFailure::new(
+                StartFailureKind::Resolution(ace_swarm::resolve::ResolveFailureKind::SafetyRefusal),
+                ProviderError::Unresolvable("catalog_disabled_in_private_mode".into()),
             ));
         }
         if self
@@ -291,28 +368,39 @@ impl AceProvider {
             .iter()
             .any(|(key, at)| *key == requested && at.elapsed() < INFOHASH_FAILURE_TTL)
         {
-            return Err(ProviderError::Unresolvable(format!(
-                "{} Recent catalog lookup failed; retry shortly.",
-                unresolved_infohash_message(id)
-            )));
+            return Err(ProviderStartFailure::new(
+                StartFailureKind::Cooldown,
+                ProviderError::Unresolvable(format!(
+                    "{} Recent catalog lookup failed; retry shortly.",
+                    unresolved_infohash_message(id)
+                )),
+            ));
         }
         let info = match catalog.await {
             Ok(info) => info,
             Err(error @ (ResolveError::ProtectedContent | ResolveError::InvalidProtection)) => {
-                return Err(ProviderError::from(error))
+                return Err(ProviderStartFailure::from(error))
             }
             Err(error) => {
                 self.remember_infohash_failure(requested);
-                return Err(ProviderError::Unresolvable(format!(
-                    "{} Catalog lookup failed: {error:?}",
-                    unresolved_infohash_message(id)
-                )));
+                return Err(ProviderStartFailure::new(
+                    StartFailureKind::Resolution(error.failure_kind()),
+                    ProviderError::Unresolvable(format!(
+                        "{} Catalog lookup failed: {error:?}",
+                        unresolved_infohash_message(id)
+                    )),
+                ));
             }
         };
         if info.infohash != requested {
             self.remember_infohash_failure(requested);
-            return Err(ProviderError::Unresolvable(
-                "catalog descriptor does not match the requested infohash".into(),
+            return Err(ProviderStartFailure::new(
+                StartFailureKind::Resolution(
+                    ace_swarm::resolve::ResolveFailureKind::RejectedMetadata,
+                ),
+                ProviderError::Unresolvable(
+                    "catalog descriptor does not match the requested infohash".into(),
+                ),
             ));
         }
         self.infohash_index.put(info.clone());
@@ -537,4 +625,124 @@ fn unresolved_infohash_message(id: &str) -> String {
          its infohash then works in this process. If {id} is itself a content id, open it as one \
          (cid:{id})."
     )
+}
+
+#[cfg(test)]
+mod classified_tests {
+    use super::*;
+    use crate::start_failure::StartFailureKind;
+    use ace_swarm::resolve::ResolveFailureKind;
+
+    #[tokio::test]
+    async fn classified_content_id_retains_catalog_network_and_response_causes() {
+        let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let network = provider
+            .resolve_content_id_prepared_with_catalog_classified(id, async {
+                Err(ResolveError::CatalogNetwork("same diagnostic"))
+            })
+            .await
+            .err()
+            .unwrap();
+        let response = provider
+            .resolve_content_id_prepared_with_catalog_classified(id, async {
+                Err(ResolveError::Catalog("same diagnostic"))
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(network.error.to_string(), response.error.to_string());
+        assert_eq!(
+            network.kind,
+            StartFailureKind::Resolution(ResolveFailureKind::Network)
+        );
+        assert_eq!(
+            response.kind,
+            StartFailureKind::Resolution(ResolveFailureKind::RejectedMetadata)
+        );
+        assert!(network.kind.retryable() && response.kind.retryable());
+        let invalid = provider
+            .resolve_content_id_prepared_with_catalog_classified("bad", async {
+                panic!("invalid selector must not poll catalog")
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            invalid.kind,
+            StartFailureKind::Resolution(ResolveFailureKind::InvalidSelector)
+        );
+        assert!(!invalid.kind.retryable());
+    }
+
+    #[tokio::test]
+    async fn classified_content_id_catalog_capacity_is_retryable_without_fetch() {
+        let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+        let ids: Vec<_> = (0..32).map(|index| infohash_hex(&[index; 20])).collect();
+        let mut pending: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                Box::pin(provider.resolve_cache.resolve_with(
+                    id,
+                    std::future::pending::<Result<StreamInfo, ResolveError>>(),
+                ))
+            })
+            .collect();
+        for future in &mut pending {
+            assert!(futures::poll!(future.as_mut()).is_pending());
+        }
+        let error = provider
+            .resolve_content_id_prepared_with_catalog_classified(
+                "0123456789abcdef0123456789abcdef01234567",
+                async { panic!("saturated catalog must not start another fetch") },
+            )
+            .await
+            .err()
+            .unwrap();
+        drop(pending);
+        assert_eq!(error.kind, StartFailureKind::Capacity);
+        assert!(error.kind.retryable());
+        assert_eq!(
+            error.error.to_string(),
+            "content-id catalog resolution capacity exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn classified_open_distinguishes_invalid_input_from_temporary_metadata_absence() {
+        let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+        let invalid = provider
+            .open_classified("not-a-selector")
+            .await
+            .err()
+            .unwrap();
+        let alias = provider
+            .open_classified("local:unknown")
+            .await
+            .err()
+            .unwrap();
+        let synthetic = "0123456789abcdef0123456789abcdef01234567";
+        provider.cache_infohash_failure_for_test(synthetic);
+        let cooldown = provider.open_classified(synthetic).await.err().unwrap();
+        assert_eq!(
+            invalid.kind,
+            StartFailureKind::Resolution(ResolveFailureKind::InvalidSelector)
+        );
+        assert!(!alias.kind.retryable());
+        assert_eq!(cooldown.kind, StartFailureKind::Cooldown);
+        assert!(cooldown.kind.retryable());
+    }
+
+    #[tokio::test]
+    async fn classified_open_preserves_guarded_url_safety_cause() {
+        let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+        let id = crate::transport_url::encode_transport_url("http://127.0.0.1/descriptor").unwrap();
+        let error = provider.open_classified(&id).await.err().unwrap();
+        assert_eq!(
+            error.kind,
+            StartFailureKind::Resolution(ResolveFailureKind::SafetyRefusal)
+        );
+        assert!(!error.kind.retryable());
+        assert!(error.error.to_string().contains("blocked address"));
+    }
 }

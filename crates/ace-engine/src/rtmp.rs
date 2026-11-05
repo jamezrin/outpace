@@ -18,12 +18,27 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 pub async fn serve_rtmp(
     bind: SocketAddr,
     broadcasts: BroadcastState,
+    cancel: watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_rtmp_with_ready(bind, broadcasts, cancel, None).await
+}
+
+pub(crate) async fn serve_rtmp_with_ready(
+    bind: SocketAddr,
+    broadcasts: BroadcastState,
     mut cancel: watch::Receiver<bool>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = ServerConfig::with_addr(bind).disable_gop_buffer();
     let server = RtmpServer::new(config, RtmpIngestHandler::new(broadcasts));
     server
-        .run_until(async move { cancelled(&mut cancel).await })
+        .run_until(async move {
+            // rtmp-rs polls this future only after its TcpListener bind succeeds.
+            if let Some(ready) = ready {
+                let _ = ready.send(());
+            }
+            cancelled(&mut cancel).await
+        })
         .await?;
     Ok(())
 }

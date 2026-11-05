@@ -455,6 +455,9 @@ Environment variables parsed by the daemon include:
   startup; absence retains 16. Changes require restart/recreation. For rollback set
   `OUTPACE_MAX_INBOUND_PER_STREAM=0`; Compose requires an explicit service environment override,
   shown in [deployment.md](docs/deployment.md), rather than `.env` interpolation alone.
+- `OUTPACE_SUPPORT_SOURCES` - opt-in bounded JSON declarations for autonomous public live
+  support. Unset is off; shares provider admission with playback and creates no viewers.
+  See [support operation](docs/support-operation.md) for controls and cleanup semantics.
 - `OUTPACE_ENABLE_SEEDING` - reciprocal upload gate over outbound leech connections
   (answering peers' chunk requests). Self-announce is gated on `OUTPACE_ENABLE_INBOUND`.
   Outbound reciprocal serving is outside the inbound admission/coordinator budgets.

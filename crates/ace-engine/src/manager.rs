@@ -7,6 +7,7 @@ use crate::provider::{
     ContentIdPreparation, ProviderError, ProviderRegistry, TsSource, VodContent,
 };
 use crate::session::{StreamSession, Subscription};
+use crate::start_failure::{ProviderStartFailure, StartFailureKind};
 use ace_swarm::types::{StreamInfo, StreamMetadata};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -19,7 +20,7 @@ use tokio::task::JoinHandle;
 type VodCacheEntry = (Arc<dyn VodContent>, Instant);
 type StreamKey = (String, String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StopError {
+pub enum StopError {
     CleanupUnconfirmed,
 }
 pub(crate) type FailedSources = Arc<StdMutex<Vec<Box<dyn TsSource>>>>;
@@ -157,7 +158,7 @@ impl WorkerControl {
         self.cancel.send_replace(true);
     }
 
-    fn transfer(&mut self) {
+    pub(crate) fn transfer(&mut self) {
         if let Some(join) = self.join.take() {
             // The coordinator is runtime-owned and exits only after every sender closes and
             // every transferred join completes. Neither HTTP cancellation nor Drop aborts it.
@@ -325,6 +326,7 @@ impl CleanupTracker {
 }
 
 pub struct StreamManager {
+    support_controls: StdMutex<Vec<Weak<crate::support_control::SupportControl>>>,
     registry: ProviderRegistry,
     admission: Arc<crate::admission::Admission>,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
@@ -356,6 +358,95 @@ pub struct StreamManager {
 }
 
 impl StreamManager {
+    /// Register one declaration without opening media. At most eight remain admitted.
+    pub async fn register_support(
+        &self,
+        network: &str,
+        id: &str,
+    ) -> Result<Arc<crate::support_control::SupportControl>, ProviderError> {
+        if id.is_empty() || id.len() > 8192 {
+            return Err(ProviderError::Backend(
+                "invalid support registration".into(),
+            ));
+        }
+        self.check_openable(network, id)?;
+        let _finalizing = self.hls_finalization.lock().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
+        let mut controls = self.support_controls.lock().unwrap();
+        controls.retain(|control| control.strong_count() > 0);
+        if controls.len() >= 8 {
+            return Err(ProviderError::CapacityExhausted);
+        }
+        let control = Arc::new(crate::support_control::SupportControl::new((
+            network.into(),
+            id.into(),
+        )));
+        controls.push(Arc::downgrade(&control));
+        Ok(control)
+    }
+
+    /// Explicit declaration control; ordinary viewer starts never call this.
+    pub async fn set_support_running(
+        &self,
+        control: &Arc<crate::support_control::SupportControl>,
+        running: bool,
+    ) -> Result<crate::support_control::SupportIntent, ProviderError> {
+        let _finalizing = self.hls_finalization.lock().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .support_controls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|registered| std::ptr::eq(registered.as_ptr(), Arc::as_ptr(control)))
+        {
+            return Err(ProviderError::NotFound);
+        }
+        Ok(control.set_running(running))
+    }
+
+    pub(crate) async fn restart_support(
+        &self,
+        control: &Arc<crate::support_control::SupportControl>,
+        expected: u64,
+    ) -> Result<crate::support_control::SupportIntent, ProviderError> {
+        let _finalizing = self.hls_finalization.lock().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .support_controls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|registered| std::ptr::eq(registered.as_ptr(), Arc::as_ptr(control)))
+        {
+            return Err(ProviderError::NotFound);
+        }
+        Ok(control.restart_if_epoch(expected))
+    }
+
+    // Called only under finalization, which also serializes explicit intent changes.
+    fn disable_support_controls(&self, key: Option<&StreamKey>) {
+        let mut controls = self.support_controls.lock().unwrap();
+        controls.retain(|registered| {
+            let Some(control) = registered.upgrade() else {
+                return false;
+            };
+            if key.is_none_or(|key| *key == control.key) {
+                control.set_running(false);
+            }
+            true
+        });
+    }
+
     pub fn new(registry: ProviderRegistry) -> Arc<StreamManager> {
         Self::with_buffer(registry, 256)
     }
@@ -389,6 +480,7 @@ impl StreamManager {
         max_sessions: usize,
     ) -> Arc<Self> {
         Arc::new(StreamManager {
+            support_controls: StdMutex::new(Vec::new()),
             registry,
             admission: crate::admission::Admission::new(max_sessions),
             sessions: Mutex::new(HashMap::new()),
@@ -564,11 +656,12 @@ impl StreamManager {
     }
 
     /// Keep initialization and its same-key lock owned after the caller is canceled.
-    async fn owned_live_start<T, F, Fut>(&self, key: StreamKey, run: F) -> Result<T, ProviderError>
+    async fn owned_live_start<T, F, Fut, E>(&self, key: StreamKey, run: F) -> Result<T, E>
     where
         T: Send + 'static,
+        E: From<ProviderStartFailure> + Send + 'static,
         F: FnOnce(watch::Receiver<bool>, HlsTransition) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<T, ProviderError>> + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
     {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let control = {
@@ -577,7 +670,11 @@ impl StreamManager {
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                return Err(ProviderError::NotFound);
+                return Err(ProviderStartFailure::new(
+                    StartFailureKind::Cancelled,
+                    ProviderError::NotFound,
+                )
+                .into());
             }
             // Register the generation before the spawned task can first be polled.
             // A stop after this public call becomes pending must already see it.
@@ -590,15 +687,155 @@ impl StreamManager {
             control.transfer();
             control
         };
-        let result = receiver
-            .await
-            .map_err(|_| ProviderError::Backend("live initializer failed".into()))?;
+        let result = receiver.await.map_err(|_| {
+            E::from(ProviderStartFailure::new(
+                StartFailureKind::CleanupUnconfirmed,
+                ProviderError::Backend("live initializer failed".into()),
+            ))
+        })?;
         control.join().await;
         result
     }
 
     /// Get the running session for `(network, id)` or start one via the provider. Returns
     /// `NotFound` if the network is unregistered.
+    /// Acquire for one registered desired-state generation.
+    pub async fn acquire_declared_support(
+        self: &Arc<Self>,
+        control: &Arc<crate::support_control::SupportControl>,
+        epoch: u64,
+    ) -> Result<crate::session::SupportPin, crate::start_failure::ProviderStartFailure> {
+        let attempt = crate::support_control::SupportAttempt {
+            control: control.clone(),
+            epoch,
+        };
+        {
+            let _finalizing = self.hls_finalization.lock().await;
+            if self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+                || attempt.current().is_none()
+                || !self
+                    .support_controls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|registered| std::ptr::eq(registered.as_ptr(), Arc::as_ptr(control)))
+            {
+                return Err(ProviderStartFailure::new(
+                    StartFailureKind::Cancelled,
+                    ProviderError::NotFound,
+                ));
+            }
+        }
+        let key = control.key.clone();
+        let manager = self.clone();
+        self.owned_live_start(key.clone(), move |cancel, transition| async move {
+            manager
+                .get_or_start_owned(
+                    &key.0,
+                    &key.1,
+                    cancel,
+                    transition,
+                    Some(attempt),
+                    |session| session.support_pin(),
+                )
+                .await
+        })
+        .await
+    }
+
+    pub async fn acquire_support(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+    ) -> Result<crate::session::SupportPin, ProviderError> {
+        self.check_openable(network, id)?;
+        let manager = self.clone();
+        let network = network.to_owned();
+        let id = id.to_owned();
+        self.owned_live_start(
+            (network.clone(), id.clone()),
+            move |cancel, transition| async move {
+                manager
+                    .get_or_start_owned(&network, &id, cancel, transition, None, |session| {
+                        session.support_pin()
+                    })
+                    .await
+            },
+        )
+        .await
+        .map_err(ProviderError::from)
+    }
+
+    /// Release one logical pin, joining its generation only when no demand remains.
+    /// `false` means another owner, a pending start, or a replacement prevented retirement.
+    pub async fn release_support(
+        &self,
+        network: &str,
+        id: &str,
+        pin: crate::session::SupportPin,
+    ) -> Result<bool, StopError> {
+        let key = (network.to_owned(), id.to_owned());
+        let session = pin.session().clone();
+        let entry = {
+            let _finalizing = self.hls_finalization.lock().await;
+            drop(pin);
+            if session.cancellation_requested() {
+                let mut completion = session.completion_receiver();
+                drop(_finalizing);
+                return if wait_cleanup(&mut completion).await {
+                    Ok(false)
+                } else {
+                    Err(StopError::CleanupUnconfirmed)
+                };
+            }
+            let pending = self
+                .hls_transitions
+                .lock()
+                .unwrap()
+                .pending
+                .contains_key(&key);
+            let mut packagers = self.packagers.lock().await;
+            let active_hls = packagers
+                .get(&key)
+                .is_some_and(|entry| entry.media.was_accessed_within(Instant::now(), self.grace));
+            let mut sessions = self.sessions.lock().await;
+            let completed = *session.completion_receiver().borrow();
+            if pending
+                || (!completed
+                    && (active_hls
+                        || session.support_pin_count() != 0
+                        || session.subscriber_count() != 0))
+                || !sessions
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                return Ok(false);
+            }
+            sessions.remove(&key);
+            self.record_stop(&key, session.completion_receiver());
+            session.cancel();
+            let entry = packagers.remove(&key);
+            if let Some(entry) = &entry {
+                self.record_stop(&key, entry.control.completion_receiver());
+                entry.media.stop();
+                entry.control.cancel();
+            }
+            entry
+        };
+        let mut success = session.stop().await;
+        if let Some(entry) = entry {
+            success &= entry.control.join().await;
+        }
+        self.stop_completions(&key);
+        if success {
+            Ok(true)
+        } else {
+            Err(StopError::CleanupUnconfirmed)
+        }
+    }
+
     pub async fn get_or_start(
         self: &Arc<Self>,
         network: &str,
@@ -621,34 +858,99 @@ impl StreamManager {
             (network.clone(), id.clone()),
             move |cancel, transition| async move {
                 manager
-                    .get_or_start_owned(&network, &id, cancel, transition)
+                    .get_or_start_owned(&network, &id, cancel, transition, None, |session| session)
                     .await
             },
         )
         .await
+        .map_err(ProviderError::from)
     }
 
-    async fn get_or_start_owned(
+    /// Acquire a real viewer under the generation fence. The subscription travels
+    /// with the result through initializer delivery, so last-support release and
+    /// idle reaping cannot retire a successfully admitted viewer during handoff.
+    pub async fn get_or_subscribe(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+    ) -> Result<(Arc<StreamSession>, crate::session::Subscription), ProviderError> {
+        self.check_openable(network, id)?;
+        let manager = self.clone();
+        let network = network.to_owned();
+        let id = id.to_owned();
+        self.owned_live_start(
+            (network.clone(), id.clone()),
+            move |cancel, transition| async move {
+                manager
+                    .get_or_start_owned(&network, &id, cancel, transition, None, |session| {
+                        let subscription = session.subscribe();
+                        (session, subscription)
+                    })
+                    .await
+            },
+        )
+        .await
+        .map_err(ProviderError::from)
+    }
+
+    async fn get_or_start_owned<T, F>(
         self: &Arc<Self>,
         network: &str,
         id: &str,
         mut cancel: watch::Receiver<bool>,
         mut transition: HlsTransition,
-    ) -> Result<Arc<StreamSession>, ProviderError> {
+        support: Option<crate::support_control::SupportAttempt>,
+        acquire: F,
+    ) -> Result<T, ProviderStartFailure>
+    where
+        F: FnOnce(Arc<StreamSession>) -> T + Send,
+        T: Send,
+    {
         self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
-        if transition.is_cancelled()
+        if support
+            .as_ref()
+            .is_some_and(|attempt| attempt.current().is_none())
+            || transition.is_cancelled()
             || *cancel.borrow()
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(ProviderError::NotFound);
+            return Err(ProviderStartFailure::new(
+                StartFailureKind::Cancelled,
+                ProviderError::NotFound,
+            ));
         }
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map.get(&key) {
-                return Ok(s.clone());
+                // Serialize pin/result publication with the stop generation fence,
+                // including cancellation that arrived during map-lock acquisition.
+                let lifecycle = transition.state.lock().unwrap();
+                if lifecycle
+                    .cancelled
+                    .contains(&(key.clone(), transition.generation))
+                    || *cancel.borrow()
+                    || self
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(ProviderStartFailure::new(
+                        StartFailureKind::Cancelled,
+                        ProviderError::NotFound,
+                    ));
+                }
+                let _intent_guard = match &support {
+                    Some(attempt) => Some(attempt.current().ok_or_else(|| {
+                        ProviderStartFailure::new(
+                            StartFailureKind::Cancelled,
+                            ProviderError::NotFound,
+                        )
+                    })?),
+                    None => None,
+                };
+                return Ok(acquire(s.clone()));
             }
         }
         // Serialize same-key starts and re-check: direct and HLS callers share this lock, while
@@ -656,31 +958,67 @@ impl StreamManager {
         let start_lock = self.session_start_lock(&key);
         let _starting = tokio::select! {
             biased;
-            _ = cancel.changed() => return Err(ProviderError::NotFound),
+            _ = cancel.changed() => return Err(ProviderStartFailure::new(StartFailureKind::Cancelled, ProviderError::NotFound)),
             guard = start_lock.lock() => guard,
         };
-        if *cancel.borrow()
+        if support
+            .as_ref()
+            .is_some_and(|attempt| attempt.current().is_none())
+            || *cancel.borrow()
             || transition.is_cancelled()
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(ProviderError::NotFound);
+            return Err(ProviderStartFailure::new(
+                StartFailureKind::Cancelled,
+                ProviderError::NotFound,
+            ));
         }
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map.get(&key) {
-                return Ok(s.clone());
+                // Serialize pin/result publication with the stop generation fence,
+                // including cancellation that arrived during map-lock acquisition.
+                let lifecycle = transition.state.lock().unwrap();
+                if lifecycle
+                    .cancelled
+                    .contains(&(key.clone(), transition.generation))
+                    || *cancel.borrow()
+                    || self
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(ProviderStartFailure::new(
+                        StartFailureKind::Cancelled,
+                        ProviderError::NotFound,
+                    ));
+                }
+                let _intent_guard = match &support {
+                    Some(attempt) => Some(attempt.current().ok_or_else(|| {
+                        ProviderStartFailure::new(
+                            StartFailureKind::Cancelled,
+                            ProviderError::NotFound,
+                        )
+                    })?),
+                    None => None,
+                };
+                return Ok(acquire(s.clone()));
             }
         }
-        let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
+        let provider = self.registry.get(network).ok_or_else(|| {
+            ProviderStartFailure::new(StartFailureKind::Cancelled, ProviderError::NotFound)
+        })?;
         let reservation = self.admission.reserve()?;
         let source: Box<dyn TsSource> = Box::new(crate::admission::Source {
-            inner: provider.open(id).await?,
+            inner: provider.open_classified(id).await?,
             _reservation: reservation,
         });
         let _finalizing = self.hls_finalization.lock().await;
-        if *cancel.borrow()
+        if support
+            .as_ref()
+            .is_some_and(|attempt| attempt.current().is_none())
+            || *cancel.borrow()
             || transition.finish()
             || self
                 .shutting_down
@@ -688,13 +1026,19 @@ impl StreamManager {
         {
             drop(_finalizing);
             if !self.cleanup.dispose_source(source).await {
-                return Err(ProviderError::Backend("source cleanup failed".into()));
+                return Err(ProviderStartFailure::new(
+                    StartFailureKind::CleanupUnconfirmed,
+                    ProviderError::Backend("source cleanup failed".into()),
+                ));
             }
-            return Err(ProviderError::NotFound);
+            return Err(ProviderStartFailure::new(
+                StartFailureKind::Cancelled,
+                ProviderError::NotFound,
+            ));
         }
         let session = StreamSession::start_with_cleanup(source, self.buffer, &self.cleanup);
         let mut map = self.sessions.lock().await;
-        Ok(map.entry(key).or_insert(session).clone())
+        Ok(acquire(map.entry(key).or_insert(session).clone()))
     }
 
     /// Peek at an already-running session without starting one.
@@ -896,6 +1240,7 @@ impl StreamManager {
         let key = (network.to_string(), id.to_string());
         let (entry, session, completions) = {
             let _finalizing = self.hls_finalization.lock().await;
+            self.disable_support_controls(Some(&key));
             {
                 let mut lifecycle = self.hls_transitions.lock().unwrap();
                 let pending = lifecycle
@@ -999,6 +1344,7 @@ impl StreamManager {
                     .iter()
                     .filter(|(key, session)| {
                         session.subscriber_count() == 0
+                            && session.support_pin_count() == 0
                             && !active_hls.contains(*key)
                             && !pending_hls.contains(*key)
                     })
@@ -1076,6 +1422,7 @@ impl StreamManager {
             let _finalizing = self.hls_finalization.lock().await;
             self.shutting_down
                 .store(true, std::sync::atomic::Ordering::Release);
+            self.disable_support_controls(None);
             if let Some(reaper) = self.reaper.lock().unwrap().take() {
                 reaper.cancel();
                 controls.push(reaper);
@@ -1804,6 +2151,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn support_pins_preserve_zero_viewer_source_and_share_admission() {
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(BlockingProvider {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }));
+        let manager =
+            StreamManager::with_admission_config(providers, 16, HlsConfig::default(), None, 1);
+        let first = manager.acquire_support("blocking", "fast").await.unwrap();
+        let second = manager.acquire_support("blocking", "fast").await.unwrap();
+        assert_eq!(first.session().subscriber_count(), 0);
+        assert!(Arc::ptr_eq(first.session(), second.session()));
+        let viewer = manager.get_or_start("blocking", "fast").await.unwrap();
+        assert!(Arc::ptr_eq(first.session(), &viewer));
+        assert_eq!(manager.admission_status().0, 1);
+        drop(viewer);
+        manager
+            .reap_idle_at(Instant::now() + Duration::from_secs(60))
+            .await;
+        let retained = manager.get("blocking", "fast").await;
+        drop(first);
+        drop(second);
+        assert!(manager.shutdown().await);
+        assert!(
+            retained.is_some(),
+            "headless pins must survive idle reaping without fake viewers"
+        );
+        assert_eq!(manager.admission_status().0, 0);
+    }
+
+    fn idle_support_manager() -> Arc<StreamManager> {
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(BlockingProvider {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }));
+        StreamManager::with_admission_config(providers, 16, HlsConfig::default(), None, 1)
+    }
+
+    #[tokio::test]
+    async fn support_release_cannot_retire_a_successful_viewer_handoff() {
+        let manager = idle_support_manager();
+        let pin = manager.acquire_support("blocking", "fast").await.unwrap();
+        let (session, mut viewer) = manager.get_or_subscribe("blocking", "fast").await.unwrap();
+        assert_eq!(session.subscriber_count(), 1);
+        // The successful acquisition has reached the caller, but response construction
+        // has not built its response yet. Subscription ownership crosses this gap.
+        let retired = manager
+            .release_support("blocking", "fast", pin)
+            .await
+            .unwrap();
+        let eof = matches!(
+            viewer.rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+        );
+        let held = manager.admission_status().0;
+        drop(viewer);
+        assert!(manager.shutdown().await);
+        assert!(
+            !retired && !eof && held == 1,
+            "viewer handoff lost source: retired={retired} eof={eof} held={held}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_viewer_handoff_owns_subscription_until_delivery_or_abandonment() {
+        let manager = idle_support_manager();
+        let pin = manager.acquire_support("blocking", "fast").await.unwrap();
+        let session = pin.session().clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let acquired = manager.get_or_subscribe("blocking", "fast").await.unwrap();
+        assert!(sender.send(acquired).is_ok());
+        let retired = manager
+            .release_support("blocking", "fast", pin)
+            .await
+            .unwrap();
+        manager
+            .reap_idle_at(Instant::now() + Duration::from_secs(60))
+            .await;
+        let queued_count = session.subscriber_count();
+        let queued_capacity = manager.admission_status().0;
+        drop(receiver);
+        let abandoned_count = session.subscriber_count();
+        manager
+            .reap_idle_at(Instant::now() + Duration::from_secs(60))
+            .await;
+        assert!(manager.shutdown().await);
+        assert!(!retired);
+        assert_eq!(queued_count, 1);
+        assert_eq!(queued_capacity, 1);
+        assert_eq!(abandoned_count, 0);
+        assert_eq!(manager.admission_status().0, 0);
+    }
+
+    #[tokio::test]
+    async fn support_last_release_joins_source_with_retained_media_handle() {
+        let manager = idle_support_manager();
+        let first = manager.acquire_support("blocking", "fast").await.unwrap();
+        let second = manager.acquire_support("blocking", "fast").await.unwrap();
+        let retained = first.session().clone();
+        assert!(!manager
+            .release_support("blocking", "fast", first)
+            .await
+            .unwrap());
+        assert_eq!(manager.admission_status().0, 1);
+        let retired = manager
+            .release_support("blocking", "fast", second)
+            .await
+            .unwrap();
+        let absent = manager.get("blocking", "fast").await.is_none();
+        let released = manager.admission_status().0 == 0;
+        assert!(manager.shutdown().await);
+        assert!(
+            retired && absent && released,
+            "last support owner must join actual source before returning"
+        );
+        assert!(matches!(
+            retained.raw_receiver().recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn support_release_preserves_actual_viewer() {
+        let manager = idle_support_manager();
+        let pin = manager.acquire_support("blocking", "fast").await.unwrap();
+        let viewer = pin.session().subscribe();
+        assert!(!manager
+            .release_support("blocking", "fast", pin)
+            .await
+            .unwrap());
+        assert!(manager.get("blocking", "fast").await.is_some());
+        assert_eq!(manager.admission_status().0, 1);
+        drop(viewer);
+        manager.reap_idle_at(Instant::now()).await;
+        assert_eq!(manager.admission_status().0, 0);
+        assert!(manager.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn support_release_preserves_recent_native_hls_demand() {
+        let manager = idle_support_manager();
+        let pin = manager.acquire_support("blocking", "fast").await.unwrap();
+        let media = manager.get_or_start_hls("blocking", "fast").await.unwrap();
+        assert!(!manager
+            .release_support("blocking", "fast", pin)
+            .await
+            .unwrap());
+        assert!(manager.get("blocking", "fast").await.is_some());
+        assert_eq!(manager.admission_status().0, 1);
+        manager
+            .reap_idle_at(Instant::now() + Duration::from_secs(60))
+            .await;
+        assert_eq!(manager.admission_status().0, 0);
+        assert!(manager.shutdown().await);
+        drop(media);
+    }
+
+    #[tokio::test]
+    async fn support_old_generation_release_cannot_retire_replacement() {
+        let manager = idle_support_manager();
+        let old = manager.acquire_support("blocking", "fast").await.unwrap();
+        assert!(manager.stop("blocking", "fast").await);
+        let replacement = manager.acquire_support("blocking", "fast").await.unwrap();
+        assert!(!Arc::ptr_eq(old.session(), replacement.session()));
+        assert!(!manager
+            .release_support("blocking", "fast", old)
+            .await
+            .unwrap());
+        manager.reap_idle_at(Instant::now()).await;
+        assert!(Arc::ptr_eq(
+            &manager.get("blocking", "fast").await.unwrap(),
+            replacement.session()
+        ));
+        let retired = manager
+            .release_support("blocking", "fast", replacement)
+            .await
+            .unwrap();
+        assert!(manager.shutdown().await);
+        assert!(retired);
+    }
+
+    #[tokio::test]
     async fn concurrent_first_requests_start_the_session_once() {
         // A provider that counts how many times `open` is called.
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2464,3 +2994,7 @@ mod tests {
 #[cfg(test)]
 #[path = "session_admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "support_control_tests.rs"]
+mod support_control_tests;
