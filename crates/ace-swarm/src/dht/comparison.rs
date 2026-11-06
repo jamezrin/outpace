@@ -373,3 +373,6 @@ async fn custom_real_udp_late_reply() {
     ));
     assert!(record["elapsed_seconds"].as_f64().unwrap() <= 15.5);
 }
+
+#[cfg(target_os = "linux")]
+mod worker;

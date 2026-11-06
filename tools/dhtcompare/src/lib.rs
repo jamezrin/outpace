@@ -247,3 +247,6 @@ pub fn remaining_budget(elapsed: Duration) -> Option<Duration> {
 
 #[cfg(feature = "candidates")]
 pub mod candidates;
+
+#[cfg(feature = "workers")]
+pub mod worker;

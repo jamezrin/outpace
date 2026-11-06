@@ -55,9 +55,9 @@ class QualificationTests(unittest.TestCase):
         self.assertTrue(report['cases'][0]['executed_exact_case'])
         self.assertEqual(report['stop_reason'],'case_failed')
     def test_original_failure_and_truncation_are_not_success(self):
-        for result in [self.result(exit_code=7),self.result(truncated=True),self.result(timed_out=True)]:
+        for index,result in enumerate([self.result(exit_code=7),self.result(truncated=True),self.result(timed_out=True)]):
             with self.subTest(result=result),mock.patch('qualification.run_offline',return_value=result) as run:
-                report=qualify(*self.artifacts,output=self.root/('run'+str(id(result))))
+                report=qualify(*self.artifacts,output=self.root/('run'+str(index)))
             self.assertFalse(report['passed']);self.assertEqual(run.call_count,1)
             self.assertEqual(report['cases'][0]['exit_code'],result.exit_code)
             self.assertTrue(report['cases'][0]['executed_exact_case'])
@@ -70,12 +70,17 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(call.kwargs['cancel_on_stdout'],b'dht_lookup_query_witness\n')
             self.assertEqual(call.kwargs['timeout'],8)
         self.assertTrue(all(case['query_witness'] for case in report['cases']))
+    def test_subcase_paths_do_not_depend_on_object_identity(self):
+        case=QualificationTests('test_external_cancel_does_not_accept_panic_timeout_or_early_return')
+        result=unittest.TestResult()
+        with mock.patch(__name__+'.id',return_value=7,create=True):case.run(result)
+        self.assertTrue(result.wasSuccessful(),'nested fixture directory reuse must not mask its safety assertions')
     def test_external_cancel_does_not_accept_panic_timeout_or_early_return(self):
         valid=dict(stdout=b"running 1 test\ndht_lookup_query_witness\n",exit_code=-9,cancelled_on_witness=True)
-        for changes in [dict(exit_code=101),dict(timed_out=True),dict(cleanup_complete=False),dict(cancelled_on_witness=False),dict(stdout=valid['stdout']+b'dht_lookup_returned_before_cancel\n')]:
+        for index,changes in enumerate([dict(exit_code=101),dict(timed_out=True),dict(cleanup_complete=False),dict(cancelled_on_witness=False),dict(stdout=valid['stdout']+b'dht_lookup_returned_before_cancel\n')]):
             result=self.result(**(valid|changes))
             with self.subTest(changes=changes),mock.patch('qualification.run_offline',return_value=result) as run:
-                report=qualify(*self.artifacts,output=self.root/('run'+str(id(result))),mode='lookup-cancellation')
+                report=qualify(*self.artifacts,output=self.root/('run'+str(index)),mode='lookup-cancellation')
                 self.assertFalse(report['passed']);self.assertEqual(run.call_count,1)
     def test_unknown_mode_denies_before_artifact_access_or_spawn(self):
         with mock.patch('qualification.run_offline') as run,mock.patch.object(Artifact,'verify') as verify:
