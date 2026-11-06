@@ -124,8 +124,8 @@ Private logs show a stale event and reconnect after the last saved sample and
 before the runner abort. The runner required integer bounds where the API allows
 null during cleared coverage: this demonstrates a harness contract mismatch,
 not the proven cause of that rejection. Neither an engine buffer bug nor a
-source-wide outage was established. The two-hour acceptance remains pending;
-offline harness tests and a corrected runner do not close it.
+source-wide outage was established. At that point the two-hour acceptance remained pending;
+offline harness tests and a corrected runner alone did not close it.
 
 A subsequent schema-correct run failed the 60-second video-frame watchdog after
 roughly 6.5 minutes, having decoded 17,248 frames with 80 valid active status
@@ -142,6 +142,56 @@ explain the earlier failure or establish live presentation quality. WARP and
 owned processes were restored/cleaned up after each run. No RSS or memory-churn
 result is established by these decode observations.
 
-Issue #195 remains open pending a full two-hour decode observation and adequate
-recovery evidence. No live evicted-gap skip was observed in these runs; the
-focused offline gap tests remain separate evidence.
+No live evicted-gap skip was observed in those historical runs; controlled gap
+tests remain separate evidence.
+
+### Sustained observation on the merged gateway build
+
+The 2026-11-05 observation used the deployed merged daemon at `e88af07`, with
+AceStream 3.2.11 as the independent reference. Both endpoints used the verified
+`tailgw-0` Mullvad route. The original command exited zero after the one planned
+7,500-second observation and settled postflight. Both players independently had
+about 7,495 seconds of active video/audio progress, 1,499 of 1,500 planned status
+slots, no counter resets, and advances in video, audio, display and playback
+counters through the final 20 seconds.
+
+All four scheduled secondary-source HTTP/structural-TS cycles completed, with
+eight exact side stops and two separate primary stops confirmed. These secondary
+captures establish delivery, not secondary decoder performance. Owned clients,
+workers and drainers were cleaned up; postflight passed. The official returned
+media URL, same-origin redirects and exact metadata-lease stop relationship were
+trusted as an API contract, not independently proved internal ownership.
+
+Resource collection completed all 500 planned pairs against finite 2 GiB ancestor
+limits. Peak cgroup memory was about 739 MiB for the candidate and 1,079 MiB for
+the reference. Candidate live heap peaked near 42 MiB and allocator resident near
+88 MiB; neither is process RSS. Host memory still grew over the window. The
+post-cleanup memory point was taken before the separate 61-second postflight
+grace and remained above the cold baseline. This supports the observed workload's
+bounded envelope, not a long-term plateau or absence of leaks.
+
+Native bitrate had positive samples. Server buffer duration stayed zero in this
+window; this is not a positive live-buffer measurement. Separate deterministic
+session/reservoir tests demonstrate nonzero buffer duration and its decrease while
+draining, and ready-window tests cover measured duration and invalidation.
+
+The cumulative evidence for [#195](https://github.com/jamezrin/outpace/issues/195)
+is intentionally compositional:
+
+| Acceptance item | Evidence and boundary |
+|---|---|
+| Multi-hour progress | The bounded matched observation above; sampled counters do not establish image quality or sub-poll smoothness. |
+| Evicted-gap recovery | Real peer-to-HTTP composition and a non-skipped FFprobe witness decoded video packets originating after the gap. This is a finite video-only recovery witness, not a naturally occurring live skip. |
+| Measured status | Positive live bitrate plus independent startup/drain and ready-window tests; zero live buffer values remain disclosed. |
+| Operator procedure | This checklist and the deployment guide, including admission, memory, cleanup and rollback distinctions. |
+| Stuck upstream isolation | Real-worker channel saturation, activation-write backpressure and actor control/cancellation tests, with draining controls. |
+| Accepted-only serving | Whole-piece acceptance before publication, signed rejection controls, memory/disk serving and replacement-generation tests. Intentionally unsigned mode retains its documented acceptance policy. |
+| Configurable resource limits | Shared atomic provider-session admission, per-session bounds and workload memory evidence. Unlimited default is intentional; configure a session cap for gateway duty. No aggregate byte-budget claim is made. |
+
+Independent reviews support the scoped runtime predicates and cumulative criteria.
+The historical stale-reconnect video stall in
+[#246](https://github.com/jamezrin/outpace/issues/246) remains an unresolved linked
+follow-up: nonrecurrence does not explain its cause or close that investigation.
+Neither this bounded evidence nor epic completion constitutes 24/7 availability,
+production-readiness or [#210](https://github.com/jamezrin/outpace/issues/210)
+human sign-off. Earlier failures and original artifact verdicts remain unchanged.
