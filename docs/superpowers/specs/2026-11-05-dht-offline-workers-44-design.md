@@ -1,43 +1,118 @@
 # Guarded comparison workers for #44
 
-Scope: the next worker-entry prerequisite in the existing #44 design, not a live comparison or adoption. Goal: real fixed exec inputs/results with default network denial. #44 remains open for observed/enforced public destination policy and live methodology/results. The active #195 observation and all34pinnedfiles are outside this work.
+Scope: the worker-entry prerequisite for #44, not a live comparison or library
+adoption. The goal is fixed executable inputs and results with default network
+denial. #44 remains open for public destination policy and live methodology and
+results. The #195 observation and its 34 pinned files are outside this work.
 
-## Approaches and decision
+## Decision
 
-Keep invoking scenario-specific ignored tests only: lowest cost but no fixed operator input/result boundary to qualify. Expose public workers now: rejected until every candidate thread's destinations/server behavior are confined. Selected: a common versioned worker contract, upstream binary and custom cfg(test) entry, usable only in the existing owned loopback-only PID/network namespace. This implements the default-deny/process-contract step without opening a public mode. No root production API/dependency/lock changes, no fake results in place of actual adapters.
+Scenario-specific ignored tests alone do not provide a fixed operator boundary.
+Public workers are premature until every candidate's destinations and server
+behavior are confined. Use a common versioned contract, a standalone upstream
+binary, and a custom test-only entry in owned loopback-only PID/network namespaces.
+There is no root production API, dependency or lockfile change, and no fake adapter
+in place of an actual library.
 
-## Entry and input
+## Entry and protected input
 
-Upstream standalone binary dht-worker requires exactly `--offline-worker mainline` or `--offline-worker n0`; anything else exits with a fixed nonzero code before reading secrets or constructing sockets/runtime. Custom cfg(test) ignored entry `dht::comparison::custom_offline_worker` uses the same contract, not a new production research API.
+The standalone `dht-worker` accepts exactly `--offline-worker mainline` or
+`--offline-worker n0`. Other arguments deny execution before environment access or
+runtime/socket construction. The synchronous ignored custom entry is
+`dht::comparison::worker::custom_offline_worker`; it adds no production API.
 
-Before input/network: PID must be1; inspect the actual process network namespace, with exactly loopback and no external routing. Existing helper owns user/net/PID namespace, hard deadline and descendant reaping. Do not rely on sysfs mounted from an unrelated network namespace. Bound inspection input; any unavailable/malformed state denies. The guard is offline confinement, not proof the libraries never attempt external sends. No live override or policy toggle exists.
+Require actual PID 1 and inspect the current network namespace before reading
+protected input. Exactly one UP loopback interface and only loopback addresses and
+routes are allowed. Inspect IPv4 and IPv6 routes across all tables; reject default
+routes, gateways and external devices. Ordinary local loopback routes are allowed.
+Use fixed `/usr/bin/ip -j` commands, not network sysfs from another namespace.
+Unavailable or malformed inspection denies execution. This is offline confinement,
+not proof that a library never attempts an external send. No live override exists.
 
-Use protected worker environment (already supported by run_offline env): OUTPACE_DHT_COMPARE_MODE=offline-v1, OUTPACE_DHT_COMPARE_ROLE=custom/mainline/n0, OUTPACE_DHT_COMPARE_TARGET and OUTPACE_DHT_COMPARE_SEEDS. Reject unknown names in this prefix, while leaving unrelated system environment alone. Role must match the fixed entry or argv role. No target/seed values in argv, Debug/errors or records; registry is never read. Target20bytes,1..4unique numericIPv4 nonzeroportseeds, existing target8/cap1024 and15secondconstructor-inclusive budget. Offline entry additionally requires every seed loopback. Parser rejects unset/unknown version/role, malformed/oversize/duplicate/zeroport/nonloopback input before adapter creation. Parent supplies a clean comparison-prefix environment; retain parsed values without mutating process-global environment in libtest. OS environment is operator-controlled, not a hostile local secret-isolation promise.
+Four fixed prefixed environment fields carry the request:
 
-## Execution and records
+- `OUTPACE_DHT_COMPARE_MODE=offline-v1`
+- `OUTPACE_DHT_COMPARE_ROLE=custom`, `mainline` or `n0`, matching the fixed entry
+- `OUTPACE_DHT_COMPARE_TARGET`: exactly 20 hex-decoded bytes
+- `OUTPACE_DHT_COMPARE_SEEDS`: 1–4 unique numeric IPv4 endpoints, nonzero ports,
+  loopback only, at most 256 bytes in total
 
-Common request/record contract belongs in standalone tool modules. The custom cfg(test) entry must obey the same schema with focused conformance tests, without a new production dependency or fragile inclusion of source outside a publishable crate. Binary parsing/isolation gate precede Tokio runtime construction. W0remains immediately before actual candidate construction; parent P0/P1 and hard30secondworker ceiling contain startup/parsing/constructor/drop even if a library blocks. No in-process actor join or self-preempting blocking constructor claim. Candidate callback cannot select argv, library code, budget or namespaces.
+Reject missing, duplicate, unknown, non-Unicode, malformed and oversized relevant
+fields before adapter construction. Leave unrelated environment fields alone. The
+parent removes inherited comparison-prefixed fields before supplying the intended
+four. Never mutate process-global environment in multithreaded libtest. Values
+must not appear in argv, Debug, errors or records. Never read the registry. The OS
+environment remains operator-controlled; it is not a hostile-local secret boundary.
 
-One bounded versioned JSON result, fixed field names: schema_version=1; candidate custom/mainline/n0; terminal target/exhausted/deadline/adapter_error; peer_count, first_peer_seconds nullable, elapsed_seconds; batch_sizes≤64, batches_observed, batch_history_truncated, target_overshoot. No identifiers/endpoints/payload or raw error text. Custom diagnostics may add numeric query/response data, but required common fields and meanings must match. Unavailable upstream diagnostics stay null with fixed reason, notzero. Parent rejects missing/duplicate/oversize/malformed records, impossible numbers and mismatched candidate. Valid target/deadline/exhaustion are measurement outcomes, not all automatically successful discoveries.
+## Execution and bounds
 
-Production dependencies/locks remain unchanged. Prefer numeric/static formatting or existing dependencies to adding a new runtime solely for record output; if a serializer dependency is justified, isolate it in the research workspace and document cost. Root custom entry can use its existing serde_json dev dependency.
+Parsing and isolation precede Tokio runtime creation. The existing lookup target
+is 8 peers, retention cap 1,024, and constructor-inclusive lookup budget 15 seconds.
+W0 is immediately before actual candidate construction. The parent owns namespaces,
+stdout/stderr, cancellation, deadline and descendant teardown. Candidate input
+cannot select arbitrary argv, libraries, budgets or namespaces.
+
+Inspectors share one 2-second deadline. Each capture caps stdout and stderr at
+16 KiB per command, drains both pipes without blocking, and kills/reaps the direct
+child on error. The fixed trusted inspector is not a caller-selected program.
+Parent namespace containment is the final bound under OS stalls; no literal
+self-preempting constructor, kernel operation or in-process actor-join claim is made.
+
+The parent allows at most 27.8 seconds in `run_offline`, reserving 2.1 seconds of
+the 30-second worker envelope for cleanup. It must not pass a 30-second timeout to
+the helper, which rejects that value. Artifact pins assume no hostile concurrent
+replacement of operator-owned binaries.
+
+## Versioned results
+
+Emit one JSON object of at most 8,192 bytes plus LF. Upstream stdout contains only
+that line. Custom libtest output contains one reserved `DHT_COMPARE_RECORD ` line,
+with its exact test name and one passed/zero failed/zero ignored summary.
+
+The exact shared schema is in `tools/dhtcompare/worker-contract.md`: version,
+candidate, terminal, peer count, first-peer and elapsed times, bounded batch
+history and its count/truncation, overshoot, nullable query/response diagnostics,
+and a fixed nullable diagnostic-unavailability reason. No identity, endpoint,
+payload or foreign error text is emitted. Upstream unavailable diagnostics are
+null with a reason, never invented zeros.
+
+The parent rejects missing, duplicate, unknown, malformed or oversized records,
+booleans used as integers, nonfinite numbers and inconsistent counts/timing.
+Integers are bounded unsigned 64-bit values; peer count is at most 1,024 and
+history at most 64 entries. Raw emission sizes may exceed the retention cap.
+Overshoot is `max(count - 8, 0)`. First-peer time is null iff count is zero, otherwise
+nonnegative and no greater than elapsed. Target completion requires at least 8
+peers; exhaustion/deadline cannot claim the target. Elapsed time may exceed
+15 seconds after a late constructor return but must fit the parent envelope.
+Measurement outcomes do not all imply successful discovery.
+
+Input denial exits 64, namespace denial 65, output failure 74; denial emits no
+result. Any diagnostic uses static tokens. Research-only optional libc and pinned
+serde_json 1.0.151 support robust kernel JSON and record encoding. The custom entry
+uses existing libc and serde_json dev dependencies. No cross-crate source inclusion
+or root dependency/lockfile change is permitted.
 
 ## Qualification and ownership
 
-Pure tests pin request parsing/default-deny ordering and record schema/bounds/redaction. Actual compiled binary with absent/unrecognized mode must deny outside isolation without socket activity. Real upstream worker function and custom entry run as PID1 with synthetic loopback seed, actual adapters, same request and one record; known target fixtures remain controls. In-process test execution must be described honestly if it exercises the same production binary entry function without exec. Do not weaken PID1 merely to make an integration test spawn a nested worker. Guarded exec can be tested by an owned namespace whose PID1 directly execs the worker while a fixture server is its explicitly owned child, or by same-entry-function tests plus explicit exec-input negative tests; builder must settle the smallest reliable composition.
+Use pure request, topology, record, redaction and ordering tests. Compiled
+executables deny absent/unrecognized arguments and unconfined execution. The
+selected positive composition runs the SAME synchronous entry under actual PID 1
+and loopback isolation, with an owned seed thread, real adapter and encoder, then
+validates its record with the common Python contract. Separate compiled executable
+denials exercise bad input. This does not prove positive binary-main OS-environment
+and stdout integration. Never weaken PID 1 or spawn a nested worker to obtain a
+false positive. Independent builder review found no essential user decision.
 
-Cancellation/missing-input/error paths remain externally contained, with capped/drained stdout/stderr, original exit, exact record/test witness and known namespace cleanup. Default tests open no external socket; real UDP cases remain ignored and require explicit helper. No public DNS/bootstrap, announce test, content request, deployment, routing/firewall/VPN change or new live block. Current active validation cannot be used as an excuse to alter its source closure or rerun it.
+Cancellation and failure retain original exit, bounded/drained output and known
+namespace cleanup. Real UDP cases stay ignored and require the explicit helper.
+No public DNS/bootstrap, content requests, deployment, routing/firewall/VPN changes
+or new live block are part of this increment.
 
-## Acceptance for this increment
+## Acceptance and remaining work
 
-A fixed default-deny input/result boundary exists for actual upstream and custom comparison paths; pure denial/record tests and confined real target controls pass; exact execution/cleanup are evidenced; source/dependency boundaries unchanged; independent review and CI integration complete. This does not complete #44. Public workers are still denied until separate destination/actor/server policy and a reviewed bounded runtime plan are qualified.
-
-## Builder resolutions
-
-Independent builder check found no essential user decision. Selected positive composition is the SAME synchronous entry function under real PID1/loopback isolation with an owned seed thread, plus separate actual executable denial cases. This does not prove positive main/OS-environment/stdout exec integration. No weakened PID1 and no nested-worker shortcut. Custom uses a synchronous ignored test and one reserved `DHT_COMPARE_RECORD ` JSON line among libtest output. Upstream stdout is exactly oneJSONline.
-
-Topology attestation uses bounded `/usr/bin/ip -j` link/address and both-family ALL-table route inspection in the current netns: one up loopback, only loopback addresses/routes, no default/gateway/external device. Permit ordinary local loopback routes. Four inspector captures each atmost16KiB, one combined2secondinspectiondeadline, explicit direct-child kill/reap on error; parent namespace remains final containment under OS stalls. No sysfs network-view assumptions. Native nonblocking pipes use libc already present in ace-swarm; research workspace may add optional libc and serde_json=1.0.151 for robust kernelJSON parsing and records. Rootmanifest/lock unchanged.
-
-Central versioned wire document/vectors and Python validator enforce producer conformance; custom owns a cfg(test) module, with no cross-crate source inclusion. Record common fields plus nodes_queried/valid_responses nullable and diagnostics_unavailable_reason fixed/null are exact, duplicate/unknown keys rejected. Integers excludebool/boundedu64, floatsfinite/nonnegative, peer_count≤1024, history≤64 with consistent truncation/count, overshoot=max(count-8,0), firstpeer nulliffzeropeers and≤elapsed. Rawbatchsize neednot≤1024. Targetterminalrequirescount≥8; exhausted/deadline cannotclaimtarget. elapsed mayexceed15ifconstructorreturns late but mustfitparentenvelope.
-
-Worker argument/request denialexit64, namespace denial65, outputfailure74; no result ondenial. Static tokensonly if diagnostics emitted; no foreignerror/string interpolation. Default invocation denies beforesecretread. Protectedenv onlyfourprefixednames, rejectduplicates/nonUnicode/unknownprefixvalues andnonloopbackseeds. Rootcustomusesexistingserde_jsondev/libc; researchbinaryrequiresworkersfeature. Parent run_offline timeout≤27.8reserves2.1s from30secondworker envelope, doesnotcalltimeout30(whichhelperrejects). Literalhardceilings underpathologicalspawn/kernelstalls are notclaimed. Publicentry/destinationconfinement remainsabsent.
+The fixed default-deny boundary must cover upstream and custom paths. Pure tests,
+confined actual targets, compiled denials, schema conformance and owned cleanup
+must pass; independent review and CI integration remain required. Preserve the
+source/dependency boundaries above. This does not complete #44: public workers
+remain denied until separate destination, actor and server policy and a reviewed
+bounded runtime plan are qualified.
