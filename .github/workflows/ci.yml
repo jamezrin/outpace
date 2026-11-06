@@ -72,9 +72,11 @@ jobs:
           build-warnings: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # The RTMP loopback test self-skips without ffmpeg; the hosted image has none.
+      # Keep media tests enabled without letting cloud-mirror downloads consume
+      # the whole test job. The helper uses scoped signed Ubuntu HTTPS sources.
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        timeout-minutes: 7
+        run: python3 tools/ci/install_media_tools.py
 
       # Live-network tests are #[ignore]d, so the default run stays offline.
       - name: Test
@@ -105,6 +107,9 @@ jobs:
       - name: Test release archive verification
         run: python3 -m unittest discover -s tools/release -v
 
+      - name: Test CI prerequisite orchestration
+        run: python3 -m unittest discover -s tools/ci -v
+
   hls-audio-synthetic:
     name: HLS audio synthetic
     runs-on: ubuntu-24.04
@@ -120,7 +125,8 @@ jobs:
           build-warnings: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install synthetic media tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        timeout-minutes: 7
+        run: python3 tools/ci/install_media_tools.py
       # The opted-in suite verifies every required encoder/generator and ffprobe;
       # missing tools or capabilities are failures, never successful skips.
       - name: Synthetic codec and lifecycle acceptance
