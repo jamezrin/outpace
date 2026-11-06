@@ -196,3 +196,28 @@ late response opportunity, not that all implementations waited the full budget
 or joined internal actors. Existing target cases supply the before-deadline
 positive controls. No public destination policy, live comparison or adoption is
 qualified by this profile.
+
+
+### Guarded offline worker boundary
+
+The optional `workers` feature adds the fixed `dht-worker --offline-worker
+mainline|n0` research executable. Its default invocation denies execution. Valid
+arguments still require actual namespace PID 1, one UP loopback interface, only
+loopback addresses, and loopback-only IPv4/IPv6 routes across all tables before
+reading protected input or creating a runtime. The inspector has a shared
+two-second budget and 16 KiB per output stream/command. The custom walker entry
+is a Linux-only ignored libtest case; neither entry adds a daemon API.
+
+See [worker-contract.md](worker-contract.md) for the fixed environment and bounded
+result schema. `workers.run_worker` cleans inherited comparison fields, verifies
+the trusted binary pin, uses only fixed arguments and the existing namespace
+owner, and reserves 2.1 seconds of a 30-second envelope for cleanup. It accepts
+loopback seeds only; it cannot run a public comparison. Captured output remains
+private. Artifact pins assume no hostile concurrent replacement of operator-owned
+binaries.
+
+Qualification uses same-entry target fixtures under real namespaces plus separate
+compiled executable denials. Same-entry positives cover gate, real adapter and
+encoder; they do not prove positive OS-environment/stdout integration through
+binary `main()`. Public destination policy, a live worker policy and matched live
+comparison remain outstanding for #44. No live execution is authorized here.
