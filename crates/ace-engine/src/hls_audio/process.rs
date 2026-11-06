@@ -413,10 +413,31 @@ fn valid_source(layout: &TransportLayout) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_command(
-    mut command: Command,
+    command: Command,
     layout: TransportLayout,
     generation: GenerationId,
     media: Arc<HlsPackager>,
+    input: mpsc::Receiver<BudgetedInput>,
+    cancel: watch::Receiver<bool>,
+    deadline: Instant,
+    observer: Observer,
+) -> Result<(), HlsFailure> {
+    run_output_command(
+        command,
+        layout,
+        HlsOutput { generation, media },
+        input,
+        cancel,
+        deadline,
+        observer,
+    )
+    .await
+}
+
+async fn run_output_command<O: ProcessOutput>(
+    mut command: Command,
+    layout: TransportLayout,
+    output: O,
     input: mpsc::Receiver<BudgetedInput>,
     mut cancel: watch::Receiver<bool>,
     deadline: Instant,
@@ -428,7 +449,7 @@ async fn run_command(
     let permit = match ChildAdmission::global().try_acquire() {
         Ok(p) => p,
         Err(e) => {
-            media.fail_generation(generation, e);
+            output.fail(e);
             return Err(e);
         }
     };
@@ -440,7 +461,7 @@ async fn run_command(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
-            media.fail_generation(generation, HlsFailure::Pipe);
+            output.fail(HlsFailure::Pipe);
             return Err(HlsFailure::Pipe);
         }
     };
@@ -471,8 +492,7 @@ async fn run_command(
         pumps.spawn(stdout_pump(
             stdout,
             layout,
-            generation,
-            media.clone(),
+            output.clone(),
             pump_rx.clone(),
             progress.clone(),
             observer.clone(),
@@ -489,7 +509,7 @@ async fn run_command(
             let changed = progress.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let status = media.status();
+            let status = output.state();
             let ready = status == HlsStatus::Ready;
             if let HlsStatus::Failed(e) = status {
                 result = Err(e);
@@ -545,9 +565,7 @@ async fn run_command(
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = false;
     if let Err(e) = result {
-        if std::panic::catch_unwind(AssertUnwindSafe(|| media.fail_generation(generation, e)))
-            .is_err()
-        {
+        if std::panic::catch_unwind(AssertUnwindSafe(|| output.fail(e))).is_err() {
             result = Err(HlsFailure::Pump);
         }
     }
@@ -702,6 +720,53 @@ async fn stderr_pump<R: AsyncRead + Unpin>(
     }
 }
 
+/// At most cached PAT, PMT and one opening packet. Own these bytes so an
+/// output adapter can await capacity after validation without borrowing state.
+struct AcceptedBatch {
+    packets: [[u8; TS]; 3],
+    len: usize,
+}
+impl AcceptedBatch {
+    fn iter(&self) -> impl Iterator<Item = &[u8; TS]> {
+        self.packets[..self.len].iter()
+    }
+}
+
+/// Reserve outside publication fencing; publishing with the owned reservation
+/// is synchronous. Implementations cannot hold a publication mutex while waiting.
+trait ProcessOutput: Clone + Send + Sync + 'static {
+    type Reservation: Send;
+    fn state(&self) -> crate::audio_normalize::State;
+    fn fail(&self, reason: crate::audio_normalize::Failure);
+    fn reserve(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Self::Reservation, HlsFailure>> + Send;
+    fn publish(&self, reservation: Self::Reservation, batch: AcceptedBatch);
+}
+
+#[derive(Clone)]
+struct HlsOutput {
+    generation: GenerationId,
+    media: Arc<HlsPackager>,
+}
+impl ProcessOutput for HlsOutput {
+    type Reservation = ();
+    fn state(&self) -> crate::audio_normalize::State {
+        self.media.status()
+    }
+    fn fail(&self, reason: crate::audio_normalize::Failure) {
+        self.media.fail_generation(self.generation, reason);
+    }
+    fn reserve(&self) -> impl std::future::Future<Output = Result<(), HlsFailure>> + Send {
+        std::future::ready(Ok(()))
+    }
+    fn publish(&self, (): (), batch: AcceptedBatch) {
+        for bytes in batch.iter() {
+            self.media.feed_generation(self.generation, bytes);
+        }
+    }
+}
+
 /// Raw output must obey the strict selector and the exact remux contract. No
 /// malformed PSI is allowed to hide behind the selector's preserve-last-good rule.
 struct OutputValidator {
@@ -724,6 +789,25 @@ impl OutputValidator {
             pmt: None,
             opened: false,
         }
+    }
+    fn packet_batch(&mut self, packet: &[u8; TS]) -> Result<AcceptedBatch, HlsFailure> {
+        let mut batch = AcceptedBatch {
+            packets: [[0; TS]; 3],
+            len: 0,
+        };
+        let mut overflow = false;
+        self.packet(packet, |bytes| {
+            if let Some(slot) = batch.packets.get_mut(batch.len) {
+                slot.copy_from_slice(bytes);
+                batch.len += 1;
+            } else {
+                overflow = true;
+            }
+        })?;
+        if overflow {
+            return Err(HlsFailure::OutputInvalid);
+        }
+        Ok(batch)
     }
     fn packet(&mut self, packet: &[u8; TS], mut feed: impl FnMut(&[u8])) -> Result<(), HlsFailure> {
         let invalid = HlsFailure::OutputInvalid;
@@ -857,11 +941,10 @@ fn output_section(packet: &[u8; TS], id: u8) -> Result<&[u8], HlsFailure> {
     Ok(s)
 }
 
-async fn stdout_pump<R: AsyncRead + Unpin>(
+async fn stdout_pump<R: AsyncRead + Unpin, O: ProcessOutput>(
     mut stdout: R,
     layout: TransportLayout,
-    generation: GenerationId,
-    media: Arc<HlsPackager>,
+    output: O,
     mut cancel: watch::Receiver<bool>,
     progress: Arc<Progress>,
     observer: Observer,
@@ -921,6 +1004,19 @@ async fn stdout_pump<R: AsyncRead + Unpin>(
                 observe!(observer, c, {
                     c.output_packets_received += 1;
                 });
+                if !*progress.publishing.lock().unwrap() {
+                    return Ok(());
+                }
+                let accepted = validator.packet_batch(&packet)?;
+                let reservation = if accepted.len == 0 {
+                    None
+                } else {
+                    Some(tokio::select! {
+                        biased;
+                        _ = cancelled(&mut cancel) => return Ok(()),
+                        permit = output.reserve() => permit?,
+                    })
+                };
                 let publishing = progress.publishing.lock().unwrap();
                 if !*publishing {
                     return Ok(());
@@ -929,7 +1025,9 @@ async fn stdout_pump<R: AsyncRead + Unpin>(
                 if observer.fault == TestFault::OutputFeedPanic {
                     panic!("injected output panic while publication lock is held");
                 }
-                validator.packet(&packet, |bytes| media.feed_generation(generation, bytes))?;
+                if let Some(reservation) = reservation {
+                    output.publish(reservation, accepted);
+                }
                 progress.clock.lock().unwrap().output(Instant::now());
                 progress.changed.notify_one();
                 observe!(observer, c, {
@@ -1772,12 +1870,10 @@ pub(crate) mod test_support {
 
     pub async fn output_guard_panic_cleanup(counters: Arc<Counters>) -> Result<(), HlsFailure> {
         let _serial = process_test_lock().await;
-        let mut packet = vec![0xff; TS];
-        packet[0] = 0x47;
-        packet[1] = 0x40;
-        packet[2] = 0;
-        packet[3] = 0x10;
-        let mut input = packet.clone();
+        // Validation now completes before capacity reservation/publication. A
+        // valid PAT reaches the same poisoned-lock witness on the first packet.
+        let packet = test_fixtures::psi_packet(0, 0, &test_fixtures::pat_section(7, 9, 4096));
+        let mut input = packet.to_vec();
         input.extend_from_slice(&packet);
         input.extend_from_slice(&packet);
         let command = fake_child(ChildMode::EchoValidTs);
@@ -2060,8 +2156,7 @@ pub(crate) mod test_support {
         let pump = tokio::spawn(stdout_pump(
             reader,
             layout,
-            generation,
-            media,
+            HlsOutput { generation, media },
             watch::channel(false).1,
             progress,
             observer.clone(),
@@ -2244,7 +2339,7 @@ fn validate_smoke(output: &[u8], layout: TransportLayout) -> Result<(), HlsPrefl
     let mut audio = false;
     for packet in output.as_chunks::<TS>().0 {
         validator
-            .packet(packet, |_| {})
+            .packet_batch(packet)
             .map_err(|_| HlsPreflightError::Smoke)?;
         if ts_pid(packet) == 257 && packet[3] & 0x10 != 0 {
             let start = if packet[3] & 0x20 != 0 {
@@ -3003,4 +3098,275 @@ fn smoke_input() -> (Vec<u8>, TransportLayout) {
 #[cfg(test)]
 pub(super) fn test_smoke_input() -> (Vec<u8>, TransportLayout) {
     smoke_input()
+}
+
+#[cfg(test)]
+mod accepted_batch_tests {
+    use super::*;
+
+    fn validator() -> OutputValidator {
+        OutputValidator::new(TransportLayout {
+            transport_stream_id: 7,
+            program_id: 9,
+            pmt_pid: 100,
+            pcr_pid: 513,
+            video_pid: 512,
+            video_type: 0x1b,
+            audio: Some(ace_media::audio::SelectedAudio {
+                pid: 513,
+                codec: AudioCodec::Ac3,
+            }),
+            semantic_identity: vec![],
+        })
+    }
+
+    #[test]
+    fn accepted_batch_waits_for_opening_then_preserves_exact_table_order() {
+        let tables = test_fixtures::ready_output_fixture(0);
+        let packets = tables.as_slice().as_chunks::<TS>().0;
+        let video = test_fixtures::video_access_packet(256);
+        let mut validator = validator();
+        assert_eq!(validator.packet_batch(&video).unwrap().iter().count(), 0);
+        assert_eq!(
+            validator.packet_batch(&packets[0]).unwrap().iter().count(),
+            0
+        );
+        assert_eq!(
+            validator.packet_batch(&packets[1]).unwrap().iter().count(),
+            0
+        );
+        let opening = validator.packet_batch(&video).unwrap();
+        assert_eq!(
+            opening.iter().copied().collect::<Vec<_>>(),
+            vec![packets[0], packets[1], video]
+        );
+        let next = validator.packet_batch(&video).unwrap();
+        assert_eq!(next.iter().copied().collect::<Vec<_>>(), vec![video]);
+    }
+
+    #[test]
+    fn accepted_batch_rejects_malformed_output_without_a_partial_publication() {
+        let tables = test_fixtures::ready_output_fixture(0);
+        let packets = tables.as_slice().as_chunks::<TS>().0;
+        let mut validator = validator();
+        validator.packet_batch(&packets[0]).unwrap();
+        let mut bad = packets[1];
+        bad[15] ^= 1;
+        assert!(matches!(
+            validator.packet_batch(&bad),
+            Err(HlsFailure::OutputInvalid)
+        ));
+        let mut invalid_sync = test_fixtures::video_access_packet(256);
+        invalid_sync[0] = 0;
+        assert!(matches!(
+            validator.packet_batch(&invalid_sync),
+            Err(HlsFailure::OutputInvalid)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod output_boundary_tests {
+    use super::*;
+    use crate::audio_normalize::{Failure, State};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct QueuedOutput {
+        tx: mpsc::Sender<AcceptedBatch>,
+        entered: Arc<AtomicUsize>,
+        changed: Arc<Notify>,
+    }
+    impl ProcessOutput for QueuedOutput {
+        type Reservation = mpsc::OwnedPermit<AcceptedBatch>;
+        fn state(&self) -> State {
+            State::Starting
+        }
+        fn fail(&self, _: Failure) {}
+        fn reserve(
+            &self,
+        ) -> impl std::future::Future<Output = Result<Self::Reservation, Failure>> + Send {
+            let tx = self.tx.clone();
+            let entered = self.entered.clone();
+            let changed = self.changed.clone();
+            async move {
+                entered.fetch_add(1, Ordering::SeqCst);
+                changed.notify_one();
+                tx.reserve_owned().await.map_err(|_| Failure::Pipe)
+            }
+        }
+        fn publish(&self, permit: Self::Reservation, batch: AcceptedBatch) {
+            permit.send(batch);
+        }
+    }
+    fn layout() -> TransportLayout {
+        TransportLayout {
+            transport_stream_id: 7,
+            program_id: 9,
+            pmt_pid: 100,
+            pcr_pid: 513,
+            video_pid: 512,
+            video_type: 0x1b,
+            audio: Some(ace_media::audio::SelectedAudio {
+                pid: 513,
+                codec: AudioCodec::Ac3,
+            }),
+            semantic_identity: vec![],
+        }
+    }
+    fn input() -> (Vec<u8>, Vec<[u8; TS]>) {
+        let mut bytes = test_fixtures::ready_output_fixture(0);
+        let video = test_fixtures::video_access_packet(256);
+        bytes.extend_from_slice(&video);
+        bytes.extend_from_slice(&video);
+        let expected = bytes.as_slice().as_chunks::<TS>().0.to_vec();
+        (bytes, expected)
+    }
+    #[tokio::test]
+    async fn output_boundary_preserves_opening_and_continuation_batches() {
+        let (bytes, expected) = input();
+        let (tx, mut rx) = mpsc::channel(4);
+        let output = QueuedOutput {
+            tx,
+            entered: Arc::new(AtomicUsize::new(0)),
+            changed: Arc::new(Notify::new()),
+        };
+        let progress = Arc::new(Progress::default());
+        *progress.publishing.lock().unwrap() = true;
+        let (_cancel, cancel) = watch::channel(false);
+        let result = stdout_pump(
+            bytes.as_slice(),
+            layout(),
+            output,
+            cancel,
+            progress,
+            Observer::default(),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err(Failure::Pipe),
+            "live stdout EOF remains terminal"
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().iter().copied().collect::<Vec<_>>(),
+            expected[..3]
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().iter().copied().collect::<Vec<_>>(),
+            expected[3..]
+        );
+        assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn output_capacity_wait_releases_publication_lock_and_observes_cancel() {
+        let (bytes, expected) = input();
+        let (tx, mut rx) = mpsc::channel(1);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(Notify::new());
+        let output = QueuedOutput {
+            tx,
+            entered: entered.clone(),
+            changed: changed.clone(),
+        };
+        let progress = Arc::new(Progress::default());
+        *progress.publishing.lock().unwrap() = true;
+        let (cancel, cancel_rx) = watch::channel(false);
+        let state = progress.clone();
+        let pump = tokio::spawn(async move {
+            stdout_pump(
+                bytes.as_slice(),
+                layout(),
+                output,
+                cancel_rx,
+                state,
+                Observer::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let waiting = changed.notified();
+                tokio::pin!(waiting);
+                waiting.as_mut().enable();
+                if entered.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                waiting.await;
+            }
+        })
+        .await
+        .expect("second output reservation not reached");
+        let lock_free = progress.publishing.try_lock().is_ok();
+        cancel.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("capacity-wait cancellation wedged")
+            .unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(
+            lock_free,
+            "publication lock held during output capacity wait"
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().iter().copied().collect::<Vec<_>>(),
+            expected[..3]
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "canceled continuation was published"
+        );
+    }
+    #[tokio::test]
+    async fn output_reservation_rechecks_fence_after_capacity_is_released() {
+        let (bytes, expected) = input();
+        let (tx, mut rx) = mpsc::channel(1);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(Notify::new());
+        let output = QueuedOutput {
+            tx,
+            entered: entered.clone(),
+            changed: changed.clone(),
+        };
+        let progress = Arc::new(Progress::default());
+        *progress.publishing.lock().unwrap() = true;
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let state = progress.clone();
+        let pump = tokio::spawn(async move {
+            stdout_pump(
+                bytes.as_slice(),
+                layout(),
+                output,
+                cancel_rx,
+                state,
+                Observer::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let waiting = changed.notified();
+                tokio::pin!(waiting);
+                waiting.as_mut().enable();
+                if entered.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                waiting.await;
+            }
+        })
+        .await
+        .expect("second reservation not reached");
+        *progress.publishing.lock().unwrap() = false;
+        let first = rx.recv().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("fenced reservation wedged")
+            .unwrap();
+        assert_eq!(first.iter().copied().collect::<Vec<_>>(), expected[..3]);
+        assert_eq!(result, Ok(()));
+        assert!(
+            rx.try_recv().is_err(),
+            "retired output published after capacity returned"
+        );
+    }
 }

@@ -32,28 +32,7 @@ const SDT_PID: u16 = 0x0011;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GenerationId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HlsFailure {
-    Unsupported,
-    Deadline,
-    InputOverflow,
-    Admission,
-    ChildExit,
-    Pipe,
-    Pump,
-    OutputInvalid,
-    OutputStall,
-    RecoveryLimit,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HlsStatus {
-    Starting,
-    Ready,
-    Recovering,
-    Failed(HlsFailure),
-    Stopped,
-}
+pub use crate::audio_normalize::{Failure as HlsFailure, State as HlsStatus};
 
 pub struct HlsPackager {
     state: Mutex<HlsState>,
