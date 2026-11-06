@@ -10,7 +10,7 @@ mod support;
 mod hls {
     pub use ace_engine::hls::*;
 }
-pub use ace_engine::{config, provider, session};
+pub use ace_engine::{audio_normalize, config, provider, session};
 #[path = "../src/hls_audio/process.rs"]
 #[allow(dead_code)]
 mod process;
