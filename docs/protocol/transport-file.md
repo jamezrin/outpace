@@ -37,7 +37,7 @@ descriptor = bencode_parse(plaintext)          # a single dict
 | `quality` | media quality hint |
 | `authmethod` | `RSA` (live integrity via source signature) |
 | `pubkey` | 124-byte RSA DER public key of the broadcaster |
-| `trackers` | list of `udp://…/announce` tracker URLs |
+| `trackers` | list of `udp://…/announce` tracker URLs; real descriptors often pack every URL into one space-separated entry, so each entry is split on whitespace when decoded |
 | `categories`, `allow_public_trackers`, `permanent` | metadata/flags |
 | `pieces` | **VOD only (legacy synthetic root schema)** — concatenated 20-byte SHA1 piece hashes |
 

@@ -119,6 +119,31 @@ fn decode_categories(raw: &Bencode) -> Vec<String> {
 ///
 /// These fields size piece/chunk requests, so a missing field or a negative value
 /// (which would otherwise wrap to a huge `u64`) is a decode error, not a silent 0.
+/// Tracker URLs from a descriptor's `trackers` field.
+///
+/// Descriptors in the wild carry this field in two shapes: a list with one URL per entry,
+/// or a list whose single entry packs every URL into one space-separated string. A bare
+/// byte string is accepted too. Each entry is split on ASCII whitespace and only tokens
+/// with a URL scheme are kept, so the packed shape yields the same URLs as the list shape.
+/// Network policy (scheme, length, destination) is still applied later, at resolution.
+fn decode_trackers(field: Option<&Bencode>) -> Vec<String> {
+    let entries: Vec<&[u8]> = match field {
+        Some(Bencode::List(list)) => list.iter().filter_map(Bencode::as_bytes).collect(),
+        Some(Bencode::Bytes(bytes)) => vec![bytes.as_slice()],
+        _ => Vec::new(),
+    };
+    entries
+        .into_iter()
+        .flat_map(|entry| {
+            String::from_utf8_lossy(entry)
+                .split_ascii_whitespace()
+                .filter(|token| token.contains("://"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn required_positive(raw: &Bencode, key: &[u8]) -> Result<u64> {
     match raw.get(key).and_then(|v| v.as_int()) {
         Some(i) if i > 0 => Ok(i as u64),
@@ -192,14 +217,7 @@ pub fn decode_transport_with_key(
         .map(|b| b.to_vec())
         .unwrap_or_default();
 
-    let trackers: Vec<String> = match raw.get(b"trackers") {
-        Some(Bencode::List(list)) => list
-            .iter()
-            .filter_map(|item| item.as_bytes())
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .collect(),
-        _ => Vec::new(),
-    };
+    let trackers = decode_trackers(raw.get(b"trackers"));
 
     // 7. VOD pieces: concatenated 20-byte SHA-1 hashes; absent on live streams.
     let pieces: Vec<[u8; 20]> = match raw.get(b"pieces") {
@@ -255,6 +273,89 @@ mod tests {
             &TRANSPORT_KEY,
             &TRANSPORT_IV,
         )
+    }
+
+    /// Synthetic live descriptor with the given `trackers` field (or none).
+    fn trackers_of(field: Option<Bencode>) -> Vec<String> {
+        let mut descriptor = std::collections::BTreeMap::from([
+            (b"name".to_vec(), Bencode::Bytes(b"synthetic".to_vec())),
+            (b"piece_length".to_vec(), Bencode::Int(131_072)),
+            (b"chunk_length".to_vec(), Bencode::Int(16_384)),
+        ]);
+        if let Some(field) = field {
+            descriptor.insert(b"trackers".to_vec(), field);
+        }
+        decode_transport(&encode_transport(&Bencode::Dict(descriptor)))
+            .unwrap()
+            .trackers
+    }
+
+    fn bytes(s: &str) -> Bencode {
+        Bencode::Bytes(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn trackers_one_url_per_list_entry() {
+        let got = trackers_of(Some(Bencode::List(vec![
+            bytes("udp://a.example:1/announce"),
+            bytes("udp://b.example:2/announce"),
+        ])));
+        assert_eq!(
+            got,
+            ["udp://a.example:1/announce", "udp://b.example:2/announce"]
+        );
+    }
+
+    #[test]
+    fn trackers_packed_into_one_space_separated_entry_are_split() {
+        // Real descriptors often carry every tracker in a single list entry. Taken whole, that
+        // entry is not a URL and no tracker is ever announced to.
+        let got = trackers_of(Some(Bencode::List(vec![bytes(
+            "udp://a.example:1/announce udp://b.example:2/announce\tudp://c.example:3/announce",
+        )])));
+        assert_eq!(
+            got,
+            [
+                "udp://a.example:1/announce",
+                "udp://b.example:2/announce",
+                "udp://c.example:3/announce",
+            ]
+        );
+    }
+
+    #[test]
+    fn trackers_as_a_bare_string_and_mixed_shapes() {
+        assert_eq!(
+            trackers_of(Some(bytes(
+                " udp://a.example:1/announce  udp://b.example:2/announce "
+            ))),
+            ["udp://a.example:1/announce", "udp://b.example:2/announce"]
+        );
+        assert_eq!(
+            trackers_of(Some(Bencode::List(vec![
+                bytes("udp://a.example:1/announce udp://b.example:2/announce"),
+                bytes("udp://c.example:3/announce"),
+            ]))),
+            [
+                "udp://a.example:1/announce",
+                "udp://b.example:2/announce",
+                "udp://c.example:3/announce",
+            ]
+        );
+    }
+
+    #[test]
+    fn trackers_drop_empty_schemeless_and_non_text_entries() {
+        let got = trackers_of(Some(Bencode::List(vec![
+            bytes(""),
+            bytes("   "),
+            bytes("not-a-url udp://a.example:1/announce"),
+            Bencode::Int(7),
+            Bencode::List(vec![bytes("udp://nested.example:9/announce")]),
+        ])));
+        assert_eq!(got, ["udp://a.example:1/announce"]);
+        assert!(trackers_of(None).is_empty());
+        assert!(trackers_of(Some(Bencode::Int(1))).is_empty());
     }
 
     #[test]
