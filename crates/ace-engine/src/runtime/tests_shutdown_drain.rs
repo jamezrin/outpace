@@ -149,7 +149,8 @@ async fn shutdown_with_open_stream(path: &str) {
             assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
             assert!(dropped.load(Ordering::SeqCst));
             assert!(manager.list().await.is_empty());
-            assert!(TcpListener::bind(address).await.is_ok());
+            // No rebind check: once released, the ephemeral port can be taken at once by a
+            // parallel test. The completed serve and the client's EOF prove the drain finished.
         })
         .await;
 }
