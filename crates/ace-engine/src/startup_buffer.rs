@@ -420,6 +420,13 @@ impl TsSource for StartupBufferedSource {
         Some(self.stats.clone())
     }
 
+    fn chunk_generation(&self) -> Option<u64> {
+        self.inner.chunk_generation()
+    }
+    fn playback_state(&self) -> Option<crate::audio_normalize::PlaybackStateHandle> {
+        self.inner.playback_state()
+    }
+
     fn metadata(&self) -> StreamMetadata {
         self.inner.metadata()
     }

@@ -1,5 +1,6 @@
 //! Bounded live-HLS audio classification, normalization, and generation recovery.
 
+pub(crate) mod live_source;
 pub mod process;
 
 pub use process::{
@@ -367,10 +368,11 @@ pub(crate) fn spawn_worker(
     tracker: &CleanupTracker,
 ) -> WorkerControl {
     let rx = session.raw_receiver();
+    let source_state = session.playback_state();
     let deadline = Instant::now() + Duration::from_millis(config.startup_timeout_ms);
     tracker.spawn(move |cancel| async move {
         match prepared {
-            None => media.run_native(rx, cancel).await,
+            None => media.run_native(rx, cancel, source_state).await,
             Some(prepared) => {
                 let mut worker = EnabledWorker {
                     media: media.clone(),
@@ -398,8 +400,15 @@ enum SourceItem {
     Failed(HlsFailure),
     Closed,
 }
+enum PacketReader {
+    Broadcast(broadcast::Receiver<StreamEvent>),
+    Direct {
+        source: Option<Box<dyn crate::provider::TsSource>>,
+        stats: Arc<std::sync::Mutex<crate::provider::SourceStats>>,
+    },
+}
 struct PacketSource {
-    rx: broadcast::Receiver<StreamEvent>,
+    rx: PacketReader,
     chunk: Option<BudgetedInput>,
     offset: usize,
     partial: [u8; 188],
@@ -414,6 +423,9 @@ struct PacketSourceProbe {
 }
 impl PacketSource {
     fn new(rx: broadcast::Receiver<StreamEvent>) -> Self {
+        Self::from_reader(PacketReader::Broadcast(rx))
+    }
+    fn from_reader(rx: PacketReader) -> Self {
         Self {
             rx,
             chunk: None,
@@ -460,8 +472,27 @@ impl PacketSource {
                     return SourceItem::Packet(self.partial);
                 }
             } else {
-                match self.rx.recv().await {
-                    Ok(StreamEvent::Data(chunk)) => {
+                let (event, gap) = match &mut self.rx {
+                    PacketReader::Broadcast(rx) => (rx.recv().await, false),
+                    PacketReader::Direct { source, stats } => {
+                        let source = source
+                            .as_mut()
+                            .expect("owned source available until cleanup");
+                        let bytes = source.next().await;
+                        *stats.lock().unwrap() = source.stats();
+                        let gap = source.take_discontinuity();
+                        (
+                            bytes
+                                .map(StreamEvent::Data)
+                                .ok_or(broadcast::error::RecvError::Closed),
+                            gap,
+                        )
+                    }
+                };
+                match event {
+                    Ok(
+                        StreamEvent::Data(chunk) | StreamEvent::NormalizedData { bytes: chunk, .. },
+                    ) => {
                         // Bytes may be a tiny view of an arbitrarily large owner.
                         // Reserve and detach synchronously, then drop that owner
                         // before returning a packet or reaching any await.
@@ -474,6 +505,10 @@ impl PacketSource {
                         self.offset = 0;
                         #[cfg(test)]
                         self.update_probe();
+                        if gap {
+                            self.discard_partial();
+                            return SourceItem::Recovery(RecoveryReason::Source);
+                        }
                     }
                     Ok(StreamEvent::Discontinuity) => {
                         self.discard_partial();
@@ -490,8 +525,68 @@ impl PacketSource {
     }
 }
 
-struct EnabledWorker {
-    media: Arc<HlsPackager>,
+trait WorkerTarget: Send + Sync {
+    type Output: process::ProcessOutput;
+    fn status(&self) -> HlsStatus;
+    fn begin_generation(&self, generation: GenerationId, deadline: Instant, recovery: bool);
+    fn fail_generation(&self, generation: GenerationId, reason: HlsFailure);
+    fn child_output(&self, generation: GenerationId) -> Self::Output;
+    fn feed_initial(
+        &self,
+        generation: GenerationId,
+        packets: &[[u8; 188]],
+        cancel: &mut watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = Result<(), HlsFailure>> + Send;
+    fn feed_packet(
+        &self,
+        generation: GenerationId,
+        packet: &[u8; 188],
+        cancel: &mut watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = Result<(), HlsFailure>> + Send;
+    fn flush_pending(&self, generation: GenerationId);
+}
+impl WorkerTarget for Arc<HlsPackager> {
+    type Output = process::HlsOutput;
+    fn status(&self) -> HlsStatus {
+        HlsPackager::status(self)
+    }
+    fn begin_generation(&self, generation: GenerationId, deadline: Instant, recovery: bool) {
+        HlsPackager::begin_generation(self, generation, deadline, recovery);
+    }
+    fn fail_generation(&self, generation: GenerationId, reason: HlsFailure) {
+        HlsPackager::fail_generation(self, generation, reason);
+    }
+    fn child_output(&self, generation: GenerationId) -> Self::Output {
+        process::HlsOutput {
+            generation,
+            media: self.clone(),
+        }
+    }
+    fn flush_pending(&self, _generation: GenerationId) {}
+    async fn feed_initial(
+        &self,
+        generation: GenerationId,
+        packets: &[[u8; 188]],
+        _cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(), HlsFailure> {
+        for packet in packets {
+            self.feed_generation(generation, packet);
+        }
+        Ok(())
+    }
+    async fn feed_packet(
+        &self,
+        generation: GenerationId,
+        packet: &[u8; 188],
+        _cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(), HlsFailure> {
+        self.feed_generation(generation, packet);
+        Ok(())
+    }
+}
+
+struct EnabledWorker<M = Arc<HlsPackager>> {
+    media: M,
     prepared: PreparedNormalizer,
     source: PacketSource,
     recovery: RecoveryWindow,
@@ -511,7 +606,7 @@ enum Turn {
     Eof,
     Stop,
 }
-impl EnabledWorker {
+impl<M: WorkerTarget> EnabledWorker<M> {
     fn invalidate(
         &mut self,
         reason: RecoveryReason,
@@ -589,10 +684,9 @@ impl EnabledWorker {
             let mut initial = opening.tables;
             initial.push(opening.packet);
             if !transform {
-                for packet in initial {
-                    self.media
-                        .feed_generation(self.recovery.generation, &packet);
-                }
+                self.media
+                    .feed_initial(self.recovery.generation, &initial, &mut cancel)
+                    .await?;
                 match AssertUnwindSafe(self.produce(
                     &mut selector,
                     &layout,
@@ -622,11 +716,10 @@ impl EnabledWorker {
                 let replay = self.budget.acquire_owned(replay, &mut cancel).await?;
                 let (tx, rx) = mpsc::channel(16);
                 let (child_cancel, child_rx) = watch::channel(false);
-                let child = run_child(
+                let child = process::run_target_child(
                     self.prepared.clone(),
                     layout.clone(),
-                    self.recovery.generation,
-                    self.media.clone(),
+                    self.media.child_output(self.recovery.generation),
                     rx,
                     child_rx,
                     self.deadline,
@@ -702,14 +795,31 @@ impl EnabledWorker {
             } else {
                 Some(self.deadline)
             };
-            let item = tokio::select! { biased;
-                _ = process::cancelled(cancel) => return Ok(Turn::Stop),
-                _ = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => return Err(HlsFailure::Deadline),
-                item = self.source.next(&self.budget) => item,
+            let item = {
+                let reading = self.source.next(&self.budget);
+                tokio::pin!(reading);
+                let mut flushed = false;
+                tokio::select! { biased;
+                    _ = process::cancelled(cancel) => return Ok(Turn::Stop),
+                    _ = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => return Err(HlsFailure::Deadline),
+                    item = std::future::poll_fn(|cx| {
+                        let result = std::future::Future::poll(reading.as_mut(),cx);
+                        if sender.is_none() && result.is_pending() && !flushed {
+                            self.media.flush_pending(self.recovery.generation);
+                            flushed = true;
+                        }
+                        result
+                    }) => item,
+                }
             };
             match item {
                 SourceItem::Failed(reason) => return Err(reason),
-                SourceItem::Closed => return Ok(Turn::Eof),
+                SourceItem::Closed => {
+                    if sender.is_none() {
+                        self.media.flush_pending(self.recovery.generation);
+                    }
+                    return Ok(Turn::Eof);
+                }
                 SourceItem::Recovery(reason) => return Ok(Turn::Recover(reason, None)),
                 SourceItem::Packet(mut packet) => {
                     if !validate_packet(&packet)? {
@@ -729,11 +839,7 @@ impl EnabledWorker {
                     }
                     clear_marker(&mut packet);
                     match sender {
-                        // The transform child receives the full source program.
                         Some(sender) => {
-                            // Source storage is still fully charged until its entire
-                            // allocation is dropped. Never await permits that only
-                            // this producer could release by consuming that tail.
                             let input = self.budget.try_copy(&packet)?;
                             tokio::select! { biased;
                                 _ = process::cancelled(cancel) => return Ok(Turn::Stop),
@@ -743,7 +849,8 @@ impl EnabledWorker {
                         None => {
                             if let Some(output) = copy_output(selected) {
                                 self.media
-                                    .feed_generation(self.recovery.generation, &output);
+                                    .feed_packet(self.recovery.generation, &output, cancel)
+                                    .await?;
                             }
                         }
                     }

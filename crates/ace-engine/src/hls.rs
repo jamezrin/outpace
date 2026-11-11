@@ -56,6 +56,7 @@ struct HlsState {
     status: HlsStatus,
     deadline: Option<tokio::time::Instant>,
     strict: bool,
+    source_generation: bool,
     generation_segments: usize,
     // The owner already announced this generation. An opening mux marker must
     // not discard its freshly validated prefix; expire at accepted access point.
@@ -119,6 +120,7 @@ impl HlsPackager {
                 status: HlsStatus::Starting,
                 deadline: None,
                 strict: false,
+                source_generation: false,
                 generation_segments: 0,
                 generation_opening: false,
                 audio: LiveAudioSelection::default(),
@@ -157,6 +159,8 @@ impl HlsPackager {
             st.generation_opening = strict;
             if strict {
                 st.access.enable_mpeg2();
+            }
+            if strict || session.playback_state().is_some() {
                 st.access.preserve_transport_identity();
             }
             st.deadline = Some(tokio::time::Instant::now() + media.startup_timeout);
@@ -251,7 +255,7 @@ impl HlsPackager {
     }
 
     fn expire(&self, st: &mut HlsState) {
-        if st.strict
+        if (st.strict || st.source_generation)
             && matches!(st.status, HlsStatus::Starting | HlsStatus::Recovering)
             && st
                 .deadline
@@ -287,7 +291,14 @@ impl HlsPackager {
             let (status, deadline) = {
                 let mut st = self.state.lock().unwrap();
                 self.expire(&mut st);
-                (st.status, if st.strict { st.deadline } else { None })
+                (
+                    st.status,
+                    if st.strict || st.source_generation {
+                        st.deadline
+                    } else {
+                        None
+                    },
+                )
             };
             if !matches!(status, HlsStatus::Starting | HlsStatus::Recovering) {
                 return status;
@@ -299,28 +310,93 @@ impl HlsPackager {
         }
     }
 
+    // Source generation identity is carried on each media chunk. The watch only
+    // controls availability: it can coalesce and must never relabel queued bytes.
+    fn observe_source_generation(&self, generation: u64) {
+        let mut st = self.state.lock().unwrap();
+        st.source_generation = true;
+        if GenerationId(generation) <= st.generation
+            || matches!(st.status, HlsStatus::Failed(_) | HlsStatus::Stopped)
+        {
+            return;
+        }
+        let was_ready = st.status == HlsStatus::Ready;
+        st.generation = GenerationId(generation);
+        if was_ready || st.deadline.is_none() {
+            st.deadline = Some(tokio::time::Instant::now() + self.startup_timeout);
+        }
+        st.status = if generation > 1 {
+            HlsStatus::Recovering
+        } else {
+            HlsStatus::Starting
+        };
+        st.generation_segments = 0;
+        Self::reset_partial(&mut st, false);
+        st.generation_opening = true;
+        st.discontinuity_pending = generation > 1;
+        // Do not switch strict output policy: native audio selection still applies.
+        self.ready.notify_waiters();
+    }
+
     pub(crate) async fn run_native(
         self: Arc<Self>,
         mut rx: tokio::sync::broadcast::Receiver<StreamEvent>,
         mut cancel: tokio::sync::watch::Receiver<bool>,
+        mut source_state: Option<crate::audio_normalize::PlaybackStateHandle>,
     ) {
         use tokio::sync::broadcast::error::RecvError;
+        fn source_failure(
+            state: &Option<crate::audio_normalize::PlaybackStateHandle>,
+        ) -> Option<HlsFailure> {
+            match state.as_ref()?.snapshot().phase {
+                crate::audio_normalize::PlaybackPhase::Failed(reason) => Some(reason),
+                _ => None,
+            }
+        }
         loop {
+            if let Some(state) = &source_state {
+                self.observe_source_generation(state.snapshot().generation);
+            }
+            if let Some(reason) = source_failure(&source_state) {
+                let generation = self.state.lock().unwrap().generation;
+                self.fail_generation(generation, reason);
+                return;
+            }
             tokio::select! {
                 biased;
                 _ = cancel.changed() => { if *cancel.borrow() { break; } }
+                _ = async {
+                    match source_state.as_mut() {
+                        Some(state) if !state.is_closed() => { let _ = state.changed().await; },
+                        _ => std::future::pending().await,
+                    }
+                } => continue,
                 event = rx.recv() => match event {
-                    Ok(StreamEvent::Data(chunk)) => self.feed(&chunk),
+                    Ok(StreamEvent::Data(chunk)) => {
+                        if source_state.is_none() { self.feed(&chunk); }
+                    }
+                    Ok(StreamEvent::NormalizedData { bytes, generation }) => {
+                        if let Some(state) = &source_state {
+                            self.observe_source_generation(state.snapshot().generation);
+                            self.feed_generation(GenerationId(generation), &bytes);
+                        }
+                    }
                     Ok(StreamEvent::Discontinuity) => self.discontinuity(),
                     Err(RecvError::Lagged(_)) => self.receiver_lag(),
                     Err(RecvError::Closed) => {
-                        self.finish();
+                        self.finish_source(&source_state);
                         return;
                     }
                 }
             }
         }
-        self.stop();
+        // A failure published before source EOF must survive that simultaneous close.
+        if let Some(reason) = source_failure(&source_state) {
+            let generation = self.state.lock().unwrap().generation;
+            self.fail_generation(generation, reason);
+        } else {
+            self.stop();
+        }
     }
 
     /// Drop media accumulated before a known gap and mark the first complete segment after it.
@@ -332,6 +408,17 @@ impl HlsPackager {
     /// an independent discontinuity and must take the normal reset path.
     fn receiver_lag(&self) {
         self.reset_for_gap(false);
+    }
+
+    fn finish_source(&self, source: &Option<crate::audio_normalize::PlaybackStateHandle>) {
+        if let Some(crate::audio_normalize::PlaybackPhase::Failed(reason)) =
+            source.as_ref().map(|source| source.snapshot().phase)
+        {
+            let generation = self.state.lock().unwrap().generation;
+            self.fail_generation(generation, reason);
+        } else {
+            self.finish();
+        }
     }
 
     fn reset_for_gap(&self, deduplicate_source_marker: bool) {
@@ -377,7 +464,11 @@ impl HlsPackager {
             }
             let mut packet: [u8; TS_PACKET] = st.input.as_slice().try_into().unwrap();
             st.input.clear();
-            if st.strict && st.generation_opening && packet[3] & 0x20 != 0 && packet[4] > 0 {
+            if (st.strict || st.source_generation)
+                && st.generation_opening
+                && packet[3] & 0x20 != 0
+                && packet[4] > 0
+            {
                 // Enabled owners fence source markers before publication. A new
                 // mux's opening marker belongs to the same announced boundary.
                 packet[5] &= !0x80;
@@ -660,7 +751,7 @@ impl HlsPackager {
             discontinuity,
         });
         st.generation_segments = st.generation_segments.saturating_add(1);
-        let count = if st.strict {
+        let count = if st.strict || st.source_generation {
             st.generation_segments
         } else {
             st.segments.len()
@@ -1871,6 +1962,137 @@ mod tests {
         assert_eq!(p.state.lock().unwrap().last_access, Some(stale));
     }
 
+    // A shared source may reach TS readiness before its HLS cushion exists.
+    #[tokio::test(start_paused = true)]
+    async fn shared_source_ready_does_not_disable_hls_absolute_deadline() {
+        use crate::audio_normalize::PlaybackPublisher;
+        let p = clean_pkg(64);
+        p.state.lock().unwrap().deadline =
+            Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        let (publisher, state) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(p.clone().run_native(rx, cancelled, Some(state)));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let observed = p.status();
+        cancel.send_replace(true);
+        worker.await.unwrap();
+        assert_eq!(observed, HlsStatus::Failed(HlsFailure::Deadline));
+    }
+
+    #[tokio::test]
+    async fn shared_source_recovery_withholds_old_playlist_but_retains_segments() {
+        use crate::audio_normalize::PlaybackPublisher;
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 64,
+                startup_segments: 2,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 2);
+        assert_eq!(p.status(), HlsStatus::Ready);
+        let old = p.segment(0).unwrap();
+        let (publisher, state) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(p.clone().run_native(rx, cancelled, Some(state)));
+        tokio::task::yield_now().await;
+        publisher.begin_generation(2);
+        tokio::task::yield_now().await;
+        let observed = p.playlist_snapshot("/synthetic/", false);
+        let retained = p.segment(0);
+        cancel.send_replace(true);
+        worker.await.unwrap();
+        assert_eq!(observed, Err(HlsStatus::Recovering));
+        assert_eq!(retained.as_deref(), Some(old.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn shared_source_coalesced_generation_drops_queued_old_media_and_requires_fresh_cushion()
+    {
+        use crate::audio_normalize::PlaybackPublisher;
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 64,
+                startup_segments: 2,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        let (publisher, state) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(p.clone().run_native(rx, cancelled, Some(state)));
+        let run = |start: u64, count: u64| {
+            let mut bytes = [pat(PMT_PID), pmt(PMT_PID, VIDEO_PID)].concat();
+            for i in 0..=count {
+                bytes.extend(video_access_packet(VIDEO_PID, start + i * 108_000));
+            }
+            Bytes::from(bytes)
+        };
+        tx.send(StreamEvent::NormalizedData {
+            bytes: run(0, 2),
+            generation: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            p.wait_available(Duration::from_secs(1)).await,
+            HlsStatus::Ready
+        );
+        let old = p.segment(0).unwrap();
+        // No await between state updates and queueing: the worker sees Ready(2)
+        // directly, with a complete old run still ahead of replacement data.
+        publisher.begin_generation(2);
+        publisher.mark_ready(2);
+        tx.send(StreamEvent::NormalizedData {
+            bytes: run(324_000, 3),
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(StreamEvent::Discontinuity).unwrap();
+        tx.send(StreamEvent::NormalizedData {
+            bytes: run(0, 1),
+            generation: 2,
+        })
+        .unwrap();
+        let progress = tokio::time::timeout(Duration::from_secs(1), async {
+            while p.segment(2).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let middle = p.playlist_snapshot("/synthetic/", false);
+        let retained = p.segment(0);
+        tx.send(StreamEvent::NormalizedData {
+            bytes: Bytes::from(video_access_packet(VIDEO_PID, 216_000)),
+            generation: 2,
+        })
+        .unwrap();
+        let ready = p.wait_available(Duration::from_secs(1)).await;
+        let playlist = p.playlist_snapshot("/synthetic/", false);
+        cancel.send_replace(true);
+        worker.await.unwrap();
+        assert_eq!(progress, Ok(()));
+        assert_eq!(middle, Err(HlsStatus::Recovering));
+        assert_eq!(retained.as_deref(), Some(old.as_ref()));
+        assert_eq!(ready, HlsStatus::Ready);
+        assert_eq!(
+            playlist.unwrap().matches("#EXT-X-DISCONTINUITY\n").count(),
+            1
+        );
+    }
+
     #[test]
     fn hls_generation_disabled_mode_preserves_readiness_after_gap() {
         let p = clean_pkg(6);
@@ -2093,6 +2315,32 @@ mod tests {
         feed_clean_run_generation(&p, GenerationId(7), 900_000, 3);
         assert_eq!(p.segment(0).as_deref(), Some(before.as_ref()));
         assert!(p.segment(1).is_none());
+    }
+
+    #[test]
+    fn source_eof_rechecks_retained_failure_before_closing_ready_playlist() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                segment_duration_ms: 1000,
+                startup_segments: 2,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 2);
+        assert_eq!(p.status(), HlsStatus::Ready);
+        let (publisher, handle) = crate::audio_normalize::PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::audio_normalize::PlaybackPhase::Ready
+        );
+        publisher.fail(1, HlsFailure::ChildExit);
+        drop(publisher);
+        p.finish_source(&Some(handle));
+        assert_eq!(p.status(), HlsStatus::Failed(HlsFailure::ChildExit));
     }
 
     #[test]

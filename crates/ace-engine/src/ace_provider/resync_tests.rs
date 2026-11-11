@@ -580,6 +580,9 @@ async fn extend_raw_until_packet_count(
         match event {
             crate::session::StreamEvent::Data(data) => collected.extend_from_slice(&data),
             crate::session::StreamEvent::Discontinuity => *marker_count += 1,
+            crate::session::StreamEvent::NormalizedData { .. } => {
+                panic!("raw recovery does not normalize")
+            }
         }
         assert!(collected.len() <= 1 << 20, "bounded raw session capture");
     }
@@ -963,6 +966,9 @@ async fn run_http_reconnect_case(
                     assert!(raw_prefix.len() <= 1 << 20, "bounded raw prefix");
                 }
                 Ok(crate::session::StreamEvent::Discontinuity) => raw_markers += 1,
+                Ok(crate::session::StreamEvent::NormalizedData { .. }) => {
+                    panic!("raw recovery does not normalize")
+                }
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
                     panic!("raw session remains open until the owned manager stop")
@@ -1035,6 +1041,9 @@ async fn run_http_reconnect_case(
         tokio::time::timeout(Duration::from_secs(8), async {
             while !saw_resumed_data {
                 match raw.recv().await.unwrap() {
+                    crate::session::StreamEvent::NormalizedData { .. } => {
+                        panic!("raw recovery does not normalize")
+                    }
                     crate::session::StreamEvent::Discontinuity => {
                         markers_before_resumed_data += 1;
                     }

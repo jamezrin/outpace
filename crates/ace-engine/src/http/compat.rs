@@ -56,6 +56,7 @@ pub(super) async fn ace_getstream(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
+
     let Some(opened) = open_for_lease(&s, &network, &session_key, expires_at, &mut cancel).await
     else {
         // This request minted the hidden lease, so it must remove it even once expired;
@@ -64,16 +65,21 @@ pub(super) async fn ace_getstream(
         return StatusCode::NOT_FOUND.into_response();
     };
     match opened {
-        Ok(session) => ace_stream_session_response(
-            session,
-            expires_at,
-            cancel,
-            Some(AceDirectLeaseGuard {
-                sessions: s.ace_sessions.clone(),
-                playback_id,
-                token,
-            }),
-        ),
+        Ok(session) => {
+            ace_stream_session_response(
+                session,
+                expires_at,
+                cancel,
+                Some(AceDirectLeaseGuard {
+                    sessions: s.ace_sessions.clone(),
+                    playback_id,
+                    token,
+                }),
+                s.manager.hls_startup_timeout(),
+            )
+            .await
+        }
+
         Err(ProviderError::CapacityExhausted) => {
             s.ace_sessions.revoke(&playback_id, &token);
             super::streams::capacity_error()
@@ -296,12 +302,23 @@ pub(super) async fn ace_playback(
     let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&id, &token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+
     let Some(opened) = open_for_lease(&s, &network, &session_key, expires_at, &mut cancel).await
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
     match opened {
-        Ok(session) => ace_stream_session_response(session, expires_at, cancel, None),
+        Ok(session) => {
+            ace_stream_session_response(
+                session,
+                expires_at,
+                cancel,
+                None,
+                s.manager.hls_startup_timeout(),
+            )
+            .await
+        }
+
         Err(error) => {
             // Provider messages may embed identifiers or credentials. Log only the typed
             // category, and keep both logs and response bodies independent of that text.

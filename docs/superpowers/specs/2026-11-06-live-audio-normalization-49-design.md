@@ -1,10 +1,12 @@
 # Optional shared live MPEG-TS normalization (#49)
 
-Status: the bounded process-output extraction is implemented and reviewed. The
-live-TS source, option and HTTP integration remain unimplemented. Routine design choices
-are delegated by the milestone goal. Existing HLS-only normalization is not #49
-completion. Implement in reviewable stages; keep the issue open until all gates
-and a real synthetic-media witness pass.
+Status: the extracted boundary is merged; shared TS output/source, configuration,
+HTTP errors and synthetic codec acceptance are implemented in the current draft.
+Synthetic codec tests, workspace gates and bounded before/after performance
+validation pass. Whole-feature review and its HLS generation-lifecycle fix pass final gates; PR
+integration remains pending. Routine design choices are delegated by the milestone goal. Existing
+HLS-only normalization is not #49 completion; keep the issue open until every
+acceptance criterion is backed by evidence.
 
 ## Decision and scope
 

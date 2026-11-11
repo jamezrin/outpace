@@ -351,6 +351,7 @@ pub struct StreamManager {
     buffer: usize,
     hls: HlsConfig,
     normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+    live_normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     grace: Duration,
     cleanup: CleanupTracker,
     reaper: StdMutex<Option<WorkerControl>>,
@@ -480,6 +481,19 @@ impl StreamManager {
         normalizer: Option<crate::hls_audio::PreparedNormalizer>,
         max_sessions: usize,
     ) -> Arc<Self> {
+        Self::with_audio_config(registry, buffer, hls, normalizer, None, max_sessions)
+    }
+
+    /// One prepared executable may serve both options; shared TS normalization
+    /// supersedes HLS-only conversion to avoid a second classifier or child.
+    pub fn with_audio_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        live_normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        max_sessions: usize,
+    ) -> Arc<Self> {
         Arc::new(StreamManager {
             support_controls: StdMutex::new(Vec::new()),
             registry,
@@ -494,12 +508,29 @@ impl StreamManager {
             vod_resolve_locks: StdMutex::new(HashMap::new()),
             buffer,
             hls,
-            normalizer,
+            normalizer: if live_normalizer.is_none() {
+                normalizer
+            } else {
+                None
+            },
+            live_normalizer,
             grace: Duration::from_secs(30),
             cleanup: CleanupTracker::default(),
             reaper: StdMutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    fn normalize_live_source(&self, source: Box<dyn TsSource>) -> Box<dyn TsSource> {
+        match &self.live_normalizer {
+            Some(prepared) => crate::hls_audio::live_source::spawn(
+                source,
+                prepared.clone(),
+                self.hls_startup_timeout(),
+                &self.cleanup,
+            ),
+            None => source,
+        }
     }
 
     #[cfg(test)]
@@ -1054,6 +1085,7 @@ impl StreamManager {
                 ProviderError::NotFound,
             ));
         }
+        let source = self.normalize_live_source(source);
         let session = StreamSession::start_with_cleanup(source, self.buffer, &self.cleanup);
         let mut map = self.sessions.lock().await;
         Ok(acquire(map.entry(key).or_insert(session).clone()))
@@ -1184,9 +1216,11 @@ impl StreamManager {
                 session.clone()
             } else {
                 let session = StreamSession::start_with_cleanup(
-                    source
-                        .take()
-                        .expect("an absent HLS session must have an opened source"),
+                    self.normalize_live_source(
+                        source
+                            .take()
+                            .expect("an absent HLS session must have an opened source"),
+                    ),
                     self.buffer,
                     &self.cleanup,
                 );
@@ -1634,6 +1668,171 @@ mod tests {
             ));
         }
         input
+    }
+
+    #[tokio::test]
+    async fn live_audio_terminal_failure_is_inherited_by_native_hls() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let manager = StreamManager::with_audio_config(
+            providers,
+            8,
+            HlsConfig::default(),
+            None,
+            Some(crate::hls_audio::PreparedNormalizer {
+                executable: "/not/an/executable".into(),
+            }),
+            1,
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "failure")
+            .await
+            .unwrap();
+        tx.send((false, vec![0xff; 188].into())).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            media.wait_available(Duration::from_secs(1)),
+        )
+        .await;
+        manager.shutdown().await;
+        assert_eq!(
+            result,
+            Ok(crate::hls::HlsStatus::Failed(
+                crate::hls::HlsFailure::Unsupported
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn live_audio_normalization_shares_one_source_for_ts_and_hls_in_both_creation_orders() {
+        for hls_first in [false, true] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut providers = ProviderRegistry::new();
+            providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+            let hls = HlsConfig {
+                segment_packets: 128,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                ..HlsConfig::default()
+            };
+            let manager = StreamManager::with_audio_config(
+                providers,
+                32,
+                hls,
+                None,
+                Some(crate::hls_audio::PreparedNormalizer {
+                    executable: "/not/an/executable".into(),
+                }),
+                1,
+            );
+            let media = if hls_first {
+                Some(
+                    manager
+                        .get_or_start_hls("normalization-test", "shared")
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let (session, mut subscriber) = manager
+                .get_or_subscribe("normalization-test", "shared")
+                .await
+                .unwrap();
+            let media = match media {
+                Some(media) => media,
+                None => manager
+                    .get_or_start_hls("normalization-test", "shared")
+                    .await
+                    .unwrap(),
+            };
+            assert!(
+                session.playback_state().is_some(),
+                "both creation paths must decorate"
+            );
+            tx.send((false, task4_input(false).into())).unwrap();
+            let delivered =
+                tokio::time::timeout(Duration::from_secs(2), subscriber.rx.recv()).await;
+            let ready = tokio::time::timeout(
+                Duration::from_secs(2),
+                media.wait_available(Duration::from_secs(2)),
+            )
+            .await;
+            let occupied = manager.admission_status().0;
+            let session_count = manager.sessions.lock().await.len();
+            manager.shutdown().await;
+            assert!(matches!(
+                delivered,
+                Ok(Ok(crate::session::StreamEvent::NormalizedData {
+                    generation: 1,
+                    ..
+                }))
+            ));
+            assert_eq!(ready, Ok(crate::hls::HlsStatus::Ready));
+            assert_eq!(occupied, 1);
+            assert_eq!(session_count, 1);
+            assert_eq!(manager.admission_status().0, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_audio_both_options_require_fresh_hls_segments_after_recovery() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+        let prepared = crate::hls_audio::PreparedNormalizer {
+            executable: "/missing-unused-normalizer".into(),
+        };
+        let manager = StreamManager::with_audio_config(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                startup_segments: 2,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            Some(prepared.clone()),
+            Some(prepared),
+            1,
+        );
+        let media = manager
+            .get_or_start_hls("normalization-test", "recovery")
+            .await
+            .unwrap();
+        let mut initial = task4_input(true);
+        initial.extend_from_slice(&crate::hls_audio::process::test_fixtures::pcr_packet(
+            256, 216_000,
+        ));
+        tx.send((false, initial.into())).unwrap();
+        let first = media.wait_available(Duration::from_secs(2)).await;
+        let old = media.segment(0);
+        tx.send((true, task4_input(true).into())).unwrap();
+        let progress = tokio::time::timeout(Duration::from_secs(2), async {
+            while media.segment(2).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let middle = media.playlist_snapshot("/synthetic/", false);
+        let retained = media.segment(0);
+        tx.send((
+            false,
+            bytes::Bytes::copy_from_slice(&crate::hls_audio::process::test_fixtures::pcr_packet(
+                256, 216_000,
+            )),
+        ))
+        .unwrap();
+        let ready = media.wait_available(Duration::from_secs(2)).await;
+        manager.shutdown().await;
+        assert_eq!(first, crate::hls::HlsStatus::Ready);
+        assert!(old.is_some());
+        assert_eq!(progress, Ok(()));
+        assert_eq!(middle, Err(crate::hls::HlsStatus::Recovering));
+        assert_eq!(retained, old);
+        assert_eq!(ready, crate::hls::HlsStatus::Ready);
+        assert_eq!(manager.admission_status().0, 0);
     }
 
     #[tokio::test]
