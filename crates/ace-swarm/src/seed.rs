@@ -106,6 +106,10 @@ impl SeederSession {
         });
         let mut unchoked = false;
         let mut advertised_bitfields = false;
+        // BEP-10 ids are directional: requests arrive on the id 2 we advertised, but replies go
+        // out on the id the peer advertised for `ut_metadata`. A later handshake that omits the
+        // mapping keeps the current one; an explicit 0 disables it.
+        let mut peer_ut_metadata_id: Option<u8> = None;
         // Highest piece already advertised to this peer (via the initial `mi`/live bitfield or a
         // subsequent id=4 HAVE). Set from the same snapshot the bitfield is built from, then
         // advanced one HAVE per newly completed piece (issue #94).
@@ -157,33 +161,53 @@ impl SeederSession {
                 crate::alog!("[seed-session] <- {}", seed_message_summary(&msg));
             }
             match msg {
-                PeerMessage::Extended { ext_id: 0, .. } if !advertised_bitfields => {
-                    if let Some(store) = &store {
-                        // Seed the live edge from the very snapshot the bitfield advertises, so a
-                        // piece that completes between here and the first poll still gets a HAVE.
-                        advertised_max = advertise_live_bitfields(session, store, debug).await?;
+                PeerMessage::Extended { ext_id: 0, payload } => {
+                    if let Some(id) = ExtendedHandshake::parse(&payload)
+                        .ok()
+                        .and_then(|eh| eh.ut_metadata_id())
+                    {
+                        peer_ut_metadata_id = u8::try_from(id).ok().filter(|&id| id != 0);
                     }
-                    advertised_bitfields = true;
+                    if !advertised_bitfields {
+                        if let Some(store) = &store {
+                            // Seed the live edge from the very snapshot the bitfield advertises,
+                            // so a piece that completes between here and the first poll still
+                            // gets a HAVE.
+                            advertised_max =
+                                advertise_live_bitfields(session, store, debug).await?;
+                        }
+                        advertised_bitfields = true;
+                    }
                 }
                 PeerMessage::Extended { ext_id: 2, payload } => {
-                    if let Some(metadata) = &metadata {
+                    if let (Some(metadata), Some(reply_id)) = (&metadata, peer_ut_metadata_id) {
                         if let Some(ace_wire::ut_metadata::MetadataMessage::Request { piece }) =
                             ace_wire::ut_metadata::MetadataMessage::parse(&payload)
                         {
-                            let piece = piece.max(0) as usize;
-                            let start = piece * ace_wire::ut_metadata::METADATA_BLOCK_LEN;
-                            if start < metadata.len() {
-                                let end = (start + ace_wire::ut_metadata::METADATA_BLOCK_LEN)
-                                    .min(metadata.len());
-                                let payload = ace_wire::ut_metadata::data_piece(
-                                    piece as i64,
-                                    metadata.len() as i64,
-                                    &metadata[start..end],
-                                );
-                                session
-                                    .send(&PeerMessage::Extended { ext_id: 2, payload })
-                                    .await?;
-                            }
+                            // A negative or out-of-range index is not a request for piece 0.
+                            let Some(start) = usize::try_from(piece)
+                                .ok()
+                                .and_then(|i| {
+                                    i.checked_mul(ace_wire::ut_metadata::METADATA_BLOCK_LEN)
+                                })
+                                .filter(|&start| start < metadata.len())
+                            else {
+                                continue;
+                            };
+                            let end = start
+                                + (metadata.len() - start)
+                                    .min(ace_wire::ut_metadata::METADATA_BLOCK_LEN);
+                            let payload = ace_wire::ut_metadata::data_piece(
+                                piece,
+                                metadata.len() as i64,
+                                &metadata[start..end],
+                            );
+                            session
+                                .send(&PeerMessage::Extended {
+                                    ext_id: reply_id,
+                                    payload,
+                                })
+                                .await?;
                         }
                     }
                 }
@@ -960,6 +984,7 @@ mod tests {
         let parsed = ExtendedHandshake::parse(&payload).unwrap();
         assert_eq!(parsed.metadata_size(), Some(27));
 
+        // Before the client advertises a `ut_metadata` id there is nowhere to reply.
         client_session
             .send(&PeerMessage::Extended {
                 ext_id: 2,
@@ -967,17 +992,53 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), client_session.read_message())
+                .await
+                .is_err(),
+            "no reply without a peer ut_metadata mapping"
+        );
+
+        // BEP-10 ids are directional: the client listens on 7, so replies must use 7.
+        client_session
+            .send(&PeerMessage::Extended {
+                ext_id: 0,
+                payload: b"d1:md11:ut_metadatai7eee".to_vec(),
+            })
+            .await
+            .unwrap();
+        // A negative index is ignored rather than served as piece 0.
+        for piece in [-1, 0] {
+            client_session
+                .send(&PeerMessage::Extended {
+                    ext_id: 2,
+                    payload: request_piece(piece),
+                })
+                .await
+                .unwrap();
+        }
         let msg = client_session.read_message().await.unwrap();
-        let PeerMessage::Extended { ext_id: 2, payload } = msg else {
-            panic!("expected ut_metadata data");
+        let PeerMessage::Extended { ext_id: 7, payload } = msg else {
+            panic!("expected ut_metadata data on the client's id, got {msg:?}");
         };
         match MetadataMessage::parse(&payload).unwrap() {
-            MetadataMessage::Data { piece, data, .. } => {
+            MetadataMessage::Data {
+                piece,
+                total_size,
+                data,
+            } => {
                 assert_eq!(piece, 0);
+                assert_eq!(total_size, Some(27));
                 assert_eq!(data, b"AceStreamTransport-metadata");
             }
             other => panic!("expected data, got {other:?}"),
         }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), client_session.read_message())
+                .await
+                .is_err(),
+            "exactly one reply: the negative index was dropped"
+        );
 
         drop(client_session);
         let _ = server_task.await;
