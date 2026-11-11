@@ -52,11 +52,18 @@ pub(super) async fn ace_getstream(
     // A direct request owns an ordinary compatibility lease, just like a caller that follows
     // the JSON playback URL. The body holds exactly one StreamManager subscription, so dropping
     // it detaches this caller without stopping a shared source or another compatibility client.
-    let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&playback_id, &token)
+    let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&playback_id, &token)
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match s.manager.get_or_subscribe(&network, &session_key).await {
+    let Some(opened) = open_for_lease(&s, &network, &session_key, expires_at, &mut cancel).await
+    else {
+        // This request minted the hidden lease, so it must remove it even once expired;
+        // `revoke` is an authorization check and refuses an expired lease.
+        s.ace_sessions.remove_owned(&playback_id, &token);
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match opened {
         Ok(session) => ace_stream_session_response(
             session,
             expires_at,
@@ -259,6 +266,26 @@ pub(super) async fn ace_hls_segment(
     }
 }
 
+/// Acquire a lease's source, unless the lease is stopped or expires first. `None` means the
+/// lease ended: dropping this waiter releases a pending open no other viewer is waiting on.
+async fn open_for_lease(
+    s: &AppState,
+    network: &str,
+    session_key: &str,
+    expires_at: Instant,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<Result<(Arc<StreamSession>, crate::session::Subscription), ProviderError>> {
+    if *cancel.borrow_and_update() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => None,
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => None,
+        opened = s.manager.get_or_subscribe(network, session_key) => Some(opened),
+    }
+}
+
 pub(super) async fn ace_playback(
     State(s): State<AppState>,
     Path((id, token)): Path<(String, String)>,
@@ -266,10 +293,14 @@ pub(super) async fn ace_playback(
     let Some(network) = ace_network(&s) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&id, &token) else {
+    let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&id, &token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match s.manager.get_or_subscribe(&network, &session_key).await {
+    let Some(opened) = open_for_lease(&s, &network, &session_key, expires_at, &mut cancel).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match opened {
         Ok(session) => ace_stream_session_response(session, expires_at, cancel, None),
         Err(error) => {
             // Provider messages may embed identifiers or credentials. Log only the typed
