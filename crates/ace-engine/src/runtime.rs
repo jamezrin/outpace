@@ -157,6 +157,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_MAX_REASM_PIECES_AHEAD") {
         config.live_recovery.max_reasm_pieces_ahead = v.parse()?;
     }
+    if let Some(v) = bool_from_env("OUTPACE_LIVE_AUDIO_NORMALIZE")? {
+        config.live_audio_normalize = v;
+    }
     if let Some(v) = bool_from_env("OUTPACE_HLS_AUDIO_NORMALIZE")? {
         config.hls_audio.normalize = v;
     }
@@ -237,7 +240,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
-    config.hls_audio.validate()?;
+    config.normalization_config().validate()?;
     validate_cache_budget(&config)?;
     config.support_sources.validate(&config)?;
     Ok(config)
@@ -652,12 +655,12 @@ pub async fn build_runtime(
     config.startup_buffer.validate()?;
     config.live_recovery.validate()?;
     config.hls.validate()?;
-    config.hls_audio.validate()?;
+    config.normalization_config().validate()?;
     validate_cache_budget(&config)?;
     let local_descriptors = config.private_descriptors.load()?;
     preflight_broadcasts(&config)?;
     preflight_disk_cache_paths(&config)?;
-    let normalizer = crate::hls_audio::preflight(&config.hls_audio).await?;
+    let normalizer = crate::hls_audio::preflight(&config.normalization_config()).await?;
 
     // This must precede identity creation and, critically, the disk cache's remove_dir_all.
     // `build_runtime` is the single validation boundary for both env-derived Config and direct
@@ -720,11 +723,16 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager = StreamManager::with_admission_config(
+    let manager = StreamManager::with_audio_config(
         registry,
         config.session_buffer,
         config.hls,
-        normalizer,
+        config
+            .hls_audio
+            .normalize
+            .then(|| normalizer.clone())
+            .flatten(),
+        config.live_audio_normalize.then_some(normalizer).flatten(),
         config.max_sessions,
     );
     manager.spawn_reaper();
@@ -1489,6 +1497,55 @@ mod tests {
         match old {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
+        }
+    }
+
+    #[test]
+    fn live_audio_normalization_defaults_off_and_validates_shared_executable_only_when_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let names = [
+            "OUTPACE_LIVE_AUDIO_NORMALIZE",
+            "OUTPACE_HLS_AUDIO_NORMALIZE",
+            "OUTPACE_FFMPEG_PATH",
+        ];
+        let old = names.map(std::env::var_os);
+        for name in names {
+            std::env::remove_var(name);
+        }
+        assert!(!config_from_env().unwrap().live_audio_normalize);
+        std::env::set_var(names[2], "");
+        assert!(
+            config_from_env().is_ok(),
+            "disabled modes never need an executable"
+        );
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(names[0], value);
+            std::env::set_var(names[2], "ffmpeg-test");
+            let config = config_from_env().unwrap();
+            assert_eq!(config.live_audio_normalize, expected);
+            assert!(
+                !config.hls_audio.normalize,
+                "live opt-in does not alter the HLS-only switch"
+            );
+        }
+        for value in ["", "yes", "TRUE", " true", "1 "] {
+            std::env::set_var(names[0], value);
+            assert!(config_from_env()
+                .unwrap_err()
+                .to_string()
+                .contains(names[0]));
+        }
+        std::env::set_var(names[0], "true");
+        std::env::set_var(names[2], "");
+        assert!(config_from_env()
+            .unwrap_err()
+            .to_string()
+            .contains(names[2]));
+        for (name, value) in names.into_iter().zip(old) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
     }
 

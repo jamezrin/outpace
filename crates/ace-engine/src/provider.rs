@@ -73,6 +73,16 @@ pub trait TsSource: Send {
     fn stats_handle(&self) -> Option<StatsHandle> {
         None
     }
+    /// Optional normalization readiness and terminal state, independent of media EOF.
+    /// Raw sources allocate no state channel.
+    fn playback_state(&self) -> Option<crate::audio_normalize::PlaybackStateHandle> {
+        None
+    }
+    /// Generation of the most recently returned chunk, not the latest asynchronous
+    /// playback snapshot. Owning decorators preserve this ordered media metadata.
+    fn chunk_generation(&self) -> Option<u64> {
+        None
+    }
     /// Descriptor metadata resolved alongside this exact source, if any.
     fn metadata(&self) -> StreamMetadata {
         StreamMetadata::default()

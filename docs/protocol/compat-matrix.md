@@ -235,7 +235,13 @@ session are required. This does not qualify any particular browser or live clien
 
 Query hints such as `audio_normalize`, codec/playlist/transcode settings, and caller
 source options do not configure FFmpeg or enable arbitrary remuxing, video encoding,
-seek or file selection. Direct TS and native VOD do not use this HLS conversion.
+seek or file selection. `OUTPACE_LIVE_AUDIO_NORMALIZE=true` separately enables
+shared-source conversion for native and compatibility TS as well as HLS. With both
+switches enabled there is one conversion child. TS startup failures return explicit
+422/502/503/504 responses; failures after headers terminate the body with an I/O
+error. Native stream status retains the bounded failure code. VOD lengths, ranges
+and bytes are unchanged. This operator policy does not add per-request conversion
+options or new compatibility response keys.
 
 ## Live statistics units and limits
 

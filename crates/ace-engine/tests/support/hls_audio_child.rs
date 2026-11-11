@@ -18,6 +18,7 @@ pub enum ChildMode {
     StderrFlood,
     EchoValidTs,
     ReadyThenStall,
+    ValidOutputFlood,
     EchoReadyIdle,
     StdoutFlood,
     CapabilityListing,
@@ -36,6 +37,7 @@ impl ChildMode {
             "stderr-flood" => Self::StderrFlood,
             "echo-valid-ts" => Self::EchoValidTs,
             "ready-then-stall" => Self::ReadyThenStall,
+            "valid-output-flood" => Self::ValidOutputFlood,
             "echo-ready-idle" => Self::EchoReadyIdle,
             "stdout-flood" => Self::StdoutFlood,
             "capability-listing" => Self::CapabilityListing,
@@ -102,6 +104,12 @@ pub fn run(mode: ChildMode) {
                 }
             }
             let _ = output.flush();
+        }
+        ChildMode::ValidOutputFlood => {
+            let mut output = io::stdout().lock();
+            let _ = output.write_all(&super::ready_output_fixture(10_000));
+            let _ = output.flush();
+            std::thread::sleep(std::time::Duration::from_secs(30));
         }
         ChildMode::ReadyThenStall => {
             let mut output = io::stdout().lock();

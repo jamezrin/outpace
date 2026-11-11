@@ -57,16 +57,20 @@ pub(super) async fn ace_getstream(
         return StatusCode::NOT_FOUND.into_response();
     };
     match s.manager.get_or_subscribe(&network, &session_key).await {
-        Ok(session) => ace_stream_session_response(
-            session,
-            expires_at,
-            cancel,
-            Some(AceDirectLeaseGuard {
-                sessions: s.ace_sessions.clone(),
-                playback_id,
-                token,
-            }),
-        ),
+        Ok(session) => {
+            ace_stream_session_response(
+                session,
+                expires_at,
+                cancel,
+                Some(AceDirectLeaseGuard {
+                    sessions: s.ace_sessions.clone(),
+                    playback_id,
+                    token,
+                }),
+                s.manager.hls_startup_timeout(),
+            )
+            .await
+        }
         Err(ProviderError::CapacityExhausted) => {
             s.ace_sessions.revoke(&playback_id, &token);
             super::streams::capacity_error()
@@ -270,7 +274,16 @@ pub(super) async fn ace_playback(
         return StatusCode::NOT_FOUND.into_response();
     };
     match s.manager.get_or_subscribe(&network, &session_key).await {
-        Ok(session) => ace_stream_session_response(session, expires_at, cancel, None),
+        Ok(session) => {
+            ace_stream_session_response(
+                session,
+                expires_at,
+                cancel,
+                None,
+                s.manager.hls_startup_timeout(),
+            )
+            .await
+        }
         Err(error) => {
             // Provider messages may embed identifiers or credentials. Log only the typed
             // category, and keep both logs and response bodies independent of that text.

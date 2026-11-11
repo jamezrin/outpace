@@ -11,6 +11,11 @@ use tokio::sync::{broadcast, watch, Mutex};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
     Data(Bytes),
+    /// Ordered chunk epoch, independent of coalescing latest-value state watches.
+    NormalizedData {
+        bytes: Bytes,
+        generation: u64,
+    },
     Discontinuity,
 }
 
@@ -22,6 +27,7 @@ pub struct StreamSession {
     stats: Arc<Mutex<SourceStats>>,
     live_stats: Option<StatsHandle>,
     metadata: StreamMetadata,
+    playback_state: Option<crate::audio_normalize::PlaybackStateHandle>,
     control: std::sync::Mutex<Option<crate::manager::WorkerControl>>,
     cancel: watch::Sender<bool>,
     completed: watch::Receiver<bool>,
@@ -96,6 +102,7 @@ impl StreamSession {
         let stats = Arc::new(Mutex::new(SourceStats::default()));
         let metadata = source.metadata();
         let live_stats = source.stats_handle();
+        let playback_state = source.playback_state();
         // Media handles must not keep a completed source's output channel alive.
         // The pump is the sole strong sender; late subscriptions observe EOF.
         let weak_tx = tx.downgrade();
@@ -126,7 +133,14 @@ impl StreamSession {
                         let _ = pump_tx.send(StreamEvent::Discontinuity);
                     }
                     // Err just means no live receivers right now; keep pulling (live).
-                    let _ = pump_tx.send(StreamEvent::Data(chunk));
+                    let event = match source.chunk_generation() {
+                        Some(generation) => StreamEvent::NormalizedData {
+                            bytes: chunk,
+                            generation,
+                        },
+                        None => StreamEvent::Data(chunk),
+                    };
+                    let _ = pump_tx.send(event);
                 }
             })
             .catch_unwind()
@@ -153,6 +167,7 @@ impl StreamSession {
             stats,
             live_stats,
             metadata,
+            playback_state,
             control: std::sync::Mutex::new(Some(control)),
             cancel,
             completed,
@@ -170,6 +185,10 @@ impl StreamSession {
 
     pub(crate) fn completion_receiver(&self) -> watch::Receiver<bool> {
         self.completed.clone()
+    }
+
+    pub(crate) fn cancellation_receiver(&self) -> watch::Receiver<bool> {
+        self.cancel.subscribe()
     }
 
     pub(crate) fn cancellation_requested(&self) -> bool {
@@ -193,6 +212,11 @@ impl StreamSession {
             rx: self.raw_receiver(),
             count: self.subscribers.clone(),
         }
+    }
+
+    /// Retained even after the media pump and source cleanup finish.
+    pub fn playback_state(&self) -> Option<crate::audio_normalize::PlaybackStateHandle> {
+        self.playback_state.clone()
     }
 
     pub fn subscriber_count(&self) -> u64 {
@@ -229,6 +253,69 @@ mod tests {
     use crate::provider::StreamProvider;
     use crate::testprovider::TestProvider;
     use ace_swarm::types::StreamMetadata;
+
+    #[tokio::test]
+    async fn playback_failure_survives_decorators_eof_and_confirmed_cleanup() {
+        use crate::audio_normalize::{
+            Failure, PlaybackPhase, PlaybackPublisher, PlaybackStateHandle,
+        };
+        struct FailingSource {
+            publisher: PlaybackPublisher,
+            handle: PlaybackStateHandle,
+        }
+        #[async_trait::async_trait]
+        impl TsSource for FailingSource {
+            async fn next(&mut self) -> Option<Bytes> {
+                self.publisher.fail(1, Failure::ChildExit);
+                None
+            }
+            fn stats(&self) -> SourceStats {
+                SourceStats::default()
+            }
+            fn playback_state(&self) -> Option<PlaybackStateHandle> {
+                Some(self.handle.clone())
+            }
+        }
+        let (publisher, handle) = PlaybackPublisher::new();
+        assert!(publisher.begin_generation(1));
+        let admission = crate::admission::Admission::new(1);
+        let source = crate::admission::Source {
+            inner: Box::new(FailingSource { publisher, handle }),
+            _reservation: admission.reserve().unwrap(),
+        };
+        let source = crate::startup_buffer::StartupBufferedSource::new(
+            Box::new(source),
+            crate::config::StartupBufferConfig::default(),
+            None,
+        );
+        let session = StreamSession::start(source, 4);
+        let retained = session.playback_state().expect("decorators preserve state");
+        let mut receiver = session.subscribe();
+        assert!(matches!(
+            receiver.rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        assert!(session.stop().await);
+        assert_eq!(admission.snapshot().0, 0);
+        assert!(retained.is_closed());
+        assert_eq!(
+            retained.snapshot().phase,
+            PlaybackPhase::Failed(Failure::ChildExit)
+        );
+        assert_eq!(
+            session.playback_state().unwrap().snapshot().phase,
+            PlaybackPhase::Failed(Failure::ChildExit)
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_source_has_no_playback_state() {
+        let source = TestProvider { chunks: 0 }.open("x").await.unwrap();
+        assert!(source.playback_state().is_none());
+        let session = StreamSession::start(source, 4);
+        assert!(session.playback_state().is_none());
+        assert!(session.stop().await);
+    }
 
     #[tokio::test]
     async fn cancellation_while_stats_lock_is_pending_prevents_publication() {

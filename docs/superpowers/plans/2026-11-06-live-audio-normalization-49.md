@@ -13,10 +13,13 @@ no new library binding/dependency. Design: sibling specification dated 2026-11-0
 
 ## Current status
 
-The first output-boundary slice passes workspace tests and independent static
-review. It does not implement the live-TS option. The copy microbenchmark covers
-only the extracted validator against debug media dependencies; whole-pipeline
-performance and all later feature acceptance remain outstanding.
+The extracted process boundary is merged. The current draft implements shared TS
+output/source, bounded failure/readiness state, manager/config/HTTP integration,
+and synthetic AC3/MP2 decoding with copied video. Current workspace gates pass
+1,834 tests (24 ignored), and both explicit synthetic media suites pass. A bounded
+optimized before/after workload covers one/two source subscribers; it measures
+pipeline cost, not player smoothness or peak RSS. Whole-feature review found one HLS generation-lifecycle defect; the fix and four
+regressions pass final gates. PR/CI integration remains pending. #49 stays open until those gates complete.
 
 ## 1. Bounded process-output extraction (first reviewable slice)
 
@@ -41,27 +44,27 @@ neutral process responsibility can actually move. Preserve existing HLS policy.
 
 Files: `audio_normalize` process/output modules, `provider.rs`, `session.rs`.
 
-- [ ] RED tests for bounded asynchronous TS sink and readiness distinct from HLS,
+- [x] RED tests for bounded asynchronous TS sink and readiness distinct from HLS,
   queue-full cancellation, epoch fencing, terminal failure retention and source
   default-state None. Validate accepted batch before publication; never await under
   publication mutex. Include held allocation owners in byte accounting.
-- [ ] Implement HLS/TS adapters; chunks <=32 KiB, queue four chunks, stable state
+- [x] Implement HLS/TS adapters; chunks <=32 KiB, queue four chunks, stable state
   watch. Preserve existing HLS completed-segment readiness and 45-second real
   stall detection while accounting intentional TS backpressure.
-- [ ] Verify adversarial framing/backing-storage, failure/reap/slot reuse and HLS
+- [x] Verify adversarial framing/backing-storage, failure/reap/slot reuse and HLS
   regressions. Independently review lifetime/error semantics.
 
 ## 3. Shared normalized source and bounded recovery
 
-Files: new `live_audio` adapter/coordinator, shared strict classifier/probe seams.
+Files: `hls_audio/live_source.rs`, shared strict classifier/probe seams.
 
-- [ ] RED tests for supported layout, opening, discontinuity, replay storage,
+- [x] RED tests for supported layout, opening, discontinuity, replay storage,
   cancellation/Drop/shutdown and old-generation output rejection.
-- [ ] Implement owning source worker under CleanupTracker, source reservation held
+- [x] Implement owning source worker under CleanupTracker, source reservation held
   through child/pump/source cleanup, original stats/metadata delegation, epoch
   output and bounded generation replacement. No wait inside `TsSource::next`
   owns an otherwise untracked child.
-- [ ] Use actual synthetic MP2 and AC3 conversion, video-copy/decoded-AAC witness;
+- [x] Use actual synthetic MP2 and AC3 conversion, video-copy/decoded-AAC witness;
   AAC/video-only no child; unsupported layout and child faults stay observable.
 
 ## 4. Manager, HTTP and configuration integration
@@ -69,22 +72,22 @@ Files: new `live_audio` adapter/coordinator, shared strict classifier/probe seam
 Files: `manager.rs`, native/compat TS and HLS HTTP paths, `config.rs`, CLI/env load,
 status serialization and operator docs.
 
-- [ ] RED separate-default-disabled live switch; raw identity/no allocation/probe,
+- [x] RED separate-default-disabled live switch; raw identity/no allocation/probe,
   live/HLS option combinations, concurrent direct/HLS/support starts with one
   source reservation/child, and VOD byte/range preservation.
-- [ ] Decorate through one helper in both manager creation paths. Share preflight,
+- [x] Decorate through one helper in both manager creation paths. Share preflight,
   admission and tracker ownership. Preserve existing HLS-only scope.
-- [ ] RED native/compat pre-header errors and midstream body errors, source-state
+- [x] RED native/compat pre-header errors and midstream body errors, source-state
   HLS failure, terminal entry retry/stop/reap. Subscribe/pin before readiness wait.
-- [ ] Implement explicit status/error propagation without broad provider trait
+- [x] Implement explicit status/error propagation without broad provider trait
   rewrites or a new session-history map. Document selected-codec/layout limits.
 
 ## 5. Performance, final gates and issue completion
 
-- [ ] Run bounded synthetic before/after throughput/latency/resource experiments,
+- [x] Run bounded synthetic before/after throughput/latency/resource experiments,
   including one/multiple viewers and cancellation under pressure. Report actual
   measurements separately from source bounds; no speculative optimization.
-- [ ] Full appropriate workspace tests, all-target Clippy, fmt and identifier
+- [x] Full appropriate workspace tests, all-target Clippy, fmt and identifier
   hygiene/diff checks; independent architecture/performance/test-fidelity review.
 - [ ] Address concrete findings, normal-hook commit/PR, handle exact-head CI and
   review, auto-merge green reviewed head. Run synthetic FFmpeg/manual-player smoke

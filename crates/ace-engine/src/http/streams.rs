@@ -100,6 +100,7 @@ pub(super) async fn stream_status(
                 "bitrate": stats.bitrate,
                 "livepos": native_live_position_json(stats.livepos.as_ref()),
                 "recovery": stats.recovery,
+                "normalization": normalization_status_json(session.playback_state()),
                 "buffer_ms": stats.buffer_ms,
                 "uploaded": stats.uploaded,
                 "peers_served": stats.peers_served,
@@ -222,75 +223,195 @@ pub(super) async fn stream_file_with_hls_timeout(
         Ok(sess) => sess,
         Err(e) => return stream_start_error(e),
     };
-    stream_session_response(session)
+    stream_session_response(session, s.manager.hls_startup_timeout()).await
 }
 
-fn stream_session_response(
-    (session, sub): (Arc<StreamSession>, crate::session::Subscription),
-) -> Response {
-    // Per-client keyframe gate: holds a mid-GOP joiner until the first clean keyframe (with
-    // PAT/PMT — and, when the stream has a resolved title, a synthesized SDT — prepended).
-    let gate = ace_media::mpegts::KeyframeGate::with_service_name(session.metadata().title.clone());
-    // Bridge the broadcast receiver to an HTTP body stream; the Subscription rides along so
-    // its Drop (decrementing the client count) fires when the client disconnects.
-    let stream = futures::stream::unfold((sub, gate), |(mut sub, mut gate)| async move {
-        loop {
-            match sub.rx.recv().await {
-                Ok(StreamEvent::Data(chunk)) => {
-                    let out = gate.push(&chunk);
-                    if out.is_empty() {
-                        continue; // still waiting for the first keyframe
-                    }
-                    return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate)));
-                }
-                Ok(StreamEvent::Discontinuity) => {
-                    reset_stream_keyframe_gate(&mut gate);
-                    continue;
-                }
-                Err(RecvError::Lagged(_)) => {
-                    reset_stream_keyframe_gate(&mut gate);
-                    continue;
-                }
-                Err(RecvError::Closed) => return None,
+fn normalization_status_json(
+    state: Option<crate::audio_normalize::PlaybackStateHandle>,
+) -> serde_json::Value {
+    use crate::audio_normalize::PlaybackPhase;
+    let Some(handle) = state else {
+        return serde_json::Value::Null;
+    };
+    let snapshot = handle.snapshot();
+    let (state, failure) = match snapshot.phase {
+        PlaybackPhase::Classifying => ("classifying", None),
+        PlaybackPhase::Starting => ("starting", None),
+        PlaybackPhase::Ready => ("ready", None),
+        PlaybackPhase::Recovering => ("recovering", None),
+        PlaybackPhase::Failed(reason) => ("failed", Some(reason.code())),
+        PlaybackPhase::Stopped => ("stopped", None),
+    };
+    json!({"generation":snapshot.generation,"state":state,"failure":failure})
+}
+
+fn normalization_error(error: crate::audio_normalize::PlaybackWaitError) -> Response {
+    use crate::audio_normalize::{Failure, PlaybackWaitError};
+    match error {
+        PlaybackWaitError::Failed(Failure::Admission) => capacity_error(),
+        PlaybackWaitError::Failed(reason) => (
+            if reason == Failure::Unsupported {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else if matches!(reason, Failure::Deadline | Failure::OutputStall) {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            format!("audio normalization failed: {}", reason.code()),
+        )
+            .into_response(),
+        PlaybackWaitError::Deadline => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "audio normalization startup timed out",
+        )
+            .into_response(),
+        PlaybackWaitError::Cancelled => (StatusCode::GONE, "stream stopped").into_response(),
+        PlaybackWaitError::Stopped | PlaybackWaitError::Closed => (
+            StatusCode::BAD_GATEWAY,
+            "audio normalization stopped before readiness",
+        )
+            .into_response(),
+    }
+}
+
+// Source failures must wake an idle body independently of pump cleanup. Raw
+// sources have no watch channel and retain their existing media-only wait.
+async fn next_media_event(
+    sub: &mut crate::session::Subscription,
+    state: &mut Option<crate::audio_normalize::PlaybackStateHandle>,
+) -> Result<Option<StreamEvent>, crate::audio_normalize::Failure> {
+    use crate::audio_normalize::{Failure, PlaybackPhase};
+    loop {
+        if let Some(state) = state.as_ref() {
+            if let PlaybackPhase::Failed(reason) = state.snapshot().phase {
+                return Err(reason);
+            }
+            if state.is_closed() && state.snapshot().phase != PlaybackPhase::Stopped {
+                return Err(Failure::Pump);
             }
         }
-    });
+        let event = tokio::select! {
+            biased;
+            _ = async {
+                match state.as_mut() {
+                    Some(state) if !state.is_closed() => { let _ = state.changed().await; },
+                    _ => std::future::pending().await,
+                }
+            } => continue,
+            event = sub.rx.recv() => event,
+        };
+        // Failure wins over queued old media and over a simultaneous EOF.
+        if let Some(state) = state.as_ref() {
+            if let PlaybackPhase::Failed(reason) = state.snapshot().phase {
+                return Err(reason);
+            }
+        }
+        return match event {
+            Ok(event) => Ok(Some(event)),
+            Err(RecvError::Lagged(_)) => Ok(Some(StreamEvent::Discontinuity)),
+            Err(RecvError::Closed) => Ok(None),
+        };
+    }
+}
+fn normalization_body_error(reason: crate::audio_normalize::Failure) -> std::io::Error {
+    std::io::Error::other(format!("audio normalization failed: {}", reason.code()))
+}
+
+async fn stream_session_response(
+    (session, sub): (Arc<StreamSession>, crate::session::Subscription),
+    startup_timeout: std::time::Duration,
+) -> Response {
+    let state = session.playback_state();
+    if let Some(state) = &state {
+        let mut cancel = session.cancellation_receiver();
+        if let Err(reason) = state
+            .wait_ready(tokio::time::Instant::now() + startup_timeout, &mut cancel)
+            .await
+        {
+            return normalization_error(reason);
+        }
+    }
+    let mut gate =
+        ace_media::mpegts::KeyframeGate::with_service_name(session.metadata().title.clone());
+    if state.is_some() {
+        gate.enable_mpeg2();
+        gate.preserve_transport_identity();
+    }
+    let stream = futures::stream::unfold(
+        (sub, gate, state, false),
+        |(mut sub, mut gate, mut state, ended)| async move {
+            if ended {
+                return None;
+            }
+            loop {
+                match next_media_event(&mut sub, &mut state).await {
+                    Ok(Some(
+                        StreamEvent::Data(chunk) | StreamEvent::NormalizedData { bytes: chunk, .. },
+                    )) => {
+                        let out = gate.push(&chunk);
+                        if out.is_empty() {
+                            continue;
+                        }
+                        return Some((Ok(Bytes::from(out)), (sub, gate, state, false)));
+                    }
+                    Ok(Some(StreamEvent::Discontinuity)) => reset_stream_keyframe_gate(&mut gate),
+                    Ok(None) => return None,
+                    Err(reason) => {
+                        return Some((
+                            Err(normalization_body_error(reason)),
+                            (sub, gate, state, true),
+                        ))
+                    }
+                }
+            }
+        },
+    );
     Response::builder()
         .header(header::CONTENT_TYPE, "video/mp2t")
         .body(Body::from_stream(stream))
         .unwrap()
 }
 
-pub(super) fn ace_stream_session_response(
+pub(super) async fn ace_stream_session_response(
     (session, sub): (Arc<StreamSession>, crate::session::Subscription),
     expires_at: Instant,
-    cancel: tokio::sync::watch::Receiver<bool>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
     direct_lease: Option<AceDirectLeaseGuard>,
+    startup_timeout: std::time::Duration,
 ) -> Response {
-    let gate = ace_media::mpegts::KeyframeGate::with_service_name(session.metadata().title.clone());
+    let state = session.playback_state();
+    if let Some(state) = &state {
+        let deadline = (tokio::time::Instant::now() + startup_timeout)
+            .min(tokio::time::Instant::from_std(expires_at));
+        if let Err(reason) = state.wait_ready(deadline, &mut cancel).await {
+            return normalization_error(reason);
+        }
+    }
+    let mut gate =
+        ace_media::mpegts::KeyframeGate::with_service_name(session.metadata().title.clone());
+    if state.is_some() {
+        gate.enable_mpeg2();
+        gate.preserve_transport_identity();
+    }
     let stream = futures::stream::unfold(
-        (sub, gate, cancel, expires_at, direct_lease),
-        |(mut sub, mut gate, mut cancel, expires_at, direct_lease)| async move {
+        (sub, gate, cancel, expires_at, direct_lease, state, false),
+        |(mut sub, mut gate, mut cancel, expires_at, direct_lease, mut state, ended)| async move {
+            if ended {
+                return None;
+            }
             loop {
-                tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
-                        return None;
-                    }
-                    changed = cancel.changed() => {
-                        if changed.is_err() || *cancel.borrow() { return None; }
-                    }
-                    received = sub.rx.recv() => match received {
-                        Ok(StreamEvent::Data(chunk)) => {
+                tokio::select! { biased;
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => return None,
+                    changed = cancel.changed() => { if changed.is_err() || *cancel.borrow() { return None; } },
+                    event = next_media_event(&mut sub,&mut state) => match event {
+                        Ok(Some(StreamEvent::Data(chunk) | StreamEvent::NormalizedData { bytes: chunk, .. })) => {
                             let out = gate.push(&chunk);
                             if out.is_empty() { continue; }
-                            return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate, cancel, expires_at, direct_lease)));
+                            return Some((Ok(Bytes::from(out)),(sub,gate,cancel,expires_at,direct_lease,state,false)));
                         }
-                        Ok(StreamEvent::Discontinuity) => {
-                            reset_stream_keyframe_gate(&mut gate);
-                        }
-                        Err(RecvError::Lagged(_)) => { reset_stream_keyframe_gate(&mut gate); }
-                        Err(RecvError::Closed) => return None,
+                        Ok(Some(StreamEvent::Discontinuity)) => reset_stream_keyframe_gate(&mut gate),
+                        Ok(None) => return None,
+                        Err(reason) => return Some((Err(normalization_body_error(reason)),(sub,gate,cancel,expires_at,direct_lease,state,true))),
                     }
                 }
             }
@@ -346,5 +467,196 @@ mod buffer_contract_tests {
             .get("buffer_complete")
             .is_none());
         assert!(native_live_position_json(None).is_null());
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+    use crate::audio_normalize::{Failure, PlaybackPublisher, PlaybackStateHandle};
+    use crate::provider::{SourceStats, TsSource};
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use tokio::sync::{mpsc, watch};
+    use tokio::time::{timeout, Duration};
+
+    struct Controlled {
+        rx: mpsc::Receiver<Result<Bytes, Failure>>,
+        publisher: PlaybackPublisher,
+        handle: PlaybackStateHandle,
+    }
+    #[async_trait]
+    impl TsSource for Controlled {
+        async fn next(&mut self) -> Option<Bytes> {
+            match self.rx.recv().await? {
+                Ok(bytes) => {
+                    self.publisher.mark_ready(1);
+                    Some(bytes)
+                }
+                Err(reason) => {
+                    self.publisher.fail(1, reason);
+                    None
+                }
+            }
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+        fn playback_state(&self) -> Option<PlaybackStateHandle> {
+            Some(self.handle.clone())
+        }
+    }
+    fn controlled() -> (mpsc::Sender<Result<Bytes, Failure>>, Arc<StreamSession>) {
+        let (publisher, handle) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        let (tx, rx) = mpsc::channel(2);
+        (
+            tx,
+            StreamSession::start(
+                Box::new(Controlled {
+                    rx,
+                    publisher,
+                    handle,
+                }),
+                4,
+            ),
+        )
+    }
+    async fn response(
+        session: Arc<StreamSession>,
+        compat: bool,
+    ) -> (Response, Option<watch::Sender<bool>>) {
+        let sub = session.subscribe();
+        if compat {
+            let (owner, cancel) = watch::channel(false);
+            let response = ace_stream_session_response(
+                (session, sub),
+                Instant::now() + Duration::from_secs(30),
+                cancel,
+                None,
+                Duration::from_secs(1),
+            )
+            .await;
+            (response, Some(owner))
+        } else {
+            (
+                stream_session_response((session, sub), Duration::from_secs(1)).await,
+                None,
+            )
+        }
+    }
+    #[test]
+    fn native_normalization_status_is_bounded_and_retains_the_terminal_code() {
+        assert_eq!(normalization_status_json(None), serde_json::Value::Null);
+        let (publisher, handle) = PlaybackPublisher::new();
+        publisher.begin_generation(4);
+        publisher.fail(4, Failure::ChildExit);
+        assert_eq!(
+            normalization_status_json(Some(handle)),
+            json!({"generation":4,"state":"failed","failure":"child_exit"})
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn normalization_capacity_and_startup_deadline_release_their_readiness_subscription() {
+        for compat in [false, true] {
+            let (tx, session) = controlled();
+            tx.send(Err(Failure::Admission)).await.unwrap();
+            let (result, _lease) = response(session.clone(), compat).await;
+            let subscribers = session.subscriber_count();
+            session.stop().await;
+            assert_eq!(result.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(result.headers()[header::RETRY_AFTER], "1");
+            assert_eq!(subscribers, 0);
+
+            let (_tx, session) = controlled();
+            let start = tokio::time::Instant::now();
+            let (result, _lease) = response(session.clone(), compat).await;
+            let elapsed = start.elapsed();
+            let subscribers = session.subscriber_count();
+            session.stop().await;
+            assert_eq!(result.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(elapsed, Duration::from_secs(1));
+            assert_eq!(subscribers, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_readiness_and_releases_native_or_compatibility_subscription() {
+        for compat in [false, true] {
+            let (_tx, session) = controlled();
+            let sub = session.subscribe();
+            let result = if compat {
+                let (_owner, cancel) = watch::channel(true);
+                ace_stream_session_response(
+                    (session.clone(), sub),
+                    Instant::now() + Duration::from_secs(30),
+                    cancel,
+                    None,
+                    Duration::from_secs(1),
+                )
+                .await
+            } else {
+                session.cancel();
+                stream_session_response((session.clone(), sub), Duration::from_secs(1)).await
+            };
+            let subscribers = session.subscriber_count();
+            session.stop().await;
+            assert_eq!(result.status(), StatusCode::GONE);
+            assert_eq!(subscribers, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn normalization_refusal_before_headers_is_explicit_for_native_and_compat_ts() {
+        for compat in [false, true] {
+            let (tx, session) = controlled();
+            tx.send(Err(Failure::Unsupported)).await.unwrap();
+            let result = timeout(Duration::from_secs(2), response(session.clone(), compat)).await;
+            session.stop().await;
+            let (response, _lease) = result.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), b"audio normalization failed: unsupported");
+        }
+    }
+    #[tokio::test]
+    async fn normalization_failure_after_headers_yields_one_body_error_and_remains_observable() {
+        for compat in [false, true] {
+            let (tx, session) = controlled();
+            tx.send(Ok(
+                crate::hls_audio::process::test_fixtures::transport_prefix().into(),
+            ))
+            .await
+            .unwrap();
+            let (response, _lease) = response(session.clone(), compat).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let first = timeout(Duration::from_secs(1), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!first.is_empty());
+            tx.send(Err(Failure::ChildExit)).await.unwrap();
+            let failure = timeout(Duration::from_secs(1), body.next()).await;
+            let end = timeout(Duration::from_secs(1), body.next()).await;
+            let retained = session.playback_state().unwrap().snapshot();
+            session.stop().await;
+            assert!(
+                matches!(failure, Ok(Some(Err(_)))),
+                "post-header failure must not be silent EOF"
+            );
+            assert!(
+                matches!(end, Ok(None)),
+                "body error is terminal, not a repeating error loop"
+            );
+            assert_eq!(
+                retained.phase,
+                crate::audio_normalize::PlaybackPhase::Failed(Failure::ChildExit)
+            );
+        }
     }
 }

@@ -339,6 +339,7 @@ An active stream status response has stable field names and numeric counters:
   "peers": 4,
   "bitrate": 2450000,
   "buffer_ms": 6200,
+  "normalization": null,
   "uploaded": 1048576,
   "peers_served": 2,
   "recovery": {
@@ -355,6 +356,16 @@ An active stream status response has stable field names and numeric counters:
   }
 }
 ```
+
+`normalization` is `null` on raw sources, including when only HLS-only conversion
+is enabled. Shared live-TS normalization exposes one latest snapshot, for example
+`{"generation":2,"state":"failed","failure":"child_exit"}`. States are
+`classifying`, `starting`, `ready`, `recovering`, `failed` and `stopped`; nonfailure
+states have `failure: null`. Failure codes are `unsupported`, `deadline`,
+`input_overflow`, `admission`, `child_exit`, `pipe`, `pump`, `output_invalid`,
+`output_stall` and `recovery_limit`. This is current state, not an error history.
+A failed source remains observable until normal stop/idle teardown; another request
+does not automatically start a replacement child.
 
 `clients` counts direct consumers of the shared byte stream; internal HLS packaging does not
 inflate it. The top-level `bitrate` is the measured session rate; `metadata.bitrate` is the
@@ -544,5 +555,8 @@ deferred. The exact supported methods and error envelopes are pinned in
 Compatibility `getstream`, `manifest` JSON, and `stat` responses expose the same nested metadata
 object. Compatibility direct and tokenized MPEG-TS playback do not emit `Icy-Name`;
 the native TS routes described above include it when the descriptor supplies a title.
-Compatibility live HLS follows the existing global `OUTPACE_HLS_AUDIO_NORMALIZE` policy;
-per-request transcoding hints do not configure conversion.
+Compatibility live HLS follows the global `OUTPACE_HLS_AUDIO_NORMALIZE` policy.
+The separate `OUTPACE_LIVE_AUDIO_NORMALIZE` switch normalizes the shared source for
+both TS and HLS, superseding HLS-only conversion when both are set. Per-request
+transcoding hints do not configure conversion. Both switches are off by default;
+see [audio prerequisites and limits](../README.md#live-hls-audio).

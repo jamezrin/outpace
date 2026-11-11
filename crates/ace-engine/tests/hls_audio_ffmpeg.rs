@@ -526,16 +526,21 @@ async fn vod_http_contract_is_identical_with_normalization_enabled_or_disabled()
     }
     let data = Bytes::from(data);
     let mut responses = Vec::new();
-    for enabled in [false, true] {
+    for (hls_enabled, live_enabled) in [(false, false), (true, false), (false, true), (true, true)]
+    {
         let mut providers = ProviderRegistry::new();
         providers.register(Arc::new(MemoryVodProvider(data.clone())));
-        let manager = StreamManager::with_normalizer(
+        let manager = StreamManager::with_audio_config(
             providers,
             4,
             HlsConfig::default(),
-            enabled.then(|| ace_engine::hls_audio::PreparedNormalizer {
+            hls_enabled.then(|| ace_engine::hls_audio::PreparedNormalizer {
                 executable: "/definitely/missing/ffmpeg".into(),
             }),
+            live_enabled.then(|| ace_engine::hls_audio::PreparedNormalizer {
+                executable: "/definitely/missing/ffmpeg".into(),
+            }),
+            0,
         );
         let app = router(AppState {
             peer_policy: Default::default(),
@@ -573,10 +578,12 @@ async fn vod_http_contract_is_identical_with_normalization_enabled_or_disabled()
         manager.shutdown().await;
         responses.push(observed);
     }
-    assert_eq!(
-        responses[0], responses[1],
-        "VOD status, headers, ranges, playlist/layout and bytes stay unchanged"
-    );
+    for response in &responses[1..] {
+        assert_eq!(
+            &responses[0], response,
+            "all audio option combinations preserve VOD status, headers, ranges, layout and bytes"
+        );
+    }
     assert_eq!(responses[1][0].0, axum::http::StatusCode::OK);
     assert_eq!(responses[1][1].0, axum::http::StatusCode::PARTIAL_CONTENT);
     assert_eq!(responses[1][1].2, data.slice(37..312).to_vec());
@@ -1431,4 +1438,217 @@ async fn selected_layer_one_fails_before_child_launch() {
         "Unsupported proves classification rejected Layer I before an attempted child launch"
     );
     manager.shutdown().await;
+}
+
+/// Manual, generated-media acceptance for #49's shared TS representation.
+#[tokio::test]
+#[ignore = "requires OUTPACE_TEST_HLS_AUDIO_FFMPEG=1, direct OUTPACE_TEST_NORMALIZER_FFMPEG_PATH, and FFmpeg/FFprobe on PATH"]
+async fn shared_live_ts_normalizes_ac3_and_mp2_for_two_viewers_and_native_hls() {
+    use futures::StreamExt;
+    assert!(opted_in(), "explicit synthetic-media opt-in required");
+    let tools = support::require_synthetic_tools().expect("synthetic tools");
+    let normalizer_path = std::env::var_os("OUTPACE_TEST_NORMALIZER_FFMPEG_PATH")
+        .expect("set OUTPACE_TEST_NORMALIZER_FFMPEG_PATH to a direct FFmpeg binary, not a wrapper");
+    let normalizer = ace_engine::hls_audio::preflight(&ace_engine::config::HlsAudioConfig {
+        normalize: true,
+        ffmpeg_path: normalizer_path.into(),
+    })
+    .await
+    .expect("direct normalizer preflight")
+    .unwrap();
+    async fn collect(response: axum::response::Response) -> Result<Vec<u8>, String> {
+        if response.status() != axum::http::StatusCode::OK {
+            return Err(format!("TS startup status {}", response.status()));
+        }
+        let mut body = response.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let chunk = tokio::time::timeout_at(deadline, body.next())
+                .await
+                .map_err(|_| "TS observation deadline")?
+                .ok_or("TS ended before progress")?
+                .map_err(|e| e.to_string())?;
+            if bytes.len() + chunk.len() > 1_048_576 {
+                return Err("TS capture cap".into());
+            }
+            bytes.extend_from_slice(&chunk);
+            let ticks = pcr_ticks(&bytes, 256);
+            if ticks
+                .first()
+                .zip(ticks.last())
+                .is_some_and(|(a, b)| b.saturating_sub(*a) >= 270_000)
+            {
+                return Ok(bytes);
+            }
+        }
+    }
+    for codec in [AudioCase::Ac3, AudioCase::MpegLayer2] {
+        let mut case = support::generate_case(&tools, codec).expect("generate source");
+        // Exercise a nondefault transport identity; elementary payload stays identical.
+        for packet in case.transport.as_chunks_mut::<188>().0 {
+            if ace_media::mpegts::ts_pid(packet) != 0 {
+                continue;
+            }
+            let payload = if packet[3] & 0x20 != 0 {
+                5 + usize::from(packet[4])
+            } else {
+                4
+            };
+            let start = payload + 1 + usize::from(packet[payload]);
+            packet[start + 3..start + 5].copy_from_slice(&7u16.to_be_bytes());
+            let len =
+                3 + ((usize::from(packet[start + 1] & 15) << 8) | usize::from(packet[start + 2]));
+            let crc_at = start + len - 4;
+            let crc = ace_media::mpegts::mpeg_crc32(&packet[start..crc_at]);
+            packet[crc_at..crc_at + 4].copy_from_slice(&crc.to_be_bytes());
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(ChanneledProvider(std::sync::Mutex::new(Some(rx)))));
+        let manager = StreamManager::with_audio_config(
+            providers,
+            32,
+            HlsConfig {
+                segment_packets: 65536,
+                window_segments: 8,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 15000,
+            },
+            // If HLS-only conversion is mistakenly started, it cannot succeed.
+            Some(ace_engine::hls_audio::PreparedNormalizer {
+                executable: "/missing-secondary-normalizer".into(),
+            }),
+            Some(normalizer.clone()),
+            1,
+        );
+        let app = synthetic_app(manager.clone());
+        let media = manager
+            .get_or_start_hls("synthetic", SYNTHETIC_STREAM_ID)
+            .await
+            .unwrap();
+        let observation = tokio::time::timeout(Duration::from_secs(20), async {
+            let clients = async {
+                let path = format!("/streams/synthetic/{SYNTHETIC_STREAM_ID}.ts");
+                let (a, b) = tokio::join!(
+                    app.clone()
+                        .oneshot(Request::get(&path).body(Body::empty()).unwrap()),
+                    app.clone()
+                        .oneshot(Request::get(&path).body(Body::empty()).unwrap()),
+                );
+                tokio::join!(collect(a.unwrap()), collect(b.unwrap()))
+            };
+            let feed = async {
+                loop {
+                    let session = manager.get("synthetic", SYNTHETIC_STREAM_ID).await.unwrap();
+                    if session.subscriber_count() >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                tx.send((false, Bytes::copy_from_slice(&case.transport)))
+                    .unwrap();
+            };
+            let (captures, ()) = tokio::join!(clients, feed);
+            let hls = media.wait_available(Duration::from_secs(2)).await;
+            (captures, hls, manager.admission_status().0)
+        })
+        .await;
+        // Always finish owned media work before inspecting/asserting observations.
+        let retained_segment = media.segment(0);
+        manager.shutdown().await;
+        let ((a, b), hls, occupied) = observation.expect("bounded shared pipeline");
+        assert_eq!(
+            hls,
+            ace_engine::hls::HlsStatus::Ready,
+            "{codec:?}: native HLS on normalized TS"
+        );
+        assert_eq!(occupied, 1, "{codec:?}: one provider resource");
+        assert_eq!(manager.admission_status().0, 0);
+        let segment = retained_segment.expect("native HLS retained segment");
+        let sdt = segment
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .find(|p| ace_media::mpegts::ts_pid(*p) == 17)
+            .expect("HLS service metadata");
+        assert_eq!(
+            sdt_transport_id(sdt),
+            7,
+            "HLS service identity follows normalized source PAT"
+        );
+        for bytes in [a.expect("first viewer"), b.expect("second viewer")] {
+            assert_eq!(
+                ace_media::mpegts::read_sdt_service_name(&bytes).as_deref(),
+                Some("Synthetic HLS Acceptance")
+            );
+            let sdt = bytes
+                .as_chunks::<188>()
+                .0
+                .iter()
+                .find(|p| ace_media::mpegts::ts_pid(*p) == 17)
+                .expect("TS service metadata");
+            assert_eq!(
+                sdt_transport_id(sdt),
+                7,
+                "TS service identity follows normalized source PAT"
+            );
+            let probe = run_ffprobe(&tools, &bytes, &["-show_streams", "-of", "json"]);
+            assert!(probe.status.success());
+            let json: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+            let streams = json["streams"].as_array().unwrap();
+            let audio = streams.iter().find(|s| s["codec_type"] == "audio").unwrap();
+            let video = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+            assert_eq!(audio["codec_name"], "aac");
+            assert_eq!(audio["profile"], "LC");
+            assert_eq!(audio["sample_rate"], "48000");
+            assert_eq!(audio["channels"], 2);
+            assert_eq!(video["codec_name"], "mpeg2video");
+            let decoded = run_ffmpeg(
+                &tools,
+                &bytes,
+                &[
+                    "-map",
+                    "0:a:0",
+                    "-f",
+                    "f32le",
+                    "-acodec",
+                    "pcm_f32le",
+                    "pipe:1",
+                ],
+            );
+            assert!(decoded.status.success());
+            assert!(decoded
+                .stdout
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|b| f32::from_le_bytes(*b).abs() > 0.001));
+            let video = run_ffmpeg(
+                &tools,
+                &bytes,
+                &[
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "copy",
+                    "-f",
+                    "mpeg2video",
+                    "pipe:1",
+                ],
+            );
+            assert!(video.status.success());
+            assert!(video.stdout.len() > 32);
+            let start = case
+                .video_elementary
+                .windows(32)
+                .position(|b| b == &video.stdout[..32])
+                .expect("copied video appears in source");
+            assert!(
+                case.video_elementary[start..].starts_with(&video.stdout),
+                "{codec:?}: contiguous copied video bytes"
+            );
+        }
+    }
 }
