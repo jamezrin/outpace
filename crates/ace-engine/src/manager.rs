@@ -364,6 +364,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<crate::support_control::SupportControl>, ProviderError> {
+        let id = &*self.canonical_id(network, id);
         if id.is_empty() || id.len() > 8192 {
             return Err(ProviderError::Backend(
                 "invalid support registration".into(),
@@ -517,7 +518,18 @@ impl StreamManager {
     /// Offline pre-check that `id` can be opened on `network`; see
     /// [`StreamProvider::check_openable`](crate::provider::StreamProvider::check_openable).
     /// `NotFound` if the network is unregistered.
+    /// `id` as `network`'s provider keys it (see [`StreamProvider::canonical_id`]). Every public
+    /// entry point that takes a stream id canonicalizes first, so spellings of one stream share a
+    /// session, VOD handle, support control and stop.
+    fn canonical_id<'a>(&self, network: &str, id: &'a str) -> std::borrow::Cow<'a, str> {
+        match self.registry.get(network) {
+            Some(provider) => provider.canonical_id(id),
+            None => std::borrow::Cow::Borrowed(id),
+        }
+    }
+
     pub fn check_openable(&self, network: &str, id: &str) -> Result<(), ProviderError> {
+        let id = &*self.canonical_id(network, id);
         self.registry
             .get(network)
             .ok_or(ProviderError::NotFound)?
@@ -548,6 +560,7 @@ impl StreamManager {
     }
 
     pub(crate) fn remember_transport_url(&self, network: &str, id: &str, info: &StreamInfo) {
+        let id = &*self.canonical_id(network, id);
         if let Some(provider) = self.registry.get(network) {
             provider.remember_transport_url(id, info);
         }
@@ -572,6 +585,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<dyn VodContent>, ProviderError> {
+        let id = &*self.canonical_id(network, id);
         self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
         if self
@@ -750,6 +764,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<crate::session::SupportPin, ProviderError> {
+        let id = &*self.canonical_id(network, id);
         self.check_openable(network, id)?;
         let manager = self.clone();
         let network = network.to_owned();
@@ -776,6 +791,7 @@ impl StreamManager {
         id: &str,
         pin: crate::session::SupportPin,
     ) -> Result<bool, StopError> {
+        let id = &*self.canonical_id(network, id);
         let key = (network.to_owned(), id.to_owned());
         let session = pin.session().clone();
         let entry = {
@@ -841,6 +857,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
+        let id = &*self.canonical_id(network, id);
         self.check_openable(network, id)?;
         if self
             .shutting_down
@@ -874,6 +891,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<(Arc<StreamSession>, crate::session::Subscription), ProviderError> {
+        let id = &*self.canonical_id(network, id);
         self.check_openable(network, id)?;
         let manager = self.clone();
         let network = network.to_owned();
@@ -1043,6 +1061,7 @@ impl StreamManager {
 
     /// Peek at an already-running session without starting one.
     pub async fn get(&self, network: &str, id: &str) -> Option<Arc<StreamSession>> {
+        let id = &*self.canonical_id(network, id);
         self.sessions
             .lock()
             .await
@@ -1056,6 +1075,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<HlsPackager>, ProviderError> {
+        let id = &*self.canonical_id(network, id);
         let (pkg, _session, _transition_pin) =
             self.get_or_start_pinned_hls(network, id, true).await?;
         Ok(pkg)
@@ -1069,6 +1089,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
+        let id = &*self.canonical_id(network, id);
         self.get_or_start_pinned_hls(network, id, false).await
     }
 
@@ -1200,6 +1221,7 @@ impl StreamManager {
 
     /// Peek at an already-running HLS packager without starting a session or packager.
     pub async fn get_hls(&self, network: &str, id: &str) -> Option<Arc<HlsPackager>> {
+        let id = &*self.canonical_id(network, id);
         self.packagers
             .lock()
             .await
@@ -1237,6 +1259,7 @@ impl StreamManager {
     }
 
     pub(crate) async fn stop_checked(&self, network: &str, id: &str) -> Result<bool, StopError> {
+        let id = &*self.canonical_id(network, id);
         let key = (network.to_string(), id.to_string());
         let (entry, session, completions) = {
             let _finalizing = self.hls_finalization.lock().await;
@@ -2381,6 +2404,109 @@ mod tests {
             ptrs.iter().all(|p| *p == ptrs[0]),
             "all callers share one session"
         );
+    }
+
+    /// A provider whose ids are case-insensitive, recording which spelling reached it.
+    struct CaseFoldProvider {
+        opens: Arc<StdMutex<Vec<String>>>,
+        vod_resolves: Arc<StdMutex<Vec<String>>>,
+    }
+
+    struct CaseFoldVod;
+
+    #[async_trait]
+    impl crate::provider::VodContent for CaseFoldVod {
+        fn content_length(&self) -> u64 {
+            0
+        }
+        async fn open_range(
+            &self,
+            _start: u64,
+            _end: u64,
+        ) -> Result<Box<dyn crate::provider::VodByteSource>, ProviderError> {
+            Err(ProviderError::NotFound)
+        }
+    }
+
+    #[async_trait]
+    impl StreamProvider for CaseFoldProvider {
+        fn network(&self) -> &'static str {
+            "casefold"
+        }
+        fn canonical_id<'a>(&self, id: &'a str) -> std::borrow::Cow<'a, str> {
+            std::borrow::Cow::Owned(id.to_ascii_lowercase())
+        }
+        async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            self.opens.lock().unwrap().push(id.into());
+            Ok(Box::new(IdleSource))
+        }
+        async fn resolve_vod(
+            &self,
+            id: &str,
+        ) -> Result<Box<dyn crate::provider::VodContent>, ProviderError> {
+            self.vod_resolves.lock().unwrap().push(id.into());
+            Ok(Box::new(CaseFoldVod))
+        }
+    }
+
+    #[tokio::test]
+    async fn spellings_of_one_canonical_id_share_session_vod_and_stop() {
+        let opens = Arc::new(StdMutex::new(Vec::new()));
+        let vod_resolves = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CaseFoldProvider {
+            opens: opens.clone(),
+            vod_resolves: vod_resolves.clone(),
+        }));
+        let m = StreamManager::new(registry);
+
+        let a = m.get_or_start("casefold", "Stream-A").await.unwrap();
+        let b = m.get_or_start("casefold", "STREAM-a").await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "one stream, one session");
+        assert_eq!(
+            *opens.lock().unwrap(),
+            ["stream-a"],
+            "opened once, canonically"
+        );
+        assert!(m.get("casefold", "stream-A").await.is_some());
+
+        let v1 = m.resolve_vod("casefold", "Vod-B").await.unwrap();
+        let v2 = m.resolve_vod("casefold", "vod-b").await.unwrap();
+        assert!(Arc::ptr_eq(&v1, &v2), "one VOD, one handle");
+        assert_eq!(*vod_resolves.lock().unwrap(), ["vod-b"]);
+
+        assert!(
+            m.stop("casefold", "STREAM-A").await,
+            "stop by another spelling"
+        );
+        assert!(m.get("casefold", "stream-a").await.is_none());
+    }
+
+    #[test]
+    fn ace_canonical_id_lowercases_only_hex_ids() {
+        use crate::ace_provider::canonical_ace_id;
+        const UPPER: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
+        const LOWER: &str = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            canonical_ace_id(&format!("cid:{UPPER}")),
+            format!("cid:{LOWER}")
+        );
+        assert_eq!(canonical_ace_id(UPPER), LOWER);
+        assert!(matches!(
+            canonical_ace_id(LOWER),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Non-hex forms and malformed ids keep their exact spelling.
+        for id in [
+            "CID:0123456789ABCDEF0123456789ABCDEF01234567",
+            "cid:ABC",
+            "cid:0123456789ABCDEG0123456789ABCDEG01234567",
+            "local:AbCd",
+            "turl-AbCd",
+            "http://Example.test/Transport.acelive",
+        ] {
+            assert_eq!(canonical_ace_id(id), id, "{id}");
+        }
     }
 
     #[tokio::test]
