@@ -32,7 +32,7 @@ fn legacy(reservoir: &mut StartupReservoir, bytes: &[u8]) -> Option<usize> {
         let timing = ts_timing(&packet);
         if reservoir.clock.observe(timing) == ClockObservation::Reset {
             retain_from = Some(prior_bytes + index + 1 - TS_PACKET_LEN);
-            reservoir.first_clean_byte = None;
+            // A clock reset discards media, never the absolute startup origin.
             reservoir.release_clock_duration = None;
             reservoir.release_bytes = 0;
             if !timing.discontinuity {
@@ -52,7 +52,7 @@ fn reservoir() -> StartupReservoir {
         },
         None,
     );
-    value.first_clean_byte = Some(Instant::now());
+    value.first_byte_at = Some(Instant::now());
     value.release_clock_duration = Some(Duration::from_secs(1));
     value.release_bytes = 73;
     value
@@ -102,8 +102,8 @@ fn all_packet_partitions_preserve_intermediate_reset_state_and_retained_bytes() 
             assert_eq!(actual.queued_bytes, expected.queued_bytes);
             assert_eq!(actual.queue, expected.queue);
             assert_eq!(
-                actual.first_clean_byte.is_none(),
-                expected.first_clean_byte.is_none()
+                actual.first_byte_at.is_none(),
+                expected.first_byte_at.is_none()
             );
             assert_eq!(
                 actual.release_clock_duration,
