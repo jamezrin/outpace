@@ -272,3 +272,59 @@ async fn peerless_cancel_before_extract_preserves_wire_and_older_pending_bypasse
     .unwrap());
     assert_eq!(c.reasm.next_needed(), 1);
 }
+
+#[tokio::test]
+async fn taking_the_cursor_piece_raises_the_worker_request_floor() {
+    let info = StreamInfo {
+        protection: None,
+        infohash: [0; 20],
+        piece_length: 4,
+        chunk_length: 2,
+        trackers: vec![],
+        metadata: Default::default(),
+        sig_len: 0,
+        source_pubkey: vec![],
+    };
+    let seed = SeedConfig {
+        peer_policy: Default::default(),
+        metrics: None,
+        registry: SeedRegistry::new(),
+        store_factory: test_store_factory(4096, None),
+        enabled: true,
+        prefetch_pieces: 0,
+        live_recovery: LiveRecoveryConfig::default(),
+        warm_peers: WarmPeerCache::memory(),
+    };
+    let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(4, 2, 4096)));
+    let (mut c, _) = Continuity::fresh(&info, 0, 0, 0, seed.live_recovery);
+    // Piece 0 completes (say, via a retry on another upstream) while workers may still
+    // hold queued chunk requests for it.
+    c.reasm.add_live_chunk(0, 0, 2, [1; 8], b"ab").unwrap();
+    c.reasm.add_live_chunk(0, 1, 2, [1; 8], b"cd").unwrap();
+    c.publication.insert(0, PublicationStatus::Needed);
+    let floor = c.request_floor.clone();
+    assert_eq!(floor.load(Ordering::Relaxed), 0);
+    let mut candidates = SessionCandidates::default();
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let (tx, _rx) = mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        drain_retained(
+            &mut c,
+            &mut candidates,
+            &info,
+            &seed,
+            &store,
+            &downloaded,
+            &tx,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.reasm.next_needed(), 1);
+    assert_eq!(
+        floor.load(Ordering::Relaxed),
+        1,
+        "queued requests for the consumed piece must stop"
+    );
+}
