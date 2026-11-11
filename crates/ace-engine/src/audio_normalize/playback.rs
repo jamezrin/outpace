@@ -63,7 +63,7 @@ impl PlaybackStateHandle {
                 _ => {}
             }
             if receiver.has_changed().is_err() {
-                return Err(PlaybackWaitError::Closed);
+                return Err(closed_wait_error(&receiver));
             }
             if Instant::now() >= deadline {
                 return Err(PlaybackWaitError::Deadline);
@@ -81,17 +81,20 @@ impl PlaybackStateHandle {
                 changed = receiver.changed() => {
                     if changed.is_err() {
                         // A final failure stays inspectable after sender closure.
-                        let final_state = *receiver.borrow();
-                        return match final_state.phase {
-                            PlaybackPhase::Failed(reason) => Err(PlaybackWaitError::Failed(reason)),
-                            PlaybackPhase::Stopped => Err(PlaybackWaitError::Stopped),
-                            _ => Err(PlaybackWaitError::Closed),
-                        };
+                        return Err(closed_wait_error(&receiver));
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => return Err(PlaybackWaitError::Deadline),
             }
         }
+    }
+}
+
+fn closed_wait_error(receiver: &watch::Receiver<PlaybackSnapshot>) -> PlaybackWaitError {
+    match receiver.borrow().phase {
+        PlaybackPhase::Failed(reason) => PlaybackWaitError::Failed(reason),
+        PlaybackPhase::Stopped => PlaybackWaitError::Stopped,
+        _ => PlaybackWaitError::Closed,
     }
 }
 
@@ -165,6 +168,23 @@ mod tests {
     use crate::audio_normalize::Failure;
     use tokio::sync::watch;
     use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn closed_readiness_rechecks_failure_published_after_prior_snapshot() {
+        let (publisher, mut handle) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        assert_eq!(
+            handle.receiver.borrow_and_update().phase,
+            PlaybackPhase::Starting
+        );
+        publisher.fail(1, Failure::Admission);
+        drop(publisher);
+        assert!(handle.receiver.has_changed().is_err());
+        assert_eq!(
+            closed_wait_error(&handle.receiver),
+            PlaybackWaitError::Failed(Failure::Admission)
+        );
+    }
 
     #[test]
     fn failed_state_is_retained_and_cannot_be_stopped_or_restarted() {

@@ -384,7 +384,7 @@ impl HlsPackager {
                     Ok(StreamEvent::Discontinuity) => self.discontinuity(),
                     Err(RecvError::Lagged(_)) => self.receiver_lag(),
                     Err(RecvError::Closed) => {
-                        self.finish();
+                        self.finish_source(&source_state);
                         return;
                     }
                 }
@@ -408,6 +408,17 @@ impl HlsPackager {
     /// an independent discontinuity and must take the normal reset path.
     fn receiver_lag(&self) {
         self.reset_for_gap(false);
+    }
+
+    fn finish_source(&self, source: &Option<crate::audio_normalize::PlaybackStateHandle>) {
+        if let Some(crate::audio_normalize::PlaybackPhase::Failed(reason)) =
+            source.as_ref().map(|source| source.snapshot().phase)
+        {
+            let generation = self.state.lock().unwrap().generation;
+            self.fail_generation(generation, reason);
+        } else {
+            self.finish();
+        }
     }
 
     fn reset_for_gap(&self, deduplicate_source_marker: bool) {
@@ -2304,6 +2315,32 @@ mod tests {
         feed_clean_run_generation(&p, GenerationId(7), 900_000, 3);
         assert_eq!(p.segment(0).as_deref(), Some(before.as_ref()));
         assert!(p.segment(1).is_none());
+    }
+
+    #[test]
+    fn source_eof_rechecks_retained_failure_before_closing_ready_playlist() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                segment_duration_ms: 1000,
+                startup_segments: 2,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 2);
+        assert_eq!(p.status(), HlsStatus::Ready);
+        let (publisher, handle) = crate::audio_normalize::PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::audio_normalize::PlaybackPhase::Ready
+        );
+        publisher.fail(1, HlsFailure::ChildExit);
+        drop(publisher);
+        p.finish_source(&Some(handle));
+        assert_eq!(p.status(), HlsStatus::Failed(HlsFailure::ChildExit));
     }
 
     #[test]

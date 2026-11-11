@@ -248,7 +248,12 @@ fn normalization_status_json(
 fn normalization_error(error: crate::audio_normalize::PlaybackWaitError) -> Response {
     use crate::audio_normalize::{Failure, PlaybackWaitError};
     match error {
-        PlaybackWaitError::Failed(Failure::Admission) => capacity_error(),
+        PlaybackWaitError::Failed(Failure::Admission) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            "audio conversion capacity reached",
+        )
+            .into_response(),
         PlaybackWaitError::Failed(reason) => (
             if reason == Failure::Unsupported {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -304,6 +309,13 @@ async fn next_media_event(
         if let Some(state) = state.as_ref() {
             if let PlaybackPhase::Failed(reason) = state.snapshot().phase {
                 return Err(reason);
+            }
+        }
+        if let (Ok(StreamEvent::NormalizedData { generation, .. }), Some(state)) =
+            (&event, state.as_ref())
+        {
+            if *generation != state.snapshot().generation {
+                continue;
             }
         }
         return match event {
@@ -479,6 +491,50 @@ mod normalization_tests {
     use futures::StreamExt;
     use tokio::sync::{mpsc, watch};
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn retired_subscription_backlog_is_not_returned_after_recovery() {
+        let (_input, session) = controlled();
+        let mut sub = session.subscribe();
+        let (sender, receiver) = tokio::sync::broadcast::channel(4);
+        sub.rx = receiver;
+        let (publisher, handle) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        sender
+            .send(StreamEvent::NormalizedData {
+                bytes: Bytes::from_static(b"retired"),
+                generation: 1,
+            })
+            .unwrap();
+        publisher.begin_generation(2);
+        publisher.mark_ready(2);
+        sender
+            .send(StreamEvent::NormalizedData {
+                bytes: Bytes::from_static(b"current"),
+                generation: 2,
+            })
+            .unwrap();
+        let result = next_media_event(&mut sub, &mut Some(handle)).await;
+        session.stop().await;
+        assert!(matches!(
+            result,
+            Ok(Some(StreamEvent::NormalizedData { generation: 2, .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn conversion_capacity_response_names_the_exhausted_resource() {
+        let response = normalization_error(crate::audio_normalize::PlaybackWaitError::Failed(
+            Failure::Admission,
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"audio conversion capacity reached");
+    }
 
     struct Controlled {
         rx: mpsc::Receiver<Result<Bytes, Failure>>,
