@@ -369,9 +369,10 @@ async fn acexy_id_json_handshake_accepts_typed_response_and_returned_lifecycle_u
         .command_url
         .strip_prefix("http://localhost:6900")
         .unwrap();
+    // The public Android SDK appends `api_version=2` to its stop command.
     let stop = app
         .oneshot(
-            Request::get(format!("{command_path}?method=stop"))
+            Request::get(format!("{command_path}?method=stop&api_version=2"))
                 .body(Body::empty())
                 .unwrap(),
         )
