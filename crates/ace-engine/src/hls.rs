@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TS_PACKET: usize = 188;
+/// Spare capacity worth an exact-size copy when a finished segment is retained.
+const SEGMENT_COMPACTION_MIN_SAVINGS: usize = 256 * 1024;
 #[cfg(test)]
 const PCR_MODULUS: u64 = 1 << 33;
 const SDT_PID: u16 = 0x0011;
@@ -653,7 +655,7 @@ impl HlsPackager {
         st.audio.emitted(&mut seg);
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
         st.segments.push_back(HlsSegment {
-            bytes: Bytes::from(seg),
+            bytes: Self::freeze_segment(seg),
             duration,
             discontinuity,
         });
@@ -777,12 +779,21 @@ impl HlsPackager {
     }
 
     fn retained_segment(st: &HlsState, seq: u64) -> Option<Bytes> {
-        if seq < st.media_seq {
-            return None;
+        // Checked: on 32-bit targets a far-off sequence must not truncate to a live index.
+        let index = usize::try_from(seq.checked_sub(st.media_seq)?).ok()?;
+        st.segments.get(index).map(|segment| segment.bytes.clone())
+    }
+
+    /// Freeze a finished segment. Its buffer is the assembly allocation, whose capacity grew
+    /// while filling; reclaim substantial slack once with an exact-size copy, and keep smaller
+    /// savings zero-copy.
+    fn freeze_segment(segment: Vec<u8>) -> Bytes {
+        if segment.capacity() - segment.len() >= SEGMENT_COMPACTION_MIN_SAVINGS {
+            // Unlike best-effort `shrink_to_fit`, a boxed slice has exactly `len` capacity.
+            Bytes::from(segment.into_boxed_slice())
+        } else {
+            Bytes::from(segment)
         }
-        st.segments
-            .get((seq - st.media_seq) as usize)
-            .map(|segment| segment.bytes.clone())
     }
 
     pub(crate) fn was_accessed_within(&self, now: Instant, grace: Duration) -> bool {
@@ -2009,6 +2020,56 @@ mod tests {
             st.segments[1].discontinuity,
             "only the first replacement boundary is marked"
         );
+    }
+
+    #[test]
+    fn finished_segment_compaction_reclaims_only_substantial_slack() {
+        let payload_len = TS_PACKET * 3;
+        for spare in [
+            0,
+            SEGMENT_COMPACTION_MIN_SAVINGS - 1,
+            SEGMENT_COMPACTION_MIN_SAVINGS,
+            SEGMENT_COMPACTION_MIN_SAVINGS + 1,
+        ] {
+            // A boxed slice turned into a Vec has this exact capacity on every allocator.
+            let mut segment = vec![0x47; payload_len + spare]
+                .into_boxed_slice()
+                .into_vec();
+            segment.truncate(payload_len);
+            let original = segment.as_ptr();
+            let bytes = HlsPackager::freeze_segment(segment);
+            assert_eq!(&bytes[..], vec![0x47; payload_len]);
+            // Recover the uniquely owned allocation to observe what is actually retained.
+            let owned: Vec<u8> = bytes.into();
+            if spare < SEGMENT_COMPACTION_MIN_SAVINGS {
+                assert_eq!(owned.as_ptr(), original, "small slack stays zero-copy");
+                assert_eq!(owned.capacity(), payload_len + spare);
+            } else {
+                assert_eq!(owned.capacity(), payload_len, "slack is reclaimed");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_segment_index_is_checked() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 2);
+        assert!(p.segment(0).is_some());
+        let st = p.state.lock().unwrap();
+        let media_seq = st.media_seq;
+        assert!(HlsPackager::retained_segment(&st, media_seq).is_some());
+        // Below the window, and far enough past it to truncate on a 32-bit `as usize`.
+        assert!(media_seq == 0 || HlsPackager::retained_segment(&st, media_seq - 1).is_none());
+        assert!(HlsPackager::retained_segment(&st, media_seq + (1 << 32)).is_none());
+        assert!(HlsPackager::retained_segment(&st, u64::MAX).is_none());
     }
 
     #[test]
