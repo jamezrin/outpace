@@ -124,10 +124,12 @@ By default a live stream's in-RAM reseed store is bounded by *age*, not just byt
 `OUTPACE_SEED_RETENTION_SECS` (default `45`) keeps roughly the last N seconds of downloaded pieces
 for reseeding, so RAM tracks the stream's bitrate instead of always growing to
 `OUTPACE_SEED_STORE_BYTES` (which remains a hard safety ceiling). Set it to `0` to disable the age
-bound and fall back to byte-only retention. VOD caches are always byte-only. outpace also uses
-jemalloc with a background purge thread on non-Windows targets, so resident memory falls back toward
-the live working set after a stream ends; `GET /debug/memstats` reports the allocator's live-heap
-and resident counters.
+bound and fall back to byte-only retention. VOD caches are always byte-only. outpace uses jemalloc
+on 64-bit non-MSVC targets. Linux builds run a background purge thread, so resident memory falls
+back toward the live working set after a stream ends. macOS builds keep the same decay settings but
+no purge thread (jemalloc does not support one there), so idle RSS only falls on later allocator
+activity. Windows/MSVC and 32-bit builds use the system allocator. `GET /debug/memstats` reports
+the allocator's live-heap and resident counters on jemalloc builds.
 
 Broadcast ingest is available in the normal service at:
 
