@@ -213,6 +213,61 @@ async fn open_range_downloads_each_covering_piece_at_most_once() {
 }
 
 #[tokio::test]
+async fn open_range_reuses_cached_pieces_larger_than_one_request() {
+    // Real VOD pieces span many 16 KiB chunks. Two 32 KiB pieces plus a short 8 KiB final
+    // piece: reads that overlap an already-downloaded piece must reuse it from the cache.
+    const CHUNK: u64 = 16 * 1024;
+    let (content, info) = make_vod_content(2 * CHUNK, CHUNK, 4 * CHUNK + CHUNK / 2);
+    assert_eq!(info.piece_count(), 3);
+    let served = Arc::new(AtomicU64::new(0));
+    let addr = spawn_counting_vod_seeder(content.clone(), info.clone(), served.clone()).await;
+    let registry = SeedRegistry::new();
+    let store = registry.lease_store(info.infohash, || {
+        PieceStore::new(2 * CHUNK, CHUNK, 16 * CHUNK)
+    });
+    let vod = AceVodContent {
+        peer_policy: Default::default(),
+        info,
+        bootstrap_peers: vec![addr],
+        announce_peer_port: tokio::sync::watch::channel(None).1,
+        store,
+        peers: Arc::new(tokio::sync::Mutex::new(None)),
+        range_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    // Two reads inside piece 0, the second one in its second chunk.
+    let first = read_all(vod.open_range(0, 3).await.unwrap()).await;
+    assert_eq!(first, content[0..=3]);
+    let start = CHUNK as usize + 100;
+    let second = read_all(
+        vod.open_range(start as u64, start as u64 + 99)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(second, content[start..start + 100]);
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2 * CHUNK,
+        "piece 0 is fetched once"
+    );
+
+    // The short final piece is cached and reused too.
+    let tail = 4 * CHUNK as usize + 10;
+    for _ in 0..2 {
+        let got = read_all(vod.open_range(tail as u64, tail as u64 + 9).await.unwrap()).await;
+        assert_eq!(got, content[tail..tail + 10]);
+    }
+    assert_eq!(served.load(Ordering::SeqCst), 2 * CHUNK + CHUNK / 2);
+
+    // A range spanning all three pieces serves cached piece 0 and downloads from the first
+    // missing piece on (only the leading cached run is reused, so piece 2 is fetched again).
+    let all = read_all(vod.open_range(0, content.len() as u64 - 1).await.unwrap()).await;
+    assert_eq!(all, content);
+    assert_eq!(served.load(Ordering::SeqCst), 4 * CHUNK + CHUNK);
+}
+
+#[tokio::test]
 async fn open_range_spanning_a_new_piece_downloads_only_the_missing_suffix() {
     // Read piece 0 first (caches it), then read [0, 20] which spans pieces 0 and 1: piece 0 is
     // served from cache, only piece 1 is fetched. The assembled bytes must still be correct.
