@@ -41,7 +41,8 @@ and exposed binds; the daemon never changes firewall/routing/VPN settings.
 Require OUTPACE_SRT_PASSPHRASE_FILE when enabled, bounded regular non-symlink file
 owned by the operator and inaccessible to other users, passphrase 10..79 bytes.
 Do not accept secrets in URLs/stream IDs or log native errors containing secrets.
-SRT encryption is mandatory (enforced encryption, fixed AES-256 key length), not
+SRT encryption is mandatory (enforced encryption, with the sender selecting a
+reference-supported AES-128/192/256 key length), not
 an optional plaintext fallback. Shared PSK grants publishing authority for this
 listener; it is not individual-user authentication or payload integrity beyond
 what the negotiated reference protocol provides. Document that trust boundary.
@@ -125,3 +126,16 @@ reference sources. Set a precise flow-window/buffer pair with option readback.
 Choose a cancellation-safe native-owner/async-cleanup handshake using existing
 CleanupTracker rather than making joins discardable. Resolve these in the plan
 before product code; source-level assumptions are not execution evidence.
+
+## Reference API clarification during Task 1
+
+The reference v1.5.7 PBKEYLEN contract requires a unidirectional receiver to leave
+PBKEYLEN at zero and accept the sender's advertised key length. The listener must
+not force a conflicting key length. Accepted sockets must prove a reference-supported
+encrypted key state (16/24/32-byte key) before producer admission. This follows the
+reference API, avoids undefined negotiation with common publishers and retains
+mandatory shared-secret encryption; it does not add an AES-256-only guarantee.
+
+Native listen backlog is additional to admitted connections, not included magically
+in the application's active count. The implementation must bound/document both
+terms and prove handshake/retirement limits before advertising a total bound.
