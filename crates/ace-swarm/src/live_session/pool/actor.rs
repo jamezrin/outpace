@@ -1106,6 +1106,11 @@ fn finish_output_step(
             return None;
         }
         let piece = continuity.reasm.take_ready_piece()?;
+        // Another upstream may have completed this piece while a retry is still queued.
+        // Stop obsolete chunk requests for everything now behind the cursor.
+        continuity
+            .request_floor
+            .fetch_max(continuity.reasm.next_needed(), Ordering::Relaxed);
         #[cfg(test)]
         output_schedules::prepare();
         continuity.publication.remove(&piece.index);
