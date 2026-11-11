@@ -1093,6 +1093,7 @@ async fn serve_http_inner(
     let cancel_background = background.cancel.clone();
     let mut background_cancelled = background.cancel.subscribe();
     let draining_broadcasts = broadcasts.clone();
+    let draining_manager = state.manager.clone();
     let result: Result<(), Box<dyn std::error::Error>> = async {
         let startup = async {
             // BTreeMap iteration is deterministic; API traffic cannot race these claims.
@@ -1147,6 +1148,12 @@ async fn serve_http_inner(
                     if !service.shutdown().await {
                         crate::alog!("[support] shutdown cleanup failed");
                     }
+                }
+                // Continuous stream responses end only when their source sender closes, so
+                // stop the manager before HTTP drain waits on those bodies. Otherwise any
+                // connected viewer holds shutdown open. Support is already stopped above.
+                if !draining_manager.shutdown().await {
+                    crate::alog!("[runtime] stream manager cleanup failed");
                 }
                 if let Err(error) = draining_broadcasts.shutdown().await {
                     crate::alog!("[broadcast] shutdown: {}", error.code());
@@ -2575,6 +2582,9 @@ mod support_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "runtime/support_topology_tests.rs"]
 mod support_topology_tests;
+#[cfg(test)]
+#[path = "runtime/tests_shutdown_drain.rs"]
+mod tests_shutdown_drain;
 #[cfg(test)]
 #[path = "runtime/tests_task_ownership.rs"]
 mod tests_task_ownership;
