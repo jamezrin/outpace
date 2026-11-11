@@ -116,6 +116,10 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     }
     if let Ok(v) = std::env::var("OUTPACE_CACHE_DIR") {
         config.cache_dir = v.into();
+    } else {
+        // `Config::default()` derived its cache dir from the default data dir; re-derive it
+        // now that `OUTPACE_DATA_DIR` may have selected a different root.
+        config.cache_dir = config.data_dir.join("cache");
     }
     if let Ok(v) = std::env::var("OUTPACE_PREFETCH_PIECES") {
         config.prefetch_pieces = Some(v.parse()?);
@@ -1466,6 +1470,49 @@ mod tests {
                 enabled
             );
         }
+    }
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn clear(names: &[&'static str]) -> Self {
+            let old = names
+                .iter()
+                .map(|&name| {
+                    let value = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (name, value)
+                })
+                .collect();
+            Self(old)
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_dir_defaults_under_the_selected_data_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::clear(&["OUTPACE_DATA_DIR", "OUTPACE_CACHE_DIR"]);
+        let root = std::env::temp_dir().join("outpace-cache-dir-default-test");
+
+        std::env::set_var("OUTPACE_DATA_DIR", &root);
+        let config = config_from_env().unwrap();
+        assert_eq!(config.data_dir, root);
+        assert_eq!(config.cache_dir, root.join("cache"));
+
+        let explicit = std::env::temp_dir().join("outpace-cache-dir-explicit-test");
+        std::env::set_var("OUTPACE_CACHE_DIR", &explicit);
+        assert_eq!(config_from_env().unwrap().cache_dir, explicit);
     }
 
     #[test]
