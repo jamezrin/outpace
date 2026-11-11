@@ -1441,3 +1441,33 @@ async fn pending_direct_playback_expires_before_provider_completion() {
 async fn pending_json_playback_expires_before_provider_completion() {
     assert_pending_playback_expires(false).await;
 }
+
+#[tokio::test]
+async fn expired_pending_direct_playback_removes_its_hidden_lease() {
+    // Real clock: the lease's authorization deadline uses the standard clock, so expiry
+    // must remove the internally owned lease rather than rely on an authorization check.
+    let (mut state, opens, release) = pending_start_state();
+    state.ace_sessions = Arc::new(AceSessionStore::new(Duration::from_millis(100), 8));
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let mut request = Box::pin(
+        router(state.clone()).oneshot(
+            Request::get(format!("/ace/getstream?infohash={id}"))
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    );
+    wait_for_first_open(&mut [&mut request], &opens).await;
+    assert_eq!(state.ace_sessions.active_count(), 1);
+    let response = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("lease expiry must end the pending request")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        state.ace_sessions.active_count(),
+        0,
+        "the hidden lease is removed"
+    );
+    release.notify_one();
+    state.manager.shutdown().await;
+}

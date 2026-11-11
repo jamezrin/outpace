@@ -58,7 +58,9 @@ pub(super) async fn ace_getstream(
     };
     let Some(opened) = open_for_lease(&s, &network, &session_key, expires_at, &mut cancel).await
     else {
-        s.ace_sessions.revoke(&playback_id, &token);
+        // This request minted the hidden lease, so it must remove it even once expired;
+        // `revoke` is an authorization check and refuses an expired lease.
+        s.ace_sessions.remove_owned(&playback_id, &token);
         return StatusCode::NOT_FOUND.into_response();
     };
     match opened {
