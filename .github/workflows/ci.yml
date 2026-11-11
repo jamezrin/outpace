@@ -87,6 +87,27 @@ jobs:
       - name: DHT comparison contracts
         run: cargo test --manifest-path tools/dhtcompare/Cargo.toml --all-features --locked
 
+  # Release builds ship Apple binaries, whose jemalloc uses prefixed symbols and no purge
+  # thread. Only a native macOS run proves the exported allocator configuration is applied.
+  allocator-macos:
+    name: Allocator (macOS)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Allocator configuration and startup
+        run: cargo test -p ace-engine --locked --bin outpace --test allocator_startup
+
   abcompare:
     name: A/B harness test
     runs-on: ubuntu-24.04
