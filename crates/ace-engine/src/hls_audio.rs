@@ -707,7 +707,7 @@ impl EnabledWorker {
                     if ts_timing(&packet).discontinuity {
                         return Ok(Turn::Recover(RecoveryReason::Transport, None));
                     }
-                    selector.observe(packet);
+                    let selected = selector.observe(packet);
                     match selector.layout() {
                         LayoutDecision::Unsupported => return Err(HlsFailure::Unsupported),
                         LayoutDecision::Supported(current) if current == *layout => {}
@@ -717,24 +717,41 @@ impl EnabledWorker {
                         probe.observe(&packet)?;
                     }
                     clear_marker(&mut packet);
-                    if let Some(sender) = sender {
-                        // Source storage is still fully charged until its entire
-                        // allocation is dropped. Never await permits that only
-                        // this producer could release by consuming that tail.
-                        let input = self.budget.try_copy(&packet)?;
-                        tokio::select! { biased;
-                            _ = process::cancelled(cancel) => return Ok(Turn::Stop),
-                            sent = sender.send(input) => sent.map_err(|_|HlsFailure::Pipe)?,
+                    match sender {
+                        // The transform child receives the full source program.
+                        Some(sender) => {
+                            // Source storage is still fully charged until its entire
+                            // allocation is dropped. Never await permits that only
+                            // this producer could release by consuming that tail.
+                            let input = self.budget.try_copy(&packet)?;
+                            tokio::select! { biased;
+                                _ = process::cancelled(cancel) => return Ok(Turn::Stop),
+                                sent = sender.send(input) => sent.map_err(|_|HlsFailure::Pipe)?,
+                            }
                         }
-                    } else {
-                        self.media
-                            .feed_generation(self.recovery.generation, &packet);
+                        None => {
+                            if let Some(output) = copy_output(selected) {
+                                self.media
+                                    .feed_generation(self.recovery.generation, &output);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 }
+
+/// What the AAC copy path publishes for one source packet: the selector's output, not the raw
+/// packet. The opening was fed from the selector's (rewritten) tables, so forwarding raw PSI
+/// afterwards would show the packager a different PMT at the first repetition; it treats that
+/// as a layout change and discards the run in progress. Unselected audio PIDs are dropped too.
+pub(crate) fn copy_output(selected: ace_media::audio::AudioPacket) -> Option<[u8; 188]> {
+    let mut packet = selected.packet?;
+    clear_marker(&mut packet);
+    Some(packet)
+}
+
 fn clear_marker(packet: &mut [u8; 188]) {
     if packet[3] & 0x20 != 0 && packet[4] > 0 {
         packet[5] &= !0x80;
