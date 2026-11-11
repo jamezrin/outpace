@@ -300,12 +300,16 @@ impl Scheduler {
                 // For unconstrained calls scan_ceiling equals the original ceiling.
                 ceiling = ceiling.saturating_add(1).min(scan_ceiling);
             } else {
-                // Prefer the peer with the most spare capacity that covers this piece —
-                // spreads load and keeps the rarest-window peers in reserve.
+                // Prefer the peer with the most spare capacity that covers this piece, to
+                // spread load. Break ties by the earliest window end within this pass: use
+                // the less flexible peer now rather than strand its slot, keeping broader
+                // peers for later pieces. Differences beyond the ceiling cannot help this
+                // pass, so those (and exact) ties keep the last-view order.
+                let horizon = ceiling;
                 if let Some(slot) = cap
                     .iter_mut()
                     .filter(|(p, c, slots)| *c > 0 && *slots > 0 && p.covers(piece))
-                    .max_by_key(|(_, c, _)| *c)
+                    .max_by_key(|(p, c, _)| (*c, std::cmp::Reverse(p.max_piece.min(horizon))))
                 {
                     out.push((slot.0.id, piece));
                     slot.1 -= 1;
@@ -313,7 +317,11 @@ impl Scheduler {
                     self.requested.insert(piece);
                 }
             }
-            piece += 1;
+            // A window ending at u64::MAX must end the scan, not overflow or wrap.
+            let Some(next) = piece.checked_add(1) else {
+                break;
+            };
+            piece = next;
         }
         out
     }
@@ -352,6 +360,72 @@ mod tests {
             unchoked,
             in_flight,
         }
+    }
+
+    #[test]
+    fn equal_capacity_uses_the_narrow_window_before_stranding_its_slot() {
+        for max_in_flight in [1, 2] {
+            for next_needed in [0, u64::MAX - 2] {
+                let head = next_needed + max_in_flight;
+                let narrow = peer(1, next_needed, next_needed, true, 0);
+                let broad = peer(2, next_needed, head, true, 0);
+                for views in [[narrow, broad], [broad, narrow]] {
+                    let mut scheduler = Scheduler::new(max_in_flight as usize);
+                    let got = scheduler.assign(next_needed, head, &views);
+                    // Only the broad peer serves the later pieces; giving it the cursor
+                    // would leave the narrow peer's usable slot idle this pass.
+                    let expected: Vec<_> = std::iter::once((1, next_needed))
+                        .chain((next_needed + 1..=head).map(|piece| (2, piece)))
+                        .collect();
+                    assert_eq!(got, expected);
+                    assert_eq!(scheduler.in_flight_count(), expected.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrower_window_does_not_override_spare_capacity_or_equal_window_ties() {
+        let mut scheduler = Scheduler::new(2);
+        assert_eq!(
+            scheduler.assign(0, 0, &[peer(1, 0, 0, true, 1), peer(2, 0, 9, true, 0)]),
+            vec![(2, 0)]
+        );
+
+        // Exact ties keep the existing last-view preference.
+        for views in [
+            [peer(1, 0, 9, true, 0), peer(2, 0, 9, true, 0)],
+            [peer(2, 0, 9, true, 0), peer(1, 0, 9, true, 0)],
+        ] {
+            let mut scheduler = Scheduler::new(1);
+            assert_eq!(scheduler.assign(0, 0, &views), vec![(views[1].id, 0)]);
+        }
+
+        // Window differences beyond this pass's ceiling are irrelevant to it.
+        for views in [
+            [peer(1, 0, 2, true, 0), peer(2, 0, u64::MAX, true, 0)],
+            [peer(2, 0, u64::MAX, true, 0), peer(1, 0, 2, true, 0)],
+        ] {
+            let mut scheduler = Scheduler::new(1);
+            let assigned = scheduler.assign(0, u64::MAX, &views);
+            assert_eq!(assigned, vec![(views[1].id, 0), (views[0].id, 1)]);
+        }
+    }
+
+    #[test]
+    fn window_tie_break_respects_queue_slots() {
+        // A narrow peer without a queue credit cannot take the cursor; the broad one does.
+        let mut scheduler = Scheduler::new(1);
+        let slots = BTreeMap::from([(1, 0), (2, 1)]);
+        assert_eq!(
+            scheduler.assign_with_queue_slots(
+                0,
+                1,
+                &[peer(1, 0, 0, true, 0), peer(2, 0, 1, true, 0)],
+                &slots
+            ),
+            vec![(2, 0)]
+        );
     }
 
     #[test]
