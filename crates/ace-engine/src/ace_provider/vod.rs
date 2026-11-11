@@ -1,5 +1,45 @@
 use super::*;
 
+/// One whole verified piece from the cache, assembled chunk by chunk. `shared_block` is the
+/// peer-facing API and refuses anything over one 16 KiB BitTorrent request, so asking it for a
+/// whole multi-chunk piece always missed and every overlapping read re-downloaded the piece.
+/// Any absent or short chunk is a miss rather than a shifted, partial piece.
+async fn cached_piece(
+    store: &Arc<tokio::sync::Mutex<PieceStore>>,
+    info: &VodInfo,
+    piece: u64,
+) -> Option<Bytes> {
+    let length = info.piece_size(piece);
+    let chunk_length = info.chunk_length;
+    if length == 0 || length > ace_swarm::resolve::MAX_PIECE_LENGTH || chunk_length == 0 {
+        return None;
+    }
+    let chunks = u16::try_from(length.div_ceil(chunk_length)).ok()?;
+    // Check the first chunk before reserving a whole piece, so a miss allocates nothing extra.
+    let (mut bytes, _) = PieceStore::shared_chunk(store, piece, 0).await?;
+    if bytes.len() as u64 != length.min(chunk_length) {
+        return None;
+    }
+    bytes.reserve_exact(length as usize - bytes.len());
+    for index in 1..chunks {
+        let (chunk, _) = PieceStore::shared_chunk(store, piece, index).await?;
+        let expected = (length - u64::from(index) * chunk_length).min(chunk_length);
+        if chunk.len() as u64 != expected {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(Bytes::from(bytes))
+}
+
+/// Remember a discovery result for later range reads, but only a nonempty one: caching an empty
+/// result would make a VOD whose first lookup found nobody unplayable for the store's lifetime.
+fn remember_peers(slot: &mut Option<Vec<SocketAddrV4>>, discovered: &[SocketAddrV4]) {
+    if !discovered.is_empty() {
+        *slot = Some(discovered.to_vec());
+    }
+}
+
 /// The leading run of `[first_piece, end_piece)` already present in `cache`. Returns those pieces'
 /// bytes plus `download_from`, the first index still needing download — so `open_range` serves the
 /// cached prefix from memory and only fetches `[download_from, end_piece)`. For the common
@@ -14,9 +54,9 @@ async fn cached_prefix(
     let mut prefix = Vec::new();
     let mut p = first_piece;
     while p < end_piece {
-        match PieceStore::shared_block(store, p, 0, info.piece_size(p) as u32).await {
+        match cached_piece(store, info, p).await {
             Some(bytes) => {
-                prefix.push(Bytes::from(bytes));
+                prefix.push(bytes);
                 p += 1;
             }
             None => break,
@@ -36,8 +76,8 @@ pub(super) struct AceVodContent {
     pub(super) announce_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
     /// Shared cache/reseed store and the producer lease anchoring its registry lifetime.
     pub(super) store: (Arc<tokio::sync::Mutex<PieceStore>>, SeedLease),
-    /// Peers discovered once and reused by every range read (VOD swarms are stable, unlike the
-    /// live edge). `None` until the first read discovers them.
+    /// Nonempty discovery result reused by every range read (VOD swarms are stable, unlike the
+    /// live edge). `None` until a read discovers at least one peer.
     pub(super) peers: Arc<tokio::sync::Mutex<Option<Vec<SocketAddrV4>>>>,
     /// Serializes cache inspection plus download streams so overlapping requests never fetch
     /// and write the same piece concurrently.
@@ -45,7 +85,7 @@ pub(super) struct AceVodContent {
 }
 
 impl AceVodContent {
-    /// Peers for this VOD, discovered once and cached. Bootstrap peers (tests / explicit config)
+    /// Peers for this VOD, discovered once and cached (an empty result is retried next read). Bootstrap peers (tests / explicit config)
     /// are used directly. VOD swarms are standard BitTorrent, discovered like the live path.
     async fn peers(&self) -> Vec<SocketAddrV4> {
         let mut guard = self.peers.lock().await;
@@ -67,7 +107,7 @@ impl AceVodContent {
         } else {
             self.bootstrap_peers.clone()
         };
-        *guard = Some(discovered.clone());
+        remember_peers(&mut guard, &discovered);
         discovered
     }
 }
@@ -234,5 +274,24 @@ impl VodByteSource for VodSource {
             return Some(chunk);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod remember_peers_tests {
+    use super::*;
+
+    #[test]
+    fn empty_discovery_is_not_cached_but_a_nonempty_one_is() {
+        let mut slot = None;
+        remember_peers(&mut slot, &[]);
+        assert_eq!(
+            slot, None,
+            "an empty result must leave the next read free to rediscover"
+        );
+
+        let peer = SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 6881);
+        remember_peers(&mut slot, &[peer]);
+        assert_eq!(slot, Some(vec![peer]));
     }
 }
