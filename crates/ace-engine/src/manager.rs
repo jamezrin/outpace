@@ -1671,7 +1671,22 @@ mod tests {
             .await
             .expect("native source should become ready without invoking FFmpeg");
             assert_eq!(status, crate::hls::HlsStatus::Ready, "case {id}");
+            let completed = media.segment(0).expect("completed native segment");
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while !media
+                    .playlist_with_segment_prefix("/segments")
+                    .contains("#EXT-X-ENDLIST")
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("source EOF must close, not stop, the native HLS playlist");
+            assert_eq!(media.status(), crate::hls::HlsStatus::Ready, "case {id}");
+            assert_eq!(media.segment(0).as_deref(), Some(completed.as_ref()));
             manager.shutdown().await;
+            assert_eq!(media.status(), crate::hls::HlsStatus::Stopped, "case {id}");
         }
     }
 

@@ -81,6 +81,8 @@ struct HlsState {
     /// Set when `access` carries a title, so upstream SDT-PID packets must be dropped from
     /// segment bodies to avoid duplicating (or conflicting with) our synthesized SDT.
     filter_sdt: bool,
+    /// The source reached EOF: the retained segments are final and the playlist is closed.
+    ended: bool,
 }
 
 struct HlsSegment {
@@ -133,6 +135,7 @@ impl HlsPackager {
                 access,
                 awaiting_access_point: true,
                 filter_sdt,
+                ended: false,
             }),
             ready: tokio::sync::Notify::new(),
             max_segment_bytes,
@@ -168,6 +171,7 @@ impl HlsPackager {
     ) {
         let mut st = self.state.lock().unwrap();
         if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_))
+            || st.ended
             || generation <= st.generation
         {
             return;
@@ -214,6 +218,27 @@ impl HlsPackager {
         let mut st = self.state.lock().unwrap();
         st.status = HlsStatus::Stopped;
         Self::reset_partial(&mut st, false);
+        self.ready.notify_waiters();
+    }
+
+    /// The source ended: keep completed segments as a closed (`#EXT-X-ENDLIST`) playlist and
+    /// drop the incomplete tail. Media that was never published ends as `Stopped`. A reported
+    /// failure or an explicit stop that won the race with EOF is left untouched.
+    pub(crate) fn finish(&self) {
+        let mut st = self.state.lock().unwrap();
+        self.expire(&mut st);
+        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) {
+            return;
+        }
+        st.ended = true;
+        Self::reset_partial(&mut st, false);
+        st.status = match st.status {
+            HlsStatus::Ready => HlsStatus::Ready,
+            // Recovery hides the playlist only until the next access point, which will now
+            // never arrive. Segments published before the gap are complete and final.
+            HlsStatus::Recovering if !st.segments.is_empty() => HlsStatus::Ready,
+            _ => HlsStatus::Stopped,
+        };
         self.ready.notify_waiters();
     }
 
@@ -286,7 +311,10 @@ impl HlsPackager {
                     Ok(StreamEvent::Data(chunk)) => self.feed(&chunk),
                     Ok(StreamEvent::Discontinuity) => self.discontinuity(),
                     Err(RecvError::Lagged(_)) => self.receiver_lag(),
-                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Closed) => {
+                        self.finish();
+                        return;
+                    }
                 }
             }
         }
@@ -334,7 +362,7 @@ impl HlsPackager {
 
     fn feed_locked(&self, st: &mut HlsState, data: &[u8]) {
         self.expire(st);
-        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) {
+        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) || st.ended {
             return;
         }
         let mut remaining = data;
@@ -707,6 +735,9 @@ impl HlsPackager {
                 "{segment_prefix}/{}.ts\n",
                 st.media_seq + i as u64
             ));
+        }
+        if st.ended {
+            out.push_str("#EXT-X-ENDLIST\n");
         }
         out
     }
@@ -2001,6 +2032,76 @@ mod tests {
         feed_clean_run_generation(&p, GenerationId(7), 900_000, 3);
         assert_eq!(p.segment(0).as_deref(), Some(before.as_ref()));
         assert!(p.segment(1).is_none());
+    }
+
+    #[test]
+    fn source_eof_keeps_completed_segments_as_a_closed_playlist() {
+        let config = HlsConfig {
+            segment_packets: 6,
+            segment_duration_ms: 1000,
+            startup_segments: 2,
+            ..HlsConfig::default()
+        };
+        let ready = HlsPackager::new(config, None);
+        feed_clean_run(&ready, 0, 2);
+        assert_eq!(ready.status(), HlsStatus::Ready);
+        // The next access point closes the last segment and opens an unfinished tail, which
+        // EOF must drop rather than publish.
+        ready.feed(&video_access_packet(VIDEO_PID, 400_000));
+        let published = ready.playlist_snapshot("/s", false).unwrap();
+        assert!(!published.contains("#EXT-X-ENDLIST"));
+        assert!(
+            !ready.state.lock().unwrap().cur.is_empty(),
+            "a partial tail is pending"
+        );
+        let first = ready.segment(0).expect("completed segment");
+        ready.finish();
+        assert_eq!(ready.status(), HlsStatus::Ready);
+        let closed = ready.playlist_snapshot("/s", false).unwrap();
+        assert!(closed.trim_end().ends_with("#EXT-X-ENDLIST"));
+        assert_eq!(
+            closed.matches("#EXTINF").count(),
+            published.matches("#EXTINF").count(),
+            "EOF neither adds the partial tail nor drops completed media"
+        );
+        assert_eq!(ready.segment(0).as_deref(), Some(first.as_ref()));
+        // A closed playlist is final: late input cannot extend it.
+        feed_clean_run(&ready, 2_000_000, 3);
+        assert_eq!(ready.playlist_snapshot("/s", false).unwrap(), closed);
+        ready.stop();
+        assert_eq!(ready.status(), HlsStatus::Stopped);
+
+        let unpublished = HlsPackager::new(config, None);
+        feed_clean_run(&unpublished, 0, 1);
+        unpublished.finish();
+        assert_eq!(unpublished.status(), HlsStatus::Stopped);
+
+        let recovering = HlsPackager::new(config, None);
+        feed_clean_run(&recovering, 0, 2);
+        recovering.begin_generation(
+            GenerationId(2),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            true,
+        );
+        assert_eq!(recovering.status(), HlsStatus::Recovering);
+        recovering.finish();
+        assert_eq!(recovering.status(), HlsStatus::Ready);
+        assert!(recovering
+            .playlist_snapshot("/s", false)
+            .unwrap()
+            .trim_end()
+            .ends_with("#EXT-X-ENDLIST"));
+
+        let failed = HlsPackager::new(config, None);
+        failed.fail_generation(GenerationId(0), HlsFailure::ChildExit);
+        failed.finish();
+        assert_eq!(failed.status(), HlsStatus::Failed(HlsFailure::ChildExit));
+
+        let stopped = HlsPackager::new(config, None);
+        feed_clean_run(&stopped, 0, 2);
+        stopped.stop();
+        stopped.finish();
+        assert_eq!(stopped.status(), HlsStatus::Stopped);
     }
 
     #[test]
