@@ -404,9 +404,11 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_PREBUFFER_BYTES` - hard byte ceiling for the startup queue, default `134217728`
   (128 MiB). Reaching it releases the available media early instead of exceeding the reservoir
   budget. Queue metadata and the rest of the daemon add memory overhead beyond this payload cap.
-- `OUTPACE_PREBUFFER_TIMEOUT_MS` - deadline after the first clean media byte for reaching the
-  target duration, default `15000`. On expiry, outpace degrades gracefully by releasing the
-  available queue; it does not turn a short advertised live window into a playback failure.
+- `OUTPACE_PREBUFFER_TIMEOUT_MS` - deadline after the first media byte for reaching the
+  target duration, default `15000`. It is absolute: a source gap or clock reset discards the
+  queued media but does not restart the deadline. On expiry, outpace degrades gracefully by
+  releasing the available queue; it does not turn a short advertised live window into a playback
+  failure.
 - `OUTPACE_REQUEST_TIMEOUT_MS` - per-piece request timeout before re-requesting or skipping an
   evicted gap, default `1500`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`. A live
   player drains in realtime, so raising this leaves a stuck piece to be healed by the much slower

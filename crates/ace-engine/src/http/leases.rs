@@ -286,7 +286,7 @@ impl AceSessionStore {
     /// Remove a lease owned by an internal body guard even if its authorization deadline has
     /// just passed. Unlike `revoke`, this is not an authorization check: the guard was created
     /// with the exact id/token pair when the lease was minted and must always clean up its entry.
-    fn remove_owned(&self, playback_id: &str, token: &str) -> bool {
+    pub(super) fn remove_owned(&self, playback_id: &str, token: &str) -> bool {
         let mut leases = self.leases.lock().unwrap();
         let matches = leases
             .get(token)
