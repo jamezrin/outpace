@@ -129,6 +129,20 @@ async fn server_api_get_media_files_lists_the_infohash_file() {
     .await;
     assert_eq!(json["error"], serde_json::Value::Null);
     assert_eq!(json["result"]["files"][0]["infohash"], ih);
+    assert_eq!(json["result"]["files"][0]["mime"], "video/mp2t");
+}
+
+#[tokio::test]
+async fn server_api_get_media_files_for_a_magnet_reports_live_mpeg_ts() {
+    let ih = "ab".repeat(20);
+    let (_, json) = server_api_json(
+        ace_compat_state(0),
+        &format!("method=get_media_files&magnet=magnet:?xt=urn:btih:{ih}"),
+    )
+    .await;
+    assert_eq!(json["error"], serde_json::Value::Null);
+    assert_eq!(json["result"]["files"][0]["mime"], "video/mp2t");
+    assert_eq!(json["result"]["files"][0]["filename"], "stream.ts");
 }
 
 #[tokio::test]
