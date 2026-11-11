@@ -1104,6 +1104,75 @@ mod tests {
         }
     }
 
+    /// The AAC copy worker opens a generation from its selector's (rewritten) tables and then
+    /// publishes one packet per source packet. Model both ways of publishing over three AAC
+    /// tracks and two GOPs, and return each segment's PIDs.
+    fn copy_path_segments(forward_selector_output: bool) -> Vec<Vec<u16>> {
+        use ace_media::audio::LiveAudioSelection;
+        let raw_pat: [u8; TS_PACKET] = valid_crc(pat(PMT_PID)).try_into().unwrap();
+        let raw_pmt: [u8; TS_PACKET] = audio_pmt(&[0x0f, 0x0f, 0x0f], VIDEO_PID)
+            .try_into()
+            .unwrap();
+        let mut selector = LiveAudioSelection::default();
+        selector.observe(raw_pat);
+        selector.observe(raw_pmt);
+        let p = timed_pkg(1000);
+        for table in selector.tables() {
+            p.feed(table);
+        }
+        let mut publish = |packet: Vec<u8>| {
+            let packet: [u8; TS_PACKET] = packet.try_into().unwrap();
+            let selected = selector.observe(packet);
+            if forward_selector_output {
+                if let Some(output) = crate::hls_audio::copy_output(selected) {
+                    p.feed(&output);
+                }
+            } else {
+                p.feed(&packet); // what the copy path used to publish
+            }
+        };
+        publish(video_access_packet(VIDEO_PID, 0));
+        for gop in 1..=3u64 {
+            for track in 0..3 {
+                publish(with_pid(packets(1), AUDIO_PID + track));
+            }
+            publish(raw_pmt.to_vec()); // ordinary PSI repetition
+            publish(video_access_packet(VIDEO_PID, gop * 108_000));
+        }
+        let mut segments = Vec::new();
+        while let Some(seg) = p.segment(segments.len() as u64) {
+            segments.push(
+                seg.as_chunks::<TS_PACKET>()
+                    .0
+                    .iter()
+                    .map(|k| ts_pid(k))
+                    .collect(),
+            );
+        }
+        segments
+    }
+
+    #[test]
+    fn aac_copy_path_keeps_every_gop_and_only_the_selected_audio() {
+        let fixed = copy_path_segments(true);
+        let raw = copy_path_segments(false);
+        assert_eq!(fixed.len(), 3, "one segment per completed GOP: {fixed:?}");
+        assert!(
+            raw.len() < fixed.len(),
+            "raw PSI repetition after a rewritten opening discards a run: {raw:?}"
+        );
+        for segment in &fixed {
+            assert!(
+                segment.contains(&AUDIO_PID),
+                "selected track missing: {fixed:?}"
+            );
+            assert!(
+                !segment.contains(&(AUDIO_PID + 1)) && !segment.contains(&(AUDIO_PID + 2)),
+                "unselected audio leaked: {fixed:?}"
+            );
+        }
+    }
+
     #[test]
     fn live_hls_without_adts_preserves_audio_and_tables() {
         let p = timed_pkg(1000);
