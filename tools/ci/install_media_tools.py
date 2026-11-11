@@ -1,6 +1,6 @@
 """Install signed Ubuntu media packages on the pinned ephemeral CI runner.
 
-Canonical's HTTPS archives are tried first; the runner's Azure mirror is the
+Canonical's HTTPS archives are tried first; kernel.org's Ubuntu mirror is the
 fallback when the Canonical index cannot be fetched (for example a runner DNS
 outage for *.ubuntu.com).
 
@@ -30,19 +30,20 @@ def supported_runner():
 
 
 # Canonical first: #333 moved off the runner's cloud mirror because slow
-# downloads consumed the job. The Azure mirror is the fallback for when runner
-# DNS cannot resolve *.ubuntu.com. Plain HTTP is acceptable there because every
-# index is still verified against the pinned keyring through signed-by.
+# downloads consumed the job. The fallback is kernel.org's official Ubuntu
+# mirror, deliberately outside *.ubuntu.com, so a runner DNS outage for that
+# domain (which also takes out azure.archive.ubuntu.com) does not block CI.
+# Every index is still verified against the pinned keyring through signed-by.
 MIRRORS = [
     ('canonical', [
         'https://archive.ubuntu.com/ubuntu noble main universe',
         'https://archive.ubuntu.com/ubuntu noble-updates main universe',
         'https://security.ubuntu.com/ubuntu noble-security main universe',
     ]),
-    ('azure', [
-        'http://azure.archive.ubuntu.com/ubuntu noble main universe',
-        'http://azure.archive.ubuntu.com/ubuntu noble-updates main universe',
-        'http://azure.archive.ubuntu.com/ubuntu noble-security main universe',
+    ('kernel.org', [
+        'https://mirrors.edge.kernel.org/ubuntu noble main universe',
+        'https://mirrors.edge.kernel.org/ubuntu noble-updates main universe',
+        'https://mirrors.edge.kernel.org/ubuntu noble-security main universe',
     ]),
 ]
 UPDATE_SECONDS = 55

@@ -50,13 +50,12 @@ class InstallMediaTests(unittest.TestCase):
     def assert_canonical(self,text):
         self.assertIn('https://archive.ubuntu.com/ubuntu noble main universe',text)
         self.assertIn('https://security.ubuntu.com/ubuntu noble-security main universe',text)
-        self.assertNotIn('azure.archive',text)
+        self.assertNotIn('kernel.org',text)
 
-    def assert_azure(self,text):
+    def assert_fallback(self,text):
         for pocket in ('noble','noble-updates','noble-security'):
-            self.assertIn(f'http://azure.archive.ubuntu.com/ubuntu {pocket} main universe',text)
-        self.assertNotIn('https://archive.ubuntu.com',text)
-        self.assertNotIn('security.ubuntu.com',text)
+            self.assertIn(f'https://mirrors.edge.kernel.org/ubuntu {pocket} main universe',text)
+        self.assertNotIn('ubuntu.com',text,'fallback must not depend on *.ubuntu.com DNS')
 
     def test_success_uses_canonical_only_then_both_tool_probes(self):
         calls,sources=self.exercise();self.assertEqual(len(calls),4)
@@ -66,12 +65,12 @@ class InstallMediaTests(unittest.TestCase):
         self.assertEqual(calls[3][0],['/usr/bin/ffprobe','-hide_banner','-version'])
         self.assertEqual(len(sources),2);self.assert_canonical(sources[0]);self.assertEqual(sources[0],sources[1])
 
-    def test_canonical_index_failure_falls_back_to_azure_once(self):
+    def test_canonical_index_failure_falls_back_once(self):
         calls,sources=self.exercise(fail_at=(1,))
         self.assertEqual(len(calls),5)
         self.assertEqual([c[0][-1] for c in calls[:2]],['update','update'])
         self.assertEqual(calls[2][0][-1],'ffmpeg')
-        self.assert_canonical(sources[0]);self.assert_azure(sources[1])
+        self.assert_canonical(sources[0]);self.assert_fallback(sources[1])
         self.assertEqual(sources[1],sources[2],'install must use the index that succeeded')
 
     def test_both_index_failures_fail_without_install(self):
@@ -84,7 +83,7 @@ class InstallMediaTests(unittest.TestCase):
             with self.subTest(phase=phase):
                 calls,sources=self.exercise(fail_at=(phase,),fails=True)
                 self.assertEqual(len(calls),phase)
-                self.assertTrue(all('azure.archive' not in t for t in sources))
+                self.assertTrue(all('kernel.org' not in t for t in sources))
 
     def test_worst_case_budget_fits_step_timeout(self):
         calls,_=self.exercise(fail_at=(1,))
