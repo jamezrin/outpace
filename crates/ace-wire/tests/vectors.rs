@@ -132,8 +132,15 @@ fn decodes_live_transport_syntheticchannel() {
     assert!(d.pieces.is_empty());
     assert!(d.name.starts_with("Synthetic Live Channel 1080"));
     assert_eq!(d.pubkey.len(), 124); // RSA DER
-    assert_eq!(d.trackers.len(), 1);
-    assert!(d.trackers[0].contains("tracker1.invalid"));
+
+    // The vector packs both trackers into one space-separated entry, like real descriptors.
+    assert_eq!(
+        d.trackers,
+        [
+            "udp://tracker1.invalid:9006/announce",
+            "udp://tracker2.invalid:1337/announce",
+        ]
+    );
 }
 
 #[test]
