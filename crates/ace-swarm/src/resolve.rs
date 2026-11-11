@@ -416,7 +416,7 @@ pub async fn transport_bytes_via_peer_with_policy<S: AsyncRead + AsyncWrite + Un
 
     let (peer_ut_id, metadata_size) = read_metadata_params(session).await?;
     let blob = session
-        .fetch_metadata(peer_ut_id, metadata_size)
+        .fetch_metadata(peer_ut_id, OUR_UT_METADATA_ID as u8, metadata_size)
         .await
         .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))?;
     if !checked_transport_file_hash(&blob, handshake_infohash) {
@@ -705,7 +705,8 @@ async fn read_metadata_params<S: AsyncRead + AsyncWrite + Unpin>(
             let size = eh
                 .metadata_size()
                 .ok_or(ResolveError::Peer("peer sent no metadata_size"))?;
-            if !(0..=255).contains(&ut_id) {
+            // 0 in an `m` dict means the extension is disabled.
+            if !(1..=255).contains(&ut_id) {
                 return Err(ResolveError::Peer("invalid ut_metadata params"));
             }
             return Ok((ut_id as u8, checked_metadata_size(size)?));
