@@ -1432,3 +1432,60 @@ async fn selected_layer_one_fails_before_child_launch() {
     );
     manager.shutdown().await;
 }
+
+#[tokio::test]
+async fn normalized_source_eof_closes_the_playlist_and_keeps_completed_segments() {
+    let Some(tools) = require_tools() else { return };
+    let ac3 = support::generate_case(&tools, AudioCase::Ac3).expect("generate AC3");
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(ChanneledProvider(std::sync::Mutex::new(Some(rx)))));
+    let manager = StreamManager::with_normalizer(
+        providers,
+        32,
+        HlsConfig {
+            segment_packets: 65_536,
+            window_segments: 16,
+            segment_duration_ms: 1000,
+            startup_segments: 2,
+            startup_timeout_ms: 15_000,
+        },
+        Some(ace_engine::hls_audio::PreparedNormalizer {
+            executable: tools.ffmpeg.clone(),
+        }),
+    );
+    let app = synthetic_app(manager.clone());
+    let native = format!("/streams/synthetic/{SYNTHETIC_STREAM_ID}.m3u8");
+    tx.send((false, Bytes::from(ac3.transport.clone())))
+        .unwrap();
+    let (status, _) = route_body(&app, &native).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let media = manager
+        .get_hls("synthetic", SYNTHETIC_STREAM_ID)
+        .await
+        .unwrap();
+    wait_ready(&media).await;
+    let first = media.segment(0).expect("first normalized segment");
+
+    // The source ends: the FFmpeg transform must close the playlist, not stop the entry.
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !media
+            .playlist_with_segment_prefix("/segments")
+            .contains("#EXT-X-ENDLIST")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("source EOF closes the normalized playlist");
+    assert_eq!(media.status(), ace_engine::hls::HlsStatus::Ready);
+    assert_eq!(media.segment(0).as_deref(), Some(first.as_ref()));
+    let (status, body) = route_body(&app, &native).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let closed = String::from_utf8(body).unwrap();
+    assert!(closed.contains("#EXTINF"), "completed media stays listed");
+    assert!(closed.trim_end().ends_with("#EXT-X-ENDLIST"));
+    manager.shutdown().await;
+    assert_eq!(media.status(), ace_engine::hls::HlsStatus::Stopped);
+}
