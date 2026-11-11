@@ -168,6 +168,13 @@ pub trait StreamProvider: Send + Sync {
         ))
     }
 
+    /// The spelling of `id` that the manager keys sessions, VOD handles and stops on. Ids that
+    /// differ only in a case-insensitive part must map to one canonical form, or two spellings of
+    /// one stream would start two swarms and miss each other's caches. Defaults to `id` unchanged.
+    fn canonical_id<'a>(&self, id: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Borrowed(id)
+    }
+
     /// Offline check that [`open`](Self::open) would get past id resolution, for routes that
     /// hand out playback URLs before opening (compat `/ace/getstream?format=json`). Must not
     /// touch the network or start anything. Defaults to accepting every id.

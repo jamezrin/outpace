@@ -7,6 +7,12 @@ use std::collections::BTreeMap;
 /// small deeply nested value cannot exhaust the stack.
 const MAX_DEPTH: usize = 32;
 
+/// Maximum values (scalars, containers and dictionary keys, the root included) accepted in one
+/// parse. Depth alone does not bound memory: a shallow list of empty values expands every 2-byte
+/// `le` into a whole node, turning one 2 MiB peer frame into tens of MiB. Legitimate peer, DHT,
+/// tracker and descriptor bencode stays far below this.
+const MAX_VALUES: usize = 65_536;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bencode {
     Int(i64),
@@ -18,7 +24,7 @@ pub enum Bencode {
 impl Bencode {
     /// Parse exactly one bencode value from the whole buffer; trailing bytes = error.
     pub fn parse(buf: &[u8]) -> Result<Bencode> {
-        let (v, n) = parse_value(buf, 0, 0)?;
+        let (v, n) = Self::parse_prefix(buf)?;
         if n != buf.len() {
             return Err(WireError::Invalid("trailing bytes"));
         }
@@ -27,7 +33,8 @@ impl Bencode {
 
     /// Parse one value from the front; return (value, bytes_consumed).
     pub fn parse_prefix(buf: &[u8]) -> Result<(Bencode, usize)> {
-        parse_value(buf, 0, 0)
+        let mut budget = MAX_VALUES;
+        parse_value(buf, 0, 0, &mut budget)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -90,16 +97,30 @@ impl Bencode {
 }
 
 /// `depth` is the number of container (list/dict) ancestors already open. It bounds
-/// recursion so untrusted, deeply nested bencode cannot exhaust the stack.
-fn parse_value(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
+/// recursion so untrusted, deeply nested bencode cannot exhaust the stack. `budget` is the number
+/// of values this parse may still produce (see [`MAX_VALUES`]).
+fn parse_value(
+    buf: &[u8],
+    pos: usize,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(Bencode, usize)> {
+    spend(budget)?;
     match buf.get(pos).ok_or(WireError::Truncated)? {
         b'i' => parse_int(buf, pos),
         b'l' | b'd' if depth >= MAX_DEPTH => Err(WireError::Invalid("bencode nesting too deep")),
-        b'l' => parse_list(buf, pos, depth),
-        b'd' => parse_dict(buf, pos, depth),
+        b'l' => parse_list(buf, pos, depth, budget),
+        b'd' => parse_dict(buf, pos, depth, budget),
         b'0'..=b'9' => parse_bytes(buf, pos),
         _ => Err(WireError::Invalid("unexpected bencode token")),
     }
+}
+
+fn spend(budget: &mut usize) -> Result<()> {
+    *budget = budget
+        .checked_sub(1)
+        .ok_or(WireError::Invalid("too many bencode values"))?;
+    Ok(())
 }
 
 fn parse_int(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
@@ -137,14 +158,19 @@ fn parse_bytes(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
     Ok((Bencode::Bytes(buf[start..end].to_vec()), end))
 }
 
-fn parse_list(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
+fn parse_list(
+    buf: &[u8],
+    pos: usize,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(Bencode, usize)> {
     let mut i = pos + 1;
     let mut items = Vec::new();
     loop {
         match buf.get(i).ok_or(WireError::Truncated)? {
             b'e' => return Ok((Bencode::List(items), i + 1)),
             _ => {
-                let (v, n) = parse_value(buf, i, depth + 1)?;
+                let (v, n) = parse_value(buf, i, depth + 1, budget)?;
                 items.push(v);
                 i = n;
             }
@@ -152,20 +178,27 @@ fn parse_list(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> 
     }
 }
 
-fn parse_dict(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
+fn parse_dict(
+    buf: &[u8],
+    pos: usize,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(Bencode, usize)> {
     let mut i = pos + 1;
     let mut map = BTreeMap::new();
     loop {
         match buf.get(i).ok_or(WireError::Truncated)? {
             b'e' => return Ok((Bencode::Dict(map), i + 1)),
             _ => {
+                // Keys spend the budget too, even ones that overwrite an earlier entry.
+                spend(budget)?;
                 let (k, n) = parse_bytes(buf, i)?;
                 let key = if let Bencode::Bytes(b) = k {
                     b
                 } else {
                     unreachable!()
                 };
-                let (v, n2) = parse_value(buf, n, depth + 1)?;
+                let (v, n2) = parse_value(buf, n, depth + 1, budget)?;
                 map.insert(key, v);
                 i = n2;
             }
@@ -203,6 +236,54 @@ mod tests {
         assert!(Bencode::parse(b"i42").is_err()); // truncated
         assert!(Bencode::parse(b"i42eX").is_err()); // trailing byte
         assert!(Bencode::parse(b"3:ab").is_err()); // short string
+    }
+
+    /// A list of `items` empty lists: two wire bytes per item, but each one becomes a full
+    /// `Bencode::List` node, so a single valid frame can expand into tens of MiB.
+    fn flat_list(items: usize) -> Vec<u8> {
+        let mut bytes = vec![b'l'];
+        for _ in 0..items {
+            bytes.extend_from_slice(b"le");
+        }
+        bytes.push(b'e');
+        bytes
+    }
+
+    #[test]
+    fn bounds_value_count_including_the_root() {
+        let Bencode::List(items) = Bencode::parse(&flat_list(MAX_VALUES - 1)).unwrap() else {
+            panic!("expected list");
+        };
+        assert_eq!(items.len(), MAX_VALUES - 1);
+        let over = Err(WireError::Invalid("too many bencode values"));
+        assert_eq!(Bencode::parse(&flat_list(MAX_VALUES)), over);
+        assert_eq!(
+            Bencode::parse_prefix(&flat_list(MAX_VALUES)).map(|_| ()),
+            over.map(|_: Bencode| ())
+        );
+    }
+
+    #[test]
+    fn a_max_size_peer_frame_of_empty_lists_is_rejected() {
+        // The largest frame a peer may send, filled with empty lists, used to parse into ~1M
+        // nodes; it must now fail fast instead.
+        let items = (crate::message::MAX_FRAME_LEN - 2) / 2;
+        assert!(Bencode::parse(&flat_list(items)).is_err());
+    }
+
+    #[test]
+    fn dictionary_keys_count_even_when_they_overwrite() {
+        // Each pair spends a key and a value; repeating one key keeps the map tiny but must
+        // still spend the budget, or overwrites would bypass it.
+        let mut bytes = vec![b'd'];
+        for _ in 0..MAX_VALUES / 2 {
+            bytes.extend_from_slice(b"1:ki1e");
+        }
+        bytes.push(b'e');
+        assert_eq!(
+            Bencode::parse(&bytes),
+            Err(WireError::Invalid("too many bencode values"))
+        );
     }
 
     /// Build a value nested `depth` levels deep: `depth` opening tokens, an inner

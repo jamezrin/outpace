@@ -384,10 +384,10 @@ pub(crate) fn spawn_worker(
                     seed: None,
                     budget: InputBudget::new(),
                 };
-                if let Err(reason) = worker.run(cancel).await {
-                    media.fail_generation(worker.recovery.generation, reason);
-                } else {
-                    media.stop();
+                match worker.run(cancel).await {
+                    Err(reason) => media.fail_generation(worker.recovery.generation, reason),
+                    Ok(WorkerEnd::Eof) => media.finish(),
+                    Ok(WorkerEnd::Cancelled) => media.stop(),
                 }
             }
         }
@@ -595,8 +595,15 @@ struct EnabledWorker<M = Arc<HlsPackager>> {
     seed: Option<[u8; 188]>,
     budget: InputBudget,
 }
+/// How a worker that did not fail ended: the source closed, or it was told to stop.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerEnd {
+    Eof,
+    Cancelled,
+}
 enum Turn {
     Recover(RecoveryReason, Option<[u8; 188]>),
+    Eof,
     Stop,
 }
 impl<M: WorkerTarget> EnabledWorker<M> {
@@ -626,27 +633,27 @@ impl<M: WorkerTarget> EnabledWorker<M> {
         self.seed = seed;
         Ok(())
     }
-    async fn run(&mut self, mut cancel: watch::Receiver<bool>) -> Result<(), HlsFailure> {
+    async fn run(&mut self, mut cancel: watch::Receiver<bool>) -> Result<WorkerEnd, HlsFailure> {
         self.media
             .begin_generation(self.recovery.generation, self.deadline, false);
         loop {
             let mut classifier = Classifier::new();
             let opening = loop {
                 if *cancel.borrow() {
-                    return Ok(());
+                    return Ok(WorkerEnd::Cancelled);
                 }
                 let item = if let Some(packet) = self.seed.take() {
                     SourceItem::Packet(packet)
                 } else {
                     tokio::select! { biased;
-                        _ = process::cancelled(&mut cancel) => return Ok(()),
+                        _ = process::cancelled(&mut cancel) => return Ok(WorkerEnd::Cancelled),
                         _ = tokio::time::sleep_until(self.deadline) => return Err(HlsFailure::Deadline),
                         item = self.source.next(&self.budget) => item,
                     }
                 };
                 match item {
                     SourceItem::Failed(reason) => return Err(reason),
-                    SourceItem::Closed => return Ok(()),
+                    SourceItem::Closed => return Ok(WorkerEnd::Eof),
                     SourceItem::Recovery(reason) => {
                         self.invalidate(reason, None)?;
                         classifier = Classifier::new();
@@ -691,7 +698,8 @@ impl<M: WorkerTarget> EnabledWorker<M> {
                 .await
                 .unwrap_or(Err(HlsFailure::Pump))?
                 {
-                    Turn::Stop => return Ok(()),
+                    Turn::Stop => return Ok(WorkerEnd::Cancelled),
+                    Turn::Eof => return Ok(WorkerEnd::Eof),
                     Turn::Recover(reason, seed) => self.invalidate(reason, seed)?,
                 }
             } else {
@@ -729,7 +737,7 @@ impl<M: WorkerTarget> EnabledWorker<M> {
                     .catch_unwind();
                     tokio::pin!(producer);
                     tokio::select! { biased;
-                        result = &mut child => { result?; return Ok(()); },
+                        result = &mut child => { result?; return Ok(WorkerEnd::Cancelled); },
                         turn = &mut producer => turn.unwrap_or(Err(HlsFailure::Pump)),
                     }
                 };
@@ -760,7 +768,10 @@ impl<M: WorkerTarget> EnabledWorker<M> {
                         }
                         child_cancel.send_replace(true);
                         let _ = child.await;
-                        return other.map(|_| ());
+                        return other.map(|turn| match turn {
+                            Turn::Eof => WorkerEnd::Eof,
+                            _ => WorkerEnd::Cancelled,
+                        });
                     }
                 }
             }
@@ -807,7 +818,7 @@ impl<M: WorkerTarget> EnabledWorker<M> {
                     if sender.is_none() {
                         self.media.flush_pending(self.recovery.generation);
                     }
-                    return Ok(Turn::Stop);
+                    return Ok(Turn::Eof);
                 }
                 SourceItem::Recovery(reason) => return Ok(Turn::Recover(reason, None)),
                 SourceItem::Packet(mut packet) => {
@@ -817,7 +828,7 @@ impl<M: WorkerTarget> EnabledWorker<M> {
                     if ts_timing(&packet).discontinuity {
                         return Ok(Turn::Recover(RecoveryReason::Transport, None));
                     }
-                    selector.observe(packet);
+                    let selected = selector.observe(packet);
                     match selector.layout() {
                         LayoutDecision::Unsupported => return Err(HlsFailure::Unsupported),
                         LayoutDecision::Supported(current) if current == *layout => {}
@@ -827,25 +838,38 @@ impl<M: WorkerTarget> EnabledWorker<M> {
                         probe.observe(&packet)?;
                     }
                     clear_marker(&mut packet);
-                    if let Some(sender) = sender {
-                        // Source storage is still fully charged until its entire
-                        // allocation is dropped. Never await permits that only
-                        // this producer could release by consuming that tail.
-                        let input = self.budget.try_copy(&packet)?;
-                        tokio::select! { biased;
-                            _ = process::cancelled(cancel) => return Ok(Turn::Stop),
-                            sent = sender.send(input) => sent.map_err(|_|HlsFailure::Pipe)?,
+                    match sender {
+                        Some(sender) => {
+                            let input = self.budget.try_copy(&packet)?;
+                            tokio::select! { biased;
+                                _ = process::cancelled(cancel) => return Ok(Turn::Stop),
+                                sent = sender.send(input) => sent.map_err(|_|HlsFailure::Pipe)?,
+                            }
                         }
-                    } else {
-                        self.media
-                            .feed_packet(self.recovery.generation, &packet, cancel)
-                            .await?;
+                        None => {
+                            if let Some(output) = copy_output(selected) {
+                                self.media
+                                    .feed_packet(self.recovery.generation, &output, cancel)
+                                    .await?;
+                            }
+                        }
                     }
                 }
             }
         }
     }
 }
+
+/// What the AAC copy path publishes for one source packet: the selector's output, not the raw
+/// packet. The opening was fed from the selector's (rewritten) tables, so forwarding raw PSI
+/// afterwards would show the packager a different PMT at the first repetition; it treats that
+/// as a layout change and discards the run in progress. Unselected audio PIDs are dropped too.
+pub(crate) fn copy_output(selected: ace_media::audio::AudioPacket) -> Option<[u8; 188]> {
+    let mut packet = selected.packet?;
+    clear_marker(&mut packet);
+    Some(packet)
+}
+
 fn clear_marker(packet: &mut [u8; 188]) {
     if packet[3] & 0x20 != 0 && packet[4] > 0 {
         packet[5] &= !0x80;
@@ -978,7 +1002,7 @@ mod task4_tests {
     }
 
     async fn wait_for_blocked_transform(
-        task: &tokio::task::JoinHandle<Result<(), HlsFailure>>,
+        task: &tokio::task::JoinHandle<Result<WorkerEnd, HlsFailure>>,
         counters: &process::test_support::Counters,
         probe: &PacketSourceProbe,
     ) -> bool {

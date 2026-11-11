@@ -563,6 +563,21 @@ impl AceProvider {
     }
 }
 
+/// Content ids (`cid:<40 hex>`) and infohashes (bare 40 hex) are case-insensitive hex, so they
+/// are keyed lowercase. Every other id form (`local:`, transport urls, magnets) keeps its exact
+/// spelling, and malformed ids pass through for the provider's own validation to reject.
+pub(crate) fn canonical_ace_id(id: &str) -> std::borrow::Cow<'_, str> {
+    let hex = id.strip_prefix("cid:").unwrap_or(id);
+    if hex.len() == 40
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && hex.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        std::borrow::Cow::Owned(id.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(id)
+    }
+}
+
 #[async_trait]
 impl StreamProvider for AceProvider {
     fn network(&self) -> &'static str {
@@ -583,6 +598,10 @@ impl StreamProvider for AceProvider {
                 ResolvedContentId::Catalog(info) => ContentIdPreparation::Catalog(info),
                 ResolvedContentId::Provider(_) => ContentIdPreparation::ProviderResolved,
             })
+    }
+
+    fn canonical_id<'a>(&self, id: &'a str) -> std::borrow::Cow<'a, str> {
+        canonical_ace_id(id)
     }
 
     fn check_openable(&self, id: &str) -> Result<(), ProviderError> {
