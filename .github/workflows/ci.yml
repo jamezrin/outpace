@@ -73,7 +73,8 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Keep media tests enabled without letting cloud-mirror downloads consume
-      # the whole test job. The helper uses scoped signed Ubuntu HTTPS sources.
+      # the whole test job. The helper uses scoped signed Canonical sources first and
+      # falls back to the Azure mirror only when the Canonical index fails.
       - name: Install ffmpeg
         timeout-minutes: 7
         run: python3 tools/ci/install_media_tools.py

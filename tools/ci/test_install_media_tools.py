@@ -16,8 +16,9 @@ class InstallMediaTests(unittest.TestCase):
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         return module
 
-    def exercise(self, fail_at=None):
-        module=self.module();calls=[];source_paths=[]
+    def exercise(self, fail_at=(), fails=False):
+        """Run install() with mocked commands; calls numbered in fail_at raise."""
+        module=self.module();calls=[];sources=[];source_paths=[]
         with tempfile.TemporaryDirectory() as directory:
             def execute(argv, **kwargs):
                 calls.append((argv,kwargs))
@@ -25,11 +26,9 @@ class InstallMediaTests(unittest.TestCase):
                     options=[argv[i+1] for i,x in enumerate(argv[:-1]) if x=='-o']
                     source=Path(next(x.split('=',1)[1] for x in options if x.startswith('Dir::Etc::sourcelist=')))
                     source_paths.append(source)
-                    text=source.read_text()
-                    self.assertIn('https://archive.ubuntu.com/ubuntu noble main universe',text)
-                    self.assertIn('https://security.ubuntu.com/ubuntu noble-security main universe',text)
-                    self.assertIn('signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg',text)
-                    self.assertNotIn('azure.archive',text)
+                    text=source.read_text();sources.append(text)
+                    for line in text.splitlines():
+                        self.assertTrue(line.startswith('deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] '),line)
                     parts=Path(next(x.split('=',1)[1] for x in options if x.startswith('Dir::Etc::sourceparts=')))
                     self.assertFalse(parts.exists())
                     self.assertIn('Acquire::Retries=0',options)
@@ -38,27 +37,58 @@ class InstallMediaTests(unittest.TestCase):
                     self.assertEqual(argv[:5],['sudo','-n','/usr/bin/timeout','--signal=TERM','--kill-after=10s'])
                     self.assertNotIn('--allow-unauthenticated',argv)
                 self.assertTrue(kwargs['check'])
-                if len(calls)==fail_at:raise subprocess.CalledProcessError(124,argv)
+                if len(calls) in fail_at:raise subprocess.CalledProcessError(124,argv)
                 return subprocess.CompletedProcess(argv,0)
             with mock.patch.dict(os.environ,{'GITHUB_ACTIONS':'true','RUNNER_OS':'Linux','RUNNER_TEMP':directory}), mock.patch.object(module,'supported_runner',return_value=None), mock.patch.object(module.subprocess,'run',side_effect=execute):
-                if fail_at:
+                if fails:
                     with self.assertRaises(subprocess.CalledProcessError):module.install()
                 else:module.install()
             self.assertTrue(source_paths)
             self.assertTrue(all(not p.exists() for p in source_paths),'temporary sources survived exit')
-        return calls
+        return calls,sources
 
-    def test_success_is_bounded_signed_install_then_both_tool_probes(self):
-        calls=self.exercise();self.assertEqual(len(calls),4)
-        self.assertIn('90s',calls[0][0]);self.assertIn('update',calls[0][0])
-        self.assertIn('240s',calls[1][0]);self.assertEqual(calls[1][0][-4:],['install','-y','--no-install-recommends','ffmpeg'])
+    def assert_canonical(self,text):
+        self.assertIn('https://archive.ubuntu.com/ubuntu noble main universe',text)
+        self.assertIn('https://security.ubuntu.com/ubuntu noble-security main universe',text)
+        self.assertNotIn('azure.archive',text)
+
+    def assert_azure(self,text):
+        for pocket in ('noble','noble-updates','noble-security'):
+            self.assertIn(f'http://azure.archive.ubuntu.com/ubuntu {pocket} main universe',text)
+        self.assertNotIn('https://archive.ubuntu.com',text)
+        self.assertNotIn('security.ubuntu.com',text)
+
+    def test_success_uses_canonical_only_then_both_tool_probes(self):
+        calls,sources=self.exercise();self.assertEqual(len(calls),4)
+        self.assertIn('55s',calls[0][0]);self.assertEqual(calls[0][0][-1],'update')
+        self.assertIn('200s',calls[1][0]);self.assertEqual(calls[1][0][-4:],['install','-y','--no-install-recommends','ffmpeg'])
         self.assertEqual(calls[2][0],['/usr/bin/ffmpeg','-hide_banner','-version'])
         self.assertEqual(calls[3][0],['/usr/bin/ffprobe','-hide_banner','-version'])
-        self.assertLessEqual(sum(x[1]['timeout'] for x in calls),390)
+        self.assertEqual(len(sources),2);self.assert_canonical(sources[0]);self.assertEqual(sources[0],sources[1])
 
-    def test_each_failure_stops_without_retry_or_successful_skip(self):
-        for phase in range(1,5):
-            with self.subTest(phase=phase):self.assertEqual(len(self.exercise(phase)),phase)
+    def test_canonical_index_failure_falls_back_to_azure_once(self):
+        calls,sources=self.exercise(fail_at=(1,))
+        self.assertEqual(len(calls),5)
+        self.assertEqual([c[0][-1] for c in calls[:2]],['update','update'])
+        self.assertEqual(calls[2][0][-1],'ffmpeg')
+        self.assert_canonical(sources[0]);self.assert_azure(sources[1])
+        self.assertEqual(sources[1],sources[2],'install must use the index that succeeded')
+
+    def test_both_index_failures_fail_without_install(self):
+        calls,_=self.exercise(fail_at=(1,2),fails=True)
+        self.assertEqual(len(calls),2)
+        self.assertTrue(all(c[0][-1]=='update' for c in calls))
+
+    def test_install_or_probe_failure_never_falls_back(self):
+        for phase in range(2,5):
+            with self.subTest(phase=phase):
+                calls,sources=self.exercise(fail_at=(phase,),fails=True)
+                self.assertEqual(len(calls),phase)
+                self.assertTrue(all('azure.archive' not in t for t in sources))
+
+    def test_worst_case_budget_fits_step_timeout(self):
+        calls,_=self.exercise(fail_at=(1,))
+        self.assertLessEqual(sum(x[1]['timeout'] for x in calls),390)
 
     def test_wrong_context_denies_before_any_command(self):
         module=self.module()
