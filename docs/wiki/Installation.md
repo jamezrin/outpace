@@ -48,6 +48,28 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
 
+### Homebrew and Scoop
+
+This repository works as a Homebrew tap (macOS, and Linux on x86_64 or ARM64) and as a Scoop
+bucket (Windows x86_64 and ARM64). Both install the newest release, verified against its
+`SHA256SUMS`:
+
+```bash
+brew tap jamezrin/outpace https://github.com/jamezrin/outpace-stream
+brew install jamezrin/outpace/outpace
+brew services start outpace      # optional: run in the background (launchd or systemd)
+```
+
+```powershell
+scoop bucket add outpace https://github.com/jamezrin/outpace-stream
+scoop install outpace/outpace
+```
+
+- `brew services` runs `outpace serve` with HTTP and RTMP on `127.0.0.1` and logs to
+  `$(brew --prefix)/var/log/outpace.log`.
+- Upgrade with `brew upgrade outpace` or `scoop update outpace`. The formula and manifest are
+  updated shortly after each release, so a brand-new release can take a little while to appear.
+
 ### ARMv7 and small devices
 
 ARMv7 builds cover hard-float ARMv7 Linux (Raspberry Pi 2/3, older NAS boxes). ARMv6 and

@@ -96,6 +96,17 @@ From the [0.9.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs
 The notes also say plainly that 0.9.0 isn't a production sign-off. Long-running playback
 stability is still being investigated.
 
+## Updating the Homebrew formula and Scoop manifest
+
+`Formula/outpace.rb` and `bucket/outpace.json` always point at the newest published release,
+because their checksums only exist once it's out. After publishing a release, a maintainer
+refreshes them and opens a PR:
+
+```bash
+gh release download vX.Y.Z --pattern SHA256SUMS --dir /tmp/sums
+python3 tools/release/package_manifests.py vX.Y.Z /tmp/sums/SHA256SUMS
+```
+
 ## Upgrading
 
 See [Deployment](Deployment#upgrades-and-rollback). In short:
