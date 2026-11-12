@@ -207,12 +207,16 @@ from observing real traffic:
 Every change passes rustfmt, Clippy with warnings denied, the offline test suite, and an
 identifier-hygiene check that keeps real content ids and infohashes out of the repository.
 
-Using AI to contribute is fine. Before you open an issue or pull request:
+AI-assisted contributions are welcome and supported here: the same agent rules the maintainer
+uses apply to yours. Two things are required:
 
-- run the tests and read what you're submitting;
-- be ready to explain it;
-- back protocol claims with evidence, such as a synthetic test vector or a reproducible run,
-  not a model's summary.
+- **Effort.** Generated code still has to be shaped, tested and trimmed. Run the tests, read the
+  diff, and back protocol claims with evidence, such as a synthetic test vector or a
+  reproducible run, not a model's summary.
+- **A human who understands it.** Whoever opens the issue or pull request must understand what
+  the change does and why, and be able to discuss it in review.
+
+Unreviewed, fully automated submissions will be closed.
 
 ## Build and contribute
 
