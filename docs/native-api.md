@@ -414,6 +414,10 @@ runs under the public-destination policy:
   multicast and unspecified addresses are refused. There is no operator override.
 - The connection is pinned to the checked address. System proxies, cookies and ambient
   authorization are not used.
+- Connections are reused only after that check. The relay keeps at most 16 HTTP/1
+  clients, keyed by origin authority *and* checked address, each with one idle
+  connection. Idle connections close after 15 seconds, clients retire after 60 seconds,
+  and a changed DNS answer retires the client pinned to the old address.
 - At most three redirects are followed, and HTTPS-to-HTTP redirects fail.
 - Each acquisition, including queueing, has a 30-second deadline.
 - Playlists are capped at 1 MiB, 16 KiB per line and 512 references; media responses at
@@ -440,6 +444,14 @@ Relay errors are plain-text codes with `no-store`:
 | `502` | `invalid_origin_playlist`, `origin_resource_limit`, fetch codes | The origin response was invalid, too large or failed |
 | `503` | `origin_capacity` | Viewer or admission limit reached |
 | `504` | `origin_timeout`, timeout fetch codes | Acquisition deadline |
+
+When the origin itself answers with an HTTP error, the relay still returns `502`. It
+adds `X-Outpace-Upstream-Status: <origin status>`, and the body is one of
+`origin_upstream_unauthorized` (401), `origin_upstream_forbidden` (403),
+`origin_upstream_not_found` (404), `origin_upstream_gone` (410),
+`origin_upstream_rate_limited` (429), `origin_upstream_unavailable` (503), or
+`origin_upstream_http_status` for any other status. No other origin header or body
+content, such as cookies, `Location` or error pages, is passed through.
 
 Encrypted keys, content steering, variable substitution, low-latency HLS
 (parts, preload hints, delta updates), `If-Range` and query-based playlist reloads are

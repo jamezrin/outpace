@@ -14,6 +14,8 @@ use tokio::sync::watch;
 
 mod resource;
 pub use resource::{open_playlist_resource, open_resource, ResourceEncoding, ResourceResponse};
+mod pool;
+pub use pool::ResourceClientPool;
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_HEADERS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -167,6 +169,8 @@ pub enum FetchError {
     HeadersTimeout,
     RedirectRejected,
     HttpStatus,
+    /// Status from a finite resource request. Never retains origin headers or body.
+    ResourceHttpStatus(u16),
     UnsupportedResponse,
     BodyFailed,
     BodyTimeout,
@@ -192,11 +196,20 @@ impl FetchError {
             Self::HeadersTimeout => "headers_timeout",
             Self::RedirectRejected => "redirect_rejected",
             Self::HttpStatus => "http_status",
+            Self::ResourceHttpStatus(_) => "resource_http_status",
             Self::UnsupportedResponse => "unsupported_response",
             Self::BodyFailed => "body_failed",
             Self::BodyTimeout => "body_timeout",
             Self::BodyFrameTooLarge => "body_frame_too_large",
             Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Only finite resource requests retain the upstream HTTP status.
+    pub const fn upstream_status(self) -> Option<u16> {
+        match self {
+            Self::ResourceHttpStatus(status) => Some(status),
+            _ => None,
         }
     }
 }
@@ -355,6 +368,8 @@ struct AttemptOptions {
     playlist: bool,
     range: Option<String>,
     deadline: Option<tokio::time::Instant>,
+    pool: Option<ResourceClientPool>,
+    policy: FetchPolicy,
     #[cfg(test)]
     tls_root: Option<Vec<u8>>,
 }
@@ -380,47 +395,21 @@ async fn open_pinned(
     if *cancel.borrow() {
         return Err(FetchError::Cancelled);
     }
-    // Preserve the existing provider selection and bundled roots. Never replace an
-    // embedding application's already-installed provider.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().map(|cert| {
-        reqwest::Certificate::from_der(cert.as_ref()).expect("bundled TLS root certificate")
-    });
-    let mut builder = reqwest::Client::builder()
-        .tls_certs_only(roots)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .referer(false)
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .no_zstd()
-        .pool_max_idle_per_host(0)
-        .connect_timeout(limits.connect_timeout)
-        .dns_resolver(Arc::new(NoFallbackDns))
-        .resolve(normalized_host(&url.0)?, addr);
-    if limits.source_response {
-        // Hyper 1.11.1 also retains its finite default 417,792-byte HTTP/1 parse
-        // buffer. The smaller parsed-byte acceptance bound is checked below.
-        builder = builder.http1_only().http1_max_headers(MAX_SOURCE_HEADERS);
-    } else {
-        // As before extraction, the transport request budget starts after DNS and
-        // remains active until the finite body has been collected.
-        builder = builder.timeout(limits.headers_timeout);
-    }
-    if options.resource {
-        builder =
-            builder.timeout(header_deadline.saturating_duration_since(tokio::time::Instant::now()));
-    }
+    let use_pool = options.resource && options.pool.is_some();
     #[cfg(test)]
-    if let Some(root) = options.tls_root {
-        builder =
-            builder
-                .tls_certs_only([reqwest::Certificate::from_der(&root)
-                    .map_err(|_| FetchError::ClientBuildFailed)?]);
-    }
-    let client = builder.build().map_err(|_| FetchError::ClientBuildFailed)?;
+    // Test trust overrides must never share a production-trust client.
+    let use_pool = use_pool && options.tls_root.is_none();
+    let client = if use_pool {
+        options.pool.as_ref().unwrap().client(
+            url,
+            addr,
+            options.policy,
+            limits.connect_timeout,
+            || build_client(url, addr, limits, &options, true),
+        )?
+    } else {
+        build_client(url, addr, limits, &options, false)?
+    };
     // Transport parsing historically accepts userinfo. Retain that admission surface,
     // but do not let reqwest translate it into URL-derived Authorization on the wire.
     let mut request_url = url.0.clone();
@@ -428,14 +417,18 @@ async fn open_pinned(
     let _ = request_url.set_password(None);
     let mut request = client.get(request_url);
     if options.resource {
-        request = request.header(
-            reqwest::header::ACCEPT_ENCODING,
-            if options.playlist {
-                "gzip, identity"
-            } else {
-                "identity"
-            },
-        );
+        // A pooled client cannot own a previous request's deadline. Keep the finite
+        // request/body timeout on each request, in addition to guarded read deadlines.
+        request = request
+            .timeout(header_deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .header(
+                reqwest::header::ACCEPT_ENCODING,
+                if options.playlist {
+                    "gzip, identity"
+                } else {
+                    "identity"
+                },
+            );
     }
     if let Some(range) = options.range.as_deref() {
         request = request.header(reqwest::header::RANGE, range);
@@ -466,6 +459,55 @@ async fn open_pinned(
         #[cfg(test)]
         frames: None,
     })
+}
+
+fn build_client(
+    url: &FetchUrl,
+    addr: SocketAddr,
+    limits: FetchLimits,
+    options: &AttemptOptions,
+    pooled: bool,
+) -> Result<reqwest::Client, FetchError> {
+    // Preserve the existing provider selection and bundled roots. Never replace an
+    // embedding application's already-installed provider.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().map(|cert| {
+        reqwest::Certificate::from_der(cert.as_ref()).expect("bundled TLS root certificate")
+    });
+    let mut builder = reqwest::Client::builder()
+        .tls_certs_only(roots)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .referer(false)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .pool_max_idle_per_host(usize::from(pooled))
+        .connect_timeout(limits.connect_timeout)
+        .dns_resolver(Arc::new(NoFallbackDns))
+        .resolve(normalized_host(&url.0)?, addr);
+    if pooled {
+        builder = builder.pool_idle_timeout(pool::IDLE_LIFETIME);
+    }
+    if limits.source_response || options.resource {
+        // Hyper 1.11.1 also retains its finite default 417,792-byte HTTP/1 parse
+        // buffer. The smaller parsed-byte acceptance bound is checked below.
+        builder = builder.http1_only().http1_max_headers(MAX_SOURCE_HEADERS);
+    } else {
+        // As before extraction, the transport request budget starts after DNS and
+        // remains active until the finite body has been collected.
+        builder = builder.timeout(limits.headers_timeout);
+    }
+    #[cfg(test)]
+    if let Some(root) = &options.tls_root {
+        builder =
+            builder
+                .tls_certs_only([reqwest::Certificate::from_der(root)
+                    .map_err(|_| FetchError::ClientBuildFailed)?]);
+    }
+    builder.build().map_err(|_| FetchError::ClientBuildFailed)
 }
 
 fn classify_open_error(error: reqwest::Error) -> FetchError {
@@ -650,6 +692,29 @@ pub(super) mod test_support {
         pub(crate) fn with_tls_root(mut self, root: Vec<u8>) -> Self {
             self.tls_root = Some(root);
             self
+        }
+
+        pub(crate) async fn resolve(
+            &self,
+            policy: FetchPolicy,
+            cancel: watch::Receiver<bool>,
+        ) -> Result<SocketAddr, FetchError> {
+            resolve_candidates(
+                async {
+                    if self.pending_dns {
+                        std::future::pending::<()>().await;
+                    }
+                    self.answers
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .map(Vec::into_iter)
+                        .ok_or(FetchError::DnsFailed)
+                },
+                policy,
+                cancel,
+            )
+            .await
         }
     }
 
