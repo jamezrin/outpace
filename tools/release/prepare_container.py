@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Verify the complete release archive set and copy only Linux executables."""
+"""Verify a release's checksummed assets and copy only the container's Linux executables.
+
+Only the archives in LINUX are required, because only they go into the image. Every asset
+listed in SHA256SUMS must exist and match, so a tampered or missing archive still fails.
+Other release assets (new targets, packages, best-effort uploads) are never opened, which
+keeps adding a release target from breaking container publication, and lets this tooling
+republish images for older releases with a smaller target set.
+"""
 import argparse
 import hashlib
 from pathlib import Path
 import re
 import tarfile
 
-TARGETS = {
-    "x86_64-unknown-linux-musl": "tar.gz",
-    "aarch64-unknown-linux-musl": "tar.gz",
-    "armv7-unknown-linux-musleabihf": "tar.gz",
-    "x86_64-apple-darwin": "tar.gz",
-    "aarch64-apple-darwin": "tar.gz",
-    "x86_64-pc-windows-msvc": "zip",
-    "aarch64-pc-windows-msvc": "zip",
-    "x86_64-unknown-freebsd": "tar.gz",
-}
 LINUX = {
     "x86_64-unknown-linux-musl": "amd64",
     "aarch64-unknown-linux-musl": "arm64",
@@ -27,17 +24,19 @@ def prepare(tag: str, assets: Path, output: Path) -> None:
     if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag):
         raise ValueError("Expected a stable release tag vX.Y.Z")
     version = tag[1:]
-    expected = {f"outpace-{version}-{target}.{ext}" for target, ext in TARGETS.items()}
-    if {p.name for p in assets.iterdir()} != expected | {"SHA256SUMS"}:
-        raise ValueError("Release must contain exactly every expected archive and SHA256SUMS")
+    required = {f"outpace-{version}-{target}.tar.gz" for target in LINUX}
+    sums = assets / "SHA256SUMS"
+    if sums.is_symlink() or not sums.is_file():
+        raise ValueError("Release must contain a regular SHA256SUMS file")
     checksums = {}
-    for line in (assets / "SHA256SUMS").read_text().splitlines():
+    for line in sums.read_text().splitlines():
         match = re.fullmatch(r"([0-9a-f]{64})  (outpace-[^/\\\s]+)", line)
         if not match or match[2] in checksums:
             raise ValueError("Invalid or duplicate checksum entry")
         checksums[match[2]] = match[1]
-    if set(checksums) != expected:
-        raise ValueError("Checksums must cover exactly every expected archive")
+    missing = sorted(required - set(checksums))
+    if missing:
+        raise ValueError(f"Checksums must cover every container archive: missing {missing}")
     for name, digest in checksums.items():
         archive = assets / name
         if archive.is_symlink() or not archive.is_file():

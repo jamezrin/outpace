@@ -26,6 +26,7 @@ fn private_state_with_descriptors(
         resolve_content_ids_in_getstream: true,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     }

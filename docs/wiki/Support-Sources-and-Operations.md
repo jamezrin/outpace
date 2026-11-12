@@ -81,10 +81,56 @@ None of these start a stream. Use them for monitoring, never a playback URL.
 | `GET /support` | Support-source states. | edge |
 | `GET /network-policy` | Public or private peer mode and allowlist size. | edge |
 | `GET /debug/memstats` | Allocator counters (live heap, resident) on 64-bit Linux and macOS builds. | all |
+| `GET /metrics` | Prometheus text metrics. Only when `OUTPACE_METRICS=1`, otherwise `404`. | all |
 | `GET /server/api?method=get_status` | `dl` or `idle`, plus `active_sessions`, `occupied_sessions` and `max_sessions`. Needs compat on. | all |
 | `GET /server/api?method=get_version` | Outpace version. Needs compat on. | all |
 
 The provided Compose file health-checks `/healthz` every 10 seconds.
+
+### Prometheus metrics
+
+Set `OUTPACE_METRICS=1` to serve `GET /metrics` in the Prometheus text format on the normal HTTP
+bind. It is off by default. The endpoint has no authentication, so keep `OUTPACE_BIND` on a
+trusted network or put it behind your reverse proxy.
+
+```yaml
+scrape_configs:
+  - job_name: outpace
+    static_configs:
+      - targets: ["outpace:6878"]
+```
+
+Labels never contain content ids, infohashes, stream or broadcast names. Per-stream values are
+summed for each provider network, and HTTP series use the route template (for example
+`/streams/{network}/{id}/status`), not the requested path.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `outpace_build_info{version}` | gauge | Always `1`, labelled with the running version. |
+| `outpace_uptime_seconds` | gauge | Seconds since the HTTP server started. |
+| `outpace_allocator_bytes{kind}` | gauge | jemalloc `allocated`, `active`, `resident`, `retained`, `mapped`. Absent on builds without jemalloc. |
+| `outpace_admission_occupied` | gauge | Admitted sources, including pending opens. |
+| `outpace_admission_limit` | gauge | `OUTPACE_MAX_SESSIONS`. Absent when unlimited. |
+| `outpace_sessions{network}` | gauge | Active stream sessions. |
+| `outpace_subscribers{network}` | gauge | Clients attached to those sessions. |
+| `outpace_peers{network}` | gauge | Connected swarm peers. |
+| `outpace_peers_served{network}` | gauge | Distinct peers served at least one chunk. |
+| `outpace_active_upstreams{network}` | gauge | Peers currently admitted as download upstreams. |
+| `outpace_download_bytes_per_second{network}` | gauge | Download rate. |
+| `outpace_upload_bytes_per_second{network}` | gauge | Upload rate. |
+| `outpace_session_downloaded_bytes{network}` | gauge | Bytes downloaded by active sessions. |
+| `outpace_session_uploaded_bytes{network}` | gauge | Bytes uploaded by active sessions. |
+| `outpace_session_upstream_reconnects{network}` | gauge | Upstream reconnects in active sessions. |
+| `outpace_session_stale_teardowns{network}` | gauge | Stale upstream teardowns in active sessions. |
+| `outpace_session_skipped_evicted_gaps{network}` | gauge | Evicted gaps skipped in active sessions. |
+| `outpace_session_signature_rejects{network}` | gauge | Chunks rejected for bad signatures in active sessions. |
+| `outpace_http_requests_total{route,method,status}` | counter | HTTP requests that matched a route. Methods outside the standard set are reported as `other`. |
+| `outpace_http_response_header_seconds_total{route,method,status}` | counter | Total time until response headers were sent. |
+
+The `outpace_session_*` values only cover sessions that are still running, so they go down when a
+stream stops. Treat them as gauges, not as process-lifetime counters. For streamed responses
+(MPEG-TS, HLS segments) the HTTP timing stops at the response headers, not at the end of the
+transfer. Divide it by `outpace_http_requests_total` for the mean.
 
 ### Session occupancy
 

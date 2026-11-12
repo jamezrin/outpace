@@ -70,9 +70,9 @@ What it isn't:
 
 - It doesn't play premium or encrypted content.
 - It has no accounts, EPG or web UI.
-- Stream-name search is not available yet. A separate, default-off AceStream services adapter
-  is [planned in this repository](https://github.com/jamezrin/outpace-stream/issues/406);
-  see [search scope and prerequisites](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search).
+- Stream-name search is a separate, default-off external services adapter. No
+  operator API key is needed. It is newer than v0.9.0; see
+  [search setup and limits](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search).
 - The compatible API is a subset, not full parity with the official engine.
 
 See [differences from the official engine](https://github.com/jamezrin/outpace-stream/wiki/Migrating-from-AceStream-Engine#whats-different).

@@ -75,6 +75,7 @@ fn ace_app_state(
         resolve_content_ids_in_getstream,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     }
@@ -1686,4 +1687,92 @@ async fn protection_refusals_never_mint_compat_leases_even_with_fallback() {
             assert!(!body.to_string().contains(key));
         }
     }
+}
+
+#[tokio::test]
+async fn search_selection_plays_verified_synthetic_media_with_explicit_infohash() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        panic!("IPv4 fixture")
+    };
+    let (transport, auth) = synthetic_transport_with_auth(524_288);
+    let info = stream_info_from_transport(&transport).unwrap();
+    let hash = ace_swarm::resolve::infohash_hex(&info.infohash);
+    let seeds = SeedRegistry::new();
+    // This fixture is the trusted local-origin namespace, not search metadata.
+    let (_store, _lease) = seeds.lease_broadcast(
+        info.infohash,
+        transport_file_hash(&transport),
+        transport,
+        || ace_swarm::store::PieceStore::new(524_288, 16_384, 2 * 1_048_576),
+    );
+    let policy =
+        ace_swarm::peer_policy::PeerPolicy::from_private_peers(Some(&addr.to_string())).unwrap();
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
+        .with_peer_policy(policy)
+        .with_seed_registry(seeds)
+        .with_bootstrap_peers(vec![addr])
+        .with_live_recovery(LiveRecoveryConfig {
+            max_active_upstreams: 1,
+            max_parallel_connect: 1,
+            ..Default::default()
+        })
+        .with_startup_buffer(StartupBufferConfig {
+            target_ms: 0,
+            ..Default::default()
+        });
+    let mut state = ace_state(provider, true);
+    state.experimental_ace_compat = false;
+    state.search=Some(crate::acestream_search::offline_service(Ok(serde_json::to_vec(&json!({"total":1,"time":0.0,"results":[{"name":"Synthetic Live","items":[{"n":"Synthetic Live","i":hash}]}]})).unwrap())));
+    let manager = state.manager.clone();
+    let app = router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/search?query=Synthetic")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: serde_json::Value =
+        serde_json::from_slice(&response_bytes(response).await).unwrap();
+    let selected = result["result"]["results"][0]["items"][0]["infohash"]
+        .as_str()
+        .unwrap();
+    assert_eq!(selected, hash);
+    assert!(result["result"]["results"][0]["items"][0]
+        .get("content_id")
+        .is_none());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server = tokio::spawn(serve_media_peer(
+        listener,
+        super::FIXTURE.to_vec(),
+        auth,
+        accepted.clone(),
+    ));
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        let response = app
+            .oneshot(
+                Request::get(format!("/streams/ace/ih:{selected}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        body.next()
+            .await
+            .expect("verified media must arrive")
+            .unwrap()
+    })
+    .await;
+    manager.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    let media = outcome.expect("synthetic search-to-playback exceeded watchdog");
+    assert_valid_fixture_ts(&media);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }

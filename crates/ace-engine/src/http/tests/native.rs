@@ -891,6 +891,7 @@ fn ace_provider_state() -> AppState {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     }
