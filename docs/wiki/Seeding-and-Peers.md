@@ -22,7 +22,6 @@ OUTPACE_ENABLE_SEEDING=0
 Why stay a full participant:
 
 - streams you watch get healthier, which benefits everyone;
-- swarms tend to treat peers that upload better;
 - [broadcasts](Broadcasting) and [support sources](Support-Sources-and-Operations) need it.
 
 Why you might not:

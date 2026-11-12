@@ -5,6 +5,9 @@ streaming path. It joins Acestream swarms, pulls MPEG-TS media, and exposes the
 result through a native daemon API, HLS, and CLI commands that work with players
 such as VLC and downstream tools such as Jellyfin or dispatcharr.
 
+**Documentation:** the [user wiki](https://github.com/jamezrin/outpace-stream/wiki) covers
+installation, configuration, playback, broadcasting, deployment and troubleshooting.
+
 The project does not use closed-source engine blobs at runtime. Reverse-engineering
 fixtures, protocol captures, and reference binaries are kept under git-ignored
 `re/` and `references/` directories when present on a development machine.
@@ -303,7 +306,7 @@ Available targets:
 Install a prebuilt Unix binary:
 
 ```bash
-version=0.1.0
+version=0.9.0
 target=x86_64-unknown-linux-musl
 artifact="outpace-${version}-${target}.tar.gz"
 curl -LO "https://github.com/jamezrin/outpace/releases/download/v${version}/${artifact}"
@@ -319,11 +322,11 @@ Run the published container image:
 
 ```bash
 docker run --rm \
-  -p 6878:6878 \
-  -p 1935:1935 \
+  -p 127.0.0.1:6878:6878 \
+  -p 127.0.0.1:1935:1935 \
   -p 8621:8621/tcp \
   -v outpace-data:/var/lib/outpace \
-  ghcr.io/jamezrin/outpace:0.1.0
+  ghcr.io/jamezrin/outpace:0.9.0
 ```
 
 The container defaults to `outpace serve`. It sets `OUTPACE_BIND=0.0.0.0:6878`,
