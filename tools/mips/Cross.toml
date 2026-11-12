@@ -1,0 +1,4 @@
+# cross configuration for the best-effort MIPS builds (tools/mips/build.sh).
+# MIPS is tier 3 since Rust 1.72: there is no prebuilt std, so build it.
+[build]
+build-std = true

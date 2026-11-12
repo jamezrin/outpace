@@ -21,9 +21,10 @@
 //! map). The engine only creates one when `enable_inbound` is on; with inbound off nothing
 //! holds a monitor, so harvesting and counting are entirely absent (see issue #22 task 5).
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Aggregates `yourip` observations and counts inbound peers. Cheap to share (`Arc`) across the

@@ -10,9 +10,10 @@ use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingEx
 use ace_wire::identity::Identity;
 use ace_wire::live_codec::{live_bitfield, live_have};
 use ace_wire::message::PeerMessage;
+use portable_atomic::AtomicU64;
 use protocol::{prepare_reply, ServeProfile};
 use std::collections::HashMap as StdHashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncRead, AsyncWrite};

@@ -1171,9 +1171,10 @@ pub(crate) async fn test_output_pump<R: AsyncRead + Unpin, O: ProcessOutput>(
 #[allow(dead_code)]
 pub(crate) mod test_support {
     use super::*;
+    use portable_atomic::AtomicU64;
     use std::collections::HashMap;
     use std::process::{Command as StdCommand, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
     type FakeFactory = Mutex<HashMap<PathBuf, (ChildMode, Arc<Mutex<TestCounters>>)>>;
     static FACTORIES: OnceLock<FakeFactory> = OnceLock::new();

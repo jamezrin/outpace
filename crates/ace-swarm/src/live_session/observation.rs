@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 /// Position and active coverage published by the follower.

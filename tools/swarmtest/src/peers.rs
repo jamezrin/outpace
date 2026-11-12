@@ -6,7 +6,8 @@
 //! async methods that actually speak HTTP are thin wrappers over them and are exercised
 //! only by a live docker run.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -18,6 +18,8 @@ default = []
 srt = ["dep:cc", "dep:shlex"]
 
 [dependencies]
+# 64-bit atomics that also build on targets without native ones (32-bit MIPS).
+portable-atomic = "1"
 ace-log = { path = "../ace-log" }
 ace-wire = { path = "../ace-wire" }
 ace-media = { path = "../ace-media" }

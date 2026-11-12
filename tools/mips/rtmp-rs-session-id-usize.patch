@@ -1,0 +1,38 @@
+--- a/src/server/listener.rs
++++ b/src/server/listener.rs
+@@ -3,7 +3,7 @@
+ //! Handles TCP accept loop and spawns connection handlers.
+ 
+ use std::net::SocketAddr;
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::Arc;
+ 
+ use tokio::net::{TcpListener, TcpStream};
+@@ -20,7 +20,7 @@
+     config: ServerConfig,
+     handler: Arc<H>,
+     registry: Arc<StreamRegistry>,
+-    next_session_id: AtomicU64,
++    next_session_id: AtomicUsize,
+     connection_semaphore: Option<Arc<Semaphore>>,
+ }
+ 
+@@ -46,7 +46,7 @@
+             config,
+             handler: Arc::new(handler),
+             registry: Arc::new(StreamRegistry::with_config(registry_config)),
+-            next_session_id: AtomicU64::new(1),
++            next_session_id: AtomicUsize::new(1),
+             connection_semaphore,
+         }
+     }
+@@ -131,7 +131,7 @@
+         };
+ 
+         // Generate session ID
+-        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
++        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed) as u64;
+ 
+         tracing::debug!(
+             session_id = session_id,

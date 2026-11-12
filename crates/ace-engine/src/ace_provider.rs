@@ -67,12 +67,13 @@ use ace_wire::message::PeerMessage;
 use ace_wire::reassembly::PieceReassembler;
 use async_trait::async_trait;
 use bytes::Bytes;
+use portable_atomic::AtomicU64;
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::future::Future;
 use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(test)]
@@ -220,7 +221,8 @@ pub(crate) fn build_piece_store(
 /// prefix aids operators; the monotonic suffix guarantees a fresh directory per store instance so
 /// a stale store's `Drop` can never delete a re-created same-infohash store's data.
 fn disk_store_subdir(infohash: &[u8; 20]) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     static GENERATION: AtomicU64 = AtomicU64::new(0);
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     format!("{}-{generation}", infohash_hex(infohash))

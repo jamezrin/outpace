@@ -187,3 +187,62 @@ jobs:
     uses: ./.github/workflows/publish-container.yml
     with:
       tag: ${{ github.ref_name }}
+
+  best-effort-mips:
+    # Tier-3 MIPS builds (nightly, -Zbuild-std; see tools/mips/build.sh). They run only after
+    # the release and its container image exist, so a MIPS failure can never block either,
+    # and their archives are not in SHA256SUMS: each gets its own .sha256 file.
+    name: Best-effort ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    needs:
+      - release-metadata
+      - publish-container
+    continue-on-error: true
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [mips-unknown-linux-musl, mipsel-unknown-linux-musl]
+    env:
+      MIPS_TOOLCHAIN: nightly-2026-11-01
+      CROSS_VERSION: 0.2.5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned stable toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+          build-warnings: ""
+
+      - name: Install nightly with rust-src
+        run: rustup toolchain install "$MIPS_TOOLCHAIN" --profile minimal --component rust-src
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@${{ env.CROSS_VERSION }}
+
+      - name: Build
+        run: tools/mips/build.sh "${{ matrix.target }}"
+
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="${BIN_NAME}-${VERSION}-${TARGET}"
+          mkdir -p "dist/${name}"
+          cp "target/${TARGET}/release/${BIN_NAME}" LICENSE README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          gh release upload "$GITHUB_REF_NAME" "dist/${name}.tar.gz" "dist/${name}.tar.gz.sha256" \
+            --repo "$GITHUB_REPOSITORY"

@@ -11,6 +11,8 @@ name = "swarmtest"
 path = "src/main.rs"
 
 [dependencies]
+# 64-bit atomics that also build on targets without native ones (32-bit MIPS).
+portable-atomic = "1"
 ace-wire = { path = "../../crates/ace-wire" }
 ace-tracker = { path = "../../crates/ace-tracker" }
 tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,7 @@
+# 32-bit MIPS has no native 64-bit atomics, so std's AtomicU64/AtomicI64 do not exist there.
+# portable_atomic's types have the same API and compile to the native instructions wherever
+# they exist.
+disallowed-types = [
+    { path = "std::sync::atomic::AtomicU64", reason = "use portable_atomic::AtomicU64 so 32-bit MIPS builds" },
+    { path = "std::sync::atomic::AtomicI64", reason = "use portable_atomic::AtomicI64 so 32-bit MIPS builds" },
+]

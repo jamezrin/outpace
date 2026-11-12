@@ -706,7 +706,7 @@ mod secure {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static NEXT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
             let temp = format!(
                 ".recent-peers-{}-{}",
                 std::process::id(),
@@ -897,7 +897,7 @@ mod tests {
         }
     }
     fn temp() -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static NEXT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
             "outpace-warm-file-{}-{}",
             std::process::id(),

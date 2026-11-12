@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# 64-bit atomics that also build on targets without native ones (32-bit MIPS).
+portable-atomic = "1"
 ace-media = { path = "../ace-media" }
 ace-log = { path = "../ace-log" }
 ace-wire = { path = "../ace-wire" }

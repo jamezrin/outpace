@@ -48,6 +48,30 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
 
+### MIPS routers (best-effort)
+
+From the next release, most OpenWrt routers get a best-effort build: `mipsel-unknown-linux-musl`
+for little-endian chips such as MT7621 (`mipsel_24kc`), and `mips-unknown-linux-musl` for
+big-endian chips such as ath79 (`mips_24kc`).
+
+- **Best-effort** means that Rust's MIPS support is tier 3. These builds use a nightly compiler
+  and are uploaded after the rest of the release. If one fails, that release has no MIPS archive.
+- They aren't covered by `SHA256SUMS`. Each archive has its own `<archive>.sha256` file instead.
+- They link against the soft-float musl (`/lib/ld-musl-mips{,el}-sf.so.1`) and `libgcc_s` that
+  OpenWrt already ships. They are not fully static, so they may not run on other MIPS Linux
+  systems.
+- Routers have little RAM. Start with the small-device settings below, and give Outpace a disk
+  cache on USB storage rather than in RAM.
+
+```bash
+version=X.Y.Z   # a release newer than v0.9.0
+target=mipsel-unknown-linux-musl
+artifact="outpace-${version}-${target}.tar.gz"
+base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
+curl -LO "${base}/${artifact}" && curl -LO "${base}/${artifact}.sha256"
+sha256sum -c "${artifact}.sha256" && tar -xzf "$artifact"
+```
+
 ### ARMv7 and small devices
 
 ARMv7 builds cover hard-float ARMv7 Linux (Raspberry Pi 2/3, older NAS boxes). ARMv6 and

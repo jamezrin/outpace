@@ -9,10 +9,8 @@ use ace_wire::extended::{LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::Handshake;
 use ace_wire::identity::{verify_handshake, Identity};
 use ace_wire::message::PeerMessage;
-use std::sync::{
-    atomic::{AtomicU32, AtomicU64},
-    Arc,
-};
+use portable_atomic::AtomicU64;
+use std::sync::{atomic::AtomicU32, Arc};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

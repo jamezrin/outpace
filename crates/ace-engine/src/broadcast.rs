@@ -15,11 +15,12 @@ use ace_wire::bencode::Bencode;
 use ace_wire::infohash::{infohash_of_descriptor, infohash_of_transport, transport_file_hash};
 use ace_wire::live_auth::LiveSourceAuth;
 use ace_wire::transport::{decode_transport, encode_transport, TransportDescriptor};
+use portable_atomic::AtomicU64;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{watch, Mutex, OwnedMutexGuard};
@@ -804,7 +805,7 @@ impl BroadcastRegistry {
         bc.cursor.check()?;
         let generation = self
             .next_generation
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
                 generation.checked_add(1)
             })
             .map_err(|_| BroadcastError::StateInvalid)?;

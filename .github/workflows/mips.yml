@@ -1,0 +1,66 @@
+name: MIPS best-effort
+
+# 32-bit MIPS (most OpenWrt routers) is a tier-3 Rust target: it needs nightly and
+# -Zbuild-std, so it is checked here instead of in the stable release matrix. Failures are
+# visible but this check is not required, and release.yml uploads MIPS archives only after
+# the release and its container image are already published.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/mips.yml
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - clippy.toml
+      - tools/mips/**
+      - tools/ci/smoke_daemon.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in step with the MIPS_TOOLCHAIN default in tools/mips/build.sh.
+  MIPS_TOOLCHAIN: nightly-2026-11-01
+  CROSS_VERSION: 0.2.5
+
+jobs:
+  mips:
+    name: Build and smoke ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [mips-unknown-linux-musl, mipsel-unknown-linux-musl]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned stable toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+          build-warnings: ""
+
+      - name: Install nightly with rust-src
+        run: rustup toolchain install "$MIPS_TOOLCHAIN" --profile minimal --component rust-src
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@${{ env.CROSS_VERSION }}
+
+      - name: Install qemu-user
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
+
+      - name: Build
+        run: tools/mips/build.sh "${{ matrix.target }}"
+
+      - name: Start emulated daemon and check health
+        env:
+          CROSS_IMAGE_TAG: ${{ env.CROSS_VERSION }}
+        run: tools/mips/smoke.sh "${{ matrix.target }}"

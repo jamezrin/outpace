@@ -264,7 +264,8 @@ fn read_descriptor(_: &std::path::Path) -> Result<Vec<u8>, LocalDescriptorError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     struct Fixture(std::path::PathBuf);
     impl Fixture {

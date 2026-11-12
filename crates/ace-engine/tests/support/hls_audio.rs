@@ -253,7 +253,8 @@ pub fn require_synthetic_tools() -> Result<SyntheticTools, String> {
 }
 
 pub fn generate_case(tools: &SyntheticTools, case: AudioCase) -> Result<SyntheticCase, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "outpace-hls-audio-{}-{}",

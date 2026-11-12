@@ -1,7 +1,8 @@
 //! Small, independently readable live metrics. No source lock is held by readers.
 use crate::provider::{LivePositionStats, SourceStats, StatsReader};
+use portable_atomic::AtomicU64;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;

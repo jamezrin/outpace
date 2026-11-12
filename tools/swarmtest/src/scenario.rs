@@ -9,10 +9,11 @@
 //! guarded by [`check_docker_available`]. It never fabricates success: with no docker it
 //! fails loudly and early.
 
+use portable_atomic::AtomicU64;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 

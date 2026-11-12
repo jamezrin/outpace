@@ -23,6 +23,7 @@ dependencies = [
  "futures",
  "hex",
  "libc",
+ "portable-atomic",
  "rand",
  "rtmp-rs",
  "serde",
@@ -82,6 +83,7 @@ dependencies = [
  "hyper",
  "igd-next",
  "libc",
+ "portable-atomic",
  "rand",
  "reqwest",
  "roxmltree",
@@ -1433,6 +1435,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1987,6 +1995,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "portable-atomic",
  "rand",
  "reqwest",
  "rustls",
