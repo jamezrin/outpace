@@ -482,13 +482,15 @@ Environment variables parsed by the daemon include:
   at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. If the startup segment count is not reached, the
   request returns a retryable HTTP `503` at the deadline.
 - `OUTPACE_HISTORY_SECONDS` - retained live-HLS replay (timeshift) span, default `0` (disabled),
-  max `3600`. Only active native HLS packagers retain history; it is in-memory, ends with its
-  packager, and is not a persistent or UTC-indexed archive. Retention obeys elapsed time,
+  max `3600`. Active native HLS packagers retain history, and with `OUTPACE_MANAGED_HLS=1` so do
+  eligible managed origin-HLS TS viewers. It is in-memory, ends with its packager or viewer, and is
+  not a persistent or UTC-indexed archive. Retention obeys elapsed time,
   accepted media duration, both byte budgets and a 4096-segment cap; the first limit wins.
 - `OUTPACE_HISTORY_BYTES` - retained-history backing-allocation budget per HLS source, default
   `134217728` (128 MiB). Must be at least `188` and within the target's safe in-memory pool
   limit. At 8 Mbit/s, 128 MiB holds roughly two minutes.
-- `OUTPACE_HISTORY_TOTAL_BYTES` - retained-history budget shared by all HLS sources, default
+- `OUTPACE_HISTORY_TOTAL_BYTES` - retained-history budget shared by all HLS sources and managed
+  origin viewers, default
   `268435456` (256 MiB). Must be at least `OUTPACE_HISTORY_BYTES`. This bounds history only, not
   total process memory. See [timeshift](docs/timeshift.md) for the per-viewer seek and
   return-to-live controls.
@@ -535,7 +537,8 @@ Environment variables parsed by the daemon include:
   bounded local relay, default off. Accepts exactly `1`, `true`, `0`, or `false`; anything
   else fails startup. Off, playback routes redirect the player straight to the origin. On,
   the daemon itself fetches origin playlists and media (public destinations only, with DNS
-  pinning, deadlines and byte limits). See [origin HLS](docs/native-api.md#origin-hls).
+  pinning, deadlines and byte limits). With `OUTPACE_HISTORY_SECONDS` also set, qualifying TS
+  origins gain bounded replay. See [origin HLS](docs/native-api.md#origin-hls).
 - `OUTPACE_ACE_COMPAT` - enables the supported Ace HTTP subset, default off. Accepts
   exactly `1`, `true`, `0`, or `false`. A present value takes precedence over the legacy
   alias, including `0`/`false`; an empty, malformed, or non-Unicode selected value fails

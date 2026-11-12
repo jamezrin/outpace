@@ -40,6 +40,8 @@ hex = "0.4"
 libc = "0.2"
 # Bounded decoding of gzip-encoded origin playlists only (see origin_hls/compression.rs).
 flate2 = "1"
+# Origin playlist reload fingerprints (already a dependency of ace-wire).
+sha2 = "0.11"
 
 # jemalloc is the default global allocator on 64-bit non-MSVC targets (see main.rs). 32-bit targets
 # (e.g. armv7) are excluded: jemalloc's 64-bit `ffs` helper needs a `__ffsdi2` builtin that fails to

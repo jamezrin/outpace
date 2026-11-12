@@ -146,6 +146,61 @@ async fn server_api_get_media_files_for_a_magnet_reports_live_mpeg_ts() {
 }
 
 #[tokio::test]
+async fn pinned_android_get_builder_repeats_equal_descriptor_fields_on_both_routes() {
+    // Android core 3798163 initEngineSession includes getQueryString() in its
+    // format string and appends it again in the GET branch (lines 2823-2903).
+    // SDK 65a6e53 getQueryString also includes an optional descriptor cache key.
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    for path in ["/ace/getstream", "/ace/manifest.m3u8"] {
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let descriptor = format!("infohash={id}&transport_file_cache_key=synthetic-key");
+        let query = format!("format=json&sid=synthetic-player&_idx=0&stream_id=-1&{descriptor}&client_session_id=1&use_timeshift=0&{descriptor}");
+        let (status, json) = control_api_json(state.clone(), path, &query).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(json["error"], serde_json::Value::Null, "{path}");
+        assert!(json["response"]["playback_url"].is_string(), "{path}");
+        state.manager.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn only_equal_decoded_sdk_source_fields_may_repeat() {
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    for query in [
+        format!("infohash={id}&%69nfohash=%30{}", &id[1..]),
+        format!("content_id={id}&content_id={id}"),
+        "url=https%3A%2F%2Fexample.test%2Fsynthetic%3Fsig%3Da%252Fb%2Bc&url=https%3A%2F%2Fexample.test%2Fsynthetic%3Fsig%3Da%252Fb%2Bc".to_owned(),
+        format!("magnet=magnet%3A%3Fxt%3Durn%3Abtih%3A{id}&magnet=magnet%3A%3Fxt%3Durn%3Abtih%3A{id}"),
+    ] {
+        let (_, json) = control_api_json(ace_compat_state(0), "/ace/getstream", &format!("format=json&{query}")).await;
+        assert_eq!(json["error"], serde_json::Value::Null);
+    }
+    for duplicate in [
+        "content_id=a&content_id=b",
+        "url=https%3A%2F%2Fexample.test%2Fa&url=https%3A%2F%2Fexample.test%2Fb",
+        "transport_file_cache_key=a&transport_file_cache_key=b",
+        "format=json&format=json",
+        "_idx=0&_idx=0",
+        "stream_id=-1&stream_id=-1",
+        "generation=1&generation=1",
+        "method=get_status&method=get_status",
+        "id=a&id=a",
+    ] {
+        for path in ["/ace/getstream", "/ace/manifest.m3u8", "/server/api"] {
+            let state = ace_compat_state(0);
+            let (_, json) =
+                control_api_json(state.clone(), path, &format!("infohash={id}&{duplicate}")).await;
+            assert_eq!(
+                json["error"], "duplicate query parameter",
+                "{path}: {duplicate}"
+            );
+            assert_eq!(state.ace_sessions.active_count(), 0);
+            assert!(state.manager.list().await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn server_api_get_network_connection_status_reports_connected() {
     let (_, json) =
         server_api_json(ace_compat_state(0), "method=get_network_connection_status").await;

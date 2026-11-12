@@ -348,6 +348,11 @@ impl VideoAccessPointState {
         self.service_name.is_some()
     }
 
+    /// Selected video PID from the currently validated PAT/PMT, if known.
+    pub fn video_pid(&self) -> Option<u16> {
+        self.video_pid
+    }
+
     pub fn reset(&mut self) {
         let name = self.service_name.take();
         let allow_mpeg2 = self.allow_mpeg2;

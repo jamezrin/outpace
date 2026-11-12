@@ -62,6 +62,26 @@ fn relay() -> Arc<OriginHls> {
         allow_non_global: true,
     })
 }
+fn history_relay() -> Arc<OriginHls> {
+    let config = HlsHistoryConfig {
+        max_seconds: 60,
+        max_bytes: 2 * 1024 * 1024,
+        global_max_bytes: 4 * 1024 * 1024,
+    };
+    OriginHls::new_with_history(
+        FetchPolicy {
+            allow_non_global: true,
+        },
+        config,
+        HistoryBudget::new(config.global_max_bytes),
+    )
+}
+fn recorded_ts() -> Bytes {
+    Bytes::from_static(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/vectors/media/h264-keyframes.ts"
+    )))
+}
 fn token(playback: &OriginPlayback) -> &str {
     playback.stop_url.rsplit('/').next().unwrap()
 }
@@ -298,14 +318,166 @@ async fn identical_reload_and_sliding_overlap_preserve_media_and_map_urls() {
 
 #[tokio::test]
 async fn refresh_prevents_older_inflight_body_from_repopulating_the_cache() {
+    inflight_body_during_refresh(true).await;
+}
+
+#[tokio::test]
+async fn discontinuity_slide_preserves_map_range_identity_but_rollback_restarts_it() {
+    let relay = relay();
+    let playback = relay
+        .start("https://example.invalid/playlist")
+        .await
+        .unwrap();
+    let session = relay
+        .sessions
+        .lock()
+        .unwrap()
+        .get(token(&playback))
+        .cloned()
+        .unwrap();
+    let base = FetchUrl::parse_source("https://example.invalid/playlist", relay.policy).unwrap();
+    let first = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:7\n#EXT-X-MAP:URI=\"file.mp4\",BYTERANGE=\"4@0\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:4@4\nfile.mp4\n#EXT-X-DISCONTINUITY\n#EXTINF:1,\n#EXT-X-BYTERANGE:4\nfile.mp4\n";
+    let original = relay
+        .rewrite(token(&playback), &session, 0, &base, first)
+        .unwrap();
+    let slide = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:11\n#EXT-X-DISCONTINUITY-SEQUENCE:8\n#EXT-X-MAP:URI=\"file.mp4\",BYTERANGE=\"4@0\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:4@8\nfile.mp4\n#EXTINF:1,\n#EXT-X-BYTERANGE:4\nfile.mp4\n";
+    let advanced = relay
+        .rewrite(token(&playback), &session, 0, &base, slide)
+        .unwrap();
+    assert_eq!(uris(&original), uris(&advanced));
+    assert_eq!(
+        session.inner.lock().unwrap().resources[&0].playlist.epoch,
+        0
+    );
+    let map = |body: &Bytes| {
+        std::str::from_utf8(body)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-MAP:"))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(map(&original), map(&advanced));
+    let mut previous = advanced;
+    for (media_sequence, tag, expected_base, epoch) in [
+        (12, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n", 1, 1),
+        (13, "", 0, 2),
+    ] {
+        let source = format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n{tag}#EXT-X-MAP:URI=\"file.mp4\",BYTERANGE=\"4@0\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:4@8\nfile.mp4\n");
+        let restarted = relay
+            .rewrite(token(&playback), &session, 0, &base, source.as_bytes())
+            .unwrap();
+        assert_ne!(uris(&previous)[0], uris(&restarted)[0]);
+        assert_ne!(map(&previous), map(&restarted));
+        assert!(map(&restarted).contains(&uris(&restarted)[0]));
+        assert_eq!(
+            relay
+                .rewrite(token(&playback), &session, 0, &base, source.as_bytes())
+                .unwrap(),
+            restarted
+        );
+        {
+            let inner = session.inner.lock().unwrap();
+            assert_eq!(inner.resources[&0].playlist.epoch, epoch);
+            assert_eq!(
+                inner.resources[&0].playlist.discontinuity_sequence,
+                Some(expected_base)
+            );
+            assert!(inner
+                .resources
+                .contains_key(&numeric_id(&uris(&previous)[0])));
+        }
+        previous = restarted;
+    }
+}
+
+#[tokio::test]
+async fn discontinuity_rollback_isolates_inflight_and_cached_media_from_new_epoch() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let notify = started.clone();
+    let unblock = release.clone();
+    let playlists = AtomicUsize::new(0);
+    let reads = AtomicUsize::new(0);
+    let origin = Fixture::new(move |path, _| {
+        if path == "/playlist" {
+            return if playlists.fetch_add(1, Ordering::SeqCst) == 0 {
+                manifest("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:7\n#EXTINF:1,\nsegment.ts\n")
+            } else {
+                manifest("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:11\n#EXT-X-DISCONTINUITY-SEQUENCE:0\n#EXTINF:1,\nsegment.ts\n")
+            };
+        }
+        if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            notify.notify_one();
+            let unblock = unblock.clone();
+            return Response::builder()
+                .header(axum::http::header::CACHE_CONTROL, "max-age=30")
+                .body(Body::from_stream(futures::stream::once(async move {
+                    unblock.notified().await;
+                    Ok::<_, std::io::Error>(Bytes::from_static(b"before restart"))
+                }))).unwrap();
+        }
+        media(b"after restart", "max-age=30")
+    }).await;
+    let relay = relay();
+    let playback = relay.start(&origin.url("/playlist")).await.unwrap();
+    let old_uri = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    )
+    .remove(0);
+    let worker = relay.clone();
+    let viewer = token(&playback).to_owned();
+    let id = resource_id(&old_uri).to_owned();
+    let old = tokio::spawn(async move { worker.resource(&viewer, &id, None).await });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let new_uri = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    )
+    .remove(0);
+    assert_ne!(old_uri, new_uri);
+    release.notify_one();
+    assert_eq!(old.await.unwrap().unwrap().body, "before restart");
+    for _ in 0..2 {
+        assert_eq!(
+            relay
+                .resource(token(&playback), resource_id(&new_uri), None)
+                .await
+                .unwrap()
+                .body,
+            "after restart"
+        );
+    }
+    assert_eq!(origin.count("/segment.ts"), 2);
+}
+
+#[tokio::test]
+async fn identical_refresh_preserves_inflight_body_cache_publication() {
+    inflight_body_during_refresh(false).await;
+}
+
+async fn inflight_body_during_refresh(changed: bool) {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let reads = Arc::new(AtomicUsize::new(0));
     let notify = started.clone();
     let unblock = release.clone();
     let count = reads.clone();
+    let playlists = AtomicUsize::new(0);
     let origin = Fixture::new(move |path, _| {
         if path == "/playlist" {
+            if playlists.fetch_add(1, Ordering::SeqCst) != 0 && changed {
+                return manifest("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:1,\nsegment.ts\n");
+            }
             return manifest("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,\nsegment.ts\n");
         }
         if count.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -339,16 +511,167 @@ async fn refresh_prevents_older_inflight_body_from_repopulating_the_cache() {
     drop(refreshed);
     release.notify_one();
     assert_eq!(old.await.unwrap().unwrap().body, "old");
-    assert!(relay.cache.lock().unwrap().entries.is_empty());
+    assert_eq!(relay.cache.lock().unwrap().entries.is_empty(), changed);
     assert_eq!(
         relay
             .resource(token(&playback), resource_id(&segment), None)
             .await
             .unwrap()
             .body,
-        "new"
+        if changed { "new" } else { "old" }
     );
-    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), if changed { 2 } else { 1 });
+}
+
+#[tokio::test]
+async fn identical_reload_reuses_fresh_media_without_extending_its_cache_ttl() {
+    let changed = Arc::new(AtomicBool::new(false));
+    let state = changed.clone();
+    let origin = Fixture::new(move |path, _| match path {
+        "/playlist" if state.load(Ordering::SeqCst) => {
+            manifest("#EXTM3U\n# changed metadata\n#EXTINF:1,\nsegment.ts\n")
+        }
+        "/playlist" => manifest("#EXTM3U\n#EXTINF:1,\nsegment.ts\n"),
+        _ => media(b"cacheable", "max-age=30"),
+    })
+    .await;
+    let relay = relay();
+    let playback = relay.start(&origin.url("/playlist")).await.unwrap();
+    let playlist = relay.resource(token(&playback), "0", None).await.unwrap();
+    let segment = uris(&playlist.body).remove(0);
+    drop(playlist);
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&segment), None)
+            .await
+            .unwrap(),
+    );
+    let key = CacheKey {
+        token: token(&playback).into(),
+        id: numeric_id(&segment),
+        range: None,
+    };
+    let expires = relay.cache.lock().unwrap().entries[&key].expires;
+    for _ in 0..3 {
+        let playlist = relay.resource(token(&playback), "0", None).await.unwrap();
+        assert_eq!(uris(&playlist.body)[0], segment);
+        drop(playlist);
+        drop(
+            relay
+                .resource(token(&playback), resource_id(&segment), None)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(origin.count("/segment.ts"), 1);
+    assert_eq!(relay.cache.lock().unwrap().entries[&key].expires, expires);
+    changed.store(true, Ordering::SeqCst);
+    let playlist = relay.resource(token(&playback), "0", None).await.unwrap();
+    assert_eq!(uris(&playlist.body)[0], segment);
+    drop(playlist);
+    assert!(relay.cache.lock().unwrap().entries.is_empty());
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&segment), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(origin.count("/segment.ts"), 2);
+}
+
+#[tokio::test]
+async fn identical_manifest_at_a_changed_redirect_base_has_distinct_cached_resources() {
+    let calls = AtomicUsize::new(0);
+    let origin = Fixture::new(move |path, _| match path {
+        "/entry" => {
+            let target = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                "/a/playlist"
+            } else {
+                "/b/playlist"
+            };
+            (StatusCode::FOUND, [(axum::http::header::LOCATION, target)]).into_response()
+        }
+        "/a/playlist" | "/b/playlist" => manifest("#EXTM3U\n#EXTINF:1,\nsegment.ts\n"),
+        "/a/segment.ts" => media(b"first", "max-age=30"),
+        "/b/segment.ts" => media(b"second", "max-age=30"),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    })
+    .await;
+    let relay = relay();
+    let playback = relay.start(&origin.url("/entry")).await.unwrap();
+    let first = relay.resource(token(&playback), "0", None).await.unwrap();
+    let old_uri = uris(&first.body).remove(0);
+    drop(first);
+    assert_eq!(
+        relay
+            .resource(token(&playback), resource_id(&old_uri), None)
+            .await
+            .unwrap()
+            .body,
+        "first"
+    );
+    let second = relay.resource(token(&playback), "0", None).await.unwrap();
+    let new_uri = uris(&second.body).remove(0);
+    drop(second);
+    assert_ne!(old_uri, new_uri);
+    assert_eq!(
+        relay
+            .resource(token(&playback), resource_id(&new_uri), None)
+            .await
+            .unwrap()
+            .body,
+        "second"
+    );
+    assert_eq!(origin.count("/a/segment.ts"), 1);
+    assert_eq!(origin.count("/b/segment.ts"), 1);
+}
+
+#[tokio::test]
+async fn unsupported_daterange_does_not_change_managed_registry_or_generation() {
+    let relay = relay();
+    let playback = relay
+        .start("https://example.invalid/playlist")
+        .await
+        .unwrap();
+    let session = relay
+        .sessions
+        .lock()
+        .unwrap()
+        .get(token(&playback))
+        .cloned()
+        .unwrap();
+    let base = FetchUrl::parse_source("https://example.invalid/playlist", relay.policy).unwrap();
+    relay
+        .rewrite(
+            token(&playback),
+            &session,
+            0,
+            &base,
+            b"#EXTM3U\n#EXTINF:1,\na.ts\n",
+        )
+        .unwrap();
+    let before = {
+        let inner = session.inner.lock().unwrap();
+        (
+            inner.next_id,
+            inner.resources[&0].playlist.refresh,
+            inner.resources[&0].playlist.fingerprint,
+        )
+    };
+    let source = b"#EXTM3U\n#EXT-X-DATERANGE:ID=\"event\",START-DATE=\"2026-01-01T00:00:00Z\",X-ASSET-LIST=\"https://example.invalid/list.json\"\n#EXTINF:1,\nb.ts\n";
+    assert!(matches!(
+        relay.rewrite(token(&playback), &session, 0, &base, source),
+        Err(OriginError::UnsupportedPlaylist)
+    ));
+    let after = {
+        let inner = session.inner.lock().unwrap();
+        (
+            inner.next_id,
+            inner.resources[&0].playlist.refresh,
+            inner.resources[&0].playlist.fingerprint,
+        )
+    };
+    assert_eq!(before, after);
 }
 
 #[tokio::test]
@@ -1085,6 +1408,7 @@ fn cache_bounds_entries_and_memory_including_zero_length_resources() {
                 content_type: "video/mp2t".into(),
                 content_range: None,
                 body: Bytes::new(),
+                allocation: 0,
             },
             Duration::from_secs(10),
         );
@@ -1103,12 +1427,404 @@ fn cache_bounds_entries_and_memory_including_zero_length_resources() {
                 content_type: "video/mp2t".into(),
                 content_range: None,
                 body: data.clone(),
+                allocation: data.len(),
             },
             Duration::from_secs(10),
         );
     }
     assert!(cache.bytes <= MAX_CACHE_BYTES);
     assert_eq!(cache.bytes, MAX_CACHE_BYTES);
+}
+
+#[test]
+fn cache_bounds_backing_capacity_and_releases_same_charge_on_eviction() {
+    let mut cache = Cache::default();
+    let key = |id| CacheKey {
+        token: "capacity".into(),
+        id,
+        range: None,
+    };
+    let mut backing = BytesMut::with_capacity(MAX_CACHE_BYTES / 2 + 1);
+    backing.extend_from_slice(b"x");
+    let allocation = backing.capacity();
+    let data = ResponseData {
+        status: 200,
+        content_type: "video/mp2t".into(),
+        content_range: None,
+        body: backing.freeze(),
+        allocation,
+    };
+    cache.put(key(1), data.clone(), Duration::from_secs(30));
+    cache.put(key(2), data.clone(), Duration::from_secs(30));
+    assert_eq!(cache.entries.len(), 1);
+    assert!(cache.get(&key(1)).is_none());
+    assert_eq!(cache.bytes, allocation);
+    cache.put(key(2), data, Duration::from_secs(30));
+    assert_eq!(cache.bytes, allocation, "replacement does not double count");
+    cache.retain(|_, _| false);
+    assert_eq!(cache.bytes, 0);
+}
+
+#[tokio::test]
+async fn retained_origin_replay_survives_removal_without_origin_reads_or_moving_another_viewer() {
+    let removed = Arc::new(AtomicBool::new(false));
+    let gone = removed.clone();
+    let origin = Fixture::new(move |path, _| match path {
+        "/record.m3u8" => manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:2,\na.ts\n#EXTINF:2,\nb.ts\n"),
+        "/live.m3u8" => manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXTINF:2,\nlive.ts\n"),
+        "/live.ts" => recorded_ts().into_response(),
+        "/a.ts" | "/b.ts" if !gone.load(Ordering::SeqCst) => ([(axum::http::header::CACHE_CONTROL,"no-store")],recorded_ts()).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }).await;
+    let relay = history_relay();
+    let first = relay.start(&origin.url("/record.m3u8")).await.unwrap();
+    let other = relay.start(&origin.url("/live.m3u8")).await.unwrap();
+    let sources = uris(&relay.resource(token(&first), "0", None).await.unwrap().body);
+    let (a, b) = tokio::join!(
+        relay.resource(token(&first), resource_id(&sources[0]), None),
+        relay.resource(token(&first), resource_id(&sources[1]), Some("bytes=0-"))
+    );
+    assert_eq!(a.unwrap().body, recorded_ts());
+    assert_eq!(b.unwrap().body, recorded_ts());
+    assert!(
+        relay.cache.lock().unwrap().entries.is_empty(),
+        "recording no-store media must not enable ordinary HTTP caching"
+    );
+    let view = relay
+        .seek(
+            token(&first),
+            OriginSeekTarget::Back(Duration::from_secs(3)),
+            Some(0),
+        )
+        .unwrap();
+    removed.store(true, Ordering::SeqCst);
+    let before = origin.calls.lock().unwrap().len();
+    let playlist = relay
+        .replay_resource(token(&first), view.generation, "index.m3u8")
+        .await
+        .unwrap();
+    let replay = uris(&playlist.body);
+    drop(playlist);
+    for url in replay {
+        assert_eq!(
+            relay
+                .replay_resource(token(&first), view.generation, resource_id(&url))
+                .await
+                .unwrap()
+                .body,
+            recorded_ts()
+        );
+    }
+    assert_eq!(origin.calls.lock().unwrap().len(), before);
+    assert_eq!(
+        relay.history_status(token(&other)).unwrap().view.generation,
+        0
+    );
+    let live = uris(&relay.resource(token(&other), "0", None).await.unwrap().body);
+    assert_eq!(
+        relay
+            .resource(token(&other), resource_id(&live[0]), None)
+            .await
+            .unwrap()
+            .body,
+        recorded_ts()
+    );
+    let response = relay
+        .replay_resource(token(&first), view.generation, "10.ts")
+        .await
+        .unwrap();
+    relay.live(token(&first), Some(view.generation)).unwrap();
+    use futures::StreamExt;
+    let stream = response.into_stream();
+    futures::pin_mut!(stream);
+    assert!(stream.next().await.unwrap().is_err());
+    assert!(relay.stop(token(&first)));
+    assert!(matches!(
+        relay.history_status(token(&first)),
+        Err(OriginError::NotFound)
+    ));
+    assert!(relay.history_status(token(&other)).unwrap().supported);
+}
+
+#[tokio::test]
+async fn origin_recording_rejects_late_body_after_source_epoch_reset() {
+    late_body_after_reset(false).await;
+}
+#[tokio::test]
+async fn origin_recording_rejects_late_body_after_equal_descriptor_aba() {
+    late_body_after_reset(true).await;
+}
+async fn late_body_after_reset(aba: bool) {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let notify = started.clone();
+    let unblock = release.clone();
+    let requests = AtomicUsize::new(0);
+    let media_requests = AtomicUsize::new(0);
+    let origin=Fixture::new(move|path,_| {
+        if path=="/index" {
+            let request = requests.fetch_add(1,Ordering::SeqCst);
+            return if request == 0 || (aba && request >= 2) {
+            manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:7\n#EXTINF:2,\na.ts\n")
+        } else if aba { manifest("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:7\n#EXTINF:2,\na.ts\n") }
+        else { manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:11\n#EXT-X-DISCONTINUITY-SEQUENCE:0\n#EXTINF:2,\na.ts\n") }; }
+        if media_requests.fetch_add(1,Ordering::SeqCst)==0 {
+            notify.notify_one(); let unblock=unblock.clone();
+            return Body::from_stream(futures::stream::once(async move { unblock.notified().await; Ok::<_,std::io::Error>(recorded_ts()) })).into_response();
+        }
+        recorded_ts().into_response()
+    }).await;
+    let relay = history_relay();
+    let playback = relay.start(&origin.url("/index")).await.unwrap();
+    let old = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    )
+    .remove(0);
+    let original_id = old.clone();
+    let worker = relay.clone();
+    let viewer = token(&playback).to_owned();
+    let task = tokio::spawn(async move { worker.resource(&viewer, resource_id(&old), None).await });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let mut new = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    )
+    .remove(0);
+    if aba {
+        assert!(!relay.history_status(token(&playback)).unwrap().supported);
+        new = uris(
+            &relay
+                .resource(token(&playback), "0", None)
+                .await
+                .unwrap()
+                .body,
+        )
+        .remove(0);
+        assert_eq!(
+            new, original_id,
+            "ABA really reintroduces the identical resource ID"
+        );
+    }
+    release.notify_one();
+    assert_eq!(task.await.unwrap().unwrap().body, recorded_ts());
+    assert_eq!(
+        relay
+            .history_status(token(&playback))
+            .unwrap()
+            .history
+            .retained_bytes,
+        0
+    );
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&new), None)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        relay
+            .history_status(token(&playback))
+            .unwrap()
+            .history
+            .retained_bytes
+            > 0
+    );
+}
+
+#[tokio::test]
+async fn origin_recording_keeps_inflight_overlapping_and_removed_segments() {
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = started.clone();
+    let unblock = release.clone();
+    let requests = AtomicUsize::new(0);
+    let origin = Fixture::new(move |path, _| {
+        if path == "/index" {
+            return if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:2,\na.ts\n#EXTINF:2,\nb.ts\n")
+            } else {
+                manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:11\n#EXTINF:2,\nb.ts\n#EXTINF:2,\nc.ts\n")
+            };
+        }
+        if matches!(path, "/a.ts" | "/b.ts") {
+            entered.add_permits(1);
+            let unblock = unblock.clone();
+            return Body::from_stream(futures::stream::once(async move {
+                unblock.acquire().await.unwrap().forget();
+                Ok::<_, std::io::Error>(recorded_ts())
+            })).into_response();
+        }
+        recorded_ts().into_response()
+    }).await;
+    let relay = history_relay();
+    let playback = relay.start(&origin.url("/index")).await.unwrap();
+    let old = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    );
+    let tasks: Vec<_> = old
+        .into_iter()
+        .map(|url| {
+            let worker = relay.clone();
+            let viewer = token(&playback).to_owned();
+            tokio::spawn(async move { worker.resource(&viewer, resource_id(&url), None).await })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(2), started.acquire_many(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let new = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    );
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&new[1]), None)
+            .await
+            .unwrap(),
+    );
+    let view = relay
+        .seek(token(&playback), OriginSeekTarget::PositionMs(4000), None)
+        .unwrap();
+    relay.live(token(&playback), Some(view.generation)).unwrap();
+    release.add_permits(2);
+    for task in tasks {
+        assert_eq!(task.await.unwrap().unwrap().body, recorded_ts());
+    }
+    let view = relay
+        .seek(token(&playback), OriginSeekTarget::PositionMs(0), None)
+        .unwrap();
+    let snapshot = view.snapshot.unwrap();
+    assert_eq!((snapshot.first_seq, snapshot.last_seq), (10, 12));
+    assert_eq!(origin.count("/a.ts"), 1);
+    assert_eq!(origin.count("/b.ts"), 1);
+}
+
+#[tokio::test]
+async fn origin_recording_recovers_from_budget_pressure_using_cached_capacity() {
+    let cfg = HlsHistoryConfig {
+        max_seconds: 60,
+        max_bytes: 2 * 1024 * 1024,
+        global_max_bytes: 2 * 1024 * 1024,
+    };
+    let budget = HistoryBudget::new(cfg.global_max_bytes);
+    let occupied = budget.reserve(cfg.global_max_bytes).unwrap();
+    let relay = OriginHls::new_with_history(
+        FetchPolicy {
+            allow_non_global: true,
+        },
+        cfg,
+        budget.clone(),
+    );
+    let origin = Fixture::new(|path, _| {
+        if path == "/index" {
+            manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXTINF:2,\na.ts\n")
+        } else {
+            (
+                [(axum::http::header::CACHE_CONTROL, "public, max-age=30")],
+                recorded_ts(),
+            )
+                .into_response()
+        }
+    })
+    .await;
+    let playback = relay.start(&origin.url("/index")).await.unwrap();
+    let url = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    )
+    .remove(0);
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&url), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        relay
+            .history_status(token(&playback))
+            .unwrap()
+            .history
+            .retained_bytes,
+        0
+    );
+    let key = CacheKey {
+        token: token(&playback).to_owned(),
+        id: numeric_id(&url),
+        range: None,
+    };
+    // Exercise spare backing capacity explicitly rather than relying on HTTP chunk sizing.
+    let mut cached = relay.cache.lock().unwrap().get(&key).unwrap();
+    let mut backing = BytesMut::with_capacity(cached.body.len() * 2);
+    backing.extend_from_slice(&cached.body);
+    let allocation = backing.capacity();
+    assert!(allocation > cached.body.len());
+    cached.body = backing.freeze();
+    cached.allocation = allocation;
+    relay
+        .cache
+        .lock()
+        .unwrap()
+        .put(key, cached, Duration::from_secs(30));
+    drop(occupied);
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&url), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        relay
+            .history_status(token(&playback))
+            .unwrap()
+            .history
+            .retained_bytes,
+        allocation
+    );
+    assert!(budget
+        .reserve(cfg.global_max_bytes - allocation + 1)
+        .is_none());
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&url), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        relay
+            .history_status(token(&playback))
+            .unwrap()
+            .history
+            .retained_bytes,
+        allocation
+    );
+    assert_eq!(
+        origin.count("/a.ts"),
+        1,
+        "archive recovery uses cached bytes without another fetch"
+    );
+    assert!(relay.stop(token(&playback)));
+    assert!(budget.reserve(cfg.global_max_bytes).is_some());
 }
 
 struct TempMedia(std::path::PathBuf);
@@ -1294,4 +2010,262 @@ async fn generated_origin_hls_ts_and_fmp4_decode() {
         assert!(relay.sessions.lock().unwrap().is_empty());
         eprintln!("managed origin HLS {container}: {frames} decoded frames");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg; generates and decodes retained TS after origin removal"]
+async fn generated_origin_ts_archive_decodes_after_origin_removal() {
+    use crate::http::{router, AceSessionStore, AppState};
+    use crate::manager::StreamManager;
+    use crate::provider::ProviderRegistry;
+    let files = TempMedia::new();
+    let output = files.0.join("index.m3u8");
+    let segments = files.0.join("segment%03d.ts");
+    let mut args: Vec<String> = [
+        "-hide_banner",
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=160x90:rate=10",
+        "-t",
+        "3",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "10",
+        "-keyint_min",
+        "10",
+        "-sc_threshold",
+        "0",
+        "-f",
+        "hls",
+        "-hls_time",
+        "1",
+        "-hls_playlist_type",
+        "vod",
+        "-hls_flags",
+        "independent_segments",
+        "-hls_segment_filename",
+    ]
+    .iter()
+    .map(|s| (*s).into())
+    .collect();
+    args.push(segments.to_str().unwrap().into());
+    args.push(output.to_str().unwrap().into());
+    ffmpeg(&args).await;
+    let resources: HashMap<_, _> = std::fs::read_dir(&files.0)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                format!("/{}", entry.file_name().to_str().unwrap()),
+                Bytes::from(std::fs::read(entry.path()).unwrap()),
+            )
+        })
+        .collect();
+    let initial = std::str::from_utf8(&resources["/index.m3u8"])
+        .unwrap()
+        .replace("#EXT-X-PLAYLIST-TYPE:VOD\n", "")
+        .replace("#EXT-X-ENDLIST\n", "");
+    let mut sliding: Vec<_> = initial.lines().collect();
+    let first = sliding
+        .iter()
+        .position(|line| line.starts_with("#EXTINF:"))
+        .unwrap();
+    sliding.drain(first..first + 2);
+    let sliding = format!("{}\n", sliding.join("\n"))
+        .replace("#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-MEDIA-SEQUENCE:1");
+    let manifests = AtomicUsize::new(0);
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = started.clone();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let unblock = release.clone();
+    let removed = Arc::new(AtomicBool::new(false));
+    let gone = removed.clone();
+    let origin = Fixture::new(move |path, _| {
+        let archive = path.starts_with("/record/");
+        let path = path
+            .strip_prefix("/record")
+            .or_else(|| path.strip_prefix("/live"))
+            .unwrap_or(path);
+        if archive && gone.load(Ordering::SeqCst) && path.ends_with(".ts") {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if archive && path == "/index.m3u8" {
+            let text = if manifests.fetch_add(1, Ordering::SeqCst) == 0 {
+                &initial
+            } else {
+                &sliding
+            };
+            return (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/vnd.apple.mpegurl",
+                )],
+                text.clone(),
+            )
+                .into_response();
+        }
+        if archive && matches!(path, "/segment000.ts" | "/segment001.ts") {
+            entered.add_permits(1);
+            let unblock = unblock.clone();
+            let body = resources[path].clone();
+            return Body::from_stream(futures::stream::once(async move {
+                unblock.acquire().await.unwrap().forget();
+                Ok::<_, std::io::Error>(body)
+            }))
+            .into_response();
+        }
+        match resources.get(path) {
+            Some(bytes) => (
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        if path.ends_with(".m3u8") {
+                            "application/vnd.apple.mpegurl"
+                        } else {
+                            "video/mp2t"
+                        },
+                    ),
+                    (axum::http::header::CACHE_CONTROL, "no-store"),
+                ],
+                bytes.clone(),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    })
+    .await;
+    let relay = history_relay();
+    let recorded = relay
+        .start(&origin.url("/record/index.m3u8"))
+        .await
+        .unwrap();
+    let other = relay.start(&origin.url("/live/index.m3u8")).await.unwrap();
+    let urls = uris(
+        &relay
+            .resource(token(&recorded), "0", None)
+            .await
+            .unwrap()
+            .body,
+    );
+    let pending: Vec<_> = urls
+        .iter()
+        .take(2)
+        .map(|uri| {
+            let worker = relay.clone();
+            let viewer = token(&recorded).to_owned();
+            let id = resource_id(uri).to_owned();
+            tokio::spawn(async move { worker.resource(&viewer, &id, None).await })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(2), started.acquire_many(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let slid = uris(
+        &relay
+            .resource(token(&recorded), "0", None)
+            .await
+            .unwrap()
+            .body,
+    );
+    assert_eq!(slid, urls[1..], "overlap keeps stable resource identity");
+    drop(
+        relay
+            .resource(token(&recorded), resource_id(&slid[1]), None)
+            .await
+            .unwrap(),
+    );
+    release.add_permits(2);
+    for task in pending {
+        drop(task.await.unwrap().unwrap());
+    }
+    let status = relay.history_status(token(&recorded)).unwrap();
+    assert_eq!(status.history.first_seq, Some(0));
+    assert_eq!(status.history.last_seq, Some(2));
+    let view = relay
+        .seek(token(&recorded), OriginSeekTarget::PositionMs(0), Some(0))
+        .unwrap();
+    removed.store(true, Ordering::SeqCst);
+    let calls = origin.calls.lock().unwrap().len();
+    let state = AppState {
+        peer_policy: Default::default(),
+        manager: StreamManager::new(ProviderRegistry::new()),
+        networks: vec![],
+        resolve_content_ids_in_getstream: false,
+        ace_sessions: Arc::new(AceSessionStore::default()),
+        experimental_ace_compat: false,
+        broadcasts: None,
+        origin_hls: Some(relay.clone()),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    struct Abort(tokio::task::AbortHandle);
+    impl Drop for Abort {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _server = Abort(task.abort_handle());
+    for (mode, path) in [
+        ("retained", view.playback_url),
+        ("independent-live", other.playback_url.clone()),
+    ] {
+        let input = format!("http://{address}{path}");
+        let decode: Vec<String> = [
+            "-hide_banner",
+            "-v",
+            "error",
+            "-nostdin",
+            "-i",
+            &input,
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "30",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-f",
+            "null",
+            "-",
+        ]
+        .iter()
+        .map(|s| (*s).into())
+        .collect();
+        let result = ffmpeg(&decode).await;
+        let progress = String::from_utf8(result.stdout).unwrap();
+        let frames = progress
+            .lines()
+            .filter_map(|line| line.strip_prefix("frame=")?.trim().parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        assert_eq!(frames, 30, "{mode} decodes all generated frames");
+        if mode == "retained" {
+            assert_eq!(
+                origin.calls.lock().unwrap().len(),
+                calls,
+                "replay must not fetch the deleted origin"
+            );
+        }
+        eprintln!("origin TS {mode}: {frames} decoded frames");
+    }
+    assert_eq!(
+        relay.history_status(token(&other)).unwrap().view.generation,
+        0
+    );
+    assert!(relay.stop(token(&recorded)));
+    assert!(relay.stop(token(&other)));
 }
