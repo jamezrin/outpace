@@ -57,3 +57,5 @@ pub mod support_config;
 pub mod support_control;
 pub mod testprovider;
 pub mod transport_url;
+#[cfg(windows)]
+pub mod win_service;

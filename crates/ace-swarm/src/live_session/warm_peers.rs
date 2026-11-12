@@ -1,7 +1,7 @@
 //! Bounded, private hints from authenticated contiguous producers. Never descriptor authority.
 use super::CandidateKind;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::SocketAddrV4;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -12,6 +12,8 @@ const TTL: u64 = 300;
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_IDENTITIES: usize = 16;
 const HEADER: &str = "OUTPACE-WARM-1\n";
+// Only the unix store persists hints; other platforms keep them in memory.
+#[cfg_attr(not(unix), allow(dead_code))]
 const FILE: &str = "recent-peers-v1";
 #[derive(Clone, Copy)]
 struct Entry {
@@ -577,6 +579,7 @@ mod secure {
     use super::*;
     use std::ffi::CString;
     use std::fs::File;
+    use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;

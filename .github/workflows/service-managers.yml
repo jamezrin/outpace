@@ -1,0 +1,119 @@
+name: Service managers
+
+# Installs and starts outpace under the Windows Service Control Manager and macOS launchd on
+# real runners, and lints the cfg(windows) code that no other PR check compiles.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/service-managers.yml
+      - crates/ace-engine/**
+      - Cargo.toml
+      - Cargo.lock
+      - packaging/macos/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-service:
+    name: Windows service lifecycle
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+          build-warnings: ""
+
+      - name: Clippy (Windows)
+        run: cargo clippy --locked -p ace-engine --all-targets -- -D warnings
+
+      - name: Unit tests (Windows service)
+        run: cargo test --locked -p ace-engine --lib win_service
+
+      - name: Build release binary
+        run: cargo build --locked --release -p ace-engine --bin outpace
+
+      # Runners are elevated, as `outpace service install` requires.
+      - name: Install, start, probe, stop and uninstall the service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:ProgramFiles 'outpace'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target\release\outpace.exe $dir
+          $exe = Join-Path $dir 'outpace.exe'
+          & $exe service install
+          if ($LASTEXITCODE -ne 0) { throw 'install failed' }
+          # Service settings live in its Environment registry value.
+          reg add HKLM\SYSTEM\CurrentControlSet\Services\outpace /v Environment /t REG_MULTI_SZ `
+            /d "OUTPACE_BIND=127.0.0.1:16878\0OUTPACE_RTMP_BIND=127.0.0.1:16879\0OUTPACE_ENABLE_INBOUND=0\0OUTPACE_ENABLE_SEEDING=0" /f
+          sc.exe qc outpace
+          sc.exe start outpace
+          $healthy = $false
+          foreach ($i in 1..60) {
+            curl.exe --fail --silent --max-time 2 http://127.0.0.1:16878/healthz 2>$null
+            if ($LASTEXITCODE -eq 0) { $healthy = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          $log = Join-Path $env:ProgramData 'outpace\outpace.log'
+          if (Test-Path $log) { Get-Content $log -Tail 20 }
+          if (-not $healthy) { sc.exe query outpace; throw 'service did not answer /healthz' }
+          sc.exe stop outpace
+          foreach ($i in 1..40) {
+            if ((Get-Service outpace).Status -eq 'Stopped') { break }
+            Start-Sleep -Seconds 1
+          }
+          if ((Get-Service outpace).Status -ne 'Stopped') { throw 'service did not stop' }
+          Get-Content $log -Tail 5
+          if (-not (Select-String -Path $log -Pattern 'stop requested' -Quiet)) { throw 'no graceful stop in log' }
+          & $exe service uninstall
+          if ($LASTEXITCODE -ne 0) { throw 'uninstall failed' }
+          if (Get-Service outpace -ErrorAction SilentlyContinue) { throw 'service still registered' }
+
+  macos-launchagent:
+    name: macOS LaunchAgent lifecycle
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+          build-warnings: ""
+
+      - name: Build release binary
+        run: cargo build --locked --release -p ace-engine --bin outpace
+
+      - name: Install, probe and uninstall the LaunchAgent
+        run: |
+          set -eu
+          packaging/macos/install-launchagent.sh install target/release/outpace
+          ok=0
+          for i in $(seq 60); do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:6878/healthz; then ok=1; break; fi
+            sleep 1
+          done
+          tail -20 "$HOME/Library/Logs/outpace.log" || true
+          [ "$ok" = 1 ] || { launchctl list | grep outpace || true; exit 1; }
+          packaging/macos/install-launchagent.sh uninstall
+          sleep 2
+          if curl --fail --silent --max-time 2 http://127.0.0.1:6878/healthz; then
+            echo "daemon still running after uninstall" >&2
+            exit 1
+          fi

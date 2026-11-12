@@ -46,7 +46,7 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
   && outpace --version
 ```
 
-On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
+On Windows, unzip the archive and run `outpace.exe serve` from a terminal. To run it in the background, see [Deployment](Deployment#windows-service).
 
 ### ARMv7 and small devices
 

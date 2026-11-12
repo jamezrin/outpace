@@ -71,6 +71,8 @@ These are merged into `main` (and so in `edge`), but aren't in v0.9.0:
   `OUTPACE_PRIVATE_DESCRIPTORS`, `/network-policy`).
 - [Support sources](Support-Sources-and-Operations#support-sources) (`OUTPACE_SUPPORT_SOURCES`,
   `/support`).
+- A Windows service (`outpace service install`) and a macOS LaunchAgent; see
+  [Deployment](Deployment#windows-service).
 
 **Fixes you'll notice**
 

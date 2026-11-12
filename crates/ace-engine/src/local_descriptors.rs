@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
 
 const MAX_ENTRIES: usize = 64;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
+// Local descriptor files are only read on unix (see `read_descriptor`).
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
 const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]

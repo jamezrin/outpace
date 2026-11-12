@@ -42,6 +42,22 @@ pub enum Command {
     Broadcast(BroadcastArgs),
     /// Write a live MPEG-TS stream (or verified VOD with --vod) to stdout.
     Play(PlayArgs),
+    /// Install, remove, or run outpace as a Windows service.
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[cfg(windows)]
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Register outpace as an automatic-start service running as LocalService (needs an
+    /// elevated prompt). It is not started.
+    Install,
+    /// Stop the service if it is running, then remove it (needs an elevated prompt).
+    Uninstall,
+    /// Entry point used by the Service Control Manager; not meant to be run by hand.
+    Run,
 }
 
 #[derive(Debug, Args)]
@@ -142,6 +158,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve(_) => run_serve().await,
         Command::Broadcast(args) => run_broadcast(args).await,
         Command::Play(args) => run_play(args).await,
+        #[cfg(windows)]
+        Command::Service(command) => tokio::task::block_in_place(|| match command {
+            ServiceCommand::Install => crate::win_service::install(),
+            ServiceCommand::Uninstall => crate::win_service::uninstall(),
+            ServiceCommand::Run => crate::win_service::run(),
+        }),
     }
 }
 

@@ -920,6 +920,16 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
     serve_http_until(runtime, shutdown_signal()).await
 }
 
+/// [`serve_http`] with a caller-supplied shutdown trigger instead of Ctrl+C/SIGTERM, for
+/// service managers that deliver stop requests another way (the Windows SCM).
+#[cfg(windows)]
+pub async fn serve_http_with_shutdown(
+    runtime: EngineRuntime,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serve_http_until(runtime, shutdown).await
+}
+
 /// The real serving/cleanup path accepts a shutdown future, allowing controlled local
 /// lifecycle tests without process-global signal/environment mutation.
 pub(crate) async fn serve_http_until(

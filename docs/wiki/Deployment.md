@@ -161,6 +161,55 @@ journalctl -u outpace -f
 Logs go to standard error. Each line starts with a UTC time of day (`HH:MM:SS.mmm`), and the
 journal adds the date. Open TCP 8621 in your firewall if you run as a full participant.
 
+## Windows service
+
+Unreleased: `edge` and builds from `main` only. On Windows, `outpace.exe` can install itself as
+a service. Run these from an elevated (administrator) prompt:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:ProgramFiles\outpace"
+Copy-Item .\outpace.exe "$env:ProgramFiles\outpace\"
+& "$env:ProgramFiles\outpace\outpace.exe" service install
+sc.exe start outpace
+```
+
+- The service is called `outpace`. It starts automatically at boot, runs as the built-in
+  `LocalService` account, and Windows restarts it if it crashes.
+- `service install` registers it but doesn't start it.
+- Stopping it (`sc.exe stop outpace`, the Services app, or a shutdown) drains connections
+  gracefully, just like Ctrl+C.
+- Without `OUTPACE_DATA_DIR`, data lives in `%ProgramData%\outpace`. The log is
+  `%ProgramData%\outpace\outpace.log`, because a service has no console.
+- Settings come from the service's `Environment` registry value: one `NAME=value` per entry,
+  separated by `\0`. Restart the service after changing it:
+
+```powershell
+reg add HKLM\SYSTEM\CurrentControlSet\Services\outpace /v Environment /t REG_MULTI_SZ `
+  /d "OUTPACE_BIND=127.0.0.1:6878\0OUTPACE_CACHE_TYPE=disk" /f
+sc.exe stop outpace; sc.exe start outpace
+```
+
+To remove it, run `outpace.exe service uninstall`, which stops the service first. The data
+directory is kept. Open TCP 8621 in Windows Defender Firewall if you run as a full participant.
+
+## macOS launchd
+
+Unreleased: `edge` and builds from `main` only. The repository ships a per-user LaunchAgent. It
+starts Outpace at login and restarts it if it crashes:
+
+```bash
+git clone https://github.com/jamezrin/outpace-stream.git outpace && cd outpace
+packaging/macos/install-launchagent.sh install /usr/local/bin/outpace
+packaging/macos/install-launchagent.sh uninstall     # to remove it
+```
+
+- The agent is `~/Library/LaunchAgents/outpace.plist`, created from
+  [`packaging/macos/outpace.plist.in`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/macos/outpace.plist.in).
+- To change settings, edit its `EnvironmentVariables` and run `install` again.
+- HTTP and RTMP stay on `127.0.0.1`. The log is `~/Library/Logs/outpace.log`, and data stays in
+  `~/Library/Application Support/outpace`.
+- Unloading sends `SIGTERM`, which drains gracefully. Uninstalling keeps the data and the log.
+
 ## Behind a reverse proxy
 
 A proxy is the usual way to add TLS and authentication. Things to get right:
