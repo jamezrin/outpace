@@ -86,7 +86,7 @@ pub fn install() -> Result<(), BoxError> {
             return Err(error.into());
         }
     }
-    // Restart after a crash, like systemd's Restart=on-failure.
+    // Restart after a failure, like systemd's Restart=on-failure.
     service.update_failure_actions(ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
         reboot_msg: None,
@@ -99,6 +99,9 @@ pub fn install() -> Result<(), BoxError> {
             3
         ]),
     })?;
+    // Also restart when the service stops with an error exit code (a serving failure), not
+    // only when the process crashes. Windows leaves this off by default.
+    service.set_failure_actions_on_non_crash_failures(true)?;
     eprintln!(
         "outpace service: installed '{SERVICE_NAME}' as {SERVICE_ACCOUNT}; start it with `sc.exe start {SERVICE_NAME}`"
     );
@@ -204,18 +207,27 @@ fn serve(
     runtime.block_on(async move {
         let peers = crate::runtime::bootstrap_peers_from_env();
         let engine = crate::runtime::build_runtime(config, peers).await?;
-        status.set_service_status(running_status(
-            ServiceState::Running,
-            ServiceExitCode::Win32(0),
-        ))?;
-        crate::runtime::serve_http_with_shutdown(engine, async move {
-            let _ = stop.await;
-            crate::alog!("[service] stop requested; draining HTTP connections");
-            let _ = status.set_service_status(running_status(
-                ServiceState::StopPending,
-                ServiceExitCode::Win32(0),
-            ));
-        })
+        crate::runtime::serve_http_with_shutdown(
+            engine,
+            async move {
+                let _ = stop.await;
+                crate::alog!("[service] stop requested; draining HTTP connections");
+                let _ = status.set_service_status(running_status(
+                    ServiceState::StopPending,
+                    ServiceExitCode::Win32(0),
+                ));
+            },
+            // Report Running only once the listeners are bound: a port conflict must surface
+            // as a failed start, not as a running service.
+            move || {
+                if let Err(error) = status.set_service_status(running_status(
+                    ServiceState::Running,
+                    ServiceExitCode::Win32(0),
+                )) {
+                    crate::alog!("[service] could not report running: {error}");
+                }
+            },
+        )
         .await
     })
 }

@@ -190,7 +190,15 @@ sc.exe start outpace
 ```powershell
 reg add HKLM\SYSTEM\CurrentControlSet\Services\outpace /v Environment /t REG_MULTI_SZ `
   /d "OUTPACE_BIND=127.0.0.1:6878\0OUTPACE_CACHE_TYPE=disk" /f
-sc.exe stop outpace; sc.exe start outpace
+sc.exe stop outpace
+# Wait for the stop (graceful drain) to finish before starting again.
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Service outpace).Status -ne 'Stopped') {
+  if ((Get-Date) -gt $deadline) { throw 'outpace did not stop within 60 seconds' }
+  Start-Sleep -Seconds 1
+}
+sc.exe start outpace
+if ($LASTEXITCODE -ne 0) { throw 'outpace did not start; see %ProgramData%\outpace\outpace.log' }
 ```
 
 To remove it, run `outpace.exe service uninstall`, which stops the service first. The data
@@ -209,7 +217,9 @@ packaging/macos/install-launchagent.sh uninstall     # to remove it
 
 - The agent is `~/Library/LaunchAgents/outpace.plist`, created from
   [`packaging/macos/outpace.plist.in`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/macos/outpace.plist.in).
-- To change settings, edit its `EnvironmentVariables` and run `install` again.
+- To change settings, edit its `EnvironmentVariables`, then run
+  `packaging/macos/install-launchagent.sh reload`. Running `install` again, for example after
+  updating the binary, keeps your edits and only updates the program path.
 - HTTP and RTMP stay on `127.0.0.1`. The log is `~/Library/Logs/outpace.log`, and data stays in
   `~/Library/Application Support/outpace`.
 - Unloading sends `SIGTERM`, which drains gracefully. Uninstalling keeps the data and the log.

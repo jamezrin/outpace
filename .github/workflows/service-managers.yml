@@ -63,6 +63,10 @@ jobs:
           Remove-Item -Recurse -Force $data
           & $exe service install
           if ($LASTEXITCODE -ne 0) { throw 'install failed' }
+          # Error exits (not only crashes) must trigger the restart actions.
+          $flag = sc.exe qfailureflag outpace | Out-String
+          $flag
+          if ($flag -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') { throw 'non-crash failure actions are off' }
           # Service settings live in its Environment registry value.
           reg add HKLM\SYSTEM\CurrentControlSet\Services\outpace /v Environment /t REG_MULTI_SZ `
             /d "OUTPACE_BIND=127.0.0.1:16878\0OUTPACE_RTMP_BIND=127.0.0.1:16879\0OUTPACE_ENABLE_INBOUND=0\0OUTPACE_ENABLE_SEEDING=0" /f
@@ -94,6 +98,15 @@ jobs:
             $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
             if ($sid -eq $users) { throw 'BUILTIN\Users can access the data dir' }
           }
+          # With the HTTP port taken, the service must never report Running.
+          $blocker = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 16878)
+          $blocker.Start()
+          sc.exe start outpace | Out-Null
+          foreach ($i in 1..40) {
+            if ((Get-Service outpace).Status -eq 'Running') { throw 'service reported Running without its listener' }
+            Start-Sleep -Milliseconds 250
+          }
+          $blocker.Stop()
           & $exe service uninstall
           if ($LASTEXITCODE -ne 0) { throw 'uninstall failed' }
           if (Get-Service outpace -ErrorAction SilentlyContinue) { throw 'service still registered' }
@@ -120,7 +133,18 @@ jobs:
       - name: Install, probe and uninstall the LaunchAgent
         run: |
           set -eu
-          packaging/macos/install-launchagent.sh install target/release/outpace
+          # A path with a space and an ampersand must be stored literally.
+          dir="$RUNNER_TEMP/A & B"
+          mkdir -p "$dir"
+          cp target/release/outpace "$dir/outpace"
+          plist="$HOME/Library/LaunchAgents/outpace.plist"
+          packaging/macos/install-launchagent.sh install "$dir/outpace"
+          [ "$(plutil -extract ProgramArguments.0 raw "$plist")" = "$dir/outpace" ]
+          # An edited setting survives install (binary update) and reload.
+          plutil -replace EnvironmentVariables.OUTPACE_SMOKE_MARKER -string kept "$plist"
+          packaging/macos/install-launchagent.sh install "$dir/outpace"
+          packaging/macos/install-launchagent.sh reload
+          [ "$(plutil -extract EnvironmentVariables.OUTPACE_SMOKE_MARKER raw "$plist")" = kept ]
           ok=0
           for i in $(seq 60); do
             if curl --fail --silent --max-time 2 http://127.0.0.1:6878/healthz; then ok=1; break; fi

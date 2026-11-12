@@ -922,19 +922,31 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
 
 /// [`serve_http`] with a caller-supplied shutdown trigger instead of Ctrl+C/SIGTERM, for
 /// service managers that deliver stop requests another way (the Windows SCM).
+/// `ready` runs once every listener is bound and startup has succeeded, just before serving.
 #[cfg(windows)]
 pub async fn serve_http_with_shutdown(
     runtime: EngineRuntime,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce() + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    serve_http_until(runtime, shutdown).await
+    serve_http_until_ready(runtime, shutdown, Some(Box::new(ready))).await
 }
 
 /// The real serving/cleanup path accepts a shutdown future, allowing controlled local
 /// lifecycle tests without process-global signal/environment mutation.
 pub(crate) async fn serve_http_until(
+    runtime: EngineRuntime,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serve_http_until_ready(runtime, shutdown, None).await
+}
+
+type ReadyHook = Box<dyn FnOnce() + Send>;
+
+async fn serve_http_until_ready(
     mut runtime: EngineRuntime,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ready: Option<ReadyHook>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manager = runtime.manager.clone();
     let broadcasts = runtime.broadcasts.clone();
@@ -944,7 +956,15 @@ pub(crate) async fn serve_http_until(
     let mut support = None;
 
     let mut srt = None;
-    let result = serve_http_inner(runtime, shutdown, &mut support, &mut srt, &mut background).await;
+    let result = serve_http_inner(
+        runtime,
+        shutdown,
+        ready,
+        &mut support,
+        &mut srt,
+        &mut background,
+    )
+    .await;
     // Retain this owner outside startup/HTTP serving: every returned error joins
     // native cleanup before registry deletion can release a producer authority.
     let srt_cleanup = if let Some(service) = &mut srt {
@@ -1013,6 +1033,7 @@ async fn supervised_srt_shutdown(
 async fn serve_http_inner(
     runtime: EngineRuntime,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ready: Option<ReadyHook>,
     support_owner: &mut Option<Arc<crate::support::SupportService>>,
 
     srt_owner: &mut Option<crate::srt::SrtService>,
@@ -1230,6 +1251,9 @@ async fn serve_http_inner(
         };
         *support_owner = support.clone();
         let draining_support = support.clone();
+        if let Some(ready) = ready {
+            ready();
+        }
         axum::serve(listener, crate::http::router_with_support(state, support))
             .with_graceful_shutdown(async move {
                 // Axum runs this future in its own task. Cancelling the outer serving future
