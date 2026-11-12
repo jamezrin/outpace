@@ -233,9 +233,10 @@ See [Private Peer Mode](Private-Peer-Mode).
 | Setting | Default | Accepted values | Avail. | Notes |
 | --- | --- | --- | --- | --- |
 | `OUTPACE_COMPAT_ACESTREAM_SERVICES` | `false` | boolean | edge | Enables `/search` and external index requests. Independent of `OUTPACE_ACE_COMPAT`; rejected in private peer mode. |
-| `OUTPACE_ACESTREAM_SEARCH_API_KEY` | unset | 1–512 visible ASCII bytes, no spaces | edge | Required only when services compatibility is enabled. Supply an accepted operator key; no test/beta key is bundled. Omitted from config serialization and Debug output. |
 
-See [Stream Search](Stream-Search) for upstream access, limits and client integration. Existing
+No operator API key is required. Search uses external plain HTTP services, exposing queries
+and the server IP to the service and network observers. See [Stream Search](Stream-Search)
+for limits and client integration. Existing
 signed-catalog content-ID resolution and its defaults remain unchanged.
 
 ## Diagnostics

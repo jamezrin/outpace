@@ -8,30 +8,28 @@ production crawler are outside this adapter's scope.
 
 ## Enable search
 
-Supply an accepted key for the external search service in your protected service environment,
-then start the daemon:
+Enable the services setting and start the daemon:
 
 ```bash
-OUTPACE_COMPAT_ACESTREAM_SERVICES=1 \
-OUTPACE_ACESTREAM_SEARCH_API_KEY="${OUTPACE_ACESTREAM_SEARCH_API_KEY:?Supply an accepted upstream search key}" \
-  outpace serve
+OUTPACE_COMPAT_ACESTREAM_SERVICES=1 outpace serve
 ```
 
-The repository's Compose file forwards both variables. Keep credentials in a protected
-operator environment or `.env` file and recreate the container after changes. The key is
-required only when search is enabled, must contain 1–512 visible ASCII bytes without spaces,
-and is omitted from configuration serialization and Debug output. No test/beta key is
-embedded or selected automatically. Private peer mode rejects this services opt-in.
+No operator API key or account is required. The repository's Compose file forwards the
+services setting; recreate the container after changing it. Private peer mode rejects this
+opt-in.
 
-Requests go to the fixed HTTPS endpoint `api.acestream.me`. The legacy
-`search.acestream.net` redirected there during the November 12 investigation. Requests use
-public-address validation and DNS pinning; redirects and environment proxies are disabled,
-so credentials are not forwarded to another host. Current key issuance, entitlement, upstream
-quotas and availability must be checked with the provider. Historical shared-test-key success
-is not a stable production contract; this adapter does not create accounts or obtain keys.
-Queries and the server's IP reach the external service. Outpace does not log query/result
-bodies or upstream diagnostics. Existing signed-catalog content-ID resolution and defaults
-remain unchanged, and known-input playback does not depend on search availability.
+Search uses the fixed AceStream hosts `s5.torrentstream.net`, `s5.torrentstream.org` and
+`s5.torrentstream.info` over **plain HTTP**. Queries and the server's IP reach the external
+service and are visible to network observers. Requests use public-address validation and
+DNS pinning; redirects and environment proxies are disabled. Outpace identifies itself as
+Outpace and sends no device or account identity. There is no automatic fallback to the
+public API or a user-supplied endpoint.
+
+Responses must pass the native protocol's signature and request-nonce checks. These shared
+protocol checks do not establish trusted playback provenance. Service availability and
+quotas remain controlled by the provider. Outpace does not log queries, result bodies or
+upstream diagnostics. Existing signed-catalog content-ID resolution and defaults remain
+unchanged, and known-input playback does not depend on search availability.
 
 ## Request and response
 
@@ -57,14 +55,18 @@ curl --get --data-urlencode 'query=synthetic-demo' \
 Success returns `{"result":{"total":0,"results":[]},"error":null}` for a valid empty
 result. Nonempty `results` are grouped as `name` plus `items`; each item has `infohash`,
 `name` and categories, with available bitrate, status, availability, availability timestamp,
-country and language metadata. Current flat-root and historical enveloped upstream responses
-are normalized to this envelope. Icons, EPG, content-ID claims and unknown fields are stripped.
+country/language metadata and a `disabled` flag. Native compact results are normalized to
+this envelope. URL-only items are unsupported; icons, EPG, content-ID claims and unknown
+fields are stripped.
 Metadata is discovery data, not proof of a public, verified or playable descriptor.
 
 ## Bounds and failures
 
-- Each external attempt has a ten-second total deadline and a 1 MiB body limit; no retries.
-- At most two attempts run concurrently, with at least one second between starts. Overload
+- Each search has a ten-second total deadline, with up to three fixed-host attempts and
+  a three-second budget per host. Wire bytes across all attempts share a 1 MiB limit;
+  decoded/expanded results are also limited to 1 MiB. Invalid responses may try the next host;
+  an exceeded byte limit stops the search.
+- At most two searches run concurrently, with at least one second between starts. Overload
   fails promptly rather than accumulating queued work.
 - Validated successes, including empty pages, are cached for 30 seconds. Cache capacity is
   32 entries and 8 MiB of serialized responses; expired/old entries are evicted.
@@ -79,8 +81,8 @@ Metadata is discovery data, not proof of a public, verified or playable descript
 | `400` | Invalid query |
 | `429` | Start-rate limit or failure cooldown; `Retry-After: 30` is conservative |
 | `502` | Upstream unavailable/rejected request, malformed result, or body/item limit exceeded |
-| `503` | Two attempts already active (`Retry-After: 1`), or service unavailable |
-| `504` | Total attempt deadline exceeded |
+| `503` | Two searches already active (`Retry-After: 1`), or service unavailable |
+| `504` | Request deadline exceeded |
 
 Errors return `result: null` and a fixed `search_*` error code, without reflecting upstream
 messages, keys, queries or identifiers. An upstream failure is never presented as an empty page.
@@ -97,25 +99,15 @@ was for an older scraper workflow that called `/search`, then
 `/server/api?method=get_content_id&infohash=...`. Reverse lookup remains unsupported. Those
 clients need an explicit integration change to use infohash playback selectors.
 
-The named repository now resolves to `visesa84/acestream-scraper`; its
-[November 11 migration](https://github.com/visesa84/acestream-scraper/commit/5668ec41d089)
-queries external search directly and saves `ih:` selectors, removing reverse lookup. That
-current client's search bypasses Outpace; using this adapter requires a client endpoint/parser
-integration change. Neither source inspection nor local tests establish a working deployed
-scraper installation. [#406](https://github.com/jamezrin/outpace-stream/issues/406) tracks the
-remaining client/access qualification requirements.
+The current [acestream-scraper](https://github.com/visesa84/acestream-scraper) client uses
+explicit `ih:` selectors and searches the external service directly. Its search bypasses
+Outpace; using this adapter requires a client endpoint/parser integration change.
+[#406](https://github.com/jamezrin/outpace-stream/issues/406) tracks remaining client
+integration qualification. Local adapter tests do not establish a working deployed scraper
+installation.
 
-## Validation and separate DHT research
-
-Offline tests cover query/response adaptation, flags, limits, cache behavior, failures and
-cancellation. A synthetic local search selection is exercised through verified playback.
-An optional ignored probe uses `OUTPACE_TEST_SEARCH_API_KEY` with an invented query and emits
-no source metadata; it checks discovery access, not public playback or production entitlement.
-No real source identifiers, stream names or private responses belong in fixtures or reports.
-
-DHT peer discovery for a known hash remains supported. Keyword search and an aggregate
-playlist would require a crawler/index and remain independent feasibility research in
-[#213](https://github.com/jamezrin/outpace-stream/issues/213), not a dependency of this adapter.
+DHT discovery for a known hash remains supported. DHT keyword search, a crawler and an
+aggregate playlist are outside this adapter's scope.
 
 ## Related pages
 

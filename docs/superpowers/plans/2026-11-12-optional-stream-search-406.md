@@ -1,5 +1,9 @@
 # Optional Stream Search Implementation Plan
 
+**Superseded backend decision:** The native protocol adaptation in
+`2026-11-12-native-stream-search-406.md` replaces this plan’s public API endpoint/key
+choices. The remaining text records the earlier implementation, not current setup.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver the separately opted-in, bounded stream-name search adapter approved in #406 and documentation PR #407.

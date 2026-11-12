@@ -1723,7 +1723,7 @@ async fn search_selection_plays_verified_synthetic_media_with_explicit_infohash(
         });
     let mut state = ace_state(provider, true);
     state.experimental_ace_compat = false;
-    state.search=Some(crate::acestream_search::offline_service(Ok(serde_json::to_vec(&json!({"total":1,"results":[{"name":"Synthetic Live","items":[{"name":"Synthetic Live","infohash":hash}]}]})).unwrap())));
+    state.search=Some(crate::acestream_search::offline_service(Ok(serde_json::to_vec(&json!({"total":1,"time":0.0,"results":[{"name":"Synthetic Live","items":[{"n":"Synthetic Live","i":hash}]}]})).unwrap())));
     let manager = state.manager.clone();
     let app = router(state);
     let response = app

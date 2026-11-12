@@ -1,6 +1,7 @@
 use super::*;
 use ace_swarm::http_fetch::{self, FetchLimits, FetchPolicy, FetchUrl};
 use bytes::Bytes;
+use rand::seq::SliceRandom;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -20,43 +21,48 @@ const CACHE_BYTES: usize = 8 * MAX_RESPONSE_BYTES;
 
 type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, SearchError>> + Send + 'a>>;
 trait Transport: Send + Sync {
-    fn fetch<'a>(&'a self, query: &'a SearchQuery, key: &'a str) -> FetchFuture<'a>;
+    fn fetch<'a>(&'a self, url: &'a str, budget: &'a mut usize) -> FetchFuture<'a>;
 }
 struct HttpTransport;
 impl Transport for HttpTransport {
-    fn fetch<'a>(&'a self, query: &'a SearchQuery, key: &'a str) -> FetchFuture<'a> {
+    fn fetch<'a>(&'a self, raw_url: &'a str, budget: &'a mut usize) -> FetchFuture<'a> {
         Box::pin(async move {
             let policy = FetchPolicy::default();
-            let url = FetchUrl::parse_source(&request_url(query, key), policy)
+            let url = FetchUrl::parse_source(raw_url, policy)
                 .map_err(|_| SearchError::InvalidSettings)?;
-            // Keep the sender alive until the finite body is read. The caller's
-            // whole-operation timeout/drop also cancels DNS, connect and reads.
+            // Whole-operation/per-host timeout or caller cancellation drops DNS,
+            // connect and body futures. Never use environment proxies or redirects.
             let (_sender, cancel) = watch::channel(false);
             let mut body = http_fetch::open(
                 &url,
                 policy,
                 FetchLimits {
-                    connect_timeout: Duration::from_secs(3),
-                    headers_timeout: Duration::from_secs(5),
+                    connect_timeout: Duration::from_secs(2),
+                    headers_timeout: Duration::from_secs(3),
                     source_response: false,
                 },
                 cancel,
             )
             .await
             .map_err(|_| SearchError::Upstream)?;
-            // The guarded non-resource request refuses every redirect. Never send
-            // the API key to a redirect destination, even another public address.
             let mut bytes = Vec::new();
             while let Some(chunk) = body.next_chunk().await.map_err(|_| SearchError::Upstream)? {
-                if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+                if chunk.len() > *budget {
                     return Err(SearchError::TooLarge);
                 }
+                *budget -= chunk.len();
                 bytes.extend_from_slice(&chunk);
             }
             Ok(bytes)
         })
     }
 }
+const HOSTS: [&str; 3] = [
+    "s5.torrentstream.net",
+    "s5.torrentstream.org",
+    "s5.torrentstream.info",
+];
+const HOST_DEADLINE: Duration = Duration::from_secs(3);
 struct CacheEntry {
     query: SearchQuery,
     expires: Instant,
@@ -92,7 +98,6 @@ impl State {
     }
 }
 pub struct SearchService {
-    settings: SearchSettings,
     transport: Arc<dyn Transport>,
     state: Mutex<State>,
     permits: Semaphore,
@@ -106,7 +111,6 @@ impl SearchService {
             return Err(SearchError::InvalidSettings);
         }
         Ok(Self {
-            settings,
             transport: Arc::new(HttpTransport),
             state: Mutex::new(State {
                 entries: VecDeque::new(),
@@ -141,20 +145,42 @@ impl SearchService {
             state.next_start = Instant::now() + Duration::from_secs(1);
         }
         let result = tokio::time::timeout(DEADLINE, async {
-            let raw = self
-                .transport
-                .fetch(
-                    &query,
-                    self.settings
-                        .key
-                        .as_deref()
-                        .ok_or(SearchError::InvalidSettings)?,
-                )
-                .await?;
-            let result = normalize_response(&raw, &query)?;
-            serde_json::to_vec(&result)
-                .map(Bytes::from)
-                .map_err(|_| SearchError::InvalidResponse)
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| SearchError::InvalidSettings)?
+                .as_secs();
+            // The service expects a numeric nonce. Hexadecimal random tokens are
+            // not interchangeable: server nonce coercion breaks response binding.
+            let nonce = rand::random_range(1..=i64::MAX).to_string();
+            let request = super::native::NativeRequest::new(&query, timestamp, nonce);
+            let mut hosts = HOSTS;
+            hosts.shuffle(&mut rand::rng());
+            let mut budget = MAX_RESPONSE_BYTES;
+            let mut last_error = SearchError::Upstream;
+            for host in hosts {
+                let url = request.url(host);
+                let raw =
+                    tokio::time::timeout(HOST_DEADLINE, self.transport.fetch(&url, &mut budget))
+                        .await
+                        .unwrap_or(Err(SearchError::Timeout));
+                let result = raw
+                    .and_then(|raw| super::native::decode_response(&raw, &request.nonce))
+                    .and_then(|expanded| normalize_response(&expanded, &query))
+                    .and_then(|result| {
+                        serde_json::to_vec(&result)
+                            .map(Bytes::from)
+                            .map_err(|_| SearchError::InvalidResponse)
+                    });
+                match result {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(SearchError::TooLarge) => return Err(SearchError::TooLarge),
+                    Err(error) => last_error = error,
+                }
+                if budget == 0 {
+                    return Err(SearchError::TooLarge);
+                }
+            }
+            Err(last_error)
         })
         .await
         .unwrap_or(Err(SearchError::Timeout));
@@ -165,22 +191,6 @@ impl SearchService {
         }
         result
     }
-}
-fn request_url(query: &SearchQuery, key: &str) -> String {
-    let mut params = form_urlencoded::Serializer::new(String::new());
-    params
-        .append_pair("method", "search")
-        .append_pair("api_version", "1")
-        .append_pair("api_key", key)
-        .append_pair("group_by_channels", "1")
-        .append_pair("show_epg", "0")
-        .append_pair("query", &query.query)
-        .append_pair("page", &query.page.to_string())
-        .append_pair("page_size", &query.page_size.to_string());
-    if let Some(category) = &query.category {
-        params.append_pair("category", category);
-    }
-    format!("https://api.acestream.me/?{}", params.finish())
 }
 #[cfg(test)]
 pub(crate) mod tests;

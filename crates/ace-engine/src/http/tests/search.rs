@@ -13,7 +13,9 @@ async fn services_and_legacy_http_flags_are_independent() {
             let mut state = state();
             state.experimental_ace_compat = compat;
             if services {
-                state.search = Some(offline_service(Ok(br#"{"total":0,"results":[]}"#.to_vec())));
+                state.search = Some(offline_service(Ok(
+                    br#"{"total":0,"time":0.0,"results":[]}"#.to_vec(),
+                )));
             }
             let app = router(state);
             let response = request(app.clone(), "/search").await;
@@ -50,7 +52,9 @@ async fn services_and_legacy_http_flags_are_independent() {
 #[tokio::test]
 async fn malformed_queries_fail_before_consuming_the_upstream_reply() {
     let mut state = state();
-    state.search = Some(offline_service(Ok(br#"{"total":0,"results":[]}"#.to_vec())));
+    state.search = Some(offline_service(Ok(
+        br#"{"total":0,"time":0.0,"results":[]}"#.to_vec(),
+    )));
     let app = router(state);
     for path in [
         "/search?page_size=0",

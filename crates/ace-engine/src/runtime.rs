@@ -289,10 +289,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     } else if let Some(v) = bool_from_env("OUTPACE_EXPERIMENTAL_ACE_COMPAT")? {
         config.experimental_ace_compat = v;
     }
-    config.acestream_services = crate::acestream_search::SearchSettings::from_env(
-        bool_from_env("OUTPACE_COMPAT_ACESTREAM_SERVICES")?.unwrap_or(false),
-        std::env::var("OUTPACE_ACESTREAM_SEARCH_API_KEY"),
-    )?;
+    config.acestream_services = crate::acestream_search::SearchSettings {
+        enabled: bool_from_env("OUTPACE_COMPAT_ACESTREAM_SERVICES")?.unwrap_or(false),
+    };
     if let Some(v) = bool_from_env("OUTPACE_BEP9_CONTENT_ID_FALLBACK")? {
         config.bep9_content_id_fallback = v;
     }
@@ -1460,11 +1459,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn search_services_environment_is_separate_strict_and_redacted() {
+    fn search_services_environment_is_separate_strict_and_needs_no_key() {
         let _lock = ENV_LOCK.lock().unwrap();
         let names = [
             "OUTPACE_COMPAT_ACESTREAM_SERVICES",
-            "OUTPACE_ACESTREAM_SEARCH_API_KEY",
             "OUTPACE_ACE_COMPAT",
             "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
             "OUTPACE_PRIVATE_PEERS",
@@ -1493,14 +1491,8 @@ mod tests {
         std::env::set_var("OUTPACE_ACE_COMPAT", "1");
         assert!(!config_from_env().unwrap().acestream_services.enabled);
         std::env::set_var("OUTPACE_COMPAT_ACESTREAM_SERVICES", "1");
-        assert!(config_from_env().is_err());
-        std::env::set_var("OUTPACE_ACESTREAM_SEARCH_API_KEY", "synthetic-secret");
         let c = config_from_env().unwrap();
         assert!(c.acestream_services.enabled);
-        assert!(!format!("{c:?}").contains("synthetic-secret"));
-        assert!(!serde_json::to_string(&c)
-            .unwrap()
-            .contains("synthetic-secret"));
         std::env::set_var("OUTPACE_ACE_COMPAT", "0");
         assert!(config_from_env().unwrap().acestream_services.enabled);
         for flag in ["", "TRUE", "yes", "2"] {

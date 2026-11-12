@@ -10,20 +10,50 @@ struct Fake {
     delay: Duration,
 }
 impl Transport for Fake {
-    fn fetch<'a>(&'a self, _query: &'a SearchQuery, _key: &'a str) -> FetchFuture<'a> {
+    fn fetch<'a>(&'a self, url: &'a str, budget: &'a mut usize) -> FetchFuture<'a> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
-            self.replies
+            let reply = self
+                .replies
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(Err(SearchError::Upstream))
+                .unwrap_or(Err(SearchError::Upstream))?;
+            let reply = if serde_json::from_slice::<Value>(&reply)
+                .is_ok_and(|v| v.get("results").is_some())
+            {
+                signed_reply(url, &reply)
+            } else {
+                reply
+            };
+            if reply.len() > *budget {
+                return Err(SearchError::TooLarge);
+            }
+            *budget -= reply.len();
+            Ok(reply)
         })
     }
 }
+fn signed_reply(url: &str, inner: &[u8]) -> Vec<u8> {
+    use base64ct::{Base64, Encoding};
+    use sha1::{Digest, Sha1};
+    let params: std::collections::BTreeMap<_, _> =
+        form_urlencoded::parse(url.split_once('?').unwrap().1.as_bytes())
+            .into_owned()
+            .collect();
+    assert_eq!(params["_p"], "outpace");
+    assert!(params["_r"].parse::<i64>().is_ok_and(|n| n > 0));
+    let data = Base64::encode_string(inner);
+    let mut hash = Sha1::new();
+    hash.update(data.as_bytes());
+    hash.update(params["_r"].as_bytes());
+    hash.update(super::super::native::RESPONSE_KEY);
+    serde_json::to_vec(&json!({"data":data,"sign":hex::encode(hash.finalize())})).unwrap()
+}
+
 fn settings() -> SearchSettings {
-    SearchSettings::from_env(true, Ok("synthetic-secret".into())).unwrap()
+    SearchSettings { enabled: true }
 }
 fn service(
     replies: Vec<Result<Vec<u8>, SearchError>>,
@@ -36,7 +66,6 @@ fn service(
     });
     (
         SearchService {
-            settings: settings(),
             transport: fake.clone(),
             state: Mutex::new(State {
                 entries: VecDeque::new(),
@@ -49,46 +78,18 @@ fn service(
     )
 }
 fn empty() -> Result<Vec<u8>, SearchError> {
-    Ok(br#"{"total":0,"results":[]}"#.to_vec())
+    Ok(br#"{"total":0,"time":0.0,"results":[]}"#.to_vec())
 }
 fn query() -> SearchQuery {
     SearchQuery::parse(vec![]).unwrap()
 }
 
 #[test]
-fn key_is_required_only_for_opt_in_and_never_debugged_or_serialized() {
-    let absent = Err(std::env::VarError::NotPresent);
-    assert!(SearchSettings::from_env(false, absent.clone())
-        .unwrap()
-        .validate(false)
-        .is_ok());
-    assert!(SearchSettings::from_env(true, absent).is_err());
-    for key in ["", "contains spaces", "\n", &"x".repeat(513)] {
-        assert!(SearchSettings::from_env(true, Ok(key.into())).is_err());
-    }
-    let settings = settings();
-    assert!(!format!("{settings:?}").contains("synthetic-secret"));
-    assert!(!serde_json::to_string(&settings)
-        .unwrap()
-        .contains("synthetic-secret"));
-    assert!(settings.validate(true).is_err());
+fn opt_in_requires_no_operator_key_and_private_mode_stays_blocked() {
+    let settings = SearchSettings { enabled: true };
     assert!(settings.validate(false).is_ok());
-}
-#[test]
-fn fixed_request_encodes_each_value_and_disables_epg() {
-    let query = SearchQuery::parse(vec![
-        ("query".into(), "a&key=+é".into()),
-        ("page".into(), "2".into()),
-        ("category".into(), "tv & radio".into()),
-    ])
-    .unwrap();
-    let url = request_url(&query, "key&value");
-    assert!(url.starts_with("https://api.acestream.me/?"));
-    assert!(url.contains("query=a%26key%3D%2B%C3%A9"));
-    assert!(url.contains("api_key=key%26value"));
-    assert!(url.contains("category=tv+%26+radio"));
-    assert!(url.contains("group_by_channels=1"));
-    assert!(url.contains("show_epg=0"));
+    assert!(settings.validate(true).is_err());
+    assert!(SearchService::new(SearchSettings::default()).is_err());
 }
 #[tokio::test(start_paused = true)]
 async fn validated_empty_results_are_cached_per_page_and_expire() {
@@ -119,13 +120,23 @@ async fn errors_are_not_cached_as_empty_and_impose_cooldown() {
         Ok(b"invalid JSON".to_vec()),
         Ok(vec![b' '; MAX_RESPONSE_BYTES + 1]),
     ] {
-        let (service, fake) = service(vec![reply, empty()], Duration::ZERO);
+        let mut replies = vec![reply.clone(); 3];
+        let attempts = if reply.as_ref().is_ok_and(|r| r.len() > MAX_RESPONSE_BYTES) {
+            1
+        } else {
+            3
+        };
+        if attempts == 1 {
+            replies.truncate(1);
+        }
+        replies.push(empty());
+        let (service, fake) = service(replies, Duration::ZERO);
         assert!(service.search(query()).await.is_err());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(service.search(query()).await, Err(SearchError::RateLimited));
         tokio::time::advance(Duration::from_secs(30)).await;
         service.search(query()).await.unwrap();
-        assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), attempts + 1);
     }
 }
 #[tokio::test(start_paused = true)]
@@ -183,13 +194,15 @@ pub(crate) fn offline_service(reply: Result<Vec<u8>, SearchError>) -> Arc<Search
     Arc::new(service(vec![reply], Duration::ZERO).0)
 }
 
-/// This probes discovery only. It requires an operator-provided key, never a source registry.
+/// Discovery-only probe; no source registry, account or operator API key.
 #[tokio::test]
-#[ignore = "requires OUTPACE_TEST_SEARCH_API_KEY and public HTTPS access"]
+#[ignore = "requires explicit OUTPACE_TEST_NATIVE_SEARCH=1 and public HTTP access"]
 async fn live_search_uses_guarded_production_transport_without_publishing_metadata() {
-    let key =
-        std::env::var("OUTPACE_TEST_SEARCH_API_KEY").expect("set OUTPACE_TEST_SEARCH_API_KEY");
-    let service = SearchService::new(SearchSettings::from_env(true, Ok(key)).unwrap()).unwrap();
+    assert_eq!(
+        std::env::var("OUTPACE_TEST_NATIVE_SEARCH").as_deref(),
+        Ok("1")
+    );
+    let service = SearchService::new(settings()).unwrap();
     let q = SearchQuery::parse(vec![
         ("query".into(), "outpace_synthetic_search_probe_406".into()),
         ("page_size".into(), "1".into()),
@@ -198,8 +211,47 @@ async fn live_search_uses_guarded_production_transport_without_publishing_metada
     let response = service
         .search(q)
         .await
-        .expect("guarded search request must succeed");
+        .expect("guarded signed native request must succeed");
     let response: Value = serde_json::from_slice(&response).unwrap();
     assert!(response["error"].is_null());
     assert!(response["result"]["results"].as_array().unwrap().len() <= 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn malformed_first_host_fails_over_to_a_valid_signed_page() {
+    let (service, fake) = service(vec![Ok(b"unsigned".to_vec()), empty()], Duration::ZERO);
+    assert!(service.search(query()).await.is_ok());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn all_three_bad_hosts_fail_without_caching_an_empty_page() {
+    let (service, fake) = service(vec![Ok(b"unsigned".to_vec()); 3], Duration::ZERO);
+    assert_eq!(
+        service.search(query()).await,
+        Err(SearchError::InvalidResponse)
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+    assert!(service.state.lock().unwrap().entries.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_host_timeouts_are_bounded_and_fail_over() {
+    let (service, fake) = service(vec![empty(); 3], Duration::from_secs(60));
+    let start = Instant::now();
+    assert_eq!(service.search(query()).await, Err(SearchError::Timeout));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+    assert!(start.elapsed() <= Duration::from_secs(10));
+    assert_eq!(service.permits.available_permits(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failover_shares_one_wire_byte_budget_and_stops_at_the_limit() {
+    let (service, fake) = service(
+        vec![Ok(vec![b' '; 600_000]), Ok(vec![b' '; 600_000]), empty()],
+        Duration::ZERO,
+    );
+    assert_eq!(service.search(query()).await, Err(SearchError::TooLarge));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    assert!(service.state.lock().unwrap().entries.is_empty());
 }
