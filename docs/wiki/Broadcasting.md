@@ -1,6 +1,6 @@
 # Broadcasting
 
-outpace can publish your own MPEG-TS feed as a new signed AceStream live swarm. You feed it
+Outpace can publish your own MPEG-TS feed as a new signed AceStream live swarm. You feed it
 media, and it cuts the feed into pieces, signs them with a per-broadcast key, announces the
 swarm and serves it to peers and local players.
 
@@ -39,7 +39,7 @@ The node must be reachable by peers for others to watch. Publish and forward TCP
 
 ## Feeding media
 
-The input must be **MPEG-TS** (or RTMP, which outpace muxes into TS), preferably with H.264 or
+The input must be **MPEG-TS** (or RTMP, which Outpace muxes into TS), preferably with H.264 or
 HEVC video and AAC audio.
 
 ### Raw HTTP PUT
@@ -51,7 +51,7 @@ curl -T movie.ts http://127.0.0.1:6878/broadcast/my-channel
 ffmpeg -re -i input.mp4 -c copy -f mpegts - | curl -T - http://127.0.0.1:6878/broadcast/my-channel
 ```
 
-The `PUT` returns `200` straight away with `name`, `content_id` and `infohash`, while outpace
+The `PUT` returns `200` straight away with `name`, `content_id` and `infohash`, while Outpace
 keeps reading the body. When the upload ends, the buffered final piece is signed and published.
 
 ### RTMP
@@ -70,7 +70,7 @@ must be exactly the broadcast name. RTMP listens on `127.0.0.1:1935` by default
 
 ### HTTP pull sources
 
-outpace can pull a continuous HTTP(S) MPEG-TS stream and broadcast it, reconnecting on its own
+Outpace can pull a continuous HTTP(S) MPEG-TS stream and broadcast it, reconnecting on its own
 when it drops.
 
 Attach one through the API:
@@ -107,7 +107,7 @@ Things to know:
   see `attempts`, `last_error` and `retry_in_ms`.
 - **Reconnection:** retries back off exponentially from the initial delay to the maximum. The
   backoff resets after 30 seconds of successful streaming. When the source ends, it is treated as
-  a live drop and outpace reconnects.
+  a live drop and Outpace reconnects.
 - **Address policy:** sources on private or loopback addresses are refused unless you set
   `OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE=1`. That switch adds private, loopback and CGNAT
   IPv4 and ULA and loopback IPv6. It never allows link-local or cloud-metadata addresses.
@@ -154,12 +154,12 @@ Security notes:
 
 - Encryption is mandatory; there is no plaintext fallback. The sender picks AES-128, -192 or -256.
 - The passphrase admits a publisher to **any** broadcast name. The `streamid` isn't a credential.
-- Encryption protects only the leg from the publisher into outpace. The broadcast itself is
+- Encryption protects only the leg from the publisher into Outpace. The broadcast itself is
   still public and unencrypted.
 - The passphrase ends up in the publisher's process arguments, so publish from a trusted host.
 - Bind to loopback or a firewalled interface. Unauthenticated UDP still costs some work before
   it is rejected, so rate-limit or allowlist publishers at the network edge.
-- outpace never maps or advertises the SRT port.
+- Outpace never maps or advertises the SRT port.
 - A disconnect is a live break, not end of file. The partial last piece is discarded, and
   reconnecting continues the same identity.
 
@@ -196,7 +196,7 @@ explicitly must match what was stored, or the broadcast fails with
 never a problem; with tiny budgets, startup fails with `broadcast_store_too_small`.
 
 `OUTPACE_TRACKERS` (comma-separated tracker URLs) replaces the default tracker for **new**
-broadcasts. outpace announces itself only to `udp://` trackers. To announce to a tracker on a
+broadcasts. Outpace announces itself only to `udp://` trackers. To announce to a tracker on a
 private address, also set `OUTPACE_TRACKER_ALLOW_NON_GLOBAL=1`.
 
 ## Watching a broadcast
@@ -204,11 +204,11 @@ private address, also set `OUTPACE_TRACKER_ALLOW_NON_GLOBAL=1`.
 | From | How |
 | --- | --- |
 | The same daemon | `http://127.0.0.1:6878/streams/ace/<content_id>`. It resolves locally, with no catalog lookup. |
-| Another outpace daemon | Set `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` on that daemon and play the content id, or play the descriptor URL below. |
+| Another Outpace daemon | Set `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` on that daemon and play the content id, or play the descriptor URL below. |
 | Any client that takes a transport-file URL | `http://<host>:6878/broadcast/<name>` serves the descriptor. |
 
-The `acestream://` link that outpace prints uses the descriptor's own hash as its content id.
-Other outpace daemons can only resolve it through the peer-metadata fallback above, because
+The `acestream://` link that Outpace prints uses the descriptor's own hash as its content id.
+Other Outpace daemons can only resolve it through the peer-metadata fallback above, because
 it isn't registered in the public catalog.
 
 ## Managing broadcasts
@@ -241,7 +241,7 @@ authenticating proxy.
 - **Never restore an old copy of a broadcast's state** while keeping its identity, and never run
   two daemons on one data directory. Either could republish piece numbers that were already
   used.
-- To downgrade outpace while you have an active broadcast, stop it, delete the broadcast, roll
+- To downgrade Outpace while you have an active broadcast, stop it, delete the broadcast, roll
   back, and then create a fresh one.
 
 ## Related pages

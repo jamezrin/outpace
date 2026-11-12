@@ -647,4 +647,4 @@ Compatibility live HLS follows the global `OUTPACE_HLS_AUDIO_NORMALIZE` policy.
 The separate `OUTPACE_LIVE_AUDIO_NORMALIZE` switch normalizes the shared source for
 both TS and HLS, superseding HLS-only conversion when both are set. Per-request
 transcoding hints do not configure conversion. Both switches are off by default;
-see [audio prerequisites and limits](../README.md#live-hls-audio).
+see [audio prerequisites and limits](live-audio.md).

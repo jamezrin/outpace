@@ -6,17 +6,25 @@
   edits made in the GitHub wiki web UI are overwritten.
 -->
 
-# outpace
+# Outpace: the open-source P2P streaming engine
 
-outpace is an open-source, AceStream-compatible streaming engine. It joins public, unencrypted
-AceStream peer-to-peer swarms, downloads the live MPEG-TS media, verifies it, and serves it to
-your players over HTTP: as a continuous MPEG-TS stream, as HLS, or through an optional
-AceStream-style HTTP API that existing apps and add-ons already understand.
+Outpace is a modern, open-source alternative to the Ace Stream engine, written from scratch in
+Rust. It joins public, unencrypted Ace Stream (AceStream) peer-to-peer swarms, verifies the
+live media, and serves it to your players over HTTP:
 
-It is a single self-contained binary (or container image). It does not download or run the
-closed-source AceStream engine.
+- as a continuous MPEG-TS stream;
+- as HLS;
+- through an optional Ace Stream-compatible HTTP API that existing apps and add-ons already
+  understand.
 
-## What outpace does
+It's a single self-contained, headless binary (or container image) for Linux, macOS and
+Windows. It never downloads or runs the proprietary Ace Stream engine. Ace Stream is the network
+it supports today. Outpace is an independent project, not affiliated with or endorsed by Ace
+Stream.
+
+New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
+
+## What Outpace does
 
 - **Plays public AceStream content.** Give it a content id, a transport-file URL, an infohash or
   a magnet link and it streams the result to VLC, mpv, ffmpeg, Jellyfin, Dispatcharr and similar
@@ -30,7 +38,7 @@ closed-source AceStream engine.
 - **Replaces the engine for most clients.** An optional compatibility layer serves the common
   `/ace/getstream`, `/ace/manifest.m3u8` and `/server/api` routes.
 
-## What outpace is not
+## What Outpace is not
 
 - It does **not** play premium, encrypted or protected content. That is a permanent non-goal.
 - It is **not** a full clone of the closed engine. There are no accounts, subscriptions, web UI,
@@ -42,10 +50,12 @@ closed-source AceStream engine.
 
 | If you want to... | Read |
 | --- | --- |
+| Get quick answers | [FAQ](FAQ) |
 | Play a stream in five minutes | [Getting Started](Getting-Started) |
 | Pick a binary, container or source build | [Installation](Installation) |
-| Look up a setting | [Configuration](Configuration) |
-| Point a player or app at outpace | [Playing Streams](Playing-Streams) |
+| Look up a setting | [Configuration](Configuration) (by topic) · [Environment Variables](Environment-Variables) (A–Z) |
+| Use `outpace play`, `broadcast` or other commands | [Command Line](Command-Line) |
+| Point a player or app at Outpace | [Playing Streams](Playing-Streams) |
 | Tune HLS or fix audio for a player | [HLS Output](HLS-Output) |
 | Rewind a live stream | [Timeshift](Timeshift) |
 | Play descriptors that point at an HLS origin | [Managed HLS Origins](Managed-HLS-Origins) |
@@ -76,4 +86,4 @@ real content ids, infohashes or stream names; see
 
 ## License
 
-outpace is licensed under AGPL-3.0-or-later.
+Outpace is licensed under AGPL-3.0-or-later.

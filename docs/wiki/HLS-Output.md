@@ -1,7 +1,7 @@
 # HLS Output
 
-outpace packages live streams into HLS itself. No FFmpeg is needed for this. A player opens
-`/streams/ace/<id>.m3u8` (or the compatibility `/ace/manifest.m3u8`), and outpace cuts the
+Outpace packages live streams into HLS itself. No FFmpeg is needed for this. A player opens
+`/streams/ace/<id>.m3u8` (or the compatibility `/ace/manifest.m3u8`), and Outpace cuts the
 incoming MPEG-TS into segments, keeps a sliding window of them and serves a live playlist.
 
 All HLS viewers of one source share one packager, and that packager shares the download with
@@ -47,7 +47,7 @@ export OUTPACE_HLS_STARTUP_SEGMENTS=2
 export OUTPACE_HLS_SEGMENT_DURATION_MS=4000
 ```
 
-Then start (or restart) outpace from the same shell. With `docker run`, pass each setting
+Then start (or restart) Outpace from the same shell. With `docker run`, pass each setting
 as `-e NAME=value`; with Compose, see [Deployment](Deployment#passing-other-settings).
 
 Constraints the daemon checks at startup:
@@ -96,7 +96,7 @@ must reopen the playlist URL to join the new run.
 
 ## Audio normalisation
 
-By default outpace doesn't touch audio. HLS takes the first AAC (ADTS) audio track; streams
+By default Outpace doesn't touch audio. HLS takes the first AAC (ADTS) audio track; streams
 without one keep their audio as it is. Many streams carry AC3 or MPEG audio (MP2/MP3), which
 browsers, Apple devices and many TVs can't play over HLS. Normalisation fixes that.
 
@@ -120,7 +120,7 @@ With both on, only the shared conversion runs. VOD is never converted, whichever
 ### What it requires
 
 - FFmpeg installed (see [Installation](Installation#ffmpeg)), and `OUTPACE_FFMPEG_PATH` if it
-  isn't on `PATH`. outpace tests it at startup and refuses to start if the test fails.
+  isn't on `PATH`. Outpace tests it at startup and refuses to start if the test fails.
 - An unencrypted 188-byte MPEG-TS stream with:
   - one program;
   - one MPEG-2, H.264 or HEVC video stream;

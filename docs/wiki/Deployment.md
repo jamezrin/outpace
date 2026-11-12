@@ -1,6 +1,6 @@
 # Deployment
 
-This page covers running outpace permanently: with Docker Compose, as a systemd service, behind
+This page covers running Outpace permanently: with Docker Compose, as a systemd service, behind
 a reverse proxy and in an LXC guest. It also covers upgrades, rollback and shutdown.
 
 ## Exposing the API safely
@@ -167,7 +167,7 @@ A proxy is the usual way to add TLS and authentication. Things to get right:
 
 - **Don't buffer streams.** Turn off response buffering, and allow long reads: a live TS
   response never ends.
-- **Native routes** use root-relative URLs (`/streams/...`). Serve outpace at the root of its own
+- **Native routes** use root-relative URLs (`/streams/...`). Serve Outpace at the root of its own
   host name, not under a sub-path.
 - **The compatibility API** builds absolute `http://<Host>/...` URLs from the request's `Host`
   header. It ignores `X-Forwarded-Proto` and `X-Forwarded-Prefix`, and it never returns

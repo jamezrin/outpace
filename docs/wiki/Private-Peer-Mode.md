@@ -3,7 +3,7 @@
 > **Unreleased:** private peer mode and private descriptors are in the `edge` image and builds
 > from `main`. v0.9.0 doesn't have them. See [Releases and Versions](Releases-and-Versions).
 
-Private peer mode restricts outpace to an exact list of peers that you choose. It is for setups
+Private peer mode restricts Outpace to an exact list of peers that you choose. It is for setups
 such as a home gateway that should only pull from your own origin node, or a lab swarm.
 
 In private mode outpace:
@@ -19,7 +19,7 @@ In private mode outpace:
 
 - **The peers you list must accept inbound connections.** A private node only connects
   outward. Two private nodes can't connect to each other.
-- The allowed peer can be a normal outpace node (or any compatible engine) with inbound serving
+- The allowed peer can be a normal Outpace node (or any compatible engine) with inbound serving
   on, that is already playing or broadcasting the stream.
 
 ## Configure it
@@ -45,7 +45,7 @@ A JSON object mapping an alias to a descriptor file:
 - aliases are 1–64 ASCII letters, digits, `_` or `-`;
 - at most 64 entries and 64 KiB in total;
 - paths are absolute, with no symlinks anywhere in them;
-- each file is a regular file of at most 1 MiB, owned by the user outpace runs as, and not
+- each file is a regular file of at most 1 MiB, owned by the user Outpace runs as, and not
   writable by group or others;
 - files are read once at startup. Changing a file later has no effect until you restart;
 - protected or encrypted descriptors are refused at startup;
@@ -53,7 +53,7 @@ A JSON object mapping an alias to a descriptor file:
 - setting it without `OUTPACE_PRIVATE_PEERS` fails startup.
 
 You can use any `.acelive` live descriptor or single-file VOD descriptor, or fetch one from an
-outpace broadcast. Run this as the user outpace runs as, so that user owns the file:
+Outpace broadcast. Run this as the user Outpace runs as, so that user owns the file:
 
 ```bash
 install -d -m 0755 /srv/outpace        # create the directory once (as root if needed)

@@ -4,7 +4,7 @@
 > builds from `main`. v0.9.0 doesn't recognise them. See [Releases and Versions](Releases-and-Versions).
 
 Some AceStream descriptors don't point at a peer-to-peer swarm. Instead they name an ordinary
-HTTP(S) HLS stream (an "origin"). outpace recognises these and never tries to open a swarm for
+HTTP(S) HLS stream (an "origin"). Outpace recognises these and never tries to open a swarm for
 them. What it does next depends on `OUTPACE_MANAGED_HLS`.
 
 ## Default: direct handoff
@@ -14,7 +14,7 @@ origin's URL (and `Cache-Control: no-store`). The player then talks to the origi
 applies to `/streams/...`, `/ace/getstream`, `/ace/manifest.m3u8` and a compat lease's
 `playback_url`.
 
-- outpace makes **no** request to the origin.
+- Outpace makes **no** request to the origin.
 - Compat `format=json` returns `playback_url` (the origin URL), `is_direct: true` and
   `transport: "hls"`, with no stat or command URL.
 - `get_media_files` returns an error telling the client to use an HTTP playback route.
@@ -27,11 +27,11 @@ This is the safe default. Its drawbacks:
 
 ## Managed relay
 
-Set `OUTPACE_MANAGED_HLS=1` (and restart) to have outpace fetch the origin itself and serve it
+Set `OUTPACE_MANAGED_HLS=1` (and restart) to have Outpace fetch the origin itself and serve it
 through a local relay:
 
 - Playback routes redirect to a per-viewer relay URL, `/origin-hls/<token>/0.m3u8`.
-- outpace rewrites the playlists, so variants, alternate renditions, I-frame playlists, segments
+- Outpace rewrites the playlists, so variants, alternate renditions, I-frame playlists, segments
   and init maps all point back at the relay. **Origin URLs and their signatures never reach the
   player.**
 - Media sequence numbers, discontinuities, programme date-time, byte ranges and `ENDLIST` pass
@@ -45,7 +45,7 @@ through a local relay:
 
 Use the relay when:
 
-- players are on a network that can reach outpace but not the internet;
+- players are on a network that can reach Outpace but not the internet;
 - you don't want origin tokens exposed to players;
 - you want [managed-origin replay](Timeshift#managed-origin-replay);
 - you need a single egress point for origin traffic.

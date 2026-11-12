@@ -8,7 +8,7 @@ a running daemon.
 > **Unreleased:** support sources are in the `edge` image and builds from `main`. v0.9.0
 > doesn't have them. See [Releases and Versions](Releases-and-Versions).
 
-A **support source** is a live stream that outpace keeps open and seeds to other peers even
+A **support source** is a live stream that Outpace keeps open and seeds to other peers even
 when no local viewer is watching. Use it to:
 
 - run a node that helps distribute particular public channels;
@@ -30,7 +30,7 @@ The value is a JSON object mapping a name of your choice to a live selector: a c
 - At most 8 entries and 64 KiB.
 - Names are 1–64 ASCII letters, digits, `_` or `-`. Selectors are at most 4096 bytes.
 - Don't put credentials in names.
-- **Requires** `OUTPACE_ENABLE_INBOUND` and `OUTPACE_ENABLE_SEEDING` to be on. outpace won't turn
+- **Requires** `OUTPACE_ENABLE_INBOUND` and `OUTPACE_ENABLE_SEEDING` to be on. Outpace won't turn
   them on for you; startup fails instead.
 - Not compatible with [private peer mode](Private-Peer-Mode).
 - VOD, protected content, and transport URLs on private or loopback addresses are rejected.
@@ -82,7 +82,7 @@ None of these start a stream. Use them for monitoring, never a playback URL.
 | `GET /network-policy` | Public or private peer mode and allowlist size. | edge |
 | `GET /debug/memstats` | Allocator counters (live heap, resident) on 64-bit Linux and macOS builds. | all |
 | `GET /server/api?method=get_status` | `dl` or `idle`, plus `active_sessions`, `occupied_sessions` and `max_sessions`. Needs compat on. | all |
-| `GET /server/api?method=get_version` | outpace version. Needs compat on. | all |
+| `GET /server/api?method=get_version` | Outpace version. Needs compat on. | all |
 
 The provided Compose file health-checks `/healthz` every 10 seconds.
 
@@ -101,7 +101,7 @@ Before a planned restart, check that `/streams` is empty, `/origin-hls/status` s
 
 ## Logs
 
-outpace logs to standard error, one event per line, prefixed with the UTC time of day and a
+Outpace logs to standard error, one event per line, prefixed with the UTC time of day and a
 `[tag]`. See [Troubleshooting](Troubleshooting#reading-the-logs) for what the tags mean. With
 Compose the logs are rotated (3 × 10 MB).
 

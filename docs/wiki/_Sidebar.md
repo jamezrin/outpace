@@ -2,9 +2,12 @@
 
 **Start**
 
+- [FAQ](FAQ)
 - [Getting Started](Getting-Started)
 - [Installation](Installation)
 - [Configuration](Configuration)
+- [Environment Variables](Environment-Variables)
+- [Command Line](Command-Line)
 
 **Watching**
 

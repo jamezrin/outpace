@@ -73,7 +73,7 @@ http://127.0.0.1:6878/streams/ace/0123456789abcdef0123456789abcdef01234567.m3u8
 
 ### Expect a delay before the picture
 
-outpace deliberately buffers before it sends the first byte, so playback rides out swarm
+Outpace deliberately buffers before it sends the first byte, so playback rides out swarm
 hiccups:
 
 - it collects up to 30 seconds of media, waiting no more than 15 seconds after the first media
@@ -132,7 +132,7 @@ See [Playing Streams](Playing-Streams#acestream-compatible-api).
 - `status` shows `peers: 0` for a long time: the channel may be offline, or your network blocks
   peer traffic. Try another stream and turn off VPNs.
 - HLS returns `503`: the stream didn't produce enough segments within the startup timeout.
-- `422` with a reason: the id couldn't be resolved to a stream outpace can play.
+- `422` with a reason: the id couldn't be resolved to a stream Outpace can play.
 
 [Troubleshooting](Troubleshooting) covers these and more.
 
