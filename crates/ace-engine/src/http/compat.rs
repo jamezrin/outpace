@@ -1,4 +1,6 @@
+use super::leases::AceHlsView;
 use super::*;
+use crate::hls::HlsHistoryError;
 use crate::provider::ContentIdPreparation;
 
 pub(super) async fn ace_getstream(
@@ -149,7 +151,8 @@ pub(super) async fn ace_manifest(
                 "is_live": 1,
                 "is_encrypted": 0,
                 "client_session_id": -1,
-                "metadata": stream_metadata_json(session.metadata())
+                "metadata": stream_metadata_json(session.metadata()),
+                "timeshift": timeshift_status(&s, &selection.playback_id, &token).await
             },
             "error": null
         }))
@@ -187,7 +190,72 @@ pub(super) async fn ace_hls_playback_with_timeout(
     let Some(token) = manifest.strip_suffix(".m3u8") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&id, token) else {
+    ace_hls_view_playback(s, headers, &id, token, None, timeout).await
+}
+
+/// `GET /ace/t/{id}/{token}/{generation}.m3u8` — the generation-specific live or replay view
+/// returned by `timeshift_seek`/`timeshift_live`. An Outpace extension, not an engine URL.
+pub(super) async fn ace_timeshift_playback(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path((id, token, manifest)): Path<(String, String, String)>,
+) -> Response {
+    let Some(generation) = manifest
+        .strip_suffix(".m3u8")
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let timeout = s.manager.hls_startup_timeout();
+    ace_hls_view_playback(s, headers, &id, &token, Some(generation), timeout).await
+}
+
+/// Resolve the view a playlist/segment URL may serve. `generation` is `None` for the
+/// original `/ace/m`/`/ace/c` URLs, which are the lease's generation-0 live view. Any
+/// committed transition fences them with 410. A non-HLS lease has no view and keeps its
+/// pre-timeshift live-only behavior on the original URLs.
+fn authorized_view(
+    s: &AppState,
+    id: &str,
+    token: &str,
+    generation: Option<u64>,
+) -> Result<
+    (
+        Option<AceHlsView>,
+        Option<tokio::sync::watch::Receiver<u64>>,
+    ),
+    StatusCode,
+> {
+    match (s.ace_sessions.hls_view(id, token), generation) {
+        (Some((view, changed)), requested) => {
+            if view.generation != requested.unwrap_or(0) {
+                return Err(StatusCode::GONE);
+            }
+            Ok((Some(view), Some(changed)))
+        }
+        (None, None) => Ok((None, None)),
+        (None, Some(_)) => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+fn view_still_current(s: &AppState, id: &str, token: &str, view: &Option<AceHlsView>) -> bool {
+    view.as_ref()
+        .is_none_or(|view| s.ace_sessions.hls_generation_is(id, token, view.generation))
+}
+
+async fn ace_hls_view_playback(
+    s: AppState,
+    headers: HeaderMap,
+    id: &str,
+    token: &str,
+    generation: Option<u64>,
+    timeout: Duration,
+) -> Response {
+    let (view, mut changed) = match authorized_view(&s, id, token, generation) {
+        Ok(view) => view,
+        Err(status) => return status.into_response(),
+    };
+    let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(id, token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(network) = ace_network(&s) else {
@@ -196,16 +264,41 @@ pub(super) async fn ace_hls_playback_with_timeout(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Replay coordinates belong to the packager they were prepared on, never a replacement.
+    if view.as_ref().is_some_and(|view| !view.fits(&pkg)) {
+        return StatusCode::GONE.into_response();
+    }
     // Sampled proxies rewrite absolute engine URLs into their own segment catch-all route.
     // Reuse the playback/control URL policy without trusting additional proxy headers.
-    let prefix = format!("{}/ace/c/{token}", request_base(&headers));
+    let prefix = match generation {
+        None => format!("{}/ace/c/{token}", request_base(&headers)),
+        Some(generation) => format!("{}/ace/tc/{token}/{generation}", request_base(&headers)),
+    };
+    let history = view.as_ref().and_then(|view| view.history.clone());
+    let render = async {
+        match &history {
+            Some(history) => pkg
+                .history_playlist(history, &prefix)
+                .map_err(|error| Box::new(history_error_response(error))),
+            None => await_hls_playlist(&pkg, timeout, &prefix, false).await,
+        }
+    };
+    let view_changed = async {
+        match changed.as_mut() {
+            Some(changed) => {
+                let _ = changed.changed().await;
+            }
+            None => std::future::pending().await,
+        }
+    };
     let playlist = tokio::select! {
         biased;
         _ = cancel.changed() => return StatusCode::NOT_FOUND.into_response(),
+        _ = view_changed => return StatusCode::GONE.into_response(),
         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
             return StatusCode::NOT_FOUND.into_response();
         }
-        playlist = await_hls_playlist(&pkg, timeout, &prefix, false) => playlist,
+        playlist = render => playlist,
     };
     // Removal/replacement and authorization take precedence over both snapshots and 503s.
     // Revalidate the lease after the asynchronous manager lookup as well.
@@ -213,9 +306,12 @@ pub(super) async fn ace_hls_playback_with_timeout(
     if !current.is_some_and(|current| Arc::ptr_eq(&current, &pkg))
         || *cancel.borrow()
         || Instant::now() >= expires_at
-        || s.ace_sessions.validate(&id, token).as_deref() != Some(session_key.as_str())
+        || s.ace_sessions.validate(id, token).as_deref() != Some(session_key.as_str())
     {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if !view_still_current(&s, id, token, &view) {
+        return StatusCode::GONE.into_response();
     }
     let playlist = match playlist {
         Ok(playlist) => playlist,
@@ -236,14 +332,38 @@ pub(super) async fn ace_hls_segment(
     State(s): State<AppState>,
     Path((token, segment)): Path<(String, String)>,
 ) -> Response {
+    ace_hls_view_segment(s, &token, None, &segment).await
+}
+
+/// `GET /ace/tc/{token}/{generation}/{seq}.ts` — a segment of a generation-specific view.
+pub(super) async fn ace_timeshift_segment(
+    State(s): State<AppState>,
+    Path((token, generation, segment)): Path<(String, String, String)>,
+) -> Response {
+    let Ok(generation) = generation.parse::<u64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    ace_hls_view_segment(s, &token, Some(generation), &segment).await
+}
+
+async fn ace_hls_view_segment(
+    s: AppState,
+    token: &str,
+    generation: Option<u64>,
+    segment: &str,
+) -> Response {
     let Some(seq) = segment
         .strip_suffix(".ts")
         .and_then(|value| value.parse::<u64>().ok())
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((_, session_key)) = s.ace_sessions.validate_token(&token) else {
+    let Some((playback_id, session_key)) = s.ace_sessions.validate_token(token) else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    let view = match authorized_view(&s, &playback_id, token, generation) {
+        Ok((view, _)) => view,
+        Err(status) => return status.into_response(),
     };
     let Some(network) = ace_network(&s) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -252,15 +372,32 @@ pub(super) async fn ace_hls_segment(
         return StatusCode::NOT_FOUND.into_response();
     };
     if s.ace_sessions
-        .validate_token(&token)
+        .validate_token(token)
         .map(|(_, key)| key)
         .as_deref()
         != Some(session_key.as_str())
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match pkg.compatibility_segment(seq) {
-        Some(bytes) => (
+    if !view_still_current(&s, &playback_id, token, &view)
+        || view.as_ref().is_some_and(|view| !view.fits(&pkg))
+    {
+        return StatusCode::GONE.into_response();
+    }
+    let bytes = match view.as_ref().and_then(|view| view.history.as_ref()) {
+        Some(history) => {
+            if !(history.first_seq..=history.last_seq).contains(&seq) {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            // A pruned replay segment is 410: never substitute live media.
+            pkg.history_segment(history, seq)
+        }
+        None => pkg
+            .compatibility_segment(seq)
+            .ok_or(HlsHistoryError::Unavailable),
+    };
+    match bytes {
+        Ok(bytes) => (
             [
                 (header::CONTENT_TYPE, "video/mp2t"),
                 (header::CACHE_CONTROL, "no-store"),
@@ -268,8 +405,19 @@ pub(super) async fn ace_hls_segment(
             bytes,
         )
             .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => history_error_response(error),
     }
+}
+
+fn history_error_response(error: HlsHistoryError) -> Response {
+    let status = match error {
+        HlsHistoryError::Gone => StatusCode::GONE,
+        HlsHistoryError::NotReady => StatusCode::SERVICE_UNAVAILABLE,
+        HlsHistoryError::Disabled => StatusCode::CONFLICT,
+        HlsHistoryError::Unavailable => return StatusCode::NOT_FOUND.into_response(),
+        HlsHistoryError::InvalidTarget => StatusCode::BAD_REQUEST,
+    };
+    (status, error.to_string()).into_response()
 }
 
 /// Acquire a lease's source, unless the lease is stopped or expires first. `None` means the
@@ -402,6 +550,7 @@ pub(super) async fn ace_stat(
     };
 
     let stats = session.stats().await;
+    let timeshift = timeshift_status(&s, &id, &token).await;
     Json(json!({
         "response": {
             "status": "dl",
@@ -416,7 +565,8 @@ pub(super) async fn ace_stat(
             "is_encrypted": 0,
             "playback_session_id": token,
             "client_session_id": -1,
-            "metadata": stream_metadata_json(session.metadata())
+            "metadata": stream_metadata_json(session.metadata()),
+            "timeshift": timeshift
         },
         "error": null
     }))
@@ -424,21 +574,169 @@ pub(super) async fn ace_stat(
 
 pub(super) async fn ace_command(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path((id, token)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
-    if s.ace_sessions.validate(&id, &token).is_none() {
-        return Json(json!({ "response": null, "error": "invalid or expired playback session" }));
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    // A map extractor silently keeps one value for a duplicated key. A command must not run
+    // a different seek or stop after a proxy or client reorders ambiguous input.
+    let mut params = HashMap::with_capacity(pairs.len());
+    let body = if pairs
+        .into_iter()
+        .any(|(key, value)| params.insert(key, value).is_some())
+    {
+        json!({ "response": null, "error": "duplicate command parameter" })
+    } else {
+        ace_command_json(&s, &headers, &id, &token, &params).await
+    };
+    ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
+
+fn command_error(error: &str) -> serde_json::Value {
+    json!({ "response": null, "error": error })
+}
+
+async fn ace_command_json(
+    s: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    token: &str,
+    params: &HashMap<String, String>,
+) -> serde_json::Value {
+    const EXPIRED: &str = "invalid or expired playback session";
+    if s.ace_sessions.validate(id, token).is_none() {
+        return command_error(EXPIRED);
     }
-    if params.get("method").is_some_and(|m| m == "stop") {
-        if !s.ace_sessions.revoke(&id, &token) {
-            return Json(
-                json!({ "response": null, "error": "invalid or expired playback session" }),
-            );
+    let method = params.get("method").map(String::as_str).unwrap_or("");
+    match method {
+        "stop" => {
+            if !s.ace_sessions.revoke(id, token) {
+                return command_error(EXPIRED);
+            }
+            return json!({ "response": "ok", "error": null });
         }
-        return Json(json!({ "response": "ok", "error": null }));
+        "timeshift_status" => {
+            return json!({ "response": timeshift_status(s, id, token).await, "error": null });
+        }
+        "timeshift_seek" | "timeshift_live" => {}
+        _ => return command_error("unknown or missing method"),
     }
-    Json(json!({ "response": null, "error": "missing method" }))
+    let Some((view, _)) = s.ace_sessions.hls_view(id, token) else {
+        return command_error("timeshift requires an HLS playback session");
+    };
+    if let Some(expected) = params.get("generation") {
+        if parse_unsigned(expected) != Some(view.generation) {
+            return command_error("playback generation changed");
+        }
+    }
+    let Some(network) = ace_network(s) else {
+        return command_error("no ace network registered");
+    };
+    let Some(session_key) = s.ace_sessions.validate(id, token) else {
+        return command_error(EXPIRED);
+    };
+    let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
+        return command_error("playback source expired");
+    };
+    // Preparation never changes the current view; only a successful commit does. A seek is
+    // a finite replay of already-completed retained segments, not a peer-network archive.
+    let history = if method == "timeshift_seek" {
+        let prepared = match (params.get("back"), params.get("position_ms")) {
+            (Some(back), None) => {
+                let Some(back) = back
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|back| back.is_finite() && *back > 0.0 && *back <= 31_536_000.0)
+                else {
+                    return command_error("back must be finite positive seconds");
+                };
+                pkg.prepare_history(Duration::from_secs_f64(back))
+            }
+            (None, Some(position)) => {
+                let Some(position) = parse_unsigned(position) else {
+                    return command_error(
+                        "position_ms must be unsigned integer media milliseconds",
+                    );
+                };
+                pkg.prepare_history_at(position)
+            }
+            _ => return command_error("specify exactly one of back or position_ms"),
+        };
+        match prepared {
+            Ok(history) => Some(history),
+            Err(error) => return command_error(&error.to_string()),
+        }
+    } else {
+        if params.contains_key("back") || params.contains_key("position_ms") {
+            return command_error("seek targets require timeshift_seek");
+        }
+        if pkg.playlist_snapshot("", false).is_err() {
+            return command_error("live playback is not ready");
+        }
+        None
+    };
+    let Some(view) = s
+        .ace_sessions
+        .replace_hls_view(id, token, view.generation, &pkg, history)
+    else {
+        return command_error("playback generation changed or expired");
+    };
+    let playback_url = format!(
+        "{}/ace/t/{id}/{token}/{}.m3u8",
+        request_base(headers),
+        view.generation
+    );
+    json!({
+        "response": {
+            "playback_url": playback_url,
+            "reload_required": true,
+            "view": timeshift_view_json(&view),
+            "history": pkg.history_status(),
+        },
+        "error": null
+    })
+}
+
+/// Strict unsigned decimal: no sign, whitespace, fraction or exponent.
+fn parse_unsigned(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
+}
+
+fn timeshift_view_json(view: &AceHlsView) -> serde_json::Value {
+    json!({
+        "generation": view.generation,
+        "mode": if view.history.is_some() { "replay" } else { "live" },
+        "snapshot": view.history,
+    })
+}
+
+async fn timeshift_status(s: &AppState, id: &str, token: &str) -> serde_json::Value {
+    if s.ace_sessions.hls_view(id, token).is_none() {
+        return json!({ "supported": false, "reason": "requires_hls_session" });
+    }
+    let Some(network) = ace_network(s) else {
+        return json!({ "supported": false, "reason": "no_ace_network" });
+    };
+    let Some(key) = s.ace_sessions.validate(id, token) else {
+        return json!({ "supported": false, "reason": "session_expired" });
+    };
+    let Some(pkg) = s.manager.get_hls(&network, &key).await else {
+        return json!({ "supported": false, "reason": "source_expired" });
+    };
+    let Some((view, _)) = s.ace_sessions.hls_view(id, token) else {
+        return json!({ "supported": false, "reason": "session_expired" });
+    };
+    json!({
+        "supported": true,
+        "kind": "finite_memory_replay",
+        "persistent": false,
+        "peer_archive": false,
+        "utc_seek": false,
+        "view": timeshift_view_json(&view),
+        "history": pkg.history_status(),
+    })
 }
 
 /// `GET /server/api` — the official-engine JSON control API (compatibility subset). Dispatches on

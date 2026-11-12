@@ -21,6 +21,7 @@ mod native;
 mod protection;
 mod server_api;
 mod support;
+mod timeshift;
 mod vod;
 
 fn state() -> AppState {
