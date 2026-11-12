@@ -1,6 +1,6 @@
 # Installation
 
-outpace ships as prebuilt binaries, as a multi-architecture container image, and as source you
+Outpace ships as prebuilt binaries, as a multi-architecture container image, and as source you
 can build yourself. All three run the same program: `outpace serve` starts the daemon.
 
 ## Choose a version
@@ -64,7 +64,7 @@ outpace serve
 
 ### ARM64 with 16 KiB memory pages
 
-outpace doesn't bundle the precompiled Android libraries that break some other engines on
+Outpace doesn't bundle the precompiled Android libraries that break some other engines on
 16 KiB-page kernels, but 16 KiB-page support has not been verified on real hardware. If you run
 one (for example some Asahi Linux or Raspberry Pi 5 kernels), please report whether it works.
 
@@ -98,7 +98,7 @@ docker run -d --name outpace --restart unless-stopped \
 ```
 
 Publish HTTP and RTMP on `127.0.0.1` unless a firewall or authenticating proxy protects them.
-Only the peer port is meant to face the internet. outpace has no UDP listener, so there is
+Only the peer port is meant to face the internet. Outpace has no UDP listener, so there is
 nothing to publish for UDP.
 
 The image doesn't include FFmpeg; see [FFmpeg](#ffmpeg) below.
@@ -155,7 +155,7 @@ SRT is newer than v0.9.0, so build from `main`.
 
 ## FFmpeg
 
-outpace doesn't need FFmpeg to play, package HLS or broadcast. It only runs FFmpeg when you turn
+Outpace doesn't need FFmpeg to play, package HLS or broadcast. It only runs FFmpeg when you turn
 on audio normalisation with `OUTPACE_HLS_AUDIO_NORMALIZE` (all versions) or
 `OUTPACE_LIVE_AUDIO_NORMALIZE` (unreleased: `edge` and builds from `main` only); see
 [HLS Output](HLS-Output#audio-normalisation). With both off, it never looks for FFmpeg.
@@ -164,7 +164,7 @@ If you turn normalisation on:
 
 - Install an FFmpeg with MPEG-TS mux/demux, the native AAC encoder, MP2/MP3/AC3 decoders and pipe
   support. Distribution packages normally include all of these.
-- outpace checks the FFmpeg at startup and runs a short test conversion before it opens any
+- Outpace checks the FFmpeg at startup and runs a short test conversion before it opens any
   listener. Startup fails if the check fails.
 - Point `OUTPACE_FFMPEG_PATH` at the executable if it isn't on `PATH`. It must be FFmpeg itself,
   not a wrapper script that starts other processes.
@@ -178,7 +178,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 USER outpace
 ```
 
-## Where outpace keeps its data
+## Where Outpace keeps its data
 
 `OUTPACE_DATA_DIR` holds:
 

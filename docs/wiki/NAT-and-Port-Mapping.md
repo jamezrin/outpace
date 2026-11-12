@@ -1,22 +1,22 @@
 # NAT and Port Mapping
 
 Most home and office connections sit behind a router doing NAT. Without help, peers on the
-internet can't open connections to you. Playback still works, because outpace connects out to
+internet can't open connections to you. Playback still works, because Outpace connects out to
 peers, but you won't receive inbound peers, and your [broadcasts](Broadcasting) and seeding are
 much less useful.
 
-To accept inbound peers, **external TCP port 8621 must reach outpace's TCP port 8621.** The
-port outpace listens on (`OUTPACE_PEER_LISTEN`) is the port it announces, so all three must
+To accept inbound peers, **external TCP port 8621 must reach Outpace's TCP port 8621.** The
+port Outpace listens on (`OUTPACE_PEER_LISTEN`) is the port it announces, so all three must
 match: the listen port, the announced port and the router's external port.
 
 ## Option 1: a manual port forward (recommended)
 
 In your router, forward **TCP** external port `8621` to the LAN address of the machine running
-outpace, port `8621`. Give that machine a fixed LAN address (a DHCP reservation, or a static
+Outpace, port `8621`. Give that machine a fixed LAN address (a DHCP reservation, or a static
 address outside the DHCP pool).
 
 - With Docker, forward to the **Docker host**, and publish `8621:8621/tcp`. Keep the host and
-  container ports the same. Remapping only the host side makes outpace announce a port nobody
+  container ports the same. Remapping only the host side makes Outpace announce a port nobody
   can reach.
 - Allow inbound TCP 8621 in the host firewall too (ufw, firewalld, nftables, Windows Firewall).
 - Some routers take a minute or so before a new rule applies.
@@ -39,7 +39,7 @@ your copy of the file: an override file can add a port mapping but can't remove 
 
 ## Option 2: automatic mapping with UPnP or NAT-PMP
 
-outpace can ask the router to open the port itself:
+Outpace can ask the router to open the port itself:
 
 ```bash
 export OUTPACE_ENABLE_PORT_MAPPING=1
@@ -53,11 +53,11 @@ in `compose.override.yml`; see [Deployment](Deployment#passing-other-settings).
 
 - It only acts when inbound serving is on.
 - `auto` tries UPnP-IGD first, then NAT-PMP.
-- Mappings are leased and renewed, and removed when outpace stops.
-- A failure is logged and outpace carries on without a mapping.
+- Mappings are leased and renewed, and removed when Outpace stops.
+- A failure is logged and Outpace carries on without a mapping.
 
-**Use it only when outpace owns the machine's LAN address**: a binary running directly on the
-host, or a container with host networking. In normal Docker bridge networking, outpace sees the
+**Use it only when Outpace owns the machine's LAN address**: a binary running directly on the
+host, or a container with host networking. In normal Docker bridge networking, Outpace sees the
 container network's gateway rather than your router, so mapping can't work. Use a manual forward
 there.
 
@@ -78,7 +78,7 @@ Many routers don't support hairpin NAT, so tests from inside the LAN are mislead
 timeout 8 bash -c 'echo > /dev/tcp/<your-public-ip>/8621' && echo open || echo closed
 ```
 
-An open port only proves the path. outpace's own check is the `[reachability]` log line, which
+An open port only proves the path. Outpace's own check is the `[reachability]` log line, which
 appears every two minutes:
 
 ```text
@@ -92,7 +92,7 @@ usual causes.
 ## Double NAT and CGNAT
 
 If your router's WAN address is itself private (for example `100.64.x.x` or `10.x.x.x`), your
-ISP is doing carrier-grade NAT, and no forward on your router can make you reachable. outpace
+ISP is doing carrier-grade NAT, and no forward on your router can make you reachable. Outpace
 warns when it notices:
 
 ```text
@@ -112,7 +112,7 @@ Full-tunnel VPNs usually break inbound peers, and some also disturb DHT and UDP 
 Cloudflare WARP in particular installs a firewall that drops inbound connections from public
 addresses and sends replies into the tunnel. Even a correct forward never completes a handshake.
 [Deployment](Deployment#lxc-guest-behind-cloudflare-warp) describes a tested workaround. If you
-don't need WARP for outpace, run outpace outside it.
+don't need WARP for Outpace, run Outpace outside it.
 
 ## Related pages
 

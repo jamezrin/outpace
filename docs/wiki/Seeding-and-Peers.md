@@ -1,7 +1,7 @@
 # Seeding and Peers
 
 AceStream is peer-to-peer: everyone watching a stream also helps distribute it. By default
-outpace behaves like the original engine and is a full participant. It downloads from peers,
+Outpace behaves like the original engine and is a full participant. It downloads from peers,
 uploads to them, accepts inbound connections and announces itself.
 
 ## The three modes
@@ -40,16 +40,16 @@ Playback works in every mode.
 ## The peer port
 
 - `OUTPACE_PEER_LISTEN` (default `0.0.0.0:8621`) is a **TCP** listener on all interfaces.
-- outpace announces this same port to trackers and the DHT, so whatever forwards traffic to it
+- Outpace announces this same port to trackers and the DHT, so whatever forwards traffic to it
   must use the same external port.
 - There is **no UDP listener**. DHT and tracker traffic use outbound UDP from random ports, so
   allow outbound UDP and its replies, but don't forward UDP 8621.
-- outpace doesn't implement the legacy port 62062 protocol.
+- Outpace doesn't implement the legacy port 62062 protocol.
 - The listener only runs while inbound serving is on.
 
 ## What gets seeded
 
-outpace keeps recently downloaded pieces of each stream so it can serve them to peers:
+Outpace keeps recently downloaded pieces of each stream so it can serve them to peers:
 
 | Setting | Default | Effect |
 | --- | --- | --- |
@@ -71,7 +71,7 @@ viewer leaves.
 
 ### Process memory after playback
 
-On Linux, outpace returns freed memory to the system in the background, so resident memory drops
+On Linux, Outpace returns freed memory to the system in the background, so resident memory drops
 back after a stream ends. On macOS memory is released more lazily. Steady growth while streams
 are running is mostly the per-stream seeding store and buffers, which are bounded by the
 settings above.
@@ -88,7 +88,7 @@ Each limit is checked when a peer connects:
 
 ### Unchoke slots
 
-Among the peers that want data from a stream, outpace lets the first `OUTPACE_MAX_UNCHOKED`
+Among the peers that want data from a stream, Outpace lets the first `OUTPACE_MAX_UNCHOKED`
 download, plus one rotating "optimistic" slot that moves to another peer about every 10
 seconds. That gives newcomers a chance. With `0`, only the optimistic slot is used. Metadata
 requests (peers asking for the descriptor) don't need a slot.
@@ -106,7 +106,7 @@ requests (peers asking for the descriptor) don't need a slot.
 
 ## Checking that peers can reach you
 
-Every two minutes, outpace logs whether peers can reach it:
+Every two minutes, Outpace logs whether peers can reach it:
 
 ```text
 [reachability] externally reachable: yes (2 inbound peer(s), ...)

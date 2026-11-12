@@ -54,10 +54,10 @@ Their stderr line counts include mid-GOP startup and timestamp/discontinuity
 messages and are not standardized error scores.
 
 The 23.31-second first-byte difference is baseline evidence for the existing
-startup work ([#166](https://github.com/jamezrin/outpace/issues/166),
-[#167](https://github.com/jamezrin/outpace/issues/167)); this run does not assign all
+startup work ([#166](https://github.com/jamezrin/outpace-stream/issues/166),
+[#167](https://github.com/jamezrin/outpace-stream/issues/167)); this run does not assign all
 of that difference to either cause. Repeated SDT continuity belongs to
-[#172](https://github.com/jamezrin/outpace/issues/172). No Rust behavior was changed.
+[#172](https://github.com/jamezrin/outpace-stream/issues/172). No Rust behavior was changed.
 This run did not reproduce a stale-prefix or permanent no-upstream recovery
 failure and does not prove those existing issues resolved.
 

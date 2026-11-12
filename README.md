@@ -1,90 +1,174 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
-    <img alt="outpace: public AceStream swarms in, MPEG-TS and HLS out" src="docs/assets/hero-light.svg" width="100%">
+    <img alt="Outpace: open-source peer-to-peer streaming engine, Ace Stream compatible" src="docs/assets/hero-light.svg" width="100%">
   </picture>
 </p>
 
+<h1 align="center">Outpace — the open-source P2P streaming engine</h1>
+
 <p align="center">
-  <a href="https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jamezrin/outpace-stream?sort=semver"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/jamezrin/outpace-stream/total"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/jamezrin/outpace-stream?style=flat"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jamezrin/outpace-stream?sort=semver"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://www.rust-lang.org"><img alt="Written in Rust" src="https://img.shields.io/badge/written%20in-Rust-orange?logo=rust"></a>
 </p>
 
-**An open-source, AceStream-compatible engine written in Rust.** outpace joins public,
-unencrypted AceStream swarms and serves the media to your player as MPEG-TS or HLS. It runs on
-Linux, macOS and Windows, and in Docker. It doesn't need the closed-source engine.
+<p align="center">
+  <b>A modern, open-source alternative to the Ace Stream engine, written from scratch in Rust.</b><br>
+  Watch, broadcast and seed live streams on Ace Stream peer-to-peer networks with one headless
+  binary, without any proprietary engine binaries.
+</p>
 
-[Wiki](https://github.com/jamezrin/outpace-stream/wiki)
-· [Getting started](https://github.com/jamezrin/outpace-stream/wiki/Getting-Started)
-· [Configuration](https://github.com/jamezrin/outpace-stream/wiki/Configuration)
-· [Command line](https://github.com/jamezrin/outpace-stream/wiki/Command-Line)
-· [HTTP API](docs/native-api.md)
-· [Releases](https://github.com/jamezrin/outpace-stream/releases)
-· [Troubleshooting](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting)
+<p align="center">
+  <a href="https://github.com/jamezrin/outpace-stream/wiki"><b>Documentation</b></a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="https://github.com/jamezrin/outpace-stream/wiki/Installation">Installation</a> ·
+  <a href="https://github.com/jamezrin/outpace-stream/wiki/FAQ">FAQ</a> ·
+  <a href="docs/native-api.md">HTTP API</a> ·
+  <a href="https://github.com/jamezrin/outpace-stream/releases">Releases</a>
+</p>
 
-## Start here
+## What is Outpace?
 
-| You want to... | Read |
-| --- | --- |
-| Play a stream in five minutes | [Getting started](https://github.com/jamezrin/outpace-stream/wiki/Getting-Started) |
-| Install a binary (Linux x64/ARM64/ARMv7, macOS, Windows) or the container | [Installation](https://github.com/jamezrin/outpace-stream/wiki/Installation) |
-| Run it with Compose, systemd or behind a proxy | [Deployment](https://github.com/jamezrin/outpace-stream/wiki/Deployment) |
-| Point VLC, mpv, Jellyfin, Dispatcharr or an AceStream app at it | [Playing streams](https://github.com/jamezrin/outpace-stream/wiki/Playing-Streams) |
-| Look up a setting or command | [Configuration](https://github.com/jamezrin/outpace-stream/wiki/Configuration) · [Environment variables](https://github.com/jamezrin/outpace-stream/wiki/Environment-Variables) · [Command line](https://github.com/jamezrin/outpace-stream/wiki/Command-Line) |
-| Replace an existing AceStream engine | [Migrating](https://github.com/jamezrin/outpace-stream/wiki/Migrating-from-AceStream-Engine) |
-| Publish your own stream | [Broadcasting](https://github.com/jamezrin/outpace-stream/wiki/Broadcasting) |
-| Integrate over HTTP | [Native API](docs/native-api.md) · [AceStream-compatible subset](docs/protocol/compat-matrix.md) |
-| Contribute | [Development](docs/development.md) · [AGENTS.md](AGENTS.md) |
+Outpace is an open-source streaming engine for peer-to-peer live video. It joins public,
+unencrypted Ace Stream (AceStream) swarms, verifies the signed media, and serves it over plain
+HTTP as MPEG-TS or HLS. Anything that can open a URL can then play it: VLC, mpv, Jellyfin,
+Dispatcharr, or an app built for the official AceStream engine.
 
-## What it does
+It runs as a self-hosted server (`outpace serve`) or as a one-shot command (`outpace play`), on
+Linux, macOS, Windows or in Docker. Ace Stream is the peer-to-peer network it supports today;
+the engine is built around pluggable provider networks, so it can grow beyond that protocol.
+
+Outpace is an independent project. It isn't affiliated with or endorsed by Ace Stream, and it
+uses Ace Stream names only to describe protocol compatibility.
+
+## Why Outpace?
+
+- **Fully open source.** AGPL-3.0-or-later, written from scratch in Rust, with the protocol work
+  [documented in the repository](docs/protocol/wire-protocol.md).
+- **No proprietary engine at runtime.** Outpace never downloads or runs the official Ace Stream
+  engine or its libraries.
+- **Headless by design.** A daemon and a CLI, configured with environment variables, with no
+  desktop UI. That suits servers, containers, NAS boxes and single-board computers.
+- **A real command line.** `outpace play` pipes a stream to standard output, and
+  `outpace broadcast` publishes one.
+- **Native HTTP API and HLS.** Stream URLs for TS and HLS, so Ace Stream content plays on
+  HLS-only devices, plus per-stream status and optional AAC audio conversion.
+- **Works with existing Ace Stream content.** Content ids, `acestream://` links and transport
+  files play directly. Apps that use the engine's HTTP API can connect through a
+  [documented compatible subset](docs/protocol/compat-matrix.md).
+- **Broadcast and share.** Publish your own signed live stream from HTTP, RTMP or an HTTP pull
+  source. By default Outpace also seeds what it plays back to other peers.
+- **Cross-platform builds.** Prebuilt binaries for Linux x86_64, ARM64 and ARMv7, macOS Intel and
+  Apple silicon, and Windows x64 and ARM64, plus a container image for amd64, arm64 and arm/v7.
+
+What it isn't:
+
+- It doesn't play premium or encrypted content.
+- It has no accounts, search, EPG or web UI.
+- The compatible API is a subset, not full parity with the official engine.
+
+See [differences from the official engine](https://github.com/jamezrin/outpace-stream/wiki/Migrating-from-AceStream-Engine#whats-different).
+
+## Quick start
+
+### 1. Install
+
+Download the archive for your platform from the
+[latest release](https://github.com/jamezrin/outpace-stream/releases/latest). For example, on
+Linux x86_64:
+
+```bash
+curl -LO https://github.com/jamezrin/outpace-stream/releases/download/v0.9.0/outpace-0.9.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf outpace-0.9.0-x86_64-unknown-linux-musl.tar.gz
+sudo install -m 0755 outpace-0.9.0-x86_64-unknown-linux-musl/outpace /usr/local/bin/outpace
+```
+
+On Windows, unzip the archive and use `outpace.exe`. The
+[installation guide](https://github.com/jamezrin/outpace-stream/wiki/Installation) covers
+checksum verification, every platform and building from source.
+
+### 2. Start the engine
+
+```bash
+outpace serve
+# outpace: listening on http://127.0.0.1:6878 networks=["ace"]
+```
+
+### 3. Play a stream
+
+Open the stream URL in VLC or any HLS-capable player. Replace the obviously fake id with the
+content id of a public stream you're allowed to watch:
+
+```bash
+vlc "http://127.0.0.1:6878/streams/ace/0123456789abcdef0123456789abcdef01234567"       # MPEG-TS
+mpv "http://127.0.0.1:6878/streams/ace/0123456789abcdef0123456789abcdef01234567.m3u8"  # HLS
+```
+
+Or play an `acestream://` link straight from the command line, with no server running:
+
+```bash
+outpace play acestream://0123456789abcdef0123456789abcdef01234567 > live.ts
+outpace play acestream://0123456789abcdef0123456789abcdef01234567 | vlc -
+```
+
+A cold start takes 20–60 seconds while Outpace finds peers and buffers.
+
+### Run it in Docker
+
+```bash
+docker run -d --name outpace -p 127.0.0.1:6878:6878 -p 8621:8621/tcp \
+  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0
+```
+
+For a production setup, use the repository's [`compose.yml`](compose.yml) and
+[`.env.example`](.env.example); see [Deployment](https://github.com/jamezrin/outpace-stream/wiki/Deployment).
+
+### Connect your apps
+
+- **Jellyfin, Dispatcharr and other IPTV tools:** put the stream URL above in your M3U playlist.
+  No handshake is needed.
+- **Apps built for the Ace Stream engine:** start Outpace with `OUTPACE_ACE_COMPAT=1`. They can
+  then use the supported `/ace/getstream?id=…` and `/server/api` routes.
+
+The HTTP API has no authentication, so keep it on `127.0.0.1` or behind a proxy. Only TCP 8621
+(the peer port) is meant to be public. See
+[Playing streams](https://github.com/jamezrin/outpace-stream/wiki/Playing-Streams) and
+[NAT and port mapping](https://github.com/jamezrin/outpace-stream/wiki/NAT-and-Port-Mapping).
+
+## Features
 
 | Capability | Behaviour |
 | --- | --- |
-| Live playback | Resolves content ids, finds peers, verifies signed pieces and serves continuous MPEG-TS. Viewers of one stream share a single download. |
-| HLS | Built-in live HLS packaging. Optional audio conversion to AAC for picky players. |
-| AceStream-compatible API | Opt-in subset (`OUTPACE_ACE_COMPAT=1`): `/ace/getstream`, `/ace/manifest.m3u8`, `/server/api`. See the [contract](docs/protocol/compat-matrix.md). |
+| Live playback | Resolves content ids, finds peers through trackers and the DHT, verifies signed pieces and serves continuous MPEG-TS. Viewers of one stream share a single download. |
+| HLS | Built-in live HLS packaging, so no FFmpeg is needed. Optional audio conversion to AAC for players that need it. |
+| Ace Stream-compatible API | Opt-in subset (`OUTPACE_ACE_COMPAT=1`): `/ace/getstream`, `/ace/manifest.m3u8`, `/server/api`. See the [contract](docs/protocol/compat-matrix.md). |
 | VOD | Single-file VOD with per-piece verification and byte-range seeking. |
-| Peer participation | Uploads and accepts inbound peers by default, like the original engine. Download-only is one setting away. |
-| Broadcasting | Publish your own signed swarm from HTTP, RTMP, an HTTP pull source or encrypted SRT. |
+| Peer participation | Uploads and accepts inbound peers by default, like the official engine. Download-only mode is one setting away. |
+| Broadcasting | Publish your own signed swarm from HTTP, RTMP or an HTTP pull source, or from encrypted SRT in builds that include it. |
 | Timeshift and HLS origins | Per-viewer rewind of live HLS, and a guarded relay for descriptors that point at HLS servers. Newer than v0.9.0 ([details](https://github.com/jamezrin/outpace-stream/wiki/Releases-and-Versions#not-yet-released)). |
-
-Premium or encrypted content, accounts, search, EPG and a web UI are out of scope.
-
-## First run
-
-```bash
-docker run --rm -p 127.0.0.1:6878:6878 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0
-# or, with a release binary on PATH:
-outpace serve
-```
-
-```bash
-curl http://127.0.0.1:6878/healthz
-vlc "http://127.0.0.1:6878/streams/ace/0123456789abcdef0123456789abcdef01234567"
-```
-
-Replace the obviously fake id with a current public content id. Add `.m3u8` to the URL for HLS.
-A cold start takes 20–60 seconds while outpace finds peers and buffers.
-
-By default:
-
-- the HTTP API listens on `127.0.0.1:6878`, and RTMP ingest on `127.0.0.1:1935`;
-- the peer listener is TCP `0.0.0.0:8621`;
-- seeding and inbound peers are on, and router port mapping is off.
-
-The API has no authentication, so keep it local or put it behind a proxy. No UDP port needs
-forwarding. See [NAT and port mapping](https://github.com/jamezrin/outpace-stream/wiki/NAT-and-Port-Mapping).
 
 ## Documentation
 
-- **[User wiki](https://github.com/jamezrin/outpace-stream/wiki):** installation, configuration,
-  playback, HLS, timeshift, broadcasting, peers, deployment and troubleshooting. It's generated
-  from [`docs/wiki/`](docs/wiki); edit it there.
-- **Reference:**
+| You want to... | Read |
+| --- | --- |
+| Get answers to common questions | [FAQ](https://github.com/jamezrin/outpace-stream/wiki/FAQ) |
+| Play a stream in five minutes | [Getting started](https://github.com/jamezrin/outpace-stream/wiki/Getting-Started) |
+| Install on Linux, macOS, Windows or Docker | [Installation](https://github.com/jamezrin/outpace-stream/wiki/Installation) |
+| Run it with Compose, systemd or behind a proxy | [Deployment](https://github.com/jamezrin/outpace-stream/wiki/Deployment) |
+| Point VLC, mpv, Jellyfin, Dispatcharr or an Ace Stream app at it | [Playing streams](https://github.com/jamezrin/outpace-stream/wiki/Playing-Streams) |
+| Look up a setting or command | [Configuration](https://github.com/jamezrin/outpace-stream/wiki/Configuration) · [Environment variables](https://github.com/jamezrin/outpace-stream/wiki/Environment-Variables) · [Command line](https://github.com/jamezrin/outpace-stream/wiki/Command-Line) |
+| Replace an existing AceStream engine | [Migrating](https://github.com/jamezrin/outpace-stream/wiki/Migrating-from-AceStream-Engine) |
+| Publish your own stream | [Broadcasting](https://github.com/jamezrin/outpace-stream/wiki/Broadcasting) |
+| Fix a problem | [Troubleshooting](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting) |
+
+The [user wiki](https://github.com/jamezrin/outpace-stream/wiki) is generated from
+[`docs/wiki/`](docs/wiki); edit it there.
+
+Technical reference:
+
+- **Interfaces:**
   - [native API](docs/native-api.md)
   - [Ace HTTP subset](docs/protocol/compat-matrix.md)
   - [configuration contract](docs/configuration.md)
@@ -130,7 +214,6 @@ check enforces this.
   <a href="https://github.com/jamezrin/outpace-stream/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/jamezrin/outpace-stream/main"></a>
   <a href="https://github.com/jamezrin/outpace-stream/pulse"><img alt="Commit activity" src="https://img.shields.io/github/commit-activity/m/jamezrin/outpace-stream"></a>
   <a href="https://github.com/jamezrin/outpace-stream/releases"><img alt="Release downloads" src="https://img.shields.io/github/downloads/jamezrin/outpace-stream/total"></a>
-  <a href="https://github.com/jamezrin/outpace-stream"><img alt="Top language" src="https://img.shields.io/github/languages/top/jamezrin/outpace-stream"></a>
 </p>
 
 <a href="https://star-history.com/#jamezrin/outpace-stream&Date">
@@ -142,5 +225,6 @@ check enforces this.
 
 ## License
 
-outpace is licensed under [AGPL-3.0-or-later](LICENSE). It contains no closed-source engine
-code or binaries.
+Outpace is licensed under [AGPL-3.0-or-later](LICENSE). It contains no closed-source engine code
+or binaries. Ace Stream is a trademark of its respective owner; Outpace is an independent,
+unaffiliated implementation.

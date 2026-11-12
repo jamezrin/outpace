@@ -4,7 +4,7 @@
 > it. See [Releases and Versions](Releases-and-Versions).
 
 Timeshift lets a viewer rewind a live HLS stream by a few minutes, watch from there, and jump
-back to live. outpace keeps recently packaged HLS segments in memory, and each viewer can seek
+back to live. Outpace keeps recently packaged HLS segments in memory, and each viewer can seek
 into them independently.
 
 It is a **short local rewind buffer**:
@@ -24,7 +24,7 @@ It is a **short local rewind buffer**:
 | [Managed HLS origin](Managed-HLS-Origins) viewers with `OUTPACE_MANAGED_HLS=1` | Yes, through the viewer's `command_url`, for qualifying streams |
 | Native HLS (`/streams/ace/<id>.m3u8`) | No seek control. The source still records history if a compat viewer could use it. |
 | Direct MPEG-TS (`/streams/...`, `/ace/getstream`) | No. Raw TS sessions record nothing. |
-| Origin HLS in the default direct-redirect mode | No. outpace never sees that media. |
+| Origin HLS in the default direct-redirect mode | No. Outpace never sees that media. |
 
 ## Turn it on
 
@@ -75,7 +75,7 @@ export OUTPACE_HISTORY_BYTES=671088640        # 640 MiB per source
 export OUTPACE_HISTORY_TOTAL_BYTES=1342177280 # 1.25 GiB for two such channels
 ```
 
-Then start (or restart) outpace from the same shell. With `docker run`, pass each setting
+Then start (or restart) Outpace from the same shell. With `docker run`, pass each setting
 as `-e NAME=value`; with Compose, see [Deployment](Deployment#passing-other-settings).
 
 Keep in mind:
@@ -217,7 +217,7 @@ compatibility HLS:
   `/ace/tc/<token>/<generation>/<seq>.ts` with the generation intact.
 - Don't advertise `catchup-days` or map this onto EPG catch-up. EPG catch-up asks for a
   programme by UTC time, which this buffer can't provide.
-- These `timeshift_*` methods are outpace extensions. They aren't the original engine's
+- These `timeshift_*` methods are Outpace extensions. They aren't the original engine's
   `liveseek`.
 
 ## Related pages

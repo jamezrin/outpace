@@ -1,14 +1,14 @@
 # Migrating from AceStream Engine
 
-outpace can replace the AceStream engine for most setups that play public, unencrypted streams:
+Outpace can replace the AceStream engine for most setups that play public, unencrypted streams:
 media servers, IPTV playlists, proxies such as acexy, and apps that use `/ace/getstream`. It is
 not a full clone, so check the differences below before you switch.
 
-outpace hasn't reached 1.0. Test it with your own clients before retiring the old engine.
+Outpace hasn't reached 1.0. Test it with your own clients before retiring the old engine.
 
 ## What carries over
 
-| You used | In outpace |
+| You used | In Outpace |
 | --- | --- |
 | `http://host:6878/ace/getstream?id=<id>` | Same URL, with `OUTPACE_ACE_COMPAT=1`. |
 | `/ace/manifest.m3u8?id=<id>` (HLS) | Same, with `OUTPACE_ACE_COMPAT=1`. |
@@ -29,17 +29,17 @@ handshake and work with compat off.
 - **No legacy seek or file selection**, and no VOD through the compat API. Native `/vod` exists.
 - **No port 62062** and no UDP 8621 listener.
 - **No access-token authentication** on the compat API. Protect it with your network.
-- **Different timings.** Startup buffering, error codes and discovery differ. outpace waits for a
+- **Different timings.** Startup buffering, error codes and discovery differ. Outpace waits for a
   bigger buffer by default; see [HLS Output](HLS-Output) and
   [Configuration](Configuration#playback-and-startup-buffering).
-- **No config-file import.** outpace reads only `OUTPACE_*` environment variables. Its identity is
+- **No config-file import.** Outpace reads only `OUTPACE_*` environment variables. Its identity is
   new; never copy the old engine's identity or account database across.
 - **Returned compat URLs are always `http://<Host>`.** See
   [Deployment](Deployment#behind-a-reverse-proxy) if you proxy.
 
 ## Settings map
 
-| Concern | outpace setting |
+| Concern | Outpace setting |
 | --- | --- |
 | HTTP API | `OUTPACE_BIND` (binary default `127.0.0.1:6878`) |
 | Compat API | `OUTPACE_ACE_COMPAT=1` (default off) |
@@ -61,7 +61,7 @@ If you used the old variable `OUTPACE_EXPERIMENTAL_ACE_COMPAT`, rename it to
    - which ports are exposed and to whom;
    - which clients use which URLs;
    - where the engine's data lives (back it up).
-2. **Stage outpace next to it** on other ports, download-only, so they don't fight over 6878 or
+2. **Stage Outpace next to it** on other ports, download-only, so they don't fight over 6878 or
    8621:
 
    ```bash
@@ -86,12 +86,12 @@ If you used the old variable `OUTPACE_EXPERIMENTAL_ACE_COMPAT`, rename it to
    Check that stopping works and that `/ace/stat` reports what your tooling expects.
 5. **Cut over:**
    - stop the old engine;
-   - move outpace to port 6878 (and 8621, with inbound and seeding on if you want to stay a full
+   - move Outpace to port 6878 (and 8621, with inbound and seeding on if you want to stay a full
      participant);
    - restart;
    - recheck your clients.
-6. **Keep the old engine and its backup** until you're confident. To roll back, stop outpace and
-   start the old engine with its own data. Never give outpace's data directory to the old engine.
+6. **Keep the old engine and its backup** until you're confident. To roll back, stop Outpace and
+   start the old engine with its own data. Never give Outpace's data directory to the old engine.
 
 ## Compose profiles
 

@@ -183,8 +183,8 @@ Engine 3.2.11 created a 1,944-byte original disk descriptor and exported ordinar
 metainfo. An independent cold official-engine consumer and the production cold Outpace
 CLI each recovered all 2,767,449 source bytes, with all 85 piece hashes matching and
 exact source byte equality. Both exported metainfo and the original disk envelope were
-validated in production ([PR #260](https://github.com/jamezrin/outpace/pull/260),
-[PR #261](https://github.com/jamezrin/outpace/pull/261)); the original-disk CLI exited 0
+validated in production ([PR #260](https://github.com/jamezrin/outpace-stream/pull/260),
+[PR #261](https://github.com/jamezrin/outpace-stream/pull/261)); the original-disk CLI exited 0
 in about six seconds.
 
 A fresh production daemon served a full 200 response, a cross-piece 206 range, a suffix

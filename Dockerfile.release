@@ -12,7 +12,7 @@ ARG TARGETVARIANT
 FROM binary-${TARGETARCH}${TARGETVARIANT} AS binary
 
 FROM debian:bookworm-slim AS runtime
-LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace" \
+LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace-stream" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \

@@ -1,6 +1,6 @@
 # Command Line
 
-outpace is one executable with three commands. Daemon behaviour is configured with `OUTPACE_*`
+Outpace is one executable with three commands. Daemon behaviour is configured with `OUTPACE_*`
 environment variables, not flags; see [Configuration](Configuration) and the
 [A–Z list](Environment-Variables).
 
@@ -68,7 +68,7 @@ Rules for these inputs:
 - Duplicate query keys, and the file-selection options `_idx` and `stream_id`, are rejected.
 - Transport-file URLs are fetched over HTTP(S) with a 1 MiB limit, no redirects, and a time
   limit. Private and loopback hosts are refused unless `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT=1`.
-- The `acestream://` link of a broadcast made by **another** outpace daemon needs
+- The `acestream://` link of a broadcast made by **another** Outpace daemon needs
   `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1`.
 
 ### How `play` behaves

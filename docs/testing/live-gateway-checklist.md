@@ -132,7 +132,7 @@ roughly 6.5 minutes, having decoded 17,248 frames with 80 valid active status
 samples. One stale teardown and reconnect occurred. This establishes a
 video-frame progress failure; the timing and cause of the media/recovery
 interaction remain under investigation in
-[#246](https://github.com/jamezrin/outpace/issues/246).
+[#246](https://github.com/jamezrin/outpace-stream/issues/246).
 
 A separate simultaneous 480-second comparison against AceStream 3.2.11 did not
 reproduce a stale teardown, reconnect, or video stall. Both saved transports
@@ -175,7 +175,7 @@ window; this is not a positive live-buffer measurement. Separate deterministic
 session/reservoir tests demonstrate nonzero buffer duration and its decrease while
 draining, and ready-window tests cover measured duration and invalidation.
 
-The cumulative evidence for [#195](https://github.com/jamezrin/outpace/issues/195)
+The cumulative evidence for [#195](https://github.com/jamezrin/outpace-stream/issues/195)
 is intentionally compositional:
 
 | Acceptance item | Evidence and boundary |
@@ -190,8 +190,8 @@ is intentionally compositional:
 
 Independent reviews support the scoped runtime predicates and cumulative criteria.
 The historical stale-reconnect video stall in
-[#246](https://github.com/jamezrin/outpace/issues/246) remains an unresolved linked
+[#246](https://github.com/jamezrin/outpace-stream/issues/246) remains an unresolved linked
 follow-up: nonrecurrence does not explain its cause or close that investigation.
 Neither this bounded evidence nor epic completion constitutes 24/7 availability,
-production-readiness or [#210](https://github.com/jamezrin/outpace/issues/210)
+production-readiness or [#210](https://github.com/jamezrin/outpace-stream/issues/210)
 human sign-off. Earlier failures and original artifact verdicts remain unchanged.

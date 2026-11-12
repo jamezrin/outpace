@@ -1,6 +1,6 @@
 # Playing Streams
 
-outpace has two HTTP interfaces for playback:
+Outpace has two HTTP interfaces for playback:
 
 - the **native API** (`/streams/...`, `/vod/...`). It is always on, and it's the one to use for
   players, media servers and playlist tools;
@@ -18,7 +18,7 @@ Examples use `http://127.0.0.1:6878` and the placeholder id
 | Input | Native form | Notes |
 | --- | --- | --- |
 | Content id (40 hex characters) | `/streams/ace/<id>` or `/streams/ace/cid:<id>` | The usual AceStream id. Resolved through the AceStream catalog. |
-| Infohash | `/streams/ace/ih:<infohash>` | A swarm hash. Plays only if outpace can find a verified descriptor for it (its own broadcasts, ones seen before, or the catalog). Otherwise `422`. |
+| Infohash | `/streams/ace/ih:<infohash>` | A swarm hash. Plays only if Outpace can find a verified descriptor for it (its own broadcasts, ones seen before, or the catalog). Otherwise `422`. |
 | Transport file (`.acelive` / `.torrent` URL) | via the compat `url=` selector or `outpace play <url>` | Fetched over HTTP(S) with a 1 MiB limit, no redirects, and private addresses refused. |
 | Magnet (`magnet:?xt=urn:btih:...`) | via compat `magnet=` or `outpace play` | Reduced to its infohash, then treated like an infohash. BitTorrent v2 magnets aren't supported. |
 | Local descriptor | `/streams/ace/local%3A<alias>` | [Private Peer Mode](Private-Peer-Mode) only. |
@@ -27,7 +27,7 @@ Examples use `http://127.0.0.1:6878` and the placeholder id
 > playlists that used bare infohashes there must switch to `ih:<infohash>`. There is no silent
 > fallback from one to the other.
 
-Content ids are case-insensitive. outpace lowercases them, and the bare and `cid:` forms share
+Content ids are case-insensitive. Outpace lowercases them, and the bare and `cid:` forms share
 one session.
 
 ## Native live playback
@@ -112,10 +112,10 @@ This returns `204`, or `404` if the stream wasn't running.
 
 ## Live and VOD
 
-Most AceStream content is **live**: a continuous signed stream with no fixed length. outpace
+Most AceStream content is **live**: a continuous signed stream with no fixed length. Outpace
 follows the live edge and keeps only a short window.
 
-**VOD** content is a single file with a fixed length and per-piece hashes. outpace verifies
+**VOD** content is a single file with a fixed length and per-piece hashes. Outpace verifies
 every piece before sending it:
 
 | URL | Returns |
@@ -201,7 +201,7 @@ curl "http://127.0.0.1:6878/ace/getstream?content_id=0123456789abcdef0123456789a
 
 | Method | Returns |
 | --- | --- |
-| `get_version` | outpace's version (not an AceStream engine version). |
+| `get_version` | Outpace's version (not an AceStream engine version). |
 | `get_status` | `dl` when any stream is active, otherwise `idle`, plus session counts. |
 | `get_network_connection_status` | Registered networks. Not a real connectivity test. |
 | `analyze_content` | Whether an id is live and whether it's encrypted, without joining the swarm. |
@@ -223,13 +223,13 @@ Once no lease or viewer holds a stream, it is torn down after the usual 30-secon
 
 There is no premium or encrypted content, no accounts, no web UI or remote control, no search,
 channel lists or EPG, no file selection beyond the single file (`_idx=0`), no seeking in the
-original engine's sense, and no VOD. outpace adds its own [timeshift](Timeshift) commands
+original engine's sense, and no VOD. Outpace adds its own [timeshift](Timeshift) commands
 instead.
 
 ### Behind a proxy
 
 The compatibility API builds returned URLs from `http://` plus the request's `Host` header. It
-ignores `X-Forwarded-*` and `Forwarded`, and it never returns HTTPS. If clients reach outpace
+ignores `X-Forwarded-*` and `Forwarded`, and it never returns HTTPS. If clients reach Outpace
 through TLS termination or a sub-path, the returned URLs won't work. See
 [Deployment](Deployment#behind-a-reverse-proxy).
 

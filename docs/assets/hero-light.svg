@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-labelledby="t d">
-<title id="t">outpace</title>
-<desc id="d">A single live AceStream swarm: a broadcaster's pieces spread peer to peer; outpace sits inside the swarm, downloads from four upstream peers, seeds to others, and serves the stream as MPEG-TS and HLS.</desc>
+<title id="t">Outpace</title>
+<desc id="d">Outpace, an open-source peer-to-peer streaming engine, shown inside a live swarm: a broadcaster's pieces spread peer to peer, and Outpace downloads from four upstream peers, seeds to others and serves the stream as MPEG-TS and HLS.</desc>
 <style>.flow{stroke-dasharray:3 15;animation:flow 1.6s linear infinite}.up{stroke-dasharray:5 7;animation:up 1.8s linear infinite}@keyframes flow{to{stroke-dashoffset:-18}}@keyframes up{to{stroke-dashoffset:-12}}@media (prefers-reduced-motion: reduce){.flow,.up{animation:none}}</style>
 <defs>
 <linearGradient id="word" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#ff5b35"/><stop offset="1" stop-color="#ffad1f"/></linearGradient>
@@ -159,7 +159,7 @@
 <circle cx="75.6" cy="266.7" r="4" fill="#d6cabc"/>
 <g font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" text-anchor="middle">
 <text x="600" y="224" font-size="112" font-weight="800" letter-spacing="-4" stroke="#fbf7f1" stroke-width="8" stroke-linejoin="round" paint-order="stroke" fill="#1f1a16">outp<tspan fill="url(#word)">ace</tspan></text>
-<text x="600" y="276" font-size="21" stroke="#fbf7f1" stroke-width="8" stroke-linejoin="round" paint-order="stroke" fill="#6f655b">Public AceStream swarms in. MPEG-TS and HLS out.</text>
-<text x="600" y="314" font-size="13" font-weight="700" letter-spacing="4" stroke="#fbf7f1" stroke-width="8" stroke-linejoin="round" paint-order="stroke" fill="#ff5b35">OPEN SOURCE  ·  RUST  ·  SELF-HOSTED</text>
+<text x="600" y="276" font-size="21" stroke="#fbf7f1" stroke-width="8" stroke-linejoin="round" paint-order="stroke" fill="#6f655b">Open-source peer-to-peer streaming engine</text>
+<text x="600" y="314" font-size="13" font-weight="700" letter-spacing="4" stroke="#fbf7f1" stroke-width="8" stroke-linejoin="round" paint-order="stroke" fill="#ff5b35">ACE STREAM COMPATIBLE  ·  RUST  ·  SELF-HOSTED</text>
 </g>
 </svg>

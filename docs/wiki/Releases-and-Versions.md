@@ -2,7 +2,7 @@
 
 ## How versions work
 
-- outpace uses `MAJOR.MINOR.PATCH` version numbers. It is still before 1.0, so minor releases
+- Outpace uses `MAJOR.MINOR.PATCH` version numbers. It is still before 1.0, so minor releases
   can change behaviour; read the notes before you upgrade.
 - A release is a git tag `vX.Y.Z`. Publishing one builds the binaries, the `SHA256SUMS` file and
   the container images, and creates a GitHub Release.
@@ -31,7 +31,7 @@ curl "http://127.0.0.1:6878/server/api?method=get_version"   # needs OUTPACE_ACE
 ```
 
 `get_version` returns `version`, a numeric `code` (`MAJOR*10000 + MINOR*100 + PATCH`) and the
-`platform`. It identifies outpace, not an AceStream engine build.
+`platform`. It identifies Outpace, not an AceStream engine build.
 
 **`edge` builds report the last release's version number**, because the version only changes
 when a release is cut. To find out exactly which commit an `edge` image contains:

@@ -143,10 +143,10 @@ def render(theme):
     a = o.append
     a(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
       'role="img" aria-labelledby="t d">')
-    a('<title id="t">outpace</title>')
-    a('<desc id="d">A single live AceStream swarm: a broadcaster\'s pieces spread peer to peer; '
-      'outpace sits inside the swarm, downloads from four upstream peers, seeds to others, and '
-      'serves the stream as MPEG-TS and HLS.</desc>')
+    a('<title id="t">Outpace</title>')
+    a('<desc id="d">Outpace, an open-source peer-to-peer streaming engine, shown inside a live '
+      'swarm: a broadcaster\'s pieces spread peer to peer, and Outpace downloads from four upstream '
+      'peers, seeds to others and serves the stream as MPEG-TS and HLS.</desc>')
     a('<style>'
       '.flow{stroke-dasharray:3 15;animation:flow 1.6s linear infinite}'
       '.up{stroke-dasharray:5 7;animation:up 1.8s linear infinite}'
@@ -210,9 +210,9 @@ def render(theme):
     a(f'<text x="{CX}" y="{CY + 34}" font-size="112" font-weight="800" letter-spacing="-4" '
       f'{halo} fill="{t["ink"]}">outp<tspan fill="url(#word)">ace</tspan></text>')
     a(f'<text x="{CX}" y="{CY + 86}" font-size="21" {halo} fill="{t["muted"]}">'
-      'Public AceStream swarms in. MPEG-TS and HLS out.</text>')
+      'Open-source peer-to-peer streaming engine</text>')
     a(f'<text x="{CX}" y="{CY + 124}" font-size="13" font-weight="700" letter-spacing="4" '
-      f'{halo} fill="{t["hot"]}">OPEN SOURCE  ·  RUST  ·  SELF-HOSTED</text>')
+      f'{halo} fill="{t["hot"]}">ACE STREAM COMPATIBLE  ·  RUST  ·  SELF-HOSTED</text>')
     a('</g>')
     a('</svg>')
     return "\n".join(o) + "\n"

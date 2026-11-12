@@ -31,7 +31,7 @@ RUN cargo build --locked --release -p ace-engine --bin outpace
 
 FROM debian:bookworm-slim AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace" \
+LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace-stream" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 
 RUN apt-get update \

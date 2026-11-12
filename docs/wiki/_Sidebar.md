@@ -2,6 +2,7 @@
 
 **Start**
 
+- [FAQ](FAQ)
 - [Getting Started](Getting-Started)
 - [Installation](Installation)
 - [Configuration](Configuration)

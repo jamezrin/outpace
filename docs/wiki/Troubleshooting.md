@@ -19,7 +19,7 @@ outpace --version                              # what you are running
 
 ## The daemon won't start
 
-outpace validates all settings before it opens any listener, and names the problem:
+Outpace validates all settings before it opens any listener, and names the problem:
 
 | Message contains | Fix |
 | --- | --- |
@@ -56,7 +56,7 @@ export OUTPACE_PREBUFFER_MS=5000          # direct TS and HLS
 export OUTPACE_HLS_STARTUP_SEGMENTS=2     # HLS
 ```
 
-Then start (or restart) outpace from the same shell. With `docker run`, pass each setting
+Then start (or restart) Outpace from the same shell. With `docker run`, pass each setting
 as `-e NAME=value`; with Compose, see [Deployment](Deployment#passing-other-settings).
 
 The logs show which stage is slow:
@@ -100,8 +100,8 @@ most players retry on their own.
 Check the stream's `/status` while it stalls:
 
 - `peers` dropping, or `recovery.upstream_reconnects` and `recovery.stale_teardowns` climbing:
-  the swarm is losing peers. outpace reconnects on its own.
-- `recovery.skipped_evicted_gaps` climbing: peers no longer had the pieces outpace needed, so
+  the swarm is losing peers. Outpace reconnects on its own.
+- `recovery.skipped_evicted_gaps` climbing: peers no longer had the pieces Outpace needed, so
   it skipped ahead. That shows up as a jump or glitch in the picture.
 - `bitrate` far below `metadata.bitrate`: not enough upload capacity in the swarm.
 
@@ -134,12 +134,12 @@ server's window and gets a discontinuity.
 - **Outbound UDP** must work for the DHT and trackers (replies to outbound UDP must come back).
   Some firewalls and VPNs block this.
 - **Outbound TCP** to arbitrary ports must work to reach peers.
-- `422` with a reason: the id couldn't be resolved. For `ih:` infohashes, outpace needs a
+- `422` with a reason: the id couldn't be resolved. For `ih:` infohashes, Outpace needs a
   verified descriptor; try the content id instead.
 - Compat `502 stream start failed`: resolution or discovery failed. Compat `422 stream
   metadata unavailable`: no descriptor was found for an infohash or magnet. Neither proves the
   content is gone for good.
-- A content id of a broadcast made by another outpace daemon only resolves with
+- A content id of a broadcast made by another Outpace daemon only resolves with
   `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1`. See [Broadcasting](Broadcasting#watching-a-broadcast).
 
 `[dht] walk done: ... peers=N` tells you how many peers the DHT found.
@@ -181,7 +181,7 @@ viewer connections first. See [Deployment](Deployment#graceful-shutdown).
 ## Reading the logs
 
 Each line looks like `HH:MM:SS.mmm [tag] message`, where the time is UTC. The tag says which part
-of outpace logged it:
+of Outpace logged it:
 
 | Tag | Area |
 | --- | --- |
@@ -238,23 +238,7 @@ For example, to mask hex ids in a log before sharing it:
 sed -E 's/[0-9a-fA-F]{40}/<id>/g' outpace.log > outpace-redacted.log
 ```
 
-## FAQ
+## More questions
 
-**Can it play premium or encrypted channels?** No, and it never will.
-
-**Does it need the original AceStream engine installed?** No. outpace doesn't use or download
-any part of it.
-
-**Why does the stream start later than with the original engine?** outpace buffers more by
-default, for smoother playback. See [Slow startup](#slow-startup).
-
-**Does it need FFmpeg?** Only for [audio normalisation](HLS-Output#audio-normalisation).
-
-**Which ports do I open?** Only TCP 8621 inbound, for peers. Keep 6878 and 1935 private.
-
-**Can I rewind live TV?** For a few minutes, with [Timeshift](Timeshift) (newer than v0.9.0).
-
-**Is there a web UI?** No. Use your player, media server or the HTTP API.
-
-**Why did my old playlist of bare infohashes stop working?** Bare ids on `/streams/ace/` are now
-content ids. Prefix infohashes with `ih:`.
+See the [FAQ](FAQ) for common questions: do you need the official engine, Docker, VLC,
+Jellyfin and Dispatcharr, broadcasting, and the differences from the official engine.

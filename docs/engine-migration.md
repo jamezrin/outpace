@@ -11,7 +11,7 @@ optional adapter, not complete engine parity. Public, unencrypted content is the
 Premium/encrypted content, account/subscription import, player/web UI, and a closed-engine
 runtime remain permanent non-goals (#212). Service-backed name search is a separate
 post-v1.0 possibility, default off and not implemented; it is not a migration prerequisite.
-Protected-descriptor refusal is still tracked in [#279](https://github.com/jamezrin/outpace/issues/279);
+Protected-descriptor refusal is still tracked in [#279](https://github.com/jamezrin/outpace-stream/issues/279);
 do not treat a reported zero encryption flag as independent proof that content is public.
 
 ## Inventory and configuration mapping

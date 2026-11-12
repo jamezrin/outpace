@@ -1,6 +1,6 @@
 # Configuration
 
-outpace is configured entirely through `OUTPACE_*` environment variables. There is no config
+Outpace is configured entirely through `OUTPACE_*` environment variables. There is no config
 file and no command-line flag for daemon settings. This page lists every setting the daemon
 reads.
 
@@ -60,13 +60,13 @@ The **Avail.** column shows where each setting is available:
 | --- | --- | --- | --- | --- |
 | `OUTPACE_BIND` | `127.0.0.1:6878` | socket address | all | HTTP API, playback, HLS and ingest. Set `0.0.0.0:6878` to reach it from other machines, and protect it with a firewall or proxy first. |
 | `OUTPACE_RTMP_BIND` | `127.0.0.1:1935` | socket address | all | RTMP ingest for [broadcasting](Broadcasting). Use port `0` for a random local port if you never use RTMP. |
-| `OUTPACE_PEER_LISTEN` | `0.0.0.0:8621` | socket address | all | TCP peer listener. Its port is also the port outpace announces, so the router's external port must match. See [NAT and Port Mapping](NAT-and-Port-Mapping). |
+| `OUTPACE_PEER_LISTEN` | `0.0.0.0:8621` | socket address | all | TCP peer listener. Its port is also the port Outpace announces, so the router's external port must match. See [NAT and Port Mapping](NAT-and-Port-Mapping). |
 
 SRT listener settings are under [Broadcasting and ingest](#broadcasting-and-ingest).
 
 ## Playback and startup buffering
 
-These control how long outpace waits before sending the first media, and how it recovers when
+These control how long Outpace waits before sending the first media, and how it recovers when
 peers stall. The defaults favour smooth playback over a fast start.
 
 | Setting | Default | Accepted values | Avail. | Notes |
@@ -140,7 +140,7 @@ See [Broadcasting](Broadcasting).
 | `OUTPACE_BROADCAST_OPTIONS` | `{}` | JSON object, at most 64 names and 262144 bytes | all | Per-broadcast title, bitrate, piece size, quality and categories, applied when a broadcast identity is created. |
 | `OUTPACE_BROADCAST_SOURCES` | `{}` | JSON object, at most 64 names and 256 KiB | all | HTTP(S) MPEG-TS sources to pull from and broadcast at startup. URLs can contain tokens, so treat this as a secret. An explicitly empty value is an error. |
 | `OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE` | off | exact `1` | all | Let broadcast pull sources use private, loopback, CGNAT and IPv6 ULA addresses. Link-local and cloud-metadata addresses stay blocked. |
-| `OUTPACE_TRACKERS` | built-in public tracker | comma-separated URLs, at most 64 kept | all | Trackers written into **new** broadcast descriptors and used for their announcements. When set, it fully replaces the default. outpace itself only announces to lowercase `udp://` entries. Existing broadcasts keep the trackers they were created with. |
+| `OUTPACE_TRACKERS` | built-in public tracker | comma-separated URLs, at most 64 kept | all | Trackers written into **new** broadcast descriptors and used for their announcements. When set, it fully replaces the default. Outpace itself only announces to lowercase `udp://` entries. Existing broadcasts keep the trackers they were created with. |
 | `OUTPACE_SRT_BIND` | unset (off) | numeric socket address | srt build | Turns on the SRT listener (UDP), for example `127.0.0.1:9000`. Starting a non-SRT build with this set fails. |
 | `OUTPACE_SRT_PASSPHRASE_FILE` | unset | absolute file path | srt build | Required with `OUTPACE_SRT_BIND`. The file holds a 10–79 byte passphrase, is owned by the daemon user, and has no group or other permissions. |
 | `OUTPACE_SRT_LATENCY_MS` | `120` | 20–2000 | srt build | SRT receiver latency. |
@@ -172,7 +172,7 @@ See [Seeding and Peers](Seeding-and-Peers).
 ### How the disk cache wipe works
 
 Disk-cache contents are throwaway live data and are never reused after a restart. To avoid
-deleting the wrong directory, outpace only wipes a cache directory that is empty or contains a
+deleting the wrong directory, Outpace only wipes a cache directory that is empty or contains a
 regular file named `.outpace-cache`. It writes that file itself the first time it uses an empty
 directory. If you point `OUTPACE_CACHE_DIR` at a non-empty directory without that file, startup
 fails instead of deleting anything.
@@ -187,7 +187,7 @@ See [NAT and Port Mapping](NAT-and-Port-Mapping).
 
 | Setting | Default | Accepted values | Avail. | Notes |
 | --- | --- | --- | --- | --- |
-| `OUTPACE_ENABLE_PORT_MAPPING` | `false` | boolean | all | Ask the gateway to forward the peer port. Only works when outpace owns the LAN address (bare metal or host networking), and only when inbound serving is on. Failure is logged and isn't fatal. |
+| `OUTPACE_ENABLE_PORT_MAPPING` | `false` | boolean | all | Ask the gateway to forward the peer port. Only works when Outpace owns the LAN address (bare metal or host networking), and only when inbound serving is on. Failure is logged and isn't fatal. |
 | `OUTPACE_PORT_MAP_BACKEND` | `auto` | `auto`, `upnp`, `natpmp`, `none` | all | `auto` tries UPnP-IGD, then NAT-PMP. |
 | `OUTPACE_PORT_MAP_EXTERNAL_PORT` | same as the peer port | 1–65535 | all | External port to request. Leave unset so the announced port matches. |
 
@@ -205,7 +205,7 @@ See [Private Peer Mode](Private-Peer-Mode).
 | Setting | Default | Accepted values | Avail. | Notes |
 | --- | --- | --- | --- | --- |
 | `OUTPACE_ACE_PEERS` | unset | comma-separated `IPv4:port` | all | Extra bootstrap peers tried on every live stream. In public mode malformed entries are skipped silently; in private mode they must be in the allowlist. |
-| `OUTPACE_BEP9_CONTENT_ID_FALLBACK` | `false` | boolean | all | If the catalog can't resolve a content id, ask peers for its metadata. Needed to play an outpace broadcast's `acestream://` link from a **different** daemon. |
+| `OUTPACE_BEP9_CONTENT_ID_FALLBACK` | `false` | boolean | all | If the catalog can't resolve a content id, ask peers for its metadata. Needed to play an Outpace broadcast's `acestream://` link from a **different** daemon. |
 | `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT` | off | exact `1` | all | Allow transport-file URLs on private, loopback or CGNAT hosts. Link-local, multicast and documentation ranges stay blocked. For self-hosted LAN swarms. |
 | `OUTPACE_TRACKER_ALLOW_NON_GLOBAL` | off | exact `1` | all | Allow announcing to trackers on private or local addresses. For self-hosted or offline swarms. |
 
