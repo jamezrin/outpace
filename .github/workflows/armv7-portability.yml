@@ -25,13 +25,25 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: armv7-unknown-linux-musleabihf
 
 jobs:
   cross-build:
-    name: Cross-build ARMv7 release binary
+    # Keep the name for the ARMv7 leg stable; other small-device release targets share it.
+    name: Cross-build ${{ matrix.label }} release binary
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: armv7-unknown-linux-musleabihf
+            label: ARMv7
+          - target: arm-unknown-linux-musleabihf
+            label: ARMv6
+          - target: riscv64gc-unknown-linux-musl
+            label: RISC-V 64
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -52,6 +64,14 @@ jobs:
 
       - name: Cross-build release binary
         run: cargo build --locked --release -p ace-engine --bin outpace --target "$TARGET"
+
+      # The cross toolchain action registers a QEMU user-mode runner for the target.
+      - name: Run the emulated binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_var="CARGO_TARGET_$(tr 'a-z-' 'A-Z_' <<<"$TARGET")_RUNNER"
+          ${!runner_var:-} "target/$TARGET/release/outpace" --version
 
   container-smoke:
     name: ARMv7 container startup and health smoke
