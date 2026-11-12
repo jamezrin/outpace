@@ -19,6 +19,7 @@ dependencies = [
  "cc",
  "clap",
  "dirs",
+ "flate2",
  "futures",
  "hex",
  "libc",

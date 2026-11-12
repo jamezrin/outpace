@@ -418,6 +418,11 @@ runs under the public-destination policy:
 - Each acquisition, including queueing, has a 30-second deadline.
 - Playlists are capped at 1 MiB, 16 KiB per line and 512 references; media responses at
   16 MiB.
+- Only playlist requests offer `Accept-Encoding: gzip, identity`; segments, maps and byte
+  ranges request `identity`, and any other response encoding is refused. A gzip playlist
+  is capped at 1 MiB both on the wire and decoded. Every member's CRC and length footer
+  is verified, at most 16 concatenated members are accepted, trailing or malformed data
+  fails, and decoding observes the same deadline and stop as the fetch.
 
 Capacity is bounded too: at most 64 viewers, 16 admitted client requests and four
 concurrent upstream fetches. Each viewer keeps at most 1,024 URL entries and 512 KiB of
