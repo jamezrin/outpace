@@ -250,6 +250,15 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_HLS_STARTUP_TIMEOUT_MS") {
         config.hls.startup_timeout_ms = v.parse()?;
     }
+    if let Ok(v) = std::env::var("OUTPACE_HISTORY_SECONDS") {
+        config.hls_history.max_seconds = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HISTORY_BYTES") {
+        config.hls_history.max_bytes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var("OUTPACE_HISTORY_TOTAL_BYTES") {
+        config.hls_history.global_max_bytes = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
         config.max_unchoked = v.parse()?;
     }
@@ -309,6 +318,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
+    config.hls_history.validate()?;
     config.normalization_config().validate()?;
     validate_cache_budget(&config)?;
     config.support_sources.validate(&config)?;
@@ -725,6 +735,7 @@ pub async fn build_runtime(
     config.startup_buffer.validate()?;
     config.live_recovery.validate()?;
     config.hls.validate()?;
+    config.hls_history.validate()?;
     config.normalization_config().validate()?;
     validate_cache_budget(&config)?;
     let local_descriptors = config.private_descriptors.load()?;
@@ -793,10 +804,11 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager = StreamManager::with_audio_config(
+    let manager = StreamManager::with_history_and_audio_config(
         registry,
         config.session_buffer,
         config.hls,
+        config.hls_history,
         config
             .hls_audio
             .normalize
@@ -2032,6 +2044,53 @@ mod tests {
 
         std::env::set_var("OUTPACE_PREFETCH_PIECES", "8");
         assert_eq!(config_from_env().unwrap().prefetch_pieces, Some(8));
+
+        for (name, value) in names.into_iter().zip(old) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn history_env_defaults_off_and_validates_budgets() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let names = [
+            "OUTPACE_HISTORY_SECONDS",
+            "OUTPACE_HISTORY_BYTES",
+            "OUTPACE_HISTORY_TOTAL_BYTES",
+        ];
+        let old: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for name in names {
+            std::env::remove_var(name);
+        }
+
+        let c = config_from_env().unwrap();
+        assert!(!c.hls_history.enabled());
+        assert_eq!(c.hls_history, crate::config::HlsHistoryConfig::default());
+        assert_eq!(c.hls_history.max_bytes, 128 * 1024 * 1024);
+        assert_eq!(c.hls_history.global_max_bytes, 256 * 1024 * 1024);
+
+        std::env::set_var("OUTPACE_HISTORY_SECONDS", "600");
+        std::env::set_var("OUTPACE_HISTORY_BYTES", "1048576");
+        std::env::set_var("OUTPACE_HISTORY_TOTAL_BYTES", "2097152");
+        let c = config_from_env().unwrap();
+        assert!(c.hls_history.enabled());
+        assert_eq!(c.hls_history.max_seconds, 600);
+        assert_eq!(c.hls_history.max_bytes, 1_048_576);
+        assert_eq!(c.hls_history.global_max_bytes, 2_097_152);
+
+        std::env::set_var("OUTPACE_HISTORY_SECONDS", "3601");
+        assert!(config_from_env().is_err());
+        std::env::set_var("OUTPACE_HISTORY_SECONDS", "600");
+        std::env::set_var("OUTPACE_HISTORY_TOTAL_BYTES", "1048575");
+        assert!(config_from_env().is_err(), "total must cover per-source");
+        std::env::set_var("OUTPACE_HISTORY_TOTAL_BYTES", "2097152");
+        std::env::set_var("OUTPACE_HISTORY_BYTES", "187");
+        assert!(config_from_env().is_err());
+        std::env::set_var("OUTPACE_HISTORY_BYTES", "-1");
+        assert!(config_from_env().is_err());
 
         for (name, value) in names.into_iter().zip(old) {
             match value {
