@@ -46,7 +46,10 @@ install)
 		plutil -replace StandardOutPath -string "$log" "$tmp"
 		plutil -replace StandardErrorPath -string "$log" "$tmp"
 	fi
-	plutil -replace ProgramArguments.0 -string "$binary" "$tmp"
+	# On an array element, plutil -replace inserts instead of replacing, so remove the old
+	# program path first.
+	plutil -remove ProgramArguments.0 "$tmp"
+	plutil -insert ProgramArguments.0 -string "$binary" "$tmp"
 	# Validate before touching the running agent.
 	plutil -lint "$tmp" >/dev/null
 	mv "$tmp" "$plist"

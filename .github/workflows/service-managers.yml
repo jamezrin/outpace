@@ -145,6 +145,10 @@ jobs:
           packaging/macos/install-launchagent.sh install "$dir/outpace"
           packaging/macos/install-launchagent.sh reload
           [ "$(plutil -extract EnvironmentVariables.OUTPACE_SMOKE_MARKER raw "$plist")" = kept ]
+          # Reinstalling must leave exactly the program and `serve`.
+          [ "$(plutil -extract ProgramArguments raw "$plist")" = 2 ]
+          [ "$(plutil -extract ProgramArguments.0 raw "$plist")" = "$dir/outpace" ]
+          [ "$(plutil -extract ProgramArguments.1 raw "$plist")" = serve ]
           ok=0
           for i in $(seq 60); do
             if curl --fail --silent --max-time 2 http://127.0.0.1:6878/healthz; then ok=1; break; fi
