@@ -76,12 +76,12 @@ http://127.0.0.1:6878/streams/ace/0123456789abcdef0123456789abcdef01234567.m3u8
 outpace deliberately buffers before it sends the first byte, so playback rides out swarm
 hiccups:
 
-- direct MPEG-TS waits for up to about 30 seconds of media, but never more than 15 seconds after
-  the first media byte arrives;
-- HLS waits until six 5-second segments are ready, and gives up with HTTP `503` after 45
-  seconds.
+- it collects up to 30 seconds of media, waiting no more than 15 seconds after the first media
+  byte arrives;
+- HLS also waits until six segments are ready. If that doesn't happen within 45 seconds it
+  returns HTTP `503`, and most players retry.
 
-Peer discovery comes before both, so a cold start often takes 20–60 seconds. You can shorten the
+Peer discovery comes first, so a cold start often takes 20–60 seconds. You can shorten the
 wait; see [HLS Output](HLS-Output) and
 [Configuration](Configuration#playback-and-startup-buffering).
 
