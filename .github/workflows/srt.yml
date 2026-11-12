@@ -49,6 +49,10 @@ jobs:
       - name: Install generated media tools
         timeout-minutes: 7
         run: python3 tools/ci/install_media_tools.py
+      - name: Native accept error classification
+        run: |
+          cc -Wall -Wextra -Werror $(pkg-config --cflags srt) crates/ace-engine/native/tests/accept.c $(pkg-config --libs srt) -o "$RUNNER_TEMP/srt-accept-test"
+          "$RUNNER_TEMP/srt-accept-test"
       - name: Enabled workspace tests and lint
         run: |
           pkg-config --atleast-version=1.5.7 srt

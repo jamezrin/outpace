@@ -123,3 +123,38 @@ async fn srt_immediate_shutdown_joins_listener_without_rereading_the_secret() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn unexpected_srt_completion_wakes_shutdown_and_latches_failure() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    for closed in [false, true] {
+        let (sender, completed) = tokio::sync::watch::channel(false);
+        let failed = Arc::new(AtomicBool::new(false));
+        let failure = failed.clone();
+        let observed = supervised_srt_shutdown(std::future::pending(), Some(completed), failure);
+        if closed {
+            drop(sender);
+        } else {
+            sender.send_replace(true);
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(100), observed)
+            .await
+            .expect("unexpected service exit must wake HTTP graceful shutdown");
+        assert!(failed.load(Ordering::Acquire));
+    }
+}
+
+#[tokio::test]
+async fn requested_shutdown_wins_over_ready_srt_completion() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let (_, completed) = tokio::sync::watch::channel(true);
+    let failed = Arc::new(AtomicBool::new(false));
+    supervised_srt_shutdown(async {}, Some(completed), failed.clone()).await;
+    assert!(!failed.load(Ordering::Acquire));
+}

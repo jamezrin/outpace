@@ -15,7 +15,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-srt = ["dep:cc"]
+srt = ["dep:cc", "dep:shlex"]
 
 [dependencies]
 ace-log = { path = "../ace-log" }
@@ -61,3 +61,4 @@ ace-tracker = { path = "../ace-tracker" }
 
 [build-dependencies]
 cc = { version = "1", optional = true }
+shlex = { version = "2", optional = true }

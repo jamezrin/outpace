@@ -967,6 +967,24 @@ pub(crate) async fn serve_http_until(
     }
 }
 
+async fn supervised_srt_shutdown(
+    shutdown: impl std::future::Future<Output = ()>,
+    completed: Option<tokio::sync::watch::Receiver<bool>>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::select! { biased;
+        () = shutdown => {},
+        () = async move {
+            let Some(mut completed) = completed else {
+                return std::future::pending::<()>().await;
+            };
+            while !*completed.borrow_and_update() {
+                if completed.changed().await.is_err() { break; }
+            }
+        } => { failed.store(true, std::sync::atomic::Ordering::Release); },
+    }
+}
+
 async fn serve_http_inner(
     runtime: EngineRuntime,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -991,7 +1009,7 @@ async fn serve_http_inner(
 
         background: _,
     } = runtime;
-    let mut shutdown = Box::pin(shutdown);
+    let shutdown = Box::pin(shutdown);
 
     // Startup banner: plain `eprintln!` on purpose. These lines are read live by whoever
     // just ran the daemon, so they intentionally skip the `alog!` timestamp/`[tag]` prefix.
@@ -1107,6 +1125,15 @@ async fn serve_http_inner(
     } else {
         None
     };
+    let srt_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completed = srt_owner
+        .as_ref()
+        .and_then(|service| service.completion_receiver());
+    let mut shutdown = Box::pin(supervised_srt_shutdown(
+        shutdown,
+        completed,
+        srt_failed.clone(),
+    ));
     let cancel_srt = srt_owner.as_ref().map(|service| service.stop_signal());
     if let Some(address) = srt_owner.as_ref().and_then(|service| service.local_addr()) {
         eprintln!("outpace: encrypted SRT ingest listening on {address}");
@@ -1213,6 +1240,9 @@ async fn serve_http_inner(
     .await;
     broadcasts.close_admissions();
     rtmp.stop(broadcasts.registry.cleanup_deadline()).await;
+    if srt_failed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(std::io::Error::other("srt_listener_exited_unexpectedly").into());
+    }
     result
 }
 

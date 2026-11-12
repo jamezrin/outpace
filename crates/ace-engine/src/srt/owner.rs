@@ -127,8 +127,8 @@ impl NativeOwner {
         let cleanup = CleanupTracker::default();
         let (published, outcome) = watch::channel(None);
         let cleanup_stop = stop.clone();
+        let mut joined = tokio::task::spawn_blocking(move || thread.join());
         let mut control = cleanup.spawn(move |mut cancel| async move {
-            let mut joined = tokio::task::spawn_blocking(move || thread.join());
             let result = tokio::select! {
                 result = &mut joined => result,
                 _ = cancel.changed() => {
@@ -618,13 +618,35 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let mut owner = runtime.block_on(NativeOwner::start(config)).unwrap();
+            // Enter without driving async tasks: readiness may arrive from the
+            // native thread before the cleanup monitor receives its first poll.
+            let entered = runtime.enter();
+            let mut startup = Box::pin(NativeOwner::start(config));
+            let waker = std::task::Waker::noop();
+            let mut context = std::task::Context::from_waker(waker);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut owner = loop {
+                match std::future::Future::poll(startup.as_mut(), &mut context) {
+                    std::task::Poll::Ready(result) => break result.unwrap(),
+                    std::task::Poll::Pending => {
+                        assert!(Instant::now() < deadline, "native startup deadline");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            };
+            let address = owner.local_addr();
+            drop(startup);
+            drop(entered);
             let (_, replacement) = mpsc::channel(1);
             let retained = std::mem::replace(&mut owner.incoming, replacement);
             drop(owner);
             // No block_on/yield after cancellation; runtime must still reap its
             // blocking join because native termination was latched synchronously.
             drop(runtime);
+            assert!(
+                std::net::UdpSocket::bind(address).is_ok(),
+                "runtime drop must finish native socket cleanup before return"
+            );
             drop(retained);
             return;
         }
@@ -657,6 +679,28 @@ mod tests {
         );
     }
 
+    async fn assert_listener_address_released(address: SocketAddr) {
+        // Other tests/listeners may retain the process-wide SDK. NONEXIST is
+        // logical retirement; the collector can still be destroying its muxer.
+        // Keep a bounded OS-level release witness rather than equating the two.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match std::net::UdpSocket::bind(address) {
+                Ok(socket) => {
+                    drop(socket);
+                    return;
+                }
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "native address {address} not released: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn native_owner_shutdown_joins_and_releases_listen_socket() {
         let (config, _key) = config();
@@ -667,15 +711,12 @@ mod tests {
             matches!(result, Ok(Ok(()))),
             "native owner must confirm its join"
         );
-        let rebound = std::net::UdpSocket::bind(address);
-        assert!(
-            rebound.is_ok(),
-            "native listener no longer owns the UDP address"
-        );
+        assert_listener_address_released(address).await;
     }
 
     #[tokio::test]
     async fn native_owner_drop_transfers_join_until_collected() {
+        let _shared_sdk = NativeLibrary::acquire().unwrap();
         let (config, _key) = config();
         let owner = NativeOwner::start(config).await.unwrap();
         let mut completion = owner.completion.clone();
@@ -689,7 +730,7 @@ mod tests {
         .await;
         assert_eq!(joined, Ok(true));
         assert!(matches!(*outcome.borrow(), Some(Ok(()))));
-        assert!(std::net::UdpSocket::bind(address).is_ok());
+        assert_listener_address_released(address).await;
     }
 
     #[tokio::test]

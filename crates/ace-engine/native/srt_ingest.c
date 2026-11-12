@@ -102,7 +102,14 @@ int op_srt_listen(int socket, const char *ip, uint16_t port, uint32_t scope,
 int op_srt_accept(int listener, int *accepted) {
     if (!accepted) return -1;
     int socket = srt_accept(listener, NULL, NULL);
-    if (socket == SRT_INVALID_SOCK) return srt_getlasterror(NULL) == SRT_EASYNCRCV ? 0 : -1;
+    if (socket == SRT_INVALID_SOCK) {
+        int error = srt_getlasterror(NULL);
+        /* ESCLOSED can refer to a queued peer removed before SDK lookup.
+           Only retry while our independently owned listener remains live. */
+        if (srt_getsockstate(listener) != SRTS_LISTENING) return -1;
+        if (error == SRT_ESCLOSED) return 2;
+        return error == SRT_EASYNCRCV ? 0 : -1;
+    }
     *accepted = socket;
     return 1;
 }

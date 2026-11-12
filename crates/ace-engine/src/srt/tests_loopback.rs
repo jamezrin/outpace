@@ -504,14 +504,14 @@ async fn generated_srt_reconnect_and_restart_preserve_identity_and_monotone_inde
         drop(second_publisher);
         service.shutdown().await.map_err(|e| e.to_string())?;
         registry.shutdown().await.map_err(|e| e.to_string())?;
-        Ok::<_, String>((identity, second.cursor.start_piece()))
+        Ok::<_, String>((identity, second.cursor.reserved_until()))
     }
     .await;
     // Finish the first runtime even if observation failed.
     let stopped = service.shutdown().await;
     let registry_stopped = registry.shutdown().await;
     assert!(stopped.is_ok() && registry_stopped.is_ok());
-    let (identity, previous_next) = observation
+    let (identity, previous_reserved_until) = observation
         .unwrap_or_else(|error| panic!("reconnect: {error}; artifacts={}", artifacts.0.display()));
     let reloaded = BroadcastRegistry::with_persist(
         &artifacts.path("origin"),
@@ -527,7 +527,7 @@ async fn generated_srt_reconnect_and_restart_preserve_identity_and_monotone_inde
     assert_eq!(loaded[0].transport_bytes, identity);
     let restart_at = loaded[0].cursor.start_piece();
     assert!(
-        restart_at >= previous_next,
+        restart_at >= previous_reserved_until,
         "restart cannot reuse consumed/reserved indexes"
     );
     let state = BroadcastState {

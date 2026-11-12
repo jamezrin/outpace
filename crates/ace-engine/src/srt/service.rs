@@ -107,6 +107,16 @@ impl SrtService {
             }))
         }
     }
+    pub(crate) fn completion_receiver(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        #[cfg(feature = "srt")]
+        {
+            Some(self.completed.clone())
+        }
+        #[cfg(not(feature = "srt"))]
+        {
+            None
+        }
+    }
     pub(crate) fn stop_signal(&self) -> StopSignal {
         self.stop.clone()
     }

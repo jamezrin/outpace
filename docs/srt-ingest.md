@@ -86,7 +86,8 @@ OUTPACE_SRT_PASSPHRASE_FILE="$HOME/.config/outpace/srt.key" \
 ```
 
 In another shell, set `BROADCAST_NAME` to the desired valid name. This example
-publishes generated video/audio for a bounded 20 seconds:
+publishes generated video/audio for a bounded 20 seconds. Start the receiver in
+a third shell immediately while this command is running:
 
 ```bash
 : "${BROADCAST_NAME:?set a valid broadcast name}"
@@ -99,6 +100,42 @@ ffmpeg -hide_banner -loglevel error -re \
   "srt://127.0.0.1:9000?mode=caller&streamid=${BROADCAST_NAME}&passphrase=${SRT_KEY}&pkt_size=1316"
 unset SRT_KEY
 ```
+
+In that third shell, use the same `BROADCAST_NAME`. With the example daemon's
+peer listener at `127.0.0.1:8621`, this receiver uses strict private peer admission.
+Private mode intentionally refuses remote descriptor selectors, so first capture
+the loopback transport URL into an operator-owned file and admit a local alias.
+Adjust both addresses if configured differently. Run after publisher admission,
+while the publisher is still active:
+
+```bash
+(
+  set -o pipefail
+  : "${BROADCAST_NAME:?set the same broadcast name}"
+  umask 077
+  SMOKE_DIR=$(mktemp -d) || exit
+  trap 'rm -f -- "$SMOKE_DIR/descriptor.acelive"; rmdir -- "$SMOKE_DIR"' EXIT
+  curl --fail --silent --show-error --max-time 3 --max-filesize 1048576 \
+    --noproxy '*' --proto '=http' \
+    "http://127.0.0.1:6878/broadcast/${BROADCAST_NAME}" \
+    -o "$SMOKE_DIR/descriptor.acelive" || exit
+  DESCRIPTORS=$(python3 -c 'import json,sys; print(json.dumps({"srt_smoke":sys.argv[1]}))' \
+    "$SMOKE_DIR/descriptor.acelive") || exit
+  OUTPACE_PRIVATE_PEERS=127.0.0.1:8621 \
+  OUTPACE_PRIVATE_DESCRIPTORS="$DESCRIPTORS" \
+    timeout --signal=INT --kill-after=3s 15s target/release/outpace play \
+      local:srt_smoke | \
+    ffmpeg -hide_banner -loglevel info -i pipe:0 \
+      -map 0:v:0 -map 0:a:0 -t 5 -f null -
+)
+```
+
+Both required maps must resolve, the decoder must report a positive video frame count and nonzero audio
+output, and its stderr must show no decode failure. Merely fetching the descriptor
+or receiving bytes is insufficient. The finite decoder closes its pipe after five
+seconds; an upstream broken-pipe or timeout exit is cleanup, not a successful decode
+verdict. Inspect the decoder result and output. The timeout bounds the upstream
+process, and `--kill-after` bounds a process that ignores its stop signal.
 
 The expanded publisher URL contains the secret in process arguments. Disable shell
 tracing, do not paste expanded URLs into logs/issues, and use a trusted host. For a

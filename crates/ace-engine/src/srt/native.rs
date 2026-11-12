@@ -185,7 +185,7 @@ impl<'a> NativeSocket<'a> {
     pub fn accept(&self) -> Result<Option<NativeSocket<'a>>, NativeError> {
         let mut socket = -1;
         match unsafe { op_srt_accept(self.socket.ok_or(NativeError::Close)?, &mut socket) } {
-            0 => Ok(None),
+            0 | 2 => Ok(None),
             1 => {
                 let accepted = NativeSocket {
                     library: self.library,
