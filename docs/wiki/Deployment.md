@@ -161,6 +161,33 @@ journalctl -u outpace -f
 Logs go to standard error. Each line starts with a UTC time of day (`HH:MM:SS.mmm`), and the
 journal adds the date. Open TCP 8621 in your firewall if you run as a full participant.
 
+## FreeBSD rc.d
+
+From the next release, there is a FreeBSD binary (see
+[Installation](Installation#freebsd-and-other-bsds)). Run it under `daemon(8)`, which
+restarts it if it exits:
+
+```sh
+pw useradd outpace -d /var/db/outpace -s /usr/sbin/nologin
+install -d -o outpace -g outpace -m 0700 /var/db/outpace
+fetch -o /usr/local/etc/rc.d/outpace \
+  https://raw.githubusercontent.com/jamezrin/outpace-stream/main/packaging/freebsd/outpace
+chmod 0755 /usr/local/etc/rc.d/outpace
+sysrc outpace_enable=YES
+service outpace start
+```
+
+Run these as root. The script is
+[`packaging/freebsd/outpace`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/freebsd/outpace).
+`daemon(8)` stays root so it can write `/var/run/outpace.pid` and `/var/log/outpace.log`, and
+runs Outpace itself as `outpace`. To use another account, set `outpace_runas`, not
+`outpace_user`: `rc.subr` would run `daemon(8)` as that user too, and the start would fail.
+
+`daemon -P` stops the supervisor and the daemon together, so `service outpace stop` shuts
+Outpace down gracefully. To change settings, set `outpace_env` with `sysrc`, for example
+`sysrc outpace_env="OUTPACE_BIND=127.0.0.1:6878 OUTPACE_DATA_DIR=/var/db/outpace OUTPACE_CACHE_TYPE=disk"`,
+then restart.
+
 ## Behind a reverse proxy
 
 A proxy is the usual way to add TLS and authentication. Things to get right:
