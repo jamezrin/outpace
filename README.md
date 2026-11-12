@@ -220,6 +220,12 @@ so players can seek — each served range is still SHA1-verified against the cov
 Multi-file VOD is intentionally unsupported and fails with a clear error; VOD HLS is a tracked
 follow-up.
 
+### Broadcast origination
+
+Optional encrypted SRT input is available in native Linux builds with the `srt`
+feature. See [SRT ingest](docs/srt-ingest.md) for native prerequisites, explicit
+listener configuration, publisher URLs, and security/cleanup behavior.
+
 Start a named broadcast:
 
 ```bash

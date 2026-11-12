@@ -46,6 +46,7 @@ pub mod rtmp_ts;
 pub mod runtime;
 pub mod server_api;
 pub mod session;
+pub mod srt;
 pub mod start_failure;
 pub mod startup_buffer;
 pub mod support;
