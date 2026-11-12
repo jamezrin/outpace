@@ -45,6 +45,9 @@ def passing():
                         'leaks': 0, 'report_has_target': False, 'report_has_seed': False}
     results['host_change'] = owned(changed=True)
     results['host_change']['boundary'].update(host_address_events=1, admitted_out=8, host_change_denied=12)
+    results['host_send_boundary'] = dict(owned(), received=0)
+    results['host_send_boundary']['boundary'].update(admitted_out=20, host_address_events=0,
+                                                     host_change_denied=0)
     for name, reason in live_fixture.REFUSALS.items():
         results[name] = {'report': {'verdict': 'inconclusive', 'arms': [], 'reason': reason},
                          'files': ['report.json']}
@@ -96,6 +99,10 @@ class EvaluateTests(unittest.TestCase):
                             lambda c: c['boundary'].update(host_address_events=0),
                             lambda c: c['boundary'].update(host_change_denied=0, admitted_out=20),
                             lambda c: c['boundary'].update(admitted_out=0, host_change_denied=20)],
+            'host_send_boundary': [lambda c: c.update(received=1),
+                                   lambda c: c['boundary'].update(admitted_out=19),
+                                   lambda c: c['boundary'].update(host_address_events=1),
+                                   lambda c: c.update(cleanup_complete=False)],
             'block_ipv6_enabled': [lambda c: c['report'].update(reason='egress_route')],
             'block_host_address': [lambda c: c['report'].update(verdict='complete')],
         }

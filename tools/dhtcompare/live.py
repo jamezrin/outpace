@@ -75,19 +75,35 @@ def _single_root_mapping(path):
     return None
 
 
-def launcher_identity(*, euid=None, uid_map='/proc/self/uid_map', gid_map='/proc/self/gid_map'):
+_nested_root_vouched = False
+
+
+def vouch_nested_root():
+    """Declare that this process is root only in a namespace its launcher created after dropping.
+
+    A uid map shows only the parent namespace, so a nested root cannot prove from inside
+    that it maps to a non-root initial-namespace id; only the launcher that dropped can.
+    """
+    global _nested_root_vouched
+    _nested_root_vouched = True
+
+
+def launcher_identity(*, euid=None, uid_map='/proc/self/uid_map', gid_map='/proc/self/gid_map',
+                      vouched=None):
     """setpriv arguments that drop a root supervisor's namespace launch to an unprivileged uid.
 
     The parent-death signal is armed after the credential change, so it survives it.
     A non-root supervisor launches as itself. A root supervisor that cannot map the
-    unprivileged id may launch as itself only inside a namespace whose sole mapped id
-    is root backed by a non-root parent id; any other root launch is refused.
+    unprivileged id may launch as itself only when its launcher vouched for it and its
+    namespace maps root alone to a non-zero parent id; any other root launch is refused.
     """
     if (os.geteuid() if euid is None else euid) != 0:
         return []
     if _maps(uid_map, UNPRIVILEGED_ID) and _maps(gid_map, UNPRIVILEGED_ID):
         return ['--reuid', str(UNPRIVILEGED_ID), '--regid', str(UNPRIVILEGED_ID), '--clear-groups']
-    if _single_root_mapping(uid_map) not in (None, 0) and _single_root_mapping(gid_map) not in (None, 0):
+    if ((_nested_root_vouched if vouched is None else vouched)
+            and _single_root_mapping(uid_map) not in (None, 0)
+            and _single_root_mapping(gid_map) not in (None, 0)):
         return []
     raise ValueError('root_equivalent_launch')
 
@@ -172,12 +188,15 @@ def _inner_report(final):
     return report
 
 
-def run_live(argv, *, timeout, env, open_outer, prefix_cap=65536):
+def run_live(argv, *, timeout, env, open_outer, prefix_cap=65536, host_events=None):
     """Run one argv inside a fresh default-deny live namespace and relay its UDP.
 
     `open_outer` returns one nonblocking root-namespace UDP socket per inner socket.
-    The timeout must leave the caller 2.1 seconds of cleanup reserve.
+    `host_events` is a caller-owned address-change subscription; without one, the run
+    subscribes after attestation. The timeout must leave the caller 2.1 seconds of
+    cleanup reserve.
     """
+    owned_events = None
     if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
             or not math.isfinite(timeout) or not 0 < timeout <= 28
             or not argv or len(argv) > 32 or not Path(argv[0]).is_absolute()
@@ -265,13 +284,14 @@ def run_live(argv, *, timeout, env, open_outer, prefix_cap=65536):
                             if packet is not None:
                                 packet.close()
                             denial = 'attestation'; kill(); continue
-                        try:
-                            events = host_address_monitor()
-                        except OSError:
-                            packet.close()
-                            denial = 'host_monitor'; kill(); continue
+                        if host_events is None:
+                            try:
+                                owned_events = host_address_monitor()
+                            except OSError:
+                                packet.close()
+                                denial = 'host_monitor'; kill(); continue
                         relay = Relay(packet, worker_mac=worker_mac, gateway_mac=gateway_mac,
-                                      open_outer=open_outer, host_events=events)
+                                      open_outer=open_outer, host_events=host_events or owned_events)
                         relay.register(selector)
                         control.send(b'go'); attested = True; phase = 'running'
                     else:
@@ -311,6 +331,8 @@ def run_live(argv, *, timeout, env, open_outer, prefix_cap=65536):
         boundary = relay.report() if relay is not None else None
         if relay is not None:
             relay.close()
+        if owned_events is not None:
+            owned_events.close()
         child_end.close(); control.close(); selector.close()
     reaped = proc is not None and proc.returncode is not None
     if reaped and proc.returncode < 0 and not init_terminal:
@@ -352,7 +374,7 @@ def worker_environment(role, target, seeds):
             PREFIX + 'TARGET': target, PREFIX + 'SEEDS': seeds}
 
 
-def run_live_worker(role, artifact, *, target, seeds, deadline, open_outer):
+def run_live_worker(role, artifact, *, target, seeds, deadline, open_outer, host_events=None):
     """Run one pinned candidate through the live boundary within a 30-second envelope.
 
     Seeds must be one to four unique permitted global IPv4 endpoints. Identity-bearing
@@ -375,7 +397,8 @@ def run_live_worker(role, artifact, *, target, seeds, deadline, open_outer):
     artifact.verify()
     env = {'LC_ALL': 'C', **worker_environment(role, target, seeds)}
     start = time.monotonic()
-    result = run_live(worker_argv(role, artifact), timeout=27.8, env=env, open_outer=open_outer)
+    result = run_live(worker_argv(role, artifact), timeout=27.8, env=env, open_outer=open_outer,
+                      host_events=host_events)
     elapsed = time.monotonic() - start
     if time.monotonic() > deadline:
         raise LiveWorkerError('live_worker_deadline', result)

@@ -281,7 +281,7 @@ python3.11 tools/dhtcompare/live_qualification.py \
   --output /private/path/to/new-live-qualification
 ```
 
-The 15 fixed cases run inside one outer namespace whose only egress is a dummy
+The 16 fixed cases run inside one outer namespace whose only egress is a dummy
 device with synthetic addresses, under a 240-second deadline:
 
 - A probe covers two threads and sockets, eight denied destination classes,
@@ -296,6 +296,8 @@ device with synthetic addresses, under a 240-second deadline:
 - As root, qualification launches as uid 65534 like live workers, and the probe
   must fail to read a root-only canary file.
 - A host-owned global address added mid-arm stops all further forwarding.
+- With change events withheld, datagrams to an address on another host interface
+  leave through the egress device and a host listener on that address receives none.
 
 Listeners on private outer addresses must receive nothing. `test_live.py` runs the
 probe locally without binaries. CI runs the pure relay, policy, consistency and

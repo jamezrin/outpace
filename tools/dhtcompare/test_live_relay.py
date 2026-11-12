@@ -5,7 +5,9 @@ import re
 import socket
 import struct
 import tempfile
+import types
 import unittest
+from unittest import mock
 import live
 import live_block
 import live_policy
@@ -296,7 +298,64 @@ class HostChangeTests(unittest.TestCase):
         self.assertEqual((report['admitted_out'], report['host_change_denied'], report['denied_destination'],
                           report['host_address_events']), (1, 2, 1, 2))
         r.close()
+        self.assertFalse(events.closed)
+
+    def test_a_receive_error_counts_as_a_change(self):
+        class Failing:
+            def recv(self, size):
+                raise OSError('ENOBUFS')
+        self.assertEqual(live_relay.drain_host_events(Failing()), 1)
+
+
+class BlockHostChangeTests(unittest.TestCase):
+    """The block subscribes before its address check and drains changes before every arm."""
+
+    def run_block(self, *, on_check=lambda events: None, on_arm=lambda events: None):
+        events = FakeEvents([])
+        artifact = types.SimpleNamespace(verify=lambda: None, sha256='0' * 64)
+        result = types.SimpleNamespace(exit_code=0, timed_out=False, cleanup_complete=True, truncated=False,
+                                       attested=True, denial=None, stdout_bytes=0, stderr_bytes=0,
+                                       stdout=b'', stderr=b'', boundary=None, inner=None)
+        arms = []
+
+        def check(exempt):
+            on_check(events)
+            return 0
+
+        def worker(role, *args, host_events, **kwargs):
+            self.assertIs(host_events, events)
+            arms.append(role)
+            on_arm(events)
+            return types.SimpleNamespace(result=result, record={}, elapsed=1.0)
+        state = {'default_via_egress': True, 'ipv6_disabled': True}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(live_block, 'host_address_monitor', lambda: events), \
+                mock.patch.object(live_block, 'network_state', lambda device: state), \
+                mock.patch.object(live_block, 'host_global_addresses', check), \
+                mock.patch.object(live_block, 'resolve_target', lambda *a: ('0123456789abcdef' * 2 + '01234567', True)), \
+                mock.patch.object(live_block, 'resolve_seeds', lambda *a: (['11.0.0.2:6881'], 0)), \
+                mock.patch.object(live_block, 'uncovered_listeners', lambda: 0), \
+                mock.patch.object(live, 'run_live_worker', worker):
+            report = live_block.run_block({'custom': artifact, 'upstream': artifact},
+                                          content_id='0123456789abcdef0123456789abcdef01234567',
+                                          egress_device='dhtq0', output=Path(directory) / 'block')
         self.assertTrue(events.closed)
+        return report, arms
+
+    def test_unchanged_host_completes_all_arms(self):
+        report, arms = self.run_block()
+        self.assertEqual((report['verdict'], arms), ('complete', ['custom', 'mainline', 'n0']))
+
+    def test_change_during_the_address_check_prevents_every_arm(self):
+        report, arms = self.run_block(on_check=lambda events: events.messages.append(b'newaddr'))
+        self.assertEqual((report['reason'], arms), ('host_address_change', []))
+
+    def test_change_between_arms_prevents_the_next_arm(self):
+        def change_once(events):
+            if not hasattr(change_once, 'done'):
+                change_once.done = events.messages.append(b'newaddr')
+        report, arms = self.run_block(on_arm=change_once)
+        self.assertEqual((report['reason'], arms), ('host_address_change', ['custom']))
 
 
 class LauncherIdentityTests(unittest.TestCase):
@@ -315,13 +374,15 @@ class LauncherIdentityTests(unittest.TestCase):
         self.assertEqual(live.launcher_identity(euid=0, uid_map=container, gid_map=container)[:2],
                          ['--reuid', '65534'])
         nested, = self.maps('         0      65534          1\n')
-        self.assertEqual(live.launcher_identity(euid=0, uid_map=nested, gid_map=nested), [])
+        self.assertEqual(live.launcher_identity(euid=0, uid_map=nested, gid_map=nested, vouched=True), [])
+        with self.assertRaises(ValueError):
+            live.launcher_identity(euid=0, uid_map=nested, gid_map=nested, vouched=False)
         host_root, = self.maps('         0          0          1\n')
         with self.assertRaises(ValueError):
-            live.launcher_identity(euid=0, uid_map=host_root, gid_map=host_root)
+            live.launcher_identity(euid=0, uid_map=host_root, gid_map=host_root, vouched=True)
         partial, = self.maps('         0          0       1000\n')
         with self.assertRaises(ValueError):
-            live.launcher_identity(euid=0, uid_map=partial, gid_map=partial)
+            live.launcher_identity(euid=0, uid_map=partial, gid_map=partial, vouched=True)
         self.assertEqual(live.launcher_identity(euid=1000, uid_map=host_root, gid_map=host_root), [])
 
     def test_maps_checks_identity_ranges(self):

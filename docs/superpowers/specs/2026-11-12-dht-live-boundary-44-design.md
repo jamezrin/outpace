@@ -54,13 +54,20 @@ datagram totals are bounded.
 The destination policy for UDP is enforced by the relay alone; nftables restricts the
 worker to UDP on its veth and counts denied destinations, and the existing host egress
 table and VPN gateway sit behind the relay. A root supervisor launches each namespace
-as uid 65534, so the worker cannot read root-only host files; a root launch that
-cannot drop is refused unless its namespace's only id is root backed by a non-root
-parent id. A block refuses admission while the host owns any address the relay would
-forward to, because Linux would deliver such datagrams locally. During an arm the
-relay watches IPv4 address changes through rtnetlink before every forward; any
-change stops all further forwarding and makes the block inconclusive. A change
-landing between that check and the send is not covered. Nothing on the host changes. Each worker's
+as uid 65534, so the worker cannot read root-only host files. A root launch that
+cannot drop is refused unless the qualification supervisor, which performed the drop
+itself, vouches for it and the namespace's only id is root backed by a non-zero parent
+id: a uid map shows only the parent namespace, so a nested root cannot prove its
+initial-namespace id from inside. The launcher's own namespace must map 65534 to a
+non-root host id; on the validation container it does. A block refuses admission while
+the host owns any address the relay would forward to, because Linux would deliver such
+datagrams locally. The block subscribes to rtnetlink IPv4 address changes before that
+check and keeps the subscription across arms; a change before any arm makes the block
+inconclusive, and a change during an arm stops all further forwarding. Relay sends are
+bound to the egress device, so the kernel never delivers them to an address on another
+host interface, whatever the event timing. Only an address added to the egress device
+itself between the relay's last event check and its send is not covered. Nothing on
+the host changes. Each worker's
 namespace, sockets and relay state are destroyed before the next arm starts. The
 launcher carries a parent-death SIGKILL, so the namespace also dies if the
 supervisor is killed.

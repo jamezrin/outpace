@@ -94,6 +94,20 @@ def host_address_monitor():
     return monitor
 
 
+def drain_host_events(monitor):
+    """Count pending address-change messages; a receive error counts as a change."""
+    events = 0
+    while True:
+        try:
+            if not monitor.recv(65536):
+                return events
+        except BlockingIOError:
+            return events
+        except OSError:
+            return events + 1
+        events += 1
+
+
 def egress_socket(device):
     outer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -202,15 +216,11 @@ class Relay:
         self.counters['admitted_out_bytes'] += len(payload)
 
     def _poll_host_events(self):
-        while self.host_events is not None:
-            try:
-                if not self.host_events.recv(65536):
-                    return
-            except BlockingIOError:
-                return
-            except OSError:
-                pass
-            self.counters['host_address_events'] += 1
+        if self.host_events is None:
+            return
+        events = drain_host_events(self.host_events)
+        if events:
+            self.counters['host_address_events'] += events
             self.halted = True
 
     def _replies(self, inner_port):
@@ -268,8 +278,6 @@ class Relay:
             self.selector.unregister(self.packet)
             self.selector = None
         self.packet.close()
-        if self.host_events is not None:
-            self.host_events.close()
 
     def report(self):
         result = dict(self.counters)

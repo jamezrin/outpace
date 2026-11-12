@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import live
 import live_policy
-from live_relay import egress_socket
+from live_relay import drain_host_events, egress_socket, host_address_monitor
 from qualification import Artifact
 
 BLOCK_SECONDS = 135
@@ -188,9 +188,14 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
     report = {'schema': 'dht-live-block-v1', 'order': list(ORDER), 'arms': [],
               'artifacts': {role: artifacts[role].sha256 for role in ('custom', 'upstream')},
               'egress_device': egress_device, 'verdict': 'inconclusive', 'reason': None}
+    monitor = None
     try:
         for artifact in artifacts.values():
             artifact.verify()
+        try:
+            monitor = host_address_monitor()
+        except OSError:
+            raise Inconclusive('host_monitor') from None
         preflight = network_state(egress_device)
         report['preflight'] = preflight
         if not preflight['default_via_egress']:
@@ -220,13 +225,16 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
         for role in ORDER:
             if deadline - time.monotonic() < ARM_RESERVE + POSTFLIGHT_RESERVE:
                 raise Inconclusive('block_deadline')
+            if drain_host_events(monitor):
+                raise Inconclusive('host_address_change')
             artifact = artifacts['custom' if role == 'custom' else 'upstream']
             arm = {'role': role}
             report['arms'].append(arm)
             try:
                 observation = live.run_live_worker(
                     role, artifact, target=target, seeds=','.join(seeds),
-                    deadline=time.monotonic() + ARM_RESERVE, open_outer=open_outer)
+                    deadline=time.monotonic() + ARM_RESERVE, open_outer=open_outer,
+                    host_events=monitor)
                 result, arm['record'], arm['status'] = observation.result, observation.record, 'complete'
                 arm['parent_elapsed_seconds'] = observation.elapsed
             except live.LiveWorkerError as error:
@@ -246,6 +254,8 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
                 raise Inconclusive('cleanup_uncertain')
             if result.boundary is not None and result.boundary['host_address_events']:
                 raise Inconclusive('host_address_change')
+        if drain_host_events(monitor):
+            raise Inconclusive('host_address_change')
         postflight = network_state(egress_device)
         report['postflight'] = postflight
         if postflight != preflight:
@@ -257,6 +267,9 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
         report['reason'] = 'terminated'
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report['reason'] = type(error).__name__
+    finally:
+        if monitor is not None:
+            monitor.close()
     report['block_elapsed_seconds'] = time.monotonic() - start
     _write_private(output, 'report.json', json.dumps(report, sort_keys=True, indent=1).encode())
     return report

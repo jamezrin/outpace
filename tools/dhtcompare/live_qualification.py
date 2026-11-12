@@ -39,7 +39,8 @@ def qualify_live(custom, upstream, *, output):
     config = json.dumps({'cases': list(live_fixture.CASES),
                          'custom': str(custom.path), 'custom_sha256': custom.sha256,
                          'upstream': str(upstream.path), 'upstream_sha256': upstream.sha256,
-                         'scratch': str(scratch), 'canary': str(canary) if canary else None})
+                         'scratch': str(scratch), 'canary': str(canary) if canary else None,
+                         'vouched_nested_root': True})
     command = ['/usr/bin/setpriv', *identity, '--pdeathsig', 'KILL', '--', '/usr/bin/unshare', '--user', '--map-root-user', '--net', '--pid', '--fork',
                '--kill-child=KILL', '--mount-proc', sys.executable, '-I',
                str(Path(live_fixture.__file__).resolve()), config]

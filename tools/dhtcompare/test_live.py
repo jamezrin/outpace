@@ -15,7 +15,8 @@ FIXTURE = Path(__file__).resolve().with_name('live_fixture.py')
 
 def run_cases(*cases):
     with tempfile.TemporaryDirectory(dir=FIXTURE.parent) as scratch:
-        config = json.dumps({'cases': list(cases), 'scratch': scratch, 'canary': None})
+        config = json.dumps({'cases': list(cases), 'scratch': scratch, 'canary': None,
+                             'vouched_nested_root': True})
         completed = subprocess.run(
             ['/usr/bin/unshare', '--user', '--map-root-user', '--net', '--pid', '--fork',
              '--kill-child=KILL', '--mount-proc', sys.executable, '-I', str(FIXTURE), config],

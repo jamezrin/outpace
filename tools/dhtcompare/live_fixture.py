@@ -28,6 +28,7 @@ SECOND = ('11.0.0.4', 6881)
 STRANGERS = (('11.0.0.3', 6881), ('11.0.0.2', 6882))
 HOST_GLOBAL = '12.0.0.1'
 HOST_LATE = '12.0.0.2'
+HOST_DEVICE = 'dhth0'
 SYNTHETIC_HOST = frozenset(('11.0.0.1', SEED[0], SECOND[0], STRANGERS[0][0]))
 LEAK_ADDRESSES = ('10.0.0.5', '192.168.1.9', '172.16.0.1', '100.64.0.1', '169.254.1.1')
 TARGET = bytes.fromhex('0123456789abcdef0123456789abcdef01234567')
@@ -275,11 +276,12 @@ def block_case(config, encrypted):
             'report_has_seed': SEED[0].encode() in written}
 
 
-TICKER = ('import socket, time\n'
-          'udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
-          'for _ in range(20):\n'
-          '    udp.sendto(b"tick", ("11.0.0.2", 6881))\n'
-          '    time.sleep(0.1)\n')
+def ticker(address):
+    return ('import socket, time\n'
+            'udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+            'for _ in range(20):\n'
+            f'    udp.sendto(b"tick", ("{address}", 6881))\n'
+            '    time.sleep(0.1)\n')
 
 
 def host_change_case():
@@ -294,7 +296,7 @@ def host_change_case():
     changer = threading.Thread(target=change)
     try:
         changer.start()
-        result = live.run_live(['/usr/bin/python3', '-I', '-c', TICKER], timeout=20,
+        result = live.run_live(['/usr/bin/python3', '-I', '-c', ticker(SEED[0])], timeout=20,
                                env={'LC_ALL': 'C'}, open_outer=lambda: egress_socket(EGRESS))
     finally:
         changer.join(5)
@@ -302,6 +304,37 @@ def host_change_case():
         if added.is_set():
             ip('address', 'del', f'{HOST_LATE}/32', 'dev', EGRESS)
     return dict(summary(result), leaks=servers.leaks, servers_alive=alive, changed=added.is_set())
+
+
+def host_send_boundary_case():
+    """Send to a host address on another device with change events withheld from the relay.
+
+    The egress-bound send must leave through the egress device, so the host listener
+    receives nothing even though the relay forwards every datagram.
+    """
+    ip('link', 'add', HOST_DEVICE, 'type', 'dummy')
+    ip('link', 'set', HOST_DEVICE, 'up')
+    ip('address', 'add', f'{HOST_LATE}/32', 'dev', HOST_DEVICE)
+    silent, unused = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    silent.setblocking(False)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+            listener.bind((HOST_LATE, 6881))
+            listener.setblocking(False)
+            result = live.run_live(['/usr/bin/python3', '-I', '-c', ticker(HOST_LATE)], timeout=20,
+                                   env={'LC_ALL': 'C'}, open_outer=lambda: egress_socket(EGRESS),
+                                   host_events=silent)
+            received = 0
+            while True:
+                try:
+                    listener.recv(65536)
+                except BlockingIOError:
+                    break
+                received += 1
+    finally:
+        silent.close(); unused.close()
+        ip('link', 'del', HOST_DEVICE)
+    return dict(summary(result), received=received)
 
 
 def refused_block_case(config, kind):
@@ -322,7 +355,8 @@ def refused_block_case(config, kind):
 CASES = ('probe', 'values:custom', 'values:mainline', 'values:n0', 'private_nodes:custom',
          'private_nodes:mainline', 'private_nodes:n0', 'unconfined:custom',
          'unconfined:mainline', 'unconfined:n0', 'block', 'block_encrypted',
-         'block_ipv6_enabled', 'block_host_address', 'host_change')
+         'block_ipv6_enabled', 'block_host_address', 'host_change',
+         'host_send_boundary')
 REFUSALS = {'block_encrypted': 'encrypted_or_unknown_protection',
             'block_ipv6_enabled': 'ipv6_enabled', 'block_host_address': 'host_global_address'}
 ZERO_CAPS = {key: '0000000000000000' for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')}
@@ -391,6 +425,12 @@ def evaluate(results):
                       and boundary['host_address_events'] >= 1
                       and boundary['admitted_out'] >= 1 and boundary['host_change_denied'] >= 1
                       and boundary['admitted_out'] + boundary['host_change_denied'] == 20)
+            elif name == 'host_send_boundary':
+                boundary = case['boundary']
+                ok = (case['exit_code'] == 0 and case['cleanup_complete'] is True
+                      and case['attested'] is True and case['received'] == 0
+                      and boundary['admitted_out'] == 20 and boundary['host_address_events'] == 0
+                      and boundary['host_change_denied'] == 0)
             elif name in REFUSALS:
                 report = case['report']
                 ok = (report['verdict'] == 'inconclusive' and report['arms'] == []
@@ -407,6 +447,8 @@ def evaluate(results):
 
 def main():
     config = json.loads(sys.argv[1])
+    if config['vouched_nested_root']:
+        live.vouch_nested_root()
     setup()
     results = {}
     for case in config['cases']:
@@ -418,6 +460,9 @@ def main():
             continue
         if case == 'host_change':
             results[case] = host_change_case()
+            continue
+        if case == 'host_send_boundary':
+            results[case] = host_send_boundary_case()
             continue
         if case in ('block_ipv6_enabled', 'block_host_address'):
             results[case] = refused_block_case(config, case)
