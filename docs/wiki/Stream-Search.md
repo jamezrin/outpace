@@ -12,17 +12,26 @@ Existing client apps supply the search UI; Outpace remains a headless engine. A 
 is not required for this adapter. A standalone catalog product with its own UI, indexer,
 EPG or playlist management is outside this scope.
 
-The first target is the search → select/add → playback workflow in
+The original target is the search → select/add → playback workflow in
 [visesa84/acestream-scraper-PyAcexy](https://github.com/visesa84/acestream-scraper-PyAcexy),
 requested in [#253](https://github.com/jamezrin/outpace-stream/issues/253#issuecomment-6334792867).
-Its search API needs name queries, zero-based pagination, category filtering, empty-query
+That compatibility contract needs name queries, zero-based pagination, category filtering, empty-query
 browsing, and results grouped by channel name with stream items and totals.
 
-Search results alone are insufficient. That client also calls
+Search results alone are insufficient. The older client workflow also calls
 `/server/api?method=get_content_id&infohash=...` before adding a selection. Outpace currently
 only echoes an already supplied content ID through `get_content_id`; reverse lookup is not
 implemented. A supported result-to-content-ID/verified-descriptor path, or an explicitly
 coordinated client change, is required before claiming this workflow works.
+
+Investigation on November 12 found that the client repository now resolves to
+`visesa84/acestream-scraper`. Its
+[November 11 migration](https://github.com/visesa84/acestream-scraper/commit/5668ec41d089)
+queries the external search service directly and uses explicit `ih:` selectors instead of
+reverse content-ID lookup. Outpace already supports infohash selectors through verified
+catalog resolution. That change provides an integration path, but does not make older clients
+compatible or prove playback of search results. The current client's search also bypasses
+Outpace; using the planned adapter will require a client integration change.
 
 ## Opt-in and playback boundaries
 
