@@ -1593,17 +1593,30 @@ async fn stuck_idle_cleanup_does_not_stop_later_background_sweeps() {
     .await
     .is_ok();
 
+    // Shutdown must still wait for cleanups the background reaper stopped waiting on.
+    let mut shutting_down = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.shutdown().await }
+    });
+    let waited_for_cleanup = tokio::time::timeout(Duration::from_secs(60), &mut shutting_down)
+        .await
+        .is_err();
     state.release.notify_one();
     state.release.notify_one();
-    let joined = tokio::time::timeout(Duration::from_secs(10), manager.shutdown()).await;
+    let joined = tokio::time::timeout(Duration::from_secs(10), shutting_down).await;
     assert!(
         reaped_later,
         "a stuck cleanup stopped the background reaper from sweeping later idle sessions"
     );
     assert!(
-        matches!(joined, Ok(true)),
+        waited_for_cleanup,
+        "shutdown finished while a reaped source cleanup was still pending"
+    );
+    assert!(
+        matches!(joined, Ok(Ok(true))),
         "shutdown lost the pending cleanup"
     );
+    assert_eq!(state.calls.load(Ordering::SeqCst), 2);
     assert!(state.dropped.load(Ordering::SeqCst));
     assert_eq!(manager.admission_status().0, 0);
 }
