@@ -45,16 +45,18 @@
 <line x1="934.6" y1="38.2" x2="1038.2" y2="39.5" stroke="#2a252e" stroke-width="1.5"/>
 <line x1="1038.2" y1="39.5" x2="1036.1" y2="133.0" stroke="#2a252e" stroke-width="1.5"/>
 <path d="M293.7 47.6 C348.4 47.6 348.4 155.0 382 155.0" fill="none" stroke="url(#flowL)" stroke-width="2.4" stroke-linecap="round"/>
-<path d="M283.4 322.5 C344.5 322.5 344.5 161.0 382 161.0" fill="none" stroke="url(#flowL)" stroke-width="2.4" stroke-linecap="round"/>
-<path d="M262.6 118.6 C336.6 118.6 336.6 167.0 382 167.0" fill="none" stroke="url(#flowL)" stroke-width="2.4" stroke-linecap="round"/>
-<path d="M245.7 238.1 C330.2 238.1 330.2 173.0 382 173.0" fill="none" stroke="url(#flowL)" stroke-width="2.4" stroke-linecap="round"/>
-<path d="M922.4 226.9 C857.7 226.9 857.7 155.0 818 155.0" fill="none" stroke="url(#flowR)" stroke-width="2.4" stroke-linecap="round"/>
-<path d="M932.1 163.1 C861.4 163.1 861.4 161.0 818 161.0" fill="none" stroke="url(#flowR)" stroke-width="2.4" stroke-linecap="round"/>
-<path d="M934.6 38.2 C862.3 38.2 862.3 167.0 818 167.0" fill="none" stroke="url(#flowR)" stroke-width="2.4" stroke-linecap="round"/>
-<path d="M934.6 299.7 C862.3 299.7 862.3 173.0 818 173.0" fill="none" stroke="url(#flowR)" stroke-width="2.4" stroke-linecap="round"/>
+<path d="M262.6 118.6 C336.6 118.6 336.6 161.0 382 161.0" fill="none" stroke="url(#flowL)" stroke-width="2.4" stroke-linecap="round"/>
+<path d="M207.8 55.2 C315.8 55.2 315.8 167.0 382 167.0" fill="none" stroke="url(#flowL)" stroke-width="2.4" stroke-linecap="round"/>
+<path d="M177.5 140.8 C304.3 140.8 304.3 173.0 382 173.0" fill="none" stroke="url(#flowL)" stroke-width="2.4" stroke-linecap="round"/>
+<path d="M932.1 163.1 C861.4 163.1 861.4 155.0 818 155.0" fill="none" stroke="url(#flowR)" stroke-width="2.4" stroke-linecap="round"/>
+<path d="M934.6 38.2 C862.3 38.2 862.3 161.0 818 161.0" fill="none" stroke="url(#flowR)" stroke-width="2.4" stroke-linecap="round"/>
+<path d="M958.2 100.2 C871.3 100.2 871.3 167.0 818 167.0" fill="none" stroke="url(#flowR)" stroke-width="2.4" stroke-linecap="round"/>
+<path d="M992.5 194.2 C884.3 194.2 884.3 173.0 818 173.0" fill="none" stroke="url(#flowR)" stroke-width="2.4" stroke-linecap="round"/>
 <circle cx="121.5" cy="78.0" r="5" fill="#3b343f"/>
-<circle cx="207.8" cy="55.2" r="4" fill="#3b343f"/>
-<circle cx="177.5" cy="140.8" r="4" fill="#3b343f"/>
+<circle cx="207.8" cy="55.2" r="7" fill="#ff6a42"/>
+<circle cx="207.8" cy="55.2" r="3" fill="#121014"/>
+<circle cx="177.5" cy="140.8" r="7" fill="#ff6a42"/>
+<circle cx="177.5" cy="140.8" r="3" fill="#121014"/>
 <circle cx="51.3" cy="182.2" r="5" fill="#3b343f"/>
 <circle cx="54.4" cy="60.5" r="4" fill="#3b343f"/>
 <circle cx="148.1" cy="275.4" r="5" fill="#3b343f"/>
@@ -64,33 +66,31 @@
 <circle cx="262.6" cy="118.6" r="7" fill="#ff6a42"/>
 <circle cx="262.6" cy="118.6" r="3" fill="#121014"/>
 <circle cx="118.9" cy="205.0" r="6" fill="#3b343f"/>
-<circle cx="245.7" cy="238.1" r="7" fill="#ff6a42"/>
-<circle cx="245.7" cy="238.1" r="3" fill="#121014"/>
+<circle cx="245.7" cy="238.1" r="5" fill="#3b343f"/>
 <circle cx="51.6" cy="258.3" r="5" fill="#3b343f"/>
 <circle cx="104.9" cy="141.1" r="6" fill="#3b343f"/>
-<circle cx="283.4" cy="322.5" r="7" fill="#ff6a42"/>
-<circle cx="283.4" cy="322.5" r="3" fill="#121014"/>
+<circle cx="283.4" cy="322.5" r="6" fill="#3b343f"/>
 <circle cx="1152.1" cy="140.5" r="4" fill="#3b343f"/>
-<circle cx="958.2" cy="100.2" r="4" fill="#3b343f"/>
+<circle cx="958.2" cy="100.2" r="7" fill="#ff6a42"/>
+<circle cx="958.2" cy="100.2" r="3" fill="#121014"/>
 <circle cx="1064.8" cy="296.9" r="5" fill="#3b343f"/>
-<circle cx="922.4" cy="226.9" r="7" fill="#ff6a42"/>
-<circle cx="922.4" cy="226.9" r="3" fill="#121014"/>
+<circle cx="922.4" cy="226.9" r="6" fill="#3b343f"/>
 <circle cx="1140.2" cy="262.4" r="6" fill="#3b343f"/>
 <circle cx="1098.0" cy="173.6" r="6" fill="#3b343f"/>
 <circle cx="987.8" cy="267.8" r="4" fill="#3b343f"/>
 <circle cx="1091.3" cy="83.6" r="4" fill="#3b343f"/>
-<circle cx="992.5" cy="194.2" r="5" fill="#3b343f"/>
+<circle cx="992.5" cy="194.2" r="7" fill="#ff6a42"/>
+<circle cx="992.5" cy="194.2" r="3" fill="#121014"/>
 <circle cx="934.6" cy="38.2" r="7" fill="#ff6a42"/>
 <circle cx="934.6" cy="38.2" r="3" fill="#121014"/>
-<circle cx="934.6" cy="299.7" r="7" fill="#ff6a42"/>
-<circle cx="934.6" cy="299.7" r="3" fill="#121014"/>
+<circle cx="934.6" cy="299.7" r="5" fill="#3b343f"/>
 <circle cx="1038.2" cy="39.5" r="5" fill="#3b343f"/>
 <circle cx="932.1" cy="163.1" r="7" fill="#ff6a42"/>
 <circle cx="932.1" cy="163.1" r="3" fill="#121014"/>
 <circle cx="1036.1" cy="133.0" r="6" fill="#3b343f"/>
 <g font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" text-anchor="middle">
-<text x="600" y="202" font-size="112" font-weight="800" letter-spacing="-4" fill="#f6f0e8">out<tspan fill="url(#word)">pace</tspan></text>
-<text x="600" y="256" font-size="23" fill="#a59a8f">Public AceStream swarms in. MPEG-TS and HLS out.</text>
-<text x="600" y="296" font-size="14" font-weight="700" letter-spacing="4" fill="#ff6a42">OPEN SOURCE  ·  RUST  ·  SELF-HOSTED</text>
+<text x="600" y="202" font-size="112" font-weight="800" letter-spacing="-4" fill="#f6f0e8">outp<tspan fill="url(#word)">ace</tspan></text>
+<text x="600" y="254" font-size="21" stroke="#121014" stroke-width="8" stroke-linejoin="round" paint-order="stroke" fill="#a59a8f">Public AceStream swarms in. MPEG-TS and HLS out.</text>
+<text x="600" y="292" font-size="13" font-weight="700" letter-spacing="4" stroke="#121014" stroke-width="8" stroke-linejoin="round" paint-order="stroke" fill="#ff6a42">OPEN SOURCE  ·  RUST  ·  SELF-HOSTED</text>
 </g>
 </svg>

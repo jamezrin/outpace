@@ -39,8 +39,11 @@ def edges(pts):
 
 def inner(pts, side):
     # nodes nearest the centre feed the stream
+    # Only nodes in the upper and middle band feed the stream, so no strand climbs up
+    # through the tagline from below.
     key = (lambda p: -p[0]) if side == "left" else (lambda p: p[0])
-    return sorted(pts, key=key)[:4]
+    band = [p for p in pts if p[1] < CY + 40]
+    return sorted(band, key=key)[:4]
 
 
 THEMES = {
@@ -101,11 +104,12 @@ def render(theme):
     font = "ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"
     a(f'<g font-family="{font}" text-anchor="middle">')
     a(f'<text x="{CX}" y="{CY + 34}" font-size="112" font-weight="800" letter-spacing="-4" '
-      f'fill="{t["ink"]}">out<tspan fill="url(#word)">pace</tspan></text>')
-    a(f'<text x="{CX}" y="{CY + 88}" font-size="23" fill="{t["muted"]}">'
+      f'fill="{t["ink"]}">outp<tspan fill="url(#word)">ace</tspan></text>')
+    halo = f'stroke="{t["bg"]}" stroke-width="8" stroke-linejoin="round" paint-order="stroke"'
+    a(f'<text x="{CX}" y="{CY + 86}" font-size="21" {halo} fill="{t["muted"]}">'
       'Public AceStream swarms in. MPEG-TS and HLS out.</text>')
-    a(f'<text x="{CX}" y="{CY + 128}" font-size="14" font-weight="700" letter-spacing="4" '
-      f'fill="{t["hot"]}">OPEN SOURCE  ·  RUST  ·  SELF-HOSTED</text>')
+    a(f'<text x="{CX}" y="{CY + 124}" font-size="13" font-weight="700" letter-spacing="4" '
+      f'{halo} fill="{t["hot"]}">OPEN SOURCE  ·  RUST  ·  SELF-HOSTED</text>')
     a('</g>')
     a('</svg>')
     return "\n".join(o) + "\n"
