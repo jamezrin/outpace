@@ -142,6 +142,7 @@ fn memvod_router(data: Vec<u8>) -> Router {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     })
@@ -239,6 +240,7 @@ fn memvod_hls_router(data: Vec<u8>, seg_packets: usize) -> Router {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     })

@@ -21,6 +21,7 @@ mod native;
 mod origin_history;
 mod origin_hls;
 mod protection;
+mod search;
 mod server_api;
 mod support;
 mod timeshift;
@@ -36,6 +37,7 @@ fn state() -> AppState {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     }
@@ -151,6 +153,7 @@ fn fixture_state(skip: usize) -> AppState {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     }
@@ -308,6 +311,7 @@ fn ace_hls_state(ttl: Duration, capacity: usize) -> AppState {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::new(ttl, capacity)),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     }
@@ -333,6 +337,7 @@ fn stalled_hls_state_with(ttl: Duration, capacity: usize) -> AppState {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::new(ttl, capacity)),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     }
