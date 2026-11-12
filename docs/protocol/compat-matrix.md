@@ -315,13 +315,14 @@ does not change them. They are not an independent media-capability probe.
 | Premium/encrypted content | Unsupported; intentional non-goal | The adapter supports public, unencrypted live inputs. |
 | Accounts, subscriptions, DAO/auth methods and engine access-token authentication | Unsupported; intentional non-goal | Outpace does not clone these engine services. |
 | Player/remote UI and bundled web UI | Unsupported; intentional non-goal | Outpace does not clone these application services. |
-| Search, channel catalogs, EPG and playlist enumeration | Unsupported; intentional non-goal | Outpace serves known public inputs. Unknown control methods use the in-band error above; absent routes such as `/search` return 404. |
+| General channel catalogs, EPG and playlist enumeration | Unsupported; outside the bounded search scope | No catalog product or full engine application-service parity is planned. |
 
 | Feature | Status | Rationale / limit |
 | --- | --- | --- |
+| Service-backed stream-name search | Planned in [#406](https://github.com/jamezrin/outpace-stream/issues/406); not implemented | `/search` currently returns 404. A dedicated default-off services opt-in is required by the planned contract; `OUTPACE_ACE_COMPAT` alone must not enable external search calls. Upstream access and result-to-playback mapping must be established first; see [search scope](../wiki/Stream-Search.md). |
 | Legacy VOD playback/HLS | Deferred; not supported | Native `/vod` is a separate surface, not this legacy contract. |
 | Seek/file selection | Deferred; not supported | No legacy seeking or file-selection contract is implemented. |
-| Reverse content-id lookup | Deferred; not supported | `get_content_id` only echoes a supplied content id. |
+| Reverse content-id lookup | Deferred; not supported | `get_content_id` only echoes a supplied content id. The selected search result's content-ID/verified-descriptor path is a prerequisite for #406, not an existing capability. |
 | Raw transport dumping | Deferred; not supported | `get_media_files` does not produce a raw transport dump. |
 | Arbitrary client-selected transcoding | Deferred; not supported | The bounded global live-HLS audio option does not implement this legacy contract. |
 
