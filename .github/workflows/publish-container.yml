@@ -33,6 +33,7 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
       revision: ${{ steps.release.outputs.revision }}
+      minimal: ${{ steps.minimal.outputs.minimal }}
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -81,6 +82,21 @@ jobs:
           python3 tools/release/prepare_container.py "$RELEASE_TAG" release-assets container-context
           cp Dockerfile.release container-context/Dockerfile
           cp LICENSE container-context/LICENSE
+
+      # The scratch image has no curl: its HEALTHCHECK runs `outpace healthcheck`. Releases
+      # whose binary predates that subcommand (v0.9.0 and older) get no minimal image.
+      - name: Check whether the release supports the minimal image
+        id: minimal
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 755 container-context/amd64/outpace
+          if container-context/amd64/outpace healthcheck --help >/dev/null 2>&1; then
+            echo "minimal=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Release binary has no healthcheck subcommand; skipping the minimal image"
+            echo "minimal=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload verified runtime context
         uses: actions/upload-artifact@v7
@@ -187,6 +203,55 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # Same verified binary in a scratch image (Dockerfile.release `minimal` stage).
+      - name: Build and push minimal image by digest
+        id: build-minimal
+        if: needs.prepare.outputs.minimal == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: container-context
+          target: minimal
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.revision }}
+          cache-from: type=gha,scope=release-minimal-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-minimal-${{ matrix.arch }}
+
+      - name: Attest minimal platform image provenance
+        if: needs.prepare.outputs.minimal == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build-minimal.outputs.digest }}
+          push-to-registry: true
+
+      - name: Export minimal image digest
+        if: needs.prepare.outputs.minimal == 'true'
+        env:
+          IMAGE_DIGEST: ${{ steps.build-minimal.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Expected an immutable minimal image digest'
+            exit 1
+          fi
+          mkdir digests-minimal
+          touch "digests-minimal/${IMAGE_DIGEST#sha256:}"
+
+      - name: Upload minimal image digest
+        if: needs.prepare.outputs.minimal == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-container-minimal-digest-${{ matrix.arch }}
+          path: digests-minimal/*
+          if-no-files-found: error
+          retention-days: 1
+
   merge:
     name: Publish complete three-platform index
     needs:
@@ -210,6 +275,14 @@ jobs:
         with:
           pattern: release-container-digest-*
           path: digests
+          merge-multiple: true
+
+      - name: Download all minimal platform digests
+        if: needs.prepare.outputs.minimal == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-container-minimal-digest-*
+          path: digests-minimal
           merge-multiple: true
 
       - name: Log in to GHCR
@@ -260,6 +333,28 @@ jobs:
             --tag "${IMAGE_NAME}:latest" \
             "${sources[@]}"
 
+      - name: Publish minimal version and minimal tags as the same complete index
+        if: needs.prepare.outputs.minimal == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sources=()
+          for digest in digests-minimal/*; do
+            hash="${digest##*/}"
+            if [[ ! "$hash" =~ ^[0-9a-f]{64}$ || ! -f "$digest" ]]; then
+              echo '::error::Invalid minimal platform image digest'
+              exit 1
+            fi
+            sources+=("${IMAGE_NAME}@sha256:${hash}")
+          done
+          if [[ "${#sources[@]}" != 3 ]]; then
+            echo '::error::Expected exactly three successful minimal platform images'
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${RELEASE_VERSION}-minimal" \
+            --tag "${IMAGE_NAME}:minimal" \
+            "${sources[@]}"
       # `gh attestation verify oci://<image>:<tag>` resolves the tag to the index digest,
       # so the index needs its own attestation alongside the per-platform ones.
       - name: Resolve index digest
@@ -280,4 +375,26 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+
+      - name: Resolve minimal index digest
+        id: minimal-index
+        if: needs.prepare.outputs.minimal == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_VERSION}-minimal" \
+            --format '{{json .Manifest}}' | jq -r .digest)"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Could not resolve the published minimal index digest'
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest minimal index provenance
+        if: needs.prepare.outputs.minimal == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.minimal-index.outputs.digest }}
           push-to-registry: true

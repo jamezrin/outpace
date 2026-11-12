@@ -54,6 +54,18 @@ What the defaults give you:
 After changing `.env`, run `docker compose up -d --wait`. `docker compose restart` doesn't apply
 environment changes.
 
+The shipped health check runs `curl`, which the Debian images include. To use a
+[minimal image](Installation#minimal-image), which has no `curl`, override it in a
+`compose.override.yml`:
+
+```yaml
+services:
+  outpace:
+    image: ghcr.io/jamezrin/outpace:X.Y.Z-minimal
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/outpace", "healthcheck"]
+```
+
 ### Passing other settings
 
 `compose.yml` only forwards a fixed list of variables into the container (listed in
