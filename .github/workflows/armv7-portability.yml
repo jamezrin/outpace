@@ -51,7 +51,7 @@ jobs:
           target: ${{ env.TARGET }}
 
       - name: Cross-build release binary
-        run: cargo build --locked --release -p ace-engine --bin outpace --target "$TARGET"
+        run: cargo build --locked --profile dist -p ace-engine --bin outpace --target "$TARGET"
 
   container-smoke:
     name: ARMv7 container startup and health smoke
