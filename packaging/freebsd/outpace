@@ -1,0 +1,30 @@
+#!/bin/sh
+# PROVIDE: outpace
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# FreeBSD rc.d script for outpace. Install as /usr/local/etc/rc.d/outpace (mode 0755).
+#
+# rc.conf settings:
+#   outpace_enable  YES to start at boot (default NO)
+#   outpace_runas   account the daemon runs as (default outpace)
+#   outpace_env     OUTPACE_* settings, space separated
+#
+# daemon(8) runs as root so it can write the pid file and log, then drops to outpace_runas
+# for outpace itself and restarts it if it exits. Do not set outpace_user: rc.subr would run
+# daemon(8) itself as that user, and it could not create those files.
+
+. /etc/rc.subr
+
+name=outpace
+rcvar=outpace_enable
+load_rc_config $name
+: "${outpace_enable:=NO}"
+: "${outpace_runas:=outpace}"
+: "${outpace_env:=OUTPACE_BIND=127.0.0.1:6878 OUTPACE_RTMP_BIND=127.0.0.1:1935 OUTPACE_DATA_DIR=/var/db/outpace}"
+
+pidfile=/var/run/${name}.pid
+command=/usr/sbin/daemon
+command_args="-r -R 5 -P ${pidfile} -u ${outpace_runas} -o /var/log/${name}.log /usr/local/bin/outpace serve"
+
+run_rc_command "$1"

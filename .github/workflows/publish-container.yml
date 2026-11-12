@@ -109,6 +109,11 @@ jobs:
   build:
     name: Build runtime image (${{ matrix.arch }})
     needs: prepare
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
@@ -170,6 +175,13 @@ jobs:
           cache-from: type=gha,scope=release-runtime-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=release-runtime-${{ matrix.arch }}
 
+      - name: Attest platform image provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
       - name: Export image digest
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
@@ -209,6 +221,14 @@ jobs:
           cache-from: type=gha,scope=release-minimal-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=release-minimal-${{ matrix.arch }}
 
+      - name: Attest minimal platform image provenance
+        if: needs.prepare.outputs.minimal == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build-minimal.outputs.digest }}
+          push-to-registry: true
+
       - name: Export minimal image digest
         if: needs.prepare.outputs.minimal == 'true'
         env:
@@ -237,6 +257,11 @@ jobs:
     needs:
       - prepare
       - build
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     env:
@@ -330,3 +355,46 @@ jobs:
             --tag "${IMAGE_NAME}:${RELEASE_VERSION}-minimal" \
             --tag "${IMAGE_NAME}:minimal" \
             "${sources[@]}"
+      # `gh attestation verify oci://<image>:<tag>` resolves the tag to the index digest,
+      # so the index needs its own attestation alongside the per-platform ones.
+      - name: Resolve index digest
+        id: index
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_VERSION}" \
+            --format '{{json .Manifest}}' | jq -r .digest)"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Could not resolve the published index digest'
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest index provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+
+      - name: Resolve minimal index digest
+        id: minimal-index
+        if: needs.prepare.outputs.minimal == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_VERSION}-minimal" \
+            --format '{{json .Manifest}}' | jq -r .digest)"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Could not resolve the published minimal index digest'
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest minimal index provenance
+        if: needs.prepare.outputs.minimal == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.minimal-index.outputs.digest }}
+          push-to-registry: true

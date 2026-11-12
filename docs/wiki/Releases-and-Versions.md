@@ -74,6 +74,12 @@ These are merged into `main` (and so in `edge`), but aren't in v0.9.0:
   `/support`).
 - A minimal `scratch` image (`X.Y.Z-minimal`) and the
   [`outpace healthcheck`](Command-Line#outpace-healthcheck) command.
+- A FreeBSD x86_64 release binary; see
+  [Installation](Installation#freebsd-and-other-bsds).
+- Signed build provenance for release archives and images, checked with
+  `gh attestation verify` (see [Installation](Installation#verify-where-a-release-came-from)).
+- Release binaries for ARMv6 hard-float (`arm-unknown-linux-musleabihf`) and RISC-V 64
+  (`riscv64gc-unknown-linux-musl`); see [Installation](Installation#release-binaries).
 
 **Fixes you'll notice**
 
