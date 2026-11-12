@@ -49,6 +49,9 @@ uses Ace Stream names only to describe protocol compatibility.
   [documented in the repository](docs/protocol/wire-protocol.md).
 - **No proprietary engine at runtime.** Outpace never downloads or runs the official Ace Stream
   engine or its libraries.
+- **Fast and efficient by design.** Performance and resource efficiency are core goals, not
+  afterthoughts: quick startup, smooth playback, and low CPU and memory use, so one small box
+  can serve many viewers. Regressions are treated as bugs and must not be merged.
 - **Headless by design.** A daemon and a CLI, configured with environment variables, with no
   desktop UI. That suits servers, containers, NAS boxes and single-board computers.
 - **A real command line.** `outpace play` pipes a stream to standard output, and
@@ -67,9 +70,9 @@ What it isn't:
 
 - It doesn't play premium or encrypted content.
 - It has no accounts, EPG or web UI.
-- Stream-name search is not available yet. A separate, default-off AceStream services adapter
-  is [planned in this repository](https://github.com/jamezrin/outpace-stream/issues/406);
-  see [search scope and prerequisites](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search).
+- Stream-name search is a separate, default-off external services adapter. No
+  operator API key is needed. It is newer than v0.9.0; see
+  [search setup and limits](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search).
 - The compatible API is a subset, not full parity with the official engine.
 
 See [differences from the official engine](https://github.com/jamezrin/outpace-stream/wiki/Migrating-from-AceStream-Engine#whats-different).

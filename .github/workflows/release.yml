@@ -68,6 +68,12 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-24.04
             archive: tar.gz
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz
@@ -180,7 +186,7 @@ jobs:
 
   publish-container:
     name: Publish GHCR image from release archives
-    # publish-release depends on all seven binary builds succeeding.
+    # publish-release depends on every binary build succeeding.
     needs: publish-release
     permissions:
       contents: read
