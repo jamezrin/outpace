@@ -1,0 +1,13 @@
+[package]
+name = "ace-fuzz"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Parser invariants shared by the committed-seed replay test (ordinary `cargo test`) and the
+# libFuzzer targets under `fuzz/`. No fuzzing tool is a dependency of the product workspace.
+[dependencies]
+ace-wire = { path = "../ace-wire" }
+ace-media = { path = "../ace-media" }
