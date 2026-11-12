@@ -50,6 +50,26 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
 
+### Verify where a release came from
+
+`SHA256SUMS` proves an archive wasn't corrupted, but it comes from the same release page as the
+archive. Releases newer than v0.9.0 also carry signed
+[build provenance](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations),
+which proves that this repository's release workflow built the archive from the tagged commit.
+With the [GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify "$artifact" --repo jamezrin/outpace-stream
+```
+
+The same works for release images, by tag or digest:
+
+```bash
+gh attestation verify oci://ghcr.io/jamezrin/outpace:<version> --repo jamezrin/outpace-stream
+```
+
+`edge` images and v0.9.0 and older releases have no attestations.
+
 ### ARM, RISC-V and small devices
 
 ARMv7 builds cover hard-float ARMv7 Linux (Raspberry Pi 2/3, older NAS boxes). From the next
