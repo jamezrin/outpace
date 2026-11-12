@@ -267,7 +267,63 @@ class ListenerInventoryTests(unittest.TestCase):
             live.bound_unix_paths = original
 
 
+class FakeEvents:
+    def __init__(self, messages):
+        self.messages = messages
+        self.closed = False
+
+    def recv(self, size):
+        if not self.messages:
+            raise BlockingIOError
+        return self.messages.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+class HostChangeTests(unittest.TestCase):
+    def test_any_host_address_event_stops_forwarding(self):
+        events = FakeEvents([])
+        r, _ = relay()
+        r.host_events = events
+        r.forward(outbound('11.0.0.2', 6881))
+        events.messages.append(b'newaddr')
+        r.forward(outbound('11.0.0.2', 6881))
+        r.forward(outbound('10.0.0.5', 6881))
+        events.messages.append(b'deladdr')
+        r.forward(outbound('11.0.0.3', 6881))
+        report = r.report()
+        self.assertEqual((report['admitted_out'], report['host_change_denied'], report['denied_destination'],
+                          report['host_address_events']), (1, 2, 1, 2))
+        r.close()
+        self.assertTrue(events.closed)
+
+
 class LauncherIdentityTests(unittest.TestCase):
+    def maps(self, *contents):
+        files = []
+        for content in contents:
+            table = tempfile.NamedTemporaryFile('w')
+            table.write(content)
+            table.flush()
+            files.append(table)
+            self.addCleanup(table.close)
+        return [table.name for table in files]
+
+    def test_root_launch_drops_refuses_or_runs_only_from_a_non_root_backed_namespace(self):
+        container, = self.maps('         0     100000      65536\n')
+        self.assertEqual(live.launcher_identity(euid=0, uid_map=container, gid_map=container)[:2],
+                         ['--reuid', '65534'])
+        nested, = self.maps('         0      65534          1\n')
+        self.assertEqual(live.launcher_identity(euid=0, uid_map=nested, gid_map=nested), [])
+        host_root, = self.maps('         0          0          1\n')
+        with self.assertRaises(ValueError):
+            live.launcher_identity(euid=0, uid_map=host_root, gid_map=host_root)
+        partial, = self.maps('         0          0       1000\n')
+        with self.assertRaises(ValueError):
+            live.launcher_identity(euid=0, uid_map=partial, gid_map=partial)
+        self.assertEqual(live.launcher_identity(euid=1000, uid_map=host_root, gid_map=host_root), [])
+
     def test_maps_checks_identity_ranges(self):
         with tempfile.NamedTemporaryFile('w') as table:
             table.write('         0     100000      65536\n')

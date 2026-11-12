@@ -54,9 +54,13 @@ datagram totals are bounded.
 The destination policy for UDP is enforced by the relay alone; nftables restricts the
 worker to UDP on its veth and counts denied destinations, and the existing host egress
 table and VPN gateway sit behind the relay. A root supervisor launches each namespace
-as uid 65534, so the worker cannot read root-only host files, and a block refuses
-admission while the host owns any address the relay would forward to, because Linux
-would deliver such datagrams locally. Nothing on the host changes. Each worker's
+as uid 65534, so the worker cannot read root-only host files; a root launch that
+cannot drop is refused unless its namespace's only id is root backed by a non-root
+parent id. A block refuses admission while the host owns any address the relay would
+forward to, because Linux would deliver such datagrams locally. During an arm the
+relay watches IPv4 address changes through rtnetlink before every forward; any
+change stops all further forwarding and makes the block inconclusive. A change
+landing between that check and the send is not covered. Nothing on the host changes. Each worker's
 namespace, sockets and relay state are destroyed before the next arm starts. The
 launcher carries a parent-death SIGKILL, so the namespace also dies if the
 supervisor is killed.

@@ -6,7 +6,9 @@ device. Replies are injected only from endpoints the same inner socket contacted
 All state is bounded; counters carry no addresses. `admitted_out` and
 `replies_admitted` count successful local sends, not delivery. Kernel receive-queue
 drops on the packet and outer sockets are reported separately from relay decisions.
-There is no rate limit beyond MAX_DATAGRAMS per worker.
+There is no rate limit beyond MAX_DATAGRAMS per worker. Linux delivers datagrams to
+host-owned addresses locally, so any IPv4 address change on the host, observed
+through rtnetlink before every forward, stops all further forwarding.
 """
 import ipaddress
 import socket
@@ -22,10 +24,11 @@ COUNTERS = (
     'denied_destination', 'mapping_cap', 'contact_cap', 'datagram_cap', 'send_errors',
     'admitted_out', 'admitted_out_bytes', 'unique_contacts', 'replied_contacts',
     'replies_admitted', 'unsolicited_in', 'oversized_in', 'receive_errors', 'mappings_opened',
-    'open_errors',
+    'open_errors', 'host_address_events', 'host_change_denied',
 )
 SOL_PACKET, PACKET_STATISTICS = 263, 6
 SO_RXQ_OVFL = 40
+RTMGRP_IPV4_IFADDR = 0x10
 _ETH_IPV4 = 0x0800
 _WORKER = ipaddress.IPv4Address(WORKER_ADDRESS).packed
 
@@ -79,6 +82,18 @@ def build_frame(worker_mac, gateway_mac, source_ip, source_port, inner_port, pay
     return worker_mac + gateway_mac + struct.pack('!H', _ETH_IPV4) + ip + udp
 
 
+def host_address_monitor():
+    """Subscribe to IPv4 address changes in this network namespace."""
+    monitor = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_NONBLOCK,
+                            socket.NETLINK_ROUTE)
+    try:
+        monitor.bind((0, RTMGRP_IPV4_IFADDR))
+    except OSError:
+        monitor.close()
+        raise
+    return monitor
+
+
 def egress_socket(device):
     outer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -94,10 +109,12 @@ def egress_socket(device):
 class Relay:
     """Bounded endpoint-dependent relay for one worker namespace."""
 
-    def __init__(self, packet, *, worker_mac, gateway_mac, open_outer):
+    def __init__(self, packet, *, worker_mac, gateway_mac, open_outer, host_events=None):
         if len(worker_mac) != 6 or len(gateway_mac) != 6:
             raise ValueError('relay_mac')
         self.packet = packet
+        self.host_events = host_events
+        self.halted = False
         self.worker_mac = worker_mac
         self.gateway_mac = gateway_mac
         self.open_outer = open_outer
@@ -144,6 +161,10 @@ class Relay:
         if not permitted(address, port):
             self.counters['denied_destination'] += 1
             return
+        self._poll_host_events()
+        if self.halted:
+            self.counters['host_change_denied'] += 1
+            return
         if self.counters['admitted_out'] >= MAX_DATAGRAMS:
             self.counters['datagram_cap'] += 1
             return
@@ -179,6 +200,18 @@ class Relay:
             return
         self.counters['admitted_out'] += 1
         self.counters['admitted_out_bytes'] += len(payload)
+
+    def _poll_host_events(self):
+        while self.host_events is not None:
+            try:
+                if not self.host_events.recv(65536):
+                    return
+            except BlockingIOError:
+                return
+            except OSError:
+                pass
+            self.counters['host_address_events'] += 1
+            self.halted = True
 
     def _replies(self, inner_port):
         outer = self.mappings[inner_port]
@@ -235,6 +268,8 @@ class Relay:
             self.selector.unregister(self.packet)
             self.selector = None
         self.packet.close()
+        if self.host_events is not None:
+            self.host_events.close()
 
     def report(self):
         result = dict(self.counters)

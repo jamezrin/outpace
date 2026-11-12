@@ -43,6 +43,8 @@ def passing():
                                    'preflight': {'ipv6_disabled': True},
                                    'postflight': {'ipv6_disabled': True}, 'host_global_addresses': 0},
                         'leaks': 0, 'report_has_target': False, 'report_has_seed': False}
+    results['host_change'] = owned(changed=True)
+    results['host_change']['boundary'].update(host_address_events=1, admitted_out=8, host_change_denied=12)
     for name, reason in live_fixture.REFUSALS.items():
         results[name] = {'report': {'verdict': 'inconclusive', 'arms': [], 'reason': reason},
                          'files': ['report.json']}
@@ -90,6 +92,10 @@ class EvaluateTests(unittest.TestCase):
                           consistency={'denials_agree': True, 'udp_frames_agree': True, 'kernel_drops': True})],
             'block_encrypted': [lambda c: c['report'].update(arms=[{}]),
                                 lambda c: c.update(files=['report.json', 'custom.stdout.private'])],
+            'host_change': [lambda c: c.update(changed=False),
+                            lambda c: c['boundary'].update(host_address_events=0),
+                            lambda c: c['boundary'].update(host_change_denied=0, admitted_out=20),
+                            lambda c: c['boundary'].update(admitted_out=0, host_change_denied=20)],
             'block_ipv6_enabled': [lambda c: c['report'].update(reason='egress_route')],
             'block_host_address': [lambda c: c['report'].update(verdict='complete')],
         }

@@ -244,6 +244,8 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
                 _write_private(output, f'{role}.stderr.private', result.stderr)
             if result is None or not result.cleanup_complete:
                 raise Inconclusive('cleanup_uncertain')
+            if result.boundary is not None and result.boundary['host_address_events']:
+                raise Inconclusive('host_address_change')
         postflight = network_state(egress_device)
         report['postflight'] = postflight
         if postflight != preflight:

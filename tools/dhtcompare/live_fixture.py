@@ -27,6 +27,7 @@ SEED = ('11.0.0.2', 6881)
 SECOND = ('11.0.0.4', 6881)
 STRANGERS = (('11.0.0.3', 6881), ('11.0.0.2', 6882))
 HOST_GLOBAL = '12.0.0.1'
+HOST_LATE = '12.0.0.2'
 SYNTHETIC_HOST = frozenset(('11.0.0.1', SEED[0], SECOND[0], STRANGERS[0][0]))
 LEAK_ADDRESSES = ('10.0.0.5', '192.168.1.9', '172.16.0.1', '100.64.0.1', '169.254.1.1')
 TARGET = bytes.fromhex('0123456789abcdef0123456789abcdef01234567')
@@ -274,6 +275,35 @@ def block_case(config, encrypted):
             'report_has_seed': SEED[0].encode() in written}
 
 
+TICKER = ('import socket, time\n'
+          'udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+          'for _ in range(20):\n'
+          '    udp.sendto(b"tick", ("11.0.0.2", 6881))\n'
+          '    time.sleep(0.1)\n')
+
+
+def host_change_case():
+    """Add a host-owned global address mid-arm; forwarding must stop at that change."""
+    servers = Servers('echo')
+    added = threading.Event()
+
+    def change():
+        time.sleep(0.8)
+        ip('address', 'add', f'{HOST_LATE}/32', 'dev', EGRESS)
+        added.set()
+    changer = threading.Thread(target=change)
+    try:
+        changer.start()
+        result = live.run_live(['/usr/bin/python3', '-I', '-c', TICKER], timeout=20,
+                               env={'LC_ALL': 'C'}, open_outer=lambda: egress_socket(EGRESS))
+    finally:
+        changer.join(5)
+        alive = servers.close()
+        if added.is_set():
+            ip('address', 'del', f'{HOST_LATE}/32', 'dev', EGRESS)
+    return dict(summary(result), leaks=servers.leaks, servers_alive=alive, changed=added.is_set())
+
+
 def refused_block_case(config, kind):
     """Run the block with one host-state violation that admission must refuse."""
     if kind == 'block_ipv6_enabled':
@@ -292,7 +322,7 @@ def refused_block_case(config, kind):
 CASES = ('probe', 'values:custom', 'values:mainline', 'values:n0', 'private_nodes:custom',
          'private_nodes:mainline', 'private_nodes:n0', 'unconfined:custom',
          'unconfined:mainline', 'unconfined:n0', 'block', 'block_encrypted',
-         'block_ipv6_enabled', 'block_host_address')
+         'block_ipv6_enabled', 'block_host_address', 'host_change')
 REFUSALS = {'block_encrypted': 'encrypted_or_unknown_protection',
             'block_ipv6_enabled': 'ipv6_enabled', 'block_host_address': 'host_global_address'}
 ZERO_CAPS = {key: '0000000000000000' for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')}
@@ -355,6 +385,12 @@ def evaluate(results):
                       and report['preflight'] == report['postflight']
                       and report['preflight']['ipv6_disabled'] is True
                       and report['host_global_addresses'] == 0)
+            elif name == 'host_change':
+                boundary = case['boundary']
+                ok = (_owned(case) and case['changed'] is True
+                      and boundary['host_address_events'] >= 1
+                      and boundary['admitted_out'] >= 1 and boundary['host_change_denied'] >= 1
+                      and boundary['admitted_out'] + boundary['host_change_denied'] == 20)
             elif name in REFUSALS:
                 report = case['report']
                 ok = (report['verdict'] == 'inconclusive' and report['arms'] == []
@@ -379,6 +415,9 @@ def main():
             continue
         if case in ('block', 'block_encrypted'):
             results[case] = block_case(config, 1 if case == 'block_encrypted' else 0)
+            continue
+        if case == 'host_change':
+            results[case] = host_change_case()
             continue
         if case in ('block_ipv6_enabled', 'block_host_address'):
             results[case] = refused_block_case(config, case)

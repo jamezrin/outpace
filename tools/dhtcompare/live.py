@@ -23,7 +23,7 @@ import sys
 import time
 from isolation import verified_init_pidfd
 import live_policy
-from live_relay import Relay
+from live_relay import Relay, host_address_monitor
 from qualification import Artifact
 from worker_records import extract_record
 
@@ -66,16 +66,30 @@ def _maps(path, identity):
     return False
 
 
-def launcher_identity():
+def _single_root_mapping(path):
+    """The parent-namespace id of this namespace's root, if root is its only mapped id."""
+    lines = Path(path).read_text().split('\n')
+    rows = [line.split() for line in lines if line.strip()]
+    if len(rows) == 1 and rows[0][0] == '0' and rows[0][2] == '1':
+        return int(rows[0][1])
+    return None
+
+
+def launcher_identity(*, euid=None, uid_map='/proc/self/uid_map', gid_map='/proc/self/gid_map'):
     """setpriv arguments that drop a root supervisor's namespace launch to an unprivileged uid.
 
     The parent-death signal is armed after the credential change, so it survives it.
-    A supervisor that is not root, or cannot map the unprivileged id, launches as itself.
+    A non-root supervisor launches as itself. A root supervisor that cannot map the
+    unprivileged id may launch as itself only inside a namespace whose sole mapped id
+    is root backed by a non-root parent id; any other root launch is refused.
     """
-    if (os.geteuid() != 0 or not _maps('/proc/self/uid_map', UNPRIVILEGED_ID)
-            or not _maps('/proc/self/gid_map', UNPRIVILEGED_ID)):
+    if (os.geteuid() if euid is None else euid) != 0:
         return []
-    return ['--reuid', str(UNPRIVILEGED_ID), '--regid', str(UNPRIVILEGED_ID), '--clear-groups']
+    if _maps(uid_map, UNPRIVILEGED_ID) and _maps(gid_map, UNPRIVILEGED_ID):
+        return ['--reuid', str(UNPRIVILEGED_ID), '--regid', str(UNPRIVILEGED_ID), '--clear-groups']
+    if _single_root_mapping(uid_map) not in (None, 0) and _single_root_mapping(gid_map) not in (None, 0):
+        return []
+    raise ValueError('root_equivalent_launch')
 
 
 def bound_unix_paths(listing='/proc/net/unix'):
@@ -251,8 +265,13 @@ def run_live(argv, *, timeout, env, open_outer, prefix_cap=65536):
                             if packet is not None:
                                 packet.close()
                             denial = 'attestation'; kill(); continue
+                        try:
+                            events = host_address_monitor()
+                        except OSError:
+                            packet.close()
+                            denial = 'host_monitor'; kill(); continue
                         relay = Relay(packet, worker_mac=worker_mac, gateway_mac=gateway_mac,
-                                      open_outer=open_outer)
+                                      open_outer=open_outer, host_events=events)
                         relay.register(selector)
                         control.send(b'go'); attested = True; phase = 'running'
                     else:
