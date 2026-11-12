@@ -139,10 +139,15 @@ pub(super) fn decode_response(bytes: &[u8], nonce: &str) -> Result<Vec<u8>, Sear
                     expanded.insert(to.into(), value.clone());
                 }
             }
-            expanded.insert(
-                "disabled".into(),
-                compact.get("d").cloned().unwrap_or(json!(false)),
-            );
+            // The native service emits integer flags as well as JSON booleans.
+            let disabled = match compact.get("d") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(value) if value.as_u64() == Some(0) => false,
+                Some(value) if value.as_u64() == Some(1) => true,
+                _ => return Err(SearchError::InvalidResponse),
+            };
+            expanded.insert("disabled".into(), json!(disabled));
             *item = Value::Object(expanded);
         }
     }

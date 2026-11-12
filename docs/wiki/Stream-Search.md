@@ -55,8 +55,8 @@ curl --get --data-urlencode 'query=synthetic-demo' \
 Success returns `{"result":{"total":0,"results":[]},"error":null}` for a valid empty
 result. Nonempty `results` are grouped as `name` plus `items`; each item has `infohash`,
 `name` and categories, with available bitrate, status, availability, availability timestamp,
-country/language metadata and a `disabled` flag. Native compact results are normalized to
-this envelope. URL-only items are unsupported; icons, EPG, content-ID claims and unknown
+country/language metadata and a boolean `disabled` flag (`true` or `false`). Native compact
+results are normalized to this envelope. URL-only items are unsupported; icons, EPG, content-ID claims and unknown
 fields are stripped.
 Metadata is discovery data, not proof of a public, verified or playable descriptor.
 

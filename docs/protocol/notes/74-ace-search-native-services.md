@@ -217,6 +217,10 @@ result. A bounded probe through Outpace's guarded production transport also
 passed with an invented query. This qualifies a discovery request, not production
 availability, quotas, nonempty current catalog coverage or live playback.
 
+Subsequent direct-route daemon verification found integer `d` flags (`0`/`1`)
+on nonempty native results. The adapter normalizes those and JSON boolean flags
+to a boolean `disabled` field; other flag values fail validation.
+
 A hexadecimal nonce initially failed response signature validation; decimal
 nonces succeeded. The backend generates positive decimal nonces, rejects every
 response that does not bind to its request nonce, and retains its own stricter

@@ -115,7 +115,7 @@ fn correctly_signed_invalid_base64_json_or_schema_still_fails() {
 fn signed_compact_metadata_is_checked_after_expansion() {
     let page = json!({"total":1,"time":0.0,"results":[{"name":"Synthetic Group","items":[{
         "n":"Synthetic Item","i":"0123456789abcdef0123456789abcdef01234567",
-        "countries":["zz"],"languages":["zz"],"d":true
+        "countries":["zz"],"languages":["zz"],"d":1
     }]}]});
     let raw = serde_json::to_vec(&page).unwrap();
     let expanded = decode_response(&signed_data(&Base64::encode_string(&raw)), NONCE).unwrap();
@@ -125,4 +125,40 @@ fn signed_compact_metadata_is_checked_after_expansion() {
     assert_eq!(item["countries"], json!(["zz"]));
     assert_eq!(item["languages"], json!(["zz"]));
     assert_eq!(item["disabled"], true);
+}
+
+#[test]
+fn native_disabled_flag_accepts_binary_numbers_and_rejects_other_values() {
+    for (flag, expected) in [
+        (json!(0), Some(false)),
+        (json!(1), Some(true)),
+        (json!(false), Some(false)),
+        (json!(true), Some(true)),
+        (json!(2), None),
+        (json!(-1), None),
+        (json!(null), None),
+        (json!("1"), None),
+    ] {
+        let page = json!({"total":1,"time":0.0,"results":[{"name":"Synthetic Group","items":[{
+            "n":"Synthetic Item","i":"0123456789abcdef0123456789abcdef01234567","d":flag
+        }]}]});
+        let response = decode_response(
+            &signed_data(&Base64::encode_string(&serde_json::to_vec(&page).unwrap())),
+            NONCE,
+        );
+        match expected {
+            Some(expected) => {
+                let normalized = super::super::normalize_response(
+                    &response.unwrap(),
+                    &SearchQuery::parse(vec![]).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    normalized["result"]["results"][0]["items"][0]["disabled"],
+                    expected
+                );
+            }
+            None => assert_eq!(response, Err(SearchError::InvalidResponse)),
+        }
+    }
 }
