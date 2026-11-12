@@ -31,6 +31,7 @@ pub mod broadcast_pull;
 mod broadcast_pull_tests;
 pub mod cli;
 pub mod config;
+pub mod history;
 pub mod hls;
 pub mod hls_audio;
 pub mod http;

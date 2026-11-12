@@ -12,7 +12,9 @@
 //! [`crate::routes`] only parses compatibility routes. [`VodHlsLayout`] separately describes
 //! the static segment geometry and playlist for VOD.
 
-use crate::config::HlsConfig;
+use crate::config::{HlsConfig, HlsHistoryConfig};
+use crate::history::{HistoryBudget, HistoryEntry, HistoryStore};
+pub use crate::history::{HlsHistoryError, HlsHistorySnapshot, HlsHistoryStatus};
 use crate::session::{StreamEvent, StreamSession};
 use ace_media::audio::LiveAudioSelection;
 use ace_media::mpegts::{
@@ -68,6 +70,8 @@ struct HlsState {
     media_seq: u64,
     discontinuity_sequence: u64,
     segments: VecDeque<HlsSegment>,
+    /// Optional bounded retained replay, sharing completed segment allocations.
+    history: HistoryStore,
     cur: Vec<u8>,
     scanned_packets: usize,
     clock: SelectedPcrClock,
@@ -81,6 +85,9 @@ struct HlsState {
     last_access: Option<Instant>,
     access: VideoAccessPointState,
     awaiting_access_point: bool,
+    /// The current run starts at a video access point with fresh tables, so it can begin
+    /// a replay. A forced byte-ceiling continuation may start mid-GOP and cannot.
+    independent_start: bool,
     /// Set when `access` carries a title, so upstream SDT-PID packets must be dropped from
     /// segment bodies to avoid duplicating (or conflicting with) our synthesized SDT.
     filter_sdt: bool,
@@ -128,6 +135,7 @@ impl HlsPackager {
                 media_seq: 0,
                 discontinuity_sequence: 0,
                 segments: VecDeque::new(),
+                history: HistoryStore::disabled(),
                 cur: Vec::new(),
                 scanned_packets: 0,
                 clock: SelectedPcrClock::new(),
@@ -138,6 +146,7 @@ impl HlsPackager {
                 last_access: None,
                 access,
                 awaiting_access_point: true,
+                independent_start: false,
                 filter_sdt,
                 ended: false,
             }),
@@ -166,6 +175,72 @@ impl HlsPackager {
             st.deadline = Some(tokio::time::Instant::now() + media.startup_timeout);
         }
         media
+    }
+
+    /// Like [`Self::create`], also retaining bounded replay history charged to `budget`.
+    pub(crate) fn create_with_history(
+        session: &StreamSession,
+        config: HlsConfig,
+        strict: bool,
+        history: HlsHistoryConfig,
+        budget: HistoryBudget,
+    ) -> Arc<Self> {
+        let media = Self::create(session, config, strict);
+        media.state.lock().unwrap().history = HistoryStore::new(history, budget);
+        media
+    }
+
+    /// Retained replay history, on this packager's media-duration timeline.
+    pub fn history_status(&self) -> HlsHistoryStatus {
+        self.state.lock().unwrap().history.status(Instant::now())
+    }
+
+    /// Prepare an immutable replay starting at least `back` behind the completed head.
+    /// Preparation never changes any viewer.
+    pub fn prepare_history(&self, back: Duration) -> Result<HlsHistorySnapshot, HlsHistoryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .history
+            .prepare(back, Instant::now())
+    }
+
+    /// Prepare replay at an absolute retained-media position, not a UTC timestamp.
+    pub fn prepare_history_at(
+        &self,
+        position_ms: u64,
+    ) -> Result<HlsHistorySnapshot, HlsHistoryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .history
+            .prepare_at(position_ms, Instant::now())
+    }
+
+    /// Render a prepared replay as a finite VOD playlist, or report that it is gone.
+    pub fn history_playlist(
+        &self,
+        view: &HlsHistorySnapshot,
+        prefix: &str,
+    ) -> Result<String, HlsHistoryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .history
+            .playlist(view, prefix, Instant::now())
+    }
+
+    /// Fetch one retained segment of a prepared replay. Never falls back to live media.
+    pub fn history_segment(
+        &self,
+        view: &HlsHistorySnapshot,
+        seq: u64,
+    ) -> Result<Bytes, HlsHistoryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .history
+            .segment(view, seq, Instant::now())
     }
 
     /// Fence old output and reset only incomplete media. Completed sequences remain readable.
@@ -438,6 +513,7 @@ impl HlsPackager {
         st.audio.reset();
         st.input.clear();
         st.awaiting_access_point = true;
+        st.independent_start = false;
     }
 
     /// Append contiguous TS bytes, emitting PCR-timed, preferably random-access-aligned segments.
@@ -535,6 +611,7 @@ impl HlsPackager {
                     st.boundary_timing = None;
                     st.discontinuity_pending = true;
                     st.awaiting_access_point = true;
+                    st.independent_start = false;
                     continue;
                 }
             }
@@ -582,6 +659,7 @@ impl HlsPackager {
                 st.cur.extend_from_slice(&trailing);
                 st.scanned_packets = prefix.len() / TS_PACKET;
                 st.awaiting_access_point = false;
+                st.independent_start = true;
                 st.generation_opening = false;
                 continue;
             }
@@ -595,6 +673,7 @@ impl HlsPackager {
                 st.discontinuity_pending = true;
                 st.deduplicate_source_marker = false;
                 st.awaiting_access_point = true;
+                st.independent_start = false;
                 continue;
             }
             let elapsed = st.clock.elapsed().map(|duration| duration.as_secs_f32());
@@ -602,6 +681,8 @@ impl HlsPackager {
             if packet_offset > 0 && target_reached && is_access_point {
                 let duration = elapsed.unwrap_or(self.seg_duration);
                 self.emit(st, packet_offset, duration);
+                // The next run opens at this access point behind fresh tables.
+                st.independent_start = true;
                 let prefix = st
                     .access
                     .table_prefix()
@@ -666,7 +747,9 @@ impl HlsPackager {
                 .access
                 .table_prefix()
                 .expect("an accumulated run past the ceiling has cached PAT/PMT state");
-            self.seed_clean_run(st, &prefix, packet, timing);
+            // The boundary packet need not be an access point: then this continuation
+            // starts mid-GOP and is not a replay seek point.
+            self.seed_clean_run(st, &prefix, packet, timing, is_access_point);
             st.boundary_timing = boundary_timing;
             st.clock.reset();
             if let Some(boundary) = boundary_timing {
@@ -681,7 +764,7 @@ impl HlsPackager {
                 .access
                 .table_prefix()
                 .expect("an observed video access point has PAT/PMT state");
-            self.seed_clean_run(st, &prefix, packet, timing);
+            self.seed_clean_run(st, &prefix, packet, timing, true);
         }
     }
 
@@ -691,6 +774,7 @@ impl HlsPackager {
         prefix: &[u8],
         packet: &[u8; TS_PACKET],
         timing: TsTiming,
+        independent: bool,
     ) {
         debug_assert!(prefix.len() + TS_PACKET <= self.max_segment_bytes);
         st.cur.clear();
@@ -701,6 +785,7 @@ impl HlsPackager {
         st.boundary_timing = None;
         Self::observe_clock(st, timing);
         st.awaiting_access_point = false;
+        st.independent_start = independent;
     }
 
     fn discard_incomplete_run(&self, st: &mut HlsState) {
@@ -711,6 +796,7 @@ impl HlsPackager {
         st.discontinuity_pending = true;
         st.deduplicate_source_marker = false;
         st.awaiting_access_point = true;
+        st.independent_start = false;
     }
 
     fn observe_clock(st: &mut HlsState, mut timing: TsTiming) -> ClockObservation {
@@ -745,8 +831,23 @@ impl HlsPackager {
         let mut seg = std::mem::replace(&mut st.cur, rest);
         st.audio.emitted(&mut seg);
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
+        let (bytes, allocation) = Self::freeze_segment(seg);
+        // Sequence numbers are assigned after eviction, matching `render_playlist`.
+        let seq = st.media_seq + st.segments.len() as u64;
+        let independent = st.independent_start;
+        st.history.push(
+            HistoryEntry {
+                seq,
+                bytes: bytes.clone(),
+                allocation,
+                duration,
+                discontinuity,
+                independent,
+            },
+            Instant::now(),
+        );
         st.segments.push_back(HlsSegment {
-            bytes: Self::freeze_segment(seg),
+            bytes,
             duration,
             discontinuity,
         });
@@ -877,13 +978,15 @@ impl HlsPackager {
 
     /// Freeze a finished segment. Its buffer is the assembly allocation, whose capacity grew
     /// while filling; reclaim substantial slack once with an exact-size copy, and keep smaller
-    /// savings zero-copy.
-    fn freeze_segment(segment: Vec<u8>) -> Bytes {
+    /// savings zero-copy. Also returns the retained backing allocation size.
+    fn freeze_segment(segment: Vec<u8>) -> (Bytes, usize) {
         if segment.capacity() - segment.len() >= SEGMENT_COMPACTION_MIN_SAVINGS {
             // Unlike best-effort `shrink_to_fit`, a boxed slice has exactly `len` capacity.
-            Bytes::from(segment.into_boxed_slice())
+            let allocation = segment.len();
+            (Bytes::from(segment.into_boxed_slice()), allocation)
         } else {
-            Bytes::from(segment)
+            let allocation = segment.capacity();
+            (Bytes::from(segment), allocation)
         }
     }
 
@@ -1823,6 +1926,77 @@ mod tests {
     }
 
     #[test]
+    fn history_seek_never_starts_at_a_forced_mid_gop_continuation() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 5,
+                window_segments: 4,
+                segment_duration_ms: 100,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        let budget = HistoryBudget::new(8192);
+        p.state.lock().unwrap().history = HistoryStore::new(
+            HlsHistoryConfig {
+                max_seconds: 600,
+                max_bytes: 8192,
+                global_max_bytes: 8192,
+            },
+            budget.clone(),
+        );
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        // Fill the ceiling and keep going without another keyframe: each later segment is a
+        // forced continuation that starts mid-GOP.
+        for i in 1..7 {
+            p.feed(&pcr_packet(VIDEO_PID, i * 45_000, false, false, i as u8));
+        }
+        let view = p.prepare_history(Duration::from_millis(100)).unwrap();
+        assert_eq!(view.first_seq, 0, "a seek rewinds to the decodable entry");
+        assert_eq!(view.last_seq, 1);
+        assert_eq!(p.history_segment(&view, 0).unwrap(), p.segment(0).unwrap());
+        let replay = p.history_playlist(&view, "/replay").unwrap();
+        assert!(replay.contains("/replay/0.ts\n") && replay.contains("/replay/1.ts\n"));
+        assert!(replay.ends_with("#EXT-X-ENDLIST\n"));
+
+        // Lose the only independent entry under the byte budget. The retained continuations
+        // still play live, but none of them may become a replay start.
+        for i in 7..60 {
+            p.feed(&pcr_packet(VIDEO_PID, i * 45_000, false, false, i as u8));
+        }
+        let status = p.history_status();
+        assert!(status.first_seq.unwrap() > 0);
+        assert_eq!(status.seekable_start_ms, None);
+        assert!(status.retained_bytes <= 8192 && budget.used() == status.retained_bytes);
+        assert_eq!(
+            p.prepare_history(Duration::from_millis(100)),
+            Err(HlsHistoryError::Unavailable)
+        );
+        assert_eq!(p.history_segment(&view, 0), Err(HlsHistoryError::Gone));
+        drop(p);
+        assert_eq!(
+            budget.used(),
+            0,
+            "dropping the packager releases its history"
+        );
+    }
+
+    #[test]
+    fn history_is_disabled_by_default_and_retains_nothing() {
+        let p = clean_pkg(5);
+        feed_clean_run(&p, 0, 3);
+        let status = p.history_status();
+        assert!(!status.enabled);
+        assert_eq!(status.retained_bytes, 0);
+        assert_eq!(
+            p.prepare_history(Duration::from_secs(1)),
+            Err(HlsHistoryError::Disabled)
+        );
+    }
+
+    #[test]
     fn clean_three_packet_ceiling_uses_next_access_point_as_boundary_lookahead() {
         let p = clean_pkg(3);
         let pat = pat(PMT_PID);
@@ -2259,10 +2433,15 @@ mod tests {
                 .into_vec();
             segment.truncate(payload_len);
             let original = segment.as_ptr();
-            let bytes = HlsPackager::freeze_segment(segment);
+            let (bytes, allocation) = HlsPackager::freeze_segment(segment);
             assert_eq!(&bytes[..], vec![0x47; payload_len]);
             // Recover the uniquely owned allocation to observe what is actually retained.
             let owned: Vec<u8> = bytes.into();
+            assert_eq!(
+                allocation,
+                owned.capacity(),
+                "history charges the real allocation"
+            );
             if spare < SEGMENT_COMPACTION_MIN_SAVINGS {
                 assert_eq!(owned.as_ptr(), original, "small slack stays zero-copy");
                 assert_eq!(owned.capacity(), payload_len + spare);

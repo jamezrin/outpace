@@ -1,7 +1,8 @@
+use crate::hls::{HlsHistorySnapshot, HlsPackager};
 use crate::session::Subscription;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -17,6 +18,41 @@ pub(super) struct AceLease {
     /// expiry, or capacity eviction. The receiver is never read; the packager uses its own raw
     /// receiver and remains the sole segmenting pipeline.
     _hls_pin: Option<Subscription>,
+    /// Per-viewer HLS view (live or a finite replay), present only on HLS leases.
+    hls_view: Option<HlsViewState>,
+}
+
+struct HlsViewState {
+    view: AceHlsView,
+    changed: tokio::sync::watch::Sender<u64>,
+}
+
+/// One viewer's playback view, independent of the shared source and of other viewers.
+/// A replay holds coordinates and a weak packager identity only: it never copies media or
+/// keeps the packager's bounded history alive.
+#[derive(Clone, Debug)]
+pub(super) struct AceHlsView {
+    /// Bumped on every committed transition; URLs of older generations return 410.
+    pub(super) generation: u64,
+    pub(super) history: Option<HlsHistorySnapshot>,
+    /// The packager `history` was prepared on. Replay coordinates (sequence numbers and
+    /// media positions) are meaningless on a replacement packager for the same source.
+    packager: Weak<HlsPackager>,
+}
+
+impl AceHlsView {
+    fn live() -> Self {
+        Self {
+            generation: 0,
+            history: None,
+            packager: Weak::new(),
+        }
+    }
+
+    /// Whether this view's replay coordinates belong to `pkg`. A live view fits any.
+    pub(super) fn fits(&self, pkg: &Arc<HlsPackager>) -> bool {
+        self.history.is_none() || std::ptr::eq(self.packager.as_ptr(), Arc::as_ptr(pkg))
+    }
 }
 
 /// Owns a hidden direct-playback lease for exactly as long as its HTTP body exists.
@@ -210,6 +246,10 @@ impl AceSessionStore {
             }
         }
         let (cancel, _) = tokio::sync::watch::channel(false);
+        let hls_view = hls_pin.is_some().then(|| HlsViewState {
+            view: AceHlsView::live(),
+            changed: tokio::sync::watch::channel(0).0,
+        });
         leases.insert(
             token,
             AceLease {
@@ -218,6 +258,7 @@ impl AceSessionStore {
                 expires_at: now + self.ttl,
                 cancel,
                 _hls_pin: hls_pin,
+                hls_view,
             },
         );
         drop(leases);
@@ -322,6 +363,68 @@ impl AceSessionStore {
                     lease.cancel.subscribe(),
                 )
             })
+    }
+
+    /// The current HLS view of an authorized HLS lease, plus a receiver that changes on the
+    /// next committed transition. `None` for unknown, expired or non-HLS leases.
+    pub(super) fn hls_view(
+        &self,
+        playback_id: &str,
+        token: &str,
+    ) -> Option<(AceHlsView, tokio::sync::watch::Receiver<u64>)> {
+        self.purge_expired(Instant::now());
+        let leases = self.leases.lock().unwrap();
+        let state = leases
+            .get(token)
+            .filter(|lease| lease.playback_id == playback_id)?
+            .hls_view
+            .as_ref()?;
+        Some((state.view.clone(), state.changed.subscribe()))
+    }
+
+    /// Whether `token` still authorizes HLS view `generation`.
+    pub(super) fn hls_generation_is(
+        &self,
+        playback_id: &str,
+        token: &str,
+        generation: u64,
+    ) -> bool {
+        self.hls_view(playback_id, token)
+            .is_some_and(|(view, _)| view.generation == generation)
+    }
+
+    /// Commit a completely prepared live/replay view with compare-and-swap on the
+    /// generation it was prepared against. A stale or concurrent command, or a stopped or
+    /// expired lease, commits nothing and leaves the current view unchanged.
+    pub(super) fn replace_hls_view(
+        &self,
+        playback_id: &str,
+        token: &str,
+        expected_generation: u64,
+        pkg: &Arc<HlsPackager>,
+        history: Option<HlsHistorySnapshot>,
+    ) -> Option<AceHlsView> {
+        self.purge_expired(Instant::now());
+        let mut leases = self.leases.lock().unwrap();
+        let state = leases
+            .get_mut(token)
+            .filter(|lease| lease.playback_id == playback_id)?
+            .hls_view
+            .as_mut()?;
+        if state.view.generation != expected_generation {
+            return None;
+        }
+        state.view = AceHlsView {
+            generation: expected_generation.checked_add(1)?,
+            packager: if history.is_some() {
+                Arc::downgrade(pkg)
+            } else {
+                Weak::new()
+            },
+            history,
+        };
+        state.changed.send_replace(state.view.generation);
+        Some(state.view.clone())
     }
 
     #[cfg(test)]

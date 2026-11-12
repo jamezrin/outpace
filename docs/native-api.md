@@ -550,7 +550,9 @@ account/premium, UI remote control, channel catalog, playlist/EPG, and encrypted
 are unsupported. The live `/ace/manifest.m3u8`, tokenized `/ace/m/...m3u8`, and
 `/ace/c/<session>/<seq>.ts` adapter reuses the native live HLS packager; compatibility VOD remains
 deferred. The exact supported methods and error envelopes are pinned in
-[`protocol/compat-matrix.md`](protocol/compat-matrix.md).
+[`protocol/compat-matrix.md`](protocol/compat-matrix.md). With `OUTPACE_HISTORY_SECONDS` set,
+compatibility HLS viewers can also rewind into retained history and return to live through
+Outpace-specific `/ace/cmd` methods; see [timeshift](timeshift.md).
 
 Compatibility `getstream`, `manifest` JSON, and `stat` responses expose the same nested metadata
 object. Compatibility direct and tokenized MPEG-TS playback do not emit `Icy-Name`;

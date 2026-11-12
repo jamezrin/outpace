@@ -133,6 +133,23 @@ pub(crate) struct WorkerControl {
     cleanup: tokio::sync::mpsc::UnboundedSender<CleanupJob>,
 }
 
+/// Entries an idle sweep has already fenced, cancelled and removed from the maps.
+struct IdleRetirement {
+    sessions: Vec<Arc<StreamSession>>,
+    controls: Vec<WorkerControl>,
+}
+
+impl IdleRetirement {
+    async fn confirm(self) {
+        for session in self.sessions {
+            session.stop().await;
+        }
+        for control in self.controls {
+            control.join().await;
+        }
+    }
+}
+
 /// False plus a closed sender denotes failed/unknown cleanup, never completion.
 pub(crate) async fn wait_cleanup(completed: &mut watch::Receiver<bool>) -> bool {
     loop {
@@ -350,6 +367,9 @@ pub struct StreamManager {
     vod_resolve_locks: StdMutex<HashMap<StreamKey, Weak<Mutex<()>>>>,
     buffer: usize,
     hls: HlsConfig,
+    /// Optional retained-HLS replay policy, charged against one manager-wide budget.
+    hls_history: crate::config::HlsHistoryConfig,
+    hls_history_budget: crate::history::HistoryBudget,
     normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     live_normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     grace: Duration,
@@ -494,6 +514,36 @@ impl StreamManager {
         live_normalizer: Option<crate::hls_audio::PreparedNormalizer>,
         max_sessions: usize,
     ) -> Arc<Self> {
+        Self::with_history_and_audio_config(
+            registry,
+            buffer,
+            hls,
+            crate::config::HlsHistoryConfig::default(),
+            normalizer,
+            live_normalizer,
+            max_sessions,
+        )
+    }
+
+    /// Native HLS packagers with optional bounded replay history (disabled by default).
+    pub fn with_history_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        history: crate::config::HlsHistoryConfig,
+    ) -> Arc<Self> {
+        Self::with_history_and_audio_config(registry, buffer, hls, history, None, None, 0)
+    }
+
+    pub fn with_history_and_audio_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        history: crate::config::HlsHistoryConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        live_normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        max_sessions: usize,
+    ) -> Arc<Self> {
         Arc::new(StreamManager {
             support_controls: StdMutex::new(Vec::new()),
             registry,
@@ -508,6 +558,8 @@ impl StreamManager {
             vod_resolve_locks: StdMutex::new(HashMap::new()),
             buffer,
             hls,
+            hls_history: history,
+            hls_history_budget: crate::history::HistoryBudget::new(history.global_max_bytes),
             normalizer: if live_normalizer.is_none() {
                 normalizer
             } else {
@@ -1234,7 +1286,13 @@ impl StreamManager {
             packagers
                 .entry(key)
                 .or_insert_with(|| {
-                    let media = HlsPackager::create(&session, self.hls, self.normalizer.is_some());
+                    let media = HlsPackager::create_with_history(
+                        &session,
+                        self.hls,
+                        self.normalizer.is_some(),
+                        self.hls_history,
+                        self.hls_history_budget.clone(),
+                    );
                     let control = crate::hls_audio::spawn_worker(
                         &session,
                         media.clone(),
@@ -1360,7 +1418,15 @@ impl StreamManager {
             .collect()
     }
 
+    /// Retire idle entries, then wait for their cleanup to be confirmed.
+    #[cfg(test)]
     async fn reap_idle_at(&self, now: Instant) {
+        self.retire_idle_at(now).await.confirm().await;
+    }
+
+    /// Fence and cancel idle entries under the lifecycle locks. Cleanup ownership is already
+    /// recorded and transferred; the returned value only waits for confirmation.
+    async fn retire_idle_at(&self, now: Instant) -> IdleRetirement {
         let expired: Vec<_> = {
             let mut cache = self.vod_cache.lock().await;
             let keys: Vec<_> = cache
@@ -1434,11 +1500,9 @@ impl StreamManager {
             }
             (controls, retired_sessions)
         };
-        for session in retired_sessions {
-            session.stop().await;
-        }
-        for control in controls {
-            control.join().await;
+        IdleRetirement {
+            sessions: retired_sessions,
+            controls,
         }
     }
 
@@ -1464,7 +1528,20 @@ impl StreamManager {
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
-                manager.reap_idle_at(Instant::now()).await;
+                let retired = manager.retire_idle_at(Instant::now()).await;
+                drop(manager);
+                // A cleanup that never confirms must not stop later sweeps. Giving up the wait
+                // abandons nothing: completions are recorded and owned by the coordinator, and
+                // stop/shutdown still wait on them.
+                tokio::select! {
+                    biased;
+                    _ = cancel.changed() => break,
+                    confirmed = tokio::time::timeout(grace, retired.confirm()) => {
+                        if confirmed.is_err() {
+                            crate::alog!("[manager] idle cleanup still pending after {grace:?}; continuing sweeps");
+                        }
+                    }
+                }
             }
         }));
     }

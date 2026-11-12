@@ -303,6 +303,14 @@ pub fn router_with_support(
             .route("/ace/manifest.m3u8", get(ace_manifest))
             .route("/ace/m/{id}/{manifest}", get(ace_hls_playback))
             .route("/ace/c/{session}/{segment}", get(ace_hls_segment))
+            .route(
+                "/ace/t/{id}/{token}/{manifest}",
+                get(ace_timeshift_playback),
+            )
+            .route(
+                "/ace/tc/{token}/{generation}/{segment}",
+                get(ace_timeshift_segment),
+            )
             .route("/ace/stat/{id}/{token}", get(ace_stat))
             .route("/ace/cmd/{id}/{token}", get(ace_command))
             .route("/server/api", get(server_api))
