@@ -1,4 +1,4 @@
-"""Install signed Ubuntu media packages on the pinned ephemeral CI runner.
+"""Install signed Ubuntu media packages on a pinned ephemeral CI runner release.
 
 Canonical's HTTPS archives are tried first; kernel.org's Ubuntu mirror is the
 fallback when the Canonical index cannot be fetched (for example a runner DNS
@@ -15,18 +15,23 @@ import sys
 import tempfile
 
 KEYRING = Path('/usr/share/keyrings/ubuntu-archive-keyring.gpg')
+# Explicit allowlist of runner releases and their archive codenames. Adding a
+# release is a deliberate change; anything else is rejected before apt runs.
+RELEASES = {'24.04': 'noble', '26.04': 'resolute'}
 
 
 def supported_runner():
-    """Reject another distribution/release before executing package commands."""
+    """Return the archive codename, rejecting another distribution/release first."""
     release = {}
     for line in Path('/etc/os-release').read_text().splitlines():
         key, separator, value = line.partition('=')
         if separator:
             release[key] = value.strip().strip('"')
-    if (release.get('ID') != 'ubuntu' or release.get('VERSION_ID') != '24.04'
+    codename = RELEASES.get(release.get('VERSION_ID'))
+    if (release.get('ID') != 'ubuntu' or codename is None
             or platform.machine() not in ('x86_64', 'amd64') or not KEYRING.is_file()):
         raise RuntimeError('unsupported_runner')
+    return codename
 
 
 # Canonical first: #333 moved off the runner's cloud mirror because slow
@@ -34,18 +39,20 @@ def supported_runner():
 # mirror, deliberately outside *.ubuntu.com, so a runner DNS outage for that
 # domain (which also takes out azure.archive.ubuntu.com) does not block CI.
 # Every index is still verified against the pinned keyring through signed-by.
-MIRRORS = [
-    ('canonical', [
-        'https://archive.ubuntu.com/ubuntu noble main universe',
-        'https://archive.ubuntu.com/ubuntu noble-updates main universe',
-        'https://security.ubuntu.com/ubuntu noble-security main universe',
-    ]),
-    ('kernel.org', [
-        'https://mirrors.edge.kernel.org/ubuntu noble main universe',
-        'https://mirrors.edge.kernel.org/ubuntu noble-updates main universe',
-        'https://mirrors.edge.kernel.org/ubuntu noble-security main universe',
-    ]),
-]
+def mirrors(codename):
+    """Signed sources for the runner's release, Canonical first."""
+    return [
+        ('canonical', [
+            f'https://archive.ubuntu.com/ubuntu {codename} main universe',
+            f'https://archive.ubuntu.com/ubuntu {codename}-updates main universe',
+            f'https://security.ubuntu.com/ubuntu {codename}-security main universe',
+        ]),
+        ('kernel.org', [
+            f'https://mirrors.edge.kernel.org/ubuntu {codename} main universe',
+            f'https://mirrors.edge.kernel.org/ubuntu {codename}-updates main universe',
+            f'https://mirrors.edge.kernel.org/ubuntu {codename}-security main universe',
+        ]),
+    ]
 UPDATE_SECONDS = 55
 INSTALL_SECONDS = 200
 
@@ -78,16 +85,16 @@ def install():
             or os.environ.get('RUNNER_OS') != 'Linux'
             or not os.environ.get('RUNNER_TEMP')):
         raise RuntimeError('ci_context_required')
-    supported_runner()
+    sources = mirrors(supported_runner())
     with tempfile.TemporaryDirectory(prefix='outpace-media-', dir=os.environ['RUNNER_TEMP']) as name:
         directory = Path(name)
         # Public repository configuration must be readable by APT's _apt user.
         directory.chmod(0o755)
-        for index, (mirror, lines) in enumerate(MIRRORS):
+        for index, (mirror, lines) in enumerate(sources):
             try:
                 apt(directory, mirror, lines, ['update'], UPDATE_SECONDS)
             except subprocess.SubprocessError:
-                if index == len(MIRRORS) - 1:
+                if index == len(sources) - 1:
                     raise
                 print(f'CI media prerequisite: {mirror} index failed; trying next mirror',
                       file=sys.stderr)
