@@ -53,6 +53,14 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target\release\outpace.exe $dir
           $exe = Join-Path $dir 'outpace.exe'
+          # Fail closed: a pre-created data dir (inheriting ProgramData's ACL, as any local
+          # user could arrange) must make install fail and leave no service behind.
+          $data = Join-Path $env:ProgramData 'outpace'
+          New-Item -ItemType Directory -Force $data | Out-Null
+          & $exe service install
+          if ($LASTEXITCODE -eq 0) { throw 'install accepted an unsafe pre-existing data dir' }
+          if (Get-Service outpace -ErrorAction SilentlyContinue) { throw 'failed install left a service behind' }
+          Remove-Item -Recurse -Force $data
           & $exe service install
           if ($LASTEXITCODE -ne 0) { throw 'install failed' }
           # Service settings live in its Environment registry value.

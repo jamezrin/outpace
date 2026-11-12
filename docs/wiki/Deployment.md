@@ -175,13 +175,13 @@ sc.exe start outpace
 
 - The service is called `outpace`. It starts automatically at boot, runs as its own
   unprivileged virtual account `NT SERVICE\outpace`, and Windows restarts it if it crashes.
-- Its data directory holds the node identity and broadcast signing keys. `service install`
-  restricts it to SYSTEM, Administrators and the service account, with nothing inherited from
-  `%ProgramData%`. If you point `OUTPACE_DATA_DIR` elsewhere, restrict that directory the same way:
-  `icacls <dir> /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "NT SERVICE\outpace:(OI)(CI)M"`.
-- `service install` registers it but doesn't start it.
-- Stopping it (`sc.exe stop outpace`, the Services app, or a shutdown) drains connections
-  gracefully, just like Ctrl+C.
+- Its data directory holds the node identity and broadcast signing keys, so it must be private.
+  `service install` creates `%ProgramData%\outpace` for SYSTEM, Administrators and the service
+  account only, with nothing inherited. The service refuses to start, and `service install`
+  refuses to finish, if the directory already exists with any other owner or access, or is a
+  link. Remove such a directory and run `service install` again. A custom `OUTPACE_DATA_DIR`
+  that doesn't exist yet is created the same way. If it already exists, it must already be
+  private.
 - Without `OUTPACE_DATA_DIR`, data lives in `%ProgramData%\outpace`. The log is
   `%ProgramData%\outpace\outpace.log`, because a service has no console.
 - Settings come from the service's `Environment` registry value: one `NAME=value` per entry,
