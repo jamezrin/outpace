@@ -57,7 +57,11 @@ jobs:
           root="$RUNNER_TEMP/pkgroot"
           mkdir -p "$root"
           dpkg-deb -x dist/*.deb "$root"
-          systemd-analyze verify --man=no --root="$root" /usr/lib/systemd/system/outpace.service
+          # Verify the packaged unit against the host's units (an unpacked package has no
+          # sysinit.target), with ExecStart pointed at the packaged binary.
+          sed "s|/usr/bin/outpace|$root/usr/bin/outpace|" \
+            "$root/usr/lib/systemd/system/outpace.service" > "$RUNNER_TEMP/outpace.service"
+          systemd-analyze verify --man=no "$RUNNER_TEMP/outpace.service"
 
       - name: Install-test the .deb on Debian
         run: |
