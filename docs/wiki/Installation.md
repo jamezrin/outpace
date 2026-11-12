@@ -23,7 +23,6 @@ file on the [releases page](https://github.com/jamezrin/outpace-stream/releases)
 | Linux ARM64 (aarch64) | `aarch64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARMv7 hard-float (Raspberry Pi 2/3 class) | `armv7-unknown-linux-musleabihf` | `.tar.gz` |
 | FreeBSD 14 and 15 x86_64, from the next release | `x86_64-unknown-freebsd` | `.tar.gz` |
-| NetBSD x86_64, from the next release | `x86_64-unknown-netbsd` | `.tar.gz` |
 | macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
@@ -50,18 +49,17 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
 
-### FreeBSD, NetBSD and OpenBSD
+### FreeBSD and other BSDs
 
-From the next release there are FreeBSD and NetBSD x86_64 binaries. They use the same archive
-layout, so the commands above work with `target=x86_64-unknown-freebsd` (or `-netbsd`). Use
-`sha256 -c` or `shasum -a 256 --check` to verify. The FreeBSD binary is built against FreeBSD 14
-and is tested on 14 and 15. That also covers pfSense and OPNsense, but install it with care on a
-firewall: keep the API on `127.0.0.1` and open only the peer port. The NetBSD binary is built but
-not tested on a running system. To run it as a service on FreeBSD, see
+From the next release there is a FreeBSD x86_64 binary. It uses the same archive layout, so
+the commands above work with `target=x86_64-unknown-freebsd`. Use `sha256 -c` or
+`shasum -a 256 --check` to verify. The binary is built against FreeBSD 14 and is tested on 14
+and 15. That also covers pfSense and OPNsense, but install it with care on a firewall: keep the
+API on `127.0.0.1` and open only the peer port. To run it as a service, see
 [Deployment](Deployment#freebsd-rcd).
 
-There is no OpenBSD build. Rust support for OpenBSD is tier 3, so
-[build from source](#build-from-source) on the OpenBSD machine itself.
+There are no NetBSD or OpenBSD builds. On those systems,
+[build from source](#build-from-source) on the machine itself.
 
 ### ARMv7 and small devices
 

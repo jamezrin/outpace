@@ -71,8 +71,8 @@ These are merged into `main` (and so in `edge`), but aren't in v0.9.0:
   `OUTPACE_PRIVATE_DESCRIPTORS`, `/network-policy`).
 - [Support sources](Support-Sources-and-Operations#support-sources) (`OUTPACE_SUPPORT_SOURCES`,
   `/support`).
-- Release binaries for FreeBSD and NetBSD x86_64; see
-  [Installation](Installation#freebsd-netbsd-and-openbsd).
+- A FreeBSD x86_64 release binary; see
+  [Installation](Installation#freebsd-and-other-bsds).
 
 **Fixes you'll notice**
 

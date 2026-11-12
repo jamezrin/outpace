@@ -164,7 +164,7 @@ journal adds the date. Open TCP 8621 in your firewall if you run as a full parti
 ## FreeBSD rc.d
 
 From the next release, there is a FreeBSD binary (see
-[Installation](Installation#freebsd-netbsd-and-openbsd)). Run it under `daemon(8)`, which
+[Installation](Installation#freebsd-and-other-bsds)). Run it under `daemon(8)`, which
 restarts it if it exits:
 
 ```bash

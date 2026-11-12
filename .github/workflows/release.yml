@@ -74,10 +74,6 @@ jobs:
             cross: x86_64-unknown-freebsd@14
             os: ubuntu-24.04
             archive: tar.gz
-          - target: x86_64-unknown-netbsd
-            cross: x86_64-unknown-netbsd
-            os: ubuntu-24.04
-            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz

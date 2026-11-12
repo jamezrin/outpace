@@ -15,7 +15,6 @@ TARGETS = {
     "x86_64-pc-windows-msvc": "zip",
     "aarch64-pc-windows-msvc": "zip",
     "x86_64-unknown-freebsd": "tar.gz",
-    "x86_64-unknown-netbsd": "tar.gz",
 }
 LINUX = {
     "x86_64-unknown-linux-musl": "amd64",
