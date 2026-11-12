@@ -6,7 +6,7 @@
 //! must accept that short form and reply with their full handshake.
 //! Exported torrent metainfo selects the separate standard 68-byte BitTorrent form explicitly.
 use crate::{Result, WireError};
-use rand::Rng;
+use rand::RngExt;
 
 /// Protocol string (length 17). Replaces BitTorrent's "BitTorrent protocol".
 pub const PSTR: &[u8] = b"AceStreamProtocol";
@@ -127,9 +127,9 @@ pub fn random_peer_id() -> [u8; 20] {
     const ALPHANUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut id = [0u8; 20];
     id[..9].copy_from_slice(b"R30------");
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for b in &mut id[9..] {
-        *b = ALPHANUM[rng.gen_range(0..ALPHANUM.len())];
+        *b = ALPHANUM[rng.random_range(0..ALPHANUM.len())];
     }
     id
 }

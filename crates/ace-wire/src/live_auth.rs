@@ -33,10 +33,10 @@
 //! - `authmethod` = literal ASCII `"RSA"`.
 
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
-use rsa::pkcs1v15::Pkcs1v15Sign;
-use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+use rsa::pkcs8::der::Decode;
+use rsa::pkcs8::EncodePublicKey;
 use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{BoxedUint, Pkcs1v15Sign, PrivateKey, PublicKey};
 use sha1::{Digest, Sha1};
 
 /// Key size matching the real engine's own source-node-generated keys (note 25: a captured
@@ -44,22 +44,31 @@ use sha1::{Digest, Sha1};
 /// matching it avoids being fingerprinted as an obviously-different implementation.
 const KEY_BITS: usize = 768;
 
+/// Smallest broadcaster modulus accepted when decoding a transport `pubkey`. `rsa` 0.10
+/// rejects anything under 1024 bits by default, which would refuse every real 768-bit
+/// AceStream source key, so the limit is lowered explicitly for this legacy protocol. 512 bits
+/// still leaves room for a PKCS#1 v1.5 SHA1 DigestInfo; the upper bound stays `rsa`'s default.
+const MIN_PUBKEY_BITS: usize = 512;
+
 /// A broadcast source's live-auth RSA identity.
 pub struct LiveSourceAuth {
-    key: RsaPrivateKey,
+    key: PrivateKey,
 }
 
 impl LiveSourceAuth {
     /// Mint a fresh keypair.
     pub fn generate() -> Self {
+        // `new_unchecked` (the `hazmat` feature) is required because `rsa` refuses to generate
+        // keys under 1024 bits. Keeping 768 bits keeps the in-band signature at 96 bytes, the
+        // same as the real engine's source keys (see `KEY_BITS`).
         let key =
-            RsaPrivateKey::new(&mut rand::thread_rng(), KEY_BITS).expect("RSA key generation");
+            PrivateKey::new_unchecked(&mut rand::rng(), KEY_BITS).expect("RSA key generation");
         LiveSourceAuth { key }
     }
 
     /// Load an identity from its PKCS#1 PEM private-key text (the `.sauth` format).
     pub fn from_pkcs1_pem(pem: &str) -> Result<Self, crate::WireError> {
-        let key = RsaPrivateKey::from_pkcs1_pem(pem)
+        let key = PrivateKey::from_pkcs1_pem(pem)
             .map_err(|_| crate::WireError::Invalid("bad PKCS#1 RSA private key PEM"))?;
         Ok(LiveSourceAuth { key })
     }
@@ -75,7 +84,7 @@ impl LiveSourceAuth {
     /// The DER-encoded X.509 SubjectPublicKeyInfo — exactly what the transport descriptor's
     /// `pubkey` field carries.
     pub fn pubkey_der(&self) -> Vec<u8> {
-        let pubkey = RsaPublicKey::from(&self.key);
+        let pubkey = PublicKey::from(&self.key);
         pubkey
             .to_public_key_der()
             .expect("DER SPKI encode")
@@ -105,7 +114,7 @@ impl LiveSourceAuth {
 /// DER SubjectPublicKeyInfo (the transport descriptor's `pubkey` field). Scheme: RSASSA-
 /// PKCS1-v1_5 with SHA1 — see the module docs for how this was recovered.
 pub fn verify_piece(pubkey_der: &[u8], payload: &[u8], signature: &[u8]) -> bool {
-    let Ok(pubkey) = RsaPublicKey::from_public_key_der(pubkey_der) else {
+    let Some(pubkey) = decode_pubkey_der(pubkey_der) else {
         return false;
     };
     let digest = Sha1::digest(payload);
@@ -119,9 +128,23 @@ pub fn verify_piece(pubkey_der: &[u8], payload: &[u8], signature: &[u8]) -> bool
 /// each wire piece are the in-band signature (see the module docs / B0). Returns `None` if the
 /// bytes aren't a parseable RSA public key.
 pub fn signature_len_from_pubkey_der(pubkey_der: &[u8]) -> Option<usize> {
-    RsaPublicKey::from_public_key_der(pubkey_der)
-        .ok()
-        .map(|k| k.size())
+    decode_pubkey_der(pubkey_der).map(|k| k.size())
+}
+
+/// Decode a broadcaster's DER SubjectPublicKeyInfo, accepting legacy modulus sizes down to
+/// `MIN_PUBKEY_BITS`. `rsa`'s own `DecodePublicKey` enforces a 1024-bit minimum, so the SPKI
+/// and PKCS#1 layers are decoded here and the key built with explicit size limits.
+fn decode_pubkey_der(pubkey_der: &[u8]) -> Option<PublicKey> {
+    let spki = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(pubkey_der).ok()?;
+    spki.algorithm
+        .assert_algorithm_oid(rsa::pkcs1::ALGORITHM_OID)
+        .ok()?;
+    let key = rsa::pkcs1::RsaPublicKeyRef::from_der(spki.subject_public_key.as_bytes()?).ok()?;
+    let n = key.modulus.as_bytes();
+    let e = key.public_exponent.as_bytes();
+    let n = BoxedUint::from_be_slice(n, u32::try_from(n.len()).ok()?.checked_mul(8)?).ok()?;
+    let e = BoxedUint::from_be_slice(e, u32::try_from(e.len()).ok()?.checked_mul(8)?).ok()?;
+    PublicKey::new_with_size_limits(n, e, MIN_PUBKEY_BITS..=PublicKey::MAX_SIZE).ok()
 }
 
 /// Split a wire piece into `(payload, signature)` given the signer's signature length —
@@ -240,6 +263,40 @@ w7burR2QqD9OS/n92TGQ2S3yyv5k6oG00re0J44=\n\
     fn signature_len_is_96_for_the_captured_768_bit_key() {
         let auth = LiveSourceAuth::from_pkcs1_pem(CAPTURED_SOURCE_PEM).unwrap();
         assert_eq!(auth.signature_len(), 96);
+    }
+
+    #[test]
+    fn captured_768_bit_pubkey_der_decodes_below_the_rsa_default_minimum() {
+        // `rsa`'s own SPKI decoder refuses moduli under 1024 bits; real source keys are 768.
+        let pubkey_der = LiveSourceAuth::from_pkcs1_pem(CAPTURED_SOURCE_PEM)
+            .unwrap()
+            .pubkey_der();
+        assert!(
+            <PublicKey as rsa::pkcs8::DecodePublicKey>::from_public_key_der(&pubkey_der).is_err()
+        );
+        assert_eq!(signature_len_from_pubkey_der(&pubkey_der), Some(96));
+    }
+
+    #[test]
+    fn generated_keys_keep_the_engine_768_bit_signature_length() {
+        let auth = LiveSourceAuth::generate();
+        assert_eq!(auth.signature_len(), 96);
+        assert_eq!(signature_len_from_pubkey_der(&auth.pubkey_der()), Some(96));
+    }
+
+    #[test]
+    fn pubkey_der_with_a_non_rsa_algorithm_is_rejected() {
+        let mut pubkey_der = LiveSourceAuth::from_pkcs1_pem(CAPTURED_SOURCE_PEM)
+            .unwrap()
+            .pubkey_der();
+        // rsaEncryption OID 1.2.840.113549.1.1.1 ends in 0x01; turn it into ...1.1.2.
+        let oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+        let at = pubkey_der
+            .windows(oid.len())
+            .position(|w| w == oid)
+            .unwrap();
+        pubkey_der[at + oid.len() - 1] = 0x02;
+        assert_eq!(signature_len_from_pubkey_der(&pubkey_der), None);
     }
 
     #[test]
