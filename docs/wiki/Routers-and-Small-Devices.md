@@ -55,8 +55,7 @@ The installer:
 
 - reads the router's architecture from `/etc/openwrt_release` and downloads the matching release
   archive;
-- checks the archive against `SHA256SUMS`, or against the archive's own `.sha256` file for
-  best-effort MIPS builds;
+- checks the archive against `SHA256SUMS`;
 - installs `/usr/bin/outpace`, `/etc/init.d/outpace` and `/etc/config/outpace`, and creates an
   unprivileged `outpace` user;
 - leaves the service disabled.
@@ -70,12 +69,13 @@ Running the installer again upgrades the binary and keeps your configuration.
 | `aarch64_*` | `aarch64-unknown-linux-musl` |
 | `arm_*` with VFP/NEON (e.g. `arm_cortex-a7_neon-vfpv4`) | `armv7-unknown-linux-musleabihf` |
 | `arm_arm1176jzf-s_vfp` | `arm-unknown-linux-musleabihf` |
-| `mipsel_*` (e.g. MT7621) | `mipsel-unknown-linux-musl`, best-effort |
-| `mips_*` (e.g. ath79) | `mips-unknown-linux-musl`, best-effort |
 | `riscv64_*` | `riscv64gc-unknown-linux-musl` |
 
-Only releases that ship an architecture's build can be installed on it. ARMv6, RISC-V 64 and
-MIPS builds are newer than v0.9.0, so on those routers install a later release.
+Only releases that ship an architecture's build can be installed on it. ARMv6 and RISC-V 64
+builds are newer than v0.9.0, so on those routers install a later release.
+
+MIPS routers (for example MT7621 or ath79 boards) are not supported. Most have too little
+flash and RAM for Outpace, and Rust supports MIPS only as a tier 3 target.
 
 Enable and start it:
 
@@ -95,8 +95,6 @@ logread -e outpace
   `sysupgrade`.
 - To take part as a full peer, open TCP 8621 on the WAN in the firewall, or turn on
   [port mapping](NAT-and-Port-Mapping) on a router that runs UPnP.
-- Best-effort MIPS builds need `libgcc`, which most images include. If the installer says the
-  binary doesn't run, install it with `apk add libgcc` or `opkg install libgcc`.
 
 ## pfSense and OPNsense
 

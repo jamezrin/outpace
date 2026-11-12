@@ -31,7 +31,7 @@ case "${1:-}" in
 	;;
 esac
 
-# OpenWrt's package architecture (for example mipsel_24kc) names the release target.
+# OpenWrt's package architecture (for example aarch64_cortex-a53) names the release target.
 target_for_arch() {
 	case "$1" in
 	x86_64) echo x86_64-unknown-linux-musl ;;
@@ -40,8 +40,6 @@ target_for_arch() {
 	arm_arm1176jzf-s_vfp) echo arm-unknown-linux-musleabihf ;;
 	arm_*vfp* | arm_*neon*) echo armv7-unknown-linux-musleabihf ;;
 	riscv64_*) echo riscv64gc-unknown-linux-musl ;;
-	mipsel_*) echo mipsel-unknown-linux-musl ;;
-	mips_*) echo mips-unknown-linux-musl ;;
 	*) return 1 ;;
 	esac
 }
@@ -56,7 +54,7 @@ if [ -z "$binary" ]; then
 	. /etc/openwrt_release
 	arch=$DISTRIB_ARCH
 	target=$(target_for_arch "$arch") || {
-		echo "no Outpace build for OpenWrt architecture $arch" >&2
+		echo "no Outpace build for OpenWrt architecture $arch (supported: x86_64, aarch64, ARMv6/ARMv7 hard-float, riscv64)" >&2
 		exit 1
 	}
 	archive="outpace-${version}-${target}.tar.gz"
@@ -65,23 +63,14 @@ if [ -z "$binary" ]; then
 	trap 'rm -rf "$work"' EXIT
 	echo "outpace: downloading $archive for $arch"
 	wget -q -O "$work/$archive" "$base/$archive"
-	case "$target" in
-	mips*)
-		# Best-effort MIPS builds carry their own checksum file.
-		wget -q -O "$work/$archive.sha256" "$base/$archive.sha256"
-		(cd "$work" && sha256sum -c "$archive.sha256")
-		;;
-	*)
-		wget -q -O "$work/SHA256SUMS" "$base/SHA256SUMS"
-		(cd "$work" && grep "  $archive\$" SHA256SUMS | sha256sum -c)
-		;;
-	esac
+	wget -q -O "$work/SHA256SUMS" "$base/SHA256SUMS"
+	(cd "$work" && grep "  $archive\$" SHA256SUMS | sha256sum -c)
 	tar -xzf "$work/$archive" -C "$work"
 	binary="$work/outpace-${version}-${target}/outpace"
 fi
 
 "$binary" --version >/dev/null || {
-	echo "the outpace binary does not run on this router (missing libgcc? try: apk add libgcc, or opkg install libgcc)" >&2
+	echo "the outpace binary does not run on this router" >&2
 	exit 1
 }
 

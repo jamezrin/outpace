@@ -20,13 +20,13 @@ check_target x86_64 x86_64-unknown-linux-musl
 check_target aarch64_cortex-a53 aarch64-unknown-linux-musl
 check_target arm_cortex-a7_neon-vfpv4 armv7-unknown-linux-musleabihf
 check_target arm_arm1176jzf-s_vfp arm-unknown-linux-musleabihf
-check_target mipsel_24kc mipsel-unknown-linux-musl
-check_target mips_24kc mips-unknown-linux-musl
 check_target riscv64_riscv64 riscv64gc-unknown-linux-musl
-if sh "$here/install.sh" --target-for powerpc_8548 >/dev/null; then
-	echo "unsupported arch was mapped" >&2
-	exit 1
-fi
+for arch in powerpc_8548 mipsel_24kc mips_24kc; do
+	if sh "$here/install.sh" --target-for "$arch" >/dev/null 2>&1; then
+		echo "unsupported arch $arch was mapped" >&2
+		exit 1
+	fi
+done
 
 container=$(docker run -d --rm "$image" /sbin/init)
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
