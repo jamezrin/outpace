@@ -143,6 +143,64 @@ impl StartupBufferConfig {
     }
 }
 
+/// Upper bound for `OUTPACE_HISTORY_SECONDS`.
+pub const HLS_HISTORY_MAX_SECONDS: u64 = 3600;
+
+/// Optional bounded retention of completed native live-HLS segments for local replay
+/// (timeshift). Disabled while `max_seconds` is zero. Only active HLS packagers retain
+/// history, and it never outlives its packager or the process.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HlsHistoryConfig {
+    /// Longest retained span, by both elapsed time and accepted media duration.
+    /// `OUTPACE_HISTORY_SECONDS`; zero disables history.
+    pub max_seconds: u64,
+    /// Backing-allocation budget per HLS source. `OUTPACE_HISTORY_BYTES`.
+    pub max_bytes: usize,
+    /// Budget shared by every HLS source of one manager. `OUTPACE_HISTORY_TOTAL_BYTES`.
+    pub global_max_bytes: usize,
+}
+
+impl Default for HlsHistoryConfig {
+    fn default() -> Self {
+        Self {
+            max_seconds: 0,
+            max_bytes: 128 * 1024 * 1024,
+            global_max_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+impl HlsHistoryConfig {
+    pub fn enabled(&self) -> bool {
+        self.max_seconds != 0
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_for_object_limit(isize::MAX as u64)
+    }
+
+    pub(crate) fn validate_for_object_limit(&self, max_object_bytes: u64) -> Result<(), String> {
+        if self.max_seconds > HLS_HISTORY_MAX_SECONDS {
+            return Err(format!(
+                "OUTPACE_HISTORY_SECONDS must be <= {HLS_HISTORY_MAX_SECONDS}"
+            ));
+        }
+        let safe = safe_in_memory_pool_limit(max_object_bytes);
+        if self.max_bytes < 188 || self.max_bytes as u64 > safe {
+            return Err(format!(
+                "OUTPACE_HISTORY_BYTES must be between 188 and {safe} bytes on this target"
+            ));
+        }
+        if self.global_max_bytes < self.max_bytes || self.global_max_bytes as u64 > safe {
+            return Err(format!(
+                "OUTPACE_HISTORY_TOTAL_BYTES must be >= OUTPACE_HISTORY_BYTES and <= {safe} bytes on this target"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct HlsConfig {
@@ -362,6 +420,8 @@ config_with_root_redaction! {
     pub startup_buffer: StartupBufferConfig,
     /// HLS byte-segment packaging policy.
     pub hls: HlsConfig,
+    /// Optional bounded retained-HLS replay (timeshift); disabled by default.
+    pub hls_history: HlsHistoryConfig,
     pub hls_audio: HlsAudioConfig,
     /// Normalize shared live TS audio to the fixed AAC profile. Disabled by default.
     pub live_audio_normalize: bool,
@@ -454,6 +514,7 @@ impl Default for Config {
             live_recovery: LiveRecoveryConfig::default(),
             startup_buffer: StartupBufferConfig::default(),
             hls: HlsConfig::default(),
+            hls_history: HlsHistoryConfig::default(),
             hls_audio: HlsAudioConfig::default(),
             live_audio_normalize: false,
             max_unchoked: 8,

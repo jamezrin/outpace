@@ -477,6 +477,16 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_HLS_STARTUP_TIMEOUT_MS` - maximum HLS playlist startup wait, default `45000`; must be
   at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. If the startup segment count is not reached, the
   request returns a retryable HTTP `503` at the deadline.
+- `OUTPACE_HISTORY_SECONDS` - retained live-HLS replay (timeshift) span, default `0` (disabled),
+  max `3600`. Only active native HLS packagers retain history; it is in-memory, ends with its
+  packager, and is not a persistent or UTC-indexed archive. Retention obeys elapsed time,
+  accepted media duration, both byte budgets and a 4096-segment cap; the first limit wins.
+- `OUTPACE_HISTORY_BYTES` - retained-history backing-allocation budget per HLS source, default
+  `134217728` (128 MiB). Must be at least `188` and within the target's safe in-memory pool
+  limit. At 8 Mbit/s, 128 MiB holds roughly two minutes.
+- `OUTPACE_HISTORY_TOTAL_BYTES` - retained-history budget shared by all HLS sources, default
+  `268435456` (256 MiB). Must be at least `OUTPACE_HISTORY_BYTES`. This bounds history only, not
+  total process memory.
 - `OUTPACE_MAX_UNCHOKED` - stable desired unchokes per exact served key, default `8` (U).
   For I interested peers, the coordinator selects `min(I, U + 1)` desired states in
   interest-entry order, with one rotating tail peer on nominal 10-second ticks. `0` still

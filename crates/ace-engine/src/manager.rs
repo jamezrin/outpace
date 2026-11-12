@@ -367,6 +367,9 @@ pub struct StreamManager {
     vod_resolve_locks: StdMutex<HashMap<StreamKey, Weak<Mutex<()>>>>,
     buffer: usize,
     hls: HlsConfig,
+    /// Optional retained-HLS replay policy, charged against one manager-wide budget.
+    hls_history: crate::config::HlsHistoryConfig,
+    hls_history_budget: crate::history::HistoryBudget,
     normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     live_normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     grace: Duration,
@@ -511,6 +514,36 @@ impl StreamManager {
         live_normalizer: Option<crate::hls_audio::PreparedNormalizer>,
         max_sessions: usize,
     ) -> Arc<Self> {
+        Self::with_history_and_audio_config(
+            registry,
+            buffer,
+            hls,
+            crate::config::HlsHistoryConfig::default(),
+            normalizer,
+            live_normalizer,
+            max_sessions,
+        )
+    }
+
+    /// Native HLS packagers with optional bounded replay history (disabled by default).
+    pub fn with_history_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        history: crate::config::HlsHistoryConfig,
+    ) -> Arc<Self> {
+        Self::with_history_and_audio_config(registry, buffer, hls, history, None, None, 0)
+    }
+
+    pub fn with_history_and_audio_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        history: crate::config::HlsHistoryConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        live_normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        max_sessions: usize,
+    ) -> Arc<Self> {
         Arc::new(StreamManager {
             support_controls: StdMutex::new(Vec::new()),
             registry,
@@ -525,6 +558,8 @@ impl StreamManager {
             vod_resolve_locks: StdMutex::new(HashMap::new()),
             buffer,
             hls,
+            hls_history: history,
+            hls_history_budget: crate::history::HistoryBudget::new(history.global_max_bytes),
             normalizer: if live_normalizer.is_none() {
                 normalizer
             } else {
@@ -1251,7 +1286,13 @@ impl StreamManager {
             packagers
                 .entry(key)
                 .or_insert_with(|| {
-                    let media = HlsPackager::create(&session, self.hls, self.normalizer.is_some());
+                    let media = HlsPackager::create_with_history(
+                        &session,
+                        self.hls,
+                        self.normalizer.is_some(),
+                        self.hls_history,
+                        self.hls_history_budget.clone(),
+                    );
                     let control = crate::hls_audio::spawn_worker(
                         &session,
                         media.clone(),
