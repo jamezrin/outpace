@@ -322,6 +322,22 @@ reads the registry. It runs these steps:
    No arm starts unless all three still fit.
 5. Re-check the digests and write a private numeric report with mode-0600 captures.
 
+Two host preconditions cannot be verified from inside the validation host, so the
+operator checks them from the initial namespace before each block:
+
+- uid and gid 65534 of the supervisor's namespace map to non-root host ids. A uid
+  map read from the initial namespace is relative to it; on a Proxmox host,
+  `cat /proc/$(lxc-info -n CTID -p -H)/uid_map` (and `gid_map`) must map 65534
+  to a non-zero host id: the second column plus 65534 minus the first, for the
+  range covering 65534. Inside the namespace,
+  `launcher_identity()` refuses only root launches it cannot drop.
+- No address is added to the egress device during the block. Relay sends bound to
+  the egress device are never delivered to addresses on other host interfaces,
+  but an address added to the egress device between the relay's last change check
+  and its send could receive one datagram. Any address change during a block makes
+  it inconclusive, so such a delivery is detected, not prevented
+  ([#391](https://github.com/jamezrin/outpace-stream/issues/391)).
+
 The report omits the target, content id and endpoints. Gateway and VPN exit
 provenance must be checked separately, immediately before and after. Exit 0 means
 all arms produced valid records with confirmed cleanup, 1 means an arm failed, and
