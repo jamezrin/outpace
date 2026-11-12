@@ -54,7 +54,8 @@ On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
 ### FreeBSD and other BSDs
 
 From the next release there is a FreeBSD x86_64 binary. It uses the same archive layout, so
-the commands above work with `target=x86_64-unknown-freebsd`. Use `sha256 -c` or
+the commands above work with `target=x86_64-unknown-freebsd` and `version` set to a release
+that includes it (v0.9.0 does not). Use `sha256 -c` or
 `shasum -a 256 --check` to verify. The binary is built against FreeBSD 14 and is tested on 14
 and 15. That also covers pfSense and OPNsense, but install it with care on a firewall: keep the
 API on `127.0.0.1` and open only the peer port. To run it as a service, see

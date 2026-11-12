@@ -167,42 +167,26 @@ From the next release, there is a FreeBSD binary (see
 [Installation](Installation#freebsd-and-other-bsds)). Run it under `daemon(8)`, which
 restarts it if it exits:
 
-```bash
-sudo pw useradd outpace -d /var/db/outpace -s /usr/sbin/nologin
-sudo install -d -o outpace -g outpace -m 0700 /var/db/outpace
-```
-
-`/usr/local/etc/rc.d/outpace` (mode `0755`):
-
 ```sh
-#!/bin/sh
-# PROVIDE: outpace
-# REQUIRE: NETWORKING
-# KEYWORD: shutdown
-
-. /etc/rc.subr
-
-name=outpace
-rcvar=outpace_enable
-load_rc_config $name
-: ${outpace_enable:=NO}
-: ${outpace_user:=outpace}
-: ${outpace_env:="OUTPACE_BIND=127.0.0.1:6878 OUTPACE_RTMP_BIND=127.0.0.1:1935 OUTPACE_DATA_DIR=/var/db/outpace"}
-
-pidfile=/var/run/${name}.pid
-command=/usr/sbin/daemon
-command_args="-r -R 5 -P ${pidfile} -u ${outpace_user} -o /var/log/${name}.log /usr/local/bin/outpace serve"
-
-run_rc_command "$1"
+pw useradd outpace -d /var/db/outpace -s /usr/sbin/nologin
+install -d -o outpace -g outpace -m 0700 /var/db/outpace
+fetch -o /usr/local/etc/rc.d/outpace \
+  https://raw.githubusercontent.com/jamezrin/outpace-stream/main/packaging/freebsd/outpace
+chmod 0755 /usr/local/etc/rc.d/outpace
+sysrc outpace_enable=YES
+service outpace start
 ```
 
-```bash
-sudo sysrc outpace_enable=YES
-sudo service outpace start
-```
+Run these as root. The script is
+[`packaging/freebsd/outpace`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/freebsd/outpace).
+`daemon(8)` stays root so it can write `/var/run/outpace.pid` and `/var/log/outpace.log`, and
+runs Outpace itself as `outpace`. To use another account, set `outpace_runas`, not
+`outpace_user`: `rc.subr` would run `daemon(8)` as that user too, and the start would fail.
 
 `daemon -P` stops the supervisor and the daemon together, so `service outpace stop` shuts
-Outpace down gracefully. Add `outpace_env` to `/etc/rc.conf` to change settings.
+Outpace down gracefully. To change settings, set `outpace_env` with `sysrc`, for example
+`sysrc outpace_env="OUTPACE_BIND=127.0.0.1:6878 OUTPACE_DATA_DIR=/var/db/outpace OUTPACE_CACHE_TYPE=disk"`,
+then restart.
 
 ## Behind a reverse proxy
 

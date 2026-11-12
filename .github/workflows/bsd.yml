@@ -11,6 +11,7 @@ on:
       - Cargo.lock
       - rust-toolchain.toml
       - tools/ci/smoke_daemon.sh
+      - packaging/freebsd/**
   workflow_dispatch:
 
 permissions:
@@ -91,3 +92,27 @@ jobs:
             set -eu
             chmod +x freebsd-bin/outpace
             sh tools/ci/smoke_daemon.sh freebsd-bin/outpace
+            # The documented rc.d service: daemon(8) as root, outpace as its own user.
+            install -m 0755 freebsd-bin/outpace /usr/local/bin/outpace
+            pw useradd outpace -d /var/db/outpace -s /usr/sbin/nologin
+            install -d -o outpace -g outpace -m 0700 /var/db/outpace
+            install -m 0755 packaging/freebsd/outpace /usr/local/etc/rc.d/outpace
+            sysrc outpace_enable=YES
+            service outpace start
+            ok=0
+            for i in $(seq 60); do
+              if curl --fail --silent --max-time 2 http://127.0.0.1:6878/healthz; then ok=1; break; fi
+              sleep 1
+            done
+            cat /var/log/outpace.log || true
+            [ "$ok" = 1 ] || { echo "rc.d service did not answer /healthz" >&2; exit 1; }
+            test -s /var/run/outpace.pid
+            # -P records the supervisor, which must be root; the daemon must run as outpace.
+            [ "$(ps -o user= -p "$(cat /var/run/outpace.pid)" | tr -d ' ')" = root ]
+            pgrep -U outpace -x outpace >/dev/null || { ps -axo user,pid,command | grep outpace; exit 1; }
+            service outpace stop
+            sleep 2
+            if curl --fail --silent --max-time 2 http://127.0.0.1:6878/healthz; then
+              echo "outpace still running after service stop" >&2
+              exit 1
+            fi
