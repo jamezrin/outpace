@@ -124,8 +124,12 @@ message boundaries.
 
 The SDK is configured with approximately 1 MiB each of send/receive buffering
 (quantized by the SDK) and a 1024-packet flow window. Its listen backlog is a
-separate bound in addition to application connections. These are not a process RSS
-limit: SDK, crypto, thread and kernel memory also contribute. Under sustained
+separate queue bound in addition to application connections. It does not bound
+rejected-handshake objects awaiting SDK garbage collection. Unauthenticated UDP
+traffic can incur native work and transient allocation before PSK rejection; the
+connection cap is not protection against a handshake flood. Restrict UDP access
+to trusted publisher addresses and rate-limit attempts at the network boundary. These are not a process
+RSS limit: SDK, crypto, thread and kernel memory also contribute. Under sustained
 pressure, SRT's live latency/drop behavior applies; this is not a lossless archive
 input with unlimited buffering.
 
@@ -135,7 +139,9 @@ reuses the persisted identity and existing piece-index reservation rules. Piece
 indices are not reused; reserved ranges can leave gaps across restart.
 
 A connection continues to occupy admission and fence its producer claim until
-native socket retirement and outstanding ingest work are confirmed. Native garbage
+logical native socket retirement and outstanding ingest work are confirmed. The
+retirement token proves that the closed handle is no longer usable, not that every
+SDK allocation has been destroyed; final SDK cleanup follows owner shutdown. Native garbage
 collection can delay replacement after disconnect. Unconfirmed cleanup reports an
 error and retains the claim rather than admitting a competing producer. Do not
 remove identity/cursor files to force reuse. Shutdown cancels ingress and joins the
@@ -144,7 +150,19 @@ native owner before broadcast cleanup releases ownership.
 ## Validation limits
 
 The implementation has offline configuration, producer/store, cancellation, native
-retirement, and generated loopback publisher controls. Whole-path playback and
-performance acceptance must be recorded separately; source inspection, HTTP byte
-counts, and a successful SRT handshake do not establish decoder progress or
-production readiness. This transport does not broaden protected-content support.
+retirement, and generated loopback publisher controls. Opt-in tests send generated
+H.264/AAC through SRT, signed peer serving, the provider and HTTP body, then decode
+video and audio. Another control checks persisted identity and monotone piece
+indices across reconnect and restart. These are local synthetic controls, not
+production readiness or playback-quality evidence.
+
+The optional-feature CI builds the pinned reference SDK into a job-local prefix
+and runs encrypted publisher, pressure, decoded playback and continuity controls.
+Default builds retain their existing native-free test path. The ignored resource
+profile compares one or four publishers against paced direct ingest; its process
+RSS snapshots are not peaks, its CPU excludes publisher children, and its library
+test allocator differs from the daemon allocator. Direct byte pacing and FFmpeg
+remux pacing differ, so first-piece timings are not isolated transport latency
+comparisons. It does not establish throughput
+capacity, tail latency or production memory limits. This transport does not
+broaden protected-content support.

@@ -12,3 +12,9 @@ mod ingest;
 
 mod service;
 pub(crate) use service::SrtService;
+
+#[cfg(all(test, feature = "srt"))]
+mod tests_loopback;
+
+#[cfg(all(test, feature = "srt"))]
+mod tests_performance;

@@ -1,6 +1,7 @@
 # Optional bounded SRT broadcast ingest (#7)
 
-Status: design draft, not implemented. Routine design decisions are delegated by
+Status: implementation and synthetic acceptance controls prepared; final whole-feature
+review and PR integration remain pending. Routine design decisions are delegated by
 the milestone goal. #7 remains open until encrypted publisher interoperability,
 signed playable output, persisted identity/cursor continuity and all gates pass.
 
@@ -66,9 +67,12 @@ thread counts, memory, CPU and publisher-to-signed-piece latency before acceptan
 
 One owned native polling thread per listener services nonblocking accept/receive
 with finite waits <=10ms and a finite per-turn batch. It owns every native socket
-and poll descriptor. Accepted sockets and native listen backlog are bounded by the
-configured connection cap; no task per handshake or unbounded pending map. Audit
-reference backlog/handshake limits before implementation acceptance.
+and poll descriptor. Application-accepted sockets and the SDK successful-handshake queue each have a
+configured cap; no application task per handshake or unbounded pending map. The
+reference SDK retains failed-handshake objects outside that queue until garbage
+collection. This adapter does not promise a hard preauthentication native-memory
+cap or flood resistance: nonloopback listeners require operator-controlled UDP
+source restriction and rate limiting. No firewall policy is changed automatically.
 
 Each admitted connection owns a bounded media channel of four <=64KiB messages
 and one retained pending message. Polling continues cancellation/control and other
@@ -82,7 +86,7 @@ An owned async connection worker validates 188-byte TS framing across message
 boundaries and feeds BroadcastIngest. Existing signed-piece geometry, verified
 publication and durable cursor reservation are authoritative. At most one ingest
 attempt per producer; no duplicate identity/store implementation. The transport
-worker's producer reservation remains owned through pending publication and exact
+worker's producer reservation remains owned through pending publication and logical
 socket retirement. A disconnected publisher drops incomplete TS/piece staging per
 existing ingest semantics, checkpoints reservations, and releases producer ownership
 only after completion. Reconnect to the same name reuses persisted identity/cursor;

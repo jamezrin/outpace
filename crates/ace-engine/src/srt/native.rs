@@ -391,8 +391,15 @@ mod tests {
             let library = NativeLibrary::acquire().unwrap();
             let mut listener = library.receiver(120, b"synthetic-test-passphrase").unwrap();
             let address = listener.listen("127.0.0.1:0".parse().unwrap(), 4).unwrap();
-            for (secret, should_connect) in [("synthetic-wrong-passphrase", false), ("synthetic-test-passphrase", true)] {
-                let url = format!("srt://{address}?mode=caller&passphrase={secret}&streamid=synthetic&pkt_size=1316&connect_timeout=500");
+            for (secret, key_bytes, should_connect) in [
+                (None, 16, false),
+                (Some("synthetic-wrong-passphrase"), 16, false),
+                (Some("synthetic-test-passphrase"), 16, true),
+                (Some("synthetic-test-passphrase"), 24, true),
+                (Some("synthetic-test-passphrase"), 32, true),
+            ] {
+                let mut url = format!("srt://{address}?mode=caller&streamid=synthetic&pkt_size=1316&connect_timeout=500&pbkeylen={key_bytes}");
+                if let Some(secret) = secret { url.push_str(&format!("&passphrase={secret}")); }
                 let mut child = OwnedChild(Command::new("ffmpeg").args(["-hide_banner","-loglevel","error","-re","-f","lavfi","-i","testsrc=size=64x64:rate=10","-an","-t","2","-c:v","mpeg2video","-f","mpegts",&url])
                     .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
                 let deadline = Instant::now() + Duration::from_secs(4);
@@ -428,7 +435,8 @@ mod tests {
                             ReadStatus::Closed => break,
                         }
                     }
-                    Some((identity, encrypted, size, bytes[0]))
+                    let sync = bytes[..size].as_chunks::<188>().0.iter().all(|packet| packet[0] == 0x47);
+                    Some((identity, encrypted, size, sync))
                 } else { None };
                 if child.0.try_wait().unwrap().is_none() { child.0.kill().unwrap(); }
                 child.0.wait().unwrap();
@@ -444,8 +452,8 @@ mod tests {
                     assert_eq!(identity, "synthetic");
                     assert!(encrypted);
                     assert!(size > 0 && size % 188 == 0);
-                    assert_eq!(sync, 0x47);
-                } else { assert!(observed.is_none(), "wrong key must never be accepted"); }
+                    assert!(sync, "decrypted messages must preserve every TS packet boundary");
+                } else { assert!(observed.is_none(), "plaintext and wrong keys must never be accepted"); }
             }
             listener.close().unwrap();
             drop(listener);
