@@ -54,6 +54,18 @@ What the defaults give you:
 After changing `.env`, run `docker compose up -d --wait`. `docker compose restart` doesn't apply
 environment changes.
 
+The shipped health check runs `curl`, which the Debian images include. To use a
+[minimal image](Installation#minimal-image), which has no `curl`, override it in a
+`compose.override.yml`:
+
+```yaml
+services:
+  outpace:
+    image: ghcr.io/jamezrin/outpace:X.Y.Z-minimal
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/outpace", "healthcheck"]
+```
+
 ### Passing other settings
 
 `compose.yml` only forwards a fixed list of variables into the container (listed in
@@ -223,6 +235,33 @@ packaging/macos/install-launchagent.sh uninstall     # to remove it
 - HTTP and RTMP stay on `127.0.0.1`. The log is `~/Library/Logs/outpace.log`, and data stays in
   `~/Library/Application Support/outpace`.
 - Unloading sends `SIGTERM`, which drains gracefully. Uninstalling keeps the data and the log.
+
+## FreeBSD rc.d
+
+From the next release, there is a FreeBSD binary (see
+[Installation](Installation#freebsd-and-other-bsds)). Run it under `daemon(8)`, which
+restarts it if it exits:
+
+```sh
+pw useradd outpace -d /var/db/outpace -s /usr/sbin/nologin
+install -d -o outpace -g outpace -m 0700 /var/db/outpace
+fetch -o /usr/local/etc/rc.d/outpace \
+  https://raw.githubusercontent.com/jamezrin/outpace-stream/main/packaging/freebsd/outpace
+chmod 0755 /usr/local/etc/rc.d/outpace
+sysrc outpace_enable=YES
+service outpace start
+```
+
+Run these as root. The script is
+[`packaging/freebsd/outpace`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/freebsd/outpace).
+`daemon(8)` stays root so it can write `/var/run/outpace.pid` and `/var/log/outpace.log`, and
+runs Outpace itself as `outpace`. To use another account, set `outpace_runas`, not
+`outpace_user`: `rc.subr` would run `daemon(8)` as that user too, and the start would fail.
+
+`daemon -P` stops the supervisor and the daemon together, so `service outpace stop` shuts
+Outpace down gracefully. To change settings, set `outpace_env` with `sysrc`, for example
+`sysrc outpace_env="OUTPACE_BIND=127.0.0.1:6878 OUTPACE_DATA_DIR=/var/db/outpace OUTPACE_CACHE_TYPE=disk"`,
+then restart.
 
 ## Behind a reverse proxy
 

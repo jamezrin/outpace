@@ -122,6 +122,24 @@ Unreleased: `edge` and builds from `main` only. This command exists only in Wind
 
 See [Deployment](Deployment#windows-service) for settings, data and logs.
 
+## `outpace healthcheck`
+
+Unreleased: `edge` and builds from `main` only. Checks that a running daemon answers `/healthz`,
+then exits `0` if it does and `1` if it doesn't. Use it for container and service health checks
+on systems without `curl`, such as the minimal image.
+
+```bash
+outpace healthcheck                       # probes OUTPACE_BIND, else 127.0.0.1:6878
+outpace healthcheck --addr 127.0.0.1:7000 --timeout 5
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--addr IP:PORT` | The HTTP API to probe. Defaults to `OUTPACE_BIND`. A wildcard bind (`0.0.0.0` or `[::]`) is probed on loopback. |
+| `--timeout SECONDS` | How long to wait for the connection and the response. Default `3`. |
+
+It reads no other settings and doesn't start anything.
+
 ## `--version` and `--help`
 
 ```bash

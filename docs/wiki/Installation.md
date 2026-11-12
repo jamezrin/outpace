@@ -24,6 +24,7 @@ file on the [releases page](https://github.com/jamezrin/outpace-stream/releases)
 | Linux ARMv7 hard-float (Raspberry Pi 2/3 class) | `armv7-unknown-linux-musleabihf` | `.tar.gz` |
 | Linux ARMv6 hard-float (Raspberry Pi Zero/1 class), from the next release | `arm-unknown-linux-musleabihf` | `.tar.gz` |
 | Linux RISC-V 64, from the next release | `riscv64gc-unknown-linux-musl` | `.tar.gz` |
+| FreeBSD 14 and 15 x86_64, from the next release | `x86_64-unknown-freebsd` | `.tar.gz` |
 | macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
@@ -50,6 +51,19 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal. To run it in the background, see [Deployment](Deployment#windows-service).
 
+### FreeBSD and other BSDs
+
+From the next release there is a FreeBSD x86_64 binary. It uses the same archive layout, so
+the commands above work with `target=x86_64-unknown-freebsd` and `version` set to a release
+that includes it (v0.9.0 does not). Use `sha256 -c` or
+`shasum -a 256 --check` to verify. The binary is built against FreeBSD 14 and is tested on 14
+and 15. That also covers pfSense and OPNsense, but install it with care on a firewall: keep the
+API on `127.0.0.1` and open only the peer port. To run it as a service, see
+[Deployment](Deployment#freebsd-rcd).
+
+There are no NetBSD or OpenBSD builds. On those systems,
+[build from source](#build-from-source) on the machine itself.
+
 ### Verify where a release came from
 
 `SHA256SUMS` proves an archive wasn't corrupted, but it comes from the same release page as the
@@ -62,7 +76,7 @@ With the [GitHub CLI](https://cli.github.com):
 gh attestation verify "$artifact" --repo jamezrin/outpace-stream
 ```
 
-The same works for release images, by tag or digest:
+The same works for release images, including the `-minimal` ones, by tag or digest:
 
 ```bash
 gh attestation verify oci://ghcr.io/jamezrin/outpace:<version> --repo jamezrin/outpace-stream
@@ -100,6 +114,7 @@ The image is `ghcr.io/jamezrin/outpace`.
 | --- | --- | --- |
 | `0.9.0` (any `X.Y.Z`) | A release. Pin this in production. | `linux/amd64`, `linux/arm64`, `linux/arm/v7` |
 | `latest` | The most recent release. | same as releases |
+| `X.Y.Z-minimal`, `minimal` | The same release in a minimal `scratch` image, from the next release. | `linux/amd64`, `linux/arm64`, `linux/arm/v7` |
 | `edge` | The current `main` branch. | `linux/amd64` only |
 | `sha-<commit>` | One specific `main` commit. | `linux/amd64` only |
 
@@ -126,6 +141,19 @@ Only the peer port is meant to face the internet. Outpace has no UDP listener, s
 nothing to publish for UDP.
 
 The image doesn't include FFmpeg; see [FFmpeg](#ffmpeg) below.
+
+### Minimal image
+
+From the next release, every release image also comes as `X.Y.Z-minimal` (and `minimal` for the
+newest). It is built `FROM scratch`: the same static binary, its licence, and a data directory,
+with no shell, package manager or `curl`. It is about a fifth of the size of the Debian image.
+
+- It runs as user and group `10001`, so a bind-mounted data directory must be writable by that
+  ID.
+- Its built-in health check runs `outpace healthcheck`, because there is no `curl`. In Compose,
+  override the health check (see [Deployment](Deployment#docker-compose)).
+- You can't extend it with `apt`. To add FFmpeg, start from the Debian image.
+- Everything else matches the Debian image: environment, ports, volume and default command.
 
 ### Docker Compose
 
@@ -223,7 +251,7 @@ USER outpace
 | `broadcasts/` | Signing keys and piece reservations of your [broadcasts](Broadcasting). These files are private keys. | Yes, and protect them |
 | `cache/` | The disk piece cache, when enabled. Wiped on start. | No |
 
-The default is the platform data directory plus `outpace`: `~/.local/share/outpace` on Linux,
+The default is the platform data directory plus `outpace`: `~/.local/share/outpace` on Linux and the BSDs,
 `~/Library/Application Support/outpace` on macOS, and `%APPDATA%\outpace` on Windows. In the
 container it is `/var/lib/outpace`. Run only one daemon per data directory.
 

@@ -42,10 +42,23 @@ pub enum Command {
     Broadcast(BroadcastArgs),
     /// Write a live MPEG-TS stream (or verified VOD with --vod) to stdout.
     Play(PlayArgs),
+    /// Check that a running daemon answers /healthz; exit 0 if healthy, 1 otherwise.
+    Healthcheck(HealthcheckArgs),
     /// Install, remove, or run outpace as a Windows service.
     #[cfg(windows)]
     #[command(subcommand)]
     Service(ServiceCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct HealthcheckArgs {
+    /// Address of the HTTP API to probe. Defaults to OUTPACE_BIND (a wildcard bind is probed on
+    /// loopback), else 127.0.0.1:6878.
+    #[arg(long)]
+    pub addr: Option<std::net::SocketAddr>,
+    /// Seconds to wait for the connection and the response.
+    #[arg(long, default_value_t = 3)]
+    pub timeout: u64,
 }
 
 #[cfg(windows)]
@@ -159,6 +172,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve(_) => run_serve().await,
         Command::Broadcast(args) => run_broadcast(args).await,
         Command::Play(args) => run_play(args).await,
+        Command::Healthcheck(args) => run_healthcheck(args),
         #[cfg(windows)]
         Command::Service(command) => tokio::task::block_in_place(|| match command {
             ServiceCommand::Install => crate::win_service::install(),
@@ -166,6 +180,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ServiceCommand::Run => crate::win_service::run(),
         }),
     }
+}
+
+fn run_healthcheck(args: HealthcheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let bind_env = std::env::var("OUTPACE_BIND").ok();
+    let addr = crate::healthcheck::target(
+        args.addr,
+        bind_env.as_deref(),
+        crate::config::Config::default().bind,
+    )?;
+    if let Err(error) =
+        crate::healthcheck::probe(addr, std::time::Duration::from_secs(args.timeout.max(1)))
+    {
+        eprintln!("outpace healthcheck: {error}");
+        std::process::exit(1);
+    }
+    eprintln!("outpace healthcheck: {addr} healthy");
+    Ok(())
 }
 
 async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
@@ -643,6 +674,33 @@ mod tests {
         let cli = Cli::parse_from(["outpace", "serve"]);
 
         assert!(matches!(cli.command, Command::Serve(_)));
+    }
+
+    #[test]
+    fn parses_healthcheck_defaults_and_flags() {
+        match Cli::parse_from(["outpace", "healthcheck"]).command {
+            Command::Healthcheck(args) => {
+                assert_eq!(args.addr, None);
+                assert_eq!(args.timeout, 3);
+            }
+            other => panic!("expected healthcheck, got {other:?}"),
+        }
+        match Cli::parse_from([
+            "outpace",
+            "healthcheck",
+            "--addr",
+            "127.0.0.1:7000",
+            "--timeout",
+            "5",
+        ])
+        .command
+        {
+            Command::Healthcheck(args) => {
+                assert_eq!(args.addr, Some("127.0.0.1:7000".parse().unwrap()));
+                assert_eq!(args.timeout, 5);
+            }
+            other => panic!("expected healthcheck, got {other:?}"),
+        }
     }
 
     #[test]
