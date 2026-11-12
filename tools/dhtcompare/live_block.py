@@ -158,10 +158,17 @@ def _consistency(boundary, inner):
     policy = inner['policy_counters']
     udp_frames = boundary['frames_in'] - sum(boundary[key] for key in
                                              ('non_ipv4', 'malformed', 'fragments', 'non_udp'))
+    packet_drops = boundary['packet_socket_kernel_drops']
     return {'denials_agree': boundary['denied_destination'] == policy['out_udp_denied'],
             'udp_frames_agree': udp_frames == policy['out_udp'] + policy['out_udp_denied'],
-            'kernel_drops': boundary['packet_socket_kernel_drops'] != 0
-            or boundary['outer_socket_kernel_drops'] != 0}
+            'kernel_drops': None if packet_drops is None
+            else packet_drops != 0 or boundary['outer_socket_kernel_drops'] != 0}
+
+
+def uncovered_listeners():
+    """Count bound UNIX socket paths outside the directories each worker namespace hides."""
+    return sum(not any(path.startswith(hidden + '/') for hidden in live.HIDDEN_PATHS)
+               for path in live.bound_unix_paths())
 
 
 def run_block(artifacts, *, content_id, egress_device, output, resolver_port=6878,
@@ -191,6 +198,9 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
         report['seed_count'] = len(seeds)
         if not seeds:
             raise Inconclusive('no_bootstrap_seed')
+        report['uncovered_listeners'] = uncovered_listeners()
+        if report['uncovered_listeners']:
+            raise Inconclusive('listener_inventory')
         if deadline - time.monotonic() < len(ORDER) * ARM_RESERVE + POSTFLIGHT_RESERVE:
             raise Inconclusive('admission_deadline')
         failed = False

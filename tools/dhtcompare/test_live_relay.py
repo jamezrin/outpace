@@ -249,6 +249,16 @@ class ListenerInventoryTests(unittest.TestCase):
                              ['/run/a path with spaces', '/run/systemd/private'])
 
 
+    def test_block_admission_counts_paths_outside_hidden_directories(self):
+        original = live.bound_unix_paths
+        live.bound_unix_paths = lambda: ['/run/systemd/private', '/var/run/x', '/tmp/a/b', '/srv/app.sock',
+                                         '/runner.sock']
+        try:
+            self.assertEqual(live_block.uncovered_listeners(), 2)
+        finally:
+            live.bound_unix_paths = original
+
+
 class ConsistencyTests(unittest.TestCase):
     ROOT = Path(__file__).resolve().parents[2]
     TOOL_GATE = Path(__file__).resolve().parent / 'src/worker/live_isolation.rs'

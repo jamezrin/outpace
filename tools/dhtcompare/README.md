@@ -259,7 +259,10 @@ reports `wait4` CPU time and sampled peak threads, sockets and `VmHWM`. A sample
 peak is a lower bound and is null when nothing was sampled; `ru_maxrss` is not used
 because it keeps the forked bootstrap's pre-`exec` peak. Admitted datagrams are
 successful local sends, not delivery. Kernel receive-queue drops on the relay
-sockets are reported separately.
+sockets are reported separately; outer-socket drops are a lower bound, because the
+kernel reports them only with a later datagram. Relay/nftables agreement and drops
+are recorded per arm without changing the verdict, so a comparison must treat a
+disagreeing arm as invalid.
 
 ### Offline live-boundary qualification
 
@@ -300,7 +303,10 @@ reads the registry. It runs these steps:
    stateless-ruleset digests.
 2. Resolve the target once through the local daemon's loopback `analyze_content`
    method. Encrypted or unknown protection is refused.
-3. Resolve the production bootstrap hostnames once, into at most four global seeds.
+3. Resolve the production bootstrap hostnames once, into at most four global seeds,
+   and refuse admission if any bound UNIX socket path lies outside the hidden
+   directories. Relative and other-namespace socket paths are invisible to this
+   check and rely on the hidden directory list.
 4. Run custom, mainline and n0 within one 135-second deadline, without retries.
    No arm starts unless all three still fit.
 5. Re-check the digests and write a private numeric report with mode-0600 captures.
