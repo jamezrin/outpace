@@ -1,8 +1,9 @@
 <!--
   This wiki is generated from docs/wiki/ in the main repository
   (https://github.com/jamezrin/outpace-stream/tree/main/docs/wiki).
-  Edit the files there through a pull request. Edits made in the GitHub wiki
-  web UI are overwritten the next time the folder is published.
+  Edit the files there through a pull request. Every merge to main that
+  touches docs/wiki/ republishes the wiki (.github/workflows/wiki.yml), so
+  edits made in the GitHub wiki web UI are overwritten.
 -->
 
 # Outpace: the open-source P2P streaming engine

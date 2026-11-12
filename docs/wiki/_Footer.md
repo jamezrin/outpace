@@ -1,1 +1,1 @@
-This wiki is generated from [`docs/wiki/`](https://github.com/jamezrin/outpace-stream/tree/main/docs/wiki) in the main repository. To fix or improve a page, open a pull request there; edits made in the wiki web UI are overwritten on the next publish.
+This wiki is generated from [`docs/wiki/`](https://github.com/jamezrin/outpace-stream/tree/main/docs/wiki) in the main repository. To fix or improve a page, open a pull request there; the wiki is republished automatically when it merges, and edits made in the wiki web UI are overwritten.
