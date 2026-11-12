@@ -59,6 +59,21 @@ optional live validation follows the repository's identifier hygiene rules. Real
 result metadata, identifiers and credentials must not enter published evidence or fixtures;
 offline fixtures use synthetic values.
 
+## Original engine protocol research
+
+[Reverse-engineering note 74](https://github.com/jamezrin/outpace-stream/blob/main/docs/protocol/notes/74-ace-search-native-services.md)
+traces a different native-engine path: compact HTTP requests to `s5.torrentstream.*`, signed
+with embedded request/response shared keys. The inspected native path does not require an
+operator-supplied search API key. Original-module offline fixtures verified request signing,
+response nonce/signature checks and synthetic result normalization; current remote service
+availability was not tested.
+
+The public HTTP API adapter proposed in [#408](https://github.com/jamezrin/outpace-stream/pull/408)
+is a separate backend with its own key configuration. That requirement must not be presented
+as original-engine parity. A native-compatible backend needs current endpoint and transport
+security validation before adoption; all search metadata still passes through existing
+playback verification.
+
 ## DHT search is separate research
 
 Known-hash peer discovery already uses the DHT. Keyword search would need a crawler to
