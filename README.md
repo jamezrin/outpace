@@ -205,7 +205,8 @@ protocol. Every kind of contribution counts:
   or open an issue first for larger changes, so we can agree on the approach before you invest
   the time.
 
-Be kind and assume good faith. Newcomers' questions are welcome, and nobody needs to be an
+The [contributing guide](CONTRIBUTING.md) covers bug reports, the local checks, conventions
+and pull requests in detail. Be kind and assume good faith. Newcomers' questions are welcome, and nobody needs to be an
 expert in Rust or peer-to-peer streaming to help.
 
 To build and check your changes:
