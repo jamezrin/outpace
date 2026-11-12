@@ -164,6 +164,7 @@ fn app(manager: Arc<StreamManager>) -> Router {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     };
@@ -179,6 +180,7 @@ async fn metrics_route_is_absent_unless_instrumented() {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     };
