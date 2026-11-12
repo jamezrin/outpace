@@ -16,6 +16,7 @@ dependencies = [
  "axum",
  "base64ct",
  "bytes",
+ "cc",
  "clap",
  "dirs",
  "futures",
@@ -26,10 +27,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.11.0",
+ "shlex",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "ace-fuzz"
+version = "0.9.0"
+dependencies = [
+ "ace-media",
+ "ace-wire",
 ]
 
 [[package]]

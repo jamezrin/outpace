@@ -43,6 +43,8 @@ pub fn valid_broadcast_name(name: &str) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProducerKind {
+    #[cfg(feature = "srt")]
+    Srt,
     RawPut,
     Rtmp,
     Pull,
@@ -273,7 +275,31 @@ pub(crate) struct ProducerAuthority {
     // settle while still holding publication authority. Jobs hold no authority/controller.
     pub(crate) jobs: StdMutex<Vec<JoinHandle<()>>>,
     ingress: StdMutex<Option<IngressTask>>,
+    transport_retirement: Option<watch::Receiver<bool>>,
     kind: ProducerKind,
+}
+
+impl ProducerAuthority {
+    fn transport_retired(&self) -> bool {
+        self.transport_retirement
+            .as_ref()
+            .is_none_or(|completion| *completion.borrow())
+    }
+    async fn wait_transport_retired(&self) -> Result<(), BroadcastError> {
+        // Completion is installed atomically with the claim and cannot be replaced.
+        let completion = self.transport_retirement.clone();
+        if let Some(mut completion) = completion {
+            loop {
+                if *completion.borrow_and_update() {
+                    return Ok(());
+                }
+                if completion.changed().await.is_err() {
+                    return Err(BroadcastError::CleanupTimeout);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Completion observer for entry-owned ingress. It owns no controller/task handle, so a
@@ -712,6 +738,41 @@ impl BroadcastRegistry {
         store_bytes: u64,
         kind: ProducerKind,
     ) -> Result<(Broadcast, ProducerSession), BroadcastError> {
+        self.acquire_producer_inner(name, trackers, seed_registry, store_bytes, kind, None)
+            .await
+    }
+
+    /// Install transport ownership before the claim can escape an acquisition future.
+    #[cfg(any(test, feature = "srt"))]
+    pub(crate) async fn acquire_producer_with_retirement(
+        &self,
+        name: &str,
+        trackers: &[String],
+        seed_registry: &SeedRegistry,
+        store_bytes: u64,
+        kind: ProducerKind,
+        retirement: watch::Receiver<bool>,
+    ) -> Result<(Broadcast, ProducerSession), BroadcastError> {
+        self.acquire_producer_inner(
+            name,
+            trackers,
+            seed_registry,
+            store_bytes,
+            kind,
+            Some(retirement),
+        )
+        .await
+    }
+
+    async fn acquire_producer_inner(
+        &self,
+        name: &str,
+        trackers: &[String],
+        seed_registry: &SeedRegistry,
+        store_bytes: u64,
+        kind: ProducerKind,
+        transport_retirement: Option<watch::Receiver<bool>>,
+    ) -> Result<(Broadcast, ProducerSession), BroadcastError> {
         self.source_preflight(name, true)?;
         let (entry, bc) = self
             .prepare(name, trackers, seed_registry, store_bytes, false)
@@ -731,6 +792,7 @@ impl BroadcastRegistry {
         }
         if let Some(old) = &data.producer {
             if old.owner_alive.load(Ordering::SeqCst)
+                || !old.transport_retired()
                 || old.ingest_busy.load(Ordering::SeqCst)
                 || old.operation.try_lock().is_err()
                 || bc.cursor.publication.try_lock().is_err()
@@ -754,6 +816,7 @@ impl BroadcastRegistry {
             operation: Arc::new(Mutex::new(())),
             jobs: StdMutex::new(Vec::new()),
             ingress: StdMutex::new(None),
+            transport_retirement,
             kind,
         });
         data.producer = Some(authority.clone());
@@ -1327,6 +1390,12 @@ impl BroadcastRegistry {
                 let jobs = std::mem::take(&mut *producer.jobs.lock().unwrap());
                 for job in jobs {
                     let _ = job.await;
+                }
+                if let Err(error) = producer.wait_transport_retired().await {
+                    // Preserve the entry, seed and authority when native cleanup is
+                    // unconfirmed. A failed observer is not a retirement acknowledgment.
+                    tx.send_replace(Some(Err(error)));
+                    return;
                 }
             }
             let _publication = state.publication.clone().lock_owned().await;
@@ -1936,3 +2005,7 @@ mod tests {
 mod tests_options51;
 #[cfg(test)]
 mod tests_pull206;
+
+#[cfg(test)]
+#[path = "broadcast/tests_srt.rs"]
+mod tests_srt;

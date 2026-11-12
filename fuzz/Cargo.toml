@@ -1,0 +1,45 @@
+[package]
+name = "outpace-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+# A separate workspace keeps libFuzzer and the nightly toolchain out of the product build.
+[workspace]
+members = ["."]
+
+[dependencies]
+ace-fuzz = { path = "../crates/ace-fuzz" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "metadata"
+path = "fuzz_targets/metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_frames"
+path = "fuzz_targets/peer_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_extensions"
+path = "fuzz_targets/peer_extensions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "media_resync"
+path = "fuzz_targets/media_resync.rs"
+test = false
+doc = false
+bench = false
