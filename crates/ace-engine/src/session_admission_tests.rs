@@ -1568,3 +1568,42 @@ async fn completed_support_generation_retires_despite_old_viewers_and_pins() {
         "completed generation must leave the map without waiting for old media handles"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn stuck_idle_cleanup_does_not_stop_later_background_sweeps() {
+    let state = Arc::new(ClosingState::default());
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(ClosingProvider(state.clone())));
+    let manager = StreamManager::with_session_limit(registry, 2);
+    manager.spawn_reaper();
+
+    drop(manager.get_or_start("synthetic", "stuck").await.unwrap());
+    // The first sweep retires the idle session; its source shutdown then never confirms.
+    tokio::time::timeout(Duration::from_secs(120), state.entered.notified())
+        .await
+        .expect("first sweep did not retire the idle session");
+    assert!(manager.get("synthetic", "stuck").await.is_none());
+
+    drop(manager.get_or_start("synthetic", "later").await.unwrap());
+    let reaped_later = tokio::time::timeout(Duration::from_secs(600), async {
+        while manager.get("synthetic", "later").await.is_some() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .is_ok();
+
+    state.release.notify_one();
+    state.release.notify_one();
+    let joined = tokio::time::timeout(Duration::from_secs(10), manager.shutdown()).await;
+    assert!(
+        reaped_later,
+        "a stuck cleanup stopped the background reaper from sweeping later idle sessions"
+    );
+    assert!(
+        matches!(joined, Ok(true)),
+        "shutdown lost the pending cleanup"
+    );
+    assert!(state.dropped.load(Ordering::SeqCst));
+    assert_eq!(manager.admission_status().0, 0);
+}
