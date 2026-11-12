@@ -20,6 +20,17 @@ Use the pinned Rust toolchain in `rust-toolchain.toml` and `rustfmt`. Follow Rus
 
 `ace-log`'s `alog!` is the only logging macro in the workspace (dependency-free by choice: no `log`, no `tracing`). Use it for **operational events** — anything read after the fact out of a log file — as `alog!("[tag] message")`, where `[tag]` names the module (`[dht]`, `[portmap]`, `[hls]`). Use plain `eprintln!` only for **user-facing output** a human reads live: the `outpace: listening on …` startup banner, `outpace play: …` CLI progress, and test-skip notices. `tools/swarmtest` is an operator-driven harness and is exempt entirely. The library crates (`ace-media`, `ace-peer`, `ace-tracker`, `ace-wire`) return errors instead of logging; keep them silent.
 
+## Performance & Efficiency
+
+Performance and resource efficiency are core goals of outpace, on equal footing with correctness. Performance regressions must not be merged.
+
+- A regression is any measurable loss in startup time, playback smoothness or latency, throughput, CPU use, memory use, allocations on hot paths, or binary size. A fix or feature that introduces one is not complete.
+- Hot paths include peer-wire decode and encode, the peer session receive loop, piece verification and reassembly, the seed store and serving, and TS/HLS output. A change to one needs a before/after measurement in the PR, taken on the same machine with a release build.
+- Use the existing tools. The bounded synthetic benchmarks are `#[ignore]` tests run in release mode, for example `cargo test --release --locked -p ace-wire live_chunk_inspection_measurement -- --ignored --nocapture`; the others are `receive_buffer_measurement` (`ace-peer`) and `shared_serving_measurement` (`ace-swarm`). Use `tools/memsoak/` for memory over real playback and `tools/abcompare/` for startup and playback against the original engine. Add a bounded benchmark when a hot path has none.
+- Prefer designs that avoid per-chunk allocation and copies, unbounded buffers or queues, busy polling, and extra tasks or threads per peer. Keep every buffer, cache and channel bounded and sized deliberately.
+- Do not add a dependency, feature flag or background loop without weighing its CPU, memory and binary-size cost.
+- If a trade-off is unavoidable, for example a correctness or security fix that costs time, measure it, state the cost in the PR, and get explicit maintainer sign-off. Never accept a regression silently.
+
 ## Testing Guidelines
 
 Use `#[tokio::test]` for async behavior and regular unit tests for pure parsing or scheduling logic. Keep live-network tests marked `#[ignore]` and document required environment variables, as existing tests do for `ACE_INFOHASH`, `ACE_PEER`, and `ACE_TRANSPORT_FILE`. For live validation, keep Cloudflare WARP off and pass a current public content id from the gitignored `acestream-ids.txt` registry via the environment; live infohashes rotate, so resolve them at runtime rather than recording them. Never hardcode a content id, infohash, or stream name into a test — see AceStream Identifier Hygiene below. Update `tests/vectors/` when fixing wire-format, identity, transport, or media parsing.
@@ -43,7 +54,7 @@ Use `#[tokio::test]` for async behavior and regular unit tests for pure parsing 
 
 ## Commit & Pull Request Guidelines
 
-Keep the root checkout on `main`; do feature work in separate worktrees that track topic branches, for example `git worktree add ../outpace-fix-dht -b fix/dht-correlation main`. Use conventional branch prefixes such as `feat/`, `fix/`, `docs/`, `test/`, or `chore/`, and commit subjects such as `fix(ace-swarm): correlate dht responses`. Keep PR titles brief and concise. PR descriptions should summarize behavior, list commands run, call out network, Docker, release, or env-var impact, name the wiki pages updated, and include logs or CLI/API examples. Release tags are `vX.Y.Z`; update crate versions before tagging.
+Keep the root checkout on `main`; do feature work in separate worktrees that track topic branches, for example `git worktree add ../outpace-fix-dht -b fix/dht-correlation main`. Use conventional branch prefixes such as `feat/`, `fix/`, `docs/`, `test/`, or `chore/`, and commit subjects such as `fix(ace-swarm): correlate dht responses`. Keep PR titles brief and concise. PR descriptions should summarize behavior, list commands run, call out network, Docker, release, or env-var impact, state the performance impact (with before/after numbers for hot-path changes, or why there is none), name the wiki pages updated, and include logs or CLI/API examples. Release tags are `vX.Y.Z`; update crate versions before tagging.
 
 ### Agent Branch Requirements
 

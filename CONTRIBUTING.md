@@ -115,6 +115,29 @@ build can rewrite `Cargo.lock`. Revert that before committing unless you changed
   test, a fixture or anywhere else.
 - Fuzz targets and their seed corpora are described in [fuzzing](docs/testing/fuzzing.md).
 
+### Performance
+
+Performance and efficiency are core goals of Outpace, and regressions must not be merged. A
+change that makes startup slower, playback less smooth, or CPU, memory or binary size worse is
+not finished, even if it's otherwise correct.
+
+- If you touch a hot path (peer-wire parsing, the peer session, piece verification and
+  reassembly, seeding and serving, or TS/HLS output), include before/after numbers in the PR,
+  measured on the same machine with a release build.
+- The bounded synthetic benchmarks are `#[ignore]`d tests that run in release mode, for example:
+
+  ```bash
+  cargo test --release --locked -p ace-wire live_chunk_inspection_measurement -- --ignored --nocapture
+  ```
+
+  The others are `receive_buffer_measurement` in `ace-peer` and `shared_serving_measurement` in
+  `ace-swarm`. For memory over real playback use [`tools/memsoak/`](tools/memsoak/), and for
+  comparisons with the original engine use [`tools/abcompare/`](tools/abcompare/).
+- Keep buffers, caches and channels bounded, avoid per-chunk allocations and copies, and weigh
+  the cost of any new dependency or background task.
+- If a cost is unavoidable, for example for a security fix, measure it and say so in the PR. The
+  maintainer decides whether it's worth it.
+
 ### Identifier hygiene
 
 Real content ids, infohashes and stream names must never appear in tracked files, commit
@@ -145,6 +168,7 @@ Keep the title short. In the description:
 - summarise the behaviour change, and link the issue (`Closes #123`);
 - list the commands you ran;
 - call out any impact on the network, Docker, releases or environment variables;
+- state the performance impact, with before/after numbers if you changed a hot path;
 - include logs or CLI and API examples where they help, with identifiers removed.
 
 CodeRabbit reviews every PR automatically. Treat its comments like any reviewer's: fix what's
