@@ -43,7 +43,8 @@ closed-source AceStream engine.
 | --- | --- |
 | Play a stream in five minutes | [Getting Started](Getting-Started) |
 | Pick a binary, container or source build | [Installation](Installation) |
-| Look up a setting | [Configuration](Configuration) |
+| Look up a setting | [Configuration](Configuration) (by topic) · [Environment Variables](Environment-Variables) (A–Z) |
+| Use `outpace play`, `broadcast` or other commands | [Command Line](Command-Line) |
 | Point a player or app at outpace | [Playing Streams](Playing-Streams) |
 | Tune HLS or fix audio for a player | [HLS Output](HLS-Output) |
 | Rewind a live stream | [Timeshift](Timeshift) |

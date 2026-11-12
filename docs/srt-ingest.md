@@ -144,7 +144,7 @@ the key using the publisher's protected credential mechanism.
 
 Once admitted, the broadcast descriptor is available at
 `http://<http-host>:<http-port>/broadcast/<name>`. Use the existing
-[broadcast playback procedure](../README.md#broadcast-origination) and
+[broadcast playback procedure](https://github.com/jamezrin/outpace-stream/wiki/Broadcasting#watching-a-broadcast) and
 [transport URL policy](native-api.md#content-id-resolution)
 for playback; a descriptor download alone does not prove decoded playback.
 A receiver must have a permitted peer path to the origin. Generated media does not

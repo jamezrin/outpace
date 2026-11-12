@@ -20,7 +20,7 @@ Record the old binary/image version, listener exposure, data backup, consumers a
 playback routes before changing anything. Do not translate an engine configuration file or
 copy its private identity/account database into Outpace. There is no account importer.
 Configure `outpace serve` through environment variables; see the full
-[configuration reference](../README.md#configuration).
+[configuration reference](configuration.md).
 
 | Operator concern | Outpace setting and behavior |
 | --- | --- |

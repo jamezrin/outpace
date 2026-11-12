@@ -207,7 +207,7 @@ anything resolves or starts:
 - `url` means an HTTP(S) **transport descriptor** URL, not an arbitrary media URL.
   Playback performs a scheme check before minting; fetching uses the SSRF guard,
   a 1 MiB cap, timeouts and disabled redirects. The
-  [configuration reference](../../README.md#configuration) documents explicit
+  [configuration reference](../configuration.md) documents explicit
   controlled-network exceptions.
   Returned ids may be encoded transport URLs rather than infohashes.
 
@@ -270,7 +270,7 @@ first ADTS AAC track, otherwise passes audio through. With
 `OUTPACE_HLS_AUDIO_NORMALIZE=true`, selected AC3 or MPEG Layer II/III can be converted
 to AAC-LC stereo (48 kHz, 128 kbit/s), copying video, under strict input constraints.
 `OUTPACE_FFMPEG_PATH` selects the operator-provided executable. Read
-[Live HLS audio](../../README.md#live-hls-audio) for admission rules, startup checks,
+[Live HLS audio](../live-audio.md) for admission rules, startup checks,
 process limits and recovery behavior. A terminal normalization failure may keep
 returning retryable 503 without restarting the worker; teardown and a fresh source
 session are required. This does not qualify any particular browser or live client.
