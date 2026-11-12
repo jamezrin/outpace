@@ -18,7 +18,7 @@ works with Ace Stream content ids and `acestream://` links. It can also serve th
 engine HTTP routes that existing apps call, through an opt-in compatibility mode.
 
 It isn't a full clone. It doesn't play premium or encrypted content, and it has no accounts, web
-UI, search or EPG. See
+UI or EPG. [Stream-name search](Stream-Search) is planned but not available yet. See
 [what's different](Migrating-from-AceStream-Engine#whats-different).
 
 Outpace isn't affiliated with or endorsed by Ace Stream. It uses Ace Stream names only to
@@ -111,8 +111,10 @@ No. Only public, unencrypted content is supported, and that won't change.
 ## What are the main differences and limitations compared with the official engine?
 
 - **Content:** only public, unencrypted streams.
-- **No application features:** no accounts, subscriptions, web UI, remote control, search,
+- **No application features:** no accounts, subscriptions, web UI, remote control,
   channel lists or EPG.
+- **No search yet:** [optional service-backed name search](Stream-Search) is planned within
+  v1.0.0. It needs its own default-off opt-in; current HTTP compatibility does not enable it.
 - **A compatibility subset:** the common playback and control routes. There is no legacy
   seeking or file selection, and VOD isn't available through it (native VOD is).
 - **Timing:** Outpace buffers more by default, so streams start later but stutter less.

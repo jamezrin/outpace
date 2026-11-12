@@ -42,7 +42,9 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 
 - It does **not** play premium, encrypted or protected content. That is a permanent non-goal.
 - It is **not** a full clone of the closed engine. There are no accounts, subscriptions, web UI,
-  search, EPG or channel catalogues. The compatibility API is a documented subset.
+  EPG or general channel catalogues. The compatibility API is a documented subset.
+- [Stream-name search](Stream-Search) is planned as a separate, default-off services adapter
+  within v1.0.0. It is not available yet.
 - It is not a recorder or DVR. The optional [Timeshift](Timeshift) buffer lives in memory and
   disappears on restart.
 

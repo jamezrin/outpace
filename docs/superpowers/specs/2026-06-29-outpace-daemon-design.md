@@ -34,10 +34,17 @@ clean public API that carries **no ace/acestream naming**.
 
 ## Non-goals (explicitly later / never)
 
-- **Stream search & aggregate playlist** — a *later* spec, and it must discover streams
-  **over the P2P network (DHT)**, NOT by calling Acestream's index/search APIs. The API
-  reserves `GET /search` and `GET /playlist.m3u8` so they slot in without rework.
-- **No dependency on any Acestream HTTP API**, ever (resolution and discovery are P2P).
+- **Stream-name search (scope revised by #212 / #213; implementation #406)** — a bounded
+  AceStream index/search service adapter is planned within v1.0.0, in this repository,
+  behind a separate explicit, default-off services setting. It is not implemented.
+  Current upstream access and the named client's search-result-to-content-ID/verified-descriptor
+  path must be established before implementation. HTTP compatibility alone must not opt in.
+- **DHT name search / aggregate playlist** — an independent bounded feasibility spike in
+  #213, not a committed production feature or prerequisite for service-backed search.
+  The original reserved routes below do not establish an implemented API contract.
+- **External services boundary (revised)** — no closed-engine runtime. Existing signed-catalog
+  content-ID resolution retains its defaults. Optional search must not become a dependency
+  of known-input playback; discovery metadata does not replace descriptor verification.
 - Premium/encrypted (DRM) content — public swarm only.
 - Transcoding — pass through the source MPEG-TS as-is.
 
@@ -162,7 +169,7 @@ infohash for that network.
 | `GET /networks` | JSON list of registered providers (v1: `["ace"]`). |
 | `DELETE /streams/{network}/{id}` | Force-stop a session (optional admin). |
 | `GET /healthz` | Liveness. |
-| *(reserved, later spec)* `GET /search?q=&network=`, `GET /playlist.m3u8` | Network discovery + aggregate. |
+| *(historical reservation, not implemented)* `GET /search?q=&network=`, `GET /playlist.m3u8` | Superseded for service-backed search by #406's client contract (`query`, `page`, `page_size`, optional `category`); DHT search/aggregate remains feasibility research only. |
 
 Example: `http://localhost:PORT/streams/ace/cid2.ts`.
 JSON uses clean names only (`network`, `stream`, `peers`, `bitrate`, `buffer`, `clients`) —
