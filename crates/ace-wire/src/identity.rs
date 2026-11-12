@@ -33,9 +33,7 @@ impl Identity {
 
     /// Mint a fresh random identity.
     pub fn generate() -> Self {
-        Identity {
-            key: SigningKey::generate(&mut rand::rngs::OsRng),
-        }
+        Self::from_seed(rand::random())
     }
 
     /// The `node_id` peers see: the 32-byte Ed25519 public key.
