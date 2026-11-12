@@ -252,8 +252,11 @@ environment-only deployments remain supported. A versioned config-file schema an
 flag surface are intentionally deferred until the configuration model is stable enough to avoid
 making internal scheduler details a permanent public contract.
 
-The complete environment-variable reference remains in the root [`README`](../README.md#configuration).
-Keep credentials out of `.env`; none of the current daemon settings require secrets.
+The environment-variable list is in the root [`README`](../README.md#configuration); the
+[user wiki's configuration page](https://github.com/jamezrin/outpace-stream/wiki/Configuration)
+groups every setting by topic. Most daemon settings are not secret, but
+`OUTPACE_BROADCAST_SOURCES` URLs can carry access tokens and `OUTPACE_SRT_PASSPHRASE_FILE`
+names a key file: protect the env file and avoid dumping the resolved configuration.
 
 ### Ace HTTP compatibility
 
