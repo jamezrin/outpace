@@ -1,0 +1,145 @@
+name: Portability
+
+on:
+  # Only run when something that can change a shipped release binary or its container
+  # definition moves. Tests, docs, and dev-only tooling do not affect the release build,
+  # so changes limited to those paths skip this portability gate.
+  pull_request:
+    paths:
+      - .github/workflows/portability.yml
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - Dockerfile
+      - .dockerignore
+      - tools/ci/smoke_daemon.sh
+  workflow_dispatch:
+    inputs:
+      run_container_smoke:
+        description: Run the emulated ARMv7 container startup smoke
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-target:
+    # Mirrors the build-binaries matrix in release.yml. Keep the two in step: a target
+    # added there must be added here so it is built before a tag ever reaches it.
+    name: Build and smoke ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-24.04
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+          build-warnings: ""
+
+      # Also registers a QEMU user-mode runner for targets the host cannot execute, which
+      # the smoke step below reuses to start the emulated daemon.
+      - name: Install Linux cross toolchain
+        if: contains(matrix.target, 'unknown-linux-musl')
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Test Windows executable resolution
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        run: cargo test --locked -p ace-engine --lib --target "${{ matrix.target }}" executable_resolution_tests
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release -p ace-engine --bin outpace --target "${{ matrix.target }}"
+
+      - name: Start daemon and check health
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          binary="target/${target}/release/outpace"
+          if [[ "$target" == *windows* ]]; then
+            binary="${binary}.exe"
+          fi
+          # setup-cross-toolchain-action exports CARGO_TARGET_<TRIPLE>_RUNNER (QEMU) when
+          # the host cannot run the target natively; empty for native targets.
+          runner_var="CARGO_TARGET_$(tr 'a-z-' 'A-Z_' <<<"$target")_RUNNER"
+          export SMOKE_RUNNER="${!runner_var:-}"
+          echo "runner: ${SMOKE_RUNNER:-native}"
+          sh tools/ci/smoke_daemon.sh "$binary"
+
+  container-smoke:
+    name: ARMv7 container startup and health smoke
+    if: github.event_name == 'workflow_dispatch' && inputs.run_container_smoke
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build ARMv7 image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm/v7
+          load: true
+          tags: outpace:armv7-smoke
+          # Persist the emulated from-source build across runs; a full ARMv7 Rust compile
+          # under QEMU is the slowest step in this workflow.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start daemon and check health
+        shell: bash
+        run: |
+          set -euo pipefail
+          container="$(docker run --detach --rm --platform linux/arm/v7 \
+            --publish 127.0.0.1::6878 \
+            --env OUTPACE_ENABLE_INBOUND=0 \
+            --env OUTPACE_ENABLE_SEEDING=0 \
+            outpace:armv7-smoke)"
+          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
+          port="$(docker port "$container" 6878/tcp | sed 's/.*://')"
+          curl --fail --retry 30 --retry-delay 1 --retry-all-errors \
+            "http://127.0.0.1:${port}/healthz"
