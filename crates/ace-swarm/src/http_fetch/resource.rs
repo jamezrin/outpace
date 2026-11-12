@@ -32,7 +32,15 @@ pub async fn open_resource(
     range: Option<&str>,
     cancel: watch::Receiver<bool>,
 ) -> Result<ResourceResponse, FetchError> {
-    open_resource_inner(url, policy, limits, range, cancel, false).await
+    open_resource_inner(
+        url,
+        policy,
+        limits,
+        range,
+        cancel,
+        ResourceOptions::default(),
+    )
+    .await
 }
 
 /// Fetch a full HLS playlist, allowing one gzip content coding. No Range requests
@@ -44,7 +52,99 @@ pub async fn open_playlist_resource(
     limits: FetchLimits,
     cancel: watch::Receiver<bool>,
 ) -> Result<ResourceResponse, FetchError> {
-    open_resource_inner(url, policy, limits, None, cancel, true).await
+    open_resource_inner(
+        url,
+        policy,
+        limits,
+        None,
+        cancel,
+        ResourceOptions {
+            playlist: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+impl ResourceClientPool {
+    /// Fetch a finite resource after fresh URL/DNS validation, reusing only a client
+    /// pinned to the same permitted authority and address. Range/encoding rules are
+    /// identical to the unpooled `open_resource` function.
+    pub async fn open_resource(
+        &self,
+        url: &FetchUrl,
+        policy: FetchPolicy,
+        limits: FetchLimits,
+        range: Option<&str>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<ResourceResponse, FetchError> {
+        open_resource_inner(
+            url,
+            policy,
+            limits,
+            range,
+            cancel,
+            ResourceOptions {
+                pool: Some(self.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Fetch a full finite playlist, with the same guarded gzip policy as the
+    /// unpooled `open_playlist_resource` function.
+    pub async fn open_playlist_resource(
+        &self,
+        url: &FetchUrl,
+        policy: FetchPolicy,
+        limits: FetchLimits,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<ResourceResponse, FetchError> {
+        open_resource_inner(
+            url,
+            policy,
+            limits,
+            None,
+            cancel,
+            ResourceOptions {
+                playlist: true,
+                pool: Some(self.clone()),
+                #[cfg(test)]
+                hooks: None,
+            },
+        )
+        .await
+    }
+}
+
+#[derive(Default)]
+struct ResourceOptions {
+    playlist: bool,
+    pool: Option<ResourceClientPool>,
+    #[cfg(test)]
+    hooks: Option<test_support::TestHooks>,
+}
+
+impl ResourceOptions {
+    async fn resolve(
+        &self,
+        url: &FetchUrl,
+        policy: FetchPolicy,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<SocketAddr, FetchError> {
+        #[cfg(test)]
+        if let Some(hooks) = &self.hooks {
+            return hooks.resolve(policy, cancel).await;
+        }
+        resolve_addr(
+            normalized_host(&url.0)?,
+            url.0.port_or_known_default().ok_or(FetchError::NoPort)?,
+            policy,
+            cancel,
+        )
+        .await
+    }
 }
 
 async fn open_resource_inner(
@@ -53,7 +153,7 @@ async fn open_resource_inner(
     limits: FetchLimits,
     range: Option<&str>,
     cancel: watch::Receiver<bool>,
-    playlist: bool,
+    options: ResourceOptions,
 ) -> Result<ResourceResponse, FetchError> {
     if limits.connect_timeout.is_zero() || limits.headers_timeout.is_zero() {
         return Err(FetchError::InvalidSourceConfig);
@@ -66,16 +166,8 @@ async fn open_resource_inner(
     let mut current = FetchUrl::parse_source(url.0.as_str(), policy)?;
     for hop in 0..=3 {
         let attempt = async {
-            let addr = resolve_addr(
-                normalized_host(&current.0)?,
-                current
-                    .0
-                    .port_or_known_default()
-                    .ok_or(FetchError::NoPort)?,
-                policy,
-                cancel.clone(),
-            )
-            .await?;
+            // Resolve every request and redirect before consulting the client pool.
+            let addr = options.resolve(&current, policy, cancel.clone()).await?;
             open_pinned(
                 &current,
                 addr,
@@ -86,9 +178,11 @@ async fn open_resource_inner(
                 cancel.clone(),
                 AttemptOptions {
                     resource: true,
-                    playlist,
+                    playlist: options.playlist,
                     range: range.map(str::to_owned),
                     deadline: Some(deadline),
+                    pool: options.pool.clone(),
+                    policy,
                     #[cfg(test)]
                     tls_root: None,
                 },
@@ -124,7 +218,7 @@ async fn open_resource_inner(
             content_type: header_text(headers, header::CONTENT_TYPE)?.map(str::to_owned),
             content_range: header_text(headers, header::CONTENT_RANGE)?.map(str::to_owned),
             content_length: content_length(headers)?,
-            content_encoding: content_encoding(headers, playlist)?,
+            content_encoding: content_encoding(headers, options.playlist)?,
             deadline,
             cache_ttl: if status == 200 && range.is_none() {
                 cache_ttl(headers)
@@ -249,8 +343,14 @@ fn validate_resource_response(
     {
         return Err(FetchError::UnsupportedResponse);
     }
+    let status = response.status().as_u16();
+    // Error representations are never consumed or decoded. Preserve their status
+    // even when their content coding differs from the requested media encoding.
+    if !matches!(status, 200 | 206 | 301 | 302 | 303 | 307 | 308) {
+        return Err(FetchError::ResourceHttpStatus(status));
+    }
     content_encoding(headers, playlist)?;
-    match response.status().as_u16() {
+    match status {
         301 | 302 | 303 | 307 | 308 => {
             header_text(headers, header::LOCATION)?;
             return Ok(());
@@ -292,7 +392,7 @@ fn validate_resource_response(
                 return Err(FetchError::UnsupportedResponse);
             }
         }
-        _ => return Err(FetchError::HttpStatus),
+        _ => unreachable!("resource status was checked above"),
     }
     content_length(headers)?;
     header_text(headers, header::CONTENT_TYPE)?;

@@ -161,6 +161,7 @@ impl ResolveError {
                 | FetchError::TlsFailed
                 | FetchError::HeadersTimeout
                 | FetchError::HttpStatus
+                | FetchError::ResourceHttpStatus(_)
                 | FetchError::BodyFailed
                 | FetchError::BodyTimeout => Kind::Network,
             },
