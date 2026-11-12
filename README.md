@@ -188,6 +188,14 @@ Technical reference:
 - **Releases:** [GitHub Releases](https://github.com/jamezrin/outpace-stream/releases),
   [release notes](docs/releases/) and [milestones](https://github.com/jamezrin/outpace-stream/milestones).
 
+## AI
+
+Outpace is maintained by one person, using the best frontier models and workflows written for
+this repository. The models write most of the code. The maintainer owns the architecture, the
+design, and the product decisions. Every change still goes through tests, CI, and review before
+it merges. An issue or a pull request has to come from a person who has read it, checked it,
+and can discuss it. Low-effort and fully automated submissions are not welcome.
+
 ## Build and contribute
 
 ```bash
