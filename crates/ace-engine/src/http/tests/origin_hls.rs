@@ -64,6 +64,7 @@ fn origin_state_for(manifest_url: &str, resolve_early: bool) -> (AppState, Arc<A
         resolve_content_ids_in_getstream: resolve_early,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     };

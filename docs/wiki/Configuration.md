@@ -228,14 +228,16 @@ See [Private Peer Mode](Private-Peer-Mode).
 | `OUTPACE_ACE_COMPAT` | `false` | boolean | all | Turns on `/ace/*`, `/server/api` and `/webui/api/service`. When off, those routes return `404`. Required for [Timeshift](Timeshift) seeking. |
 | `OUTPACE_EXPERIMENTAL_ACE_COMPAT` | unset | boolean | all | Deprecated old name. Read only when `OUTPACE_ACE_COMPAT` is unset; a set `OUTPACE_ACE_COMPAT=0` wins over it. Rename it. |
 
-### Planned services compatibility
+### AceStream search services
 
-[Service-backed stream-name search](Stream-Search) is planned, not implemented. The proposed
-setting name is `OUTPACE_COMPAT_ACESTREAM_SERVICES`; it is not a supported configuration
-variable yet, and setting it does not enable search. The planned setting defaults off and
-is independent of `OUTPACE_ACE_COMPAT`. Existing signed-catalog content-ID resolution and its
-defaults remain unchanged. Final spelling, upstream access requirements and route gating
-will be documented when implemented.
+| Setting | Default | Accepted values | Avail. | Notes |
+| --- | --- | --- | --- | --- |
+| `OUTPACE_COMPAT_ACESTREAM_SERVICES` | `false` | boolean | edge | Enables `/search` and external index requests. Independent of `OUTPACE_ACE_COMPAT`; rejected in private peer mode. |
+
+No operator API key is required. Search uses external plain HTTP services, exposing queries
+and the server IP to the service and network observers. See [Stream Search](Stream-Search)
+for limits and client integration. Existing
+signed-catalog content-ID resolution and its defaults remain unchanged.
 
 ## Diagnostics
 

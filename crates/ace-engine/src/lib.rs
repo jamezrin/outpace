@@ -16,6 +16,7 @@
 pub use ace_log::alog;
 
 pub mod ace_provider;
+pub mod acestream_search;
 mod admission;
 pub mod audio_normalize;
 pub mod broadcast;

@@ -319,10 +319,10 @@ does not change them. They are not an independent media-capability probe.
 
 | Feature | Status | Rationale / limit |
 | --- | --- | --- |
-| Service-backed stream-name search | Planned in [#406](https://github.com/jamezrin/outpace-stream/issues/406); not implemented | `/search` currently returns 404. A dedicated default-off services opt-in is required by the planned contract; `OUTPACE_ACE_COMPAT` alone must not enable external search calls. Upstream access and result-to-playback mapping must be established first; see [search scope](../wiki/Stream-Search.md). |
+| Service-backed stream-name search | Separate opt-in adapter; newer than v0.9.0 | `GET /search` requires `OUTPACE_COMPAT_ACESTREAM_SERVICES=1`. The native HTTP backend needs no operator API key; legacy HTTP compatibility alone does not enable it. See [the search contract, limits and current-client boundary](../wiki/Stream-Search.md). |
 | Legacy VOD playback/HLS | Deferred; not supported | Native `/vod` is a separate surface, not this legacy contract. |
 | Seek/file selection | Deferred; not supported | No legacy seeking or file-selection contract is implemented. |
-| Reverse content-id lookup | Deferred; not supported | `get_content_id` only echoes a supplied content id. The selected search result's content-ID/verified-descriptor path is a prerequisite for #406, not an existing capability. |
+| Reverse content-id lookup | Deferred; not supported | `get_content_id` only echoes a supplied content id. Search selections use explicit infohash playback selectors and existing descriptor verification; no reverse mapping is fabricated. Older clients requiring it need an integration change. |
 | Raw transport dumping | Deferred; not supported | `get_media_files` does not produce a raw transport dump. |
 | Arbitrary client-selected transcoding | Deferred; not supported | The bounded global live-HLS audio option does not implement this legacy contract. |
 

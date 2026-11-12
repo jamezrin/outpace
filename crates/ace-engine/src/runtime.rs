@@ -289,6 +289,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     } else if let Some(v) = bool_from_env("OUTPACE_EXPERIMENTAL_ACE_COMPAT")? {
         config.experimental_ace_compat = v;
     }
+    config.acestream_services = crate::acestream_search::SearchSettings {
+        enabled: bool_from_env("OUTPACE_COMPAT_ACESTREAM_SERVICES")?.unwrap_or(false),
+    };
     if let Some(v) = bool_from_env("OUTPACE_BEP9_CONTENT_ID_FALLBACK")? {
         config.bep9_content_id_fallback = v;
     }
@@ -321,6 +324,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
             crate::private_network::validate_private_config(&config, &bootstrap.endpoints())?;
         }
     }
+    config
+        .acestream_services
+        .validate(config.peer_policy.is_private())?;
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
@@ -725,6 +731,9 @@ pub async fn build_runtime(
     mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    config
+        .acestream_services
+        .validate(config.peer_policy.is_private())?;
     let srt_config = config.srt.prepare(cfg!(feature = "srt"))?;
     config.support_sources.validate(&config)?;
     crate::private_network::validate_private_config(&config, &bootstrap_peers)?;
@@ -1049,6 +1058,14 @@ async fn serve_http_inner(
         let (history, budget) = manager.history_context();
         crate::origin_hls::OriginHls::new_with_history(FetchPolicy::default(), history, budget)
     });
+    let search = if config.acestream_services.enabled {
+        Some(Arc::new(
+            crate::acestream_search::SearchService::new(config.acestream_services.clone())
+                .map_err(|_| "invalid AceStream search service configuration")?,
+        ))
+    } else {
+        None
+    };
     let state = AppState {
         peer_policy: config.peer_policy.clone(),
         manager,
@@ -1056,6 +1073,7 @@ async fn serve_http_inner(
         resolve_content_ids_in_getstream: true,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: config.experimental_ace_compat,
+        search,
         origin_hls,
         broadcasts: Some(broadcasts.clone()),
     };
@@ -1452,6 +1470,54 @@ fn hex_node_id(identity: &ace_wire::identity::Identity) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn search_services_environment_is_separate_strict_and_needs_no_key() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let names = [
+            "OUTPACE_COMPAT_ACESTREAM_SERVICES",
+            "OUTPACE_ACE_COMPAT",
+            "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+            "OUTPACE_PRIVATE_PEERS",
+        ];
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            names
+                .iter()
+                .map(|&name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+        for name in names {
+            std::env::remove_var(name);
+        }
+        assert!(!config_from_env().unwrap().acestream_services.enabled);
+        std::env::set_var("OUTPACE_ACE_COMPAT", "1");
+        assert!(!config_from_env().unwrap().acestream_services.enabled);
+        std::env::set_var("OUTPACE_COMPAT_ACESTREAM_SERVICES", "1");
+        let c = config_from_env().unwrap();
+        assert!(c.acestream_services.enabled);
+        std::env::set_var("OUTPACE_ACE_COMPAT", "0");
+        assert!(config_from_env().unwrap().acestream_services.enabled);
+        for flag in ["", "TRUE", "yes", "2"] {
+            std::env::set_var("OUTPACE_COMPAT_ACESTREAM_SERVICES", flag);
+            assert!(config_from_env().is_err());
+        }
+        std::env::set_var("OUTPACE_COMPAT_ACESTREAM_SERVICES", "1");
+        std::env::set_var("OUTPACE_PRIVATE_PEERS", "127.0.0.1:8621");
+        assert!(config_from_env().is_err());
+        std::env::set_var("OUTPACE_COMPAT_ACESTREAM_SERVICES", "0");
+        assert!(!config_from_env().unwrap().acestream_services.enabled);
+    }
+
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct CompatEnvRestore([Option<std::ffi::OsString>; 2]);
@@ -1616,6 +1682,7 @@ mod tests {
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
             experimental_ace_compat: config.experimental_ace_compat,
+            search: None,
             origin_hls: None,
             broadcasts: None,
         });
