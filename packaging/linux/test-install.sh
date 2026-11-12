@@ -9,6 +9,11 @@
 set -eu
 
 pkg=$1
+# apt reads "dist/x.deb" as package "dist" from release "x.deb"; make the path explicit.
+case "$pkg" in
+	/* | ./*) ;;
+	*) pkg=./$pkg ;;
+esac
 here=$(cd "$(dirname "$0")" && pwd)
 case "$pkg" in
 	*.deb)

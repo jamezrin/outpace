@@ -15,4 +15,4 @@ echo "${sha256}  $dir/$archive" | sha256sum --check --quiet
 tar -xzf "$dir/$archive" -C "$dir" nfpm
 rm "$dir/$archive"
 "$dir/nfpm" --version >/dev/null
-echo "$(cd "$dir" && pwd)"
+cd "$dir" && pwd
