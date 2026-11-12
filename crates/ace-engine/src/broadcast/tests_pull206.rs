@@ -950,6 +950,7 @@ async fn pull206_queued_http_attach_returns_503_while_detach_holds_real_disk_fen
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: false,
+        origin_hls: None,
         broadcasts: Some(state.clone()),
     });
     let put = app.oneshot(

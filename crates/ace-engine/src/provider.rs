@@ -204,6 +204,10 @@ pub enum ProviderError {
     /// message is user-facing: it explains the refusal and how to open the stream instead, and
     /// is safe to return to HTTP clients and to print in the CLI.
     Unresolvable(String),
+    /// The id resolved to an origin HLS source, which cannot be opened as raw TS. HTTP callers
+    /// hand this URL to the player (or the opt-in managed relay); no local session or piece
+    /// geometry is created. `Debug` and `Display` never include the (possibly signed) URL.
+    DirectHls(Box<ace_swarm::resolve::HlsOrigin>),
 }
 
 impl std::fmt::Display for ProviderError {
@@ -214,6 +218,9 @@ impl std::fmt::Display for ProviderError {
             ProviderError::CapacityExhausted => f.write_str("session capacity reached"),
             ProviderError::NotFound => f.write_str("not found"),
             ProviderError::Backend(msg) | ProviderError::Unresolvable(msg) => f.write_str(msg),
+            ProviderError::DirectHls(_) => {
+                f.write_str("source is origin HLS; open it through an HTTP playback route")
+            }
         }
     }
 }
@@ -246,6 +253,8 @@ impl From<ace_swarm::resolve::ResolveError> for ProviderError {
         match error {
             ace_swarm::resolve::ResolveError::ProtectedContent => Self::ProtectedContent,
             ace_swarm::resolve::ResolveError::InvalidProtection => Self::InvalidProtection,
+            ace_swarm::resolve::ResolveError::HlsOrigin(origin) => Self::DirectHls(origin),
+            ace_swarm::resolve::ResolveError::Hls(reason) => Self::Unresolvable(reason.into()),
             other => Self::Backend(format!("descriptor resolution: {other:?}")),
         }
     }

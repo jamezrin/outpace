@@ -75,6 +75,7 @@ fn ace_app_state(
         resolve_content_ids_in_getstream,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: true,
+        origin_hls: None,
         broadcasts: None,
     }
 }

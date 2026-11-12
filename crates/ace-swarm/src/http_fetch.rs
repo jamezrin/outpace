@@ -12,6 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
+mod resource;
+pub use resource::{open_resource, ResourceResponse};
+
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_HEADERS_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SOURCE_URL: usize = 8_192;
@@ -32,7 +35,7 @@ impl FetchPolicy {
 }
 
 /// A parsed, normalized URL. Its serialized form is deliberately private.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct FetchUrl(reqwest::Url);
 
 impl fmt::Debug for FetchUrl {
@@ -42,6 +45,55 @@ impl fmt::Debug for FetchUrl {
 }
 
 impl FetchUrl {
+    /// Resolve against the final response URL without copying a parent query to a child.
+    pub fn join_reference(&self, reference: &str, policy: FetchPolicy) -> Result<Self, FetchError> {
+        if reference.is_empty()
+            || reference.len() > MAX_SOURCE_URL
+            || reference
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+        {
+            return Err(FetchError::InvalidSourceUrl);
+        }
+        if reference
+            .split(['/', '?', '#'])
+            .next()
+            .is_some_and(|part| part.contains(':'))
+        {
+            return Self::parse_source(reference, policy);
+        }
+        if reference.starts_with("//") {
+            return Self::parse_source(&format!("{}:{reference}", self.0.scheme()), policy);
+        }
+        let joined = self
+            .0
+            .join(reference)
+            .map_err(|_| FetchError::InvalidSourceUrl)?;
+        Self::parse_source(joined.as_str(), policy)
+    }
+
+    pub fn serialized_len(&self) -> usize {
+        self.0.as_str().len()
+    }
+
+    /// A bounded filename hint for local HLS resources, without exposing origin URLs.
+    pub fn safe_media_extension(&self) -> Option<&'static str> {
+        let file = self.0.path().rsplit('/').next()?;
+        let (_, extension) = file.rsplit_once('.')?;
+        match extension.to_ascii_lowercase().as_str() {
+            "ts" => Some(".ts"),
+            "m4s" => Some(".m4s"),
+            "mp4" => Some(".mp4"),
+            "aac" => Some(".aac"),
+            "mp3" => Some(".mp3"),
+            "ac3" => Some(".ac3"),
+            "ec3" => Some(".ec3"),
+            "vtt" => Some(".vtt"),
+            "webvtt" => Some(".webvtt"),
+            _ => None,
+        }
+    }
+
     /// Admit a source without DNS or any other network side effect.
     pub fn parse_source(raw: &str, policy: FetchPolicy) -> Result<Self, FetchError> {
         if raw.len() > MAX_SOURCE_URL || raw.chars().any(char::is_control) {
@@ -117,6 +169,7 @@ pub enum FetchError {
     HttpStatus,
     UnsupportedResponse,
     BodyFailed,
+    BodyTimeout,
     BodyFrameTooLarge,
     Cancelled,
 }
@@ -141,6 +194,7 @@ impl FetchError {
             Self::HttpStatus => "http_status",
             Self::UnsupportedResponse => "unsupported_response",
             Self::BodyFailed => "body_failed",
+            Self::BodyTimeout => "body_timeout",
             Self::BodyFrameTooLarge => "body_frame_too_large",
             Self::Cancelled => "cancelled",
         }
@@ -297,6 +351,9 @@ pub async fn open(
 
 #[derive(Default)]
 struct AttemptOptions {
+    resource: bool,
+    range: Option<String>,
+    deadline: Option<tokio::time::Instant>,
     #[cfg(test)]
     tls_root: Option<Vec<u8>>,
 }
@@ -311,12 +368,14 @@ async fn open_pinned(
     if limits.connect_timeout.is_zero() || limits.headers_timeout.is_zero() {
         return Err(FetchError::InvalidSourceConfig);
     }
-    let header_deadline = tokio::time::Instant::now()
-        + if limits.source_response {
-            limits.headers_timeout.min(SOURCE_HEADERS_TIMEOUT)
-        } else {
-            limits.headers_timeout
-        };
+    let header_deadline = options.deadline.unwrap_or_else(|| {
+        tokio::time::Instant::now()
+            + if limits.source_response {
+                limits.headers_timeout.min(SOURCE_HEADERS_TIMEOUT)
+            } else {
+                limits.headers_timeout
+            }
+    });
     if *cancel.borrow() {
         return Err(FetchError::Cancelled);
     }
@@ -349,6 +408,10 @@ async fn open_pinned(
         // remains active until the finite body has been collected.
         builder = builder.timeout(limits.headers_timeout);
     }
+    if options.resource {
+        builder =
+            builder.timeout(header_deadline.saturating_duration_since(tokio::time::Instant::now()));
+    }
     #[cfg(test)]
     if let Some(root) = options.tls_root {
         builder =
@@ -356,27 +419,34 @@ async fn open_pinned(
                 .tls_certs_only([reqwest::Certificate::from_der(&root)
                     .map_err(|_| FetchError::ClientBuildFailed)?]);
     }
-    #[cfg(not(test))]
-    let _ = options;
     let client = builder.build().map_err(|_| FetchError::ClientBuildFailed)?;
     // Transport parsing historically accepts userinfo. Retain that admission surface,
     // but do not let reqwest translate it into URL-derived Authorization on the wire.
     let mut request_url = url.0.clone();
     let _ = request_url.set_username("");
     let _ = request_url.set_password(None);
+    let mut request = client.get(request_url);
+    if let Some(range) = options.range.as_deref() {
+        request = request.header(reqwest::header::RANGE, range);
+    }
     let response = tokio::select! {
         biased;
         _ = cancelled(&mut cancel) => return Err(FetchError::Cancelled),
-        result = tokio::time::timeout_at(header_deadline, client.get(request_url).send()) => {
+        result = tokio::time::timeout_at(header_deadline, request.send()) => {
             result.map_err(|_| FetchError::HeadersTimeout)?
                 .map_err(classify_open_error)?
         }
     };
-    validate_response(&response, limits.source_response)?;
+    if options.resource {
+        resource::validate_response(&response, options.range.as_deref())?;
+    } else {
+        validate_response(&response, limits.source_response)?;
+    }
     Ok(GuardedBody {
         response: Some(response),
         client: Some(client),
         source_response: limits.source_response,
+        deadline: options.deadline,
         cancel,
         #[cfg(test)]
         frames: None,
@@ -472,6 +542,7 @@ pub struct GuardedBody {
     response: Option<reqwest::Response>,
     client: Option<reqwest::Client>,
     source_response: bool,
+    deadline: Option<tokio::time::Instant>,
     cancel: watch::Receiver<bool>,
     #[cfg(test)]
     frames: Option<std::collections::VecDeque<Bytes>>,
@@ -488,9 +559,16 @@ impl GuardedBody {
     /// The engine must also select cancellation around each caller-side body read.
     pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, FetchError> {
         let mut cancel = self.cancel.clone();
+        let deadline = self.deadline;
         let result = tokio::select! {
             biased;
             _ = cancelled(&mut cancel) => Err(FetchError::Cancelled),
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => Err(FetchError::BodyTimeout),
             result = self.read_frame() => result,
         };
         let result = match result {
@@ -587,6 +665,7 @@ pub(super) mod test_support {
             cancel,
             AttemptOptions {
                 tls_root: hooks.tls_root,
+                ..Default::default()
             },
         )
         .await
@@ -598,6 +677,7 @@ pub(super) mod test_support {
             response: None,
             client: None,
             source_response: true,
+            deadline: None,
             cancel,
             frames: Some(frames.into()),
         }

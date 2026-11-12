@@ -271,6 +271,7 @@ async fn generated_srt_reaches_signed_peer_http_body_and_decoded_video_audio() {
             resolve_content_ids_in_getstream: true,
             ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
             experimental_ace_compat: false,
+            origin_hls: None,
             broadcasts: Some(state.clone()),
         });
         let descriptor_response = origin
@@ -314,6 +315,7 @@ async fn generated_srt_reaches_signed_peer_http_body_and_decoded_video_audio() {
             resolve_content_ids_in_getstream: true,
             ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
             experimental_ace_compat: false,
+            origin_hls: None,
             broadcasts: None,
         });
         let response = app
