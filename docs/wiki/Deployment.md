@@ -296,8 +296,9 @@ To compare two engines behind one router, give each its own external peer port a
 ## Linux portability
 
 - Images: `linux/amd64`, `linux/arm64`, `linux/arm/v7` (releases); `edge` is `linux/amd64` only.
-- ARMv7 means hard-float ARMv7 such as Raspberry Pi 2/3. ARMv6 and soft-float aren't supported.
-  Expect fewer simultaneous streams; start with `OUTPACE_CACHE_TYPE=disk`,
+- ARMv7 means hard-float ARMv7 such as Raspberry Pi 2/3. From the next release there are also
+  ARMv6 hard-float and RISC-V 64 binaries (no image). Soft-float ARM isn't supported. On 32-bit
+  ARM expect fewer simultaneous streams; start with `OUTPACE_CACHE_TYPE=disk`,
   `OUTPACE_SEED_STORE_BYTES=67108864` and `OUTPACE_SESSION_BUFFER=64`.
 - On 32-bit systems each in-memory pool is capped at about 512 MiB. Disk caches can be larger.
 - ARM64 kernels with 16 KiB pages haven't been verified on real hardware.
