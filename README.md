@@ -486,7 +486,8 @@ Environment variables parsed by the daemon include:
   limit. At 8 Mbit/s, 128 MiB holds roughly two minutes.
 - `OUTPACE_HISTORY_TOTAL_BYTES` - retained-history budget shared by all HLS sources, default
   `268435456` (256 MiB). Must be at least `OUTPACE_HISTORY_BYTES`. This bounds history only, not
-  total process memory.
+  total process memory. See [timeshift](docs/timeshift.md) for the per-viewer seek and
+  return-to-live controls.
 - `OUTPACE_MAX_UNCHOKED` - stable desired unchokes per exact served key, default `8` (U).
   For I interested peers, the coordinator selects `min(I, U + 1)` desired states in
   interest-entry order, with one rotating tail peer on nominal 10-second ticks. `0` still
@@ -608,6 +609,8 @@ Start with these durable docs instead of a session resume file:
   proprietary engine, so it is NOT run in CI).
 - [`docs/testing/fuzzing.md`](docs/testing/fuzzing.md) - parser fuzz targets; committed seeds
   replay in `cargo test`, mutation campaigns run locally with `cargo-fuzz`.
+- [`docs/timeshift.md`](docs/timeshift.md) - opt-in retained live-HLS replay: configuration,
+  per-viewer seek/return-to-live controls, expiry and limits.
 - [`docs/deployment-lxc-warp.md`](docs/deployment-lxc-warp.md) - LXC guest behind Cloudflare
   WARP, `edge` auto-deploy, and the inbound-peer workaround (scripts in `tools/deploy/lxc/`).
 - `docs/superpowers/plans/` and `docs/superpowers/specs/` - implementation plans
