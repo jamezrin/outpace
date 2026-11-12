@@ -43,9 +43,12 @@ of media after the swarm starts delivering.
 For faster starts at the cost of resilience:
 
 ```bash
-OUTPACE_HLS_STARTUP_SEGMENTS=2
-OUTPACE_HLS_SEGMENT_DURATION_MS=4000
+export OUTPACE_HLS_STARTUP_SEGMENTS=2
+export OUTPACE_HLS_SEGMENT_DURATION_MS=4000
 ```
+
+Then start (or restart) outpace from the same shell. With `docker run`, pass each setting
+as `-e NAME=value`; with Compose, see [Deployment](Deployment#passing-other-settings).
 
 Constraints the daemon checks at startup:
 

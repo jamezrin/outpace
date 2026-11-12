@@ -24,19 +24,32 @@ address outside the DHCP pool).
 To use a different port, change it everywhere:
 
 ```bash
-OUTPACE_PEER_LISTEN=0.0.0.0:8622
-# Docker: -p 8622:8622/tcp, and forward external TCP 8622 -> host 8622
+# native binary
+export OUTPACE_PEER_LISTEN=0.0.0.0:8622
+outpace serve
+
+# docker run: set the listener and publish the same port
+docker run -d --name outpace -e OUTPACE_PEER_LISTEN=0.0.0.0:8622 -p 8622:8622/tcp \
+  -p 127.0.0.1:6878:6878 -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0
 ```
+
+Then forward external TCP 8622 to port 8622 on the host. The provided `compose.yml` fixes both
+`OUTPACE_PEER_LISTEN` and the port mapping at 8621. To change the port there, edit both lines in
+your copy of the file: an override file can add a port mapping but can't remove the 8621 one.
 
 ## Option 2: automatic mapping with UPnP or NAT-PMP
 
 outpace can ask the router to open the port itself:
 
 ```bash
-OUTPACE_ENABLE_PORT_MAPPING=1
-OUTPACE_PORT_MAP_BACKEND=auto      # or upnp, natpmp, none
-# OUTPACE_PORT_MAP_EXTERNAL_PORT=8621  # optional; defaults to the listen port
+export OUTPACE_ENABLE_PORT_MAPPING=1
+export OUTPACE_PORT_MAP_BACKEND=auto      # or upnp, natpmp, none
+# export OUTPACE_PORT_MAP_EXTERNAL_PORT=8621  # optional; defaults to the listen port
+outpace serve
 ```
+
+With Compose, `OUTPACE_ENABLE_PORT_MAPPING` is read from `.env`. Set `OUTPACE_PORT_MAP_BACKEND`
+in `compose.override.yml`; see [Deployment](Deployment#passing-other-settings).
 
 - It only acts when inbound serving is on.
 - `auto` tries UPnP-IGD first, then NAT-PMP.

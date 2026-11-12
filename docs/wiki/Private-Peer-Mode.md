@@ -52,9 +52,14 @@ A JSON object mapping an alias to a descriptor file:
 - Unix only;
 - setting it without `OUTPACE_PRIVATE_PEERS` fails startup.
 
-You can get a descriptor file from an outpace broadcast with
-`curl -o my-feed.acelive http://<origin>:6878/broadcast/<name>`, or use any `.acelive` live
-descriptor, or a single-file VOD descriptor.
+You can use any `.acelive` live descriptor or single-file VOD descriptor, or fetch one from an
+outpace broadcast. Run this as the user outpace runs as, so that user owns the file:
+
+```bash
+install -d -m 0755 /srv/outpace        # create the directory once (as root if needed)
+curl --fail -o /srv/outpace/my-feed.acelive "http://192.0.2.10:6878/broadcast/my-channel"
+chmod 0644 /srv/outpace/my-feed.acelive
+```
 
 ### Settings that conflict
 
@@ -64,7 +69,7 @@ These fail startup in private mode, because they would widen the network:
 - `OUTPACE_ENABLE_PORT_MAPPING=1`
 - any explicit `OUTPACE_TRACKERS`
 
-Leaving them unset (or `0`) is fine. Extra `OUTPACE_ACE_PEERS` or `--peer` entries must be in
+Leave `OUTPACE_TRACKERS` unset. The two boolean settings may be unset or `0`. Extra `OUTPACE_ACE_PEERS` or `--peer` entries must be in
 the allowlist.
 
 ## Play an alias

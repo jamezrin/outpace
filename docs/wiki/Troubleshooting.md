@@ -7,7 +7,7 @@ Start with the quick checks, then go to the section that matches what you see.
 ```bash
 curl http://127.0.0.1:6878/healthz             # is the daemon up?
 curl http://127.0.0.1:6878/streams             # what is running?
-curl http://127.0.0.1:6878/streams/ace/<id>/status   # peers, bitrate, buffer, recovery
+curl "http://127.0.0.1:6878/streams/ace/${CONTENT_ID:?set a content id}/status"  # peers, bitrate, buffer
 outpace --version                              # what you are running
 ```
 
@@ -52,9 +52,12 @@ A cold start has three stages:
 stutter on weak swarms:
 
 ```bash
-OUTPACE_PREBUFFER_MS=5000          # direct TS and HLS
-OUTPACE_HLS_STARTUP_SEGMENTS=2     # HLS
+export OUTPACE_PREBUFFER_MS=5000          # direct TS and HLS
+export OUTPACE_HLS_STARTUP_SEGMENTS=2     # HLS
 ```
+
+Then start (or restart) outpace from the same shell. With `docker run`, pass each setting
+as `-e NAME=value`; with Compose, see [Deployment](Deployment#passing-other-settings).
 
 The logs show which stage is slow:
 

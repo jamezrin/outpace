@@ -28,13 +28,14 @@ It is a **short local rewind buffer**:
 
 ## Turn it on
 
-Set these in the daemon's environment and restart:
+Set these in the daemon's environment, then restart it:
 
 ```bash
-OUTPACE_ACE_COMPAT=1
-OUTPACE_HISTORY_SECONDS=600
-OUTPACE_HISTORY_BYTES=134217728
-OUTPACE_HISTORY_TOTAL_BYTES=268435456
+export OUTPACE_ACE_COMPAT=1
+export OUTPACE_HISTORY_SECONDS=600
+export OUTPACE_HISTORY_BYTES=134217728
+export OUTPACE_HISTORY_TOTAL_BYTES=268435456
+outpace serve
 ```
 
 | Setting | Default | Meaning |
@@ -69,10 +70,13 @@ allocation of each segment is charged. For example, to give an 8 Mbit/s channel 
 minutes:
 
 ```bash
-OUTPACE_HISTORY_SECONDS=600
-OUTPACE_HISTORY_BYTES=671088640        # 640 MiB per source
-OUTPACE_HISTORY_TOTAL_BYTES=1342177280 # 1.25 GiB for two such channels
+export OUTPACE_HISTORY_SECONDS=600
+export OUTPACE_HISTORY_BYTES=671088640        # 640 MiB per source
+export OUTPACE_HISTORY_TOTAL_BYTES=1342177280 # 1.25 GiB for two such channels
 ```
+
+Then start (or restart) outpace from the same shell. With `docker run`, pass each setting
+as `-e NAME=value`; with Compose, see [Deployment](Deployment#passing-other-settings).
 
 Keep in mind:
 

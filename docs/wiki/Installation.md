@@ -29,19 +29,21 @@ file on the [releases page](https://github.com/jamezrin/outpace-stream/releases)
 
 The Linux binaries are statically linked (musl) and run on any reasonably recent distribution.
 
-Download, verify and install on Linux or macOS:
+Download, verify and install on Linux or macOS. Set `target` to the row for your platform from
+the table above:
 
 ```bash
 version=0.9.0
-target=x86_64-unknown-linux-musl
+target=x86_64-unknown-linux-musl   # e.g. aarch64-apple-darwin on Apple silicon
 artifact="outpace-${version}-${target}.tar.gz"
 base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
 curl -LO "${base}/${artifact}"
 curl -LO "${base}/SHA256SUMS"
-awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | shasum -a 256 --check
-tar -xzf "$artifact"
-sudo install -m 0755 "outpace-${version}-${target}/outpace" /usr/local/bin/outpace
-outpace --version
+awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
+  && awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | shasum -a 256 --check \
+  && tar -xzf "$artifact" \
+  && sudo install -m 0755 "outpace-${version}-${target}/outpace" /usr/local/bin/outpace \
+  && outpace --version
 ```
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
@@ -154,7 +156,8 @@ SRT is newer than v0.9.0, so build from `main`.
 ## FFmpeg
 
 outpace doesn't need FFmpeg to play, package HLS or broadcast. It only runs FFmpeg when you turn
-on audio normalisation with `OUTPACE_HLS_AUDIO_NORMALIZE` or `OUTPACE_LIVE_AUDIO_NORMALIZE`; see
+on audio normalisation with `OUTPACE_HLS_AUDIO_NORMALIZE` (all versions) or
+`OUTPACE_LIVE_AUDIO_NORMALIZE` (unreleased: `edge` and builds from `main` only); see
 [HLS Output](HLS-Output#audio-normalisation). With both off, it never looks for FFmpeg.
 
 If you turn normalisation on:

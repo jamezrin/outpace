@@ -15,9 +15,13 @@ uploads to them, accepts inbound connections and announces itself.
 To switch to pure leecher mode:
 
 ```bash
-OUTPACE_ENABLE_INBOUND=0
-OUTPACE_ENABLE_SEEDING=0
+export OUTPACE_ENABLE_INBOUND=0
+export OUTPACE_ENABLE_SEEDING=0
+outpace serve
 ```
+
+With Docker, pass `-e OUTPACE_ENABLE_INBOUND=0 -e OUTPACE_ENABLE_SEEDING=0`. The provided Compose
+file reads both from `.env`.
 
 Why stay a full participant:
 

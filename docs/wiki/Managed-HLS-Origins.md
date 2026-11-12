@@ -129,7 +129,9 @@ origin's status in **`X-Outpace-Upstream-Status`** with a stable body code:
 | anything else | `origin_upstream_http_status` |
 
 ```bash
-curl -si http://127.0.0.1:6878/origin-hls/<token>/0.m3u8 | grep -i '^x-outpace-upstream-status'
+# TOKEN is the viewer token from the relay URL /origin-hls/<token>/0.m3u8
+curl -si "http://127.0.0.1:6878/origin-hls/${TOKEN:?set the viewer token}/0.m3u8" \
+  | grep -i '^x-outpace-upstream-status'
 ```
 
 Nothing else from the origin's error is passed on: no cookies, no `Location` and no error page.

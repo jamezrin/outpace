@@ -86,8 +86,11 @@ curl -X DELETE http://127.0.0.1:6878/broadcast/my-channel/source
 Or declare sources at startup, so they reattach on every restart:
 
 ```bash
-OUTPACE_BROADCAST_SOURCES='{"my-channel":{"url":"https://source.example.com/live.ts"}}'
+export OUTPACE_BROADCAST_SOURCES='{"my-channel":{"url":"https://source.example.com/live.ts"}}'
+outpace serve
 ```
+
+The provided Compose file reads `OUTPACE_BROADCAST_SOURCES` from `.env`.
 
 | Field | Default | Range |
 | --- | --- | --- |
@@ -166,8 +169,12 @@ Security notes:
 and to the `broadcast` command:
 
 ```bash
-OUTPACE_BROADCAST_OPTIONS='{"my-channel":{"title":"My Channel","bitrate_bytes_per_sec":500000,"piece_length":131072,"quality":"HD","categories":["other"]}}'
+export OUTPACE_BROADCAST_OPTIONS='{"my-channel":{"title":"My Channel","bitrate_bytes_per_sec":500000,"piece_length":131072,"quality":"HD","categories":["other"]}}'
+outpace broadcast my-channel
 ```
+
+With Compose, forward it through `compose.override.yml`; see
+[Deployment](Deployment#passing-other-settings).
 
 | Field | Values | Default when omitted |
 | --- | --- | --- |
