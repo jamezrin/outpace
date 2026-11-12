@@ -2,6 +2,20 @@ use super::WorkerError;
 use crate::WorkerInput;
 use std::{collections::HashMap, ffi::OsString};
 const PREFIX: &str = "OUTPACE_DHT_COMPARE_";
+/// Fixed execution mode. Each mode has its own gate and seed policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Offline,
+    Live,
+}
+impl Mode {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Offline => "offline-v1",
+            Self::Live => "live-v1",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Mainline,
@@ -29,11 +43,15 @@ impl Request {
     }
 }
 /// Accept only fixed operation/role arguments, with no identity-bearing argv.
-pub fn parse_role_args(args: impl IntoIterator<Item = OsString>) -> Result<Role, WorkerError> {
+pub fn parse_role_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<(Mode, Role), WorkerError> {
     let mut args = args.into_iter();
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--offline-worker")) {
-        return Err(WorkerError::Input);
-    }
+    let mode = match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+        Some("--offline-worker") => Mode::Offline,
+        Some("--live-worker") => Mode::Live,
+        _ => return Err(WorkerError::Input),
+    };
     let role = match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
         Some("mainline") => Role::Mainline,
         Some("n0") => Role::N0,
@@ -42,10 +60,12 @@ pub fn parse_role_args(args: impl IntoIterator<Item = OsString>) -> Result<Role,
     if args.next().is_some() {
         return Err(WorkerError::Input);
     }
-    Ok(role)
+    Ok((mode, role))
 }
 /// Parse only the four comparison fields. Namespace admission is separate.
+/// Offline seeds must be loopback; live seeds must be permitted global IPv4.
 pub fn parse_environment(
+    mode: Mode,
     role: Role,
     entries: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Result<Request, WorkerError> {
@@ -70,14 +90,18 @@ pub fn parse_environment(
         }
     }
     if values.len() != 4
-        || values.get("MODE").map(String::as_str) != Some("offline-v1")
+        || values.get("MODE").map(String::as_str) != Some(mode.token())
         || values.get("ROLE").map(String::as_str) != Some(role.name())
     {
         return Err(WorkerError::Input);
     }
     let input =
         WorkerInput::parse(&values["TARGET"], &values["SEEDS"]).map_err(|_| WorkerError::Input)?;
-    if input.seeds.iter().any(|seed| !seed.ip().is_loopback()) {
+    let admitted = |ip: &std::net::Ipv4Addr| match mode {
+        Mode::Offline => ip.is_loopback(),
+        Mode::Live => super::live_isolation::permitted(*ip),
+    };
+    if input.seeds.iter().any(|seed| !admitted(seed.ip())) {
         return Err(WorkerError::Input);
     }
     Ok(Request { role, input })

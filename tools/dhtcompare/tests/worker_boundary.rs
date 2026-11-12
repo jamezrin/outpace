@@ -1,7 +1,7 @@
 #![cfg(feature = "workers")]
 use outpace_dht_compare::{
     candidates::{Record, Terminal},
-    worker::{encode_record, parse_environment, parse_role_args, Role},
+    worker::{encode_record, parse_environment, parse_role_args, Mode, Role},
 };
 use std::{ffi::OsString, time::Duration};
 const TARGET: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -24,15 +24,17 @@ fn environment() -> Vec<(OsString, OsString)> {
 #[test]
 fn fixed_arguments_and_input_are_redacted() {
     let args = ["--offline-worker", "mainline"].map(OsString::from);
-    let role = parse_role_args(args).unwrap();
-    assert_eq!(role, Role::Mainline);
-    let request = parse_environment(role, environment()).unwrap();
+    let (mode, role) = parse_role_args(args).unwrap();
+    assert_eq!((mode, role), (Mode::Offline, Role::Mainline));
+    let live = ["--live-worker", "n0"].map(OsString::from);
+    assert_eq!(parse_role_args(live).unwrap(), (Mode::Live, Role::N0));
+    let request = parse_environment(mode, role, environment()).unwrap();
     assert!(!format!("{request:?}").contains(TARGET));
     assert!(!format!("{request:?}").contains("127.0.0.1"));
     for args in [
         vec![],
         vec!["mainline"],
-        vec!["--live-worker", "mainline"],
+        vec!["--live-worker", "custom"],
         vec!["--offline-worker", "custom"],
         vec!["--offline-worker", "n0", "extra"],
     ] {
@@ -43,6 +45,37 @@ fn fixed_arguments_and_input_are_redacted() {
             "input_error"
         );
     }
+}
+#[test]
+fn live_environment_requires_live_mode_and_global_seeds() {
+    let live = |seeds: &str, mode: &str| {
+        let mut entries = environment();
+        for (key, value) in [("MODE", mode), ("SEEDS", seeds)] {
+            entries
+                .iter_mut()
+                .find(|(k, _)| k == &OsString::from(format!("OUTPACE_DHT_COMPARE_{key}")))
+                .unwrap()
+                .1 = OsString::from(value);
+        }
+        parse_environment(Mode::Live, Role::Mainline, entries)
+    };
+    assert!(live("11.0.0.2:6881,45.1.2.3:25401", "live-v1").is_ok());
+    for (seeds, mode) in [
+        ("11.0.0.2:6881", "offline-v1"),
+        ("127.0.0.1:6881", "live-v1"),
+        ("10.0.0.5:6881", "live-v1"),
+        ("192.168.1.9:6881", "live-v1"),
+        ("11.0.0.2:6881,100.64.0.1:6881", "live-v1"),
+        ("224.0.0.1:6881", "live-v1"),
+    ] {
+        assert!(live(seeds, mode).is_err(), "{seeds} {mode}");
+    }
+    assert!(parse_environment(Mode::Offline, Role::Mainline, {
+        let mut entries = environment();
+        entries[0].1 = OsString::from("live-v1");
+        entries
+    })
+    .is_err());
 }
 #[test]
 fn environment_rejects_missing_duplicate_unknown_and_nonloopback() {
@@ -61,7 +94,7 @@ fn environment_rejects_missing_duplicate_unknown_and_nonloopback() {
             .unwrap()
             .1 = OsString::from(value);
         assert_eq!(
-            parse_environment(Role::Mainline, entries)
+            parse_environment(Mode::Offline, Role::Mainline, entries)
                 .unwrap_err()
                 .token(),
             "input_error"
@@ -69,13 +102,13 @@ fn environment_rejects_missing_duplicate_unknown_and_nonloopback() {
     }
     let mut missing = environment();
     missing.pop();
-    assert!(parse_environment(Role::Mainline, missing).is_err());
+    assert!(parse_environment(Mode::Offline, Role::Mainline, missing).is_err());
     let mut duplicate = environment();
     duplicate.push(duplicate[0].clone());
-    assert!(parse_environment(Role::Mainline, duplicate).is_err());
+    assert!(parse_environment(Mode::Offline, Role::Mainline, duplicate).is_err());
     let mut unknown = environment();
     unknown.push(("OUTPACE_DHT_COMPARE_OVERRIDE".into(), "1".into()));
-    assert!(parse_environment(Role::Mainline, unknown).is_err());
+    assert!(parse_environment(Mode::Offline, Role::Mainline, unknown).is_err());
 }
 #[test]
 fn one_bounded_numeric_record_has_no_input() {

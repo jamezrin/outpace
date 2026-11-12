@@ -28,6 +28,25 @@ class Result:
     truncated: bool
     cancelled_on_witness: bool = False
 
+def verified_init_pidfd(launcher):
+    """Return a pidfd for the launcher's only child iff it is PID 1 of a new PID namespace."""
+    fd=None
+    try:
+        children=Path(f'/proc/{launcher}/task/{launcher}/children').read_text().split()
+        if len(children)!=1: return None
+        child=int(children[0]); fd=os.pidfd_open(child)
+        status=Path(f'/proc/{child}/status').read_text().splitlines()
+        fields={line.split(':',1)[0]:line.split(':',1)[1].split() for line in status if ':' in line}
+        if fields.get('PPid')!=[str(launcher)] or fields.get('NSpid',[])[-1:]!=['1']: return None
+        if Path(f'/proc/{child}/ns/pid').stat().st_ino==Path('/proc/self/ns/pid').stat().st_ino: return None
+        info=Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines()
+        if not any(line.split()==['Pid:',str(child)] for line in info): return None
+        verified,fd=fd,None
+        return verified
+    except (OSError, ValueError): return None
+    finally:
+        if fd is not None: os.close(fd)
+
 def run_offline(argv, *, timeout, prefix_cap=65536, env=None, cancel_on_stdout=None):
     """Run in fresh user/network/PID namespaces; retain prefixes and drain both pipes.
 
@@ -57,22 +76,7 @@ def run_offline(argv, *, timeout, prefix_cap=65536, env=None, cancel_on_stdout=N
     cancelled_on_witness=False; witness_tail=b''
     def find_init():
         nonlocal init_fd
-        if init_fd is not None or proc is None: return
-        fd=None
-        try:
-            children=Path(f'/proc/{proc.pid}/task/{proc.pid}/children').read_text().split()
-            if len(children)!=1: return
-            child=int(children[0]); fd=os.pidfd_open(child)
-            status=Path(f'/proc/{child}/status').read_text().splitlines()
-            fields={line.split(':',1)[0]:line.split(':',1)[1].split() for line in status if ':' in line}
-            if fields.get('PPid')!=[str(proc.pid)] or fields.get('NSpid',[])[-1:]!=['1']: return
-            if Path(f'/proc/{child}/ns/pid').stat().st_ino==Path('/proc/self/ns/pid').stat().st_ino: return
-            info=Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines()
-            if not any(line.split()==['Pid:',str(child)] for line in info): return
-            init_fd=fd; fd=None
-        except (OSError, ValueError): pass
-        finally:
-            if fd is not None: os.close(fd)
+        if init_fd is None and proc is not None: init_fd=verified_init_pidfd(proc.pid)
     def kill():
         nonlocal uncertain
         if proc is not None and proc.poll() is None:

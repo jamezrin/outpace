@@ -1,9 +1,11 @@
 //! Fixed worker wire contract. Parsing alone never authorizes a lookup.
 mod input;
 mod isolation;
+mod live_isolation;
 pub use isolation::{attest_offline, validate_snapshot};
+pub use live_isolation::{attest_live, validate_live};
 mod record;
-pub use input::{parse_environment, parse_role_args, Request, Role};
+pub use input::{parse_environment, parse_role_args, Mode, Request, Role};
 pub use record::encode_record;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,21 +30,26 @@ impl std::fmt::Display for WorkerError {
 }
 impl std::error::Error for WorkerError {}
 
-/// Fixed offline entry. Environment acquisition and runtime construction happen
-/// only after actual namespace admission; parsing cannot authorize networking.
+/// Fixed offline or live entry. Environment acquisition and runtime construction
+/// happen only after the mode's actual namespace admission; parsing cannot
+/// authorize networking.
 pub fn entry<I, E, V>(args: I, environment: E, output: &mut impl std::io::Write) -> i32
 where
     I: IntoIterator<Item = std::ffi::OsString>,
     E: FnOnce() -> V,
     V: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 {
-    let Ok(role) = parse_role_args(args) else {
+    let Ok((mode, role)) = parse_role_args(args) else {
         return 64;
     };
-    if attest_offline().is_err() {
+    let admitted = match mode {
+        Mode::Offline => attest_offline(),
+        Mode::Live => attest_live(),
+    };
+    if admitted.is_err() {
         return 65;
     }
-    let Ok(request) = parse_environment(role, environment()) else {
+    let Ok(request) = parse_environment(mode, role, environment()) else {
         return 64;
     };
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()

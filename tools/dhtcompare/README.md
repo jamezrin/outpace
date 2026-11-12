@@ -1,13 +1,14 @@
 # DHT comparison research harness (#44)
 
-Work in progress. Strict worker input parsing and bounded batch/deadline accounting are implemented.
+Strict worker input parsing and bounded batch/deadline accounting are implemented.
 All three actual implementations have passed target, silent-node, and
 malformed/uncorrelated/duplicate-response cases inside the offline namespace helper.
 The custom cases exercise ace-swarm's existing numeric-seed seam.
 Fixed offline late-response-opportunity and external lookup-cancellation profiles
 are available. Internal cancellation/actor joining, observed late datagram receipt,
 and whole-harness/live qualification remain incomplete.
-There is no live worker executable, complete live comparison supervisor, public-network mode or library-adoption decision.
+A default-deny live boundary and one bounded live-block supervisor are described
+under [Live boundary](#live-boundary); this tool makes no library-adoption decision.
 A Linux offline namespace helper has synthetic lifecycle tests; it is not live clearance.
 The `candidates` feature is research-only, not a safe execution entry point.
 Real-UDP integration tests are ignored by default and reject execution outside
@@ -219,5 +220,125 @@ binaries.
 Qualification uses same-entry target fixtures under real namespaces plus separate
 compiled executable denials. Same-entry positives cover gate, real adapter and
 encoder; they do not prove positive OS-environment/stdout integration through
-binary `main()`. Public destination policy, a live worker policy and matched live
-comparison remain outstanding for #44. No live execution is authorized here.
+binary `main()`. The offline worker authorizes no live execution; the public
+destination policy and live worker policy are under [Live boundary](#live-boundary),
+and the matched comparison is in
+[the comparison report](../../docs/testing/dht-comparison-44.md).
+
+## Live boundary
+
+`live.py` runs one worker in fresh nested user, network and PID namespaces with
+the fixed topology, policy and relay described in
+[the live-boundary design](../../docs/superpowers/specs/2026-11-12-dht-live-boundary-44-design.md):
+
+- The worker gets a veth with a default route, IPv6 disabled, and a default-deny
+  nftables table.
+- It runs with empty capability sets and `no_new_privs`, on a read-only root,
+  with empty tmpfs over every directory holding host UNIX sockets. A root
+  supervisor launches the namespace as uid 65534, so root-only host files are
+  unreadable.
+- The namespace dies with the supervisor through a parent-death SIGKILL.
+- The supervisor relay forwards only IPv4 UDP to global unicast destinations,
+  from sockets bound to the declared egress device.
+- Replies are admitted only from endpoints that the same inner socket contacted.
+
+UDP to a denied prefix is counted by nftables and dropped silently by the relay.
+A synchronous `EPERM` would penalize a library for the harness rather than model
+network loss. The block reports whether the two counts agree. Every non-UDP, IPv6 or unsolicited packet
+is dropped inside the namespace. Unprivileged nested namespaces, veth, `AF_PACKET`
+and `SO_BINDTODEVICE` are required. No TUN device and no host firewall or routing
+change is needed.
+
+The live entries are `dht-worker --live-worker mainline|n0` and the custom libtest
+case `dht::comparison::worker::custom_live_worker`. Before reading protected input,
+they require mode `live-v1`, global seeds, empty capabilities, `no_new_privs`, the
+fixed interfaces and routes, and IPv6 disabled. An unconfined invocation exits 65;
+the custom case fails.
+
+Per arm, the boundary reports admitted, denied and unsolicited datagrams, unique
+contacted and unanswered endpoints, and inner nftables counters. These are
+measured at the boundary. They are not library-internal query or timeout
+diagnostics, and unavailable library counters stay null. The bootstrap also
+reports `wait4` CPU time and sampled peak threads, sockets and `VmHWM`. A sampled
+peak is a lower bound and is null when nothing was sampled; `ru_maxrss` is not used
+because it keeps the forked bootstrap's pre-`exec` peak. Admitted datagrams are
+successful local sends, not delivery. Kernel receive-queue drops on the relay
+sockets are reported separately; outer-socket drops are a lower bound, because the
+kernel reports them only with a later datagram. Relay/nftables agreement and drops
+are recorded per arm without changing the verdict, so a comparison must treat a
+disagreeing arm as invalid.
+
+### Offline live-boundary qualification
+
+Build release artifacts for every arm, so all of them share the optimization level:
+
+```sh
+cargo test -p ace-swarm --lib --release --locked --no-run
+cargo build --manifest-path tools/dhtcompare/Cargo.toml --release --features workers --bin dht-worker --locked
+python3.11 tools/dhtcompare/live_qualification.py \
+  --custom /absolute/path/to/ace_swarm-release-test-binary --custom-sha256 CUSTOM_SHA256 \
+  --upstream /absolute/path/to/release/dht-worker --upstream-sha256 UPSTREAM_SHA256 \
+  --output /private/path/to/new-live-qualification
+```
+
+The 16 fixed cases run inside one outer namespace whose only egress is a dummy
+device with synthetic addresses, under a 240-second deadline:
+
+- A probe covers two threads and sockets, eight denied destination classes,
+  stranger and wrong-port inbound packets, TCP, IPv6, raw sockets, policy and
+  link mutation, a supervisor-owned UNIX socket and a write to the read-only root.
+- All three candidates are run through their real binary entries against synthetic
+  values, and against advertised private nodes. Each candidate must try and fail to
+  reach the private nodes, with matching relay and nftables counts.
+- Unconfined gate denials are exercised for every entry.
+- The complete block supervisor runs. It refuses encrypted content, enabled IPv6
+  and a host-owned global address before starting any arm.
+- As root, qualification launches as uid 65534 like live workers, and the probe
+  must fail to read a root-only canary file.
+- A host-owned global address added mid-arm stops all further forwarding.
+- With change events withheld, datagrams to an address on another host interface
+  leave through the egress device and a host listener on that address receives none.
+
+Listeners on private outer addresses must receive nothing. `test_live.py` runs the
+probe locally without binaries. CI runs the pure relay, policy, consistency and
+predicate tests.
+
+### One bounded live block
+
+`live_block.py` runs as host root on the validation host. It reads
+`{"content_id": "..."}` on stdin; the operator supplies it, and this tool never
+reads the registry. It runs these steps:
+
+1. Verify pins, the single default route via `--egress-device`, disabled IPv6, no
+   host-owned address the relay would forward to, and the route and
+   stateless-ruleset digests.
+2. Resolve the target once through the local daemon's loopback `analyze_content`
+   method. Encrypted or unknown protection is refused.
+3. Resolve the production bootstrap hostnames once, into at most four global seeds,
+   and refuse admission if any bound UNIX socket path lies outside the hidden
+   directories. Relative and other-namespace socket paths are invisible to this
+   check and rely on the hidden directory list.
+4. Run custom, mainline and n0 within one 135-second deadline, without retries.
+   No arm starts unless all three still fit.
+5. Re-check the digests and write a private numeric report with mode-0600 captures.
+
+Two host preconditions cannot be verified from inside the validation host, so the
+operator checks them from the initial namespace before each block:
+
+- uid and gid 65534 of the supervisor's namespace map to non-root host ids. A uid
+  map read from the initial namespace is relative to it; on a Proxmox host,
+  `cat /proc/$(lxc-info -n CTID -p -H)/uid_map` (and `gid_map`) must map 65534
+  to a non-zero host id: the second column plus 65534 minus the first, for the
+  range covering 65534. Inside the namespace,
+  `launcher_identity()` refuses only root launches it cannot drop.
+- No address is added to the egress device during the block. Relay sends bound to
+  the egress device are never delivered to addresses on other host interfaces,
+  but an address added to the egress device between the relay's last change check
+  and its send could receive one datagram. Any address change during a block makes
+  it inconclusive, so such a delivery is detected, not prevented
+  ([#391](https://github.com/jamezrin/outpace-stream/issues/391)).
+
+The report omits the target, content id and endpoints. Gateway and VPN exit
+provenance must be checked separately, immediately before and after. Exit 0 means
+all arms produced valid records with confirmed cleanup, 1 means an arm failed, and
+2 means inconclusive.

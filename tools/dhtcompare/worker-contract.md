@@ -1,7 +1,8 @@
 # Worker record and request contract v1 (#44)
 
-This is an offline research contract, not public-network authorization. The
-request/parser and record validator do not authorize sockets by themselves.
+This research contract covers offline and live workers; it is not network
+authorization by itself. The request/parser and record validator do not
+authorize sockets.
 A worker entry must first validate its fixed arguments and actual isolated
 namespace. The parent must own the PID namespace, deadline, pipes and cleanup.
 
@@ -12,15 +13,18 @@ system environment is separate. The parent removes inherited fields in this
 prefix and inserts the intended four. Workers reject duplicate or unknown names,
 non-Unicode relevant values, missing fields and mismatched roles.
 
-- `OUTPACE_DHT_COMPARE_MODE=offline-v1`
+- `OUTPACE_DHT_COMPARE_MODE=offline-v1` or `live-v1`; it must match the fixed
+  argument (`--offline-worker`/`--live-worker`) or custom test case
 - `OUTPACE_DHT_COMPARE_ROLE=mainline`, `n0`, or the fixed custom entry's `custom`
 - `OUTPACE_DHT_COMPARE_TARGET`: exactly twenty hex-decoded bytes
 - `OUTPACE_DHT_COMPARE_SEEDS`: one to four unique numeric IPv4 endpoints with
-  nonzero ports; at most 256 bytes, and only loopback addresses in offline mode
+  nonzero ports; at most 256 bytes. Offline mode accepts only loopback addresses;
+  live mode accepts only addresses outside the denied special-purpose prefixes.
 
 No identity or endpoint is accepted through argv or emitted in a result, error or
 Debug representation. The registry is never read. Valid parsing is only one
-prerequisite; no public mode is exposed by this contract.
+prerequisite. Live mode additionally requires the live namespace gate and the
+supervisor-owned boundary described in the README.
 
 ## One bounded result
 

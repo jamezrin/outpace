@@ -126,6 +126,10 @@ jobs:
       - name: Test DHT comparison qualification coordinator
         run: python3 -m unittest discover -s tools/dhtcompare -p test_qualification.py -v
 
+      # Relay frames, destination policy, cross-language lists and fixture predicates only.
+      - name: Test DHT live-boundary policy
+        run: python3 -m unittest discover -s tools/dhtcompare -p 'test_live_[rf]*.py' -v
+
       - name: Test release archive verification
         run: python3 -m unittest discover -s tools/release -v
 

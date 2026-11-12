@@ -1,16 +1,24 @@
-//! Fixed offline custom-walker entry, compiled only in libtest on Linux.
+//! Fixed offline and live custom-walker entries, compiled only in libtest on Linux.
 use std::{collections::HashMap, ffi::OsString, net::SocketAddrV4};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerError {
     Namespace,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Offline,
+    Live,
+}
 #[path = "worker_isolation.rs"]
 mod isolation;
+#[path = "worker_live_isolation.rs"]
+mod live_isolation;
 struct Request {
     hash: [u8; 20],
     seeds: Vec<SocketAddrV4>,
 }
 fn parse_environment(
+    mode: Mode,
     entries: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Result<Request, ()> {
     let mut values = HashMap::new();
@@ -37,7 +45,11 @@ fn parse_environment(
         }
     }
     if values.len() != 4
-        || values["MODE"] != "offline-v1"
+        || values["MODE"]
+            != match mode {
+                Mode::Offline => "offline-v1",
+                Mode::Live => "live-v1",
+            }
         || values["ROLE"] != "custom"
         || values["TARGET"].len() != 40
         || values["SEEDS"].is_empty()
@@ -60,23 +72,30 @@ fn parse_environment(
     let mut seeds = Vec::with_capacity(4);
     for text in values["SEEDS"].split(',') {
         let seed: SocketAddrV4 = text.parse().map_err(|_| ())?;
-        if seeds.len() == 4 || !seed.ip().is_loopback() || seed.port() == 0 || seeds.contains(&seed)
-        {
+        let admitted = match mode {
+            Mode::Offline => seed.ip().is_loopback(),
+            Mode::Live => live_isolation::permitted(*seed.ip()),
+        };
+        if seeds.len() == 4 || !admitted || seed.port() == 0 || seeds.contains(&seed) {
             return Err(());
         }
         seeds.push(seed);
     }
     Ok(Request { hash, seeds })
 }
-fn entry<E, V>(environment: E, output: &mut impl std::io::Write) -> i32
+fn entry<E, V>(mode: Mode, environment: E, output: &mut impl std::io::Write) -> i32
 where
     E: FnOnce() -> V,
     V: IntoIterator<Item = (OsString, OsString)>,
 {
-    if isolation::attest_offline().is_err() {
+    let admitted = match mode {
+        Mode::Offline => isolation::attest_offline(),
+        Mode::Live => live_isolation::attest_live(),
+    };
+    if admitted.is_err() {
         return 65;
     }
-    let Ok(request) = parse_environment(environment()) else {
+    let Ok(request) = parse_environment(mode, environment()) else {
         return 64;
     };
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -118,8 +137,18 @@ where
 #[test]
 #[ignore = "fixed worker: exact compiled case only through owned offline namespace"]
 fn custom_offline_worker() {
-    let status = entry(std::env::vars_os, &mut std::io::stdout().lock());
+    let status = entry(
+        Mode::Offline,
+        std::env::vars_os,
+        &mut std::io::stdout().lock(),
+    );
     assert_eq!(status, 0, "custom worker denied or failed");
+}
+#[test]
+#[ignore = "fixed worker: exact compiled case only through the owned live boundary"]
+fn custom_live_worker() {
+    let status = entry(Mode::Live, std::env::vars_os, &mut std::io::stdout().lock());
+    assert_eq!(status, 0, "custom live worker denied or failed");
 }
 
 #[cfg(test)]
@@ -143,7 +172,7 @@ mod tests {
     }
     #[test]
     fn custom_boundary_denies_bad_environment() {
-        assert!(parse_environment(env()).is_ok());
+        assert!(parse_environment(Mode::Offline, env()).is_ok());
         for (key, value) in [
             ("MODE", "live-v1"),
             ("ROLE", "mainline"),
@@ -158,27 +187,45 @@ mod tests {
                 .find(|(k, _)| k == &OsString::from(format!("OUTPACE_DHT_COMPARE_{key}")))
                 .unwrap()
                 .1 = value.into();
-            assert!(parse_environment(entries).is_err());
+            assert!(parse_environment(Mode::Offline, entries).is_err());
         }
         let mut duplicate = env();
         duplicate.push(duplicate[0].clone());
-        assert!(parse_environment(duplicate).is_err());
+        assert!(parse_environment(Mode::Offline, duplicate).is_err());
         let mut unknown = env();
         unknown.push(("OUTPACE_DHT_COMPARE_EXTRA".into(), "secret".into()));
-        assert!(parse_environment(unknown).is_err());
-        assert!(parse_environment(env().into_iter().take(3)).is_err());
+        assert!(parse_environment(Mode::Offline, unknown).is_err());
+        assert!(parse_environment(Mode::Offline, env().into_iter().take(3)).is_err());
+        let live = |seeds: &str| {
+            let mut entries = env();
+            entries[0].1 = "live-v1".into();
+            entries[3].1 = seeds.into();
+            parse_environment(Mode::Live, entries)
+        };
+        assert!(live("11.0.0.2:6881").is_ok());
+        for seeds in [
+            "127.0.0.1:9001",
+            "10.0.0.5:6881",
+            "11.0.0.2:6881,192.168.1.9:6881",
+        ] {
+            assert!(live(seeds).is_err(), "{seeds}");
+        }
+        assert!(parse_environment(Mode::Live, env()).is_err());
     }
     #[test]
     fn unconfined_entry_never_reads_environment() {
         assert_ne!(std::process::id(), 1);
         let mut output = Vec::new();
-        assert_eq!(
-            entry(
-                || -> Vec<(OsString, OsString)> { panic!("read before gate") },
-                &mut output
-            ),
-            65
-        );
+        for mode in [Mode::Offline, Mode::Live] {
+            assert_eq!(
+                entry(
+                    mode,
+                    || -> Vec<(OsString, OsString)> { panic!("read before gate") },
+                    &mut output
+                ),
+                65
+            );
+        }
         assert!(output.is_empty());
     }
 }
@@ -236,6 +283,7 @@ fn custom_confined_entry_target() {
     });
     let mut output = Vec::new();
     let status = entry(
+        Mode::Offline,
         || {
             [
                 ("MODE", "offline-v1".to_owned()),
