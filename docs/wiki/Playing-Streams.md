@@ -221,10 +221,14 @@ Once no lease or viewer holds a stream, it is torn down after the usual 30-secon
 
 ### What the compatibility API doesn't do
 
-There is no premium or encrypted content, no accounts, no web UI or remote control, no search,
+There is no premium or encrypted content, no accounts, no web UI or remote control, no general
 channel lists or EPG, no file selection beyond the single file (`_idx=0`), no seeking in the
 original engine's sense, and no VOD. Outpace adds its own [timeshift](Timeshift) commands
 instead.
+
+[Stream-name search](Stream-Search) is planned within v1.0.0 as a separate, default-off
+AceStream services adapter. It is not implemented: `/search` returns `404`, and `get_content_id`
+does not convert an infohash to a content ID. Enabling `OUTPACE_ACE_COMPAT` does not add search.
 
 ### Behind a proxy
 

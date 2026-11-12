@@ -106,8 +106,11 @@ it does not implement engine access-token authentication.
 
 The [optional search UI](https://github.com/gabo-it/Acestream-Manager/blob/e63917a092c7/webui/search.js#L29-L60)
 GETs `/search` with `query`, `page`, `page_size` and optional `category`, expecting
-`.result.results[].items`, icons and totals. Outpace has no `/search` route. Search, channel
-catalog and EPG enumeration are non-goals here; known public sources can use playback.
+`.result.results[].items`, icons and totals. Outpace has no `/search` route. Bounded
+service-backed name search is planned in [#406](https://github.com/jamezrin/outpace-stream/issues/406),
+starting with the named scraper workflow described there; this inventory does not establish
+Manager search compatibility. General catalog and EPG enumeration remain outside that scope;
+known public sources can use playback.
 Consequently this inventory does not claim full application replacement.
 
 ## Local coverage and remaining boundaries
@@ -140,8 +143,9 @@ API. Existing selector precedence, source leases, token isolation, typed errors,
 SSRF checks and authenticated catalog resolution remain in force. Compatibility gate policy
 is documented in the [operator contract](compat-matrix.md#enable-and-advertise-the-adapter).
 
-Premium/account/subscription/encrypted inputs, remote/player UI, search/channel catalogs and
-EPG are excluded. Legacy VOD playback/HLS, seek/file selection, arbitrary client-selected
+Premium/account/subscription/encrypted inputs, remote/player UI, general channel catalogs and
+EPG are excluded. Service-backed name search is planned separately, not implemented or covered
+by this inventory's tests. Legacy VOD playback/HLS, seek/file selection, arbitrary client-selected
 transcoding, raw transport dumps and reverse content-id lookup remain deferred.
 Native `/vod` is a separate surface. Inert
 transcoding hints do not mean conversion occurred. Live HLS follows the existing daemon-wide

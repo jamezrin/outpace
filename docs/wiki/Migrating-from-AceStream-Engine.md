@@ -24,8 +24,11 @@ handshake and work with compat off.
 
 ## What's different
 
-- **No premium or encrypted content**, accounts, subscriptions, web UI, remote control, search,
+- **No premium or encrypted content**, accounts, subscriptions, web UI, remote control,
   channel lists or EPG. These are permanent non-goals.
+- **Search is not available yet.** [Service-backed stream-name search](Stream-Search) is planned
+  within v1.0.0, behind a separate default-off setting. Turning on the current compatibility
+  API does not provide search or reverse content-ID lookup.
 - **No legacy seek or file selection**, and no VOD through the compat API. Native `/vod` exists.
 - **No port 62062** and no UDP 8621 listener.
 - **No access-token authentication** on the compat API. Protect it with your network.
