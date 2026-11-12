@@ -205,7 +205,7 @@ async fn unsupported_or_ambiguous_selection_is_rejected_before_anything_starts()
                 "playlist_selected_indexes=0",
                 "playlist_start_from=0",
                 "next_file_indexes=0",
-                &format!("content_id={CID}"),
+                &format!("content_id={}", CID.replace('0', "f")),
             ] {
                 let path = format!("{base}&content_id={CID}&{query}");
                 let response = get(&state, &path).await;
@@ -322,9 +322,10 @@ async fn managed_relay_serves_a_rewritten_origin_and_stop_releases_it() {
     assert_eq!(response["managed_origin"], true, "{body}");
     assert_eq!(response["is_direct"], true);
     assert_eq!(response["transport"], "hls");
-    for field in ["stat_url", "command_url", "infohash", "playback_session_id"] {
+    for field in ["stat_url", "infohash", "playback_session_id"] {
         assert!(response.get(field).is_none(), "invented {field}");
     }
+    assert!(local_path(&response["command_url"]).ends_with("/cmd"));
     let playlist_path = local_path(&response["playback_url"]);
     let stop_path = local_path(&response["stop_url"]);
     assert!(playlist_path.starts_with("/origin-hls/"));

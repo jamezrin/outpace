@@ -159,8 +159,11 @@ not repackage it. No swarm session or stat/command lease is created.
   to the origin and revokes itself.
 - **`OUTPACE_MANAGED_HLS=1` (managed relay, default off).** The same starts return
   a local `/origin-hls/<token>/0.m3u8` URL instead. JSON keeps `is_direct: true` and
-  adds `managed_origin: true` and `stop_url`; `DELETE stop_url` returns `204` once,
-  then `404`. Relay statuses, limits and the outbound fetch policy are described in
+  adds `managed_origin: true`, `command_url` and `stop_url`; `DELETE stop_url` returns
+  `204` once, then `404`. `command_url` (`/origin-hls/<token>/cmd`) reports and
+  controls the restricted [origin TS replay](../timeshift.md#managed-origin-ts-replay);
+  its status truthfully reports a disabled or unsupported state. Relay statuses,
+  limits and the outbound fetch policy are described in
   [Origin HLS](../native-api.md#origin-hls).
 
 ## Selectors and provenance
@@ -184,6 +187,10 @@ anything resolves or starts:
 - `direct_url`, `transport_file_data`, `playlist_selected_indexes`,
   `playlist_start_from` and `next_file_indexes` are rejected.
 - SDK expansion flags such as `expand_wrapper` and `mode` remain accepted.
+- The public Android SDK's GET builder appends its descriptor query twice. Equal
+  decoded repeats of `content_id`, `infohash`, `url`, `magnet` and the inert
+  `transport_file_cache_key` count as one value. Conflicting values and every other
+  repeated parameter (file selection, options, commands) are rejected.
 
 `outpace play` applies the URI contract: `index=0` is accepted, while `_idx`, any
 `stream_id` and duplicate keys are rejected.

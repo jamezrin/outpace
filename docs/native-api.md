@@ -53,6 +53,8 @@ outpace broadcast sports --public-host stream.example
 | `DELETE /streams/<network>/<id>` | `204` | Force-stops an active session; `404` if inactive. A `.ts` or `.m3u8` suffix is also accepted. |
 | `GET /origin-hls/status` | `200 application/json`, `{"enabled":false,"active_sessions":0}` | Managed origin-HLS relay state; never contains tokens or origin URLs. See [Origin HLS](#origin-hls). |
 | `GET /origin-hls/<token>/<resource>` | `200`/`206` playlist or media | Only with `OUTPACE_MANAGED_HLS=1`; otherwise `404`. |
+| `GET /origin-hls/<token>/cmd?method=…` | `200 application/json` envelope | Per-viewer `timeshift_status`/`timeshift_seek`/`timeshift_live`/`stop`; see [managed-origin TS replay](timeshift.md#managed-origin-ts-replay). |
+| `GET /origin-hls/<token>/replay/<generation>/<resource>` | `200` playlist or retained TS | Finite replay of retained origin media; `410` once superseded or pruned. |
 | `DELETE /origin-hls/<token>` | `204` | Stops one managed origin-HLS viewer; `404` if unknown, expired or already stopped. |
 | `GET /vod/<network>/<id>` | `200` or `206` streaming body | Verified single-file VOD. Supports one byte range and advertises `Accept-Ranges: bytes`; an unsatisfiable range returns `416`. |
 | `GET /vod/<network>/<id>/manifest.m3u8` | `200 application/vnd.apple.mpegurl` | Static VOD HLS playlist. |
@@ -455,8 +457,12 @@ content, such as cookies, `Location` or error pages, is passed through.
 
 Encrypted keys, content steering, variable substitution, low-latency HLS
 (parts, preload hints, delta updates), `If-Range` and query-based playlist reloads are
-unsupported. The relay has no swarm statistics, peer controls, audio conversion or
-timeshift. `GET /origin-hls/status` reports only `enabled` and `active_sessions`. Idle
+unsupported. The relay has no swarm statistics, peer controls or audio conversion.
+With retained history also enabled (`OUTPACE_HISTORY_SECONDS`, off by default),
+JSON starts add a `command_url` (`/origin-hls/<token>/cmd`) for bounded replay of
+qualifying MPEG-TS media playlists from retained bytes, under the same budget as
+native timeshift; see [managed-origin TS replay](timeshift.md#managed-origin-ts-replay).
+`GET /origin-hls/status` reports only `enabled` and `active_sessions`. Idle
 checks must look at it as well as `/streams`, because relay viewers are not stream
 sessions.
 

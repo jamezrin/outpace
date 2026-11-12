@@ -38,10 +38,49 @@ peer buffers and runtime metadata add to process memory. History shares each
 segment's bytes with the live window rather than copying them, and viewers never
 get their own copy: a replay holds coordinates only and cannot prevent pruning.
 
-Only active native HLS packagers collect history. Raw `/ace/getstream` TS
-sessions and inactive channels do not record anything.
+Active native HLS packagers and eligible managed-origin viewers collect history.
+Raw `/ace/getstream` TS sessions, direct origin-HLS redirects and inactive channels
+do not record anything.
 
-## Playback contract
+## Managed-origin TS replay
+
+With `OUTPACE_MANAGED_HLS=1` **and** a nonzero `OUTPACE_HISTORY_SECONDS`, the
+[managed origin-HLS relay](native-api.md#origin-hls) also retains completed media
+segments that an active viewer fetched through it. Both settings are off by default.
+Recording is driven by the viewer's own requests: there is no background polling and
+nothing is written to disk. The relay's short HTTP media cache is a separate mechanism.
+Each viewer is charged against `OUTPACE_HISTORY_BYTES`, and all viewers and native
+packagers share `OUTPACE_HISTORY_TOTAL_BYTES`.
+
+Only a narrow subset is recorded: a media playlist (not a master) that declares
+`EXT-X-INDEPENDENT-SEGMENTS`, with unique full-segment URLs and complete `200`
+MPEG-TS bodies. Each retained segment needs CRC-checked PAT/PMT tables and evidence of
+a video access point on the first selected video PID. That packet-level check is a
+conservative heuristic, not a full decoder. Master and alternate-rendition playlists,
+initialization maps, fMP4, byte ranges, gaps and audio-only media are not recorded.
+Their live relay behaviour is unchanged, and status reports the reason.
+
+Managed JSON starts include `command_url` (`/origin-hls/<token>/cmd`). It accepts
+`timeshift_status`, `timeshift_seek`, `timeshift_live` and `stop` with the same
+envelope, selectors and generation checks as the native contract below, and the
+Android SDK's `api_version=2` hint is accepted. Status reports
+`kind: "retained_origin_ts"`, `time_basis: "observed_media_duration"`, `enabled`,
+`supported` and a `reason` (for example `history_disabled` or
+`requires_single_independent_ts_media_playlist`). Check
+`history.seekable_start_ms` and `history.end_ms` before seeking: a supported playlist
+does not mean media has arrived yet.
+
+A successful seek returns `/origin-hls/<token>/replay/<generation>/index.m3u8`, a
+finite playlist with `EXT-X-ENDLIST` that serves only retained bytes and never
+re-fetches the origin. Whole segments and an initial `Range: bytes=0-` probe return
+`200`; other ranges and `If-Range` are refused. A failed seek leaves the current view
+intact; a seek or live return invalidates older replay generations (`410`).
+Unlike native playback, **the original `/origin-hls/<token>/0.m3u8` stays the live
+URL**, and `timeshift_live` returns it. Pruned media also returns `410`; a stopped or
+expired viewer returns `404`. A media-sequence rollback clears incompatible history.
+Stop, expiry and restart discard the recording, and other viewers are unaffected.
+
+## Native playback contract
 
 1. Start HLS with
    `GET /ace/manifest.m3u8?content_id=0123456789abcdef0123456789abcdef01234567&format=json`

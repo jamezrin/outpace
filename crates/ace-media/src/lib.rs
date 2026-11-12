@@ -3,13 +3,15 @@
 //! Acestream live content is already an MPEG-TS stream chopped into pieces; the
 //! reassembled byte stream is therefore MPEG-TS. [`mpegts`] provides packet alignment,
 //! resynchronization, PCR tracking, and keyframe/access-point detection; [`hls`] provides
-//! packet-count segmentation and a basic media-playlist renderer. This crate performs no I/O.
+//! packet-count segmentation and a basic media-playlist renderer; [`hls_input`] validates and
+//! locates rewritable URIs in origin HLS playlists. This crate performs no I/O.
 //!
 //! The daemon's `ace-engine` crate owns live packaging tasks, session lifecycle, retained
 //! segment windows, live playlists, and HTTP serving. Those policies are outside this crate.
 
 pub mod audio;
 pub mod hls;
+pub mod hls_input;
 pub mod mpegts;
 
 /// Errors from media framing.

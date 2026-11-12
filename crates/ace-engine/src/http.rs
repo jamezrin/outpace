@@ -44,6 +44,7 @@ use tokio::sync::broadcast::error::RecvError;
 mod broadcast;
 mod broadcast_source;
 mod compat;
+mod origin_history;
 mod origin_hls;
 mod streams;
 mod support;
@@ -52,6 +53,7 @@ mod vod;
 use broadcast::*;
 use broadcast_source::*;
 use compat::*;
+use origin_history::*;
 use origin_hls::*;
 use streams::*;
 use vod::*;
@@ -276,6 +278,11 @@ pub fn router_with_support(
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/origin-hls/status", get(origin_hls_status))
+        .route("/origin-hls/{token}/cmd", get(origin_history_command))
+        .route(
+            "/origin-hls/{token}/replay/{generation}/{resource}",
+            get(origin_history_resource),
+        )
         .route("/origin-hls/{token}/{id}", get(origin_hls_resource))
         .route(
             "/origin-hls/{token}",
