@@ -37,6 +37,10 @@ jobs:
             os: ubuntu-24.04
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-24.04
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-24.04
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-24.04
           - target: x86_64-apple-darwin
             os: macos-15-intel
           - target: aarch64-apple-darwin
