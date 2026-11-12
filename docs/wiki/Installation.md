@@ -22,6 +22,8 @@ file on the [releases page](https://github.com/jamezrin/outpace-stream/releases)
 | Linux x86_64 | `x86_64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARM64 (aarch64) | `aarch64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARMv7 hard-float (Raspberry Pi 2/3 class) | `armv7-unknown-linux-musleabihf` | `.tar.gz` |
+| FreeBSD 14 and 15 x86_64, from the next release | `x86_64-unknown-freebsd` | `.tar.gz` |
+| NetBSD x86_64, from the next release | `x86_64-unknown-netbsd` | `.tar.gz` |
 | macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
@@ -47,6 +49,19 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 ```
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
+
+### FreeBSD, NetBSD and OpenBSD
+
+From the next release there are FreeBSD and NetBSD x86_64 binaries. They use the same archive
+layout, so the commands above work with `target=x86_64-unknown-freebsd` (or `-netbsd`). Use
+`sha256 -c` or `shasum -a 256 --check` to verify. The FreeBSD binary is built against FreeBSD 14
+and is tested on 14 and 15. That also covers pfSense and OPNsense, but install it with care on a
+firewall: keep the API on `127.0.0.1` and open only the peer port. The NetBSD binary is built but
+not tested on a running system. To run it as a service on FreeBSD, see
+[Deployment](Deployment#freebsd-rcd).
+
+There is no OpenBSD build. Rust support for OpenBSD is tier 3, so
+[build from source](#build-from-source) on the OpenBSD machine itself.
 
 ### ARMv7 and small devices
 
@@ -188,7 +203,7 @@ USER outpace
 | `broadcasts/` | Signing keys and piece reservations of your [broadcasts](Broadcasting). These files are private keys. | Yes, and protect them |
 | `cache/` | The disk piece cache, when enabled. Wiped on start. | No |
 
-The default is the platform data directory plus `outpace`: `~/.local/share/outpace` on Linux,
+The default is the platform data directory plus `outpace`: `~/.local/share/outpace` on Linux and the BSDs,
 `~/Library/Application Support/outpace` on macOS, and `%APPDATA%\outpace` on Windows. In the
 container it is `/var/lib/outpace`. Run only one daemon per data directory.
 

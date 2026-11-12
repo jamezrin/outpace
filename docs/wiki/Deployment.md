@@ -161,6 +161,49 @@ journalctl -u outpace -f
 Logs go to standard error. Each line starts with a UTC time of day (`HH:MM:SS.mmm`), and the
 journal adds the date. Open TCP 8621 in your firewall if you run as a full participant.
 
+## FreeBSD rc.d
+
+From the next release, there is a FreeBSD binary (see
+[Installation](Installation#freebsd-netbsd-and-openbsd)). Run it under `daemon(8)`, which
+restarts it if it exits:
+
+```bash
+sudo pw useradd outpace -d /var/db/outpace -s /usr/sbin/nologin
+sudo install -d -o outpace -g outpace -m 0700 /var/db/outpace
+```
+
+`/usr/local/etc/rc.d/outpace` (mode `0755`):
+
+```sh
+#!/bin/sh
+# PROVIDE: outpace
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name=outpace
+rcvar=outpace_enable
+load_rc_config $name
+: ${outpace_enable:=NO}
+: ${outpace_user:=outpace}
+: ${outpace_env:="OUTPACE_BIND=127.0.0.1:6878 OUTPACE_RTMP_BIND=127.0.0.1:1935 OUTPACE_DATA_DIR=/var/db/outpace"}
+
+pidfile=/var/run/${name}.pid
+command=/usr/sbin/daemon
+command_args="-r -R 5 -P ${pidfile} -u ${outpace_user} -o /var/log/${name}.log /usr/local/bin/outpace serve"
+
+run_rc_command "$1"
+```
+
+```bash
+sudo sysrc outpace_enable=YES
+sudo service outpace start
+```
+
+`daemon -P` stops the supervisor and the daemon together, so `service outpace stop` shuts
+Outpace down gracefully. Add `outpace_env` to `/etc/rc.conf` to change settings.
+
 ## Behind a reverse proxy
 
 A proxy is the usual way to add TLS and authentication. Things to get right:

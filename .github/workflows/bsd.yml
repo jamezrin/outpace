@@ -1,0 +1,95 @@
+name: BSD portability
+
+# Cross-builds the BSD release targets on PRs that can change them, and starts the
+# FreeBSD binary inside a FreeBSD VM. Mirrors the BSD rows of release.yml.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/bsd.yml
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - tools/ci/smoke_daemon.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-build:
+    name: Cross-build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-freebsd
+            cross: x86_64-unknown-freebsd@14
+          - target: x86_64-unknown-netbsd
+            cross: x86_64-unknown-netbsd
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+          build-warnings: ""
+
+      - name: Install cross toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.cross }}
+
+      - name: Cross-build release binary
+        run: cargo build --locked --release -p ace-engine --bin outpace --target "${{ matrix.target }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: outpace-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/outpace
+          if-no-files-found: error
+          retention-days: 1
+
+  freebsd-smoke:
+    name: FreeBSD ${{ matrix.release }} startup and health smoke
+    needs: cross-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest and newest supported majors the FreeBSD 14 build is meant to cover.
+        release: ["14.3", "15.0"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download FreeBSD binary
+        uses: actions/download-artifact@v8
+        with:
+          name: outpace-x86_64-unknown-freebsd
+          path: freebsd-bin
+
+      - name: Start daemon in a FreeBSD VM and check health
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          prepare: pkg install -y curl
+          run: |
+            set -eu
+            chmod +x freebsd-bin/outpace
+            sh tools/ci/smoke_daemon.sh freebsd-bin/outpace

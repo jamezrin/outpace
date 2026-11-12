@@ -68,6 +68,16 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-24.04
             archive: tar.gz
+          # Built against the FreeBSD 14 sysroot so one binary runs on FreeBSD 14 and 15
+          # (including pfSense and OPNsense).
+          - target: x86_64-unknown-freebsd
+            cross: x86_64-unknown-freebsd@14
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: x86_64-unknown-netbsd
+            cross: x86_64-unknown-netbsd
+            os: ubuntu-24.04
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz
@@ -94,11 +104,11 @@ jobs:
           cache: false
           build-warnings: ""
 
-      - name: Install Linux cross toolchain
-        if: contains(matrix.target, 'unknown-linux-musl')
+      - name: Install cross toolchain
+        if: contains(matrix.target, 'unknown-linux-musl') || matrix.cross
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: ${{ matrix.cross || matrix.target }}
 
       - name: Test Windows executable resolution
         if: contains(matrix.target, 'windows')
@@ -179,7 +189,7 @@ jobs:
 
   publish-container:
     name: Publish GHCR image from release archives
-    # publish-release depends on all seven binary builds succeeding.
+    # publish-release depends on every binary build succeeding.
     needs: publish-release
     permissions:
       contents: read

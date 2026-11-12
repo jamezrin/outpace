@@ -14,6 +14,8 @@ TARGETS = {
     "aarch64-apple-darwin": "tar.gz",
     "x86_64-pc-windows-msvc": "zip",
     "aarch64-pc-windows-msvc": "zip",
+    "x86_64-unknown-freebsd": "tar.gz",
+    "x86_64-unknown-netbsd": "tar.gz",
 }
 LINUX = {
     "x86_64-unknown-linux-musl": "amd64",
@@ -28,7 +30,7 @@ def prepare(tag: str, assets: Path, output: Path) -> None:
     version = tag[1:]
     expected = {f"outpace-{version}-{target}.{ext}" for target, ext in TARGETS.items()}
     if {p.name for p in assets.iterdir()} != expected | {"SHA256SUMS"}:
-        raise ValueError("Release must contain exactly all seven expected archives and SHA256SUMS")
+        raise ValueError("Release must contain exactly every expected archive and SHA256SUMS")
     checksums = {}
     for line in (assets / "SHA256SUMS").read_text().splitlines():
         match = re.fullmatch(r"([0-9a-f]{64})  (outpace-[^/\\\s]+)", line)
@@ -36,7 +38,7 @@ def prepare(tag: str, assets: Path, output: Path) -> None:
             raise ValueError("Invalid or duplicate checksum entry")
         checksums[match[2]] = match[1]
     if set(checksums) != expected:
-        raise ValueError("Checksums must cover exactly all seven expected archives")
+        raise ValueError("Checksums must cover exactly every expected archive")
     for name, digest in checksums.items():
         archive = assets / name
         if archive.is_symlink() or not archive.is_file():
