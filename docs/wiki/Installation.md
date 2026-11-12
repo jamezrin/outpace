@@ -109,6 +109,8 @@ With the [GitHub CLI](https://cli.github.com):
 gh attestation verify "$artifact" --repo jamezrin/outpace-stream
 ```
 
+The `.deb` and `.rpm` packages are attested the same way.
+
 The same works for release images, including the `-minimal` ones, by tag or digest:
 
 ```bash

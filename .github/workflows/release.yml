@@ -235,12 +235,14 @@ jobs:
           sha256sum outpace-* outpace_* > SHA256SUMS
           cat SHA256SUMS
 
-      # Records which workflow run and commit built each archive. Verify with
-      # `gh attestation verify <archive> --repo <owner>/<repo>`.
+      # Records which workflow run and commit built each archive and package. Verify with
+      # `gh attestation verify <file> --repo <owner>/<repo>`.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/outpace-*
+          subject-path: |
+            dist/outpace-*
+            dist/outpace_*
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
