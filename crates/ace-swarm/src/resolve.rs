@@ -19,7 +19,7 @@ use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
 use ace_wire::infohash::{infohash_of_decoded_transport, transport_file_hash};
 use ace_wire::message::PeerMessage;
-use ace_wire::transport::decode_transport;
+use ace_wire::transport::{decode_transport, decode_transport_source, TransportSource};
 use base64ct::{Base64, Encoding};
 use rand::RngExt;
 use sha1::{Digest, Sha1};
@@ -75,8 +75,28 @@ const CATALOG_SIGNING_SECRET: &[u8] =
 // Public protocol interoperability constant, not a private server credential.
 const CATALOG_RESPONSE_KEY: &[u8] = b"CNVU\\\\w5S/HGg\"pSzY&O\"`uGCD18\\x0cfS|h2H4eJBihWumSD7zSv;8,=z2?<\\tl6ka\\n\\x0c*O<3dzOZ|MT11]f0 Xuc| R\"$D;SsYm\\rw*..8h7d4k";
 
+/// A validated HTTP(S) HLS origin described by a transport descriptor. It is not a swarm:
+/// callers hand the URL to a player (or the opt-in managed relay) and never cache it, because
+/// a signed query may expire or rotate.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HlsOrigin {
+    pub manifest_url: String,
+    pub metadata: StreamMetadata,
+}
+
+impl std::fmt::Debug for HlsOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Signed origin URLs belong only in explicit playback responses.
+        f.debug_struct("HlsOrigin").finish_non_exhaustive()
+    }
+}
+
 #[derive(PartialEq, Eq)]
 pub enum ResolveError {
+    /// The descriptor is a usable HLS origin, not a live swarm.
+    HlsOrigin(Box<HlsOrigin>),
+    /// A recognized HLS descriptor has no usable manifest.
+    Hls(&'static str),
     ProtectedContent,
     InvalidProtection,
     BadInfohash,
@@ -115,7 +135,7 @@ impl ResolveError {
             Self::ProtectedContent => Kind::ProtectedContent,
             Self::InvalidProtection => Kind::InvalidProtection,
             Self::BadInfohash => Kind::InvalidSelector,
-            Self::Transport(_) => Kind::InvalidDescriptor,
+            Self::HlsOrigin(_) | Self::Hls(_) | Self::Transport(_) => Kind::InvalidDescriptor,
             Self::Catalog(_) | Self::TransportTooLarge => Kind::RejectedMetadata,
             Self::Peer(_) | Self::CatalogNetwork(_) => Kind::Network,
             Self::Url(_) => Kind::Unclassified,
@@ -151,6 +171,8 @@ impl ResolveError {
 impl std::fmt::Debug for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::HlsOrigin(_) => f.write_str("HlsOrigin"),
+            Self::Hls(reason) => f.debug_tuple("Hls").field(reason).finish(),
             Self::ProtectedContent => f.write_str("ProtectedContent"),
             Self::InvalidProtection => f.write_str("InvalidProtection"),
             Self::BadInfohash => f.write_str("BadInfohash"),
@@ -172,6 +194,7 @@ impl std::fmt::Debug for ResolveError {
 fn protection_wire_error(error: ace_wire::WireError) -> ResolveError {
     match error {
         ace_wire::WireError::InvalidProtection => ResolveError::InvalidProtection,
+        ace_wire::WireError::Hls(reason) => ResolveError::Hls(reason),
         _ => ResolveError::Transport("decode failed"),
     }
 }
@@ -198,8 +221,26 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
         info.ensure_playable()?;
         return Err(ResolveError::Transport("not a live transport"));
     }
-    let d = decode_transport(bytes).map_err(protection_wire_error)?;
+    let d = match decode_transport_source(bytes).map_err(protection_wire_error)? {
+        TransportSource::Swarm(descriptor) => *descriptor,
+        TransportSource::Hls(descriptor) => {
+            validate_hls_manifest_url(&descriptor.manifest_url)?;
+            return Err(ResolveError::HlsOrigin(Box::new(HlsOrigin {
+                manifest_url: descriptor.manifest_url,
+                metadata: StreamMetadata {
+                    title: descriptor.title,
+                    bitrate: None,
+                    categories: descriptor.categories,
+                },
+            })));
+        }
+    };
     let protection = d.protection().map_err(protection_wire_error)?;
+    if d.is_multifile() {
+        return Err(ResolveError::Transport(
+            "multi-file descriptor is not a live stream",
+        ));
+    }
     validate_geometry(d.piece_length, d.chunk_length)?;
     // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip *and* a key
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
@@ -278,6 +319,11 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
     let total_length = d
         .vod_total_length()
         .ok_or(ResolveError::Transport("VOD descriptor missing length"))?;
+    if d.pieces.len() as u64 != total_length.div_ceil(d.piece_length) {
+        return Err(ResolveError::Transport(
+            "VOD piece count does not match length",
+        ));
+    }
     Ok(VodInfo {
         protection: Some(protection),
         infohash: infohash_of_decoded_transport(&d)
@@ -291,25 +337,72 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
     })
 }
 
+/// Require an ordinary, absolute HTTP(S) URL without ambiguous whitespace or userinfo.
+/// By default this URL is returned to the player, not fetched by the engine. Redirecting
+/// the complete manifest URL keeps relative variants, segments and signed queries relative
+/// to the origin. This is not the separate Acestream HLS-over-P2P distribution protocol.
+fn validate_hls_manifest_url(value: &str) -> Result<(), ResolveError> {
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'\\')
+    {
+        return Err(ResolveError::Hls("invalid HLS manifest URL"));
+    }
+    let url =
+        reqwest::Url::parse(value).map_err(|_| ResolveError::Hls("invalid HLS manifest URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !value.starts_with(&format!("{}://", url.scheme()))
+        || value
+            .split_once("://")
+            .is_none_or(|(_, rest)| rest.starts_with('/'))
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ResolveError::Hls("unsupported HLS manifest URL"));
+    }
+    Ok(())
+}
+
+/// Classified descriptor identity, without joining its swarm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptorInspection {
+    pub infohash: [u8; 20],
+    pub is_live: bool,
+    pub protection: ace_wire::protection::Protection,
+    /// Only a verified single-file VOD descriptor establishes a finite size.
+    pub total_length: Option<u64>,
+}
+
 /// Inspect supported descriptor identity and protection without joining its swarm.
-pub fn inspect_descriptor(
-    bytes: &[u8],
-) -> Result<([u8; 20], bool, ace_wire::protection::Protection), ResolveError> {
+pub fn inspect_descriptor(bytes: &[u8]) -> Result<DescriptorInspection, ResolveError> {
     if ace_wire::infohash::is_transport_file(bytes) {
         let descriptor = decode_transport(bytes).map_err(protection_wire_error)?;
-        let protection = descriptor.protection().map_err(protection_wire_error)?;
-        validate_geometry(descriptor.piece_length, descriptor.chunk_length)?;
-        let hash = infohash_of_decoded_transport(&descriptor)
-            .map_err(|_| ResolveError::Transport("infohash failed"))?;
-        Ok((hash, descriptor.is_live, protection))
-    } else {
-        let info = vod_info_from_transport(bytes)?;
-        Ok((
-            info.infohash,
-            false,
-            info.protection.expect("decoded metainfo inspection"),
-        ))
+        if descriptor.is_live {
+            let protection = descriptor.protection().map_err(protection_wire_error)?;
+            if descriptor.is_multifile() {
+                return Err(ResolveError::Transport(
+                    "multi-file descriptor is not a live stream",
+                ));
+            }
+            validate_geometry(descriptor.piece_length, descriptor.chunk_length)?;
+            let infohash = infohash_of_decoded_transport(&descriptor)
+                .map_err(|_| ResolveError::Transport("infohash failed"))?;
+            return Ok(DescriptorInspection {
+                infohash,
+                is_live: true,
+                protection,
+                total_length: None,
+            });
+        }
     }
+    let info = vod_info_from_transport(bytes)?;
+    Ok(DescriptorInspection {
+        infohash: info.infohash,
+        is_live: false,
+        protection: info.protection.expect("decoded VOD inspection"),
+        total_length: Some(info.total_length),
+    })
 }
 
 /// Validate untrusted transport geometry before it becomes a [`StreamInfo`].
@@ -1226,11 +1319,159 @@ mod tests {
 
     #[test]
     fn vod_info_rejects_missing_length() {
-        let tf = vod_transport(20, None, false);
+        for length in [None, Some(0), Some(-1)] {
+            let tf = vod_transport(20, length, false);
+            assert!(matches!(
+                vod_info_from_transport(&tf),
+                Err(ResolveError::Transport(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn wrapped_vod_requires_exact_piece_count_for_its_length() {
+        for length in [1, 131_071, 131_072, 131_073, 262_144, 262_145, i64::MAX] {
+            for count in 1..=3 {
+                let bytes = vod_transport(count * 20, Some(length), false);
+                let expected = count as u64 == (length as u64).div_ceil(131_072);
+                let vod = vod_info_from_transport(&bytes);
+                assert_eq!(vod.is_ok(), expected, "length={length}, pieces={count}");
+                assert_eq!(
+                    inspect_descriptor(&bytes).is_ok(),
+                    expected,
+                    "inspect length={length}, pieces={count}"
+                );
+                if !expected {
+                    assert!(matches!(
+                        vod,
+                        Err(ResolveError::Transport(
+                            "VOD piece count does not match length"
+                        ))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_wrapped_pieces_are_terminal_not_live() {
+        use ace_wire::bencode::Bencode;
+        for value in [
+            Bencode::Bytes(vec![]),
+            Bencode::Bytes(vec![0; 19]),
+            Bencode::Bytes(vec![0; 21]),
+            Bencode::Int(0),
+            Bencode::List(vec![]),
+        ] {
+            let Bencode::Dict(mut raw) = decode_transport(&vod_transport(20, Some(16_384), false))
+                .unwrap()
+                .raw
+            else {
+                unreachable!()
+            };
+            raw.insert(b"pieces".to_vec(), value);
+            let bytes = ace_wire::transport::encode_transport(&Bencode::Dict(raw));
+            assert!(inspect_descriptor(&bytes).is_err());
+            assert!(vod_info_from_transport(&bytes).is_err());
+            assert!(stream_info_from_transport(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn any_multifile_marker_is_rejected_without_live_or_single_file_fallback() {
+        use ace_wire::bencode::Bencode;
+        for value in [
+            Bencode::List(vec![]),
+            Bencode::Int(0),
+            Bencode::Bytes(vec![]),
+            Bencode::Dict(Default::default()),
+        ] {
+            for with_pieces in [false, true] {
+                let Bencode::Dict(mut raw) =
+                    decode_transport(&vod_transport(20, Some(16_384), false))
+                        .unwrap()
+                        .raw
+                else {
+                    unreachable!()
+                };
+                if !with_pieces {
+                    raw.remove(b"pieces".as_slice());
+                }
+                raw.insert(b"files".to_vec(), value.clone());
+                let bytes = ace_wire::transport::encode_transport(&Bencode::Dict(raw));
+                assert!(inspect_descriptor(&bytes).is_err());
+                assert!(vod_info_from_transport(&bytes).is_err());
+                assert!(stream_info_from_transport(&bytes).is_err());
+            }
+        }
+    }
+
+    fn hls_transport() -> Vec<u8> {
+        let raw = ace_wire::bencode::Bencode::parse(
+            include_bytes!("../../../tests/vectors/hls-descriptor.bencode")
+                .strip_suffix(b"\n")
+                .unwrap(),
+        )
+        .unwrap();
+        ace_wire::transport::encode_transport(&raw)
+    }
+
+    #[test]
+    fn hls_descriptor_resolves_to_an_origin_instead_of_swarm_geometry() {
+        let bytes = hls_transport();
+        let Err(ResolveError::HlsOrigin(origin)) = stream_info_from_transport(&bytes) else {
+            panic!("expected HLS origin")
+        };
+        assert!(origin.manifest_url.ends_with("?token=a%2Fb&expires=123"));
+        assert_eq!(
+            origin.metadata.title.as_deref(),
+            Some("Synthetic HLS fixture")
+        );
+        assert_eq!(origin.metadata.bitrate, None);
+        assert_eq!(origin.metadata.categories, vec!["fixture"]);
+        let debug = format!("{:?}", ResolveError::HlsOrigin(origin));
+        assert!(!debug.contains("cdn.example.test") && !debug.contains("token"));
         assert!(matches!(
-            vod_info_from_transport(&tf),
-            Err(ResolveError::Transport(_))
+            vod_info_from_transport(&bytes),
+            Err(ResolveError::Hls(_))
         ));
+        assert!(matches!(
+            inspect_descriptor(&bytes),
+            Err(ResolveError::Hls(_))
+        ));
+    }
+
+    #[test]
+    fn hls_origin_accepts_http_https_and_preserves_the_url_bytes() {
+        for url in [
+            "http://cdn.example.test/path/master.m3u8",
+            "https://cdn.example.test:8443/a%2Fb/master.m3u8?token=a%2Fb%3D&x=1&x=2",
+        ] {
+            assert_eq!(validate_hls_manifest_url(url), Ok(()));
+        }
+    }
+
+    #[test]
+    fn hls_origin_rejects_non_http_credentials_and_ambiguous_input() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://cdn.example.test/live",
+            "/relative.m3u8",
+            "javascript:alert(1)",
+            "http:///cdn.example.test/x",
+            "http:cdn.example.test/x",
+            "HTTP://cdn.example.test/x",
+            "https://user:password@cdn.example.test/x",
+            "https://cdn.example.test/a\rb",
+            "https://cdn.example.test/a b",
+            "https://cdn.example.test/a\\b",
+            "http://",
+        ] {
+            assert!(
+                matches!(validate_hls_manifest_url(url), Err(ResolveError::Hls(_))),
+                "{url}"
+            );
+        }
     }
 
     #[test]
@@ -1463,7 +1704,7 @@ mod tests {
             Err(ResolveError::ProtectedContent)
         );
         assert_eq!(
-            inspect_descriptor(&bytes).unwrap().2,
+            inspect_descriptor(&bytes).unwrap().protection,
             ace_wire::protection::Protection::Protected
         );
     }

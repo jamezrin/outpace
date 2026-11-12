@@ -108,6 +108,8 @@ pub struct ResolvedContent {
     pub content_id: Option<String>,
     /// Whether this is a live stream (the primary outpace path). A bare infohash is assumed live.
     pub is_live: bool,
+    /// Only a verified single-file VOD descriptor establishes a finite size.
+    pub total_length: Option<u64>,
 }
 
 /// Resolve the selectors that need no network — a direct `infohash` or a `magnet` link.
@@ -123,6 +125,7 @@ pub fn resolve_offline(sel: &Selector) -> Option<Result<ResolvedContent, String>
                 infohash: infohash_hex(&bytes),
                 content_id: None,
                 is_live: true,
+                total_length: None,
             }),
             Err(_) => Err(format!("invalid infohash: {h}")),
         }),
@@ -132,6 +135,7 @@ pub fn resolve_offline(sel: &Selector) -> Option<Result<ResolvedContent, String>
                 infohash: hex,
                 content_id: None,
                 is_live: true,
+                total_length: None,
             }),
             Err(e) => Err(format!("invalid magnet: {e:?}")),
         }),
@@ -193,13 +197,21 @@ pub fn content_id_result(content_id: &str) -> Value {
 }
 
 /// `get_media_files` result: outpace transports are single-file, so this reports one media file
-/// keyed by the infohash. `dump_transport_file` is intentionally unsupported (see the matrix).
+/// keyed by the infohash. A decoded descriptor also reports its classified `type` (the public
+/// Android SDK `MediaFile` reads `type`, not `is_live`) and, for verified single-file VOD, its
+/// `size`. `dump_transport_file` is intentionally unsupported (see the matrix).
 pub fn media_files_result(c: &ResolvedContent) -> Value {
     let mut file = json!({
         "infohash": c.infohash,
         "index": 0,
         "is_live": bool_flag(c.is_live),
     });
+    if c.protection.is_some() {
+        file["type"] = json!(if c.is_live { "live" } else { "vod" });
+    }
+    if let Some(length) = c.total_length {
+        file["size"] = json!(length);
+    }
     if c.is_live {
         // Live output is always MPEG-TS. The public Android SDK reads `mime` (and shows
         // `filename`) before choosing an output route, without a null check. The name is a
@@ -330,6 +342,7 @@ mod tests {
             infohash: "aa".repeat(20),
             content_id: Some("cid".to_string()),
             is_live: true,
+            total_length: None,
         };
         let v = analyze_result(&c);
         assert_eq!(v["infohash"], "aa".repeat(20));
@@ -345,11 +358,14 @@ mod tests {
             infohash: "bb".repeat(20),
             content_id: None,
             is_live: false,
+            total_length: Some(123_456),
         };
         let v = media_files_result(&c);
         assert_eq!(v["infohash"], "bb".repeat(20));
         assert_eq!(v["files"][0]["infohash"], "bb".repeat(20));
         assert_eq!(v["files"][0]["is_live"], 0);
+        assert_eq!(v["files"][0]["type"], "vod");
+        assert_eq!(v["files"][0]["size"], 123_456);
         assert!(
             v["files"][0].get("mime").is_none(),
             "VOD type is not inferred"
@@ -364,6 +380,7 @@ mod tests {
             infohash: "bb".repeat(20),
             content_id: None,
             is_live: true,
+            total_length: None,
         };
         let v = media_files_result(&c);
         assert_eq!(v["files"][0]["is_live"], 1);
@@ -373,6 +390,45 @@ mod tests {
             v["files"][0].get("size").is_none(),
             "live size is not fabricated"
         );
+        assert!(
+            v["files"][0].get("type").is_none(),
+            "an unclassified infohash has no descriptor type"
+        );
+        let classified = ResolvedContent {
+            protection: Some(ace_wire::protection::Protection::Public),
+            ..c
+        };
+        assert_eq!(media_files_result(&classified)["files"][0]["type"], "live");
+    }
+
+    #[test]
+    fn classified_descriptors_report_type_and_only_verified_vod_size() {
+        let inspected = |bytes: &[u8]| {
+            let inspection = ace_swarm::resolve::inspect_descriptor(bytes).unwrap();
+            ResolvedContent {
+                protection: Some(inspection.protection),
+                infohash: infohash_hex(&inspection.infohash),
+                content_id: None,
+                is_live: inspection.is_live,
+                total_length: inspection.total_length,
+            }
+        };
+        let live = inspected(include_bytes!(
+            "../../../tests/vectors/transport/synthetic-live-512k.bin"
+        ));
+        let file = &media_files_result(&live)["files"][0];
+        assert_eq!(file["type"], "live");
+        assert!(file.get("size").is_none());
+
+        let torrent =
+            include_bytes!("../../../tests/vectors/metainfo/single-file-unsorted.torrent");
+        let length = ace_swarm::resolve::vod_info_from_transport(torrent)
+            .unwrap()
+            .total_length;
+        let file = &media_files_result(&inspected(torrent))["files"][0];
+        assert_eq!(file["type"], "vod");
+        assert_eq!(file["size"], length);
+        assert!(file.get("mime").is_none() && file.get("filename").is_none());
     }
 
     #[test]
