@@ -35,10 +35,12 @@ clean public API that carries **no ace/acestream naming**.
 ## Non-goals (explicitly later / never)
 
 - **Stream-name search (scope revised by #212 / #213; implementation #406)** — a bounded
-  AceStream index/search service adapter is planned within v1.0.0, in this repository,
-  behind a separate explicit, default-off services setting. It is not implemented.
-  Current upstream access and the named client's search-result-to-content-ID/verified-descriptor
-  path must be established before implementation. HTTP compatibility alone must not opt in.
+  AceStream index/search service adapter is implemented behind separate explicit, default-off
+  `OUTPACE_COMPAT_ACESTREAM_SERVICES`, using the native signed HTTP service protocol without
+  operator API-key provisioning.
+  See `docs/wiki/Stream-Search.md` for the bounded API and upstream-access limits. Current-client
+  integration uses explicit infohash selectors and existing descriptor verification; older
+  reverse-content-ID clients remain unsupported. HTTP compatibility alone does not opt in.
 - **DHT name search / aggregate playlist** — an independent bounded feasibility spike in
   #213, not a committed production feature or prerequisite for service-backed search.
   The original reserved routes below do not establish an implemented API contract.
@@ -169,7 +171,7 @@ infohash for that network.
 | `GET /networks` | JSON list of registered providers (v1: `["ace"]`). |
 | `DELETE /streams/{network}/{id}` | Force-stop a session (optional admin). |
 | `GET /healthz` | Liveness. |
-| *(historical reservation, not implemented)* `GET /search?q=&network=`, `GET /playlist.m3u8` | Superseded for service-backed search by #406's client contract (`query`, `page`, `page_size`, optional `category`); DHT search/aggregate remains feasibility research only. |
+| *(historical reservation)* `GET /search?q=&network=`, `GET /playlist.m3u8` | Superseded for service-backed search by #406's client contract (`query`, `page`, `page_size`, optional `category`); DHT search/aggregate remains feasibility research only. |
 
 Example: `http://localhost:PORT/streams/ace/cid2.ts`.
 JSON uses clean names only (`network`, `stream`, `peers`, `bitrate`, `buffer`, `clients`) —

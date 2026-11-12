@@ -20,6 +20,7 @@ dependencies = [
  "clap",
  "dirs",
  "flate2",
+ "form_urlencoded",
  "futures",
  "hex",
  "libc",
