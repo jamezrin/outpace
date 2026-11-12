@@ -22,9 +22,9 @@ file on the [releases page](https://github.com/jamezrin/outpace-stream/releases)
 | Linux x86_64 | `x86_64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARM64 (aarch64) | `aarch64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARMv7 hard-float (Raspberry Pi 2/3 class) | `armv7-unknown-linux-musleabihf` | `.tar.gz` |
-| FreeBSD 14 and 15 x86_64, from the next release | `x86_64-unknown-freebsd` | `.tar.gz` |
 | Linux ARMv6 hard-float (Raspberry Pi Zero/1 class), from the next release | `arm-unknown-linux-musleabihf` | `.tar.gz` |
 | Linux RISC-V 64, from the next release | `riscv64gc-unknown-linux-musl` | `.tar.gz` |
+| FreeBSD 14 and 15 x86_64, from the next release | `x86_64-unknown-freebsd` | `.tar.gz` |
 | macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
