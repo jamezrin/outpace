@@ -464,6 +464,7 @@ fn synthetic_app(manager: Arc<StreamManager>) -> axum::Router {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: true,
+        origin_hls: None,
         broadcasts: None,
     })
 }
@@ -549,6 +550,7 @@ async fn vod_http_contract_is_identical_with_normalization_enabled_or_disabled()
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(AceSessionStore::default()),
             experimental_ace_compat: true,
+            origin_hls: None,
             broadcasts: None,
         });
         let mut observed = Vec::new();

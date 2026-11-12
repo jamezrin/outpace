@@ -44,6 +44,7 @@ use tokio::sync::broadcast::error::RecvError;
 mod broadcast;
 mod broadcast_source;
 mod compat;
+mod origin_hls;
 mod streams;
 mod support;
 mod vod;
@@ -51,6 +52,7 @@ mod vod;
 use broadcast::*;
 use broadcast_source::*;
 use compat::*;
+use origin_hls::*;
 use streams::*;
 use vod::*;
 
@@ -114,6 +116,8 @@ pub struct AppState {
     /// Supported, opt-in Acestream HTTP subset. Native `/streams` and
     /// `/broadcast` routes remain available regardless of this flag.
     pub experimental_ace_compat: bool,
+    /// Opt-in managed origin-HLS relay (`OUTPACE_MANAGED_HLS`); `None` keeps direct handoff.
+    pub origin_hls: Option<Arc<crate::origin_hls::OriginHls>>,
     /// B1: origination state. `None` disables `PUT /broadcast/{name}` (404) — e.g. in tests
     /// that don't need it.
     pub broadcasts: Option<BroadcastState>,
@@ -271,6 +275,12 @@ pub fn router_with_support(
     let compat = state.experimental_ace_compat;
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/origin-hls/status", get(origin_hls_status))
+        .route("/origin-hls/{token}/{id}", get(origin_hls_resource))
+        .route(
+            "/origin-hls/{token}",
+            axum::routing::delete(origin_hls_stop),
+        )
         .route("/debug/memstats", get(debug_memstats))
         .route("/networks", get(networks))
         .route("/network-policy", get(network_policy))

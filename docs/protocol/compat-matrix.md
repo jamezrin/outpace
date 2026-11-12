@@ -146,6 +146,23 @@ message-based timeout-to-504 mapping. Direct `getstream` and HLS creation retain
 their 404 start-failure behavior. These are **Outpace-pinned** statuses, not an
 established official-engine error matrix.
 
+### Origin HLS descriptors
+
+A descriptor that names an HTTP(S) HLS manifest takes precedence over the requested
+output route: `/ace/getstream` does not relabel it as TS and `/ace/manifest.m3u8` does
+not repackage it. No swarm session or stat/command lease is created.
+
+- **Default (direct handoff).** Default and `redirect` playback answer `302` to the
+  origin URL with `no-store`. Early-resolved `format=json` returns `playback_url` (the
+  origin URL), `is_direct: true`, `transport: "hls"`, `content_id` and descriptor
+  `metadata`. A TS JSON lease whose source resolves late redirects its `playback_url`
+  to the origin and revokes itself.
+- **`OUTPACE_MANAGED_HLS=1` (managed relay, default off).** The same starts return
+  a local `/origin-hls/<token>/0.m3u8` URL instead. JSON keeps `is_direct: true` and
+  adds `managed_origin: true` and `stop_url`; `DELETE stop_url` returns `204` once,
+  then `404`. Relay statuses, limits and the outbound fetch policy are described in
+  [Origin HLS](../native-api.md#origin-hls).
+
 ## Selectors and provenance
 
 Use URL encoding for selector values (especially nested URLs and magnets). Empty

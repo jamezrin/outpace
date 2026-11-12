@@ -25,10 +25,13 @@ pub(super) async fn ace_getstream(
     };
     if let Some(origin) = &selection.hls_origin {
         return origin_hls_response(
+            &s,
+            &headers,
             origin,
             selection.content_id.as_deref(),
             mode == AceGetstreamMode::Json,
-        );
+        )
+        .await;
     }
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }))
@@ -96,7 +99,7 @@ pub(super) async fn ace_getstream(
         }
         Err(ProviderError::DirectHls(origin)) => {
             s.ace_sessions.revoke(&playback_id, &token);
-            origin_hls_redirect(&origin.manifest_url)
+            resolved_origin_redirect(&s, &origin.manifest_url).await
         }
         Err(_) => {
             s.ace_sessions.revoke(&playback_id, &token);
@@ -128,7 +131,14 @@ pub(super) async fn ace_manifest(
     };
     let json_mode = format == "json";
     if let Some(origin) = &selection.hls_origin {
-        return origin_hls_response(origin, selection.content_id.as_deref(), json_mode);
+        return origin_hls_response(
+            &s,
+            &headers,
+            origin,
+            selection.content_id.as_deref(),
+            json_mode,
+        )
+        .await;
     }
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }))
@@ -149,7 +159,14 @@ pub(super) async fn ace_manifest(
             };
         }
         Err(ProviderError::DirectHls(origin)) => {
-            return origin_hls_response(&origin, selection.content_id.as_deref(), json_mode);
+            return origin_hls_response(
+                &s,
+                &headers,
+                &origin,
+                selection.content_id.as_deref(),
+                json_mode,
+            )
+            .await;
         }
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -496,7 +513,7 @@ pub(super) async fn ace_playback(
                     if !s.ace_sessions.revoke(&id, &token) {
                         return StatusCode::NOT_FOUND.into_response();
                     }
-                    return origin_hls_redirect(&origin.manifest_url);
+                    return resolved_origin_redirect(&s, &origin.manifest_url).await;
                 }
                 ProviderError::NotFound => (StatusCode::NOT_FOUND, "NotFound", ""),
                 ProviderError::ProtectedContent => (
@@ -1020,29 +1037,62 @@ pub(super) async fn resolve_ace_selection(
 }
 
 /// HLS descriptors refer to an existing origin. Do not mint swarm/control leases or relabel
-/// an HLS manifest as MPEG-TS: the player follows the origin URL and owns buffering.
-fn origin_hls_response(origin: &HlsOrigin, content_id: Option<&str>, json_mode: bool) -> Response {
-    if json_mode {
-        return (
-            [(header::CACHE_CONTROL, "no-store")],
-            Json(json!({
-                "response": {
-                    "playback_url": origin.manifest_url,
-                    // Clients must not require local status/command URLs for this handoff.
-                    "is_direct": true,
-                    "content_id": content_id,
-                    "transport": "hls",
-                    "metadata": stream_metadata_json(&origin.metadata),
-                },
-                "error": null
-            })),
-        )
-            .into_response();
+/// an HLS manifest as MPEG-TS. Without the managed relay the player follows the origin URL
+/// and owns buffering; with it, the player gets a local lease plus an explicit stop URL.
+async fn origin_hls_response(
+    s: &AppState,
+    headers: &HeaderMap,
+    origin: &HlsOrigin,
+    content_id: Option<&str>,
+    json_mode: bool,
+) -> Response {
+    let managed = match &s.origin_hls {
+        Some(relay) => match relay.start(&origin.manifest_url).await {
+            Ok(playback) => Some(playback),
+            Err(error) => return origin_hls_error(error),
+        },
+        None => None,
+    };
+    if !json_mode {
+        return origin_hls_redirect(
+            managed
+                .as_ref()
+                .map_or(&origin.manifest_url, |p| &p.playback_url),
+        );
     }
-    origin_hls_redirect(&origin.manifest_url)
+    let mut response = json!({
+        // Clients must not require local status/command URLs for this handoff.
+        "playback_url": origin.manifest_url,
+        "is_direct": true,
+        "content_id": content_id,
+        "transport": "hls",
+        "metadata": stream_metadata_json(&origin.metadata),
+    });
+    if let Some(playback) = managed {
+        let base = request_base(headers);
+        response["playback_url"] = json!(format!("{base}{}", playback.playback_url));
+        response["stop_url"] = json!(format!("{base}{}", playback.stop_url));
+        response["managed_origin"] = json!(true);
+    }
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "response": response, "error": null })),
+    )
+        .into_response()
 }
 
-pub(super) fn origin_hls_redirect(url: &str) -> Response {
+/// Redirect a late-resolved origin: through a fresh relay lease when managed, else directly.
+pub(super) async fn resolved_origin_redirect(s: &AppState, url: &str) -> Response {
+    match &s.origin_hls {
+        Some(relay) => match relay.start(url).await {
+            Ok(playback) => origin_hls_redirect(&playback.playback_url),
+            Err(error) => origin_hls_error(error),
+        },
+        None => origin_hls_redirect(url),
+    }
+}
+
+fn origin_hls_redirect(url: &str) -> Response {
     (
         StatusCode::FOUND,
         [

@@ -51,6 +51,9 @@ outpace broadcast sports --public-host stream.example
 | `GET /streams/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Retained live HLS segment. Missing, expired, or not-yet-produced segments return `404`; a segment request alone never starts a stream. |
 | `GET /streams/<network>/<id>/status` | `200 application/json` | Active-session status; `404` before playback starts or after teardown. |
 | `DELETE /streams/<network>/<id>` | `204` | Force-stops an active session; `404` if inactive. A `.ts` or `.m3u8` suffix is also accepted. |
+| `GET /origin-hls/status` | `200 application/json`, `{"enabled":false,"active_sessions":0}` | Managed origin-HLS relay state; never contains tokens or origin URLs. See [Origin HLS](#origin-hls). |
+| `GET /origin-hls/<token>/<resource>` | `200`/`206` playlist or media | Only with `OUTPACE_MANAGED_HLS=1`; otherwise `404`. |
+| `DELETE /origin-hls/<token>` | `204` | Stops one managed origin-HLS viewer; `404` if unknown, expired or already stopped. |
 | `GET /vod/<network>/<id>` | `200` or `206` streaming body | Verified single-file VOD. Supports one byte range and advertises `Accept-Ranges: bytes`; an unsatisfiable range returns `416`. |
 | `GET /vod/<network>/<id>/manifest.m3u8` | `200 application/vnd.apple.mpegurl` | Static VOD HLS playlist. |
 | `GET /vod/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Verified VOD HLS segment. |
@@ -379,6 +382,66 @@ descriptors without metadata return `null`, `null`, and `[]` respectively.
 The descriptor title is authoritative for both `metadata.title` and `Icy-Name`; outpace does not
 invent a title.
 Live HLS media playlists are unchanged because they have no portable stream-title field.
+
+## Origin HLS
+
+Some descriptors carry no swarm: they name an HTTP(S) HLS manifest. These are not
+peer-to-peer sources, so outpace never opens a session for them.
+
+**Default: direct handoff.** Live playback routes (`/streams/…`, `/ace/getstream`,
+`/ace/manifest.m3u8`, and a compat JSON lease's `playback_url`) answer `302` with the
+origin URL and `Cache-Control: no-store`. The player then talks to the origin itself.
+Compat JSON starts that resolve early return `playback_url` (the origin URL),
+`is_direct: true` and `transport: "hls"`, without stat or command URLs. The daemon makes
+no outbound request to the origin.
+
+**Opt-in: managed relay (`OUTPACE_MANAGED_HLS=1`).** The same routes instead create a
+per-viewer relay lease and redirect to `/origin-hls/<token>/0.m3u8`. JSON starts add
+`managed_origin: true` and a `stop_url`; `DELETE stop_url` ends only that viewer. The
+relay rewrites master variants, alternate renditions, I-frame playlists, media segments
+and initialization maps to local URLs. Origin URLs and their signatures never reach the
+player. Media sequence numbers, discontinuities, programme date-time, byte ranges and
+`ENDLIST` are preserved. The relay neither transcodes nor buffers: the player chooses
+variants and pulls segments, and each request is fetched from the origin (or from a
+short cache).
+
+Enabling the relay makes the daemon fetch URLs supplied by descriptors, so every fetch
+runs under the public-destination policy:
+
+- Only HTTP(S) is accepted, without credentials.
+- Every request and every redirect is resolved, and the resolved address is checked.
+  Loopback, private, link-local (including cloud metadata), CGNAT, unique-local,
+  multicast and unspecified addresses are refused. There is no operator override.
+- The connection is pinned to the checked address. System proxies, cookies and ambient
+  authorization are not used.
+- At most three redirects are followed, and HTTPS-to-HTTP redirects fail.
+- Each acquisition, including queueing, has a 30-second deadline.
+- Playlists are capped at 1 MiB, 16 KiB per line and 512 references; media responses at
+  16 MiB.
+
+Capacity is bounded too: at most 64 viewers, 16 admitted client requests and four
+concurrent upstream fetches. Each viewer keeps at most 1,024 URL entries and 512 KiB of
+URL text. A viewer expires after 60 seconds idle, and after six hours in any case. Media
+is cached only with explicit fresh origin permission, for at most 30 seconds, within a
+global budget of 16 MiB and 1,024 entries.
+
+Relay errors are plain-text codes with `no-store`:
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_hls_origin`, `invalid_origin_range` | Refused origin URL or destination, or an invalid `Range` |
+| `404` | `origin_not_found`, `origin_cancelled` | Unknown, expired or stopped token or resource |
+| `415` | `unsupported_origin_playlist` | Unsupported HLS feature, or a query string on a relay URL |
+| `502` | `invalid_origin_playlist`, `origin_resource_limit`, fetch codes | The origin response was invalid, too large or failed |
+| `503` | `origin_capacity` | Viewer or admission limit reached |
+| `504` | `origin_timeout`, timeout fetch codes | Acquisition deadline |
+
+Encrypted keys, content steering, variable substitution, low-latency HLS
+(parts, preload hints, delta updates), `If-Range` and query-based playlist reloads are
+unsupported. The relay has no swarm statistics, peer controls, audio conversion or
+timeshift. `GET /origin-hls/status` reports only `enabled` and `active_sessions`. Idle
+checks must look at it as well as `/streams`, because relay viewers are not stream
+sessions.
 
 ## Content-id resolution
 

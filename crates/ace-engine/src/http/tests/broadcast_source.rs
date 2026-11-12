@@ -199,6 +199,7 @@ async fn source_runtime() -> (AppState, crate::runtime::EngineRuntime) {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: false,
+        origin_hls: None,
         broadcasts: Some(runtime.broadcasts.clone()),
     };
     (app, runtime)

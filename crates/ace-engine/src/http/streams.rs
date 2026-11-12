@@ -138,13 +138,13 @@ pub(super) async fn stream_segment(
 /// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
 /// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
 /// that text. Protection policy failures also return 422 with their stable message.
-/// Capacity returns 503 with Retry-After; an origin HLS source is a `302` handoff without a
-/// local session; other failures retain bodiless 404.
-fn stream_start_error(e: ProviderError) -> Response {
+/// Capacity returns 503 with Retry-After; an origin HLS source is a `302` handoff (to the origin,
+/// or to a managed relay lease) without a swarm session; other failures retain bodiless 404.
+async fn stream_start_error(s: &AppState, e: ProviderError) -> Response {
     match e {
         ProviderError::CapacityExhausted => capacity_error(),
         ProviderError::DirectHls(origin) => {
-            super::compat::origin_hls_redirect(&origin.manifest_url)
+            super::compat::resolved_origin_redirect(s, &origin.manifest_url).await
         }
         e @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
@@ -206,7 +206,7 @@ pub(super) async fn stream_file_with_hls_timeout(
                 )
                     .into_response()
             }
-            Err(e) => stream_start_error(e),
+            Err(e) => stream_start_error(&s, e).await,
         };
     }
     let id = if let Some(id) = file.strip_suffix(".ts") {
@@ -225,7 +225,7 @@ pub(super) async fn stream_file_with_hls_timeout(
     };
     let session = match s.manager.get_or_subscribe(&network, &id).await {
         Ok(sess) => sess,
-        Err(e) => return stream_start_error(e),
+        Err(e) => return stream_start_error(&s, e).await,
     };
     stream_session_response(session, s.manager.hls_startup_timeout()).await
 }

@@ -47,6 +47,7 @@ async fn native_protection_refusals_preserve_policy_text_before_source_work() {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: false,
+        origin_hls: None,
         broadcasts: None,
     });
     let mut observed = Vec::new();
@@ -235,6 +236,7 @@ async fn url_protection_preparation_refuses_raw_and_disk_without_leases_or_opens
                 resolve_content_ids_in_getstream: true,
                 ace_sessions: leases.clone(),
                 experimental_ace_compat: true,
+                origin_hls: None,
                 broadcasts: None,
             };
             let response = URL_DESCRIPTOR_BYTES.scope(
