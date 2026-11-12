@@ -47,6 +47,7 @@ from `main`; **srt build** means binaries built with the `srt` feature.
 | [`OUTPACE_MAX_REASM_PIECES_AHEAD`](Configuration#live-recovery-advanced) | `512` | all | Pieces accepted ahead of the playback cursor. |
 | [`OUTPACE_MAX_SESSIONS`](Configuration#limits-and-admission) | `0` (unlimited) | all | Cap on concurrent sources. |
 | [`OUTPACE_MAX_UNCHOKED`](Configuration#seeding-and-inbound-peers) | `8` | all | Stable desired unchoke count per stream, plus one rotating optimistic peer. `0` still selects one optimistic peer; this is not an instantaneous wire-visible cap. |
+| [`OUTPACE_METRICS`](Configuration#diagnostics) | `false` | all | Serve Prometheus metrics at `GET /metrics`. |
 | [`OUTPACE_PEER_LISTEN`](Configuration#network-and-listeners) | `0.0.0.0:8621` | all | TCP peer listener. Its port is also the announced port. |
 | [`OUTPACE_PORT_MAP_BACKEND`](Configuration#nat-and-port-mapping) | `auto` | all | `auto`, `upnp`, `natpmp` or `none`. |
 | [`OUTPACE_PORT_MAP_EXTERNAL_PORT`](Configuration#nat-and-port-mapping) | the peer port | all | External port to request from the router. |

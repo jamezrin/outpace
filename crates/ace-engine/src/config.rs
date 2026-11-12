@@ -472,6 +472,9 @@ config_with_root_redaction! {
     /// Serve resolved origin HLS through a bounded local relay instead of handing the client
     /// the origin URL. Off by default. `OUTPACE_MANAGED_HLS`.
     pub managed_hls: bool,
+    /// Serve Prometheus text metrics at `GET /metrics` on the HTTP bind. Off by default.
+    /// `OUTPACE_METRICS`.
+    pub metrics: bool,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
     pub bep9_content_id_fallback: bool,
     /// Immutable per-name origination profiles, applied only at identity admission.
@@ -534,6 +537,7 @@ impl Default for Config {
             experimental_ace_compat: false,
             acestream_services: Default::default(),
             managed_hls: false,
+            metrics: false,
             bep9_content_id_fallback: false,
             broadcast_options: BTreeMap::new(),
             broadcast_sources: BTreeMap::new(),
@@ -814,6 +818,7 @@ mod tests {
             "Acestream HTTP compatibility must be opt-in"
         );
         assert!(!c.managed_hls, "managed origin HLS must remain opt-in");
+        assert!(!c.metrics, "the metrics endpoint must remain opt-in");
         assert!(
             !c.enable_port_mapping,
             "port mapping must default OFF so merging has zero effect on default operation"
