@@ -267,6 +267,7 @@ struct StallClock {
     pending: bool,
     accepted: bool,
     since: Option<Instant>,
+    capacity_paused: Option<Instant>,
 }
 impl StallClock {
     fn pending(&mut self, now: Instant) {
@@ -286,8 +287,22 @@ impl StallClock {
         self.accepted = false;
         self.since = self.pending.then_some(now);
     }
+    fn pause_capacity(&mut self, now: Instant) {
+        self.capacity_paused.get_or_insert(now);
+    }
+    fn resume_capacity(&mut self, now: Instant) {
+        if let Some(paused) = self.capacity_paused.take() {
+            if let Some(since) = self.since.as_mut() {
+                *since += now.saturating_duration_since(paused.max(*since));
+            }
+        }
+    }
     fn deadline(&self) -> Option<Instant> {
-        self.since.map(|t| t + STALL)
+        if self.capacity_paused.is_some() {
+            None
+        } else {
+            self.since.map(|t| t + STALL)
+        }
     }
 }
 
@@ -297,6 +312,55 @@ struct Progress {
     changed: Notify,
     // Publication and teardown share this lock: no feed can follow fencing.
     publishing: Mutex<bool>,
+}
+
+// A ready reservation does not alter the stall clock. Only an observed Pending
+// pauses it; Drop resumes even when select cancellation discards the future.
+struct CapacityPause {
+    progress: Arc<Progress>,
+    paused: bool,
+}
+impl Drop for CapacityPause {
+    fn drop(&mut self) {
+        if self.paused {
+            self.progress
+                .clock
+                .lock()
+                .unwrap()
+                .resume_capacity(Instant::now());
+            self.progress.changed.notify_one();
+        }
+    }
+}
+async fn reserve_capacity<F: std::future::Future>(
+    future: F,
+    progress: Arc<Progress>,
+    _observer: &Observer,
+) -> F::Output {
+    let mut pause = CapacityPause {
+        progress,
+        paused: false,
+    };
+    tokio::pin!(future);
+    std::future::poll_fn(|cx| {
+        let result = future.as_mut().poll(cx);
+        if result.is_pending() && !pause.paused {
+            #[cfg(test)]
+            {
+                _observer.counters.lock().unwrap().capacity_waits += 1;
+            }
+            pause
+                .progress
+                .clock
+                .lock()
+                .unwrap()
+                .pause_capacity(Instant::now());
+            pause.paused = true;
+            pause.progress.changed.notify_one();
+        }
+        result
+    })
+    .await
 }
 
 // These hooks are compiled only when this source is included by the integration
@@ -335,6 +399,7 @@ struct TestCounters {
     valid_packets: usize,
     accounting_window_output_events: usize,
     output_packets_received: usize,
+    capacity_waits: usize,
     cancel_observed: usize,
     kill_requested: usize,
 }
@@ -378,8 +443,27 @@ pub async fn run_child(
     cancel: watch::Receiver<bool>,
     deadline: Instant,
 ) -> Result<(), HlsFailure> {
+    run_target_child(
+        prepared,
+        layout,
+        HlsOutput { generation, media },
+        input,
+        cancel,
+        deadline,
+    )
+    .await
+}
+
+pub(super) async fn run_target_child<O: ProcessOutput>(
+    prepared: PreparedNormalizer,
+    layout: TransportLayout,
+    output: O,
+    input: mpsc::Receiver<BudgetedInput>,
+    cancel: watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<(), HlsFailure> {
     if !valid_source(&layout) {
-        media.fail_generation(generation, HlsFailure::Unsupported);
+        output.fail(HlsFailure::Unsupported);
         return Err(HlsFailure::Unsupported);
     }
     #[cfg(test)]
@@ -389,10 +473,7 @@ pub async fn run_child(
     let command = build_command(&prepared, &layout);
     #[cfg(not(test))]
     let observer = Observer::default();
-    run_command(
-        command, layout, generation, media, input, cancel, deadline, observer,
-    )
-    .await
+    run_output_command(command, layout, output, input, cancel, deadline, observer).await
 }
 
 fn valid_source(layout: &TransportLayout) -> bool {
@@ -412,6 +493,7 @@ fn valid_source(layout: &TransportLayout) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn run_command(
     command: Command,
     layout: TransportLayout,
@@ -722,32 +804,41 @@ async fn stderr_pump<R: AsyncRead + Unpin>(
 
 /// At most cached PAT, PMT and one opening packet. Own these bytes so an
 /// output adapter can await capacity after validation without borrowing state.
-struct AcceptedBatch {
-    packets: [[u8; TS]; 3],
-    len: usize,
+pub(crate) struct AcceptedBatch {
+    pub(crate) packets: [[u8; TS]; 3],
+    pub(crate) len: usize,
 }
 impl AcceptedBatch {
-    fn iter(&self) -> impl Iterator<Item = &[u8; TS]> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &[u8; TS]> {
         self.packets[..self.len].iter()
     }
 }
 
 /// Reserve outside publication fencing; publishing with the owned reservation
 /// is synchronous. Implementations cannot hold a publication mutex while waiting.
-trait ProcessOutput: Clone + Send + Sync + 'static {
+pub(crate) trait ProcessOutput: Clone + Send + Sync + 'static {
     type Reservation: Send;
     fn state(&self) -> crate::audio_normalize::State;
     fn fail(&self, reason: crate::audio_normalize::Failure);
     fn reserve(
         &self,
     ) -> impl std::future::Future<Output = Result<Self::Reservation, HlsFailure>> + Send;
+    fn reserve_batch(
+        &self,
+        _batch: &AcceptedBatch,
+    ) -> impl std::future::Future<Output = Result<Self::Reservation, HlsFailure>> + Send {
+        self.reserve()
+    }
     fn publish(&self, reservation: Self::Reservation, batch: AcceptedBatch);
+    /// Buffered sinks publish reserved bytes before an input wait or EOF. This
+    /// remains synchronous under the publication fence; stateless sinks do nothing.
+    fn flush_pending(&self) {}
 }
 
 #[derive(Clone)]
-struct HlsOutput {
-    generation: GenerationId,
-    media: Arc<HlsPackager>,
+pub(crate) struct HlsOutput {
+    pub(super) generation: GenerationId,
+    pub(super) media: Arc<HlsPackager>,
 }
 impl ProcessOutput for HlsOutput {
     type Reservation = ();
@@ -978,16 +1069,36 @@ async fn stdout_pump<R: AsyncRead + Unpin, O: ProcessOutput>(
         observe!(observer, c, {
             c.stdout_read_waits += 1;
         });
-        let n = tokio::select! {
-            biased;
-            _ = cancelled(&mut cancel) => return Ok(()),
-            n = stdout.read(&mut read) => n.map_err(|_| HlsFailure::Pipe)?,
+        let n = {
+            let reading = stdout.read(&mut read);
+            tokio::pin!(reading);
+            let mut flushed = false;
+            tokio::select! {
+                biased;
+                _ = cancelled(&mut cancel) => return Ok(()),
+                n = std::future::poll_fn(|cx| {
+                    let result = std::future::Future::poll(reading.as_mut(), cx);
+                    if result.is_pending() && !flushed {
+                        // Coalesce continuously available reads, but do not hold
+                        // low-volume valid output across an actual input wait.
+                        let publishing = progress.publishing.lock().unwrap();
+                        if *publishing { output.flush_pending(); }
+                        flushed = true;
+                    }
+                    result
+                }) => n.map_err(|_| HlsFailure::Pipe)?,
+            }
         };
         observe!(observer, c, {
             c.max_stdout_read = c.max_stdout_read.max(n);
             c.stdout_bytes_read += n;
         });
         if n == 0 {
+            let publishing = progress.publishing.lock().unwrap();
+            if !*publishing {
+                return Ok(());
+            }
+            output.flush_pending();
             return Err(if staged != 0 {
                 HlsFailure::OutputInvalid
             } else {
@@ -1014,7 +1125,7 @@ async fn stdout_pump<R: AsyncRead + Unpin, O: ProcessOutput>(
                     Some(tokio::select! {
                         biased;
                         _ = cancelled(&mut cancel) => return Ok(()),
-                        permit = output.reserve() => permit?,
+                        permit = reserve_capacity(output.reserve_batch(&accepted), progress.clone(), &observer) => permit?,
                     })
                 };
                 let publishing = progress.publishing.lock().unwrap();
@@ -1040,6 +1151,18 @@ async fn stdout_pump<R: AsyncRead + Unpin, O: ProcessOutput>(
             });
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_output_pump<R: AsyncRead + Unpin, O: ProcessOutput>(
+    bytes: R,
+    layout: TransportLayout,
+    output: O,
+) -> Result<(), HlsFailure> {
+    let progress = Arc::new(Progress::default());
+    *progress.publishing.lock().unwrap() = true;
+    let (_cancel, cancel) = watch::channel(false);
+    stdout_pump(bytes, layout, output, cancel, progress, Observer::default()).await
 }
 
 /// Integration-only adapter. It calls the same supervisor and pumps used by production;
@@ -1068,6 +1191,7 @@ pub(crate) mod test_support {
         StderrFlood,
         EchoValidTs,
         ReadyThenStall,
+        ValidOutputFlood,
         EchoReadyIdle,
         StdoutFlood,
         CapabilityListing,
@@ -1121,6 +1245,7 @@ pub(crate) mod test_support {
         pub valid_packets: usize,
         pub accounting_window_output_events: usize,
         pub output_packets_received: usize,
+        pub capacity_waits: usize,
         pub kill_requested: usize,
         pub stdin_write_waits: usize,
         pub input_recv_waits: usize,
@@ -1154,6 +1279,7 @@ pub(crate) mod test_support {
                 valid_packets: c.valid_packets,
                 accounting_window_output_events: c.accounting_window_output_events,
                 output_packets_received: c.output_packets_received,
+                capacity_waits: c.capacity_waits,
                 kill_requested: c.kill_requested,
                 stdin_write_waits: c.stdin_write_waits,
                 input_recv_waits: c.input_recv_waits,
@@ -1207,6 +1333,7 @@ pub(crate) mod test_support {
             ChildMode::StderrFlood => "stderr-flood",
             ChildMode::EchoValidTs => "echo-valid-ts",
             ChildMode::ReadyThenStall => "ready-then-stall",
+            ChildMode::ValidOutputFlood => "valid-output-flood",
             ChildMode::EchoReadyIdle => "echo-ready-idle",
             ChildMode::StdoutFlood => "stdout-flood",
             ChildMode::CapabilityListing => "capability-listing",
@@ -2074,6 +2201,7 @@ pub(crate) mod test_support {
             ChildMode::StderrFlood => "stderr-flood",
             ChildMode::EchoValidTs => "echo-valid-ts",
             ChildMode::ReadyThenStall => "ready-then-stall",
+            ChildMode::ValidOutputFlood => "valid-output-flood",
             ChildMode::EchoReadyIdle => "echo-ready-idle",
             ChildMode::StdoutFlood => "stdout-flood",
             ChildMode::CapabilityListing => "capability-listing",
@@ -2184,7 +2312,7 @@ pub enum HlsPreflightError {
 }
 impl std::fmt::Display for HlsPreflightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HLS normalization preflight: {self:?}")
+        write!(f, "audio normalization preflight: {self:?}")
     }
 }
 impl std::error::Error for HlsPreflightError {}
@@ -3367,6 +3495,64 @@ mod output_boundary_tests {
         assert!(
             rx.try_recv().is_err(),
             "retired output published after capacity returned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod capacity_wait_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn only_polled_pending_capacity_pauses_stall_and_drop_restores_remaining_time() {
+        let progress = Arc::new(Progress::default());
+        let start = Instant::now();
+        progress.clock.lock().unwrap().pending(start);
+        let (tx, mut rx) = mpsc::channel::<u8>(1);
+        tx.send(1).await.unwrap();
+        let observer = Observer::default();
+        let mut waiting = Box::pin(reserve_capacity(
+            tx.clone().reserve_owned(),
+            progress.clone(),
+            &observer,
+        ));
+        assert_eq!(
+            progress.clock.lock().unwrap().deadline(),
+            Some(start + STALL)
+        );
+        assert!(matches!(
+            futures::poll!(&mut waiting),
+            std::task::Poll::Pending
+        ));
+        assert!(progress.clock.lock().unwrap().deadline().is_none());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        // Drop the future itself, not merely a pinned reference.
+        drop(waiting);
+        assert_eq!(
+            progress.clock.lock().unwrap().deadline(),
+            Some(start + Duration::from_secs(60) + STALL)
+        );
+        rx.recv().await.unwrap();
+        let permit = tx.reserve_owned().await.unwrap();
+        permit.send(2);
+        assert_eq!(rx.recv().await, Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_capacity_never_refreshes_the_oldest_pending_stall_deadline() {
+        let progress = Arc::new(Progress::default());
+        let start = Instant::now();
+        progress.clock.lock().unwrap().pending(start);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        reserve_capacity(
+            std::future::ready(()),
+            progress.clone(),
+            &Observer::default(),
+        )
+        .await;
+        assert_eq!(
+            progress.clock.lock().unwrap().deadline(),
+            Some(start + STALL)
         );
     }
 }

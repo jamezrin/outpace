@@ -124,7 +124,7 @@ need not be JSON.
 | `/ace/m/<id>/<token>.m3u8` | Token-authenticated live media playlist; absolute segment URLs; `no-store`. | Invalid lease or removed packager: 404. Not ready, stalled/recovering or failed packager: 503 with `Retry-After: 1`; authorization/expiry takes precedence. |
 | `/ace/c/<token>/<seq>.ts` | Token-authenticated retained native HLS bytes, `video/mp2t`, `no-store`. Does not start a source. | Unknown/revoked token, missing packager, malformed/future/evicted segment: 404. |
 | `/ace/stat/<id>/<token>` | Stats and metadata under `response`; does not start a source. | Invalid lease: HTTP 200, `response: null`, `error: "invalid or expired playback session"`. No network also gives an in-band error. |
-| `/ace/cmd/<id>/<token>?method=stop` | Revokes this lease; success is `response: "ok"`. | Invalid lease: same in-band error as stat. Any method other than `stop`, including absent method: HTTP 200 with `error: "missing method"`. |
+| `/ace/cmd/<id>/<token>?method=stop` | Revokes this lease; success is `response: "ok"`. Extra query parameters, such as the `api_version=2` the Android SDK appends, are ignored. | Invalid lease: same in-band error as stat. Any method other than `stop`, including absent method: HTTP 200 with `error: "missing method"`. |
 | `/server/api`, `/webui/api/service` | Identical GET control-method dispatch on `?method=`; table below. | Handler responses are HTTP 200 with `result`/`error`, including unknown/missing methods and resolution failures. |
 
 For **leased TS start failures**, `NotFound` maps to 404 (an unregistered provider,
@@ -201,7 +201,7 @@ Both aliases use `{"result": <value>, "error": null}` on success and
 | `get_network_connection_status` | `status`, boolean `connected`, and `networks` reflect registered provider networks, not measured Internet or peer reachability. |
 | `analyze_content` | `infohash`, nullable `content_id`, integer `is_live`/`is_encrypted`, and `status: "complete"`. Bare infohash/magnet analysis returns the error envelope `descriptor metadata is unavailable`. Content-id/URL analysis inspects supported wrapped live/historical VOD or single-file raw/disk metainfo without joining a swarm. Inspected public reports `is_encrypted: 0`; protected reports `1`. Malformed protection is an error. |
 | `get_content_id` | **Echo only:** returns a nonempty caller `content_id`/`query` unchanged, even malformed strings, without 40-hex validation or catalog lookup. Cannot derive a content id from an infohash/URL/magnet. |
-| `get_media_files` | Best-effort `infohash` and one synthetic `files[]` entry with `infohash`, `index: 0`, `is_live`. Same resolution as analysis; no multi-file or selection contract. `dump_transport_file` does not produce a raw dump. |
+| `get_media_files` | Best-effort `infohash` and one synthetic `files[]` entry with `infohash`, `index: 0`, `is_live`. Live entries also carry `mime: video/mp2t` (the served output) and a display `filename: stream.ts`; VOD entries carry neither. Same resolution as analysis; no multi-file or selection contract. `dump_transport_file` does not produce a raw dump. |
 
 ## Lease ownership and live HLS
 
@@ -235,7 +235,13 @@ session are required. This does not qualify any particular browser or live clien
 
 Query hints such as `audio_normalize`, codec/playlist/transcode settings, and caller
 source options do not configure FFmpeg or enable arbitrary remuxing, video encoding,
-seek or file selection. Direct TS and native VOD do not use this HLS conversion.
+seek or file selection. `OUTPACE_LIVE_AUDIO_NORMALIZE=true` separately enables
+shared-source conversion for native and compatibility TS as well as HLS. With both
+switches enabled there is one conversion child. TS startup failures return explicit
+422/502/503/504 responses; failures after headers terminate the body with an I/O
+error. Native stream status retains the bounded failure code. VOD lengths, ranges
+and bytes are unchanged. This operator policy does not add per-request conversion
+options or new compatibility response keys.
 
 ## Live statistics units and limits
 

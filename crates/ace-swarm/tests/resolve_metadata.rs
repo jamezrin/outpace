@@ -223,3 +223,64 @@ async fn resolve_via_peer_rejects_metadata_hash_mismatch() {
     drop(session);
     srv.await.unwrap();
 }
+
+/// Our resolver against our own seeder: the seeder must learn the reply id from the resolver's
+/// real (signed) extended handshake, not a hand-built one, or outpace peers would silently stop
+/// serving metadata to each other.
+#[tokio::test]
+async fn resolver_fetches_transport_from_our_own_seeder() {
+    use ace_swarm::seed::SeederSession;
+    use std::sync::Arc;
+
+    let filler = "y".repeat(20_000);
+    let name = format!("Loopback {filler}");
+    let pubkey = "q".repeat(124);
+    let descriptor = format!(
+        "d10:authmethod3:RSA7:bitratei100000e12:chunk_lengthi16384e4:name{}:{}12:piece_lengthi1048576e6:pubkey{}:{}8:trackersl18:udp://t.example:80ee",
+        name.len(),
+        name,
+        pubkey.len(),
+        pubkey,
+    );
+    let transport = make_transport(descriptor.as_bytes());
+    assert!(
+        transport.len() > METADATA_BLOCK_LEN,
+        "want a multi-piece blob"
+    );
+    let expected_infohash = infohash_of_transport(&transport);
+    let content_id = transport_file_hash(&transport);
+    let metadata = Arc::new(transport);
+
+    let (client, mut server) = tokio::io::duplex(128 * 1024);
+    let seeder_identity = Identity::generate();
+    let srv = tokio::spawn(async move {
+        let mut hs = [0u8; 66];
+        server.read_exact(&mut hs).await.unwrap();
+        let reply = Handshake::new(content_id, *b"R30------LOOPBACKSRV");
+        server.write_all(&reply.encode()).await.unwrap();
+        let mut sess = PeerSession::new(server);
+        let _ = SeederSession::serve(
+            &mut sess,
+            None,
+            Some(metadata),
+            [0u8; 8],
+            &seeder_identity,
+            [127, 0, 0, 1],
+            None,
+        )
+        .await;
+    });
+
+    let identity = Identity::generate();
+    let mut session = PeerSession::new(client);
+    let info = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        resolve_via_peer(&mut session, content_id, &identity),
+    )
+    .await
+    .expect("resolution over our own seeder must not stall")
+    .unwrap();
+    assert_eq!(info.infohash, expected_infohash);
+    drop(session);
+    let _ = srv.await;
+}

@@ -431,6 +431,10 @@ fn skip_evicted_gap_jumps_to_lowest_covered_when_cursor_is_stranded() {
     c.observer = Some(observer.clone());
     assert_eq!(c.skip_evicted_gap(now), Some(105));
     assert_eq!(c.reasm.next_needed(), 105);
+    assert!(
+        c.request_floor.load(Ordering::Relaxed) >= 105,
+        "queued requests for skipped pieces must stop"
+    );
     assert_eq!(
         observer.snapshot().recovery_events,
         vec![RecoveryEvent::SkippedEvictedGap]

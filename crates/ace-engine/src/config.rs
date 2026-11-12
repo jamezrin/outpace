@@ -363,6 +363,8 @@ config_with_root_redaction! {
     /// HLS byte-segment packaging policy.
     pub hls: HlsConfig,
     pub hls_audio: HlsAudioConfig,
+    /// Normalize shared live TS audio to the fixed AAC profile. Disabled by default.
+    pub live_audio_normalize: bool,
     /// Stable desired unchokes per exact served key, plus one rotating optimistic slot.
     /// With I interested peers, the coordinator desires min(I, max_unchoked + 1); this is not
     /// an instantaneous wire-visible bound. Zero still selects one optimistic peer.
@@ -417,6 +419,15 @@ config_with_root_redaction! {
     pub allow_non_global_broadcast_source: bool,
 }
 
+impl Config {
+    pub(crate) fn normalization_config(&self) -> HlsAudioConfig {
+        HlsAudioConfig {
+            normalize: self.hls_audio.normalize || self.live_audio_normalize,
+            ffmpeg_path: self.hls_audio.ffmpeg_path.clone(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let data_dir = dirs::data_dir()
@@ -444,6 +455,7 @@ impl Default for Config {
             startup_buffer: StartupBufferConfig::default(),
             hls: HlsConfig::default(),
             hls_audio: HlsAudioConfig::default(),
+            live_audio_normalize: false,
             max_unchoked: 8,
             max_inbound_peers: 64,
             max_inbound_per_stream: 16,

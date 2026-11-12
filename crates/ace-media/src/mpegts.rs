@@ -506,6 +506,18 @@ impl KeyframeGate {
         }
     }
 
+    /// Opt into packet-local MPEG-2 access detection for a validated source.
+    /// Existing raw consumers retain their H.264/HEVC policy.
+    pub fn enable_mpeg2(&mut self) {
+        self.access.enable_mpeg2();
+    }
+
+    /// Synthesize service metadata using the current source PAT's transport ID.
+    /// Legacy consumers keep their historical identity unless explicitly enabled.
+    pub fn preserve_transport_identity(&mut self) {
+        self.access.preserve_transport_identity();
+    }
+
     /// Re-arm the gate (drop its buffer and re-require a keyframe) while preserving its
     /// configured title, so a mid-stream reset keeps injecting/filtering the SDT.
     pub fn reset(&mut self) {
@@ -1561,6 +1573,61 @@ mod tests {
         assert!(!state.observe(&random_access_packet(AUDIO_PID)));
         assert!(state.observe(&random_access_packet(VIDEO_PID)));
         assert_eq!(state.table_prefix().unwrap(), [pat, pmt].concat());
+    }
+
+    #[test]
+    fn keyframe_gate_transport_identity_opt_in_does_not_change_legacy_metadata() {
+        let mut mapping = pat(PMT_PID);
+        let start = psi_section_start(&mapping).unwrap();
+        mapping[start + 3..start + 5].copy_from_slice(&7u16.to_be_bytes());
+        let input = [
+            mapping,
+            pmt(PMT_PID, VIDEO_PID),
+            random_access_packet(VIDEO_PID),
+        ]
+        .concat();
+        for preserve in [false, true] {
+            let mut gate = KeyframeGate::with_service_name(Some("Synthetic title".into()));
+            if preserve {
+                gate.preserve_transport_identity();
+            }
+            let output = gate.push(&input);
+            let sdt = output
+                .as_chunks::<188>()
+                .0
+                .iter()
+                .find(|p| ts_pid(*p) == 17)
+                .unwrap();
+            let start = psi_section_start(sdt).unwrap();
+            assert_eq!(
+                u16::from_be_bytes([sdt[start + 3], sdt[start + 4]]),
+                if preserve { 7 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn keyframe_gate_mpeg2_is_opt_in_and_survives_discontinuity_reset() {
+        let input = [
+            pat(PMT_PID),
+            pmt_codec(PMT_PID, VIDEO_PID, 0x02),
+            mpeg2_packet(&mpeg2_picture_pes(1, 0)),
+        ]
+        .concat();
+        let mut raw = KeyframeGate::new();
+        assert!(raw.push(&input).is_empty());
+        let mut enabled = KeyframeGate::new();
+        enabled.enable_mpeg2();
+        assert_eq!(enabled.push(&input), input);
+        enabled.reset_for_discontinuity();
+        let recovered = enabled.push(&input);
+        assert!(enabled.is_locked());
+        assert!(!recovered.is_empty());
+        assert!(recovered.ends_with(&mpeg2_packet(&mpeg2_picture_pes(1, 0))));
+        assert!(
+            raw.push(&input).is_empty(),
+            "opt-in does not mutate another raw gate"
+        );
     }
 
     #[test]

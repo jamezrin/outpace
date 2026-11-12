@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TS_PACKET: usize = 188;
+/// Spare capacity worth an exact-size copy when a finished segment is retained.
+const SEGMENT_COMPACTION_MIN_SAVINGS: usize = 256 * 1024;
 #[cfg(test)]
 const PCR_MODULUS: u64 = 1 << 33;
 const SDT_PID: u16 = 0x0011;
@@ -54,6 +56,7 @@ struct HlsState {
     status: HlsStatus,
     deadline: Option<tokio::time::Instant>,
     strict: bool,
+    source_generation: bool,
     generation_segments: usize,
     // The owner already announced this generation. An opening mux marker must
     // not discard its freshly validated prefix; expire at accepted access point.
@@ -81,6 +84,8 @@ struct HlsState {
     /// Set when `access` carries a title, so upstream SDT-PID packets must be dropped from
     /// segment bodies to avoid duplicating (or conflicting with) our synthesized SDT.
     filter_sdt: bool,
+    /// The source reached EOF: the retained segments are final and the playlist is closed.
+    ended: bool,
 }
 
 struct HlsSegment {
@@ -115,6 +120,7 @@ impl HlsPackager {
                 status: HlsStatus::Starting,
                 deadline: None,
                 strict: false,
+                source_generation: false,
                 generation_segments: 0,
                 generation_opening: false,
                 audio: LiveAudioSelection::default(),
@@ -133,6 +139,7 @@ impl HlsPackager {
                 access,
                 awaiting_access_point: true,
                 filter_sdt,
+                ended: false,
             }),
             ready: tokio::sync::Notify::new(),
             max_segment_bytes,
@@ -152,6 +159,8 @@ impl HlsPackager {
             st.generation_opening = strict;
             if strict {
                 st.access.enable_mpeg2();
+            }
+            if strict || session.playback_state().is_some() {
                 st.access.preserve_transport_identity();
             }
             st.deadline = Some(tokio::time::Instant::now() + media.startup_timeout);
@@ -168,6 +177,7 @@ impl HlsPackager {
     ) {
         let mut st = self.state.lock().unwrap();
         if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_))
+            || st.ended
             || generation <= st.generation
         {
             return;
@@ -217,6 +227,27 @@ impl HlsPackager {
         self.ready.notify_waiters();
     }
 
+    /// The source ended: keep completed segments as a closed (`#EXT-X-ENDLIST`) playlist and
+    /// drop the incomplete tail. Media that was never published ends as `Stopped`. A reported
+    /// failure or an explicit stop that won the race with EOF is left untouched.
+    pub(crate) fn finish(&self) {
+        let mut st = self.state.lock().unwrap();
+        self.expire(&mut st);
+        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) {
+            return;
+        }
+        st.ended = true;
+        Self::reset_partial(&mut st, false);
+        st.status = match st.status {
+            HlsStatus::Ready => HlsStatus::Ready,
+            // Recovery hides the playlist only until the next access point, which will now
+            // never arrive. Segments published before the gap are complete and final.
+            HlsStatus::Recovering if !st.segments.is_empty() => HlsStatus::Ready,
+            _ => HlsStatus::Stopped,
+        };
+        self.ready.notify_waiters();
+    }
+
     pub fn status(&self) -> HlsStatus {
         let mut st = self.state.lock().unwrap();
         self.expire(&mut st);
@@ -224,7 +255,7 @@ impl HlsPackager {
     }
 
     fn expire(&self, st: &mut HlsState) {
-        if st.strict
+        if (st.strict || st.source_generation)
             && matches!(st.status, HlsStatus::Starting | HlsStatus::Recovering)
             && st
                 .deadline
@@ -260,7 +291,14 @@ impl HlsPackager {
             let (status, deadline) = {
                 let mut st = self.state.lock().unwrap();
                 self.expire(&mut st);
-                (st.status, if st.strict { st.deadline } else { None })
+                (
+                    st.status,
+                    if st.strict || st.source_generation {
+                        st.deadline
+                    } else {
+                        None
+                    },
+                )
             };
             if !matches!(status, HlsStatus::Starting | HlsStatus::Recovering) {
                 return status;
@@ -272,25 +310,93 @@ impl HlsPackager {
         }
     }
 
+    // Source generation identity is carried on each media chunk. The watch only
+    // controls availability: it can coalesce and must never relabel queued bytes.
+    fn observe_source_generation(&self, generation: u64) {
+        let mut st = self.state.lock().unwrap();
+        st.source_generation = true;
+        if GenerationId(generation) <= st.generation
+            || matches!(st.status, HlsStatus::Failed(_) | HlsStatus::Stopped)
+        {
+            return;
+        }
+        let was_ready = st.status == HlsStatus::Ready;
+        st.generation = GenerationId(generation);
+        if was_ready || st.deadline.is_none() {
+            st.deadline = Some(tokio::time::Instant::now() + self.startup_timeout);
+        }
+        st.status = if generation > 1 {
+            HlsStatus::Recovering
+        } else {
+            HlsStatus::Starting
+        };
+        st.generation_segments = 0;
+        Self::reset_partial(&mut st, false);
+        st.generation_opening = true;
+        st.discontinuity_pending = generation > 1;
+        // Do not switch strict output policy: native audio selection still applies.
+        self.ready.notify_waiters();
+    }
+
     pub(crate) async fn run_native(
         self: Arc<Self>,
         mut rx: tokio::sync::broadcast::Receiver<StreamEvent>,
         mut cancel: tokio::sync::watch::Receiver<bool>,
+        mut source_state: Option<crate::audio_normalize::PlaybackStateHandle>,
     ) {
         use tokio::sync::broadcast::error::RecvError;
+        fn source_failure(
+            state: &Option<crate::audio_normalize::PlaybackStateHandle>,
+        ) -> Option<HlsFailure> {
+            match state.as_ref()?.snapshot().phase {
+                crate::audio_normalize::PlaybackPhase::Failed(reason) => Some(reason),
+                _ => None,
+            }
+        }
         loop {
+            if let Some(state) = &source_state {
+                self.observe_source_generation(state.snapshot().generation);
+            }
+            if let Some(reason) = source_failure(&source_state) {
+                let generation = self.state.lock().unwrap().generation;
+                self.fail_generation(generation, reason);
+                return;
+            }
             tokio::select! {
                 biased;
                 _ = cancel.changed() => { if *cancel.borrow() { break; } }
+                _ = async {
+                    match source_state.as_mut() {
+                        Some(state) if !state.is_closed() => { let _ = state.changed().await; },
+                        _ => std::future::pending().await,
+                    }
+                } => continue,
                 event = rx.recv() => match event {
-                    Ok(StreamEvent::Data(chunk)) => self.feed(&chunk),
+                    Ok(StreamEvent::Data(chunk)) => {
+                        if source_state.is_none() { self.feed(&chunk); }
+                    }
+                    Ok(StreamEvent::NormalizedData { bytes, generation }) => {
+                        if let Some(state) = &source_state {
+                            self.observe_source_generation(state.snapshot().generation);
+                            self.feed_generation(GenerationId(generation), &bytes);
+                        }
+                    }
                     Ok(StreamEvent::Discontinuity) => self.discontinuity(),
                     Err(RecvError::Lagged(_)) => self.receiver_lag(),
-                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Closed) => {
+                        self.finish_source(&source_state);
+                        return;
+                    }
                 }
             }
         }
-        self.stop();
+        // A failure published before source EOF must survive that simultaneous close.
+        if let Some(reason) = source_failure(&source_state) {
+            let generation = self.state.lock().unwrap().generation;
+            self.fail_generation(generation, reason);
+        } else {
+            self.stop();
+        }
     }
 
     /// Drop media accumulated before a known gap and mark the first complete segment after it.
@@ -302,6 +408,17 @@ impl HlsPackager {
     /// an independent discontinuity and must take the normal reset path.
     fn receiver_lag(&self) {
         self.reset_for_gap(false);
+    }
+
+    fn finish_source(&self, source: &Option<crate::audio_normalize::PlaybackStateHandle>) {
+        if let Some(crate::audio_normalize::PlaybackPhase::Failed(reason)) =
+            source.as_ref().map(|source| source.snapshot().phase)
+        {
+            let generation = self.state.lock().unwrap().generation;
+            self.fail_generation(generation, reason);
+        } else {
+            self.finish();
+        }
     }
 
     fn reset_for_gap(&self, deduplicate_source_marker: bool) {
@@ -334,7 +451,7 @@ impl HlsPackager {
 
     fn feed_locked(&self, st: &mut HlsState, data: &[u8]) {
         self.expire(st);
-        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) {
+        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) || st.ended {
             return;
         }
         let mut remaining = data;
@@ -347,7 +464,11 @@ impl HlsPackager {
             }
             let mut packet: [u8; TS_PACKET] = st.input.as_slice().try_into().unwrap();
             st.input.clear();
-            if st.strict && st.generation_opening && packet[3] & 0x20 != 0 && packet[4] > 0 {
+            if (st.strict || st.source_generation)
+                && st.generation_opening
+                && packet[3] & 0x20 != 0
+                && packet[4] > 0
+            {
                 // Enabled owners fence source markers before publication. A new
                 // mux's opening marker belongs to the same announced boundary.
                 packet[5] &= !0x80;
@@ -625,12 +746,12 @@ impl HlsPackager {
         st.audio.emitted(&mut seg);
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
         st.segments.push_back(HlsSegment {
-            bytes: Bytes::from(seg),
+            bytes: Self::freeze_segment(seg),
             duration,
             discontinuity,
         });
         st.generation_segments = st.generation_segments.saturating_add(1);
-        let count = if st.strict {
+        let count = if st.strict || st.source_generation {
             st.generation_segments
         } else {
             st.segments.len()
@@ -708,6 +829,9 @@ impl HlsPackager {
                 st.media_seq + i as u64
             ));
         }
+        if st.ended {
+            out.push_str("#EXT-X-ENDLIST\n");
+        }
         out
     }
 
@@ -746,12 +870,21 @@ impl HlsPackager {
     }
 
     fn retained_segment(st: &HlsState, seq: u64) -> Option<Bytes> {
-        if seq < st.media_seq {
-            return None;
+        // Checked: on 32-bit targets a far-off sequence must not truncate to a live index.
+        let index = usize::try_from(seq.checked_sub(st.media_seq)?).ok()?;
+        st.segments.get(index).map(|segment| segment.bytes.clone())
+    }
+
+    /// Freeze a finished segment. Its buffer is the assembly allocation, whose capacity grew
+    /// while filling; reclaim substantial slack once with an exact-size copy, and keep smaller
+    /// savings zero-copy.
+    fn freeze_segment(segment: Vec<u8>) -> Bytes {
+        if segment.capacity() - segment.len() >= SEGMENT_COMPACTION_MIN_SAVINGS {
+            // Unlike best-effort `shrink_to_fit`, a boxed slice has exactly `len` capacity.
+            Bytes::from(segment.into_boxed_slice())
+        } else {
+            Bytes::from(segment)
         }
-        st.segments
-            .get((seq - st.media_seq) as usize)
-            .map(|segment| segment.bytes.clone())
     }
 
     pub(crate) fn was_accessed_within(&self, now: Instant, grace: Duration) -> bool {
@@ -1101,6 +1234,75 @@ mod tests {
                 assert_eq!(ace_media::mpegts::mpeg_crc32(&pkt[5..end]), 0);
                 assert_eq!(pkt[7], 23); // fixed PMT + video + one audio + CRC
             }
+        }
+    }
+
+    /// The AAC copy worker opens a generation from its selector's (rewritten) tables and then
+    /// publishes one packet per source packet. Model both ways of publishing over three AAC
+    /// tracks and two GOPs, and return each segment's PIDs.
+    fn copy_path_segments(forward_selector_output: bool) -> Vec<Vec<u16>> {
+        use ace_media::audio::LiveAudioSelection;
+        let raw_pat: [u8; TS_PACKET] = valid_crc(pat(PMT_PID)).try_into().unwrap();
+        let raw_pmt: [u8; TS_PACKET] = audio_pmt(&[0x0f, 0x0f, 0x0f], VIDEO_PID)
+            .try_into()
+            .unwrap();
+        let mut selector = LiveAudioSelection::default();
+        selector.observe(raw_pat);
+        selector.observe(raw_pmt);
+        let p = timed_pkg(1000);
+        for table in selector.tables() {
+            p.feed(table);
+        }
+        let mut publish = |packet: Vec<u8>| {
+            let packet: [u8; TS_PACKET] = packet.try_into().unwrap();
+            let selected = selector.observe(packet);
+            if forward_selector_output {
+                if let Some(output) = crate::hls_audio::copy_output(selected) {
+                    p.feed(&output);
+                }
+            } else {
+                p.feed(&packet); // what the copy path used to publish
+            }
+        };
+        publish(video_access_packet(VIDEO_PID, 0));
+        for gop in 1..=3u64 {
+            for track in 0..3 {
+                publish(with_pid(packets(1), AUDIO_PID + track));
+            }
+            publish(raw_pmt.to_vec()); // ordinary PSI repetition
+            publish(video_access_packet(VIDEO_PID, gop * 108_000));
+        }
+        let mut segments = Vec::new();
+        while let Some(seg) = p.segment(segments.len() as u64) {
+            segments.push(
+                seg.as_chunks::<TS_PACKET>()
+                    .0
+                    .iter()
+                    .map(|k| ts_pid(k))
+                    .collect(),
+            );
+        }
+        segments
+    }
+
+    #[test]
+    fn aac_copy_path_keeps_every_gop_and_only_the_selected_audio() {
+        let fixed = copy_path_segments(true);
+        let raw = copy_path_segments(false);
+        assert_eq!(fixed.len(), 3, "one segment per completed GOP: {fixed:?}");
+        assert!(
+            raw.len() < fixed.len(),
+            "raw PSI repetition after a rewritten opening discards a run: {raw:?}"
+        );
+        for segment in &fixed {
+            assert!(
+                segment.contains(&AUDIO_PID),
+                "selected track missing: {fixed:?}"
+            );
+            assert!(
+                !segment.contains(&(AUDIO_PID + 1)) && !segment.contains(&(AUDIO_PID + 2)),
+                "unselected audio leaked: {fixed:?}"
+            );
         }
     }
 
@@ -1760,6 +1962,137 @@ mod tests {
         assert_eq!(p.state.lock().unwrap().last_access, Some(stale));
     }
 
+    // A shared source may reach TS readiness before its HLS cushion exists.
+    #[tokio::test(start_paused = true)]
+    async fn shared_source_ready_does_not_disable_hls_absolute_deadline() {
+        use crate::audio_normalize::PlaybackPublisher;
+        let p = clean_pkg(64);
+        p.state.lock().unwrap().deadline =
+            Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        let (publisher, state) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(p.clone().run_native(rx, cancelled, Some(state)));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let observed = p.status();
+        cancel.send_replace(true);
+        worker.await.unwrap();
+        assert_eq!(observed, HlsStatus::Failed(HlsFailure::Deadline));
+    }
+
+    #[tokio::test]
+    async fn shared_source_recovery_withholds_old_playlist_but_retains_segments() {
+        use crate::audio_normalize::PlaybackPublisher;
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 64,
+                startup_segments: 2,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 2);
+        assert_eq!(p.status(), HlsStatus::Ready);
+        let old = p.segment(0).unwrap();
+        let (publisher, state) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(p.clone().run_native(rx, cancelled, Some(state)));
+        tokio::task::yield_now().await;
+        publisher.begin_generation(2);
+        tokio::task::yield_now().await;
+        let observed = p.playlist_snapshot("/synthetic/", false);
+        let retained = p.segment(0);
+        cancel.send_replace(true);
+        worker.await.unwrap();
+        assert_eq!(observed, Err(HlsStatus::Recovering));
+        assert_eq!(retained.as_deref(), Some(old.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn shared_source_coalesced_generation_drops_queued_old_media_and_requires_fresh_cushion()
+    {
+        use crate::audio_normalize::PlaybackPublisher;
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 64,
+                startup_segments: 2,
+                segment_duration_ms: 1000,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        let (publisher, state) = PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(p.clone().run_native(rx, cancelled, Some(state)));
+        let run = |start: u64, count: u64| {
+            let mut bytes = [pat(PMT_PID), pmt(PMT_PID, VIDEO_PID)].concat();
+            for i in 0..=count {
+                bytes.extend(video_access_packet(VIDEO_PID, start + i * 108_000));
+            }
+            Bytes::from(bytes)
+        };
+        tx.send(StreamEvent::NormalizedData {
+            bytes: run(0, 2),
+            generation: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            p.wait_available(Duration::from_secs(1)).await,
+            HlsStatus::Ready
+        );
+        let old = p.segment(0).unwrap();
+        // No await between state updates and queueing: the worker sees Ready(2)
+        // directly, with a complete old run still ahead of replacement data.
+        publisher.begin_generation(2);
+        publisher.mark_ready(2);
+        tx.send(StreamEvent::NormalizedData {
+            bytes: run(324_000, 3),
+            generation: 1,
+        })
+        .unwrap();
+        tx.send(StreamEvent::Discontinuity).unwrap();
+        tx.send(StreamEvent::NormalizedData {
+            bytes: run(0, 1),
+            generation: 2,
+        })
+        .unwrap();
+        let progress = tokio::time::timeout(Duration::from_secs(1), async {
+            while p.segment(2).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let middle = p.playlist_snapshot("/synthetic/", false);
+        let retained = p.segment(0);
+        tx.send(StreamEvent::NormalizedData {
+            bytes: Bytes::from(video_access_packet(VIDEO_PID, 216_000)),
+            generation: 2,
+        })
+        .unwrap();
+        let ready = p.wait_available(Duration::from_secs(1)).await;
+        let playlist = p.playlist_snapshot("/synthetic/", false);
+        cancel.send_replace(true);
+        worker.await.unwrap();
+        assert_eq!(progress, Ok(()));
+        assert_eq!(middle, Err(HlsStatus::Recovering));
+        assert_eq!(retained.as_deref(), Some(old.as_ref()));
+        assert_eq!(ready, HlsStatus::Ready);
+        assert_eq!(
+            playlist.unwrap().matches("#EXT-X-DISCONTINUITY\n").count(),
+            1
+        );
+    }
+
     #[test]
     fn hls_generation_disabled_mode_preserves_readiness_after_gap() {
         let p = clean_pkg(6);
@@ -1912,6 +2245,56 @@ mod tests {
     }
 
     #[test]
+    fn finished_segment_compaction_reclaims_only_substantial_slack() {
+        let payload_len = TS_PACKET * 3;
+        for spare in [
+            0,
+            SEGMENT_COMPACTION_MIN_SAVINGS - 1,
+            SEGMENT_COMPACTION_MIN_SAVINGS,
+            SEGMENT_COMPACTION_MIN_SAVINGS + 1,
+        ] {
+            // A boxed slice turned into a Vec has this exact capacity on every allocator.
+            let mut segment = vec![0x47; payload_len + spare]
+                .into_boxed_slice()
+                .into_vec();
+            segment.truncate(payload_len);
+            let original = segment.as_ptr();
+            let bytes = HlsPackager::freeze_segment(segment);
+            assert_eq!(&bytes[..], vec![0x47; payload_len]);
+            // Recover the uniquely owned allocation to observe what is actually retained.
+            let owned: Vec<u8> = bytes.into();
+            if spare < SEGMENT_COMPACTION_MIN_SAVINGS {
+                assert_eq!(owned.as_ptr(), original, "small slack stays zero-copy");
+                assert_eq!(owned.capacity(), payload_len + spare);
+            } else {
+                assert_eq!(owned.capacity(), payload_len, "slack is reclaimed");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_segment_index_is_checked() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 2);
+        assert!(p.segment(0).is_some());
+        let st = p.state.lock().unwrap();
+        let media_seq = st.media_seq;
+        assert!(HlsPackager::retained_segment(&st, media_seq).is_some());
+        // Below the window, and far enough past it to truncate on a 32-bit `as usize`.
+        assert!(media_seq == 0 || HlsPackager::retained_segment(&st, media_seq - 1).is_none());
+        assert!(HlsPackager::retained_segment(&st, media_seq + (1 << 32)).is_none());
+        assert!(HlsPackager::retained_segment(&st, u64::MAX).is_none());
+    }
+
+    #[test]
     fn hls_generation_stale_feed_cannot_publish_segments() {
         let p = HlsPackager::new(
             HlsConfig {
@@ -1932,6 +2315,102 @@ mod tests {
         feed_clean_run_generation(&p, GenerationId(7), 900_000, 3);
         assert_eq!(p.segment(0).as_deref(), Some(before.as_ref()));
         assert!(p.segment(1).is_none());
+    }
+
+    #[test]
+    fn source_eof_rechecks_retained_failure_before_closing_ready_playlist() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_packets: 6,
+                segment_duration_ms: 1000,
+                startup_segments: 2,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 2);
+        assert_eq!(p.status(), HlsStatus::Ready);
+        let (publisher, handle) = crate::audio_normalize::PlaybackPublisher::new();
+        publisher.begin_generation(1);
+        publisher.mark_ready(1);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::audio_normalize::PlaybackPhase::Ready
+        );
+        publisher.fail(1, HlsFailure::ChildExit);
+        drop(publisher);
+        p.finish_source(&Some(handle));
+        assert_eq!(p.status(), HlsStatus::Failed(HlsFailure::ChildExit));
+    }
+
+    #[test]
+    fn source_eof_keeps_completed_segments_as_a_closed_playlist() {
+        let config = HlsConfig {
+            segment_packets: 6,
+            segment_duration_ms: 1000,
+            startup_segments: 2,
+            ..HlsConfig::default()
+        };
+        let ready = HlsPackager::new(config, None);
+        feed_clean_run(&ready, 0, 2);
+        assert_eq!(ready.status(), HlsStatus::Ready);
+        // The next access point closes the last segment and opens an unfinished tail, which
+        // EOF must drop rather than publish.
+        ready.feed(&video_access_packet(VIDEO_PID, 400_000));
+        let published = ready.playlist_snapshot("/s", false).unwrap();
+        assert!(!published.contains("#EXT-X-ENDLIST"));
+        assert!(
+            !ready.state.lock().unwrap().cur.is_empty(),
+            "a partial tail is pending"
+        );
+        let first = ready.segment(0).expect("completed segment");
+        ready.finish();
+        assert_eq!(ready.status(), HlsStatus::Ready);
+        let closed = ready.playlist_snapshot("/s", false).unwrap();
+        assert!(closed.trim_end().ends_with("#EXT-X-ENDLIST"));
+        assert_eq!(
+            closed.matches("#EXTINF").count(),
+            published.matches("#EXTINF").count(),
+            "EOF neither adds the partial tail nor drops completed media"
+        );
+        assert_eq!(ready.segment(0).as_deref(), Some(first.as_ref()));
+        // A closed playlist is final: late input cannot extend it.
+        feed_clean_run(&ready, 2_000_000, 3);
+        assert_eq!(ready.playlist_snapshot("/s", false).unwrap(), closed);
+        ready.stop();
+        assert_eq!(ready.status(), HlsStatus::Stopped);
+
+        let unpublished = HlsPackager::new(config, None);
+        feed_clean_run(&unpublished, 0, 1);
+        unpublished.finish();
+        assert_eq!(unpublished.status(), HlsStatus::Stopped);
+
+        let recovering = HlsPackager::new(config, None);
+        feed_clean_run(&recovering, 0, 2);
+        recovering.begin_generation(
+            GenerationId(2),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            true,
+        );
+        assert_eq!(recovering.status(), HlsStatus::Recovering);
+        recovering.finish();
+        assert_eq!(recovering.status(), HlsStatus::Ready);
+        assert!(recovering
+            .playlist_snapshot("/s", false)
+            .unwrap()
+            .trim_end()
+            .ends_with("#EXT-X-ENDLIST"));
+
+        let failed = HlsPackager::new(config, None);
+        failed.fail_generation(GenerationId(0), HlsFailure::ChildExit);
+        failed.finish();
+        assert_eq!(failed.status(), HlsStatus::Failed(HlsFailure::ChildExit));
+
+        let stopped = HlsPackager::new(config, None);
+        feed_clean_run(&stopped, 0, 2);
+        stopped.stop();
+        stopped.finish();
+        assert_eq!(stopped.status(), HlsStatus::Stopped);
     }
 
     #[test]

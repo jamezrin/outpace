@@ -41,12 +41,18 @@ libc = "0.2"
 
 # jemalloc is the default global allocator on 64-bit non-MSVC targets (see main.rs). 32-bit targets
 # (e.g. armv7) are excluded: jemalloc's 64-bit `ffs` helper needs a `__ffsdi2` builtin that fails to
-# link against static 32-bit musl. The `background_threads` feature builds jemalloc with the purge
-# thread that returns freed pages to the OS while idle; `unprefixed_malloc_on_supported_platforms`
-# lets it back the global allocator. `tikv-jemalloc-ctl` powers `/debug/memstats`.
+# link against static 32-bit musl. The default `background_threads_runtime_support` feature lets
+# main.rs's exported `malloc_conf` turn the purge thread on where it is supported; do not force the
+# `background_threads` feature, which compiles `background_thread:true` in on every target and makes
+# Apple builds print a startup warning. `tikv-jemalloc-ctl` powers `/debug/memstats`.
 [target.'cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))'.dependencies]
-tikv-jemallocator = { version = "0.7", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = "0.7"
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+
+# Unprefixed symbols let jemalloc back plain `malloc` too. tikv-jemalloc-sys refuses them on Apple,
+# Android and DragonFly (allocator-mixing crashes), so main.rs exports `_rjem_malloc_conf` there.
+[target.'cfg(all(not(target_env = "msvc"), target_pointer_width = "64", not(any(target_vendor = "apple", target_os = "android", target_os = "dragonfly"))))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

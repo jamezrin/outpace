@@ -53,7 +53,9 @@ Transient network, metadata-discovery and admission failures retry after 1, 2, 4
 then at most 30 seconds. Opening a connection alone does not reset this backoff: reset requires
 30 observed seconds of emitted-byte progress. Invalid, unsafe or protected descriptors stop
 with a static error until explicitly restarted. Natural source EOF allows a fresh supervised
-generation; existing playback clients of the ended generation observe EOF and reconnect.
+generation. Direct playback clients of the ended generation observe EOF and reconnect. HLS
+clients receive the ended generation's completed segments as a closed playlist
+(`#EXT-X-ENDLIST`) and must reopen the playlist URL to join the new generation.
 
 Shutdown closes support admission, cancels opens/retries and releases pins, joins the service,
 then shuts down the shared manager. Admission capacity remains held through pending source

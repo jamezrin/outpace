@@ -73,6 +73,16 @@ pub trait TsSource: Send {
     fn stats_handle(&self) -> Option<StatsHandle> {
         None
     }
+    /// Optional normalization readiness and terminal state, independent of media EOF.
+    /// Raw sources allocate no state channel.
+    fn playback_state(&self) -> Option<crate::audio_normalize::PlaybackStateHandle> {
+        None
+    }
+    /// Generation of the most recently returned chunk, not the latest asynchronous
+    /// playback snapshot. Owning decorators preserve this ordered media metadata.
+    fn chunk_generation(&self) -> Option<u64> {
+        None
+    }
     /// Descriptor metadata resolved alongside this exact source, if any.
     fn metadata(&self) -> StreamMetadata {
         StreamMetadata::default()
@@ -156,6 +166,13 @@ pub trait StreamProvider: Send + Sync {
         Err(ProviderError::Backend(
             "this network does not support VOD".into(),
         ))
+    }
+
+    /// The spelling of `id` that the manager keys sessions, VOD handles and stops on. Ids that
+    /// differ only in a case-insensitive part must map to one canonical form, or two spellings of
+    /// one stream would start two swarms and miss each other's caches. Defaults to `id` unchanged.
+    fn canonical_id<'a>(&self, id: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Borrowed(id)
     }
 
     /// Offline check that [`open`](Self::open) would get past id resolution, for routes that

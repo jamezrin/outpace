@@ -296,6 +296,9 @@ impl Continuity {
             return None;
         }
         self.recovery_event(RecoveryEvent::SkippedEvictedGap);
+        // Workers may still hold queued whole-piece requests below the new cursor; stop
+        // their remaining chunks, as a live-head skip does.
+        self.request_floor.fetch_max(floor, Ordering::Relaxed);
         self.reasm.skip_to(floor);
         self.invalidate_stats();
         self.publication.retain(|&piece, _| piece >= floor);

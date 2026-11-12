@@ -305,17 +305,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// request every 16 KiB piece from the peer and assemble the data blocks into a single
     /// buffer of `metadata_size` bytes.
     ///
-    /// `peer_ut_metadata_id` is the ext id the peer assigned to `ut_metadata` in its extended
-    /// handshake `m` dict; the BEP-10 handshake must already have been exchanged. Unrelated
-    /// messages are ignored; a `Reject` or an early close is an error.
+    /// `peer_ut_metadata_id` is the id the peer assigned to `ut_metadata` in its extended
+    /// handshake `m` dict (used on our requests); `our_ut_metadata_id` is the id we advertised in
+    /// ours (used on its replies). BEP-10 ids are directional, so the two need not match. The
+    /// handshakes must already have been exchanged. Other extensions are ignored. Every data
+    /// block must carry the expected total size and exact 16 KiB block geometry, and a
+    /// duplicate block must not contradict the first copy; a `Reject` or early close is an error.
     pub async fn fetch_metadata(
         &mut self,
         peer_ut_metadata_id: u8,
+        our_ut_metadata_id: u8,
         metadata_size: usize,
     ) -> Result<Vec<u8>> {
         use ace_wire::ut_metadata::{
             piece_count, request_piece, MetadataMessage, METADATA_BLOCK_LEN,
         };
+        // Id 0 is the extended handshake itself; in an `m` dict it means "disabled".
+        if peer_ut_metadata_id == 0 || our_ut_metadata_id == 0 {
+            return Err(PeerError::Protocol("ut_metadata extension disabled"));
+        }
+        let total_size = i64::try_from(metadata_size)
+            .map_err(|_| PeerError::Protocol("invalid metadata size"))?;
         let pieces = piece_count(metadata_size);
         if pieces == 0 {
             return Ok(Vec::new());
@@ -332,31 +342,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         let mut have = vec![false; pieces];
         let mut remaining = pieces;
         while remaining > 0 {
-            match self.read_message().await? {
-                PeerMessage::Extended { ext_id, payload } if ext_id != 0 => {
-                    match MetadataMessage::parse(&payload) {
-                        Some(MetadataMessage::Data { piece, data, .. }) => {
-                            let idx = piece as usize;
-                            if piece < 0 || idx >= pieces {
-                                continue;
-                            }
-                            let off = idx * METADATA_BLOCK_LEN;
-                            let end = (off + data.len()).min(metadata_size);
-                            if off < end {
-                                blob[off..end].copy_from_slice(&data[..end - off]);
-                            }
-                            if !have[idx] {
-                                have[idx] = true;
-                                remaining -= 1;
-                            }
-                        }
-                        Some(MetadataMessage::Reject { .. }) => {
-                            return Err(PeerError::Protocol("metadata request rejected"));
-                        }
-                        _ => {}
+            let PeerMessage::Extended { ext_id, payload } = self.read_message().await? else {
+                continue; // ignore non-extension traffic during the fetch
+            };
+            if ext_id != our_ut_metadata_id {
+                continue;
+            }
+            match MetadataMessage::parse(&payload) {
+                Some(MetadataMessage::Data {
+                    piece,
+                    total_size: advertised,
+                    data,
+                }) => {
+                    let Some(idx) = usize::try_from(piece).ok().filter(|&i| i < pieces) else {
+                        continue;
+                    };
+                    let off = idx * METADATA_BLOCK_LEN;
+                    let end = off + (metadata_size - off).min(METADATA_BLOCK_LEN);
+                    if advertised != Some(total_size) || data.len() != end - off {
+                        return Err(PeerError::Protocol("invalid metadata block geometry"));
                     }
+                    if have[idx] {
+                        if blob[off..end] != data[..] {
+                            return Err(PeerError::Protocol("conflicting metadata block"));
+                        }
+                        continue;
+                    }
+                    blob[off..end].copy_from_slice(&data);
+                    have[idx] = true;
+                    remaining -= 1;
                 }
-                _ => {} // ignore non-metadata traffic during the fetch
+                Some(MetadataMessage::Reject { .. }) => {
+                    return Err(PeerError::Protocol("metadata request rejected"));
+                }
+                _ => {}
             }
         }
         Ok(blob)
@@ -1122,7 +1141,9 @@ mod tests {
             .collect();
         let total = metadata.len();
         let meta_peer = metadata.clone();
-        let peer_ut_id = 2u8;
+        // Directional ids: the peer listens on 7 for requests, we listen on 2 for its replies.
+        let peer_ut_id = 7u8;
+        let our_ut_id = 2u8;
 
         let (client, server) = tokio::io::duplex(64 * 1024);
         // Mock peer: answer every ut_metadata request with the matching data block.
@@ -1140,7 +1161,7 @@ mod tests {
                             let end = (off + METADATA_BLOCK_LEN).min(total);
                             let resp = data_piece(piece, total as i64, &meta_peer[off..end]);
                             sess.send(&PeerMessage::Extended {
-                                ext_id: peer_ut_id,
+                                ext_id: our_ut_id,
                                 payload: resp,
                             })
                             .await
@@ -1154,9 +1175,104 @@ mod tests {
         });
 
         let mut session = PeerSession::new(client);
-        let got = session.fetch_metadata(peer_ut_id, total).await.unwrap();
+        let got = session
+            .fetch_metadata(peer_ut_id, our_ut_id, total)
+            .await
+            .unwrap();
         assert_eq!(got, metadata);
         srv.await.unwrap();
+    }
+
+    /// Run `fetch_metadata(7, 2, size)` against a peer that, after reading our requests,
+    /// sends `replies` (ext id, payload) in order and then holds the connection open briefly.
+    async fn fetch_against_scripted_replies(
+        size: usize,
+        replies: Vec<(u8, Vec<u8>)>,
+    ) -> Result<Vec<u8>> {
+        use ace_wire::ut_metadata::piece_count;
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            let mut sess = PeerSession::new(server);
+            for _ in 0..piece_count(size) {
+                let _ = sess.read_message().await;
+            }
+            for (ext_id, payload) in replies {
+                let _ = sess.send(&PeerMessage::Extended { ext_id, payload }).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let mut session = PeerSession::new(client);
+        let res = tokio::time::timeout(Duration::from_secs(2), session.fetch_metadata(7, 2, size))
+            .await
+            .unwrap_or(Err(PeerError::Protocol("test timeout")));
+        srv.await.unwrap();
+        res
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_only_accepts_replies_on_our_advertised_id() {
+        use ace_wire::ut_metadata::data_piece;
+        let good = b"0123456789".to_vec();
+        // A bogus block on the peer's own id (7) is not a reply to us and must be ignored.
+        let got = fetch_against_scripted_replies(
+            10,
+            vec![
+                (7, data_piece(0, 10, b"XXXXXXXXXX")),
+                (2, data_piece(0, 10, &good)),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, good);
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_rejects_bad_block_geometry_and_conflicts() {
+        use ace_wire::ut_metadata::{data_piece, METADATA_BLOCK_LEN};
+        let size = METADATA_BLOCK_LEN + 10;
+        let first = vec![1u8; METADATA_BLOCK_LEN];
+        for (label, replies) in [
+            (
+                "short interior block",
+                vec![(2, data_piece(0, size as i64, &first[..100]))],
+            ),
+            (
+                "wrong total size",
+                vec![(2, data_piece(0, size as i64 + 1, &first))],
+            ),
+            (
+                "missing total size",
+                vec![(2, b"d8:msg_typei1e5:piecei0ee".to_vec())],
+            ),
+            (
+                "conflicting duplicate",
+                vec![
+                    (2, data_piece(0, size as i64, &first)),
+                    (
+                        2,
+                        data_piece(0, size as i64, &vec![9u8; METADATA_BLOCK_LEN]),
+                    ),
+                ],
+            ),
+        ] {
+            let res = fetch_against_scripted_replies(size, replies).await;
+            assert!(
+                matches!(res, Err(PeerError::Protocol(msg)) if msg != "test timeout"),
+                "{label}: {res:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_rejects_a_disabled_extension_id() {
+        let (client, _server) = tokio::io::duplex(1024);
+        let mut session = PeerSession::new(client);
+        for (peer, ours) in [(0, 2), (2, 0)] {
+            assert!(matches!(
+                session.fetch_metadata(peer, ours, 10).await,
+                Err(PeerError::Protocol(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1177,7 +1293,7 @@ mod tests {
             }
         });
         let mut session = PeerSession::new(client);
-        let res = session.fetch_metadata(peer_ut_id, 100).await;
+        let res = session.fetch_metadata(peer_ut_id, peer_ut_id, 100).await;
         assert!(matches!(res, Err(PeerError::Protocol(_))));
         srv.await.unwrap();
     }

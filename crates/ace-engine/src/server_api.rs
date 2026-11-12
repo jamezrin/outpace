@@ -195,14 +195,19 @@ pub fn content_id_result(content_id: &str) -> Value {
 /// `get_media_files` result: outpace transports are single-file, so this reports one media file
 /// keyed by the infohash. `dump_transport_file` is intentionally unsupported (see the matrix).
 pub fn media_files_result(c: &ResolvedContent) -> Value {
-    json!({
+    let mut file = json!({
         "infohash": c.infohash,
-        "files": [{
-            "infohash": c.infohash,
-            "index": 0,
-            "is_live": bool_flag(c.is_live),
-        }],
-    })
+        "index": 0,
+        "is_live": bool_flag(c.is_live),
+    });
+    if c.is_live {
+        // Live output is always MPEG-TS. The public Android SDK reads `mime` (and shows
+        // `filename`) before choosing an output route, without a null check. The name is a
+        // display fallback, not one read from the descriptor. VOD layout is not inspected.
+        file["mime"] = json!("video/mp2t");
+        file["filename"] = json!("stream.ts");
+    }
+    json!({ "infohash": c.infohash, "files": [file] })
 }
 
 /// The engine reports booleans as `0`/`1` integers in these envelopes.
@@ -345,6 +350,29 @@ mod tests {
         assert_eq!(v["infohash"], "bb".repeat(20));
         assert_eq!(v["files"][0]["infohash"], "bb".repeat(20));
         assert_eq!(v["files"][0]["is_live"], 0);
+        assert!(
+            v["files"][0].get("mime").is_none(),
+            "VOD type is not inferred"
+        );
+        assert!(v["files"][0].get("filename").is_none());
+    }
+
+    #[test]
+    fn live_media_files_report_the_served_mime_and_a_display_name() {
+        let c = ResolvedContent {
+            protection: None,
+            infohash: "bb".repeat(20),
+            content_id: None,
+            is_live: true,
+        };
+        let v = media_files_result(&c);
+        assert_eq!(v["files"][0]["is_live"], 1);
+        assert_eq!(v["files"][0]["mime"], "video/mp2t");
+        assert_eq!(v["files"][0]["filename"], "stream.ts");
+        assert!(
+            v["files"][0].get("size").is_none(),
+            "live size is not fabricated"
+        );
     }
 
     #[test]
