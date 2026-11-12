@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "ace_engine"
 path = "src/lib.rs"
 
+[features]
+default = []
+srt = ["dep:cc"]
+
 [dependencies]
 ace-log = { path = "../ace-log" }
 ace-wire = { path = "../ace-wire" }
@@ -48,3 +52,6 @@ tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 tokio = { version = "1", features = ["test-util"] }
 sha1 = "0.11"
 ace-tracker = { path = "../ace-tracker" }
+
+[build-dependencies]
+cc = { version = "1", optional = true }

@@ -330,6 +330,8 @@ config_with_root_redaction! {
     pub max_sessions: usize,
     /// Address the RTMP ingest listener binds to.
     pub rtmp_bind: SocketAddr,
+    /// Optional encrypted SRT ingest; an unset bind creates no listener.
+    pub srt: crate::srt::config::SrtConfig,
     /// Directory for the persistent identity seed and any caches.
     pub data_dir: PathBuf,
     /// Networks (providers) to enable.
@@ -428,6 +430,7 @@ impl Default for Config {
             max_sessions: 0,
             bind: "127.0.0.1:6878".parse().unwrap(),
             rtmp_bind: "127.0.0.1:1935".parse().unwrap(),
+            srt: Default::default(),
             data_dir,
             networks: vec!["ace".into()],
             peer_listen: "0.0.0.0:8621".parse().unwrap(),

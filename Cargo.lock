@@ -16,6 +16,7 @@ dependencies = [
  "axum",
  "base64ct",
  "bytes",
+ "cc",
  "clap",
  "dirs",
  "futures",
