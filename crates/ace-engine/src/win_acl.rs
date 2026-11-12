@@ -11,16 +11,22 @@
 //! * an existing one must be a real directory (not a reparse point), owned by SYSTEM,
 //!   Administrators or the service account, with a protected DACL whose allow entries name
 //!   only those three. Anything else is refused, never repaired in place.
+//!
+//! The checks run on one handle, opened without following reparse points and without
+//! `FILE_SHARE_DELETE`. The caller keeps that handle ([`PrivateDir`]) for as long as it uses
+//! the directory, so the verified entry cannot be renamed, deleted or swapped for a junction
+//! between the check and every later open by path.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{LocalFree, ERROR_ALREADY_EXISTS};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, EqualSid, GetAce, GetSecurityDescriptorControl, LookupAccountNameW,
@@ -28,13 +34,32 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, WELL_KNOWN_SID_TYPE,
 };
-use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, READ_CONTROL,
+};
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
 /// "Modify" (icacls `M`): read, write, execute and delete, but not change permissions or owner.
 const MODIFY: u32 = 0x0013_01bf;
 
 type Error = String;
+
+/// An open, verified handle on the private data directory. While it lives, the directory
+/// entry cannot be deleted, renamed or replaced (no `FILE_SHARE_DELETE`).
+pub struct PrivateDir(HANDLE);
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateFileW and is closed exactly once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+// SAFETY: a kernel handle may be used and closed from any thread.
+unsafe impl Send for PrivateDir {}
 
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
@@ -126,13 +151,13 @@ pub fn data_dir_sddl(service_sid: &str, owner_admins: bool) -> String {
     format!("{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{MODIFY:#x};;;{service_sid})")
 }
 
-/// Create `dir` with the private security descriptor, or check an existing one.
-/// Fails closed: an existing directory that is not provably private is an error.
+/// Create `dir` with the private security descriptor, or check an existing one, and return a
+/// handle that pins it. Fails closed: a directory that is not provably private is an error.
 pub fn ensure_private_dir(
     dir: &Path,
     service_account: &str,
     owner_admins: bool,
-) -> Result<(), Error> {
+) -> Result<PrivateDir, Error> {
     let service = Sid::account(service_account)?;
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -179,12 +204,43 @@ pub fn ensure_private_dir(
     })
 }
 
-fn verify_private_dir(dir: &Path, service: &Sid) -> Result<(), Error> {
-    let metadata = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+fn open_dir(dir: &Path) -> Result<PrivateDir, Error> {
+    let path = wide(dir.as_os_str());
+    // SAFETY: `path` is NUL-terminated; the returned handle is owned by PrivateDir.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            READ_CONTROL | FILE_READ_ATTRIBUTES,
+            // Deliberately no FILE_SHARE_DELETE: nobody may rename or delete it while held.
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            // Directories need BACKUP_SEMANTICS; OPEN_REPARSE_POINT opens a junction itself
+            // instead of its target, so it is detected below rather than followed.
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(format!("open: {}", std::io::Error::last_os_error()));
+    }
+    Ok(PrivateDir(handle))
+}
+
+fn verify_private_dir(dir: &Path, service: &Sid) -> Result<PrivateDir, Error> {
+    let pinned = open_dir(dir)?;
+    // SAFETY: zeroed is a valid BY_HANDLE_FILE_INFORMATION; the handle is open.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(pinned.0, &mut info) } == 0 {
+        return Err(format!(
+            "read attributes: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err("it is a link or junction".into());
     }
-    if !metadata.is_dir() {
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err("it is not a directory".into());
     }
     let trusted = [
@@ -199,14 +255,13 @@ fn verify_private_dir(dir: &Path, service: &Sid) -> Result<(), Error> {
             .any(|t| unsafe { EqualSid(t.as_psid(), sid) } != 0)
     };
 
-    let path = wide(dir.as_os_str());
     let mut owner: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: out-pointers are valid; owner and dacl point into `descriptor`, freed below.
     let status = unsafe {
-        GetNamedSecurityInfoW(
-            path.as_ptr(),
+        GetSecurityInfo(
+            pinned.0,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
@@ -264,7 +319,7 @@ fn verify_private_dir(dir: &Path, service: &Sid) -> Result<(), Error> {
         Ok(())
     })();
     unsafe { LocalFree(descriptor as _) };
-    verdict
+    verdict.map(|()| pinned)
 }
 
 #[cfg(test)]

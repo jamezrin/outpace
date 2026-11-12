@@ -190,7 +190,8 @@ fn serve(
     );
     // Fail closed: the identity seed and broadcast keys are never written into a directory
     // that is not provably private (see win_acl).
-    crate::win_acl::ensure_private_dir(&config.data_dir, SERVICE_ACCOUNT, false)?;
+    // Held until the service stops, so the verified directory cannot be swapped out.
+    let _pinned = crate::win_acl::ensure_private_dir(&config.data_dir, SERVICE_ACCOUNT, false)?;
     redirect_stderr(&config.data_dir.join("outpace.log"))?;
     crate::alog!(
         "[service] starting (data dir {})",
