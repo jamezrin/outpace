@@ -61,12 +61,19 @@ pub(super) async fn origin_hls_stop(
 }
 
 pub(super) fn origin_hls_error(error: OriginError) -> Response {
-    (
+    let mut response = (
         StatusCode::from_u16(error.status()).expect("constant status"),
         [(header::CACHE_CONTROL, "no-store")],
         error.code(),
     )
-        .into_response()
+        .into_response();
+    if let Some(status) = error.upstream_status() {
+        response.headers_mut().insert(
+            "x-outpace-upstream-status",
+            axum::http::HeaderValue::from(status),
+        );
+    }
+    response
 }
 
 /// Aggregate operational status only; no tokens, origin URLs or channel identities.

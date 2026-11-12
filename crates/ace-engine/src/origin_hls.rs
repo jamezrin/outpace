@@ -68,7 +68,22 @@ impl OriginError {
             Self::InvalidRange => "invalid_origin_range",
             Self::Timeout => "origin_timeout",
             Self::Cancelled => "origin_cancelled",
+            Self::Fetch(FetchError::ResourceHttpStatus(status)) => match status {
+                401 => "origin_upstream_unauthorized",
+                403 => "origin_upstream_forbidden",
+                404 => "origin_upstream_not_found",
+                410 => "origin_upstream_gone",
+                429 => "origin_upstream_rate_limited",
+                503 => "origin_upstream_unavailable",
+                _ => "origin_upstream_http_status",
+            },
             Self::Fetch(error) => error.code(),
+        }
+    }
+    pub const fn upstream_status(self) -> Option<u16> {
+        match self {
+            Self::Fetch(error) => error.upstream_status(),
+            _ => None,
         }
     }
     pub fn status(&self) -> u16 {
@@ -277,6 +292,7 @@ pub struct OriginHls {
     cache: Mutex<Cache>,
     admission: Arc<Semaphore>,
     fetches: Arc<Semaphore>,
+    resource_clients: http_fetch::ResourceClientPool,
     reaper_started: AtomicBool,
     lifetime: watch::Sender<bool>,
 }
@@ -289,6 +305,7 @@ impl OriginHls {
             cache: Mutex::new(Cache::default()),
             admission: Arc::new(Semaphore::new(16)),
             fetches: Arc::new(Semaphore::new(4)),
+            resource_clients: http_fetch::ResourceClientPool::default(),
             reaper_started: AtomicBool::new(false),
             lifetime,
         })
@@ -485,15 +502,12 @@ impl OriginHls {
             // Playlists are rewritten representations; byte offsets on the origin
             // cannot address them. HTTP permits ignoring a valid Range and returning
             // the entire representation (FFmpeg sends bytes=0- while probing).
-            http_fetch::open_playlist_resource(
-                &url,
-                self.policy,
-                limits,
-                session.cancel.subscribe(),
-            )
-            .await
+            self.resource_clients
+                .open_playlist_resource(&url, self.policy, limits, session.cancel.subscribe())
+                .await
         } else {
-            http_fetch::open_resource(&url, self.policy, limits, range, session.cancel.subscribe())
+            self.resource_clients
+                .open_resource(&url, self.policy, limits, range, session.cancel.subscribe())
                 .await
         }
         .map_err(|error| {

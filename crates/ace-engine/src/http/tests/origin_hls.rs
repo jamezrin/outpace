@@ -382,6 +382,97 @@ async fn managed_relay_serves_a_rewritten_origin_and_stop_releases_it() {
 }
 
 #[tokio::test]
+async fn managed_relay_reports_sanitized_upstream_status_for_playlists_and_media() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = axum::Router::new()
+        .route(
+            "/status/{code}",
+            route_get(|Path(code): Path<u16>| async move {
+                (
+                    StatusCode::from_u16(code).unwrap(),
+                    [
+                        (header::SET_COOKIE, "synthetic-origin-cookie"),
+                        (header::LOCATION, "https://example.invalid/synthetic-origin"),
+                        (header::CONTENT_ENCODING, "br"),
+                    ],
+                    "synthetic-origin-body",
+                )
+            }),
+        )
+        .route(
+            "/manifest/{code}",
+            route_get(|Path(code): Path<u16>| async move {
+                format!(
+                    "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n../status/{code}?token=synthetic-origin-query\n#EXT-X-ENDLIST\n"
+                )
+            }),
+        );
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    for (status, code) in [
+        (401, "origin_upstream_unauthorized"),
+        (403, "origin_upstream_forbidden"),
+        (404, "origin_upstream_not_found"),
+        (410, "origin_upstream_gone"),
+        (429, "origin_upstream_rate_limited"),
+        (503, "origin_upstream_unavailable"),
+        (418, "origin_upstream_http_status"),
+    ] {
+        for media in [false, true] {
+            let origin = if media {
+                format!("http://{address}/manifest/{status}")
+            } else {
+                format!("http://{address}/status/{status}?token=synthetic-origin-query")
+            };
+            let (mut state, _) = origin_state_for(&origin, true);
+            let relay = managed(
+                &mut state,
+                FetchPolicy {
+                    allow_non_global: true,
+                },
+            );
+            let started = get(&state, &format!("/ace/getstream?content_id={CID}")).await;
+            let playlist = started.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let resource = if media {
+                let response = get(&state, &playlist).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(!response.headers().contains_key("x-outpace-upstream-status"));
+                let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap();
+                std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .lines()
+                    .find(|line| line.starts_with("/origin-hls/"))
+                    .unwrap()
+                    .to_owned()
+            } else {
+                playlist
+            };
+            let response = get(&state, &resource).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{status}");
+            assert_eq!(
+                response.headers()["x-outpace-upstream-status"],
+                status.to_string()
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(!format!("{:?}", response.headers()).contains("synthetic-origin"));
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+            assert!(!response.headers().contains_key(header::LOCATION));
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(body, code);
+            assert_eq!(relay.active_count(), 1);
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn managed_relay_redirects_late_resolution_to_local_leases() {
     let (mut state, _) = origin_state(false);
     let relay = managed(&mut state, FetchPolicy::default());

@@ -1,12 +1,48 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod pooled;
+
 fn response(status: u16, headers: &[(&str, &str)]) -> reqwest::Response {
     let mut response = hyper::Response::builder().status(status);
     for (name, value) in headers {
         response = response.header(*name, *value);
     }
     response.body(Vec::<u8>::new()).unwrap().into()
+}
+
+#[test]
+fn resource_http_errors_retain_only_status_and_preserve_legacy_errors() {
+    for status in [204, 401, 403, 404, 410, 418, 429, 500, 503, 599] {
+        let response = response(
+            status,
+            &[
+                ("content-encoding", "br"),
+                ("set-cookie", "synthetic-origin-secret"),
+                (
+                    "location",
+                    "https://example.invalid/synthetic-origin-secret",
+                ),
+            ],
+        );
+        for error in [
+            validate_response(&response, None).unwrap_err(),
+            validate_playlist_response(&response).unwrap_err(),
+        ] {
+            assert_eq!(error, FetchError::ResourceHttpStatus(status));
+            assert_eq!(error.upstream_status(), Some(status));
+            assert_eq!(error.code(), "resource_http_status");
+            assert!(!format!("{error:?} {error}").contains("synthetic-origin-secret"));
+        }
+        if status >= 400 {
+            for continuous in [false, true] {
+                let error = super::super::validate_response(&response, continuous).unwrap_err();
+                assert_eq!(error, FetchError::HttpStatus);
+                assert_eq!(error.upstream_status(), None);
+                assert_eq!(error.code(), "http_status");
+            }
+        }
+    }
 }
 
 #[test]
