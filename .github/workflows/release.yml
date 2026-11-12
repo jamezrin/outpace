@@ -149,6 +149,9 @@ jobs:
       - build-binaries
     permissions:
       contents: write
+      # Signed build provenance for the archives (GitHub artifact attestations).
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -169,6 +172,13 @@ jobs:
           sha256sum outpace-* > SHA256SUMS
           cat SHA256SUMS
 
+      # Records which workflow run and commit built each archive. Verify with
+      # `gh attestation verify <archive> --repo <owner>/<repo>`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/outpace-*
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
@@ -184,6 +194,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/publish-container.yml
     with:
       tag: ${{ github.ref_name }}
