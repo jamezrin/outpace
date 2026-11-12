@@ -210,8 +210,14 @@ The custom walk's 24 datagrams show that the conservative footprint is worth kee
   cheap per lookup, not how they rank.
 - **Unobserved behavior.** Background routing-table traffic, adaptive server mode and
   announces were not exercised. Statements about them come from source.
-- **Boundary hardening after the run.** The block ran before two later hardening
+- **Boundary hardening after the run.** The block ran before later hardening
   changes. Its workers had no capabilities but kept the host's uid 0, so owner checks
-  would have let them read root-only files; workers now launch as uid 65534. The host
-  owned no address the relay would forward to; blocks now refuse admission otherwise.
-  Neither change alters the lookups' network path, so the measured results stand.
+  would have let them read root-only files; workers now launch as uid 65534. Before
+  and after the run the host owned no address the relay would forward to, and its
+  route digests, which cover the local table, were unchanged. No address-change
+  monitor existed yet, so an address added and removed during the run is not ruled
+  out. Blocks now refuse admission when the host owns such an address, and any
+  change during a block makes it inconclusive
+  ([#391](https://github.com/jamezrin/outpace-stream/issues/391) tracks prevention).
+  None of these changes alters the lookups' network path, so the measured results
+  stand.
