@@ -241,6 +241,7 @@ will be documented when implemented.
 
 | Setting | Default | Notes |
 | --- | --- | --- |
+| `OUTPACE_METRICS` | `false` | `1` or `true` serves Prometheus text metrics at `GET /metrics` on the HTTP bind. See [Support sources and operations](Support-Sources-and-Operations#prometheus-metrics). |
 | `OUTPACE_SEED_DEBUG` | unset | Any value logs every inbound seeding message (`[seed-session]` lines). Very verbose. Turn it on only while debugging. |
 
 Variables named `OUTPACE_TEST_*`, `OUTPACE_DHT_COMPARE_*` or `OUTPACE_RUN_*` belong to the test

@@ -295,6 +295,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_MANAGED_HLS")? {
         config.managed_hls = v;
     }
+    if let Some(v) = bool_from_env("OUTPACE_METRICS")? {
+        config.metrics = v;
+    }
     // Preserve presence: explicit public-network settings conflict, implicit defaults normalize.
     let private_peers = optional_private_env("OUTPACE_PRIVATE_PEERS")?;
     let private_descriptors = optional_private_env("OUTPACE_PRIVATE_DESCRIPTORS")?;
@@ -1183,6 +1186,9 @@ async fn serve_http_inner(
     );
     eprintln!("  Live ids: bare hex or cid: selects a content id; ih: selects a verified infohash");
     eprintln!("  status:  http://{}/streams", config.bind);
+    if config.metrics {
+        eprintln!("  metrics: http://{}/metrics", config.bind);
+    }
     let cancel_rtmp = rtmp.cancel.clone();
     let cancel_background = background.cancel.clone();
     let mut background_cancelled = background.cancel.subscribe();
@@ -1220,7 +1226,13 @@ async fn serve_http_inner(
         };
         *support_owner = support.clone();
         let draining_support = support.clone();
-        axum::serve(listener, crate::http::router_with_support(state, support))
+        let manager = state.manager.clone();
+        let networks = state.networks.clone();
+        let mut app = crate::http::router_with_support(state, support);
+        if config.metrics {
+            app = crate::metrics::instrument(app, manager, &networks);
+        }
+        axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 // Axum runs this future in its own task. Cancelling the outer serving future
                 // drops the runtime tasks owner, which must wake it to release its state too.
@@ -1720,6 +1732,22 @@ mod tests {
             assert_eq!(config_from_env().unwrap().managed_hls, expected);
         }
         for invalid in ["", "yes", "ture", " 1"] {
+            std::env::set_var(name, invalid);
+            assert!(config_from_env().unwrap_err().to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn metrics_env_defaults_off_and_parses_strictly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_METRICS";
+        let _restore = EnvRestore::clear(&[name]);
+        assert!(!config_from_env().unwrap().metrics);
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(name, value);
+            assert_eq!(config_from_env().unwrap().metrics, expected);
+        }
+        for invalid in ["", "yes", " 1"] {
             std::env::set_var(name, invalid);
             assert!(config_from_env().unwrap_err().to_string().contains(name));
         }
