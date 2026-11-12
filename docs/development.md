@@ -74,12 +74,21 @@ The release version is the Cargo package version: the workspace crates inherit a
 single `version` from `[workspace.package]` in the root `Cargo.toml`, and that is
 the version `outpace --version` reports. The git tag is only a validated trigger.
 
-First bump the shared version, then tag it with a leading `v`:
+First bump the shared version and commit the change, including the updated lockfile.
+Merge that release-preparation commit into `main` before creating the matching tag
+with a leading `v`:
 
 ```bash
-# edit [workspace.package] version in Cargo.toml, e.g. to 0.2.0, then:
-git tag v0.2.0
-git push origin v0.2.0
+# On a release-preparation branch, edit [workspace.package] in Cargo.toml,
+# e.g. to 0.10.0, then refresh Cargo.lock and commit both files:
+cargo check --workspace
+git add Cargo.toml Cargo.lock
+git commit -m "chore: prepare release 0.10.0"
+# After the release-preparation PR is merged:
+git switch main
+git pull --ff-only origin main
+git tag v0.10.0
+git push origin v0.10.0
 ```
 
 Pushing the tag runs `.github/workflows/release.yml`. It reads the version from

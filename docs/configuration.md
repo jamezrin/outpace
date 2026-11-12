@@ -7,7 +7,12 @@ settings by task with defaults and examples; this page keeps the detailed contra
 [Outbound-only private peer mode](private-peer-mode.md) restricts peer traffic to
 an exact operator allowlist and disables public discovery and advertising.
 
-Environment variables parsed by the daemon include:
+Audio normalization settings (`OUTPACE_HLS_AUDIO_NORMALIZE`,
+`OUTPACE_LIVE_AUDIO_NORMALIZE`, and `OUTPACE_FFMPEG_PATH`) are documented in
+[live audio](live-audio.md). SRT ingest settings (`OUTPACE_SRT_*`) are documented
+in [SRT ingest](srt-ingest.md).
+
+Other environment variables parsed by the daemon include:
 
 - `OUTPACE_PRIVATE_PEERS` - unset preserves public mode; a nonempty bounded numeric
   IPv4 endpoint list selects strict outbound-only private mode.

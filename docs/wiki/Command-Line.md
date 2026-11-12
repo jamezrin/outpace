@@ -65,11 +65,14 @@ Rules for these inputs:
 
 - When an `acestream:?` link carries several selectors, the first present wins:
   `content_id`, then `infohash`, then `url`, then `magnet`.
-- Duplicate query keys, and the file-selection options `_idx` and `stream_id`, are rejected.
 - Transport-file URLs are fetched over HTTP(S) with a 1 MiB limit, no redirects, and a time
   limit. Private and loopback hosts are refused unless `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT=1`.
 - The `acestream://` link of a broadcast made by **another** Outpace daemon needs
   `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1`.
+
+> **Unreleased:** the `edge` image and builds from `main` reject duplicate query keys
+> and the file-selection options `_idx` and `stream_id`. v0.9.0 does not enforce
+> these rejection rules.
 
 ### How `play` behaves
 
