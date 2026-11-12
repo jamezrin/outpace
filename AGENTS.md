@@ -22,7 +22,7 @@ Use the pinned Rust toolchain in `rust-toolchain.toml` and `rustfmt`. Follow Rus
 
 ## Performance & Efficiency
 
-Performance and resource efficiency are core goals of outpace, on equal footing with correctness. Performance regressions must not be merged.
+Performance and resource efficiency are core goals of outpace, on equal footing with correctness. Regressions must not be merged, unless the maintainer explicitly accepts a measured, unavoidable cost as described below.
 
 - A regression is any measurable loss in startup time, playback smoothness or latency, throughput, CPU use, memory use, allocations on hot paths, or binary size. A fix or feature that introduces one is not complete.
 - Hot paths include peer-wire decode and encode, the peer session receive loop, piece verification and reassembly, the seed store and serving, and TS/HLS output. A change to one needs a before/after measurement in the PR, taken on the same machine with a release build.

@@ -117,7 +117,8 @@ build can rewrite `Cargo.lock`. Revert that before committing unless you changed
 
 ### Performance
 
-Performance and efficiency are core goals of Outpace, and regressions must not be merged. A
+Performance and efficiency are core goals of Outpace, and regressions must not be merged unless
+the maintainer explicitly accepts a measured, unavoidable cost (see the last point below). A
 change that makes startup slower, playback less smooth, or CPU, memory or binary size worse is
 not finished, even if it's otherwise correct.
 
