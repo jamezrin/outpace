@@ -53,27 +53,31 @@ Twelve bounded HTTPS probes were made in total (12-second per-request timeout, 1
 
 **Files:** `acestream_search/service.rs` and its tests; reuse `ace_swarm::http_fetch`.
 
-**Interfaces:** `SearchService::search(SearchQuery) -> Result<Value, SearchError>`; `SearchSettings` owns the redacted API key. Fixed `https://api.acestream.me/`, no redirects. URL-encode each query parameter independently.
+**Interfaces:** `SearchService::search(SearchQuery) -> Result<Bytes, SearchError>`; `SearchSettings` owns the redacted API key. Fixed `https://api.acestream.me/`, no redirects. URL-encode each query parameter independently.
 
-- [ ] Write failing tests for request encoding, key redaction, per-page caching, expiry and cache byte eviction, upstream failures, deadline/size caps, and cancellation releasing admission.
-- [ ] Implement a 10-second total deadline, 1 MiB response limit, at most two active attempts, a bounded 8 MiB/32-entry cache with 30-second TTL, minimum one second between outbound starts, and 30-second failure cooldown. Cache only validated successes; distinguish overload/rate failures from valid empty results.
-- [ ] Test against an injected offline transport at the service boundary; do not weaken production destination policy for tests.
-- [ ] Run focused tests and lint, then commit.
+- [x] Write failing tests for request encoding, key redaction, per-page caching, expiry and cache byte eviction, upstream failures, deadline/size caps, and cancellation releasing admission.
+- [x] Implement a 10-second total deadline, 1 MiB response limit, at most two active attempts, a bounded 8 MiB/32-entry cache with 30-second TTL, minimum one second between outbound starts, and 30-second failure cooldown. Cache only validated successes; distinguish overload/rate failures from valid empty results.
+- [x] Test against an injected offline transport at the service boundary; do not weaken production destination policy for tests.
+- [x] Run focused tests and lint, then commit.
 
 ## Task 3: Configuration, route and playback boundary
 
 **Files:** `config.rs`, `runtime.rs`, `http.rs`, `http/acestream_search.rs`, HTTP/runtime tests, `.env.example`, `compose.yml`.
 
-- [ ] Write failing tests for independent flag combinations and existing native playback with services disabled/failed. `/search` requires only services opt-in; legacy `/server/api` still requires HTTP compatibility.
-- [ ] Add strict `OUTPACE_COMPAT_ACESTREAM_SERVICES` boolean (default false) and `OUTPACE_ACESTREAM_SEARCH_API_KEY` (required only when enabled, redacted in Debug/serialization). Reject services opt-in in private peer mode before listeners open.
-- [ ] Construct the service only after validation; expose bounded `/search` route and typed sanitized errors. No new resolution or reverse lookup behavior.
-- [ ] Add deterministic search → selection of an explicit infohash selector → existing verified-catalog playback-path coverage, and state the historical-client limitation explicitly.
-- [ ] Run offline tests and commit.
+- [x] Write failing tests for independent flag combinations and existing native playback with services disabled/failed. `/search` requires only services opt-in; legacy `/server/api` still requires HTTP compatibility.
+- [x] Add strict `OUTPACE_COMPAT_ACESTREAM_SERVICES` boolean (default false) and `OUTPACE_ACESTREAM_SEARCH_API_KEY` (required only when enabled, redacted in Debug/serialization). Reject services opt-in in private peer mode before listeners open.
+- [x] Construct the service only after validation; expose bounded `/search` route and typed sanitized errors. No new resolution or reverse lookup behavior.
+- [x] Add deterministic search → selection of an explicit infohash selector → existing verified-descriptor playback-path coverage, and state the historical-client limitation explicitly.
+- [x] Run offline tests and commit.
 
 ## Task 4: Operator documentation and full validation
 
 **Files:** README, configuration/variables/search/playback/migration wiki pages, compatibility matrix/inventory, `.env.example`, issue #406.
 
-- [ ] Document actual flags, required key, fixed upstream, bounds, error behavior, privacy and current/older client integration requirements; preserve the fact that result availability does not prove playback.
-- [ ] Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, identifier hygiene and wiki link checks.
-- [ ] Request branch review, fix material findings, push and open a PR. Do not close #406 until the named end-to-end acceptance path and external access requirements are actually supported and qualified.
+- [x] Document actual flags, required key, fixed upstream, bounds, error behavior, privacy and current/older client integration requirements; preserve the fact that result availability does not prove playback.
+- [x] Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, identifier hygiene and wiki link checks.
+- [x] Request branch review, fix material findings, push and open a PR. Do not close #406 until the named end-to-end acceptance path and external access requirements are actually supported and qualified.
+
+## Completion boundary
+
+The adapter and its offline/synthetic playback contract are implemented for PR #408. Full workspace tests, workspace all-target Clippy, formatting, identifier hygiene, wiki links and Compose configuration pass. The fresh branch review found no blockers. The production-transport discovery probe passed with the historical public test key, without source metadata output. This does not establish production key entitlement or deployed scraper behavior. #406 remains open for the named client's endpoint/parser integration and production access qualification.

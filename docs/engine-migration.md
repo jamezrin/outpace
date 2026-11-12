@@ -9,11 +9,13 @@ Outpace runs independently of the closed engine. Use the native CLI and
 [native API](native-api.md) first; the [Ace HTTP subset](protocol/compat-matrix.md) is an
 optional adapter, not complete engine parity. Public, unencrypted content is the scope.
 Premium/encrypted content, account/subscription import, player/web UI, and a closed-engine
-runtime remain permanent non-goals (#212). Service-backed name search is planned within
-v1.0.0 in [#406](https://github.com/jamezrin/outpace-stream/issues/406), as a separate,
-default-off adapter in this repository. It is not implemented or a migration prerequisite.
-Upstream access and a supported search-result-to-playback path must be established first;
-see the [search scope](wiki/Stream-Search.md).
+runtime remain permanent non-goals (#212). Service-backed name search is a separate,
+default-off adapter in builds newer than v0.9.0. It needs an accepted upstream key; see
+[search configuration and client limits](wiki/Stream-Search.md). HTTP compatibility alone
+does not enable it. Existing infohash playback selectors provide the result-to-playback path;
+older reverse-content-ID clients still need an integration change. Search is not a migration
+prerequisite, and [#406](https://github.com/jamezrin/outpace-stream/issues/406) retains the
+remaining client/access qualification requirements.
 Protected-descriptor refusal is still tracked in [#279](https://github.com/jamezrin/outpace-stream/issues/279);
 do not treat a reported zero encryption flag as independent proof that content is public.
 

@@ -12,6 +12,8 @@ from `main`; **srt build** means binaries built with the `srt` feature.
 | Variable | Default | Avail. | Purpose |
 | --- | --- | --- | --- |
 | [`OUTPACE_ACE_COMPAT`](Configuration#acestream-compatibility-api) | `false` | all | Turn on the AceStream-compatible `/ace/*` and `/server/api` routes. |
+| [`OUTPACE_ACESTREAM_SEARCH_API_KEY`](Configuration#acestream-search-services) | unset | edge | Accepted external search key; required only with services compatibility. |
+| [`OUTPACE_COMPAT_ACESTREAM_SERVICES`](Configuration#acestream-search-services) | `false` | edge | Separate opt-in for external stream-name search. |
 | [`OUTPACE_ACE_PEERS`](Configuration#discovery-trackers-and-resolution) | unset | all | Extra bootstrap peers, as `IPv4:port` separated by commas. |
 | [`OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE`](Configuration#broadcasting-and-ingest) | off | all | Exact `1`: allow private and loopback broadcast pull sources. |
 | [`OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT`](Configuration#discovery-trackers-and-resolution) | off | all | Exact `1`: allow transport-file URLs on private hosts. |

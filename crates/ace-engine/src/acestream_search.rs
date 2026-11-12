@@ -23,6 +23,10 @@ pub enum SearchError {
     InvalidResponse,
     Upstream,
     TooLarge,
+    InvalidSettings,
+    RateLimited,
+    Busy,
+    Timeout,
 }
 
 impl SearchQuery {
@@ -169,3 +173,53 @@ fn normalize_item(item: &Value) -> Result<Value, SearchError> {
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SearchSettings {
+    pub enabled: bool,
+    #[serde(skip)]
+    key: Option<String>,
+}
+impl std::fmt::Debug for SearchSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchSettings")
+            .field("enabled", &self.enabled)
+            .finish_non_exhaustive()
+    }
+}
+impl SearchSettings {
+    pub fn from_env(
+        enabled: bool,
+        key: Result<String, std::env::VarError>,
+    ) -> Result<Self, String> {
+        if !enabled {
+            return Ok(Self::default());
+        }
+        let key = key.map_err(|_| {
+            "OUTPACE_ACESTREAM_SEARCH_API_KEY is required when services compatibility is enabled"
+        })?;
+        if key.is_empty() || key.len() > 512 || !key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("OUTPACE_ACESTREAM_SEARCH_API_KEY must contain 1–512 visible ASCII bytes without spaces".into());
+        }
+        Ok(Self {
+            enabled,
+            key: Some(key),
+        })
+    }
+    pub fn validate(&self, private: bool) -> Result<(), String> {
+        if self.enabled && private {
+            return Err(
+                "OUTPACE_COMPAT_ACESTREAM_SERVICES conflicts with private peer mode".into(),
+            );
+        }
+        if self.enabled {
+            Self::from_env(true, self.key.clone().ok_or(std::env::VarError::NotPresent))?;
+        }
+        Ok(())
+    }
+}
+mod service;
+pub use service::SearchService;
+
+#[cfg(test)]
+pub(crate) use service::tests::offline_service;
