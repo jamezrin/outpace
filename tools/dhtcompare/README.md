@@ -220,8 +220,10 @@ binaries.
 Qualification uses same-entry target fixtures under real namespaces plus separate
 compiled executable denials. Same-entry positives cover gate, real adapter and
 encoder; they do not prove positive OS-environment/stdout integration through
-binary `main()`. Public destination policy, a live worker policy and matched live
-comparison remain outstanding for #44. No live execution is authorized here.
+binary `main()`. The offline worker authorizes no live execution; the public
+destination policy and live worker policy are under [Live boundary](#live-boundary),
+and the matched comparison is in
+[the comparison report](../../docs/testing/dht-comparison-44.md).
 
 ## Live boundary
 
@@ -232,7 +234,9 @@ the fixed topology, policy and relay described in
 - The worker gets a veth with a default route, IPv6 disabled, and a default-deny
   nftables table.
 - It runs with empty capability sets and `no_new_privs`, on a read-only root,
-  with empty tmpfs over every directory holding host UNIX sockets.
+  with empty tmpfs over every directory holding host UNIX sockets. A root
+  supervisor launches the namespace as uid 65534, so root-only host files are
+  unreadable.
 - The namespace dies with the supervisor through a parent-death SIGKILL.
 - The supervisor relay forwards only IPv4 UDP to global unicast destinations,
   from sockets bound to the declared egress device.
@@ -277,7 +281,7 @@ python3.11 tools/dhtcompare/live_qualification.py \
   --output /private/path/to/new-live-qualification
 ```
 
-The 12 fixed cases run inside one outer namespace whose only egress is a dummy
+The 14 fixed cases run inside one outer namespace whose only egress is a dummy
 device with synthetic addresses, under a 240-second deadline:
 
 - A probe covers two threads and sockets, eight denied destination classes,
@@ -287,7 +291,10 @@ device with synthetic addresses, under a 240-second deadline:
   values, and against advertised private nodes. Each candidate must try and fail to
   reach the private nodes, with matching relay and nftables counts.
 - Unconfined gate denials are exercised for every entry.
-- The complete block supervisor runs, and refuses encrypted content.
+- The complete block supervisor runs. It refuses encrypted content, enabled IPv6
+  and a host-owned global address before starting any arm.
+- As root, qualification launches as uid 65534 like live workers, and the probe
+  must fail to read a root-only canary file.
 
 Listeners on private outer addresses must receive nothing. `test_live.py` runs the
 probe locally without binaries. CI runs the pure relay, policy, consistency and
@@ -299,7 +306,8 @@ predicate tests.
 `{"content_id": "..."}` on stdin; the operator supplies it, and this tool never
 reads the registry. It runs these steps:
 
-1. Verify pins, the single default route via `--egress-device`, and the route and
+1. Verify pins, the single default route via `--egress-device`, disabled IPv6, no
+   host-owned address the relay would forward to, and the route and
    stateless-ruleset digests.
 2. Resolve the target once through the local daemon's loopback `analyze_content`
    method. Encrypted or unknown protection is refused.

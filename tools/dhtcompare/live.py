@@ -5,8 +5,9 @@ the relay in this process; see live_policy and live_relay. Its filesystem is
 read-only and every directory holding host UNIX sockets is covered by an empty
 tmpfs. This owner bounds time, pipes and relay state, tears down the namespace
 through its verified PID 1, and arms a parent-death SIGKILL so the namespace dies
-with this process. It does not prove library actor joins; namespace teardown is
-the hard boundary.
+with this process. A root supervisor launches the namespace as an unprivileged uid,
+so the worker cannot read root-only host files. It does not prove library actor
+joins; namespace teardown is the hard boundary.
 """
 from dataclasses import dataclass
 import json
@@ -32,6 +33,7 @@ SETPRIV = '/usr/bin/setpriv'
 # bound path the supervisor can see must be unreachable inside the namespace.
 HIDDEN_PATHS = ('/run', '/var/run', '/tmp', '/var/tmp', '/var/spool', '/dev/shm')
 MAX_LISTENERS = 1024
+UNPRIVILEGED_ID = 65534
 BOOTSTRAP = Path(__file__).resolve().with_name('live_bootstrap.py')
 MESSAGE = 65536
 INNER_FIELDS = ('wait_status', 'elapsed_seconds', 'rss_hwm_kib_sampled', 'user_seconds', 'system_seconds',
@@ -54,6 +56,26 @@ class LiveResult:
     denial: str | None = None
     boundary: dict | None = None
     inner: dict | None = None
+
+
+def _maps(path, identity):
+    for line in Path(path).read_text().splitlines():
+        inside, _, count = (int(field) for field in line.split())
+        if inside <= identity < inside + count:
+            return True
+    return False
+
+
+def launcher_identity():
+    """setpriv arguments that drop a root supervisor's namespace launch to an unprivileged uid.
+
+    The parent-death signal is armed after the credential change, so it survives it.
+    A supervisor that is not root, or cannot map the unprivileged id, launches as itself.
+    """
+    if (os.geteuid() != 0 or not _maps('/proc/self/uid_map', UNPRIVILEGED_ID)
+            or not _maps('/proc/self/gid_map', UNPRIVILEGED_ID)):
+        return []
+    return ['--reuid', str(UNPRIVILEGED_ID), '--regid', str(UNPRIVILEGED_ID), '--clear-groups']
 
 
 def bound_unix_paths(listing='/proc/net/unix'):
@@ -148,7 +170,7 @@ def run_live(argv, *, timeout, env, open_outer, prefix_cap=65536):
             or any(not isinstance(a, str) or not a or len(a) > 16384 for a in argv)):
         raise ValueError('invalid_live_worker')
     control, child_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    command = [SETPRIV, '--pdeathsig', 'KILL', '--', UNSHARE, '--user', '--map-root-user', '--net', '--pid', '--fork',
+    command = [SETPRIV, *launcher_identity(), '--pdeathsig', 'KILL', '--', UNSHARE, '--user', '--map-root-user', '--net', '--pid', '--fork',
                '--kill-child=KILL', '--mount-proc', sys.executable, '-I', str(BOOTSTRAP),
                str(child_end.fileno()), *argv]
     start = time.monotonic(); deadline = start + timeout; cleanup_deadline = deadline + 2

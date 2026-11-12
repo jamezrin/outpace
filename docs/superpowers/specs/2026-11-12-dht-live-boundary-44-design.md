@@ -22,15 +22,17 @@ supervisor. A fixed bootstrap is namespace PID 1:
 1. Disables IPv6 and IPv4 forwarding, creates a veth pair (`dhtw0` for the worker, `dhtr0` for the relay),
    assigns `10.200.0.2/30` to `dhtw0`, adds a permanent neighbour entry for gateway
    `10.200.0.1`, and routes the default route through it.
-2. Loads a default-deny nftables table. Output accepts the inner loopback, and UDP to
-   IPv4 destinations outside the special-purpose prefixes. Input accepts the inner
-   loopback, and conntrack-established UDP replies. Every other packet is counted
-   and dropped.
+2. Loads a default-deny nftables table. Output accepts the inner loopback and IPv4
+   UDP on `dhtw0`. UDP to the special-purpose prefixes is counted separately and also
+   accepted, so the relay, not nftables, drops it and the library sees network loss
+   rather than `EPERM`. Input accepts the inner loopback and conntrack-established
+   UDP replies. Every other packet, including all TCP, ICMP and IPv6, is counted and
+   dropped.
 3. Opens an `AF_PACKET` socket on `dhtr0`, then makes every inherited mount
    read-only and covers each directory that holds host UNIX sockets (`/run`, `/tmp`,
    `/var/tmp`, `/var/spool`, `/dev/shm`) with an empty tmpfs. Path sockets bypass
-   network namespaces, so without this a uid-0 worker could reach the init system,
-   the message bus or a mail spool and egress through them.
+   network namespaces, so without this a worker could reach the init system, the
+   message bus or a mail spool and egress through them.
 4. Passes the packet socket and an attestation to the supervisor over a
    sequenced-packet socket. The supervisor validates the links, addresses, routes,
    ruleset structure and zero counters, forwarding state, the read-only root, the
@@ -49,8 +51,12 @@ same inner socket contacted. Unsolicited inbound traffic is counted and dropped,
 no candidate can act as a reachable DHT server. Mappings, contacts, payload sizes and
 datagram totals are bounded.
 
-There are three independent layers: the relay policy, the inner nftables policy, and the
-existing host egress table and VPN gateway. Nothing on the host changes. Each worker's
+The destination policy for UDP is enforced by the relay alone; nftables restricts the
+worker to UDP on its veth and counts denied destinations, and the existing host egress
+table and VPN gateway sit behind the relay. A root supervisor launches each namespace
+as uid 65534, so the worker cannot read root-only host files, and a block refuses
+admission while the host owns any address the relay would forward to, because Linux
+would deliver such datagrams locally. Nothing on the host changes. Each worker's
 namespace, sockets and relay state are destroyed before the next arm starts. The
 launcher carries a parent-death SIGKILL, so the namespace also dies if the
 supervisor is killed.

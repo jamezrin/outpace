@@ -94,8 +94,16 @@ class PolicyTests(unittest.TestCase):
         text = live_policy.nft_ruleset()
         for prefix in live_policy.DENIED_V4:
             self.assertIn(prefix, text)
-        for comment in live_policy.RULE_COMMENTS:
-            self.assertIn(f'comment "{comment}"', text)
+        rules = [(m.group(2), m.group(1)) for m in
+                 re.finditer(r'counter (accept|drop) comment "([a-z_0-9]+)"', text)]
+        self.assertEqual(rules, [
+            ('out_lo', 'accept'), ('out_udp_denied', 'accept'), ('out_udp', 'accept'),
+            ('out_icmp_drop', 'drop'), ('out_drop', 'drop'),
+            ('in_lo', 'accept'), ('in_udp_established', 'accept'), ('in_drop', 'drop')])
+        self.assertEqual([name for name, _ in rules], list(live_policy.RULE_COMMENTS))
+        self.assertEqual(text.count('policy drop;'), 2)
+        self.assertIn('oifname "dhtw0" meta nfproto ipv4 meta l4proto udp ip daddr @denied4 counter', text)
+        self.assertIn('iifname "dhtw0" meta nfproto ipv4 meta l4proto udp ct state established counter', text)
 
     def listing(self, comments=live_policy.RULE_COMMENTS, prefixes=live_policy.DENIED_V4):
         elem = [{'prefix': {'addr': p.split('/')[0], 'len': int(p.split('/')[1])}} for p in prefixes]
@@ -257,6 +265,19 @@ class ListenerInventoryTests(unittest.TestCase):
             self.assertEqual(live_block.uncovered_listeners(), 2)
         finally:
             live.bound_unix_paths = original
+
+
+class LauncherIdentityTests(unittest.TestCase):
+    def test_maps_checks_identity_ranges(self):
+        with tempfile.NamedTemporaryFile('w') as table:
+            table.write('         0     100000      65536\n')
+            table.flush()
+            self.assertTrue(live._maps(table.name, 65534))
+            self.assertFalse(live._maps(table.name, 65536))
+        with tempfile.NamedTemporaryFile('w') as table:
+            table.write('0 1000 1\n')
+            table.flush()
+            self.assertFalse(live._maps(table.name, 65534))
 
 
 class ConsistencyTests(unittest.TestCase):

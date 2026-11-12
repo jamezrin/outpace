@@ -131,8 +131,8 @@ node with a routing table:
 The custom walk keeps no state between lookups.
 
 **Inbound serving.** Both libraries default to *adaptive* mode. After a table refresh,
-a node that has seen it is not firewalled switches itself into server mode and answers
-inbound DHT queries. Adopting either library would silently change Outpace's
+a node that has determined that it is not firewalled switches itself into server mode
+and answers inbound DHT queries. Adopting either library would silently change Outpace's
 inbound-serving default unless it is pinned off. The live block could not observe this,
 because the boundary admits no unsolicited inbound traffic.
 
@@ -210,3 +210,8 @@ The custom walk's 24 datagrams show that the conservative footprint is worth kee
   cheap per lookup, not how they rank.
 - **Unobserved behavior.** Background routing-table traffic, adaptive server mode and
   announces were not exercised. Statements about them come from source.
+- **Boundary hardening after the run.** The block ran before two later hardening
+  changes. Its workers had no capabilities but kept the host's uid 0, so owner checks
+  would have let them read root-only files; workers now launch as uid 65534. The host
+  owned no address the relay would forward to; blocks now refuse admission otherwise.
+  Neither change alters the lookups' network path, so the measured results stand.

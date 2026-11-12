@@ -1,8 +1,8 @@
 """Fixed boundary probe run as a live worker in offline qualification only.
 
 Exercises the destination matrix from two threads and sockets, inbound filtering,
-privilege denials and filesystem confinement. argv: UNIX_SOCKET_PATH WRITE_PATH,
-both supervisor-owned. Prints one JSON object.
+privilege denials and filesystem confinement. argv: UNIX_SOCKET_PATH WRITE_PATH
+[CANARY_PATH], all supervisor-owned. Prints one JSON object.
 """
 import errno
 import json
@@ -94,6 +94,8 @@ def main():
     results['unix_connect'] = outcome(lambda: unix_connect(sys.argv[1]))
     results['file_write'] = outcome(lambda: file_write(sys.argv[2]))
     results['run_listing'] = sorted(os.listdir('/run'))
+    results['canary_read'] = (outcome(lambda: open(sys.argv[3], 'rb').close())
+                              if len(sys.argv) > 3 else 'not_tested')
     results['nft_flush'] = command('/usr/sbin/nft', 'flush', 'ruleset')
     results['link_down'] = command('/usr/bin/ip', 'link', 'set', 'dhtw0', 'down')
     status = {}

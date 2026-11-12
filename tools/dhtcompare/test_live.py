@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 import live_fixture
 
@@ -13,11 +14,12 @@ FIXTURE = Path(__file__).resolve().with_name('live_fixture.py')
 
 
 def run_cases(*cases):
-    config = json.dumps({'cases': list(cases)})
-    completed = subprocess.run(
-        ['/usr/bin/unshare', '--user', '--map-root-user', '--net', '--pid', '--fork',
-         '--kill-child=KILL', '--mount-proc', sys.executable, '-I', str(FIXTURE), config],
-        capture_output=True, timeout=60)
+    with tempfile.TemporaryDirectory(dir=FIXTURE.parent) as scratch:
+        config = json.dumps({'cases': list(cases), 'scratch': scratch, 'canary': None})
+        completed = subprocess.run(
+            ['/usr/bin/unshare', '--user', '--map-root-user', '--net', '--pid', '--fork',
+             '--kill-child=KILL', '--mount-proc', sys.executable, '-I', str(FIXTURE), config],
+            capture_output=True, timeout=60)
     if completed.returncode != 0:
         raise AssertionError(completed.stderr.decode(errors='replace')[-2000:])
     return json.loads(completed.stdout)

@@ -26,6 +26,8 @@ EGRESS = 'dhtq0'
 SEED = ('11.0.0.2', 6881)
 SECOND = ('11.0.0.4', 6881)
 STRANGERS = (('11.0.0.3', 6881), ('11.0.0.2', 6882))
+HOST_GLOBAL = '12.0.0.1'
+SYNTHETIC_HOST = frozenset(('11.0.0.1', SEED[0], SECOND[0], STRANGERS[0][0]))
 LEAK_ADDRESSES = ('10.0.0.5', '192.168.1.9', '172.16.0.1', '100.64.0.1', '169.254.1.1')
 TARGET = bytes.fromhex('0123456789abcdef0123456789abcdef01234567')
 CUSTOM_TEST = 'dht::comparison::worker::custom_live_worker'
@@ -35,10 +37,16 @@ def ip(*args):
     subprocess.run(('/usr/bin/ip', *args), check=True, timeout=2, capture_output=True)
 
 
+def set_ipv6(enabled):
+    for scope in ('all', 'default'):
+        Path(f'/proc/sys/net/ipv6/conf/{scope}/disable_ipv6').write_text('0' if enabled else '1')
+
+
 def setup():
     links = json.loads(subprocess.check_output(('/usr/bin/ip', '-j', 'link', 'show'), timeout=2))
     if [link['ifname'] for link in links] != ['lo'] or os.getuid() != 0:
         raise SystemExit('fixture requires a fresh isolated network namespace')
+    set_ipv6(False)
     ip('link', 'set', 'lo', 'up')
     ip('link', 'add', EGRESS, 'type', 'dummy')
     ip('link', 'set', EGRESS, 'up')
@@ -164,35 +172,41 @@ def summary(result):
             'boundary': result.boundary, 'inner': result.inner}
 
 
-def probe_case():
+def probe_case(scratch, canary):
     servers = Servers('echo')
-    with tempfile.TemporaryDirectory(dir='/tmp') as sockets, \
-            tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as writable, \
-            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-        listener.bind(f'{sockets}/probe.sock')
-        listener.listen(4)
-        listener.setblocking(False)
-        target = f'{writable}/leak'
-        try:
-            result = live.run_live(['/usr/bin/python3', '-I', str(Path(__file__).with_name('live_probe.py')),
-                                    f'{sockets}/probe.sock', target],
-                                   timeout=20, env={'LC_ALL': 'C'},
-                                   open_outer=lambda: egress_socket(EGRESS))
-        finally:
-            alive = servers.close()
-        try:
-            listener.accept()[0].close()
-            unix_accepted = 1
-        except BlockingIOError:
-            unix_accepted = 0
-        file_created = os.path.lexists(target)
+    alive = None
+    try:
+        with tempfile.TemporaryDirectory(dir='/tmp') as sockets, \
+                tempfile.TemporaryDirectory(dir=scratch) as writable, \
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(f'{sockets}/probe.sock')
+            listener.listen(4)
+            listener.setblocking(False)
+            target = f'{writable}/leak'
+            argv = ['/usr/bin/python3', '-I', str(Path(__file__).with_name('live_probe.py')),
+                    f'{sockets}/probe.sock', target, *([canary] if canary else [])]
+            try:
+                result = live.run_live(argv, timeout=20, env={'LC_ALL': 'C'},
+                                       open_outer=lambda: egress_socket(EGRESS))
+            finally:
+                alive = servers.close()
+            try:
+                listener.accept()[0].close()
+                unix_accepted = 1
+            except BlockingIOError:
+                unix_accepted = 0
+            file_created = os.path.lexists(target)
+    finally:
+        if alive is None:
+            servers.close()
     probe = None
     try:
         probe = json.loads(result.stdout)
     except ValueError:
         pass
     return dict(summary(result), probe=probe, leaks=servers.leaks, servers_alive=alive,
-                unix_accepted=unix_accepted, file_created=file_created)
+                unix_accepted=unix_accepted, file_created=file_created,
+                canary_expected='EACCES' if canary else 'not_tested')
 
 
 def candidate_case(role, artifact, mode):
@@ -249,7 +263,7 @@ def block_case(config, encrypted):
             report = live_block.run_block(
                 artifacts, content_id='0123456789abcdef0123456789abcdef01234567',
                 egress_device=EGRESS, output=Path(directory) / 'block',
-                bootstrap=(f'{SEED[0]}:{SEED[1]}',))
+                bootstrap=(f'{SEED[0]}:{SEED[1]}',), local_exemptions=SYNTHETIC_HOST)
             files = sorted(p.name for p in (Path(directory) / 'block').iterdir())
             written = (Path(directory) / 'block' / 'report.json').read_bytes()
     finally:
@@ -260,9 +274,27 @@ def block_case(config, encrypted):
             'report_has_seed': SEED[0].encode() in written}
 
 
+def refused_block_case(config, kind):
+    """Run the block with one host-state violation that admission must refuse."""
+    if kind == 'block_ipv6_enabled':
+        set_ipv6(True)
+    else:
+        ip('address', 'add', f'{HOST_GLOBAL}/32', 'dev', EGRESS)
+    try:
+        return block_case(config, 0)
+    finally:
+        if kind == 'block_ipv6_enabled':
+            set_ipv6(False)
+        else:
+            ip('address', 'del', f'{HOST_GLOBAL}/32', 'dev', EGRESS)
+
+
 CASES = ('probe', 'values:custom', 'values:mainline', 'values:n0', 'private_nodes:custom',
          'private_nodes:mainline', 'private_nodes:n0', 'unconfined:custom',
-         'unconfined:mainline', 'unconfined:n0', 'block', 'block_encrypted')
+         'unconfined:mainline', 'unconfined:n0', 'block', 'block_encrypted',
+         'block_ipv6_enabled', 'block_host_address')
+REFUSALS = {'block_encrypted': 'encrypted_or_unknown_protection',
+            'block_ipv6_enabled': 'ipv6_enabled', 'block_host_address': 'host_global_address'}
 ZERO_CAPS = {key: '0000000000000000' for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')}
 
 
@@ -297,6 +329,7 @@ def evaluate(results):
                       and probe['unix_connect'] == 'ENOENT' and probe['file_write'] == 'EROFS'
                       and probe['run_listing'] == [] and case['unix_accepted'] == 0
                       and case['file_created'] is False
+                      and probe['canary_read'] == case['canary_expected']
                       and probe['status'] == dict(ZERO_CAPS, NoNewPrivs='1'))
             elif name.startswith(('values:', 'private_nodes:')):
                 record = case['record']
@@ -319,11 +352,13 @@ def evaluate(results):
                       and not case['report_has_target'] and not case['report_has_seed']
                       and [a['role'] for a in report['arms']] == ['custom', 'mainline', 'n0']
                       and all(a['record']['terminal'] == 'target' for a in report['arms'])
-                      and report['preflight'] == report['postflight'])
-            elif name == 'block_encrypted':
+                      and report['preflight'] == report['postflight']
+                      and report['preflight']['ipv6_disabled'] is True
+                      and report['host_global_addresses'] == 0)
+            elif name in REFUSALS:
                 report = case['report']
                 ok = (report['verdict'] == 'inconclusive' and report['arms'] == []
-                      and report['reason'] == 'encrypted_or_unknown_protection'
+                      and report['reason'] == REFUSALS[name]
                       and case['files'] == ['report.json'])
             else:
                 ok = False
@@ -340,10 +375,13 @@ def main():
     results = {}
     for case in config['cases']:
         if case == 'probe':
-            results[case] = probe_case()
+            results[case] = probe_case(config['scratch'], config['canary'])
             continue
         if case in ('block', 'block_encrypted'):
             results[case] = block_case(config, 1 if case == 'block_encrypted' else 0)
+            continue
+        if case in ('block_ipv6_enabled', 'block_host_address'):
+            results[case] = refused_block_case(config, case)
             continue
         kind, role = case.split(':')
         artifact = live.Artifact(Path(config[('custom' if role == 'custom' else 'upstream')]),

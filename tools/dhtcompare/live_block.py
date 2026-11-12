@@ -165,6 +165,13 @@ def _consistency(boundary, inner):
             else packet_drops != 0 or boundary['outer_socket_kernel_drops'] != 0}
 
 
+def host_global_addresses(exempt=frozenset()):
+    """Count host IPv4 addresses the relay would forward to; Linux delivers those locally."""
+    entries = _command_json('/usr/bin/ip', '-j', '-4', 'address', 'show')
+    return sum(live_policy.permitted(info['local'], 1) and info['local'] not in exempt
+               for entry in entries for info in entry.get('addr_info', ()))
+
+
 def uncovered_listeners():
     """Count bound UNIX socket paths outside the directories each worker namespace hides."""
     return sum(not any(path.startswith(hidden + '/') for hidden in live.HIDDEN_PATHS)
@@ -172,7 +179,8 @@ def uncovered_listeners():
 
 
 def run_block(artifacts, *, content_id, egress_device, output, resolver_port=6878,
-              bootstrap=BOOTSTRAP, open_outer=None):
+              bootstrap=BOOTSTRAP, open_outer=None, local_exemptions=frozenset()):
+    """`local_exemptions` names synthetic host addresses for offline qualification only."""
     start = time.monotonic(); deadline = start + BLOCK_SECONDS
     output = Path(output)
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -187,6 +195,11 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
         report['preflight'] = preflight
         if not preflight['default_via_egress']:
             raise Inconclusive('egress_route')
+        if not preflight['ipv6_disabled']:
+            raise Inconclusive('ipv6_enabled')
+        report['host_global_addresses'] = host_global_addresses(local_exemptions)
+        if report['host_global_addresses']:
+            raise Inconclusive('host_global_address')
         resolution_start = time.monotonic()
         target, is_live = resolve_target(content_id, resolver_port, deadline)
         report['target_resolution_seconds'] = time.monotonic() - resolution_start

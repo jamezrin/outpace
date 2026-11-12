@@ -22,8 +22,9 @@ def passing():
                          'unsolicited': 'pong:unsolicited', 'unsolicited_extra': [],
                          'private': private, 'tcp': 'timeout', 'ipv6': 'EADDRNOTAVAIL',
                          'raw': 'EPERM', 'nft_flush': 1, 'link_down': 2, 'status': caps,
-                         'unix_connect': 'ENOENT', 'file_write': 'EROFS', 'run_listing': []},
-                  unix_accepted=0, file_created=False)
+                         'unix_connect': 'ENOENT', 'file_write': 'EROFS', 'run_listing': [],
+                         'canary_read': 'EACCES'},
+                  unix_accepted=0, file_created=False, canary_expected='EACCES')
     probe['boundary'] = {'denied_destination': 5, 'unsolicited_in': 2, 'admitted_out': 3}
     probe['inner']['policy_counters']['out_udp_denied'] = 5
     results = {'probe': probe}
@@ -38,12 +39,13 @@ def passing():
                                          'record_line': False, 'stdout_bytes': 0}
     consistent = {'denials_agree': True, 'udp_frames_agree': True, 'kernel_drops': False}
     arms = [{'role': r, 'record': record, 'consistency': consistent} for r in ('custom', 'mainline', 'n0')]
-    results['block'] = {'report': {'verdict': 'complete', 'arms': arms, 'preflight': {},
-                                   'postflight': {}},
+    results['block'] = {'report': {'verdict': 'complete', 'arms': arms,
+                                   'preflight': {'ipv6_disabled': True},
+                                   'postflight': {'ipv6_disabled': True}, 'host_global_addresses': 0},
                         'leaks': 0, 'report_has_target': False, 'report_has_seed': False}
-    results['block_encrypted'] = {'report': {'verdict': 'inconclusive', 'arms': [],
-                                             'reason': 'encrypted_or_unknown_protection'},
-                                  'files': ['report.json']}
+    for name, reason in live_fixture.REFUSALS.items():
+        results[name] = {'report': {'verdict': 'inconclusive', 'arms': [], 'reason': reason},
+                         'files': ['report.json']}
     return results
 
 
@@ -65,7 +67,8 @@ class EvaluateTests(unittest.TestCase):
                       lambda c: c['probe'].update(file_write='EACCES'),
                       lambda c: c['probe'].update(run_listing=['systemd']),
                       lambda c: c.update(unix_accepted=1),
-                      lambda c: c.update(file_created=True)],
+                      lambda c: c.update(file_created=True),
+                      lambda c: c['probe'].update(canary_read='sent')],
             'values:mainline': [lambda c: c['record'].update(terminal='deadline'),
                                 lambda c: c['boundary'].update(denied_destination=1)],
             'private_nodes:n0': [lambda c: c['boundary'].update(denied_destination=0),
@@ -78,12 +81,17 @@ class EvaluateTests(unittest.TestCase):
                       lambda c: c.update(report_has_seed=True),
                       lambda c: c['report']['arms'].reverse(),
                       lambda c: c['report'].update(postflight={'drift': 1}),
+                      lambda c: c['report'].update(preflight={'ipv6_disabled': False},
+                                                   postflight={'ipv6_disabled': False}),
+                      lambda c: c['report'].update(host_global_addresses=1),
                       lambda c: c['report']['arms'][1].update(
                           consistency={'denials_agree': True, 'udp_frames_agree': False, 'kernel_drops': False}),
                       lambda c: c['report']['arms'][2].update(
                           consistency={'denials_agree': True, 'udp_frames_agree': True, 'kernel_drops': True})],
             'block_encrypted': [lambda c: c['report'].update(arms=[{}]),
                                 lambda c: c.update(files=['report.json', 'custom.stdout.private'])],
+            'block_ipv6_enabled': [lambda c: c['report'].update(reason='egress_route')],
+            'block_host_address': [lambda c: c['report'].update(verdict='complete')],
         }
         for name, changes in mutations.items():
             for change in changes:

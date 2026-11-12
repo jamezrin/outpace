@@ -4,6 +4,8 @@ Runs every live_fixture case inside one owned outer user/network/PID namespace w
 only egress is a dummy device with synthetic addresses, under a 240-second hard
 deadline. Pins detect stale operator-built binaries, not hostile concurrent edits.
 The outer namespace receives SIGKILL if this process dies; SIGTERM kills it first.
+A root caller launches it as the same unprivileged uid as live workers, and the probe
+must then fail to read a root-only canary file.
 Exit 0 only when every fixed predicate passes and the outer namespace was reaped.
 """
 import argparse
@@ -13,6 +15,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import live
 import live_fixture
 from qualification import Artifact
 
@@ -23,10 +26,21 @@ def qualify_live(custom, upstream, *, output):
     custom.verify(); upstream.verify()
     output = Path(output)
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    identity = live.launcher_identity()
+    scratch = output / 'scratch'
+    scratch.mkdir(mode=0o700)
+    canary = None
+    if identity:
+        os.chown(scratch, live.UNPRIVILEGED_ID, live.UNPRIVILEGED_ID)
+        output.chmod(0o711)
+        canary = output / 'canary.private'
+        descriptor = os.open(canary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
     config = json.dumps({'cases': list(live_fixture.CASES),
                          'custom': str(custom.path), 'custom_sha256': custom.sha256,
-                         'upstream': str(upstream.path), 'upstream_sha256': upstream.sha256})
-    command = ['/usr/bin/setpriv', '--pdeathsig', 'KILL', '--', '/usr/bin/unshare', '--user', '--map-root-user', '--net', '--pid', '--fork',
+                         'upstream': str(upstream.path), 'upstream_sha256': upstream.sha256,
+                         'scratch': str(scratch), 'canary': str(canary) if canary else None})
+    command = ['/usr/bin/setpriv', *identity, '--pdeathsig', 'KILL', '--', '/usr/bin/unshare', '--user', '--map-root-user', '--net', '--pid', '--fork',
                '--kill-child=KILL', '--mount-proc', sys.executable, '-I',
                str(Path(live_fixture.__file__).resolve()), config]
     try:
@@ -35,6 +49,9 @@ def qualify_live(custom, upstream, *, output):
         exit_code, stdout, stderr, timed_out = completed.returncode, completed.stdout, completed.stderr, False
     except subprocess.TimeoutExpired as expired:
         exit_code, stdout, stderr, timed_out = None, expired.stdout or b'', expired.stderr or b'', True
+    if canary is not None:
+        canary.unlink()
+        output.chmod(0o700)
     for name, data in (('fixture.stdout.private', stdout), ('fixture.stderr.private', stderr)):
         descriptor = os.open(output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, 'wb') as out:
