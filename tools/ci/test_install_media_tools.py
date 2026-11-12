@@ -16,6 +16,8 @@ class InstallMediaTests(unittest.TestCase):
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         return module
 
+    codename='resolute'
+
     def exercise(self, fail_at=(), fails=False):
         """Run install() with mocked commands; calls numbered in fail_at raise."""
         module=self.module();calls=[];sources=[];source_paths=[]
@@ -39,7 +41,7 @@ class InstallMediaTests(unittest.TestCase):
                 self.assertTrue(kwargs['check'])
                 if len(calls) in fail_at:raise subprocess.CalledProcessError(124,argv)
                 return subprocess.CompletedProcess(argv,0)
-            with mock.patch.dict(os.environ,{'GITHUB_ACTIONS':'true','RUNNER_OS':'Linux','RUNNER_TEMP':directory}), mock.patch.object(module,'supported_runner',return_value=None), mock.patch.object(module.subprocess,'run',side_effect=execute):
+            with mock.patch.dict(os.environ,{'GITHUB_ACTIONS':'true','RUNNER_OS':'Linux','RUNNER_TEMP':directory}), mock.patch.object(module,'supported_runner',return_value=self.codename), mock.patch.object(module.subprocess,'run',side_effect=execute):
                 if fails:
                     with self.assertRaises(subprocess.CalledProcessError):module.install()
                 else:module.install()
@@ -48,12 +50,12 @@ class InstallMediaTests(unittest.TestCase):
         return calls,sources
 
     def assert_canonical(self,text):
-        self.assertIn('https://archive.ubuntu.com/ubuntu noble main universe',text)
-        self.assertIn('https://security.ubuntu.com/ubuntu noble-security main universe',text)
+        self.assertIn(f'https://archive.ubuntu.com/ubuntu {self.codename} main universe',text)
+        self.assertIn(f'https://security.ubuntu.com/ubuntu {self.codename}-security main universe',text)
         self.assertNotIn('kernel.org',text)
 
     def assert_fallback(self,text):
-        for pocket in ('noble','noble-updates','noble-security'):
+        for pocket in (self.codename,f'{self.codename}-updates',f'{self.codename}-security'):
             self.assertIn(f'https://mirrors.edge.kernel.org/ubuntu {pocket} main universe',text)
         self.assertNotIn('ubuntu.com',text,'fallback must not depend on *.ubuntu.com DNS')
 
@@ -95,11 +97,11 @@ class InstallMediaTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):module.install()
         command.assert_not_called()
 
-    def test_platform_gate_accepts_only_pinned_ubuntu_release(self):
+    def test_platform_gate_accepts_only_pinned_ubuntu_releases(self):
         module=self.module()
-        for content,allowed in [('ID=ubuntu\nVERSION_ID="24.04"\n',True),('ID=debian\nVERSION_ID="12"\n',False),('ID=ubuntu\nVERSION_ID="22.04"\n',False)]:
+        for content,codename in [('ID=ubuntu\nVERSION_ID="24.04"\n','noble'),('ID=ubuntu\nVERSION_ID="26.04"\n','resolute'),('ID=debian\nVERSION_ID="12"\n',None),('ID=ubuntu\nVERSION_ID="22.04"\n',None),('ID=ubuntu\nVERSION_ID="25.10"\n',None)]:
             with mock.patch.object(Path,'read_text',return_value=content),mock.patch.object(Path,'is_file',return_value=True),mock.patch.object(module.platform,'machine',return_value='x86_64'):
-                if allowed:module.supported_runner()
+                if codename:self.assertEqual(module.supported_runner(),codename)
                 else:
                     with self.assertRaises(RuntimeError):module.supported_runner()
 
@@ -108,6 +110,11 @@ class InstallMediaTests(unittest.TestCase):
         result=subprocess.run([sys.executable,'-I',str(SCRIPT)],env=env,capture_output=True,timeout=3)
         self.assertEqual(result.returncode,2)
         self.assertIn(b'CI media prerequisite setup failed',result.stderr)
+
+    def test_mirrors_follow_the_runner_codename(self):
+        for codename in ('noble','resolute'):
+            for _,lines in self.module().mirrors(codename):
+                self.assertEqual([l.split()[1] for l in lines],[codename,f'{codename}-updates',f'{codename}-security'])
 
     def test_platform_gate_rejects_missing_keyring_or_other_architecture(self):
         module=self.module()
