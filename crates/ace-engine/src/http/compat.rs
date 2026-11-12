@@ -1084,6 +1084,7 @@ async fn origin_hls_response(
         let base = request_base(headers);
         response["playback_url"] = json!(format!("{base}{}", playback.playback_url));
         response["stop_url"] = json!(format!("{base}{}", playback.stop_url));
+        response["command_url"] = json!(format!("{base}{}", playback.command_url));
         response["managed_origin"] = json!(true);
     }
     (
@@ -1115,15 +1116,26 @@ fn origin_hls_redirect(url: &str) -> Response {
         .into_response()
 }
 
-/// Reject duplicate keys and unsupported file/stream selection before anything resolves
+/// Reject ambiguous keys and unsupported file/stream selection before anything resolves
 /// or starts, so a request never silently plays a different selection than it asked for.
 fn checked_source_query(
     params: Vec<(String, String)>,
 ) -> Result<HashMap<String, String>, &'static str> {
     let mut unique = HashMap::with_capacity(params.len());
     for (key, value) in params {
-        if unique.insert(key, value).is_some() {
-            return Err("duplicate query parameter");
+        match unique.get(&key) {
+            // The public Android SDK appends its source selector twice when it starts GET
+            // playback. Only an identical decoded selector may repeat; options do not.
+            Some(previous)
+                if previous == &value
+                    && matches!(
+                        key.as_str(),
+                        "content_id" | "infohash" | "url" | "magnet" | "transport_file_cache_key"
+                    ) => {}
+            Some(_) => return Err("duplicate query parameter"),
+            None => {
+                unique.insert(key, value);
+            }
         }
     }
     validate_source_options(&unique)?;
@@ -1239,7 +1251,7 @@ fn ace_network(s: &AppState) -> Option<String> {
     }
 }
 
-fn request_base(headers: &HeaderMap) -> String {
+pub(super) fn request_base(headers: &HeaderMap) -> String {
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())

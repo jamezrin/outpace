@@ -101,7 +101,7 @@ impl HistoryBudget {
         }
     }
 
-    fn reserve(&self, bytes: usize) -> Option<Charge> {
+    pub(crate) fn reserve(&self, bytes: usize) -> Option<Charge> {
         self.used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.max)
@@ -121,7 +121,7 @@ impl HistoryBudget {
 
 /// Returns its reservation to the shared budget when the retained entry is dropped.
 #[derive(Debug)]
-struct Charge {
+pub(crate) struct Charge {
     used: Arc<AtomicUsize>,
     bytes: usize,
 }

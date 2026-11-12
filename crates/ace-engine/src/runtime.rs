@@ -1040,6 +1040,12 @@ async fn serve_http_inner(
         eprintln!("outpace: private peer mode ({count} allowed outbound endpoints; inbound peers and public discovery/advertising disabled)");
     }
     let rtmp_bind = config.rtmp_bind;
+    // The relay always applies the public-destination policy; there is no opt-out. Its
+    // retained replay shares the native packagers' history configuration and budget.
+    let origin_hls = config.managed_hls.then(|| {
+        let (history, budget) = manager.history_context();
+        crate::origin_hls::OriginHls::new_with_history(FetchPolicy::default(), history, budget)
+    });
     let state = AppState {
         peer_policy: config.peer_policy.clone(),
         manager,
@@ -1047,10 +1053,7 @@ async fn serve_http_inner(
         resolve_content_ids_in_getstream: true,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: config.experimental_ace_compat,
-        // The relay always applies the public-destination policy; there is no opt-out.
-        origin_hls: config
-            .managed_hls
-            .then(|| crate::origin_hls::OriginHls::new(FetchPolicy::default())),
+        origin_hls,
         broadcasts: Some(broadcasts.clone()),
     };
 
