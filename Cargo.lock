@@ -76,6 +76,7 @@ dependencies = [
  "cbc",
  "crab_nat",
  "hex",
+ "httpdate",
  "hyper",
  "igd-next",
  "libc",
