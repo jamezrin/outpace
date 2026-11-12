@@ -48,6 +48,36 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
 
+### Android with Termux (best-effort)
+
+From the next release, there is a best-effort `aarch64-linux-android` build for 64-bit ARM
+phones and Android TV boxes, to run under [Termux](https://termux.dev).
+
+- **Best-effort** means it is uploaded after the rest of the release. If its build fails, that
+  release has no Android archive.
+- It isn't covered by `SHA256SUMS`. It has its own `<archive>.sha256` file.
+- It runs on Android 5 and newer, without root.
+
+In Termux:
+
+```bash
+pkg install curl
+version=X.Y.Z   # a release newer than v0.9.0
+artifact="outpace-${version}-aarch64-linux-android.tar.gz"
+base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
+curl -LO "${base}/${artifact}" && curl -LO "${base}/${artifact}.sha256"
+sha256sum -c "${artifact}.sha256" && tar -xzf "$artifact"
+install -m 0755 "outpace-${version}-aarch64-linux-android/outpace" "$PREFIX/bin/outpace"
+termux-wake-lock    # keep Android from suspending it in the background
+outpace serve
+```
+
+- Data lives in `~/.local/share/outpace` inside Termux.
+- The API listens on `127.0.0.1:6878`, which players on the same device can reach. To reach it
+  from the LAN, set `OUTPACE_BIND=0.0.0.0:6878` on a trusted network only.
+- Android may still stop background apps. Disable battery optimisation for Termux if streams
+  stop when the screen is off.
+
 ### ARMv7 and small devices
 
 ARMv7 builds cover hard-float ARMv7 Linux (Raspberry Pi 2/3, older NAS boxes). ARMv6 and

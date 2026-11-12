@@ -71,6 +71,8 @@ These are merged into `main` (and so in `edge`), but aren't in v0.9.0:
   `OUTPACE_PRIVATE_DESCRIPTORS`, `/network-policy`).
 - [Support sources](Support-Sources-and-Operations#support-sources) (`OUTPACE_SUPPORT_SOURCES`,
   `/support`).
+- A best-effort Android (`aarch64-linux-android`) binary for Termux; see
+  [Installation](Installation#android-with-termux-best-effort).
 
 **Fixes you'll notice**
 

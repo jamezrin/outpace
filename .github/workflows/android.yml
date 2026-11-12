@@ -1,0 +1,57 @@
+name: Android best-effort
+
+# aarch64-linux-android (Termux on phones and Android TV boxes) is a best-effort target:
+# checked here, and uploaded by release.yml only after the release and image are published.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/android.yml
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - tools/ci/smoke_daemon.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: aarch64-linux-android
+
+jobs:
+  android:
+    name: Build and smoke aarch64-linux-android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ env.TARGET }}
+          cache: false
+          build-warnings: ""
+
+      # NDK with the default API level (21, Android 5), and a QEMU user-mode runner.
+      - name: Install Android cross toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ env.TARGET }}
+
+      - name: Build release binary
+        run: cargo build --locked --release -p ace-engine --bin outpace --target "$TARGET"
+
+      - name: Start emulated daemon and check health
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_var="CARGO_TARGET_$(tr 'a-z-' 'A-Z_' <<<"$TARGET")_RUNNER"
+          export SMOKE_RUNNER="${!runner_var:-}"
+          echo "runner: ${SMOKE_RUNNER:-native}"
+          sh tools/ci/smoke_daemon.sh "target/$TARGET/release/outpace"
