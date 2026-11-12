@@ -68,6 +68,12 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-24.04
             archive: tar.gz
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz
@@ -108,7 +114,8 @@ jobs:
       - name: Build release binary
         shell: bash
         run: |
-          cargo build --locked --release -p ace-engine --bin "$BIN_NAME" --target "${{ matrix.target }}"
+          # The dist profile (Cargo.toml) is the size-optimised release profile.
+          cargo build --locked --profile dist -p ace-engine --bin "$BIN_NAME" --target "${{ matrix.target }}"
 
       - name: Package binary
         shell: bash
@@ -116,7 +123,7 @@ jobs:
           set -euo pipefail
           version="${{ needs.release-metadata.outputs.version }}"
           target="${{ matrix.target }}"
-          binary="target/${target}/release/${BIN_NAME}"
+          binary="target/${target}/dist/${BIN_NAME}"
 
           if [[ "$target" == *windows* ]]; then
             binary="${binary}.exe"
@@ -189,7 +196,7 @@ jobs:
 
   publish-container:
     name: Publish GHCR image from release archives
-    # publish-release depends on all seven binary builds succeeding.
+    # publish-release depends on every binary build succeeding.
     needs: publish-release
     permissions:
       contents: read

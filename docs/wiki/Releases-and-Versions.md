@@ -73,6 +73,8 @@ These are merged into `main` (and so in `edge`), but aren't in v0.9.0:
   `/support`).
 - Signed build provenance for release archives and images, checked with
   `gh attestation verify` (see [Installation](Installation#verify-where-a-release-came-from)).
+- Release binaries for ARMv6 hard-float (`arm-unknown-linux-musleabihf`) and RISC-V 64
+  (`riscv64gc-unknown-linux-musl`); see [Installation](Installation#release-binaries).
 
 **Fixes you'll notice**
 

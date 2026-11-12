@@ -22,6 +22,8 @@ file on the [releases page](https://github.com/jamezrin/outpace-stream/releases)
 | Linux x86_64 | `x86_64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARM64 (aarch64) | `aarch64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARMv7 hard-float (Raspberry Pi 2/3 class) | `armv7-unknown-linux-musleabihf` | `.tar.gz` |
+| Linux ARMv6 hard-float (Raspberry Pi Zero/1 class), from the next release | `arm-unknown-linux-musleabihf` | `.tar.gz` |
+| Linux RISC-V 64, from the next release | `riscv64gc-unknown-linux-musl` | `.tar.gz` |
 | macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
@@ -68,11 +70,13 @@ gh attestation verify oci://ghcr.io/jamezrin/outpace:<version> --repo jamezrin/o
 
 `edge` images and v0.9.0 and older releases have no attestations.
 
-### ARMv7 and small devices
+### ARM, RISC-V and small devices
 
-ARMv7 builds cover hard-float ARMv7 Linux (Raspberry Pi 2/3, older NAS boxes). ARMv6 and
-soft-float ARM are not supported. Expect lower throughput and fewer simultaneous streams than on
-64-bit hardware. On 32-bit targets each in-memory pool, such as the piece cache or the timeshift
+ARMv7 builds cover hard-float ARMv7 Linux (Raspberry Pi 2/3, older NAS boxes). From the next
+release, ARMv6 builds cover hard-float ARMv6 (Raspberry Pi Zero and 1, older ARM routers and NAS
+boxes), and RISC-V 64 builds cover 64-bit RISC-V boards. Soft-float ARM is not supported. The
+container image doesn't cover ARMv6 or RISC-V 64 yet: use the binaries. Expect lower throughput
+and fewer simultaneous streams on 32-bit ARM than on 64-bit hardware. On 32-bit targets each in-memory pool, such as the piece cache or the timeshift
 budget, is capped at about 512 MiB. A conservative start for a small device:
 
 ```bash
@@ -154,7 +158,18 @@ cargo build --release --locked -p ace-engine --bin outpace
 ./target/release/outpace --version
 ```
 
-The binary is `target/release/outpace`. To build the container image yourself:
+The binary is `target/release/outpace`.
+
+Release binaries use a slower, smaller `dist` profile (link-time optimisation, one codegen unit,
+symbols stripped). It roughly halves the binary, which helps on routers and boards with little
+flash. To build the same way, from source newer than v0.9.0:
+
+```bash
+cargo build --profile dist --locked -p ace-engine --bin outpace
+./target/dist/outpace --version
+```
+
+To build the container image yourself:
 
 ```bash
 docker build -t outpace:local .
