@@ -1,13 +1,14 @@
 # DHT comparison research harness (#44)
 
-Work in progress. Strict worker input parsing and bounded batch/deadline accounting are implemented.
+Strict worker input parsing and bounded batch/deadline accounting are implemented.
 All three actual implementations have passed target, silent-node, and
 malformed/uncorrelated/duplicate-response cases inside the offline namespace helper.
 The custom cases exercise ace-swarm's existing numeric-seed seam.
 Fixed offline late-response-opportunity and external lookup-cancellation profiles
 are available. Internal cancellation/actor joining, observed late datagram receipt,
 and whole-harness/live qualification remain incomplete.
-There is no live worker executable, complete live comparison supervisor, public-network mode or library-adoption decision.
+A default-deny live boundary and one bounded live-block supervisor are described
+under [Live boundary](#live-boundary); this tool makes no library-adoption decision.
 A Linux offline namespace helper has synthetic lifecycle tests; it is not live clearance.
 The `candidates` feature is research-only, not a safe execution entry point.
 Real-UDP integration tests are ignored by default and reject execution outside
@@ -221,3 +222,85 @@ compiled executable denials. Same-entry positives cover gate, real adapter and
 encoder; they do not prove positive OS-environment/stdout integration through
 binary `main()`. Public destination policy, a live worker policy and matched live
 comparison remain outstanding for #44. No live execution is authorized here.
+
+## Live boundary
+
+`live.py` runs one worker in fresh nested user, network and PID namespaces with
+the fixed topology, policy and relay described in
+[the live-boundary design](../../docs/superpowers/specs/2026-11-12-dht-live-boundary-44-design.md):
+
+- The worker gets a veth with a default route, IPv6 disabled, and a default-deny
+  nftables table.
+- It runs with empty capability sets and `no_new_privs`.
+- The supervisor relay forwards only IPv4 UDP to global unicast destinations,
+  from sockets bound to the declared egress device.
+- Replies are admitted only from endpoints that the same inner socket contacted.
+
+UDP to a denied prefix is counted by nftables and dropped silently by the relay.
+A synchronous `EPERM` would penalize a library for the harness rather than model
+network loss. The two counts must agree. Every non-UDP, IPv6 or unsolicited packet
+is dropped inside the namespace. Unprivileged nested namespaces, veth, `AF_PACKET`
+and `SO_BINDTODEVICE` are required. No TUN device and no host firewall or routing
+change is needed.
+
+The live entries are `dht-worker --live-worker mainline|n0` and the custom libtest
+case `dht::comparison::worker::custom_live_worker`. Before reading protected input,
+they require mode `live-v1`, global seeds, empty capabilities, `no_new_privs`, the
+fixed interfaces and routes, and IPv6 disabled. An unconfined invocation exits 65;
+the custom case fails.
+
+Per arm, the boundary reports admitted, denied and unsolicited datagrams, unique
+contacted and unanswered endpoints, and inner nftables counters. These are
+measured at the boundary. They are not library-internal query or timeout
+diagnostics, and unavailable library counters stay null. The bootstrap also
+reports `wait4` CPU time and sampled peak threads, sockets and `VmHWM`. A sampled
+peak is a lower bound; `ru_maxrss` is not used because it keeps the forked
+bootstrap's pre-`exec` peak.
+
+### Offline live-boundary qualification
+
+Build release artifacts for every arm, so all of them share the optimization level:
+
+```sh
+cargo test -p ace-swarm --lib --release --locked --no-run
+cargo build --manifest-path tools/dhtcompare/Cargo.toml --release --features workers --bin dht-worker --locked
+python3.11 tools/dhtcompare/live_qualification.py \
+  --custom /absolute/path/to/ace_swarm-release-test-binary --custom-sha256 CUSTOM_SHA256 \
+  --upstream /absolute/path/to/release/dht-worker --upstream-sha256 UPSTREAM_SHA256 \
+  --output /private/path/to/new-live-qualification
+```
+
+The 12 fixed cases run inside one outer namespace whose only egress is a dummy
+device with synthetic addresses, under a 240-second deadline:
+
+- A probe covers two threads and sockets, eight denied destination classes,
+  stranger and wrong-port inbound packets, TCP, IPv6, raw sockets, and policy
+  and link mutation.
+- All three candidates are run through their real binary entries against synthetic
+  values, and against advertised private nodes. Each candidate must try and fail to
+  reach the private nodes, with matching relay and nftables counts.
+- Unconfined gate denials are exercised for every entry.
+- The complete block supervisor runs, and refuses encrypted content.
+
+Listeners on private outer addresses must receive nothing. `test_live.py` runs the
+probe locally without binaries. CI runs the pure relay, policy, consistency and
+predicate tests.
+
+### One bounded live block
+
+`live_block.py` runs as host root on the validation host. It reads
+`{"content_id": "..."}` on stdin; the operator supplies it, and this tool never
+reads the registry. It runs these steps:
+
+1. Verify pins, the single default route via `--egress-device`, and the route and
+   stateless-ruleset digests.
+2. Resolve the target once through the local daemon's loopback `analyze_content`
+   method. Encrypted or unknown protection is refused.
+3. Resolve the production bootstrap hostnames once, into at most four global seeds.
+4. Run custom, mainline and n0 within one 120-second deadline, without retries.
+5. Re-check the digests and write a private numeric report with mode-0600 captures.
+
+The report omits the target, content id and endpoints. Gateway and VPN exit
+provenance must be checked separately, immediately before and after. Exit 0 means
+all arms produced valid records with confirmed cleanup, 1 means an arm failed, and
+2 means inconclusive.
