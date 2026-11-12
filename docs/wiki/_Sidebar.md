@@ -27,6 +27,7 @@
 **Running it**
 
 - [Deployment](Deployment)
+- [Routers and Small Devices](Routers-and-Small-Devices)
 - [Migrating from AceStream Engine](Migrating-from-AceStream-Engine)
 - [Support Sources and Operations](Support-Sources-and-Operations)
 - [Troubleshooting](Troubleshooting)
