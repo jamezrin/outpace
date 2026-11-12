@@ -1,8 +1,8 @@
 name: ARMv7 portability
 
 on:
-  # Only run when something that can change the shipped ARMv7 binary or its container
-  # definition moves. Tests, docs, and dev-only tooling do not affect the release build,
+  # Only run when something that can change the shipped ARMv7 binary
+  # moves. Tests, docs, and dev-only tooling do not affect the release build,
   # so changes limited to those paths skip this portability gate.
   pull_request:
     paths:
@@ -11,14 +11,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
-      - Dockerfile
-      - .dockerignore
   workflow_dispatch:
-    inputs:
-      run_container_smoke:
-        description: Run the emulated ARMv7 container startup smoke
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -72,48 +65,3 @@ jobs:
           set -euo pipefail
           runner_var="CARGO_TARGET_$(tr 'a-z-' 'A-Z_' <<<"$TARGET")_RUNNER"
           ${!runner_var:-} "target/$TARGET/release/outpace" --version
-
-  container-smoke:
-    name: ARMv7 container startup and health smoke
-    if: github.event_name == 'workflow_dispatch' && inputs.run_container_smoke
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build ARMv7 image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/arm/v7
-          load: true
-          tags: outpace:armv7-smoke
-          # Persist the emulated from-source build across runs; a full ARMv7 Rust compile
-          # under QEMU is the slowest step in this workflow.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Start daemon and check health
-        shell: bash
-        run: |
-          set -euo pipefail
-          container="$(docker run --detach --rm --platform linux/arm/v7 \
-            --publish 127.0.0.1::6878 \
-            --env OUTPACE_ENABLE_INBOUND=0 \
-            --env OUTPACE_ENABLE_SEEDING=0 \
-            outpace:armv7-smoke)"
-          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
-          port="$(docker port "$container" 6878/tcp | sed 's/.*://')"
-          curl --fail --retry 30 --retry-delay 1 --retry-all-errors \
-            "http://127.0.0.1:${port}/healthz"

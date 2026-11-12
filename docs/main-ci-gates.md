@@ -34,9 +34,8 @@ actual checks when integrating: GitHub evaluates the test merge commit when it
 has checks, otherwise the head commit. Do not substitute a green push run for a
 failed PR run. See [GitHub's required-check troubleshooting guidance](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
 
-Compose `Smoke (linux/amd64)` and `Cross-build ARMv7 release binary` are
-path-filtered. `ARMv7 container startup and health smoke` only runs through an
-explicit manual input, and release checks only run for tags. These checks remain
+Compose `Smoke (linux/amd64)` and the `Cross-build <ARMv7|ARMv6|RISC-V 64> release binary` checks are
+path-filtered, and release checks only run for tags. These checks remain
 useful when triggered but are not globally required: a documentation-only PR
 cannot produce them. Workflow-wide path filters can leave required checks
 pending indefinitely.
