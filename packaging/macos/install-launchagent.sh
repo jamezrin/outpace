@@ -21,10 +21,30 @@ log="$HOME/Library/Logs/outpace.log"
 domain="gui/$(id -u)"
 launchctl print "$domain" >/dev/null 2>&1 || domain="user/$(id -u)"
 
+unload() {
+	launchctl bootout "$domain/$label" 2>/dev/null || true
+	# bootout returns before launchd has removed the job (and before outpace has drained);
+	# bootstrapping again too early fails with "Input/output error".
+	i=0
+	while launchctl print "$domain/$label" >/dev/null 2>&1; do
+		i=$((i + 1))
+		if [ "$i" -gt 60 ]; then
+			echo "outpace: the previous agent did not unload within 30 seconds" >&2
+			exit 1
+		fi
+		sleep 0.5
+	done
+}
+
 load() {
 	# Reloading replaces a previous definition.
-	launchctl bootout "$domain/$label" 2>/dev/null || true
-	launchctl bootstrap "$domain" "$plist"
+	unload
+	i=0
+	until launchctl bootstrap "$domain" "$plist"; do
+		i=$((i + 1))
+		[ "$i" -lt 5 ] || exit 1
+		sleep 1
+	done
 	echo "outpace: loaded $plist; log: $log"
 }
 
@@ -61,7 +81,7 @@ reload)
 	load
 	;;
 uninstall)
-	launchctl bootout "$domain/$label" 2>/dev/null || true
+	unload
 	rm -f "$plist"
 	echo "outpace: removed $plist"
 	;;
