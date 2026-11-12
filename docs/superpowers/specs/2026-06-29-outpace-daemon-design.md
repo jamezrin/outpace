@@ -36,7 +36,8 @@ clean public API that carries **no ace/acestream naming**.
 
 - **Stream-name search (scope revised by #212 / #213; implementation #406)** — a bounded
   AceStream index/search service adapter is implemented behind separate explicit, default-off
-  `OUTPACE_COMPAT_ACESTREAM_SERVICES`, requiring an operator-supplied accepted search key.
+  `OUTPACE_COMPAT_ACESTREAM_SERVICES`, using the native signed HTTP service protocol without
+  operator API-key provisioning.
   See `docs/wiki/Stream-Search.md` for the bounded API and upstream-access limits. Current-client
   integration uses explicit infohash selectors and existing descriptor verification; older
   reverse-content-ID clients remain unsupported. HTTP compatibility alone does not opt in.

@@ -54,5 +54,14 @@
 **Files:** `.env.example`, `compose.yml`, user wiki configuration/search/variables pages, previous plan supersession note.
 
 - [x] Remove API-key provisioning and document opt-in, HTTP privacy, fixed native hosts, failover/bounds and usable response contract. Research stays in developer notes.
-- [ ] Run fmt, full workspace tests, all-target workspace Clippy, identifier hygiene, wiki links and Compose validation.
-- [ ] Obtain one fresh whole-branch review, resolve material findings, commit/push and update #408 around the native backend. Keep #406 open for deployed client integration qualification.
+- [x] Run fmt, full workspace tests, all-target workspace Clippy, identifier hygiene, wiki links and Compose validation.
+- [x] Obtain one fresh whole-branch review, resolve material findings, commit/push and update #408 around the native backend. Keep #406 open for deployed client integration qualification.
+
+## Verification outcome
+
+Full workspace tests, all-target workspace Clippy with warnings denied, formatting,
+identifier hygiene, 23-page wiki links and Compose default/opt-in validation passed.
+The production native transport probe passed with an invented query. Fresh review
+found no runtime blockers; stale key requirements in the remaining reference docs
+and configuration comment were corrected. #408 contains the native adaptation;
+#406 remains open for deployed client integration qualification.

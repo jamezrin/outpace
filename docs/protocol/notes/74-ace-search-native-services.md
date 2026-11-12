@@ -41,8 +41,10 @@ full-width increment whose low-byte arithmetic agrees. The single zero-unit empt
 string is special. Relocated pointers must be resolved, and Ghidra's imported
 image base must be accounted for when using ELF relative virtual addresses.
 
-Raw binaries, keys, decompiled code and probe logs remain in ignored private
-research artifacts. No real content IDs, swarm infohashes, source names or account
+Raw binaries, decompiled code and probe logs remain in ignored private research
+artifacts. The recovered fixed shared keys are global client protocol constants,
+not account credentials; the compatible implementation includes them as interop
+constants, following the transport-file protocol precedent. No real content IDs, swarm infohashes, source names or account
 state were used. The source container was stopped and left unchanged; probes ran
 in newly created, automatically removed containers with `--network none`, CPU,
 memory, process and wall-clock limits.
@@ -200,21 +202,27 @@ web-search backend, account enrichment and real remote services remain
 unqualified. No live sources, playback measurements or source-wide availability
 claims are part of this research.
 
-## Implications for Outpace
+## Implementation follow-up
 
-#408 implements the **public HTTP search API backend**, requiring a configured
-API key. That is distinct from the native signed service protocol recovered
-here. Its operator-key requirement is an implementation choice for that backend,
-not a requirement established for all original-engine search.
+#408 was initially a public HTTP API backend with an operator key. The subsequent
+native adaptation replaces that backend with this signed service protocol and
+removes operator API-key provisioning.
 
-A native-compatible backend is now a concrete implementation candidate that
-could avoid operator API-key provisioning. Before adoption, validate current
-endpoint reachability, responses and usable transport security; the original
-code's HTTP URLs do not establish HTTPS support. Preserve the separate,
-default-off services gate, private-mode egress restrictions, bounded requests,
-identifier hygiene and existing descriptor/media verification. Do not copy an
-old engine's device or account identity.
+Bounded probes on 2026-11-12 found that all three native hosts fail HTTPS hostname
+verification. The compatible backend therefore explicitly uses native HTTP behind
+the separate default-off services opt-in; it does not bypass TLS checks or
+silently downgrade HTTPS. A signed request with an Outpace version/platform
+identity and positive decimal nonce received a valid nonce-bound signed empty
+result. A bounded probe through Outpace's guarded production transport also
+passed with an invented query. This qualifies a discovery request, not production
+availability, quotas, nonempty current catalog coverage or live playback.
 
-This does not solve the older scraper's reverse-content-ID workflow, prove a
-production credential/availability contract, or authorize a DHT crawler. #406
-remains the client/access qualification tracker.
+A hexadecimal nonce initially failed response signature validation; decimal
+nonces succeeded. The backend generates positive decimal nonces, rejects every
+response that does not bind to its request nonce, and retains its own stricter
+time/body/cache/admission limits. It does not copy old engine device/account
+identity or promote shared-key metadata to descriptor provenance.
+
+The original-module offline evidence and its exclusions above remain unchanged.
+This does not solve older scraper reverse-content-ID workflows or authorize a
+DHT crawler. #406 remains the client integration qualification tracker.

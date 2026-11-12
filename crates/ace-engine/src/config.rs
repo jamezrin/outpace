@@ -467,7 +467,7 @@ config_with_root_redaction! {
     /// the deprecated `OUTPACE_EXPERIMENTAL_ACE_COMPAT` alias. The field name is retained
     /// for Rust and serialized configuration compatibility; native APIs remain primary.
     pub experimental_ace_compat: bool,
-    /// Explicit external index service opt-in and redacted operator credential.
+    /// Explicit native external search opt-in; no operator API key is required.
     pub acestream_services: crate::acestream_search::SearchSettings,
     /// Serve resolved origin HLS through a bounded local relay instead of handing the client
     /// the origin URL. Off by default. `OUTPACE_MANAGED_HLS`.

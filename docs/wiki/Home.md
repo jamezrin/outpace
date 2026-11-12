@@ -44,7 +44,8 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 - It is **not** a full clone of the closed engine. There are no accounts, subscriptions, web UI,
   EPG or general channel catalogues. The compatibility API is a documented subset.
 - [Stream-name search](Stream-Search) is a separate, default-off external services adapter,
-  newer than v0.9.0. It needs an accepted upstream key; it does not bundle a UI or catalog.
+  newer than v0.9.0. It needs no operator API key and uses external HTTP services; it does
+  not bundle a UI or catalog.
 - It is not a recorder or DVR. The optional [Timeshift](Timeshift) buffer lives in memory and
   disappears on restart.
 

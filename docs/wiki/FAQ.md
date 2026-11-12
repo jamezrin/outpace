@@ -19,7 +19,7 @@ engine HTTP routes that existing apps call, through an opt-in compatibility mode
 
 It isn't a full clone. It doesn't play premium or encrypted content, and it has no accounts, web
 UI or EPG. [Optional stream-name search](Stream-Search) requires a separate services opt-in
-and upstream key in builds newer than v0.9.0. See
+in builds newer than v0.9.0. It needs no operator API key. See
 [what's different](Migrating-from-AceStream-Engine#whats-different).
 
 Outpace isn't affiliated with or endorsed by Ace Stream. It uses Ace Stream names only to
@@ -115,7 +115,8 @@ No. Only public, unencrypted content is supported, and that won't change.
 - **No application features:** no accounts, subscriptions, web UI, remote control,
   channel lists or EPG.
 - **Search is separate:** [service-backed name search](Stream-Search) needs a default-off opt-in
-  and an accepted upstream key. HTTP compatibility alone does not enable it.
+  and uses external plain HTTP services. No operator API key is required; HTTP compatibility
+  alone does not enable it.
 - **A compatibility subset:** the common playback and control routes. There is no legacy
   seeking or file selection, and VOD isn't available through it (native VOD is).
 - **Timing:** Outpace buffers more by default, so streams start later but stutter less.

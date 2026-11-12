@@ -10,7 +10,8 @@ Outpace runs independently of the closed engine. Use the native CLI and
 optional adapter, not complete engine parity. Public, unencrypted content is the scope.
 Premium/encrypted content, account/subscription import, player/web UI, and a closed-engine
 runtime remain permanent non-goals (#212). Service-backed name search is a separate,
-default-off adapter in builds newer than v0.9.0. It needs an accepted upstream key; see
+default-off adapter in builds newer than v0.9.0. It uses native HTTP services without an
+operator API key; see
 [search configuration and client limits](wiki/Stream-Search.md). HTTP compatibility alone
 does not enable it. Existing infohash playback selectors provide the result-to-playback path;
 older reverse-content-ID clients still need an integration change. Search is not a migration

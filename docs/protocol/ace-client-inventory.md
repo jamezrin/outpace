@@ -107,8 +107,8 @@ it does not implement engine access-token authentication.
 The [optional search UI](https://github.com/gabo-it/Acestream-Manager/blob/e63917a092c7/webui/search.js#L29-L60)
 GETs `/search` with `query`, `page`, `page_size` and optional `category`, expecting
 `.result.results[].items`, icons and totals. A separate [service-backed name search adapter](../wiki/Stream-Search.md)
-now provides bounded grouped name/item results behind its own default-off setting and upstream
-key. It strips icons, EPG and unknown fields; this inventory does not establish Manager search
+now provides bounded grouped name/item results behind its own default-off setting, using the
+native signed HTTP protocol without operator API-key provisioning. It strips icons, EPG and unknown fields; this inventory does not establish Manager search
 compatibility or claim its optional icon contract. General catalog and EPG enumeration remain outside that scope;
 known public sources can use playback.
 Consequently this inventory does not claim full application replacement.
