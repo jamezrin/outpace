@@ -6,15 +6,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# RSA 0.9 requires digest 0.10 and rand_core 0.6; keep its signing inputs compatible.
-sha1 = { version = "0.10", features = ["oid"] }
+# RSA 0.10 signs with digest 0.11 hashes; keep sha1 on the matching digest version.
+sha1 = { version = "0.11", features = ["oid"] }
 sha2 = "0.11"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-# ed25519-dalek 2 also requires rand_core 0.6 for key generation.
-rand = "0.8"
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+rand = "0.10"
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
-rsa = "0.9"
+# `pkcs1v15` is the live-source signature scheme; `hazmat` allows 768-bit key generation
+# to match real engine source keys (see live_auth.rs).
+rsa = { version = "0.10", features = ["pkcs1v15", "hazmat"] }
 pkcs8 = { version = "0.11", features = ["pem"] }
 
 [dev-dependencies]

@@ -49,6 +49,9 @@ uses Ace Stream names only to describe protocol compatibility.
   [documented in the repository](docs/protocol/wire-protocol.md).
 - **No proprietary engine at runtime.** Outpace never downloads or runs the official Ace Stream
   engine or its libraries.
+- **Fast and efficient by design.** Performance and resource efficiency are core goals, not
+  afterthoughts: quick startup, smooth playback, and low CPU and memory use, so one small box
+  can serve many viewers. Regressions are treated as bugs and must not be merged.
 - **Headless by design.** A daemon and a CLI, configured with environment variables, with no
   desktop UI. That suits servers, containers, NAS boxes and single-board computers.
 - **A real command line.** `outpace play` pipes a stream to standard output, and
