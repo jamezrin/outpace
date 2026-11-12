@@ -133,6 +133,23 @@ pub(crate) struct WorkerControl {
     cleanup: tokio::sync::mpsc::UnboundedSender<CleanupJob>,
 }
 
+/// Entries an idle sweep has already fenced, cancelled and removed from the maps.
+struct IdleRetirement {
+    sessions: Vec<Arc<StreamSession>>,
+    controls: Vec<WorkerControl>,
+}
+
+impl IdleRetirement {
+    async fn confirm(self) {
+        for session in self.sessions {
+            session.stop().await;
+        }
+        for control in self.controls {
+            control.join().await;
+        }
+    }
+}
+
 /// False plus a closed sender denotes failed/unknown cleanup, never completion.
 pub(crate) async fn wait_cleanup(completed: &mut watch::Receiver<bool>) -> bool {
     loop {
@@ -1360,7 +1377,15 @@ impl StreamManager {
             .collect()
     }
 
+    /// Retire idle entries, then wait for their cleanup to be confirmed.
+    #[cfg(test)]
     async fn reap_idle_at(&self, now: Instant) {
+        self.retire_idle_at(now).await.confirm().await;
+    }
+
+    /// Fence and cancel idle entries under the lifecycle locks. Cleanup ownership is already
+    /// recorded and transferred; the returned value only waits for confirmation.
+    async fn retire_idle_at(&self, now: Instant) -> IdleRetirement {
         let expired: Vec<_> = {
             let mut cache = self.vod_cache.lock().await;
             let keys: Vec<_> = cache
@@ -1434,11 +1459,9 @@ impl StreamManager {
             }
             (controls, retired_sessions)
         };
-        for session in retired_sessions {
-            session.stop().await;
-        }
-        for control in controls {
-            control.join().await;
+        IdleRetirement {
+            sessions: retired_sessions,
+            controls,
         }
     }
 
@@ -1464,7 +1487,20 @@ impl StreamManager {
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
-                manager.reap_idle_at(Instant::now()).await;
+                let retired = manager.retire_idle_at(Instant::now()).await;
+                drop(manager);
+                // A cleanup that never confirms must not stop later sweeps. Giving up the wait
+                // abandons nothing: completions are recorded and owned by the coordinator, and
+                // stop/shutdown still wait on them.
+                tokio::select! {
+                    biased;
+                    _ = cancel.changed() => break,
+                    confirmed = tokio::time::timeout(grace, retired.confirm()) => {
+                        if confirmed.is_err() {
+                            crate::alog!("[manager] idle cleanup still pending after {grace:?}; continuing sweeps");
+                        }
+                    }
+                }
             }
         }));
     }
