@@ -190,8 +190,8 @@ jobs:
 
   best-effort-android:
     # aarch64-linux-android for Termux. Runs only after the release and its container image
-    # exist, so a failure can never block either; the archive is not in SHA256SUMS and gets
-    # its own .sha256 file.
+    # exist, so a failure can never block either. Builds with a read-only token; the separate
+    # upload job below is the only one that can write to the release.
     name: Best-effort aarch64-linux-android
     runs-on: ubuntu-24.04
     needs:
@@ -200,7 +200,7 @@ jobs:
     continue-on-error: true
     timeout-minutes: 45
     permissions:
-      contents: write
+      contents: read
     env:
       TARGET: aarch64-linux-android
     steps:
@@ -224,10 +224,10 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release -p ace-engine --bin "$BIN_NAME" --target "$TARGET"
 
-      - name: Package and upload
+      # Not covered by SHA256SUMS: the archive gets its own .sha256 file.
+      - name: Package
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
           set -euo pipefail
@@ -236,5 +236,35 @@ jobs:
           cp "target/${TARGET}/release/${BIN_NAME}" LICENSE README.md "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
-          gh release upload "$GITHUB_REF_NAME" "dist/${name}.tar.gz" "dist/${name}.tar.gz.sha256" \
-            --repo "$GITHUB_REPOSITORY"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: best-effort-android
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  upload-best-effort-android:
+    # Write-scoped, but runs no build steps or toolchain actions: it only attaches the
+    # archive built above.
+    name: Upload best-effort aarch64-linux-android
+    runs-on: ubuntu-24.04
+    needs: best-effort-android
+    continue-on-error: true
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged binary
+        uses: actions/download-artifact@v8
+        with:
+          name: best-effort-android
+          path: dist
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
