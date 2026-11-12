@@ -76,6 +76,7 @@ The image is `ghcr.io/jamezrin/outpace`.
 | --- | --- | --- |
 | `0.9.0` (any `X.Y.Z`) | A release. Pin this in production. | `linux/amd64`, `linux/arm64`, `linux/arm/v7` |
 | `latest` | The most recent release. | same as releases |
+| `X.Y.Z-minimal`, `minimal` | The same release in a minimal `scratch` image, from the next release. | `linux/amd64`, `linux/arm64`, `linux/arm/v7` |
 | `edge` | The current `main` branch. | `linux/amd64` only |
 | `sha-<commit>` | One specific `main` commit. | `linux/amd64` only |
 
@@ -102,6 +103,19 @@ Only the peer port is meant to face the internet. Outpace has no UDP listener, s
 nothing to publish for UDP.
 
 The image doesn't include FFmpeg; see [FFmpeg](#ffmpeg) below.
+
+### Minimal image
+
+From the next release, every release image also comes as `X.Y.Z-minimal` (and `minimal` for the
+newest). It is built `FROM scratch`: the same static binary, its licence, and a data directory,
+with no shell, package manager or `curl`. It is about a fifth of the size of the Debian image.
+
+- It runs as user and group `10001`, so a bind-mounted data directory must be writable by that
+  ID.
+- Its built-in health check runs `outpace healthcheck`, because there is no `curl`. In Compose,
+  override the health check (see [Deployment](Deployment#docker-compose)).
+- You can't extend it with `apt`. To add FFmpeg, start from the Debian image.
+- Everything else matches the Debian image: environment, ports, volume and default command.
 
 ### Docker Compose
 

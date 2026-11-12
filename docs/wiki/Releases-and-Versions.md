@@ -50,6 +50,7 @@ build.
 | --- | --- | --- | --- |
 | `X.Y.Z` (e.g. `0.9.0`) | No | amd64, arm64, arm/v7 | Production. Pin this. |
 | `latest` | With each release | amd64, arm64, arm/v7 | Trying the newest release. |
+| `X.Y.Z-minimal`, `minimal` | Like `X.Y.Z` and `latest` | amd64, arm64, arm/v7 | Smaller `scratch` image (next release on). |
 | `edge` | With every merge to `main` | amd64 | Testing unreleased features. |
 | `sha-<commit>` | No | amd64 | Pinning one specific `main` build. |
 
@@ -71,6 +72,8 @@ These are merged into `main` (and so in `edge`), but aren't in v0.9.0:
   `OUTPACE_PRIVATE_DESCRIPTORS`, `/network-policy`).
 - [Support sources](Support-Sources-and-Operations#support-sources) (`OUTPACE_SUPPORT_SOURCES`,
   `/support`).
+- A minimal `scratch` image (`X.Y.Z-minimal`) and the
+  [`outpace healthcheck`](Command-Line#outpace-healthcheck) command.
 
 **Fixes you'll notice**
 
