@@ -100,7 +100,9 @@ impl PlaybackTarget {
                 .ok_or_else(|| "invalid local descriptor alias".into());
         }
         if let Some(rest) = input.strip_prefix("acestream://") {
-            let id = rest.split(['?', '#']).next().unwrap_or("");
+            let rest = rest.split('#').next().unwrap_or("");
+            let (id, query) = rest.split_once('?').unwrap_or((rest, ""));
+            validate_uri_options(&parse_query(query)?)?;
             return content_id_target(id);
         }
         if input.starts_with("magnet:") {
@@ -115,7 +117,8 @@ impl PlaybackTarget {
             // `parse_query` percent-decodes values, so a `url=`/`magnet=` whose own query string
             // is percent-encoded (`%26` for `&`) survives — matching the HTTP query contract. A
             // URL with literal `&` should use the bare-`http(s)://` form above instead.
-            let params = parse_query(query);
+            let params = parse_query(query.split('#').next().unwrap_or(""))?;
+            validate_uri_options(&params)?;
             if let Some(id) = params.get("content_id") {
                 return content_id_target(id);
             }
@@ -382,20 +385,23 @@ fn normalize_hex40(id: &str) -> Result<String, String> {
     }
 }
 
-fn parse_query(query: &str) -> std::collections::BTreeMap<String, String> {
-    query
-        .split('&')
-        .filter_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let key = parts.next()?.trim();
-            let value = parts.next().unwrap_or("").trim();
-            if key.is_empty() {
-                None
-            } else {
-                Some((key.to_string(), percent_decode(value)))
-            }
-        })
-        .collect()
+/// Duplicate keys are rejected rather than resolved by position: a selector or file index
+/// must not silently change meaning when a link is reordered.
+fn parse_query(query: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut params = std::collections::BTreeMap::new();
+    for pair in query.split('&').filter(|pair| !pair.trim().is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key.trim());
+        if key.is_empty() || params.insert(key, percent_decode(value.trim())).is_some() {
+            return Err("empty or duplicate query parameter".into());
+        }
+    }
+    Ok(params)
+}
+
+fn validate_uri_options(params: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    crate::source_options::validate(params.iter().map(|(k, v)| (k.as_str(), v.as_str())), true)
+        .map_err(Into::into)
 }
 
 /// Percent-decode a query value (`%XX` -> byte, `+` left as-is). Invalid escapes are kept
@@ -774,6 +780,36 @@ mod tests {
         assert_eq!(
             crate::transport_url::decode_transport_url(&t.provider_id).as_deref(),
             Some("https://e/x.acelive")
+        );
+    }
+
+    #[test]
+    fn ace_uri_keeps_selected_file_intent_and_rejects_duplicates() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        for prefix in [
+            format!("acestream://{id}?"),
+            format!("acestream:?content_id={id}&"),
+        ] {
+            assert!(PlaybackTarget::parse(&format!("{prefix}index=0")).is_ok());
+            assert!(PlaybackTarget::parse(&format!("{prefix}index=0#fragment")).is_ok());
+            for query in [
+                "index=1",
+                "index=-1",
+                "index=",
+                "index=0&%69ndex=1",
+                "_idx=0",
+                "stream_id=0",
+                "stream_id=-1",
+                "direct_url=https%3A%2F%2Fexample.test%2Fmedia",
+            ] {
+                assert!(
+                    PlaybackTarget::parse(&format!("{prefix}{query}")).is_err(),
+                    "{prefix}{query}"
+                );
+            }
+        }
+        assert!(
+            PlaybackTarget::parse(&format!("acestream:?content_id={id}&content_id={id}")).is_err()
         );
     }
 

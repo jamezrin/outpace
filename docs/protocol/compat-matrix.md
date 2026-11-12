@@ -174,6 +174,20 @@ falling through.
 | `/ace/getstream`, `/ace/manifest.m3u8` | `content_id` > `infohash` > `id` > `url` > `magnet` |
 | `analyze_content`, `get_media_files`, `get_content_id` | `content_id` > `query` > `infohash` > `url` > `magnet`; `id` is not an alias here |
 
+A repeated query key on `/ace/getstream`, `/ace/manifest.m3u8`, `/server/api`,
+`/webui/api/service` or `/ace/cmd/…` is rejected in-band rather than resolved by
+position. Playback is single-file, so file and stream selection is checked before
+anything resolves or starts:
+
+- `_idx=0` and the Android client's no-selection sentinel `stream_id=-1` are accepted.
+- Any other `_idx`, any other `stream_id`, and the URI-only `index` are rejected.
+- `direct_url`, `transport_file_data`, `playlist_selected_indexes`,
+  `playlist_start_from` and `next_file_indexes` are rejected.
+- SDK expansion flags such as `expand_wrapper` and `mode` remain accepted.
+
+`outpace play` applies the URI contract: `index=0` is accepted, while `_idx`, any
+`stream_id` and duplicate keys are rejected.
+
 - `content_id` and legacy playback `id` mean a **content id**, not a bare swarm
   hash. Playback requires exactly 40 hexadecimal characters and normalizes to
   lowercase. Control analysis validates content ids through the catalog resolver;
@@ -222,7 +236,7 @@ Both aliases use `{"result": <value>, "error": null}` on success and
 | `get_network_connection_status` | `status`, boolean `connected`, and `networks` reflect registered provider networks, not measured Internet or peer reachability. |
 | `analyze_content` | `infohash`, nullable `content_id`, integer `is_live`/`is_encrypted`, and `status: "complete"`. Bare infohash/magnet analysis returns the error envelope `descriptor metadata is unavailable`. Content-id/URL analysis inspects supported wrapped live/historical VOD or single-file raw/disk metainfo without joining a swarm. Inspected public reports `is_encrypted: 0`; protected reports `1`. Malformed protection is an error. |
 | `get_content_id` | **Echo only:** returns a nonempty caller `content_id`/`query` unchanged, even malformed strings, without 40-hex validation or catalog lookup. Cannot derive a content id from an infohash/URL/magnet. |
-| `get_media_files` | Best-effort `infohash` and one synthetic `files[]` entry with `infohash`, `index: 0`, `is_live`. Live entries also carry `mime: video/mp2t` (the served output) and a display `filename: stream.ts`; VOD entries carry neither. Same resolution as analysis; no multi-file or selection contract. `dump_transport_file` does not produce a raw dump. |
+| `get_media_files` | Best-effort `infohash` and one synthetic `files[]` entry with `infohash`, `index: 0`, `is_live`. A classified descriptor adds `type: live` or `type: vod`; verified single-file VOD adds `size` in bytes. Live entries also carry `mime: video/mp2t` (the served output) and a display `filename: stream.ts`; VOD entries carry neither. An origin-HLS descriptor returns an in-band error telling the client to use an HTTP playback route; no file table is fabricated. Same resolution as analysis; no multi-file contract, and selection is limited as described under [Selectors and provenance](#selectors-and-provenance). `dump_transport_file` does not produce a raw dump. |
 
 ## Lease ownership and live HLS
 

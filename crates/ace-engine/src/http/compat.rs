@@ -7,8 +7,12 @@ use ace_swarm::resolve::HlsOrigin;
 pub(super) async fn ace_getstream(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(json!({ "response": null, "error": error })).into_response(),
+    };
     let mode = match params.get("format").map(String::as_str) {
         None | Some("") => AceGetstreamMode::Direct,
         Some("json") => AceGetstreamMode::Json,
@@ -114,8 +118,12 @@ pub(super) async fn ace_getstream(
 pub(super) async fn ace_manifest(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(json!({ "response": null, "error": error })).into_response(),
+    };
     let format = params
         .get("format")
         .map(String::as_str)
@@ -787,10 +795,14 @@ async fn timeshift_status(s: &AppState, id: &str, token: &str) -> serde_json::Va
 /// the methods in [`crate::server_api::Method`] are served; see `docs/protocol/compat-matrix.md`.
 pub(super) async fn server_api(
     State(s): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
     use crate::server_api as api;
 
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(api::err(error)).into_response(),
+    };
     let method = params.get("method").map(String::as_str).unwrap_or("");
     let body = match api::parse_method(method) {
         api::Method::GetVersion => {
@@ -1103,9 +1115,29 @@ fn origin_hls_redirect(url: &str) -> Response {
         .into_response()
 }
 
+/// Reject duplicate keys and unsupported file/stream selection before anything resolves
+/// or starts, so a request never silently plays a different selection than it asked for.
+fn checked_source_query(
+    params: Vec<(String, String)>,
+) -> Result<HashMap<String, String>, &'static str> {
+    let mut unique = HashMap::with_capacity(params.len());
+    for (key, value) in params {
+        if unique.insert(key, value).is_some() {
+            return Err("duplicate query parameter");
+        }
+    }
+    validate_source_options(&unique)?;
+    Ok(unique)
+}
+
+fn validate_source_options(params: &HashMap<String, String>) -> Result<(), &'static str> {
+    crate::source_options::validate(params.iter().map(|(k, v)| (k.as_str(), v.as_str())), false)
+}
+
 pub(super) fn ace_selected_stream(
     params: &HashMap<String, String>,
 ) -> Result<AceStreamSelection, &'static str> {
+    validate_source_options(params)?;
     if let Some(content_id) = ace_nonempty_param(params, "content_id") {
         let content_id = ace_normalized_hex_id(content_id).ok_or("invalid content_id")?;
         return Ok(AceStreamSelection {

@@ -183,6 +183,65 @@ async fn early_resolution_returns_direct_json_without_swarm_controls() {
     assert_eq!(opens.load(Ordering::SeqCst), 0, "no source was opened");
 }
 
+#[tokio::test]
+async fn unsupported_or_ambiguous_selection_is_rejected_before_anything_starts() {
+    for resolve_early in [false, true] {
+        let (state, opens) = origin_state(resolve_early);
+        for base in [
+            "/ace/getstream?format=json",
+            "/ace/manifest.m3u8?format=json",
+            "/server/api?method=get_media_files",
+            "/webui/api/service?method=analyze_content",
+        ] {
+            for query in [
+                "_idx=1",
+                "_idx=-1",
+                "_idx=",
+                "_idx=0&%5fidx=0",
+                "index=0",
+                "stream_id=1",
+                "direct_url=https%3A%2F%2Fexample.test%2Fmedia",
+                "transport_file_data=AA",
+                "playlist_selected_indexes=0",
+                "playlist_start_from=0",
+                "next_file_indexes=0",
+                &format!("content_id={CID}"),
+            ] {
+                let path = format!("{base}&content_id={CID}&{query}");
+                let response = get(&state, &path).await;
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let body = json(response).await;
+                assert!(body["error"].is_string(), "{path}: {body}");
+            }
+        }
+        assert_eq!(state.ace_sessions.active_count(), 0);
+        assert!(state.manager.list().await.is_empty());
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn duplicate_command_parameters_do_not_execute() {
+    let (state, _) = origin_state(false);
+    let started = json(get(&state, &format!("/ace/getstream?id={CID}&format=json")).await).await;
+    let command = local_path(&started["response"]["command_url"]);
+    let body = json(get(&state, &format!("{command}?method=stop&method=stop")).await).await;
+    assert_eq!(body["error"], "duplicate command parameter");
+    assert_eq!(state.ace_sessions.active_count(), 1, "the lease survives");
+    let body = json(get(&state, &format!("{command}?method=stop")).await).await;
+    assert_eq!(body["response"], "ok");
+    assert_eq!(state.ace_sessions.active_count(), 0);
+}
+
+#[tokio::test]
+async fn android_default_selection_is_still_accepted() {
+    let (state, _) = origin_state(true);
+    let path = format!("/ace/getstream?format=json&content_id={CID}&_idx=0&stream_id=-1");
+    let body = json(get(&state, &path).await).await;
+    assert!(body["error"].is_null(), "{body}");
+    assert_eq!(body["response"]["playback_url"], URL);
+}
+
 fn managed(state: &mut AppState, policy: FetchPolicy) -> Arc<crate::origin_hls::OriginHls> {
     let relay = crate::origin_hls::OriginHls::new(policy);
     state.origin_hls = Some(relay.clone());
