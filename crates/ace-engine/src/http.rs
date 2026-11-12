@@ -46,6 +46,7 @@ mod broadcast_source;
 mod compat;
 mod origin_history;
 mod origin_hls;
+mod search;
 mod streams;
 mod support;
 mod vod;
@@ -118,6 +119,8 @@ pub struct AppState {
     /// Supported, opt-in Acestream HTTP subset. Native `/streams` and
     /// `/broadcast` routes remain available regardless of this flag.
     pub experimental_ace_compat: bool,
+    /// Separately opted-in external search; unrelated to legacy HTTP compatibility.
+    pub search: Option<Arc<crate::acestream_search::SearchService>>,
     /// Opt-in managed origin-HLS relay (`OUTPACE_MANAGED_HLS`); `None` keeps direct handoff.
     pub origin_hls: Option<Arc<crate::origin_hls::OriginHls>>,
     /// B1: origination state. `None` disables `PUT /broadcast/{name}` (404) — e.g. in tests
@@ -332,6 +335,9 @@ pub fn router_with_support(
             .route("/ace/cmd/{id}/{token}", get(ace_command))
             .route("/server/api", get(server_api))
             .route("/webui/api/service", get(server_api));
+    }
+    if state.search.is_some() && !state.peer_policy.is_private() {
+        router = router.route("/search", get(search::search));
     }
     router
         .with_state(state)

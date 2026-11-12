@@ -68,6 +68,18 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-24.04
             archive: tar.gz
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tar.gz
+          # Built against the FreeBSD 14 sysroot so one binary runs on FreeBSD 14 and 15
+          # (including pfSense and OPNsense).
+          - target: x86_64-unknown-freebsd
+            cross: x86_64-unknown-freebsd@14
+            os: ubuntu-24.04
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz
@@ -94,11 +106,11 @@ jobs:
           cache: false
           build-warnings: ""
 
-      - name: Install Linux cross toolchain
-        if: contains(matrix.target, 'unknown-linux-musl')
+      - name: Install cross toolchain
+        if: contains(matrix.target, 'unknown-linux-musl') || matrix.cross
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: ${{ matrix.cross || matrix.target }}
 
       - name: Test Windows executable resolution
         if: contains(matrix.target, 'windows')
@@ -108,7 +120,8 @@ jobs:
       - name: Build release binary
         shell: bash
         run: |
-          cargo build --locked --release -p ace-engine --bin "$BIN_NAME" --target "${{ matrix.target }}"
+          # The dist profile (Cargo.toml) is the size-optimised release profile.
+          cargo build --locked --profile dist -p ace-engine --bin "$BIN_NAME" --target "${{ matrix.target }}"
 
       - name: Package binary
         shell: bash
@@ -116,7 +129,7 @@ jobs:
           set -euo pipefail
           version="${{ needs.release-metadata.outputs.version }}"
           target="${{ matrix.target }}"
-          binary="target/${target}/release/${BIN_NAME}"
+          binary="target/${target}/dist/${BIN_NAME}"
 
           if [[ "$target" == *windows* ]]; then
             binary="${binary}.exe"
@@ -141,14 +154,67 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  linux-packages:
+    # .deb and .rpm packages (packaging/linux/) around the static musl archives built above.
+    # Named outpace_<version>_<arch>.<deb|rpm>, outside the outpace-* archive pattern.
+    name: Package ${{ matrix.target }}
+    runs-on: ubuntu-26.04
+    needs:
+      - release-metadata
+      - build-binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download packaged binary
+        uses: actions/download-artifact@v8
+        with:
+          name: release-${{ matrix.target }}
+          path: archive
+
+      - name: Install nfpm
+        run: echo "$(packaging/linux/install-nfpm.sh "$RUNNER_TEMP/nfpm")" >> "$GITHUB_PATH"
+
+      - name: Build packages
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          tar -xzf "archive/${BIN_NAME}-${VERSION}-${TARGET}.tar.gz" -C archive
+          packaging/linux/build.sh "$TARGET" "$VERSION" \
+            "archive/${BIN_NAME}-${VERSION}-${TARGET}/${BIN_NAME}" packages
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-packages-${{ matrix.target }}
+          path: packages/outpace_*
+          if-no-files-found: error
+          compression-level: 0
+
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-26.04
     needs:
       - release-metadata
       - build-binaries
+      - linux-packages
     permissions:
       contents: write
+      # Signed build provenance for the archives (GitHub artifact attestations).
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -166,8 +232,17 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum outpace-* > SHA256SUMS
+          sha256sum outpace-* outpace_* > SHA256SUMS
           cat SHA256SUMS
+
+      # Records which workflow run and commit built each archive and package. Verify with
+      # `gh attestation verify <file> --repo <owner>/<repo>`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/outpace-*
+            dist/outpace_*
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
@@ -175,15 +250,18 @@ jobs:
           generate_release_notes: true
           files: |
             dist/outpace-*
+            dist/outpace_*
             dist/SHA256SUMS
 
   publish-container:
     name: Publish GHCR image from release archives
-    # publish-release depends on all seven binary builds succeeding.
+    # publish-release depends on every binary build succeeding.
     needs: publish-release
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/publish-container.yml
     with:
       tag: ${{ github.ref_name }}

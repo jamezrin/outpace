@@ -467,9 +467,14 @@ config_with_root_redaction! {
     /// the deprecated `OUTPACE_EXPERIMENTAL_ACE_COMPAT` alias. The field name is retained
     /// for Rust and serialized configuration compatibility; native APIs remain primary.
     pub experimental_ace_compat: bool,
+    /// Explicit native external search opt-in; no operator API key is required.
+    pub acestream_services: crate::acestream_search::SearchSettings,
     /// Serve resolved origin HLS through a bounded local relay instead of handing the client
     /// the origin URL. Off by default. `OUTPACE_MANAGED_HLS`.
     pub managed_hls: bool,
+    /// Serve Prometheus text metrics at `GET /metrics` on the HTTP bind. Off by default.
+    /// `OUTPACE_METRICS`.
+    pub metrics: bool,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
     pub bep9_content_id_fallback: bool,
     /// Immutable per-name origination profiles, applied only at identity admission.
@@ -530,7 +535,9 @@ impl Default for Config {
             port_map_backend: ace_swarm::portmap::PortMapBackend::Auto,
             port_map_external_port: None,
             experimental_ace_compat: false,
+            acestream_services: Default::default(),
             managed_hls: false,
+            metrics: false,
             bep9_content_id_fallback: false,
             broadcast_options: BTreeMap::new(),
             broadcast_sources: BTreeMap::new(),
@@ -811,6 +818,7 @@ mod tests {
             "Acestream HTTP compatibility must be opt-in"
         );
         assert!(!c.managed_hls, "managed origin HLS must remain opt-in");
+        assert!(!c.metrics, "the metrics endpoint must remain opt-in");
         assert!(
             !c.enable_port_mapping,
             "port mapping must default OFF so merging has zero effect on default operation"

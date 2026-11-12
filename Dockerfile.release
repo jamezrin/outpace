@@ -1,15 +1,47 @@
 # syntax=docker/dockerfile:1
 # Context is prepared from verified release assets by prepare_container.py.
-FROM debian:bookworm-slim AS binary-amd64
+# Two final stages share the verified binary: `runtime` (Debian, the default tags) and
+# `minimal` (scratch, the -minimal tags). The binary stages are scratch so they never pull a
+# per-platform base image.
+FROM scratch AS binary-amd64
 COPY amd64/outpace /outpace
-FROM debian:bookworm-slim AS binary-arm64
+FROM scratch AS binary-arm64
 COPY arm64/outpace /outpace
-FROM debian:bookworm-slim AS binary-armv7
+FROM scratch AS binary-armv7
 COPY arm-v7/outpace /outpace
 
 ARG TARGETARCH
 ARG TARGETVARIANT
 FROM binary-${TARGETARCH}${TARGETVARIANT} AS binary
+
+# Files for the scratch image: a passwd/group entry for the fixed non-root user and an
+# owned, private data directory. Built on the build platform, so it adds no per-arch pull.
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS minimal-rootfs
+RUN mkdir -p /rootfs/etc /rootfs/var/lib/outpace /rootfs/tmp \
+    && echo 'outpace:x:10001:10001:outpace:/var/lib/outpace:/sbin/nologin' > /rootfs/etc/passwd \
+    && echo 'outpace:x:10001:' > /rootfs/etc/group \
+    && chown 10001:10001 /rootfs/var/lib/outpace \
+    && chmod 0700 /rootfs/var/lib/outpace \
+    && chmod 1777 /rootfs/tmp
+
+# The static musl binary needs nothing else: TLS roots are compiled in (webpki-root-certs).
+# No shell, no package manager and no curl; use `outpace healthcheck` for health checks.
+FROM scratch AS minimal
+LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace-stream" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+COPY --from=minimal-rootfs /rootfs/ /
+COPY --from=binary /outpace /usr/local/bin/outpace
+COPY LICENSE /usr/share/doc/outpace/LICENSE
+ENV OUTPACE_BIND=0.0.0.0:6878 \
+    OUTPACE_RTMP_BIND=0.0.0.0:1935 \
+    OUTPACE_DATA_DIR=/var/lib/outpace
+EXPOSE 6878/tcp 1935/tcp 8621/tcp
+VOLUME ["/var/lib/outpace"]
+USER 10001:10001
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=6 \
+    CMD ["/usr/local/bin/outpace", "healthcheck"]
+ENTRYPOINT ["/usr/local/bin/outpace"]
+CMD ["serve"]
 
 FROM debian:bookworm-slim AS runtime
 LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace-stream" \
