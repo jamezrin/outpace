@@ -8,6 +8,11 @@
 //! at `<data dir>\outpace.log`. Without `OUTPACE_DATA_DIR` the data directory is
 //! `%ProgramData%\outpace`, because the service account's own profile is not a useful home.
 //! Settings come from the service's `Environment` registry value; see the wiki.
+//!
+//! The service runs as its own virtual account, `NT SERVICE\outpace`, and its data directory
+//! (identity seed, broadcast signing keys) gets a protected DACL: SYSTEM and Administrators
+//! full control, the service account modify, nothing inherited from `%ProgramData%` (which
+//! would otherwise let every local user read it).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -26,8 +31,9 @@ use windows_service::{define_windows_service, service_dispatcher};
 pub const SERVICE_NAME: &str = "outpace";
 const DISPLAY_NAME: &str = "Outpace streaming engine";
 const DESCRIPTION: &str = "Streams and broadcasts public Acestream content (outpace serve).";
-/// Least-privileged built-in account that can still open network listeners.
-const SERVICE_ACCOUNT: &str = r"NT AUTHORITY\LocalService";
+/// Per-service virtual account: unprivileged, and unlike `LocalService` not shared with
+/// other services, so the data directory ACL can name it alone.
+const SERVICE_ACCOUNT: &str = r"NT SERVICE\outpace";
 /// Longest graceful shutdown the SCM is told to wait for (mirrors `TimeoutStopSec=30`).
 const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
 
@@ -69,6 +75,12 @@ pub fn install() -> Result<(), BoxError> {
         ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
     )?;
     service.set_description(DESCRIPTION)?;
+    // The virtual account exists once the service does; lock down the default data dir now so
+    // it is never created with %ProgramData%'s inherited, world-readable ACL.
+    if let Some(dir) = default_data_dir(std::env::var_os("ProgramData").as_deref()) {
+        std::fs::create_dir_all(&dir)?;
+        restrict_data_dir(&dir)?;
+    }
     // Restart after a crash, like systemd's Restart=on-failure.
     service.update_failure_actions(ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
@@ -171,12 +183,24 @@ fn serve(
         std::env::var_os("OUTPACE_CACHE_DIR").as_deref(),
         std::env::var_os("ProgramData").as_deref(),
     );
+    let existed = config.data_dir.exists();
     std::fs::create_dir_all(&config.data_dir)?;
+    // A directory this service creates is owned by it and is locked down before any key or
+    // log is written. One that already exists (made by `service install`, or by an admin for
+    // OUTPACE_DATA_DIR) is owned by its creator; re-applying is attempted, and a failure is
+    // logged rather than fatal because the account has modify, not change-permission, rights.
+    let restricted = restrict_data_dir(&config.data_dir);
+    if !existed {
+        restricted.as_ref().map_err(|e| e.to_string())?;
+    }
     redirect_stderr(&config.data_dir.join("outpace.log"))?;
     crate::alog!(
         "[service] starting (data dir {})",
         config.data_dir.display()
     );
+    if let Err(error) = restricted {
+        crate::alog!("[service] warning: kept existing data dir permissions: {error}");
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -211,13 +235,52 @@ fn apply_service_data_dir(
     if data_dir_env.is_some() {
         return;
     }
-    let Some(program_data) = program_data else {
+    let Some(data_dir) = default_data_dir(program_data) else {
         return;
     };
-    config.data_dir = PathBuf::from(program_data).join("outpace");
+    config.data_dir = data_dir;
     if cache_dir_env.is_none() {
         config.cache_dir = config.data_dir.join("cache");
     }
+}
+
+fn default_data_dir(program_data: Option<&OsStr>) -> Option<PathBuf> {
+    program_data.map(|dir| PathBuf::from(dir).join("outpace"))
+}
+
+/// `icacls` arguments that replace `dir`'s DACL: inheritance removed, then full control for
+/// SYSTEM (`S-1-5-18`) and Administrators (`S-1-5-32-544`) and modify for the service account,
+/// all inherited by files and subdirectories. SIDs avoid localized group names.
+fn restrict_data_dir_args(dir: &Path) -> Vec<OsString> {
+    vec![
+        dir.as_os_str().to_owned(),
+        OsString::from("/inheritance:r"),
+        OsString::from("/grant:r"),
+        OsString::from("*S-1-5-18:(OI)(CI)F"),
+        OsString::from("*S-1-5-32-544:(OI)(CI)F"),
+        OsString::from(format!("{SERVICE_ACCOUNT}:(OI)(CI)M")),
+        OsString::from("/Q"),
+    ]
+}
+
+fn restrict_data_dir(dir: &Path) -> Result<(), BoxError> {
+    // Absolute path, so a PATH entry cannot substitute another icacls.
+    let system_root = std::env::var_os("SystemRoot").ok_or("SystemRoot is not set")?;
+    let icacls = PathBuf::from(system_root)
+        .join("System32")
+        .join("icacls.exe");
+    let output = std::process::Command::new(icacls)
+        .args(restrict_data_dir_args(dir))
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not restrict permissions on {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Point this process's standard error at `path` (appending), so `alog!` and `eprintln!`
@@ -281,6 +344,27 @@ mod tests {
             Some(OsStr::new(r"C:\ProgramData")),
         );
         assert_eq!(config.cache_dir, PathBuf::from(r"E:\cache"));
+    }
+
+    #[test]
+    fn data_dir_acl_grants_only_system_admins_and_the_service() {
+        let args = restrict_data_dir_args(Path::new(r"C:\ProgramData\outpace"));
+        let args: Vec<_> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], r"C:\ProgramData\outpace");
+        assert!(args.contains(&"/inheritance:r".to_owned()));
+        assert!(args.contains(&"/grant:r".to_owned()));
+        let grants: Vec<_> = args.iter().filter(|a| a.contains(":(OI)(CI)")).collect();
+        assert_eq!(
+            grants,
+            [
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                r"NT SERVICE\outpace:(OI)(CI)M"
+            ]
+        );
     }
 
     #[test]

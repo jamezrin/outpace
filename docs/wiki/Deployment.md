@@ -173,8 +173,12 @@ Copy-Item .\outpace.exe "$env:ProgramFiles\outpace\"
 sc.exe start outpace
 ```
 
-- The service is called `outpace`. It starts automatically at boot, runs as the built-in
-  `LocalService` account, and Windows restarts it if it crashes.
+- The service is called `outpace`. It starts automatically at boot, runs as its own
+  unprivileged virtual account `NT SERVICE\outpace`, and Windows restarts it if it crashes.
+- Its data directory holds the node identity and broadcast signing keys. `service install`
+  restricts it to SYSTEM, Administrators and the service account, with nothing inherited from
+  `%ProgramData%`. If you point `OUTPACE_DATA_DIR` elsewhere, restrict that directory the same way:
+  `icacls <dir> /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "NT SERVICE\outpace:(OI)(CI)M"`.
 - `service install` registers it but doesn't start it.
 - Stopping it (`sc.exe stop outpace`, the Services app, or a shutdown) drains connections
   gracefully, just like Ctrl+C.

@@ -77,6 +77,15 @@ jobs:
           if ((Get-Service outpace).Status -ne 'Stopped') { throw 'service did not stop' }
           Get-Content $log -Tail 5
           if (-not (Select-String -Path $log -Pattern 'stop requested' -Quiet)) { throw 'no graceful stop in log' }
+          # The data dir holds the identity seed and broadcast keys: no inherited or Users access.
+          $acl = Get-Acl (Join-Path $env:ProgramData 'outpace')
+          $acl.Access | Format-Table IdentityReference, FileSystemRights, IsInherited -AutoSize
+          if (-not $acl.AreAccessRulesProtected) { throw 'data dir ACL still inherits' }
+          $users = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+          foreach ($rule in $acl.Access) {
+            $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+            if ($sid -eq $users) { throw 'BUILTIN\Users can access the data dir' }
+          }
           & $exe service uninstall
           if ($LASTEXITCODE -ne 0) { throw 'uninstall failed' }
           if (Get-Service outpace -ErrorAction SilentlyContinue) { throw 'service still registered' }

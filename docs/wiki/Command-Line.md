@@ -116,7 +116,7 @@ Unreleased: `edge` and builds from `main` only. This command exists only in Wind
 
 | Command | What it does |
 | --- | --- |
-| `outpace service install` | Registers the automatic-start `outpace` service as `LocalService`, without starting it. Needs an elevated prompt. |
+| `outpace service install` | Registers the automatic-start `outpace` service, running as its own `NT SERVICE\outpace` account, and creates its private data directory. It doesn't start the service. Needs an elevated prompt. |
 | `outpace service uninstall` | Stops the service if it's running, then removes it. Needs an elevated prompt. |
 | `outpace service run` | The entry point the Service Control Manager starts. Not for running by hand. |
 

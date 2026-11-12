@@ -51,8 +51,9 @@ pub enum Command {
 #[cfg(windows)]
 #[derive(Debug, Subcommand)]
 pub enum ServiceCommand {
-    /// Register outpace as an automatic-start service running as LocalService (needs an
-    /// elevated prompt). It is not started.
+    /// Register outpace as an automatic-start service running as the NT SERVICE\outpace
+    /// virtual account, with a private data directory (needs an elevated prompt). It is not
+    /// started.
     Install,
     /// Stop the service if it is running, then remove it (needs an elevated prompt).
     Uninstall,
