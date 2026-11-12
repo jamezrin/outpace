@@ -10,3 +10,6 @@
 
 # Local AceStream content-id registry (LLM context only, never committed)
 /acestream-ids.txt
+
+# Cached Inter fonts for tools/readme-hero (downloaded and checksum-verified on demand)
+tools/readme-hero/.fonts/

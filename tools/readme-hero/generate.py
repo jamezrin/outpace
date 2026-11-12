@@ -10,18 +10,38 @@ The picture follows how a live AceStream swarm works:
   of four active upstreams) and seeds back to others (thinner dashed strands leaving it);
 - a subtle CSS animation shows direction (inward downloads, outward uploads) and is
   disabled for readers who prefer reduced motion.
+All text is drawn as kerned Inter outlines (see textpath.py), so it looks the same in every
+browser and stays sharp when GitHub scales the image down. Requires fontTools.
 The output is deterministic, so re-running reproduces the committed files.
 """
 import heapq
 import math
+import os
 import random
 import sys
 
-W, H = 1200, 400
-CX, CY = 600, 190                  # centre of the wordmark
-TEXT_BOX = (330, 82, 870, 330)     # region kept free of peers (wordmark + subtext)
-WORD_L, WORD_R = CX - 214, CX + 214  # horizontal extent of the wordmark
-WORD_TOP = CY - 70
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from textpath import Face, ensure_fonts  # noqa: E402
+
+FONTS = {w: Face(p) for w, p in ensure_fonts().items()}
+
+W, H = 1200, 420
+CX = 600
+WORD_SIZE, WORD_BASE, WORD_TRACK = 132, 214, -4.0
+TAG_SIZE, TAG_BASE = 32, 272
+CAPS_SIZE, CAPS_BASE, CAPS_TRACK = 18, 320, 3.4
+WORD_TEXT = ("outp", "ace")
+TAG_TEXT = "Open-source P2P streaming engine"
+CAPS_TEXT = "ACE STREAM COMPATIBLE  ·  RUST"
+
+_, WORD_W = FONTS["ExtraBold"].layout("".join(WORD_TEXT), WORD_SIZE, WORD_TRACK)
+_, TAG_W = FONTS["Medium"].layout(TAG_TEXT, TAG_SIZE)
+CY = WORD_BASE - 44                # vertical centre of the wordmark's x-height
+WORD_L, WORD_R = CX - WORD_W / 2 - 6, CX + WORD_W / 2 + 6
+WORD_TOP = WORD_BASE - 96          # top of the ascenders
+TEXT_BOX = (CX - max(WORD_W, TAG_W) / 2 - 28, WORD_TOP - 24,
+            CX + max(WORD_W, TAG_W) / 2 + 28, CAPS_BASE + 18)
 
 rng = random.Random(11)
 
@@ -170,8 +190,10 @@ def render(theme):
         colour, width = (t["chain"], 2.2) if (i, j) in chain_edges else (t["edge"], 1.4)
         a(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{colour}" stroke-width="{width}"/>')
 
-    a(f'<ellipse cx="{CX}" cy="{CY + 40}" rx="330" ry="150" fill="url(#plate)"/>')
-    a(f'<ellipse cx="{CX}" cy="{CY + 10}" rx="360" ry="160" fill="url(#glow)"/>')
+    box_cy = (TEXT_BOX[1] + TEXT_BOX[3]) / 2
+    box_rx = (TEXT_BOX[2] - TEXT_BOX[0]) / 2
+    a(f'<ellipse cx="{CX}" cy="{box_cy:.1f}" rx="{box_rx + 70:.1f}" ry="175" fill="url(#plate)"/>')
+    a(f'<ellipse cx="{CX}" cy="{CY + 10}" rx="{box_rx + 110:.1f}" ry="175" fill="url(#glow)"/>')
 
     # Downloads: four strands from upstream peers into the ends of the wordmark.
     for k, i in enumerate(upstreams):
@@ -187,7 +209,7 @@ def render(theme):
     for k, i in enumerate(sorted(seeded, key=lambda i: peers[i][0])):
         x, y = peers[i]
         sx = CX - 120 + k * 120
-        d = strand(sx, WORD_TOP + 34, x, y, horizontal=False)
+        d = strand(sx, WORD_BASE - 74, x, y, horizontal=False)
         a(f'<path class="up" d="{d}" fill="none" stroke="{t["warm"]}" stroke-width="1.8" stroke-linecap="round"/>')
 
     for i, (x, y) in enumerate(peers):
@@ -204,16 +226,18 @@ def render(theme):
             r = 4 + (int(x * 7 + y) % 3)
             a(f'<circle cx="{x}" cy="{y}" r="{r}" fill="{t["node"]}"/>')
 
-    font = "ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"
-    halo = f'stroke="{t["bg"]}" stroke-width="8" stroke-linejoin="round" paint-order="stroke"'
-    a(f'<g font-family="{font}" text-anchor="middle">')
-    a(f'<text x="{CX}" y="{CY + 34}" font-size="112" font-weight="800" letter-spacing="-4" '
-      f'{halo} fill="{t["ink"]}">outp<tspan fill="url(#word)">ace</tspan></text>')
-    a(f'<text x="{CX}" y="{CY + 86}" font-size="21" {halo} fill="{t["muted"]}">'
-      'Open-source peer-to-peer streaming engine</text>')
-    a(f'<text x="{CX}" y="{CY + 124}" font-size="13" font-weight="700" letter-spacing="4" '
-      f'{halo} fill="{t["hot"]}">ACE STREAM COMPATIBLE  ·  RUST  ·  SELF-HOSTED</text>')
-    a('</g>')
+    bold, medium, semi = FONTS["ExtraBold"], FONTS["Medium"], FONTS["SemiBold"]
+    placed, width = bold.layout("".join(WORD_TEXT), WORD_SIZE, WORD_TRACK)
+    x0 = CX - width / 2
+    split_x = x0 + placed[len(WORD_TEXT[0])][1]
+    d_first, _, _ = bold.path(WORD_TEXT[0], WORD_SIZE, x0, WORD_BASE, WORD_TRACK)
+    d_second, _, _ = bold.path(WORD_TEXT[1], WORD_SIZE, split_x, WORD_BASE, WORD_TRACK)
+    a(f'<path d="{d_first}" fill="{t["ink"]}"/>')
+    a(f'<path d="{d_second}" fill="url(#word)"/>')
+    d_tag, _, _ = medium.path(TAG_TEXT, TAG_SIZE, CX, TAG_BASE, anchor="middle")
+    a(f'<path d="{d_tag}" fill="{t["muted"]}"/>')
+    d_caps, _, _ = semi.path(CAPS_TEXT, CAPS_SIZE, CX, CAPS_BASE, CAPS_TRACK, anchor="middle")
+    a(f'<path d="{d_caps}" fill="{t["hot"]}"/>')
     a('</svg>')
     return "\n".join(o) + "\n"
 
