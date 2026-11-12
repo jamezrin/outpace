@@ -31,10 +31,13 @@ def prepare(tag: str, assets: Path, output: Path) -> None:
         raise ValueError("Release must contain exactly all seven expected archives and SHA256SUMS")
     checksums = {}
     for line in (assets / "SHA256SUMS").read_text().splitlines():
-        match = re.fullmatch(r"([0-9a-f]{64})  (outpace-[^/\\\s]+)", line)
+        match = re.fullmatch(r"([0-9a-f]{64})  (outpace[-_][^/\\\s]+)", line)
         if not match or match[2] in checksums:
             raise ValueError("Invalid or duplicate checksum entry")
         checksums[match[2]] = match[1]
+    # .deb/.rpm packages (outpace_<version>_<arch>.*) are listed too, but they are not
+    # downloaded for the image and not part of the archive set checked here.
+    checksums = {name: digest for name, digest in checksums.items() if name.startswith("outpace-")}
     if set(checksums) != expected:
         raise ValueError("Checksums must cover exactly all seven expected archives")
     for name, digest in checksums.items():

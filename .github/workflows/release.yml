@@ -141,12 +141,62 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  linux-packages:
+    # .deb and .rpm packages (packaging/linux/) around the static musl archives built above.
+    # Named outpace_<version>_<arch>.<deb|rpm>, outside the outpace-* archive pattern.
+    name: Package ${{ matrix.target }}
+    runs-on: ubuntu-26.04
+    needs:
+      - release-metadata
+      - build-binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download packaged binary
+        uses: actions/download-artifact@v8
+        with:
+          name: release-${{ matrix.target }}
+          path: archive
+
+      - name: Install nfpm
+        run: echo "$(packaging/linux/install-nfpm.sh "$RUNNER_TEMP/nfpm")" >> "$GITHUB_PATH"
+
+      - name: Build packages
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          tar -xzf "archive/${BIN_NAME}-${VERSION}-${TARGET}.tar.gz" -C archive
+          packaging/linux/build.sh "$TARGET" "$VERSION" \
+            "archive/${BIN_NAME}-${VERSION}-${TARGET}/${BIN_NAME}" packages
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-packages-${{ matrix.target }}
+          path: packages/outpace_*
+          if-no-files-found: error
+          compression-level: 0
+
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-26.04
     needs:
       - release-metadata
       - build-binaries
+      - linux-packages
     permissions:
       contents: write
 
@@ -166,7 +216,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum outpace-* > SHA256SUMS
+          sha256sum outpace-* outpace_* > SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish release
@@ -175,6 +225,7 @@ jobs:
           generate_release_notes: true
           files: |
             dist/outpace-*
+            dist/outpace_*
             dist/SHA256SUMS
 
   publish-container:

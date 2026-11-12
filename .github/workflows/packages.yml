@@ -1,0 +1,70 @@
+name: Linux packages
+
+# Builds the .deb and .rpm packages from a static musl release binary and install-tests
+# them in Debian and Fedora containers. Mirrors the linux-packages job in release.yml.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/packages.yml
+      - packaging/linux/**
+      - tools/ci/smoke_daemon.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  packages:
+    name: Build and install-test deb and rpm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ env.TARGET }}
+          cache: false
+          build-warnings: ""
+
+      - name: Install musl cross toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ env.TARGET }}
+
+      - name: Build release binary
+        run: cargo build --locked --release -p ace-engine --bin outpace --target "$TARGET"
+
+      - name: Install nfpm
+        run: echo "$(packaging/linux/install-nfpm.sh "$RUNNER_TEMP/nfpm")" >> "$GITHUB_PATH"
+
+      - name: Build packages
+        run: |
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "ace-engine") | .version')"
+          packaging/linux/build.sh "$TARGET" "$version" "target/$TARGET/release/outpace" dist
+
+      - name: Verify systemd unit
+        run: |
+          root="$RUNNER_TEMP/pkgroot"
+          mkdir -p "$root"
+          dpkg-deb -x dist/*.deb "$root"
+          systemd-analyze verify --man=no --root="$root" /usr/lib/systemd/system/outpace.service
+
+      - name: Install-test the .deb on Debian
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src debian:bookworm-slim \
+            sh packaging/linux/test-install.sh "$(ls dist/*.deb)"
+
+      - name: Install-test the .rpm on Fedora
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src fedora:42 \
+            sh packaging/linux/test-install.sh "$(ls dist/*.rpm)"
