@@ -18,7 +18,9 @@ live media, and serves it to your players over HTTP:
   understand.
 
 It's a single self-contained, headless binary (or container image) for Linux, macOS and
-Windows. It never downloads or runs the proprietary Ace Stream engine. Ace Stream is the network
+Windows. Performance and efficiency are core goals: Outpace aims to start quickly, play
+smoothly and stay light on CPU and memory, and the project treats performance regressions as
+bugs. It never downloads or runs the proprietary Ace Stream engine. Ace Stream is the network
 it supports today. Outpace is an independent project, not affiliated with or endorsed by Ace
 Stream.
 
