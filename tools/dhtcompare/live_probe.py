@@ -1,12 +1,15 @@
 """Fixed boundary probe run as a live worker in offline qualification only.
 
 Exercises the destination matrix from two threads and sockets, inbound filtering,
-and privilege denials. Prints one JSON object; no input is read.
+privilege denials and filesystem confinement. argv: UNIX_SOCKET_PATH WRITE_PATH,
+both supervisor-owned. Prints one JSON object.
 """
 import errno
 import json
+import os
 import socket
 import subprocess
+import sys
 import threading
 
 SYNTHETIC = ('11.0.0.2', 6881)
@@ -61,6 +64,16 @@ def raw_socket():
     socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP).close()
 
 
+def unix_connect(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix:
+        unix.connect(path)
+
+
+def file_write(path):
+    with open(path, 'x') as out:
+        out.write('leak')
+
+
 def command(*args):
     return subprocess.run(args, capture_output=True, timeout=2).returncode
 
@@ -78,6 +91,9 @@ def main():
     results['tcp'] = outcome(tcp_connect)
     results['ipv6'] = outcome(ipv6_send)
     results['raw'] = outcome(raw_socket)
+    results['unix_connect'] = outcome(lambda: unix_connect(sys.argv[1]))
+    results['file_write'] = outcome(lambda: file_write(sys.argv[2]))
+    results['run_listing'] = sorted(os.listdir('/run'))
     results['nft_flush'] = command('/usr/sbin/nft', 'flush', 'ruleset')
     results['link_down'] = command('/usr/bin/ip', 'link', 'set', 'dhtw0', 'down')
     status = {}

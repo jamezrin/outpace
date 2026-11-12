@@ -3,7 +3,10 @@
 Frames come from the worker namespace's relay-side veth. Only IPv4 UDP to permitted
 global destinations is forwarded, from root-namespace sockets bound to the egress
 device. Replies are injected only from endpoints the same inner socket contacted.
-All state is bounded; counters carry no addresses.
+All state is bounded; counters carry no addresses. `admitted_out` and
+`replies_admitted` count successful local sends, not delivery. Kernel receive-queue
+drops on the packet and outer sockets are reported separately from relay decisions.
+There is no rate limit beyond MAX_DATAGRAMS per worker.
 """
 import ipaddress
 import socket
@@ -19,7 +22,10 @@ COUNTERS = (
     'denied_destination', 'mapping_cap', 'contact_cap', 'datagram_cap', 'send_errors',
     'admitted_out', 'admitted_out_bytes', 'unique_contacts', 'replied_contacts',
     'replies_admitted', 'unsolicited_in', 'oversized_in', 'receive_errors', 'mappings_opened',
+    'open_errors',
 )
+SOL_PACKET, PACKET_STATISTICS = 263, 6
+SO_RXQ_OVFL = 40
 _ETH_IPV4 = 0x0800
 _WORKER = ipaddress.IPv4Address(WORKER_ADDRESS).packed
 
@@ -98,6 +104,8 @@ class Relay:
         self.mappings = {}
         self.contacts = {}
         self.replied = set()
+        self.outer_drops = {}
+        self.packet_drops = 0
         self.counters = dict.fromkeys(COUNTERS, 0)
         self.selector = None
 
@@ -144,8 +152,14 @@ class Relay:
             if len(self.mappings) >= MAX_MAPPINGS:
                 self.counters['mapping_cap'] += 1
                 return
-            outer = self.open_outer()
+            try:
+                outer = self.open_outer()
+                outer.setsockopt(socket.SOL_SOCKET, SO_RXQ_OVFL, 1)
+            except OSError:
+                self.counters['open_errors'] += 1
+                return
             self.mappings[inner_port] = outer
+            self.outer_drops[inner_port] = 0
             self.counters['mappings_opened'] += 1
             self.contacts[inner_port] = set()
             if self.selector is not None:
@@ -170,12 +184,16 @@ class Relay:
         outer = self.mappings[inner_port]
         for _ in range(FRAMES_PER_WAKE):
             try:
-                payload, _, flags, source = outer.recvmsg(MTU_PAYLOAD + 1)
+                payload, ancillary, flags, source = outer.recvmsg(MTU_PAYLOAD + 1, socket.CMSG_SPACE(4))
             except BlockingIOError:
                 return
             except OSError:
                 self.counters['receive_errors'] += 1
                 return
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == SO_RXQ_OVFL and len(data) >= 4:
+                    self.outer_drops[inner_port] = max(self.outer_drops[inner_port],
+                                                       struct.unpack('=I', data[:4])[0])
             self.inject(inner_port, payload, flags, source)
 
     def inject(self, inner_port, payload, flags, source):
@@ -198,6 +216,15 @@ class Relay:
             self.replied.add(key)
             self.counters['replied_contacts'] += 1
 
+    def _packet_statistics(self):
+        """Accumulate kernel drops on the packet socket; reading resets the kernel counters."""
+        try:
+            _, drops = struct.unpack('=II', self.packet.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))
+        except (OSError, struct.error):
+            return None
+        self.packet_drops += drops
+        return self.packet_drops
+
     def close(self):
         for outer in self.mappings.values():
             if self.selector is not None:
@@ -212,4 +239,6 @@ class Relay:
     def report(self):
         result = dict(self.counters)
         result['unanswered_contacts'] = result['unique_contacts'] - result['replied_contacts']
+        result['packet_socket_kernel_drops'] = self._packet_statistics()
+        result['outer_socket_kernel_drops'] = sum(self.outer_drops.values())
         return result

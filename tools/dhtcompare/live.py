@@ -1,9 +1,12 @@
 """Linux live-worker owner: one default-deny namespace plus its supervisor relay.
 
 The worker sees only a veth whose traffic is filtered by inner nftables and then by
-the relay in this process; see live_policy and live_relay. This owner bounds time,
-pipes and relay state, and tears down the namespace through its verified PID 1.
-It does not prove library actor joins; namespace teardown is the hard boundary.
+the relay in this process; see live_policy and live_relay. Its filesystem is
+read-only and every directory holding host UNIX sockets is covered by an empty
+tmpfs. This owner bounds time, pipes and relay state, tears down the namespace
+through its verified PID 1, and arms a parent-death SIGKILL so the namespace dies
+with this process. It does not prove library actor joins; namespace teardown is
+the hard boundary.
 """
 from dataclasses import dataclass
 import json
@@ -24,10 +27,16 @@ from qualification import Artifact
 from worker_records import extract_record
 
 UNSHARE = '/usr/bin/unshare'
+SETPRIV = '/usr/bin/setpriv'
+# Every directory known to hold host UNIX sockets on the qualified hosts; any other
+# bound path the supervisor can see must be unreachable inside the namespace.
+HIDDEN_PATHS = ('/run', '/var/run', '/tmp', '/var/tmp', '/var/spool', '/dev/shm')
+MAX_LISTENERS = 1024
 BOOTSTRAP = Path(__file__).resolve().with_name('live_bootstrap.py')
 MESSAGE = 65536
 INNER_FIELDS = ('wait_status', 'elapsed_seconds', 'rss_hwm_kib_sampled', 'user_seconds', 'system_seconds',
                 'threads_peak_sampled', 'sockets_peak_sampled', 'samples')
+SAMPLED_FIELDS = ('rss_hwm_kib_sampled', 'threads_peak_sampled', 'sockets_peak_sampled')
 
 
 @dataclass(frozen=True)
@@ -47,11 +56,26 @@ class LiveResult:
     inner: dict | None = None
 
 
+def bound_unix_paths(listing='/proc/net/unix'):
+    """Absolute filesystem paths of UNIX sockets visible in this network namespace."""
+    paths = set()
+    with open(listing) as table:
+        next(table)
+        for line in table:
+            fields = line.split(maxsplit=7)
+            if len(fields) == 8 and fields[7].startswith('/'):
+                paths.add(fields[7].rstrip('\n'))
+    if len(paths) > MAX_LISTENERS:
+        raise ValueError('listener_inventory')
+    return sorted(paths)
+
+
 def _config():
     return json.dumps({
         'ruleset': live_policy.nft_ruleset(), 'worker_device': live_policy.WORKER_DEVICE,
         'relay_device': live_policy.RELAY_DEVICE, 'worker_address': live_policy.WORKER_ADDRESS,
         'gateway_address': live_policy.GATEWAY_ADDRESS, 'prefix': live_policy.PREFIX_LENGTH,
+        'hidden_paths': list(HIDDEN_PATHS), 'listeners': bound_unix_paths(),
     }).encode()
 
 
@@ -85,7 +109,12 @@ def validate_attestation(attestation):
         if defaults != 1 or attestation['routes6']:
             raise ValueError
         counters = live_policy.ruleset_counters(attestation['ruleset'])
-        if any(counters.values()):
+        if any(counters.values()) or attestation['ip_forward'] != '0':
+            raise ValueError
+        filesystem = attestation['filesystem']
+        if (filesystem['root_readonly'] is not True or filesystem['reachable_listeners'] != 0
+                or set(filesystem['hidden']) != set(HIDDEN_PATHS)
+                or any(state not in ('empty', 'absent', 'link') for state in filesystem['hidden'].values())):
             raise ValueError
         return macs[0], macs[1]
     except (KeyError, TypeError, AttributeError, ValueError):
@@ -96,7 +125,8 @@ def _inner_report(final):
     if type(final) is not dict or any(f not in final for f in INNER_FIELDS):
         return None
     report = {f: final[f] for f in INNER_FIELDS
-              if type(final[f]) in (int, float) and math.isfinite(final[f])}
+              if (type(final[f]) in (int, float) and math.isfinite(final[f]))
+              or (final[f] is None and f in SAMPLED_FIELDS)}
     if len(report) != len(INNER_FIELDS):
         return None
     try:
@@ -118,7 +148,7 @@ def run_live(argv, *, timeout, env, open_outer, prefix_cap=65536):
             or any(not isinstance(a, str) or not a or len(a) > 16384 for a in argv)):
         raise ValueError('invalid_live_worker')
     control, child_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    command = [UNSHARE, '--user', '--map-root-user', '--net', '--pid', '--fork',
+    command = [SETPRIV, '--pdeathsig', 'KILL', '--', UNSHARE, '--user', '--map-root-user', '--net', '--pid', '--fork',
                '--kill-child=KILL', '--mount-proc', sys.executable, '-I', str(BOOTSTRAP),
                str(child_end.fileno()), *argv]
     start = time.monotonic(); deadline = start + timeout; cleanup_deadline = deadline + 2
@@ -148,11 +178,13 @@ def run_live(argv, *, timeout, env, open_outer, prefix_cap=65536):
             pass
 
     try:
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        config = _config()
+        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
                                 start_new_session=True, env=env, close_fds=True,
                                 pass_fds=(child_end.fileno(),))
         child_end.close()
-        control.sendall(_config())
+        control.sendall(config)
         control.setblocking(False)
         for index, stream in enumerate((proc.stdout, proc.stderr)):
             os.set_blocking(stream.fileno(), False)
@@ -297,9 +329,9 @@ def run_live_worker(role, artifact, *, target, seeds, deadline, open_outer):
             raise ValueError
     except (ValueError, TypeError):
         raise LiveWorkerError('invalid_live_worker') from None
-    artifact.verify()
     if deadline - time.monotonic() < 29.9:
         raise LiveWorkerError('live_worker_deadline')
+    artifact.verify()
     env = {'LC_ALL': 'C', **worker_environment(role, target, seeds)}
     start = time.monotonic()
     result = run_live(worker_argv(role, artifact), timeout=27.8, env=env, open_outer=open_outer)

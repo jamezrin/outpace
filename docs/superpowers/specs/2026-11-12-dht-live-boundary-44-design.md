@@ -19,19 +19,28 @@ firewall, routing and DNS must not change.
 Each worker runs in fresh nested user, network and PID namespaces created by the
 supervisor. A fixed bootstrap is namespace PID 1:
 
-1. Disables IPv6, creates a veth pair (`dhtw0` for the worker, `dhtr0` for the relay),
+1. Disables IPv6 and IPv4 forwarding, creates a veth pair (`dhtw0` for the worker, `dhtr0` for the relay),
    assigns `10.200.0.2/30` to `dhtw0`, adds a permanent neighbour entry for gateway
    `10.200.0.1`, and routes the default route through it.
 2. Loads a default-deny nftables table. Output accepts the inner loopback, and UDP to
    IPv4 destinations outside the special-purpose prefixes. Input accepts the inner
    loopback, and conntrack-established UDP replies. Every other packet is counted
    and dropped.
-3. Verifies the loaded ruleset structure, opens an `AF_PACKET` socket on `dhtr0`, and
-   passes it with an attestation to the supervisor over a sequenced-packet socket.
-4. After the supervisor accepts the attestation, forks the worker. The worker has
-   empty capability sets and `no_new_privs`, so it cannot alter the policy.
-5. Samples the worker's thread count, collects `wait4` resource usage, and reports
-   nftables counters after the worker exits.
+3. Opens an `AF_PACKET` socket on `dhtr0`, then makes every inherited mount
+   read-only and covers each directory that holds host UNIX sockets (`/run`, `/tmp`,
+   `/var/tmp`, `/var/spool`, `/dev/shm`) with an empty tmpfs. Path sockets bypass
+   network namespaces, so without this a uid-0 worker could reach the init system,
+   the message bus or a mail spool and egress through them.
+4. Passes the packet socket and an attestation to the supervisor over a
+   sequenced-packet socket. The supervisor validates the links, addresses, routes,
+   ruleset structure and zero counters, forwarding state, the read-only root, the
+   covered directories, and that no absolute UNIX socket path it can see is
+   reachable inside the namespace.
+5. After the supervisor accepts the attestation, forks the worker. The worker has
+   empty capability sets and `no_new_privs`, so it cannot alter the policy or the
+   mounts.
+6. Samples the worker's threads, sockets and `VmHWM` every 10 ms, collects `wait4`
+   CPU time, and reports nftables counters after the worker exits.
 
 The supervisor relay reads frames from `dhtr0`. It applies the same destination
 policy, independently of nftables, and forwards UDP payloads from root-namespace
@@ -42,7 +51,9 @@ datagram totals are bounded.
 
 There are three independent layers: the relay policy, the inner nftables policy, and the
 existing host egress table and VPN gateway. Nothing on the host changes. Each worker's
-namespace, sockets and relay state are destroyed before the next arm starts.
+namespace, sockets and relay state are destroyed before the next arm starts. The
+launcher carries a parent-death SIGKILL, so the namespace also dies if the
+supervisor is killed.
 
 Rejected alternatives: a host firewall table or cgroup BPF changes host policy;
 pasta or slirp4netns needs a TUN device; seccomp address inspection is racy and
@@ -72,14 +83,20 @@ uniform across candidates:
 - Unique contacted endpoints, and endpoints that never replied.
 - Admitted replies and unsolicited drops.
 
-These are measured at the boundary, not library-internal query diagnostics.
-Per-arm `wait4` peak RSS and CPU time, and sampled peak thread counts, are measured
-process facts. Unavailable library counters remain null with their reason.
+These are measured at the boundary, not library-internal query diagnostics. An
+admitted datagram is a successful local send, not proof of delivery or of the
+library's handling. Kernel receive-queue drops on the relay's packet and outer
+sockets are reported separately, as is agreement between relay and nftables
+counts. Per-arm `wait4` CPU time and sampled peak threads, sockets and `VmHWM` are
+measured process facts; sampled peaks are lower bounds and are null when no sample
+was taken. Unavailable library counters remain null with their reason.
 
 ## Live block
 
-The block has one absolute 120-second deadline and uses a fixed order: custom,
-mainline, n0. Each worker envelope is 30 seconds. The steps are:
+The block has one absolute 135-second deadline and uses a fixed order: custom,
+mainline, n0. Each worker envelope is 30 seconds. No arm starts unless all three
+envelopes and the postflight still fit, so a block never yields an unmatched
+subset. The steps are:
 
 1. Verify artifact pins, the single default route through the declared egress
    device, disabled IPv6, and the host route and stateless ruleset digests.

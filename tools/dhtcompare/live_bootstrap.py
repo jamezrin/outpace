@@ -2,12 +2,14 @@
 
 argv: CONTROL_FD WORKER_ARGV... The supervisor sends one configuration message,
 validates the attestation this process returns, then sends `go`. The worker runs
-as a child with empty capability sets and no_new_privs; this process reports
-resource usage and nftables counters after the worker exits.
+as a child with empty capability sets and no_new_privs, on a read-only root with
+fresh empty scratch mounts over every directory that holds host UNIX sockets.
+This process reports resource usage and nftables counters after the worker exits.
 """
 import ctypes
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -17,6 +19,13 @@ IP = '/usr/bin/ip'
 NFT = '/usr/sbin/nft'
 MESSAGE = 65536
 PR_CAPBSET_DROP, PR_SET_NO_NEW_PRIVS, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 24, 38, 47, 4
+SYS_MOUNT_SETATTR, AT_FDCWD, AT_RECURSIVE, MOUNT_ATTR_RDONLY = 442, -100, 0x8000, 0x1
+MS_NOSUID, MS_NODEV, MS_NOEXEC = 2, 4, 8
+
+
+class MountAttr(ctypes.Structure):
+    _fields_ = [('attr_set', ctypes.c_uint64), ('attr_clr', ctypes.c_uint64),
+                ('propagation', ctypes.c_uint64), ('userns_fd', ctypes.c_uint64)]
 
 
 def run(*args, data=None):
@@ -28,10 +37,10 @@ def ip_json(*args):
     return json.loads(run(IP, '-j', *args))
 
 
-def configure(config):
-    for scope in ('all', 'default'):
-        with open(f'/proc/sys/net/ipv6/conf/{scope}/disable_ipv6', 'w') as sysctl:
-            sysctl.write('1')
+def configure_network(config):
+    for path in ('ipv6/conf/all/disable_ipv6', 'ipv6/conf/default/disable_ipv6', 'ipv4/ip_forward'):
+        with open(f'/proc/sys/net/{path}', 'w') as sysctl:
+            sysctl.write('0' if path.endswith('forward') else '1')
     worker, relay = config['worker_device'], config['relay_device']
     run(IP, 'link', 'set', 'lo', 'up')
     run(IP, 'link', 'add', worker, 'type', 'veth', 'peer', 'name', relay)
@@ -43,14 +52,46 @@ def configure(config):
         'nud', 'permanent')
     run(IP, 'route', 'add', 'default', 'via', config['gateway_address'], 'dev', worker)
     run(NFT, '-f', '-', data=config['ruleset'].encode())
+
+
+def lock_filesystem(hidden):
+    """Make every inherited mount read-only, then cover `hidden` with empty tmpfs."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    attr = MountAttr(MOUNT_ATTR_RDONLY, 0, 0, 0)
+    if libc.syscall(SYS_MOUNT_SETATTR, AT_FDCWD, b'/', AT_RECURSIVE, ctypes.byref(attr),
+                    ctypes.sizeof(attr)) != 0:
+        raise OSError(ctypes.get_errno(), 'mount_setattr')
+    for path in hidden:
+        if os.path.isdir(path) and not os.path.islink(path):
+            if libc.mount(b'tmpfs', path.encode(), b'tmpfs', MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                          b'mode=0755,size=1m') != 0:
+                raise OSError(ctypes.get_errno(), 'mount tmpfs')
+
+
+def filesystem_attestation(hidden, listeners):
+    covered = {}
+    for path in hidden:
+        if os.path.islink(path) or not os.path.lexists(path):
+            covered[path] = 'absent' if not os.path.lexists(path) else 'link'
+        else:
+            covered[path] = 'empty' if not os.listdir(path) else 'occupied'
+    return {'root_readonly': bool(os.statvfs('/').f_flag & os.ST_RDONLY), 'hidden': covered,
+            'reachable_listeners': sum(os.path.lexists(path) for path in listeners)}
+
+
+def configure(config):
+    configure_network(config)
     packet = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
-    packet.bind((relay, 0))
+    packet.bind((config['relay_device'], 0))
+    lock_filesystem(config['hidden_paths'])
     attestation = {
         'links': ip_json('link', 'show'),
         'addresses': ip_json('address', 'show'),
         'routes4': ip_json('-4', 'route', 'show', 'table', 'all'),
         'routes6': ip_json('-6', 'route', 'show', 'table', 'all'),
         'ruleset': json.loads(run(NFT, '-j', 'list', 'ruleset')),
+        'ip_forward': open('/proc/sys/net/ipv4/ip_forward').read().strip(),
+        'filesystem': filesystem_attestation(config['hidden_paths'], config['listeners']),
     }
     return packet, attestation
 
@@ -89,6 +130,9 @@ def sample(pid):
 
 
 def main():
+    # As namespace PID 1 this process receives only signals it handles; the worker
+    # must not be able to abort its own arm's evidence through SIGINT.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     if os.getpid() != 1 or len(sys.argv) < 3:
         raise SystemExit(125)
     control = socket.socket(fileno=int(sys.argv[1]))
@@ -109,6 +153,8 @@ def main():
     if child == 0:
         try:
             control.close()
+            for number in (signal.SIGINT, signal.SIGPIPE, signal.SIGXFSZ):
+                signal.signal(number, signal.SIG_DFL)
             drop_privileges()
             os.execv(sys.argv[2], sys.argv[2:])
         finally:
@@ -137,11 +183,12 @@ def main():
         counters = json.loads(run(NFT, '-j', 'list', 'ruleset'))
     except (OSError, subprocess.SubprocessError, ValueError):
         counters = None
+    sampled = (lambda value: value) if samples else (lambda value: None)
     control.send(json.dumps({
         'wait_status': status, 'elapsed_seconds': elapsed,
-        'rss_hwm_kib_sampled': peaks['hwm'], 'user_seconds': usage.ru_utime,
-        'system_seconds': usage.ru_stime, 'threads_peak_sampled': peaks['threads'],
-        'sockets_peak_sampled': peaks['sockets'], 'samples': samples, 'ruleset': counters,
+        'rss_hwm_kib_sampled': sampled(peaks['hwm']), 'user_seconds': usage.ru_utime,
+        'system_seconds': usage.ru_stime, 'threads_peak_sampled': sampled(peaks['threads']),
+        'sockets_peak_sampled': sampled(peaks['sockets']), 'samples': samples, 'ruleset': counters,
     }).encode())
     code = os.waitstatus_to_exitcode(status)
     raise SystemExit(code if code >= 0 else 128 - code)

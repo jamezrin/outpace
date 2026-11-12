@@ -4,7 +4,9 @@ from pathlib import Path
 import re
 import socket
 import struct
+import tempfile
 import unittest
+import live
 import live_block
 import live_policy
 import live_relay
@@ -26,18 +28,33 @@ class FakeOuter:
     def __init__(self):
         self.sent = []
         self.closed = False
+        self.inbox = []
 
     def sendto(self, payload, endpoint):
         self.sent.append((payload, endpoint))
+
+    def setsockopt(self, *option):
+        self.option = option
+
+    def recvmsg(self, *_):
+        if not self.inbox:
+            raise BlockingIOError
+        return self.inbox.pop(0)
 
 
 class FakePacket:
     def __init__(self):
         self.sent = []
         self.closed = False
+        self.drops = [3, 2]
 
     def send(self, frame):
         self.sent.append(frame)
+
+    def getsockopt(self, level, option, size):
+        if self.closed:
+            raise OSError
+        return struct.pack('=II', 10, self.drops.pop(0) if self.drops else 0)
 
     def close(self):
         self.closed = True
@@ -186,6 +203,26 @@ class RelayTests(unittest.TestCase):
         r.forward(outbound('11.0.0.2', 6881))
         self.assertEqual(r.report()['datagram_cap'], 1)
 
+    def test_open_failure_is_counted_and_not_mapped(self):
+        def refuse():
+            raise OSError('no egress')
+        r = Relay(FakePacket(), worker_mac=WORKER_MAC, gateway_mac=GATEWAY_MAC, open_outer=refuse)
+        r.forward(outbound('11.0.0.2', 6881))
+        report = r.report()
+        self.assertEqual((report['open_errors'], report['admitted_out'], report['mappings_opened']), (1, 0, 0))
+
+    def test_reports_kernel_drops_separately(self):
+        r, outers = relay()
+        r.forward(outbound('11.0.0.2', 6881))
+        self.assertEqual(outers[0].option, (socket.SOL_SOCKET, live_relay.SO_RXQ_OVFL, 1))
+        overflow = [(socket.SOL_SOCKET, live_relay.SO_RXQ_OVFL, struct.pack('=I', count)) for count in (4, 7)]
+        outers[0].inbox = [(b'a', overflow[:1], 0, ('11.0.0.2', 6881)), (b'b', overflow[1:], 0, ('11.0.0.2', 6881))]
+        r.handle(('outer', 40000))
+        self.assertEqual(r.report()['outer_socket_kernel_drops'], 7)
+        self.assertEqual(r.report()['packet_socket_kernel_drops'], 5)
+        r.close()
+        self.assertIsNone(r.report()['packet_socket_kernel_drops'])
+
     def test_close_releases_every_owned_socket(self):
         r, outers = relay()
         r.forward(outbound('11.0.0.2', 6881, sport=40000))
@@ -194,6 +231,22 @@ class RelayTests(unittest.TestCase):
         self.assertTrue(all(o.closed for o in outers))
         self.assertTrue(r.packet.closed)
         self.assertEqual(r.report()['mappings_opened'], 2)
+
+
+class ListenerInventoryTests(unittest.TestCase):
+    def test_collects_absolute_bound_paths_only(self):
+        rows = ['Num       RefCount Protocol Flags    Type St Inode Path',
+                '0: 00000002 00000000 00010000 0001 01 1 /run/systemd/private',
+                '0: 00000002 00000000 00010000 0001 01 2 private/anvil',
+                '0: 00000002 00000000 00010000 0001 01 3 @abstract',
+                '0: 00000002 00000000 00000000 0002 01 4 /run/a path with spaces',
+                '0: 00000002 00000000 00000000 0001 03 5',
+                '0: 00000002 00000000 00010000 0001 01 6 /run/systemd/private']
+        with tempfile.NamedTemporaryFile('w') as listing:
+            listing.write('\n'.join(rows) + '\n')
+            listing.flush()
+            self.assertEqual(live.bound_unix_paths(listing.name),
+                             ['/run/a path with spaces', '/run/systemd/private'])
 
 
 class ConsistencyTests(unittest.TestCase):

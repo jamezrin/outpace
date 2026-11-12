@@ -231,14 +231,16 @@ the fixed topology, policy and relay described in
 
 - The worker gets a veth with a default route, IPv6 disabled, and a default-deny
   nftables table.
-- It runs with empty capability sets and `no_new_privs`.
+- It runs with empty capability sets and `no_new_privs`, on a read-only root,
+  with empty tmpfs over every directory holding host UNIX sockets.
+- The namespace dies with the supervisor through a parent-death SIGKILL.
 - The supervisor relay forwards only IPv4 UDP to global unicast destinations,
   from sockets bound to the declared egress device.
 - Replies are admitted only from endpoints that the same inner socket contacted.
 
 UDP to a denied prefix is counted by nftables and dropped silently by the relay.
 A synchronous `EPERM` would penalize a library for the harness rather than model
-network loss. The two counts must agree. Every non-UDP, IPv6 or unsolicited packet
+network loss. The block reports whether the two counts agree. Every non-UDP, IPv6 or unsolicited packet
 is dropped inside the namespace. Unprivileged nested namespaces, veth, `AF_PACKET`
 and `SO_BINDTODEVICE` are required. No TUN device and no host firewall or routing
 change is needed.
@@ -254,8 +256,10 @@ contacted and unanswered endpoints, and inner nftables counters. These are
 measured at the boundary. They are not library-internal query or timeout
 diagnostics, and unavailable library counters stay null. The bootstrap also
 reports `wait4` CPU time and sampled peak threads, sockets and `VmHWM`. A sampled
-peak is a lower bound; `ru_maxrss` is not used because it keeps the forked
-bootstrap's pre-`exec` peak.
+peak is a lower bound and is null when nothing was sampled; `ru_maxrss` is not used
+because it keeps the forked bootstrap's pre-`exec` peak. Admitted datagrams are
+successful local sends, not delivery. Kernel receive-queue drops on the relay
+sockets are reported separately.
 
 ### Offline live-boundary qualification
 
@@ -274,8 +278,8 @@ The 12 fixed cases run inside one outer namespace whose only egress is a dummy
 device with synthetic addresses, under a 240-second deadline:
 
 - A probe covers two threads and sockets, eight denied destination classes,
-  stranger and wrong-port inbound packets, TCP, IPv6, raw sockets, and policy
-  and link mutation.
+  stranger and wrong-port inbound packets, TCP, IPv6, raw sockets, policy and
+  link mutation, a supervisor-owned UNIX socket and a write to the read-only root.
 - All three candidates are run through their real binary entries against synthetic
   values, and against advertised private nodes. Each candidate must try and fail to
   reach the private nodes, with matching relay and nftables counts.
@@ -297,7 +301,8 @@ reads the registry. It runs these steps:
 2. Resolve the target once through the local daemon's loopback `analyze_content`
    method. Encrypted or unknown protection is refused.
 3. Resolve the production bootstrap hostnames once, into at most four global seeds.
-4. Run custom, mainline and n0 within one 120-second deadline, without retries.
+4. Run custom, mainline and n0 within one 135-second deadline, without retries.
+   No arm starts unless all three still fit.
 5. Re-check the digests and write a private numeric report with mode-0600 captures.
 
 The report omits the target, content id and endpoints. Gateway and VPN exit

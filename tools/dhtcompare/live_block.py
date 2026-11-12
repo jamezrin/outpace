@@ -5,8 +5,11 @@ program never reads any registry. The content id is resolved once to an infohash
 through the local daemon's loopback `analyze_content` method; neither value nor
 any endpoint is written. Bootstrap hostnames are resolved once, and the same
 numeric seeds go to every arm. Workers run through the live boundary (live.py) in
-the fixed order custom, mainline, n0, inside one 120-second deadline, without
-retries. Gateway/VPN exit provenance is the operator's separate responsibility.
+the fixed order custom, mainline, n0, inside one 135-second deadline, without
+retries. No arm starts unless all three arms and the postflight still fit, so a
+block never spends its observation on an unmatched subset. SIGTERM ends the block
+as inconclusive after owned cleanup. Gateway/VPN exit provenance is the
+operator's separate responsibility.
 
 Exit 0: all three arms produced valid records with confirmed cleanup.
 Exit 1: an arm failed with confirmed cleanup. Exit 2: inconclusive.
@@ -16,6 +19,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -28,9 +32,10 @@ import live_policy
 from live_relay import egress_socket
 from qualification import Artifact
 
-BLOCK_SECONDS = 120
+BLOCK_SECONDS = 135
 ARM_RESERVE = 30
-POSTFLIGHT_RESERVE = 5
+POSTFLIGHT_RESERVE = 7
+DNS_SECONDS = 10
 ORDER = ('custom', 'mainline', 'n0')
 # Mirrors ace-swarm's production DHT bootstrap list; a test keeps them identical.
 BOOTSTRAP = ('router.bittorrent.com:6881', 'router.utorrent.com:6881',
@@ -40,6 +45,15 @@ HTTP_CAP = 65536
 
 class Inconclusive(Exception):
     pass
+
+
+class Terminated(BaseException):
+    pass
+
+
+def _terminate(*_):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise Terminated
 
 
 def _digest(value):
@@ -113,8 +127,9 @@ def resolve_seeds(hosts, deadline):
     threads = [threading.Thread(target=lookup, args=(h,), daemon=True) for h in hosts]
     for thread in threads:
         thread.start()
+    joined = min(deadline, time.monotonic() + DNS_SECONDS)
     for thread in threads:
-        thread.join(max(0, min(deadline, time.monotonic() + 10) - time.monotonic()))
+        thread.join(max(0, joined - time.monotonic()))
     seeds = []
     for entry in hosts:
         seed = found.get(entry)
@@ -134,6 +149,19 @@ def _process(result):
     return {key: getattr(result, key) for key in
             ('exit_code', 'timed_out', 'cleanup_complete', 'truncated', 'attested', 'denial',
              'stdout_bytes', 'stderr_bytes')}
+
+
+def _consistency(boundary, inner):
+    """Relay and nftables observe the same worker UDP; disagreement invalidates the arm."""
+    if boundary is None or inner is None or inner.get('policy_counters') is None:
+        return None
+    policy = inner['policy_counters']
+    udp_frames = boundary['frames_in'] - sum(boundary[key] for key in
+                                             ('non_ipv4', 'malformed', 'fragments', 'non_udp'))
+    return {'denials_agree': boundary['denied_destination'] == policy['out_udp_denied'],
+            'udp_frames_agree': udp_frames == policy['out_udp'] + policy['out_udp_denied'],
+            'kernel_drops': boundary['packet_socket_kernel_drops'] != 0
+            or boundary['outer_socket_kernel_drops'] != 0}
 
 
 def run_block(artifacts, *, content_id, egress_device, output, resolver_port=6878,
@@ -163,6 +191,8 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
         report['seed_count'] = len(seeds)
         if not seeds:
             raise Inconclusive('no_bootstrap_seed')
+        if deadline - time.monotonic() < len(ORDER) * ARM_RESERVE + POSTFLIGHT_RESERVE:
+            raise Inconclusive('admission_deadline')
         failed = False
         for role in ORDER:
             if deadline - time.monotonic() < ARM_RESERVE + POSTFLIGHT_RESERVE:
@@ -179,10 +209,14 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
             except live.LiveWorkerError as error:
                 result, arm['status'], arm['error'] = error.result, 'failed', str(error)
                 failed = True
+                if result is None:
+                    raise Inconclusive(f'prelaunch_{error}') from None
             if result is not None:
                 arm['process'] = _process(result)
+                arm['record_line_seen'] = b'"schema_version"' in result.stdout
                 arm['boundary'] = result.boundary
                 arm['inner'] = result.inner
+                arm['consistency'] = _consistency(result.boundary, result.inner)
                 _write_private(output, f'{role}.stdout.private', result.stdout)
                 _write_private(output, f'{role}.stderr.private', result.stderr)
             if result is None or not result.cleanup_complete:
@@ -194,6 +228,8 @@ def run_block(artifacts, *, content_id, egress_device, output, resolver_port=687
         report['verdict'] = 'failed' if failed else 'complete'
     except Inconclusive as reason:
         report['reason'] = str(reason)
+    except Terminated:
+        report['reason'] = 'terminated'
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report['reason'] = type(error).__name__
     report['block_elapsed_seconds'] = time.monotonic() - start
@@ -218,6 +254,7 @@ def main(argv=None):
     if content_id is None:
         print('dht live block: invalid stdin payload', file=sys.stderr)
         return 2
+    signal.signal(signal.SIGTERM, _terminate)
     artifacts = {'custom': Artifact(args.custom, args.custom_sha256),
                  'upstream': Artifact(args.upstream, args.upstream_sha256)}
     report = run_block(artifacts, content_id=content_id, egress_device=args.egress_device,

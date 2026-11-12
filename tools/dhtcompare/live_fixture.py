@@ -166,18 +166,33 @@ def summary(result):
 
 def probe_case():
     servers = Servers('echo')
-    try:
-        result = live.run_live(['/usr/bin/python3', '-I', str(Path(__file__).with_name('live_probe.py'))],
-                               timeout=20, env={'LC_ALL': 'C'},
-                               open_outer=lambda: egress_socket(EGRESS))
-    finally:
-        alive = servers.close()
+    with tempfile.TemporaryDirectory(dir='/tmp') as sockets, \
+            tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as writable, \
+            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(f'{sockets}/probe.sock')
+        listener.listen(4)
+        listener.setblocking(False)
+        target = f'{writable}/leak'
+        try:
+            result = live.run_live(['/usr/bin/python3', '-I', str(Path(__file__).with_name('live_probe.py')),
+                                    f'{sockets}/probe.sock', target],
+                                   timeout=20, env={'LC_ALL': 'C'},
+                                   open_outer=lambda: egress_socket(EGRESS))
+        finally:
+            alive = servers.close()
+        try:
+            listener.accept()[0].close()
+            unix_accepted = 1
+        except BlockingIOError:
+            unix_accepted = 0
+        file_created = os.path.lexists(target)
     probe = None
     try:
         probe = json.loads(result.stdout)
     except ValueError:
         pass
-    return dict(summary(result), probe=probe, leaks=servers.leaks, servers_alive=alive)
+    return dict(summary(result), probe=probe, leaks=servers.leaks, servers_alive=alive,
+                unix_accepted=unix_accepted, file_created=file_created)
 
 
 def candidate_case(role, artifact, mode):
@@ -279,6 +294,9 @@ def evaluate(results):
                           [a for a in probe['private'] if not a.startswith('127.')])
                       and probe['tcp'] != 'sent' and probe['ipv6'] != 'sent' and probe['raw'] == 'EPERM'
                       and probe['nft_flush'] != 0 and probe['link_down'] != 0
+                      and probe['unix_connect'] == 'ENOENT' and probe['file_write'] == 'EROFS'
+                      and probe['run_listing'] == [] and case['unix_accepted'] == 0
+                      and case['file_created'] is False
                       and probe['status'] == dict(ZERO_CAPS, NoNewPrivs='1'))
             elif name.startswith(('values:', 'private_nodes:')):
                 record = case['record']
@@ -296,6 +314,8 @@ def evaluate(results):
             elif name == 'block':
                 report = case['report']
                 ok = (report['verdict'] == 'complete' and case['leaks'] == 0
+                      and all(a['consistency'] == {'denials_agree': True, 'udp_frames_agree': True,
+                                                   'kernel_drops': False} for a in report['arms'])
                       and not case['report_has_target'] and not case['report_has_seed']
                       and [a['role'] for a in report['arms']] == ['custom', 'mainline', 'n0']
                       and all(a['record']['terminal'] == 'target' for a in report['arms'])

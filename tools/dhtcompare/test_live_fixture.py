@@ -21,7 +21,9 @@ def passing():
     probe = owned(probe={'thread_a': 'pong:ping-a', 'thread_b': 'pong:ping-b',
                          'unsolicited': 'pong:unsolicited', 'unsolicited_extra': [],
                          'private': private, 'tcp': 'timeout', 'ipv6': 'EADDRNOTAVAIL',
-                         'raw': 'EPERM', 'nft_flush': 1, 'link_down': 2, 'status': caps})
+                         'raw': 'EPERM', 'nft_flush': 1, 'link_down': 2, 'status': caps,
+                         'unix_connect': 'ENOENT', 'file_write': 'EROFS', 'run_listing': []},
+                  unix_accepted=0, file_created=False)
     probe['boundary'] = {'denied_destination': 5, 'unsolicited_in': 2, 'admitted_out': 3}
     probe['inner']['policy_counters']['out_udp_denied'] = 5
     results = {'probe': probe}
@@ -34,7 +36,8 @@ def passing():
         results[f'private_nodes:{role}'] = private_nodes
         results[f'unconfined:{role}'] = {'exit_code': 101 if role == 'custom' else 65,
                                          'record_line': False, 'stdout_bytes': 0}
-    arms = [{'role': r, 'record': record} for r in ('custom', 'mainline', 'n0')]
+    consistent = {'denials_agree': True, 'udp_frames_agree': True, 'kernel_drops': False}
+    arms = [{'role': r, 'record': record, 'consistency': consistent} for r in ('custom', 'mainline', 'n0')]
     results['block'] = {'report': {'verdict': 'complete', 'arms': arms, 'preflight': {},
                                    'postflight': {}},
                         'leaks': 0, 'report_has_target': False, 'report_has_seed': False}
@@ -57,7 +60,12 @@ class EvaluateTests(unittest.TestCase):
                       lambda c: c['probe'].update(tcp='sent'),
                       lambda c: c['probe'].update(nft_flush=0),
                       lambda c: c.update(cleanup_complete=False),
-                      lambda c: c.update(inner=None)],
+                      lambda c: c.update(inner=None),
+                      lambda c: c['probe'].update(unix_connect='sent'),
+                      lambda c: c['probe'].update(file_write='EACCES'),
+                      lambda c: c['probe'].update(run_listing=['systemd']),
+                      lambda c: c.update(unix_accepted=1),
+                      lambda c: c.update(file_created=True)],
             'values:mainline': [lambda c: c['record'].update(terminal='deadline'),
                                 lambda c: c['boundary'].update(denied_destination=1)],
             'private_nodes:n0': [lambda c: c['boundary'].update(denied_destination=0),
@@ -69,7 +77,11 @@ class EvaluateTests(unittest.TestCase):
                       lambda c: c.update(report_has_target=True),
                       lambda c: c.update(report_has_seed=True),
                       lambda c: c['report']['arms'].reverse(),
-                      lambda c: c['report'].update(postflight={'drift': 1})],
+                      lambda c: c['report'].update(postflight={'drift': 1}),
+                      lambda c: c['report']['arms'][1].update(
+                          consistency={'denials_agree': True, 'udp_frames_agree': False, 'kernel_drops': False}),
+                      lambda c: c['report']['arms'][2].update(
+                          consistency={'denials_agree': True, 'udp_frames_agree': True, 'kernel_drops': True})],
             'block_encrypted': [lambda c: c['report'].update(arms=[{}]),
                                 lambda c: c.update(files=['report.json', 'custom.stdout.private'])],
         }

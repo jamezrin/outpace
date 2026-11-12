@@ -3,12 +3,14 @@
 Runs every live_fixture case inside one owned outer user/network/PID namespace whose
 only egress is a dummy device with synthetic addresses, under a 240-second hard
 deadline. Pins detect stale operator-built binaries, not hostile concurrent edits.
+The outer namespace receives SIGKILL if this process dies; SIGTERM kills it first.
 Exit 0 only when every fixed predicate passes and the outer namespace was reaped.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import live_fixture
@@ -24,11 +26,11 @@ def qualify_live(custom, upstream, *, output):
     config = json.dumps({'cases': list(live_fixture.CASES),
                          'custom': str(custom.path), 'custom_sha256': custom.sha256,
                          'upstream': str(upstream.path), 'upstream_sha256': upstream.sha256})
-    command = ['/usr/bin/unshare', '--user', '--map-root-user', '--net', '--pid', '--fork',
+    command = ['/usr/bin/setpriv', '--pdeathsig', 'KILL', '--', '/usr/bin/unshare', '--user', '--map-root-user', '--net', '--pid', '--fork',
                '--kill-child=KILL', '--mount-proc', sys.executable, '-I',
                str(Path(live_fixture.__file__).resolve()), config]
     try:
-        completed = subprocess.run(command, capture_output=True, timeout=DEADLINE,
+        completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=DEADLINE,
                                    env={'LC_ALL': 'C', 'PATH': '/usr/bin:/usr/sbin'})
         exit_code, stdout, stderr, timed_out = completed.returncode, completed.stdout, completed.stderr, False
     except subprocess.TimeoutExpired as expired:
@@ -59,6 +61,7 @@ def main(argv=None):
     parser.add_argument('--upstream-sha256', required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     report = qualify_live(Artifact(args.custom, args.custom_sha256),
                           Artifact(args.upstream, args.upstream_sha256), output=args.output)
     print(json.dumps({k: report[k] for k in ('passed', 'failed_cases', 'cases')}))
