@@ -48,8 +48,10 @@ sha2 = "0.11"
 # link against static 32-bit musl. The default `background_threads_runtime_support` feature lets
 # main.rs's exported `malloc_conf` turn the purge thread on where it is supported; do not force the
 # `background_threads` feature, which compiles `background_thread:true` in on every target and makes
-# Apple builds print a startup warning. `tikv-jemalloc-ctl` powers `/debug/memstats`.
-[target.'cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))'.dependencies]
+# Apple builds print a startup warning. `tikv-jemalloc-ctl` powers `/debug/memstats`. Android keeps
+# Bionic's allocator (Scudo, or jemalloc on older releases), which already returns freed pages, and
+# tikv-jemalloc-sys links libgcc there, which current NDKs no longer ship.
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "android"), target_pointer_width = "64"))'.dependencies]
 tikv-jemallocator = "0.7"
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 
