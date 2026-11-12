@@ -43,6 +43,7 @@ outpace broadcast sports --public-host stream.example
 | Route | Success response | Operational notes |
 | --- | --- | --- |
 | `GET /healthz` | `200 text/plain` (`ok`) | Process health probe; it does not prove swarm connectivity. |
+| `GET /metrics` | `200 text/plain; version=0.0.4` | Prometheus exposition. Only with `OUTPACE_METRICS=1`; otherwise `404`. Labels carry provider network names and route templates, never stream ids. See the [metric list](wiki/Support-Sources-and-Operations.md#prometheus-metrics). |
 | `GET /networks` | `200 application/json`, `{"networks":["ace"]}` | Provider networks configured in this daemon. |
 | `GET /streams` | `200 application/json`, `{"streams":[...]}` | Active shared sessions. Entries have `network`, `id`, direct-client count `clients`, and descriptor `metadata`. |
 | `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. An `ih:` selector without a verified descriptor returns `422` with a plain-text reason. Malformed `cid:`/`ih:` selectors return `400`. |

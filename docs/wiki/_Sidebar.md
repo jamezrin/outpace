@@ -12,7 +12,7 @@
 **Watching**
 
 - [Playing Streams](Playing-Streams)
-- [Stream Search (planned)](Stream-Search)
+- [Stream Search](Stream-Search)
 - [HLS Output](HLS-Output)
 - [Timeshift](Timeshift)
 - [Managed HLS Origins](Managed-HLS-Origins)

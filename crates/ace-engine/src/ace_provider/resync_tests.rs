@@ -858,6 +858,7 @@ async fn run_http_reconnect_case(
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     });

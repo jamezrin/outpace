@@ -16,6 +16,7 @@
 pub use ace_log::alog;
 
 pub mod ace_provider;
+pub mod acestream_search;
 mod admission;
 pub mod audio_normalize;
 pub mod broadcast;
@@ -39,6 +40,7 @@ mod live_stats;
 pub mod local_descriptors;
 pub mod magnet;
 pub mod manager;
+pub mod metrics;
 pub mod origin_hls;
 pub mod private_network;
 pub mod provider;
