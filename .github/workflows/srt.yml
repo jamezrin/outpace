@@ -1,0 +1,65 @@
+name: Optional SRT
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  srt:
+    name: SRT synthetic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The distro SDK predates the required security fixes. Build the reference
+      # release in a job-local prefix; never replace a host or FFmpeg library.
+      - name: Checkout reference SDK 1.5.7
+        uses: actions/checkout@v7
+        with:
+          repository: Haivision/srt
+          ref: 899348d8318eb9a3c5a5b6ec43c4a1114288773a
+          path: .native/srt
+          persist-credentials: false
+      - name: Build encrypted reference SDK
+        run: |
+          pkg-config --exists openssl
+          cmake -S .native/srt -B "$RUNNER_TEMP/srt-build" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/srt-sdk" \
+            -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_ENCRYPTION=ON \
+            -DENABLE_SHARED=ON -DENABLE_STATIC=OFF -DENABLE_APPS=OFF \
+            -DENABLE_TESTING=OFF -DENABLE_UNITTESTS=OFF
+          cmake --build "$RUNNER_TEMP/srt-build" --parallel 2
+          cmake --install "$RUNNER_TEMP/srt-build"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/srt-sdk/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/srt-sdk/lib" >> "$GITHUB_ENV"
+      - name: Install generated media tools
+        timeout-minutes: 7
+        run: python3 tools/ci/install_media_tools.py
+      - name: Native accept error classification
+        run: |
+          cc -Wall -Wextra -Werror $(pkg-config --cflags srt) crates/ace-engine/native/tests/accept.c $(pkg-config --libs srt) -o "$RUNNER_TEMP/srt-accept-test"
+          "$RUNNER_TEMP/srt-accept-test"
+      - name: Enabled workspace tests and lint
+        run: |
+          pkg-config --atleast-version=1.5.7 srt
+          cargo test --workspace --features ace-engine/srt --locked
+          cargo clippy --workspace --all-targets --features ace-engine/srt --locked -- -D warnings
+      - name: Generated publisher encryption, pressure, playback and continuity
+        env:
+          OUTPACE_TEST_SRT_FFMPEG: "1"
+        run: |
+          cargo test -p ace-engine --lib --features srt --locked srt:: -- --ignored --skip fixed_one_or_four_stream_resource_profile --test-threads=1

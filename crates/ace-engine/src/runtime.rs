@@ -50,6 +50,9 @@ pub struct EngineRuntime {
     announce_port_tx: tokio::sync::watch::Sender<Option<u16>>,
     identity: Arc<ace_wire::identity::Identity>,
     source_configs: BTreeMap<String, ValidatedSourceConfig>,
+
+    srt_config: Option<crate::srt::config::PreparedConfig>,
+
     background: RuntimeTasks,
 }
 
@@ -123,6 +126,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         ),
         ..defaults
     };
+    config.srt = crate::srt::config::SrtConfig::from_lookup(|name| std::env::var_os(name))?;
     config.support_sources = match std::env::var("OUTPACE_SUPPORT_SOURCES") {
         Ok(raw) => crate::support_config::SupportSources::parse(Some(&raw))?,
         Err(std::env::VarError::NotPresent) => Default::default(),
@@ -705,6 +709,7 @@ pub async fn build_runtime(
     mut config: Config,
     bootstrap_peers: Vec<SocketAddrV4>,
 ) -> Result<EngineRuntime, Box<dyn std::error::Error>> {
+    let srt_config = config.srt.prepare(cfg!(feature = "srt"))?;
     config.support_sources.validate(&config)?;
     crate::private_network::validate_private_config(&config, &bootstrap_peers)?;
     // Validate the complete ordered map before normalizer, filesystem, identity, or
@@ -889,6 +894,9 @@ pub async fn build_runtime(
         announce_port_tx,
         identity,
         source_configs,
+
+        srt_config,
+
         background,
     })
 }
@@ -909,8 +917,22 @@ pub(crate) async fn serve_http_until(
     // of this future stops the listener, its connections and maintenance.
     let mut background = std::mem::take(&mut runtime.background);
     let mut support = None;
-    let result = serve_http_inner(runtime, shutdown, &mut support, &mut background).await;
+
+    let mut srt = None;
+    let result = serve_http_inner(runtime, shutdown, &mut support, &mut srt, &mut background).await;
+    // Retain this owner outside startup/HTTP serving: every returned error joins
+    // native cleanup before registry deletion can release a producer authority.
+    let srt_cleanup = if let Some(service) = &mut srt {
+        service.shutdown().await
+    } else {
+        Ok(())
+    };
+    let result = match (result, srt_cleanup) {
+        (Ok(()), Err(error)) => Err(Box::new(error) as Box<dyn std::error::Error>),
+        (result, _) => result,
+    };
     background.shutdown().await;
+
     // Retain the service outside the serving future so every returned startup/HTTP
     // error still joins support before the shared manager is shut down.
     let support_cleanup = if let Some(service) = support {
@@ -945,10 +967,31 @@ pub(crate) async fn serve_http_until(
     }
 }
 
+async fn supervised_srt_shutdown(
+    shutdown: impl std::future::Future<Output = ()>,
+    completed: Option<tokio::sync::watch::Receiver<bool>>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::select! { biased;
+        () = shutdown => {},
+        () = async move {
+            let Some(mut completed) = completed else {
+                return std::future::pending::<()>().await;
+            };
+            while !*completed.borrow_and_update() {
+                if completed.changed().await.is_err() { break; }
+            }
+        } => { failed.store(true, std::sync::atomic::Ordering::Release); },
+    }
+}
+
 async fn serve_http_inner(
     runtime: EngineRuntime,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     support_owner: &mut Option<Arc<crate::support::SupportService>>,
+
+    srt_owner: &mut Option<crate::srt::SrtService>,
+
     background: &mut RuntimeTasks,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let EngineRuntime {
@@ -961,9 +1004,12 @@ async fn serve_http_inner(
         announce_port_tx,
         identity,
         source_configs,
+
+        srt_config,
+
         background: _,
     } = runtime;
-    let mut shutdown = Box::pin(shutdown);
+    let shutdown = Box::pin(shutdown);
 
     // Startup banner: plain `eprintln!` on purpose. These lines are read live by whoever
     // just ran the daemon, so they intentionally skip the `alog!` timestamp/`[tag]` prefix.
@@ -1074,6 +1120,24 @@ async fn serve_http_inner(
     // Bind HTTP before starting broadcast-owned network work. RTMP keeps its existing
     // dependency listener/bind behavior; its owned handle is stopped on every exit path.
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    *srt_owner = if srt_config.is_some() {
+        crate::srt::SrtService::start(srt_config, broadcasts.clone()).await?
+    } else {
+        None
+    };
+    let srt_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completed = srt_owner
+        .as_ref()
+        .and_then(|service| service.completion_receiver());
+    let mut shutdown = Box::pin(supervised_srt_shutdown(
+        shutdown,
+        completed,
+        srt_failed.clone(),
+    ));
+    let cancel_srt = srt_owner.as_ref().map(|service| service.stop_signal());
+    if let Some(address) = srt_owner.as_ref().and_then(|service| service.local_addr()) {
+        eprintln!("outpace: encrypted SRT ingest listening on {address}");
+    }
     let mut rtmp = if config.support_sources.is_empty() {
         OwnedRtmpListener::start(rtmp_bind, broadcasts.clone())
     } else {
@@ -1150,6 +1214,9 @@ async fn serve_http_inner(
                 }
                 // Close/cancel before HTTP graceful drain can wait on a live request body.
                 draining_broadcasts.close_admissions();
+                if let Some(cancel) = cancel_srt {
+                    cancel.cancel();
+                }
                 cancel_rtmp.send_replace(true);
                 cancel_background.send_replace(true);
                 if let Some(service) = draining_support {
@@ -1173,6 +1240,9 @@ async fn serve_http_inner(
     .await;
     broadcasts.close_admissions();
     rtmp.stop(broadcasts.registry.cleanup_deadline()).await;
+    if srt_failed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(std::io::Error::other("srt_listener_exited_unexpectedly").into());
+    }
     result
 }
 
@@ -2639,6 +2709,10 @@ mod support_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "runtime/support_topology_tests.rs"]
 mod support_topology_tests;
+
+#[cfg(test)]
+mod tests_srt;
+
 #[cfg(test)]
 #[path = "runtime/tests_shutdown_drain.rs"]
 mod tests_shutdown_drain;
