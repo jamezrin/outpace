@@ -30,7 +30,7 @@ def prepare(tag: str, assets: Path, output: Path) -> None:
         raise ValueError("Release must contain a regular SHA256SUMS file")
     checksums = {}
     for line in sums.read_text().splitlines():
-        match = re.fullmatch(r"([0-9a-f]{64})  (outpace-[^/\\\s]+)", line)
+        match = re.fullmatch(r"([0-9a-f]{64})  (outpace[-_][^/\\\s]+)", line)
         if not match or match[2] in checksums:
             raise ValueError("Invalid or duplicate checksum entry")
         checksums[match[2]] = match[1]

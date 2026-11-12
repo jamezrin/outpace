@@ -51,6 +51,39 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal.
 
+### Debian, Ubuntu and Fedora packages
+
+From the next release, each release also has `.deb` and `.rpm` packages for x86_64, ARM64 and
+ARMv7. They contain the same static binary, plus a systemd unit and a configuration file, and
+they are listed in `SHA256SUMS`.
+
+| Architecture | `.deb` | `.rpm` |
+| --- | --- | --- |
+| x86_64 | `outpace_<version>_amd64.deb` | `outpace_<version>_x86_64.rpm` |
+| ARM64 | `outpace_<version>_arm64.deb` | `outpace_<version>_aarch64.rpm` |
+| ARMv7 hard-float | `outpace_<version>_armhf.deb` | `outpace_<version>_armv7hl.rpm` |
+
+```bash
+sudo apt install ./outpace_<version>_amd64.deb      # Debian, Ubuntu
+sudo dnf install ./outpace_<version>_x86_64.rpm     # Fedora, RHEL and derivatives
+sudoedit /etc/outpace/outpace.env                   # optional: change settings
+sudo systemctl enable --now outpace
+```
+
+What the package does:
+
+- installs `/usr/bin/outpace`, `/usr/lib/systemd/system/outpace.service` and
+  `/etc/outpace/outpace.env`;
+- creates a system user and group `outpace`;
+- does **not** enable or start the service. On upgrade, a running service is restarted on the
+  new binary;
+- on removal, stops and disables the service. It keeps the `outpace` user, your edited
+  `outpace.env` and `/var/lib/outpace` (your node identity and broadcast keys). Delete them by hand
+  to purge.
+
+The service runs with the hardening described in [Deployment](Deployment#systemd). Data lives in
+`/var/lib/outpace`.
+
 ### FreeBSD and other BSDs
 
 From the next release there is a FreeBSD x86_64 binary. It uses the same archive layout, so
@@ -75,6 +108,8 @@ With the [GitHub CLI](https://cli.github.com):
 ```bash
 gh attestation verify "$artifact" --repo jamezrin/outpace-stream
 ```
+
+The `.deb` and `.rpm` packages are attested the same way.
 
 The same works for release images, including the `-minimal` ones, by tag or digest:
 

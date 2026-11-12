@@ -78,7 +78,7 @@ jobs:
           set -euo pipefail
           mkdir release-assets
           gh release download "$RELEASE_TAG" --dir release-assets \
-            --pattern 'outpace-*' --pattern SHA256SUMS
+            --pattern 'outpace-*' --pattern 'outpace_*' --pattern SHA256SUMS
           python3 tools/release/prepare_container.py "$RELEASE_TAG" release-assets container-context
           cp Dockerfile.release container-context/Dockerfile
           cp LICENSE container-context/LICENSE
