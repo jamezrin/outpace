@@ -188,6 +188,40 @@ Technical reference:
 - **Releases:** [GitHub Releases](https://github.com/jamezrin/outpace-stream/releases),
   [release notes](docs/releases/) and [milestones](https://github.com/jamezrin/outpace-stream/milestones).
 
+## Contributing
+
+Outpace is a community project, and you're welcome to take part, whether you're fixing a typo,
+reporting a stream that won't play, testing it with your player or app, or digging into the
+protocol. Every kind of contribution counts:
+
+- **Bug reports and feature ideas.** Open an [issue](https://github.com/jamezrin/outpace-stream/issues).
+  Include what you ran, what you expected and what happened.
+- **Questions and discussion.** Ask in an issue for now; GitHub Discussions is planned
+  ([#399](https://github.com/jamezrin/outpace-stream/issues/399)). Disagreement is healthy, so
+  challenge a design or a decision when you think it's wrong, and explain why.
+- **Docs and guides.** The wiki lives in [`docs/wiki/`](docs/wiki). If something confused you,
+  improving the page helps the next person.
+- **Code.** Look for [good first issues](https://github.com/jamezrin/outpace-stream/labels/good%20first%20issue),
+  or open an issue first for larger changes, so we can agree on the approach before you invest
+  the time.
+
+Be kind and assume good faith. Newcomers' questions are welcome, and nobody needs to be an
+expert in Rust or peer-to-peer streaming to help.
+
+To build and check your changes:
+
+```bash
+cargo build --release --locked -p ace-engine --bin outpace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+The pinned toolchain is in `rust-toolchain.toml`. Tests are offline; live-swarm tests are
+`#[ignore]`d. Read [development](docs/development.md) and [AGENTS.md](AGENTS.md) before you
+open a PR, and keep PRs focused on one change. Never commit real content ids, infohashes or
+stream names, including in issues and logs; the identifier-hygiene check enforces this for code.
+
 ## AI
 
 Outpace has one maintainer and is built largely with AI coding agents, which follow the
@@ -217,20 +251,6 @@ uses apply to yours. Two things are required:
   the change does and why, and be able to discuss it in review.
 
 Unreviewed, fully automated submissions will be closed.
-
-## Build and contribute
-
-```bash
-cargo build --release --locked -p ace-engine --bin outpace
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-```
-
-The pinned toolchain is in `rust-toolchain.toml`. Tests are offline; live-swarm tests are
-`#[ignore]`d. Read [development](docs/development.md) and [AGENTS.md](AGENTS.md) before you
-open a PR. Never commit real content ids, infohashes or stream names; the identifier-hygiene
-check enforces this.
 
 ## Project activity
 
