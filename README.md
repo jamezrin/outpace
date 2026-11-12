@@ -1,8 +1,17 @@
-# outpace
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
+    <img alt="outpace: public AceStream swarms in, MPEG-TS and HLS out" src="docs/assets/hero-light.svg" width="100%">
+  </picture>
+</p>
 
-[![CI](https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/jamezrin/outpace-stream?sort=semver)](https://github.com/jamezrin/outpace-stream/releases/latest)
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
+<p align="center">
+  <a href="https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jamezrin/outpace-stream?sort=semver"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/jamezrin/outpace-stream/total"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/jamezrin/outpace-stream?style=flat"></a>
+  <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue"></a>
+</p>
 
 **An open-source, AceStream-compatible engine written in Rust.** outpace joins public,
 unencrypted AceStream swarms and serves the media to your player as MPEG-TS or HLS. It runs on
@@ -108,6 +117,28 @@ The pinned toolchain is in `rust-toolchain.toml`. Tests are offline; live-swarm 
 `#[ignore]`d. Read [development](docs/development.md) and [AGENTS.md](AGENTS.md) before you
 open a PR. Never commit real content ids, infohashes or stream names; the identifier-hygiene
 check enforces this.
+
+## Project activity
+
+<p>
+  <a href="https://github.com/jamezrin/outpace-stream/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/jamezrin/outpace-stream?style=flat"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/forks"><img alt="Forks" src="https://img.shields.io/github/forks/jamezrin/outpace-stream?style=flat"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/watchers"><img alt="Watchers" src="https://img.shields.io/github/watchers/jamezrin/outpace-stream?style=flat"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/jamezrin/outpace-stream"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/issues"><img alt="Open issues" src="https://img.shields.io/github/issues/jamezrin/outpace-stream"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/pulls"><img alt="Open pull requests" src="https://img.shields.io/github/issues-pr/jamezrin/outpace-stream"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/jamezrin/outpace-stream/main"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/pulse"><img alt="Commit activity" src="https://img.shields.io/github/commit-activity/m/jamezrin/outpace-stream"></a>
+  <a href="https://github.com/jamezrin/outpace-stream/releases"><img alt="Release downloads" src="https://img.shields.io/github/downloads/jamezrin/outpace-stream/total"></a>
+  <a href="https://github.com/jamezrin/outpace-stream"><img alt="Top language" src="https://img.shields.io/github/languages/top/jamezrin/outpace-stream"></a>
+</p>
+
+<a href="https://star-history.com/#jamezrin/outpace-stream&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jamezrin/outpace-stream&type=Date&theme=dark">
+    <img alt="Star history" src="https://api.star-history.com/svg?repos=jamezrin/outpace-stream&type=Date" width="600">
+  </picture>
+</a>
 
 ## License
 
