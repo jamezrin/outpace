@@ -96,7 +96,7 @@ ISP is doing carrier-grade NAT, and no forward on your router can make you reach
 warns when it notices:
 
 ```text
-[reachability] WARNING: observed public IP ... differs from the mapped external IP ... — likely double-NAT / CGNAT
+[reachability] WARNING: observed public IP ... differs from the mapped external IP ...
 ```
 
 Your options:

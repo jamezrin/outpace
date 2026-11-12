@@ -67,7 +67,7 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_REQUEST_TIMEOUT_MS` - per-piece request timeout before re-requesting or skipping an
   evicted gap, default `1500`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`. A live
   player drains in realtime, so raising this leaves a stuck piece to be healed by the much slower
-  `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` pool teardown instead — a visible playback gap.
+  `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` pool teardown instead, which is a visible playback gap.
 - `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` - whole-upstream no-progress timeout before reconnecting,
   default `12000`.
 - `OUTPACE_REQUEST_CHECK_INTERVAL_MS` - request timeout sweep interval, default `1000`; must be
@@ -111,7 +111,7 @@ Environment variables parsed by the daemon include:
   not an instantaneous wire-visible bound. Metadata replies bypass Interested/Unchoke.
 - `OUTPACE_SEED_TTL_SECS` - idle-TTL (seconds, default 300; 0 disables) after which an *ownerless*
   seed-registry entry (one with no live producer lease) is force-evicted by the reaper. A backstop
-  only — normal teardown rides the lease drop, and entries held by a live producer or a broadcast
+  only: normal teardown rides the lease drop, and entries held by a live producer or a broadcast
   are never reaped. This TTL limits registry lifetime, not connection lifetime.
 - `OUTPACE_MAX_INBOUND` - retained inbound connection limit, default `64` (G); `0` acts as `1`.
   Unidentified/incomplete handshakes consume this capacity too. Excess accepted sockets close

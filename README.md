@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<h1 align="center">Outpace — the open-source P2P streaming engine</h1>
+<h1 align="center">Outpace: the open-source P2P streaming engine</h1>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue"></a>
