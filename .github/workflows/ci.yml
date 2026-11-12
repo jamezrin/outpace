@@ -159,3 +159,6 @@ jobs:
         env:
           OUTPACE_TEST_HLS_AUDIO_FFMPEG: "1"
         run: cargo test -p ace-engine --test hls_audio_ffmpeg --locked -- --nocapture
+      # Generated loopback TS and fMP4 origins must decode through the managed HLS relay.
+      - name: Managed origin HLS decode
+        run: cargo test -p ace-engine --lib --locked generated_origin_hls_ts_and_fmp4_decode -- --ignored --nocapture

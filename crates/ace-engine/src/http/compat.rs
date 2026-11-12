@@ -2,12 +2,17 @@ use super::leases::AceHlsView;
 use super::*;
 use crate::hls::HlsHistoryError;
 use crate::provider::ContentIdPreparation;
+use ace_swarm::resolve::HlsOrigin;
 
 pub(super) async fn ace_getstream(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(json!({ "response": null, "error": error })).into_response(),
+    };
     let mode = match params.get("format").map(String::as_str) {
         None | Some("") => AceGetstreamMode::Direct,
         Some("json") => AceGetstreamMode::Json,
@@ -22,6 +27,16 @@ pub(super) async fn ace_getstream(
             return Json(json!({ "response": null, "error": error })).into_response();
         }
     };
+    if let Some(origin) = &selection.hls_origin {
+        return origin_hls_response(
+            &s,
+            &headers,
+            origin,
+            selection.content_id.as_deref(),
+            mode == AceGetstreamMode::Json,
+        )
+        .await;
+    }
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }))
             .into_response();
@@ -86,6 +101,10 @@ pub(super) async fn ace_getstream(
             s.ace_sessions.revoke(&playback_id, &token);
             super::streams::capacity_error()
         }
+        Err(ProviderError::DirectHls(origin)) => {
+            s.ace_sessions.revoke(&playback_id, &token);
+            resolved_origin_redirect(&s, &origin.manifest_url).await
+        }
         Err(_) => {
             s.ace_sessions.revoke(&playback_id, &token);
             StatusCode::NOT_FOUND.into_response()
@@ -99,8 +118,12 @@ pub(super) async fn ace_getstream(
 pub(super) async fn ace_manifest(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(json!({ "response": null, "error": error })).into_response(),
+    };
     let format = params
         .get("format")
         .map(String::as_str)
@@ -114,6 +137,17 @@ pub(super) async fn ace_manifest(
             return Json(json!({ "response": null, "error": error })).into_response();
         }
     };
+    let json_mode = format == "json";
+    if let Some(origin) = &selection.hls_origin {
+        return origin_hls_response(
+            &s,
+            &headers,
+            origin,
+            selection.content_id.as_deref(),
+            json_mode,
+        )
+        .await;
+    }
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }))
             .into_response();
@@ -131,6 +165,16 @@ pub(super) async fn ace_manifest(
             } else {
                 super::streams::capacity_error()
             };
+        }
+        Err(ProviderError::DirectHls(origin)) => {
+            return origin_hls_response(
+                &s,
+                &headers,
+                &origin,
+                selection.content_id.as_deref(),
+                json_mode,
+            )
+            .await;
         }
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -472,6 +516,13 @@ pub(super) async fn ace_playback(
             // category, and keep both logs and response bodies independent of that text.
             let (status, category, reason) = match error {
                 ProviderError::CapacityExhausted => return super::streams::capacity_error(),
+                ProviderError::DirectHls(origin) => {
+                    // Late resolution found an origin: this lease never owned a local source.
+                    if !s.ace_sessions.revoke(&id, &token) {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    return resolved_origin_redirect(&s, &origin.manifest_url).await;
+                }
                 ProviderError::NotFound => (StatusCode::NOT_FOUND, "NotFound", ""),
                 ProviderError::ProtectedContent => (
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -744,10 +795,14 @@ async fn timeshift_status(s: &AppState, id: &str, token: &str) -> serde_json::Va
 /// the methods in [`crate::server_api::Method`] are served; see `docs/protocol/compat-matrix.md`.
 pub(super) async fn server_api(
     State(s): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
     use crate::server_api as api;
 
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(api::err(error)).into_response(),
+    };
     let method = params.get("method").map(String::as_str).unwrap_or("");
     let body = match api::parse_method(method) {
         api::Method::GetVersion => {
@@ -846,13 +901,14 @@ pub(super) fn inspect_server_api_descriptor(
     bytes: &[u8],
     content_id: Option<String>,
 ) -> Result<crate::server_api::ResolvedContent, String> {
-    let (hash, is_live, protection) = ace_swarm::resolve::inspect_descriptor(bytes)
+    let inspection = ace_swarm::resolve::inspect_descriptor(bytes)
         .map_err(|e| ProviderError::from(e).to_string())?;
     Ok(crate::server_api::ResolvedContent {
-        protection: Some(protection),
-        infohash: infohash_hex(&hash),
+        protection: Some(inspection.protection),
+        infohash: infohash_hex(&inspection.infohash),
         content_id,
-        is_live,
+        is_live: inspection.is_live,
+        total_length: inspection.total_length,
     })
 }
 
@@ -863,6 +919,8 @@ pub(super) struct AceStreamSelection {
     pub(super) session_key: String,
     pub(super) content_id: Option<String>,
     pub(super) metadata: StreamMetadata,
+    /// Set when early resolution classified the selector as an origin HLS source.
+    pub(super) hls_origin: Option<HlsOrigin>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -883,6 +941,12 @@ impl AceStreamSelection {
         self.metadata = metadata;
         self
     }
+
+    fn with_hls_origin(mut self, origin: HlsOrigin) -> Self {
+        self.metadata = origin.metadata.clone();
+        self.hls_origin = Some(origin);
+        self
+    }
 }
 
 pub(super) async fn resolve_ace_selection(
@@ -899,10 +963,13 @@ pub(super) async fn resolve_ace_selection(
     if s.resolve_content_ids_in_getstream {
         if let Some(content_id) = selection.content_id.as_deref() {
             let preparation = if let Some(network) = network.as_deref() {
-                s.manager
-                    .prepare_live_content_id(network, content_id)
-                    .await
-                    .map_err(|error| error.to_string())?
+                match s.manager.prepare_live_content_id(network, content_id).await {
+                    Ok(preparation) => preparation,
+                    Err(ProviderError::DirectHls(origin)) => {
+                        return Ok(selection.with_hls_origin(*origin));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             } else {
                 ContentIdPreparation::Unsupported
             };
@@ -929,6 +996,9 @@ pub(super) async fn resolve_ace_selection(
                             selection = selection
                                 .with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
                         }
+                        Err(ace_swarm::resolve::ResolveError::HlsOrigin(origin)) => {
+                            return Ok(selection.with_hls_origin(*origin));
+                        }
                         Err(
                             e @ (ace_swarm::resolve::ResolveError::ProtectedContent
                             | ace_swarm::resolve::ResolveError::InvalidProtection
@@ -947,8 +1017,13 @@ pub(super) async fn resolve_ace_selection(
             let bytes = url_descriptor_bytes(&url)
                 .await
                 .map_err(|e| ProviderError::from(e).to_string())?;
-            let info = ace_swarm::resolve::stream_info_from_transport(&bytes)
-                .map_err(|e| ProviderError::from(e).to_string())?;
+            let info = match ace_swarm::resolve::stream_info_from_transport(&bytes) {
+                Ok(info) => info,
+                Err(ace_swarm::resolve::ResolveError::HlsOrigin(origin)) => {
+                    return Ok(selection.with_hls_origin(*origin));
+                }
+                Err(e) => return Err(ProviderError::from(e).to_string()),
+            };
             info.ensure_playable()
                 .map_err(|e| ProviderError::from(e).to_string())?;
             if let Some(network) = network.as_deref() {
@@ -973,9 +1048,96 @@ pub(super) async fn resolve_ace_selection(
     Ok(selection)
 }
 
+/// HLS descriptors refer to an existing origin. Do not mint swarm/control leases or relabel
+/// an HLS manifest as MPEG-TS. Without the managed relay the player follows the origin URL
+/// and owns buffering; with it, the player gets a local lease plus an explicit stop URL.
+async fn origin_hls_response(
+    s: &AppState,
+    headers: &HeaderMap,
+    origin: &HlsOrigin,
+    content_id: Option<&str>,
+    json_mode: bool,
+) -> Response {
+    let managed = match &s.origin_hls {
+        Some(relay) => match relay.start(&origin.manifest_url).await {
+            Ok(playback) => Some(playback),
+            Err(error) => return origin_hls_error(error),
+        },
+        None => None,
+    };
+    if !json_mode {
+        return origin_hls_redirect(
+            managed
+                .as_ref()
+                .map_or(&origin.manifest_url, |p| &p.playback_url),
+        );
+    }
+    let mut response = json!({
+        // Clients must not require local status/command URLs for this handoff.
+        "playback_url": origin.manifest_url,
+        "is_direct": true,
+        "content_id": content_id,
+        "transport": "hls",
+        "metadata": stream_metadata_json(&origin.metadata),
+    });
+    if let Some(playback) = managed {
+        let base = request_base(headers);
+        response["playback_url"] = json!(format!("{base}{}", playback.playback_url));
+        response["stop_url"] = json!(format!("{base}{}", playback.stop_url));
+        response["managed_origin"] = json!(true);
+    }
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "response": response, "error": null })),
+    )
+        .into_response()
+}
+
+/// Redirect a late-resolved origin: through a fresh relay lease when managed, else directly.
+pub(super) async fn resolved_origin_redirect(s: &AppState, url: &str) -> Response {
+    match &s.origin_hls {
+        Some(relay) => match relay.start(url).await {
+            Ok(playback) => origin_hls_redirect(&playback.playback_url),
+            Err(error) => origin_hls_error(error),
+        },
+        None => origin_hls_redirect(url),
+    }
+}
+
+fn origin_hls_redirect(url: &str) -> Response {
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, url.to_owned()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+    )
+        .into_response()
+}
+
+/// Reject duplicate keys and unsupported file/stream selection before anything resolves
+/// or starts, so a request never silently plays a different selection than it asked for.
+fn checked_source_query(
+    params: Vec<(String, String)>,
+) -> Result<HashMap<String, String>, &'static str> {
+    let mut unique = HashMap::with_capacity(params.len());
+    for (key, value) in params {
+        if unique.insert(key, value).is_some() {
+            return Err("duplicate query parameter");
+        }
+    }
+    validate_source_options(&unique)?;
+    Ok(unique)
+}
+
+fn validate_source_options(params: &HashMap<String, String>) -> Result<(), &'static str> {
+    crate::source_options::validate(params.iter().map(|(k, v)| (k.as_str(), v.as_str())), false)
+}
+
 pub(super) fn ace_selected_stream(
     params: &HashMap<String, String>,
 ) -> Result<AceStreamSelection, &'static str> {
+    validate_source_options(params)?;
     if let Some(content_id) = ace_nonempty_param(params, "content_id") {
         let content_id = ace_normalized_hex_id(content_id).ok_or("invalid content_id")?;
         return Ok(AceStreamSelection {
@@ -984,6 +1146,7 @@ pub(super) fn ace_selected_stream(
             session_key: format!("cid:{content_id}"),
             content_id: Some(content_id),
             metadata: StreamMetadata::default(),
+            hls_origin: None,
         });
     }
     if let Some(infohash) = ace_nonempty_param(params, "infohash") {
@@ -994,6 +1157,7 @@ pub(super) fn ace_selected_stream(
             session_key: infohash,
             content_id: None,
             metadata: StreamMetadata::default(),
+            hls_origin: None,
         });
     }
     // The legacy `id=` spelling denotes an AceStream content id, not a swarm infohash.
@@ -1008,6 +1172,7 @@ pub(super) fn ace_selected_stream(
                 session_key: id.to_owned(),
                 content_id: None,
                 metadata: StreamMetadata::default(),
+                hls_origin: None,
             });
         }
     }
@@ -1019,6 +1184,7 @@ pub(super) fn ace_selected_stream(
             session_key: format!("cid:{content_id}"),
             content_id: Some(content_id),
             metadata: StreamMetadata::default(),
+            hls_origin: None,
         });
     }
     if let Some(url) = ace_nonempty_param(params, "url") {
@@ -1033,6 +1199,7 @@ pub(super) fn ace_selected_stream(
             session_key: token,
             content_id: None,
             metadata: StreamMetadata::default(),
+            hls_origin: None,
         });
     }
     if let Some(magnet) = ace_nonempty_param(params, "magnet") {
@@ -1043,6 +1210,7 @@ pub(super) fn ace_selected_stream(
             session_key: hex,
             content_id: None,
             metadata: StreamMetadata::default(),
+            hls_origin: None,
         });
     }
     Err("missing content_id/infohash/id/url/magnet")

@@ -102,6 +102,12 @@ impl AceProvider {
                 Err(CatalogLookupError::Catalog(error)) => error,
             };
             match catalog_error.as_ref() {
+                // A classified HLS descriptor is not a catalog outage: it must not be
+                // reinterpreted as raw-hash peer data, and its signed URL is never cached.
+                ResolveError::HlsOrigin(origin) => {
+                    return Err(ResolveError::HlsOrigin(origin.clone()).into())
+                }
+                ResolveError::Hls(reason) => return Err(ResolveError::Hls(reason).into()),
                 ResolveError::ProtectedContent => {
                     return Err(ProviderError::ProtectedContent.into())
                 }
@@ -276,9 +282,10 @@ impl AceProvider {
             return stream_info_from_transport_url(&url).await.map_err(|error| {
                 let kind = StartFailureKind::Resolution(error.failure_kind());
                 let legacy = match error {
-                    ResolveError::ProtectedContent | ResolveError::InvalidProtection => {
-                        ProviderError::from(error)
-                    }
+                    ResolveError::ProtectedContent
+                    | ResolveError::InvalidProtection
+                    | ResolveError::HlsOrigin(_)
+                    | ResolveError::Hls(_) => ProviderError::from(error),
                     other => ProviderError::Backend(format!("transport url: {other:?}")),
                 };
                 ProviderStartFailure::new(kind, legacy)
@@ -673,6 +680,42 @@ mod classified_tests {
             StartFailureKind::Resolution(ResolveFailureKind::InvalidSelector)
         );
         assert!(!invalid.kind.retryable());
+    }
+
+    #[tokio::test]
+    async fn catalog_hls_origin_hands_off_and_never_enters_the_cache() {
+        const URL: &str = "https://cdn.example.test/live/master.m3u8?token=synthetic";
+        let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..2 {
+            let counted = fetches.clone();
+            let failure = provider
+                .resolve_content_id_prepared_with_catalog_classified(id, async move {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(ResolveError::HlsOrigin(Box::new(
+                        ace_swarm::resolve::HlsOrigin {
+                            manifest_url: URL.into(),
+                            metadata: Default::default(),
+                        },
+                    )))
+                })
+                .await
+                .err()
+                .unwrap();
+            let ProviderError::DirectHls(origin) = &failure.error else {
+                panic!("expected an origin handoff, got {:?}", failure.error);
+            };
+            assert_eq!(origin.manifest_url, URL);
+            assert!(!format!("{:?}", failure.error).contains("cdn.example.test"));
+            assert!(!failure.error.to_string().contains("cdn.example.test"));
+        }
+        assert_eq!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "signed origin URLs are resolved per playback, not cached"
+        );
+        assert!(provider.resolve_cache.get(id).is_none());
     }
 
     #[tokio::test]

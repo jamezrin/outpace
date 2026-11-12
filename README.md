@@ -388,6 +388,10 @@ lease ownership, live HLS and intentional gaps. The
 [pinned client inventory](docs/protocol/ace-client-inventory.md) supplies supporting
 client evidence; it does not claim full engine or application parity.
 
+Descriptors that point at an HTTP(S) HLS origin are redirected straight to that
+origin by default. `OUTPACE_MANAGED_HLS=1` (off by default) serves them through a
+bounded local relay instead; see [origin HLS](docs/native-api.md#origin-hls).
+
 ## Configuration
 
 [Outbound-only private peer mode](docs/private-peer-mode.md) restricts peer traffic to
@@ -527,6 +531,11 @@ Environment variables parsed by the daemon include:
   normal bridge-mode containers should use a manual router-to-Docker-host TCP forward.
 - `OUTPACE_PORT_MAP_BACKEND` - `auto`, `upnp`, `natpmp`, or `none`; default `auto`.
 - `OUTPACE_PORT_MAP_EXTERNAL_PORT` - optional external TCP port requested from the gateway.
+- `OUTPACE_MANAGED_HLS` - serve descriptors that resolve to an HTTP(S) HLS origin through a
+  bounded local relay, default off. Accepts exactly `1`, `true`, `0`, or `false`; anything
+  else fails startup. Off, playback routes redirect the player straight to the origin. On,
+  the daemon itself fetches origin playlists and media (public destinations only, with DNS
+  pinning, deadlines and byte limits). See [origin HLS](docs/native-api.md#origin-hls).
 - `OUTPACE_ACE_COMPAT` - enables the supported Ace HTTP subset, default off. Accepts
   exactly `1`, `true`, `0`, or `false`. A present value takes precedence over the legacy
   alias, including `0`/`false`; an empty, malformed, or non-Unicode selected value fails

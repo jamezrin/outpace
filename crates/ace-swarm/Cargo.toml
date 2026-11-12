@@ -23,6 +23,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 webpki-root-certs = "1"
 # Inspect the locked HTTP parser's typed errors without retaining URL-bearing diagnostics.
 hyper = { version = "1", default-features = false }
+httpdate = "1"
 hex = "0.4"
 roxmltree = "0.21"
 igd-next = { version = "0.17", features = ["aio_tokio"] }

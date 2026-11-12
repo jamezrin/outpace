@@ -516,7 +516,7 @@ async fn parsed_vod_protection_refuses_before_store_with_public_control() {
             p.cache_dir = cache.clone();
             let hash = ace_swarm::resolve::inspect_descriptor(&bytes)
                 .ok()
-                .map(|v| v.0);
+                .map(|v| v.infohash);
             let result = p
                 .resolve_vod_inner_with_catalog(&format!("cid:{CID}"), ready(Ok(bytes)))
                 .await;

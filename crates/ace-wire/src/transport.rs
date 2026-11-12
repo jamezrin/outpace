@@ -74,13 +74,42 @@ impl TransportDescriptor {
             .map(|i| i as u64)
     }
 
-    /// Whether this descriptor advertises a multi-file layout (`files` list). Multi-file VOD is
-    /// intentionally unsupported; callers reject it. This checks the historical synthetic
-    /// root schema (see [`Self::vod_total_length`]), not an original-engine multi-file schema.
+    /// Whether this descriptor advertises a multi-file layout (`files` key). Multi-file VOD is
+    /// intentionally unsupported; callers reject even a malformed value rather than treating
+    /// it as single-file or live. This checks the historical synthetic root schema (see
+    /// [`Self::vod_total_length`]), not an original-engine multi-file schema.
     pub fn is_multifile(&self) -> bool {
-        matches!(self.raw.get(b"files"), Some(Bencode::List(_)))
+        self.raw.get(b"files").is_some()
     }
 }
+
+/// The descriptor determines its playback protocol; HLS has no piece geometry.
+#[derive(Debug)]
+pub enum TransportSource {
+    Swarm(Box<TransportDescriptor>),
+    Hls(HlsTransportDescriptor),
+}
+
+/// An HTTP HLS source described inside an encrypted Acestream transport file.
+#[derive(PartialEq, Eq)]
+pub struct HlsTransportDescriptor {
+    /// Original URL, including any signed query. Never rewrite or log it.
+    pub manifest_url: String,
+    pub title: Option<String>,
+    pub categories: Vec<String>,
+}
+
+impl std::fmt::Debug for HlsTransportDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HlsTransportDescriptor")
+            .field("title", &self.title)
+            .field("categories", &self.categories)
+            .finish_non_exhaustive()
+    }
+}
+
+const MAX_HLS_MANIFEST_URL: usize = 8192;
+const MAX_HLS_TITLE_BYTES: usize = 256;
 
 type Dec = cbc::Decryptor<aes::Aes128>;
 
@@ -166,6 +195,23 @@ pub fn decode_transport_with_key(
     key: &[u8; 16],
     iv: &[u8; 16],
 ) -> Result<TransportDescriptor> {
+    match decode_transport_source_with_key(bytes, key, iv)? {
+        TransportSource::Swarm(descriptor) => Ok(*descriptor),
+        TransportSource::Hls(_) => Err(WireError::Hls("HLS transport requires manifest playback")),
+    }
+}
+
+/// Decode either a classic piece-based descriptor or an HLS descriptor.
+pub fn decode_transport_source(bytes: &[u8]) -> Result<TransportSource> {
+    decode_transport_source_with_key(bytes, &TRANSPORT_KEY, &TRANSPORT_IV)
+}
+
+/// Typed transport decoder with an explicit key and IV for deterministic vectors.
+pub fn decode_transport_source_with_key(
+    bytes: &[u8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Result<TransportSource> {
     // 1. Magic check.
     if !crate::infohash::is_transport_file(bytes) {
         return Err(WireError::Invalid("not a transport file"));
@@ -197,6 +243,24 @@ pub fn decode_transport_with_key(
         return Err(WireError::Invalid("descriptor not a dict"));
     }
 
+    if raw.get(b"type").and_then(Bencode::as_bytes) == Some(b"hls") {
+        let manifest_url = raw
+            .get(b"manifest_url")
+            .and_then(Bencode::as_bytes)
+            .filter(|value| !value.is_empty() && value.len() <= MAX_HLS_MANIFEST_URL)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .ok_or(WireError::Hls("missing or invalid HLS manifest_url"))?
+            .to_string();
+        return Ok(TransportSource::Hls(HlsTransportDescriptor {
+            manifest_url,
+            title: raw
+                .get(b"title")
+                .and_then(Bencode::as_bytes)
+                .and_then(|value| bounded_text(value, MAX_HLS_TITLE_BYTES)),
+            categories: decode_categories(&raw),
+        }));
+    }
+
     // 6. Extract fields.
     let name = raw
         .get(b"name")
@@ -220,15 +284,17 @@ pub fn decode_transport_with_key(
     let trackers = decode_trackers(raw.get(b"trackers"));
 
     // 7. VOD pieces: concatenated 20-byte SHA-1 hashes; absent on live streams.
+    // A present but malformed table is terminal: it must never be reclassified as live.
     let pieces: Vec<[u8; 20]> = match raw.get(b"pieces") {
+        None => Vec::new(),
         Some(Bencode::Bytes(p)) if p.len().is_multiple_of(20) && !p.is_empty() => {
             p.as_chunks::<20>().0.to_vec()
         }
-        _ => Vec::new(),
+        Some(_) => return Err(WireError::Invalid("invalid VOD pieces")),
     };
     let is_live = pieces.is_empty();
 
-    Ok(TransportDescriptor {
+    Ok(TransportSource::Swarm(Box::new(TransportDescriptor {
         name,
         piece_length,
         chunk_length,
@@ -239,7 +305,7 @@ pub fn decode_transport_with_key(
         pieces,
         is_live,
         raw,
-    })
+    })))
 }
 
 /// Encode an Acestream transport file from a bencode descriptor dict — the inverse of
@@ -381,6 +447,104 @@ mod tests {
         assert_eq!(d.piece_length, 131072);
         assert_eq!(d.chunk_length, 16384);
         assert_eq!(d.name, "hi");
+    }
+
+    fn hls_fixture() -> Bencode {
+        Bencode::parse(
+            include_bytes!("../../../tests/vectors/hls-descriptor.bencode")
+                .strip_suffix(b"\n")
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn hls_descriptor_is_typed_without_inventing_piece_geometry() {
+        let bytes = encode_transport(&hls_fixture());
+        let TransportSource::Hls(descriptor) = decode_transport_source(&bytes).unwrap() else {
+            panic!("expected HLS transport");
+        };
+        assert_eq!(
+            descriptor.manifest_url,
+            "https://cdn.example.test/live/master.m3u8?token=a%2Fb&expires=123"
+        );
+        assert_eq!(descriptor.title.as_deref(), Some("Synthetic HLS fixture"));
+        assert_eq!(descriptor.categories, vec!["fixture"]);
+        assert!(matches!(decode_transport(&bytes), Err(WireError::Hls(_))));
+        assert!(!format!("{descriptor:?}").contains("cdn.example.test"));
+    }
+
+    #[test]
+    fn hls_requires_a_bounded_utf8_manifest_url_even_if_piece_fields_are_present() {
+        for manifest in [
+            None,
+            Some(Bencode::Int(1)),
+            Some(Bencode::Bytes(vec![])),
+            Some(Bencode::Bytes(vec![0xff])),
+            Some(Bencode::Bytes(vec![b'x'; 8193])),
+        ] {
+            let Bencode::Dict(mut descriptor) = hls_fixture() else {
+                unreachable!()
+            };
+            descriptor.remove(b"manifest_url".as_slice());
+            if let Some(manifest) = manifest {
+                descriptor.insert(b"manifest_url".to_vec(), manifest);
+            }
+            descriptor.insert(b"piece_length".to_vec(), Bencode::Int(131072));
+            descriptor.insert(b"chunk_length".to_vec(), Bencode::Int(16384));
+            assert!(matches!(
+                decode_transport_source(&encode_transport(&Bencode::Dict(descriptor))),
+                Err(WireError::Hls(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn source_decoder_checks_version_and_truncated_version_before_slicing_body() {
+        let mut bytes = encode_transport(&hls_fixture());
+        bytes[19] = 3;
+        assert!(matches!(
+            decode_transport_source(&bytes),
+            Err(WireError::Invalid(_))
+        ));
+        assert!(decode_transport_source(b"AceStreamTransport").is_err());
+        assert!(decode_transport_source(b"AceStreamTransport\x00").is_err());
+    }
+
+    #[test]
+    fn present_invalid_vod_pieces_never_become_live() {
+        for pieces in [
+            Bencode::Bytes(vec![]),
+            Bencode::Bytes(vec![0; 19]),
+            Bencode::Bytes(vec![0; 21]),
+            Bencode::Int(1),
+            Bencode::List(vec![]),
+            Bencode::Dict(Default::default()),
+        ] {
+            let descriptor = Bencode::Dict(std::collections::BTreeMap::from([
+                (b"piece_length".to_vec(), Bencode::Int(16_384)),
+                (b"chunk_length".to_vec(), Bencode::Int(16_384)),
+                (b"pieces".to_vec(), pieces),
+            ]));
+            assert!(matches!(
+                decode_transport_source(&encode_transport(&descriptor)),
+                Err(WireError::Invalid("invalid VOD pieces"))
+            ));
+        }
+    }
+
+    #[test]
+    fn absent_pieces_stay_live_and_valid_pieces_stay_vod() {
+        let mut descriptor = std::collections::BTreeMap::from([
+            (b"piece_length".to_vec(), Bencode::Int(16_384)),
+            (b"chunk_length".to_vec(), Bencode::Int(16_384)),
+        ]);
+        let live = decode_transport(&encode_transport(&Bencode::Dict(descriptor.clone()))).unwrap();
+        assert!(live.is_live);
+        descriptor.insert(b"pieces".to_vec(), Bencode::Bytes(vec![0xa5; 40]));
+        let vod = decode_transport(&encode_transport(&Bencode::Dict(descriptor))).unwrap();
+        assert!(!vod.is_live);
+        assert_eq!(vod.pieces, vec![[0xa5; 20]; 2]);
     }
 
     #[test]

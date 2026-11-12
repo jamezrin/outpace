@@ -23,6 +23,8 @@ pub mod ut_metadata;
 /// Errors produced while decoding untrusted wire bytes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WireError {
+    /// A recognized HLS descriptor cannot be used as a piece-based swarm.
+    Hls(&'static str),
     /// Buffer ended before a complete structure was parsed.
     Truncated,
     /// Descriptor protection is outside the explicitly supported zero/one policy.

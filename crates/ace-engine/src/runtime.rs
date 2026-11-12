@@ -292,6 +292,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_BEP9_CONTENT_ID_FALLBACK")? {
         config.bep9_content_id_fallback = v;
     }
+    if let Some(v) = bool_from_env("OUTPACE_MANAGED_HLS")? {
+        config.managed_hls = v;
+    }
     // Preserve presence: explicit public-network settings conflict, implicit defaults normalize.
     let private_peers = optional_private_env("OUTPACE_PRIVATE_PEERS")?;
     let private_descriptors = optional_private_env("OUTPACE_PRIVATE_DESCRIPTORS")?;
@@ -1044,6 +1047,10 @@ async fn serve_http_inner(
         resolve_content_ids_in_getstream: true,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: config.experimental_ace_compat,
+        // The relay always applies the public-destination policy; there is no opt-out.
+        origin_hls: config
+            .managed_hls
+            .then(|| crate::origin_hls::OriginHls::new(FetchPolicy::default())),
         broadcasts: Some(broadcasts.clone()),
     };
 
@@ -1594,6 +1601,7 @@ mod tests {
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
             experimental_ace_compat: config.experimental_ace_compat,
+            origin_hls: None,
             broadcasts: None,
         });
         drop(_restore);
@@ -1696,6 +1704,22 @@ mod tests {
         let explicit = std::env::temp_dir().join("outpace-cache-dir-explicit-test");
         std::env::set_var("OUTPACE_CACHE_DIR", &explicit);
         assert_eq!(config_from_env().unwrap().cache_dir, explicit);
+    }
+
+    #[test]
+    fn managed_hls_env_defaults_off_and_parses_strictly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_MANAGED_HLS";
+        let _restore = EnvRestore::clear(&[name]);
+        assert!(!config_from_env().unwrap().managed_hls);
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(name, value);
+            assert_eq!(config_from_env().unwrap().managed_hls, expected);
+        }
+        for invalid in ["", "yes", "ture", " 1"] {
+            std::env::set_var(name, invalid);
+            assert!(config_from_env().unwrap_err().to_string().contains(name));
+        }
     }
 
     #[test]
