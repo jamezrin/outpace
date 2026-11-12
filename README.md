@@ -190,11 +190,29 @@ Technical reference:
 
 ## AI
 
-Outpace is maintained by one person, using the best frontier models and workflows written for
-this repository. The models write most of the code. The maintainer owns the architecture, the
-design, and the product decisions. Every change still goes through tests, CI, and review before
-it merges. An issue or a pull request has to come from a person who has read it, checked it,
-and can discuss it. Low-effort and fully automated submissions are not welcome.
+Outpace has one maintainer and is built largely with AI coding agents, which follow the
+repository rules in [AGENTS.md](AGENTS.md). Agents write most of the Rust and much of the
+documentation. The maintainer sets the scope (public, unencrypted content only), owns the
+design, and decides what ships.
+
+A model's idea of how Ace Stream works is never treated as evidence. Protocol behaviour comes
+from observing real traffic:
+
+- it's written up in the [protocol notes](docs/protocol/notes/);
+- wire formats are pinned by test vectors under `tests/vectors/`;
+- parsers are covered by [fuzz targets](docs/testing/fuzzing.md);
+- playback behaviour is checked against the original engine with the
+  [A/B comparison tools](tools/abcompare/) and the [interop harness](docs/testing/interop-swarm.md).
+
+Every change passes rustfmt, Clippy with warnings denied, the offline test suite, and an
+identifier-hygiene check that keeps real content ids and infohashes out of the repository.
+
+Using AI to contribute is fine. Before you open an issue or pull request:
+
+- run the tests and read what you're submitting;
+- be ready to explain it;
+- back protocol claims with evidence, such as a synthetic test vector or a reproducible run,
+  not a model's summary.
 
 ## Build and contribute
 
