@@ -1,0 +1,97 @@
+name: Portability
+
+on:
+  # Only run when something that can change a shipped release binary
+  # moves. Tests, docs, and dev-only tooling do not affect the release build,
+  # so changes limited to those paths skip this portability gate.
+  pull_request:
+    paths:
+      - .github/workflows/portability.yml
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - tools/ci/smoke_daemon.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-target:
+    # Mirrors the build-binaries matrix in release.yml. Keep the two in step: a target
+    # added there must be added here so it is built before a tag ever reaches it.
+    name: Build and smoke ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-24.04
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-24.04
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+          build-warnings: ""
+
+      # Also registers a QEMU user-mode runner for targets the host cannot execute, which
+      # the smoke step below reuses to start the emulated daemon.
+      - name: Install Linux cross toolchain
+        if: contains(matrix.target, 'unknown-linux-musl')
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Test Windows executable resolution
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        run: cargo test --locked -p ace-engine --lib --target "${{ matrix.target }}" executable_resolution_tests
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release -p ace-engine --bin outpace --target "${{ matrix.target }}"
+
+      - name: Start daemon and check health
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          binary="target/${target}/release/outpace"
+          if [[ "$target" == *windows* ]]; then
+            binary="${binary}.exe"
+          fi
+          # setup-cross-toolchain-action exports CARGO_TARGET_<TRIPLE>_RUNNER (QEMU) when
+          # the host cannot run the target natively; empty for native targets.
+          runner_var="CARGO_TARGET_$(tr 'a-z-' 'A-Z_' <<<"$target")_RUNNER"
+          export SMOKE_RUNNER="${!runner_var:-}"
+          echo "runner: ${SMOKE_RUNNER:-native}"
+          sh tools/ci/smoke_daemon.sh "$binary"

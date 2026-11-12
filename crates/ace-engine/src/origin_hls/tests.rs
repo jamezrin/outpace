@@ -1960,6 +1960,7 @@ async fn generated_origin_hls_ts_and_fmp4_decode() {
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(AceSessionStore::default()),
             experimental_ace_compat: false,
+            search: None,
             broadcasts: None,
             origin_hls: Some(relay.clone()),
         };
@@ -2206,6 +2207,7 @@ async fn generated_origin_ts_archive_decodes_after_origin_removal() {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         broadcasts: None,
         origin_hls: Some(relay.clone()),
     };

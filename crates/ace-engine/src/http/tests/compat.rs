@@ -482,6 +482,7 @@ async fn ace_direct_and_json_playback_share_source_and_disconnect_independently(
         resolve_content_ids_in_getstream: false,
         ace_sessions: ace_sessions.clone(),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     });
@@ -605,6 +606,7 @@ async fn ace_direct_start_failure_revokes_its_hidden_lease() {
         resolve_content_ids_in_getstream: false,
         ace_sessions: sessions.clone(),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     });
@@ -974,6 +976,7 @@ async fn ace_stop_isolates_two_compat_clients_and_preserves_native_consumer() {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: true,
+        search: None,
         origin_hls: None,
         broadcasts: None,
     });

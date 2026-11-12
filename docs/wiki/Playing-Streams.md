@@ -226,9 +226,10 @@ channel lists or EPG, no file selection beyond the single file (`_idx=0`), no se
 original engine's sense, and no VOD. Outpace adds its own [timeshift](Timeshift) commands
 instead.
 
-[Stream-name search](Stream-Search) is planned within v1.0.0 as a separate, default-off
-AceStream services adapter. It is not implemented: `/search` returns `404`, and `get_content_id`
-does not convert an infohash to a content ID. Enabling `OUTPACE_ACE_COMPAT` does not add search.
+[Stream-name search](Stream-Search) is a separate, default-off AceStream services adapter in
+builds newer than v0.9.0. Enabling `OUTPACE_ACE_COMPAT` alone does not add search, and
+`get_content_id` still does not convert an infohash to a content ID. Select results using
+explicit `/streams/ace/ih:<infohash>` or compatibility `infohash=` playback selectors.
 
 ### Behind a proxy
 
