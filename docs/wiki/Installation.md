@@ -138,7 +138,18 @@ cargo build --release --locked -p ace-engine --bin outpace
 ./target/release/outpace --version
 ```
 
-The binary is `target/release/outpace`. To build the container image yourself:
+The binary is `target/release/outpace`.
+
+Release binaries use a slower, smaller `dist` profile (link-time optimisation, one codegen unit,
+symbols stripped). It roughly halves the binary, which helps on routers and boards with little
+flash. To build the same way, from source newer than v0.9.0:
+
+```bash
+cargo build --profile dist --locked -p ace-engine --bin outpace
+./target/dist/outpace --version
+```
+
+To build the container image yourself:
 
 ```bash
 docker build -t outpace:local .
