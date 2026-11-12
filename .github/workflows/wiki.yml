@@ -1,0 +1,78 @@
+name: wiki
+
+# docs/wiki/ is the source of the GitHub wiki. Pull requests that touch it are
+# checked; merges to main republish it, replacing the wiki repo's contents with
+# exactly that folder. Edits made in the wiki web UI are overwritten.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/wiki/**"
+      - "tools/wiki/**"
+      - ".github/workflows/wiki.yml"
+  pull_request:
+    paths:
+      - "docs/wiki/**"
+      - "tools/wiki/**"
+      - ".github/workflows/wiki.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: wiki checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Scan tracked files for real AceStream identifiers
+        run: python3 tools/hygiene/check_identifiers.py
+      - name: Check links between wiki pages
+        run: python3 tools/wiki/check_links.py docs/wiki
+
+  publish:
+    name: publish wiki
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # One publish at a time, in merge order; never cancel a push half-way.
+    concurrency:
+      group: wiki-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Replace the wiki with docs/wiki
+        env:
+          # A fine-grained token in WIKI_TOKEN (contents: write) is only needed
+          # if the default token is ever refused by the wiki remote.
+          WIKI_TOKEN: ${{ secrets.WIKI_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$WIKI_TOKEN" | base64 -w0)"
+          echo "::add-mask::$(printf 'x-access-token:%s' "$WIKI_TOKEN" | base64 -w0)"
+          wiki="$RUNNER_TEMP/wiki"
+          git -c http.extraheader="$auth" clone --depth 1 \
+            "https://github.com/${GITHUB_REPOSITORY}.wiki.git" "$wiki"
+
+          find "$wiki" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a docs/wiki/. "$wiki/"
+          diff -r --exclude=.git docs/wiki "$wiki"
+
+          cd "$wiki"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wiki already matches docs/wiki at ${GITHUB_SHA::7}."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Publish docs/wiki from ${GITHUB_SHA::7}"
+          git -c http.extraheader="$auth" push origin HEAD
+          echo "Published https://github.com/${GITHUB_REPOSITORY}/wiki from ${GITHUB_SHA::7}."
