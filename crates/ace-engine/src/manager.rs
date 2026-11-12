@@ -1411,6 +1411,23 @@ impl StreamManager {
         }
     }
 
+    /// Per-session `(network, subscriber_count, stats)` for aggregate metrics. Stream ids are
+    /// deliberately omitted. Stats are read after the session map lock is released.
+    pub async fn session_stats(&self) -> Vec<(String, u64, crate::provider::SourceStats)> {
+        let sessions: Vec<_> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|((network, _), session)| (network.clone(), session.clone()))
+            .collect();
+        let mut out = Vec::with_capacity(sessions.len());
+        for (network, session) in sessions {
+            out.push((network, session.subscriber_count(), session.stats().await));
+        }
+        out
+    }
+
     /// Active sessions as `(network, id, subscriber_count, metadata)`.
     pub async fn list(&self) -> Vec<(String, String, u64, StreamMetadata)> {
         self.sessions

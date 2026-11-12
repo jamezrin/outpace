@@ -271,6 +271,7 @@ async fn generated_srt_reaches_signed_peer_http_body_and_decoded_video_audio() {
             resolve_content_ids_in_getstream: true,
             ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
             experimental_ace_compat: false,
+            search: None,
             origin_hls: None,
             broadcasts: Some(state.clone()),
         });
@@ -315,6 +316,7 @@ async fn generated_srt_reaches_signed_peer_http_body_and_decoded_video_audio() {
             resolve_content_ids_in_getstream: true,
             ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
             experimental_ace_compat: false,
+            search: None,
             origin_hls: None,
             broadcasts: None,
         });

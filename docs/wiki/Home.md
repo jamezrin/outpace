@@ -18,7 +18,9 @@ live media, and serves it to your players over HTTP:
   understand.
 
 It's a single self-contained, headless binary (or container image) for Linux, macOS and
-Windows. It never downloads or runs the proprietary Ace Stream engine. Ace Stream is the network
+Windows. Performance and efficiency are core goals: Outpace aims to start quickly, play
+smoothly and stay light on CPU and memory, and the project treats performance regressions as
+bugs. It never downloads or runs the proprietary Ace Stream engine. Ace Stream is the network
 it supports today. Outpace is an independent project, not affiliated with or endorsed by Ace
 Stream.
 
@@ -43,8 +45,9 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 - It does **not** play premium, encrypted or protected content. That is a permanent non-goal.
 - It is **not** a full clone of the closed engine. There are no accounts, subscriptions, web UI,
   EPG or general channel catalogues. The compatibility API is a documented subset.
-- [Stream-name search](Stream-Search) is planned as a separate, default-off services adapter
-  within v1.0.0. It is not available yet.
+- [Stream-name search](Stream-Search) is a separate, default-off external services adapter,
+  newer than v0.9.0. It needs no operator API key and uses external HTTP services; it does
+  not bundle a UI or catalog.
 - It is not a recorder or DVR. The optional [Timeshift](Timeshift) buffer lives in memory and
   disappears on restart.
 
