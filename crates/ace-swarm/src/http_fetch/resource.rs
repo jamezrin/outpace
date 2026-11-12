@@ -2,6 +2,13 @@
 use super::*;
 use reqwest::header::{self, HeaderMap};
 
+/// Validated wire encoding. The caller still receives the original, encoded bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceEncoding {
+    Identity,
+    Gzip,
+}
+
 #[derive(Debug)]
 pub struct ResourceResponse {
     pub final_url: FetchUrl,
@@ -9,6 +16,9 @@ pub struct ResourceResponse {
     pub content_type: Option<String>,
     pub content_range: Option<String>,
     pub content_length: Option<u64>,
+    pub content_encoding: ResourceEncoding,
+    /// The original DNS/redirect/body deadline, also applicable to caller decoding.
+    pub deadline: tokio::time::Instant,
     pub cache_ttl: Option<Duration>,
     pub body: GuardedBody,
 }
@@ -21,6 +31,29 @@ pub async fn open_resource(
     limits: FetchLimits,
     range: Option<&str>,
     cancel: watch::Receiver<bool>,
+) -> Result<ResourceResponse, FetchError> {
+    open_resource_inner(url, policy, limits, range, cancel, false).await
+}
+
+/// Fetch a full HLS playlist, allowing one gzip content coding. No Range requests
+/// are permitted. Wire size/length and bounded decoding remain the caller's job.
+/// Other resources must use `open_resource`, which continues to require identity.
+pub async fn open_playlist_resource(
+    url: &FetchUrl,
+    policy: FetchPolicy,
+    limits: FetchLimits,
+    cancel: watch::Receiver<bool>,
+) -> Result<ResourceResponse, FetchError> {
+    open_resource_inner(url, policy, limits, None, cancel, true).await
+}
+
+async fn open_resource_inner(
+    url: &FetchUrl,
+    policy: FetchPolicy,
+    limits: FetchLimits,
+    range: Option<&str>,
+    cancel: watch::Receiver<bool>,
+    playlist: bool,
 ) -> Result<ResourceResponse, FetchError> {
     if limits.connect_timeout.is_zero() || limits.headers_timeout.is_zero() {
         return Err(FetchError::InvalidSourceConfig);
@@ -53,6 +86,7 @@ pub async fn open_resource(
                 cancel.clone(),
                 AttemptOptions {
                     resource: true,
+                    playlist,
                     range: range.map(str::to_owned),
                     deadline: Some(deadline),
                     #[cfg(test)]
@@ -90,6 +124,8 @@ pub async fn open_resource(
             content_type: header_text(headers, header::CONTENT_TYPE)?.map(str::to_owned),
             content_range: header_text(headers, header::CONTENT_RANGE)?.map(str::to_owned),
             content_length: content_length(headers)?,
+            content_encoding: content_encoding(headers, playlist)?,
+            deadline,
             cache_ttl: if status == 200 && range.is_none() {
                 cache_ttl(headers)
             } else {
@@ -126,6 +162,16 @@ fn content_length(headers: &HeaderMap) -> Result<Option<u64>, FetchError> {
     header_text(headers, header::CONTENT_LENGTH)?
         .map(|v| decimal(v).ok_or(FetchError::UnsupportedResponse))
         .transpose()
+}
+
+fn content_encoding(headers: &HeaderMap, playlist: bool) -> Result<ResourceEncoding, FetchError> {
+    let value = header_text(headers, header::CONTENT_ENCODING)?;
+    match value.map(|value| value.trim_matches([' ', '\t'])) {
+        None => Ok(ResourceEncoding::Identity),
+        Some(value) if value.eq_ignore_ascii_case("identity") => Ok(ResourceEncoding::Identity),
+        Some(value) if playlist && value.eq_ignore_ascii_case("gzip") => Ok(ResourceEncoding::Gzip),
+        _ => Err(FetchError::UnsupportedResponse),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,6 +221,18 @@ pub(super) fn validate_response(
     response: &reqwest::Response,
     range: Option<&str>,
 ) -> Result<(), FetchError> {
+    validate_resource_response(response, range, false)
+}
+
+pub(super) fn validate_playlist_response(response: &reqwest::Response) -> Result<(), FetchError> {
+    validate_resource_response(response, None, true)
+}
+
+fn validate_resource_response(
+    response: &reqwest::Response,
+    range: Option<&str>,
+    playlist: bool,
+) -> Result<(), FetchError> {
     let headers = response.headers();
     if headers.len() > MAX_SOURCE_HEADERS
         || headers
@@ -188,13 +246,10 @@ pub(super) fn validate_response(
                 .split(|b| *b == b',')
                 .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
         })
-        || headers
-            .get_all(header::CONTENT_ENCODING)
-            .iter()
-            .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
     {
         return Err(FetchError::UnsupportedResponse);
     }
+    content_encoding(headers, playlist)?;
     match response.status().as_u16() {
         301 | 302 | 303 | 307 | 308 => {
             header_text(headers, header::LOCATION)?;

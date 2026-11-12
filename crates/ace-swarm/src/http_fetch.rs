@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 mod resource;
-pub use resource::{open_resource, ResourceResponse};
+pub use resource::{open_playlist_resource, open_resource, ResourceEncoding, ResourceResponse};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_HEADERS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -352,6 +352,7 @@ pub async fn open(
 #[derive(Default)]
 struct AttemptOptions {
     resource: bool,
+    playlist: bool,
     range: Option<String>,
     deadline: Option<tokio::time::Instant>,
     #[cfg(test)]
@@ -426,6 +427,16 @@ async fn open_pinned(
     let _ = request_url.set_username("");
     let _ = request_url.set_password(None);
     let mut request = client.get(request_url);
+    if options.resource {
+        request = request.header(
+            reqwest::header::ACCEPT_ENCODING,
+            if options.playlist {
+                "gzip, identity"
+            } else {
+                "identity"
+            },
+        );
+    }
     if let Some(range) = options.range.as_deref() {
         request = request.header(reqwest::header::RANGE, range);
     }
@@ -438,7 +449,11 @@ async fn open_pinned(
         }
     };
     if options.resource {
-        resource::validate_response(&response, options.range.as_deref())?;
+        if options.playlist {
+            resource::validate_playlist_response(&response)?;
+        } else {
+            resource::validate_response(&response, options.range.as_deref())?;
+        }
     } else {
         validate_response(&response, limits.source_response)?;
     }

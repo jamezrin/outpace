@@ -6,6 +6,8 @@ use axum::{extract::State, routing::any, Router};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 
+mod gzip;
+
 struct Fixture {
     address: std::net::SocketAddr,
     abort: tokio::task::AbortHandle,

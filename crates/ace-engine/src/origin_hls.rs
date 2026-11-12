@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+mod compression;
 mod playlist;
 #[cfg(test)]
 mod tests;
@@ -421,7 +422,7 @@ impl OriginHls {
         let (result, fetch_permit) = tokio::select! {
             biased;
             _ = cancelled(&mut cancel) => Err(OriginError::Cancelled),
-            result = tokio::time::timeout_at(deadline, self.load(token, id, &session, resource, range)) => {
+            result = tokio::time::timeout_at(deadline, self.load(token, id, &session, resource, range, deadline)) => {
                 result.map_err(|_| OriginError::Timeout)?
             }
         }?;
@@ -446,6 +447,7 @@ impl OriginHls {
         session: &Arc<Session>,
         resource: RequestedResource,
         range: Option<&str>,
+        deadline: Instant,
     ) -> Result<(ResponseData, Option<OwnedSemaphorePermit>), OriginError> {
         let RequestedResource {
             url,
@@ -474,25 +476,26 @@ impl OriginHls {
             }
         }
         let opened_at = Instant::now();
-        let mut response = http_fetch::open_resource(
-            &url,
-            self.policy,
-            FetchLimits {
-                connect_timeout: Duration::from_secs(5),
-                headers_timeout: REQUEST_TIMEOUT,
-                source_response: true,
-            },
+        let limits = FetchLimits {
+            connect_timeout: Duration::from_secs(5),
+            headers_timeout: REQUEST_TIMEOUT,
+            source_response: true,
+        };
+        let mut response = if kind == ResourceKind::Playlist {
             // Playlists are rewritten representations; byte offsets on the origin
             // cannot address them. HTTP permits ignoring a valid Range and returning
             // the entire representation (FFmpeg sends bytes=0- while probing).
-            if kind == ResourceKind::Playlist {
-                None
-            } else {
-                range
-            },
-            session.cancel.subscribe(),
-        )
-        .await
+            http_fetch::open_playlist_resource(
+                &url,
+                self.policy,
+                limits,
+                session.cancel.subscribe(),
+            )
+            .await
+        } else {
+            http_fetch::open_resource(&url, self.policy, limits, range, session.cancel.subscribe())
+                .await
+        }
         .map_err(|error| {
             if error == FetchError::InvalidSourceConfig && range.is_some() {
                 OriginError::InvalidRange
@@ -528,6 +531,18 @@ impl OriginHls {
             if range_length(content_range).is_none_or(|length| length != bytes.len() as u64) {
                 return Err(OriginError::Fetch(FetchError::BodyFailed));
             }
+        }
+        if response.content_encoding == http_fetch::ResourceEncoding::Gzip {
+            let decode_deadline = deadline.min(response.deadline);
+            bytes = compression::decode_gzip(&bytes, limit, || {
+                if *session.cancel.borrow() {
+                    Err(OriginError::Cancelled)
+                } else if Instant::now() >= decode_deadline {
+                    Err(OriginError::Timeout)
+                } else {
+                    Ok(())
+                }
+            })?;
         }
         let body = if kind == ResourceKind::Playlist {
             if response.status != 200 {
