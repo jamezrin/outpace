@@ -15,15 +15,15 @@ Ace Stream swarms.
 **Not in scope**, unless an issue explicitly narrows it:
 - premium or encrypted content;
 - accounts, a web UI, EPG, or catalog and playlist management. Stream search is limited to the
-  optional [service-backed adapter](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search);
+  optional [service-backed adapter](https://github.com/outpace-stream/outpace-engine/wiki/Stream-Search);
 - full parity with the closed engine's API.
 
 Contributions in those areas won't be accepted.
 
 ## Reporting a bug
 
-Open a [bug report](https://github.com/jamezrin/outpace-stream/issues/new?template=bug_report.yml)
-(or the [performance form](https://github.com/jamezrin/outpace-stream/issues/new?template=performance.yml)
+Open a [bug report](https://github.com/outpace-stream/outpace-engine/issues/new?template=bug_report.yml)
+(or the [performance form](https://github.com/outpace-stream/outpace-engine/issues/new?template=performance.yml)
 for slow startup, stutter, CPU or memory). The form asks for:
 
 - `outpace --version`, and whether you run a release, the `edge` image (with its `sha-` tag) or
@@ -42,25 +42,25 @@ for slow startup, stutter, CPU or memory). The form asks for:
 - Remove stream and channel names, source URLs and tokens, and IP addresses.
 - If the specific stream matters, the maintainer will arrange a private channel.
 
-The wiki's [bug report checklist](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting#reporting-a-bug)
+The wiki's [bug report checklist](https://github.com/outpace-stream/outpace-engine/wiki/Troubleshooting#reporting-a-bug)
 includes commands to mask ids in a log and a `/status` snapshot.
 
 ## Asking a question
 
-Ask questions in [Discussions](https://github.com/jamezrin/outpace-stream/discussions), under
+Ask questions in [Discussions](https://github.com/outpace-stream/outpace-engine/discussions), under
 Q&A, rather than in an issue. Rough ideas that need discussion before they're a concrete
 request can go under Ideas. The same identifier rules apply there.
 
 ## Requesting a feature
 
-For feature ideas, use the [feature request](https://github.com/jamezrin/outpace-stream/issues/new?template=feature_request.yml)
+For feature ideas, use the [feature request](https://github.com/outpace-stream/outpace-engine/issues/new?template=feature_request.yml)
 form and describe the problem you're trying to solve before the solution.
 
 ## Security issues
 
 Please don't post exploit details publicly, in issues, discussions or pull requests. Report
 vulnerabilities privately through
-[GitHub private vulnerability reporting](https://github.com/jamezrin/outpace-stream/security/advisories/new).
+[GitHub private vulnerability reporting](https://github.com/outpace-stream/outpace-engine/security/advisories/new).
 See the [security policy](SECURITY.md).
 
 ## Setting up
@@ -69,7 +69,7 @@ You need the Rust toolchain pinned in `rust-toolchain.toml` (rustup installs it 
 and a C toolchain.
 
 ```bash
-git clone https://github.com/jamezrin/outpace-stream.git outpace
+git clone https://github.com/outpace-stream/outpace-engine.git outpace
 cd outpace
 git config core.hooksPath .githooks   # enable the identifier-hygiene pre-commit hook
 cargo build --locked -p ace-engine --bin outpace
@@ -169,7 +169,7 @@ a genuine non-identifier hash, such as a test-fixture digest, add it to
 ## Documentation
 
 - **User docs** live in [`docs/wiki/`](docs/wiki) and are published to the
-  [GitHub wiki](https://github.com/jamezrin/outpace-stream/wiki) automatically on merge. Edit them
+  [GitHub wiki](https://github.com/outpace-stream/outpace-engine/wiki) automatically on merge. Edit them
   there, not in the wiki web UI, which is overwritten.
   - Pages use GitHub-wiki conventions: dashed page names, and links written `[text](Page-Name)`.
   - Mark features that aren't in a release yet as **Unreleased**.

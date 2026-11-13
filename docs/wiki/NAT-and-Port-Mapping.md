@@ -30,7 +30,7 @@ outpace serve
 
 # docker run: set the listener and publish the same port
 docker run -d --name outpace -e OUTPACE_PEER_LISTEN=0.0.0.0:8622 -p 8622:8622/tcp \
-  -p 127.0.0.1:6878:6878 -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.1
+  -p 127.0.0.1:6878:6878 -v outpace-data:/var/lib/outpace ghcr.io/outpace-stream/outpace-engine:1.0.1
 ```
 
 Then forward external TCP 8622 to port 8622 on the host. The provided `compose.yml` fixes both

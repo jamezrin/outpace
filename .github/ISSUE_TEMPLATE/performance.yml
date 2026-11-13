@@ -7,7 +7,7 @@ body:
       value: |
         Performance is treated as seriously as correctness, and a regression is a bug. Numbers make these reports actionable, even rough ones.
 
-        **Never include stream identifiers.** Remove content ids, infohashes, stream names, source URLs, tokens and IP addresses. Where a hex id is needed, write `0123456789abcdef0123456789abcdef01234567`. See [Reporting a bug](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting#reporting-a-bug) for redaction commands.
+        **Never include stream identifiers.** Remove content ids, infohashes, stream names, source URLs, tokens and IP addresses. Where a hex id is needed, write `0123456789abcdef0123456789abcdef01234567`. See [Reporting a bug](https://github.com/outpace-stream/outpace-engine/wiki/Troubleshooting#reporting-a-bug) for redaction commands.
 
   - type: checkboxes
     id: preflight

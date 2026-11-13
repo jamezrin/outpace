@@ -33,7 +33,7 @@ docker run --rm \
   -e OUTPACE_SEED_STORE_BYTES=67108864 \
   -e OUTPACE_SESSION_BUFFER=64 \
   -v outpace-data:/var/lib/outpace \
-  ghcr.io/jamezrin/outpace:latest serve
+  ghcr.io/outpace-stream/outpace-engine:latest serve
 ```
 
 The current inbound peer listener is TCP; it does not bind UDP port 8621, so an ARMv7 deployment

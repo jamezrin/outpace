@@ -15,7 +15,7 @@ See [Releases and Versions](Releases-and-Versions) for which features are in whi
 ## Release binaries
 
 Every release publishes archives named `outpace-<version>-<target>.<ext>` and one `SHA256SUMS`
-file on the [releases page](https://github.com/jamezrin/outpace-stream/releases).
+file on the [releases page](https://github.com/outpace-stream/outpace-engine/releases).
 
 | Platform | Target | Archive |
 | --- | --- | --- |
@@ -39,7 +39,7 @@ the table above:
 version=1.0.1
 target=x86_64-unknown-linux-musl   # e.g. aarch64-apple-darwin on Apple silicon
 artifact="outpace-${version}-${target}.tar.gz"
-base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
+base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
 curl -LO "${base}/${artifact}"
 curl -LO "${base}/SHA256SUMS"
 awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
@@ -67,7 +67,7 @@ In Termux:
 pkg install curl
 version=1.0.1
 artifact="outpace-${version}-aarch64-linux-android.tar.gz"
-base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
+base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
 curl -LO "${base}/${artifact}" && curl -LO "${base}/${artifact}.sha256"
 sha256sum -c "${artifact}.sha256" && tar -xzf "$artifact"
 install -m 0755 "outpace-${version}-aarch64-linux-android/outpace" "$PREFIX/bin/outpace"
@@ -81,20 +81,24 @@ outpace serve
 - Android may still stop background apps. Disable battery optimisation for Termux if streams
   stop when the screen is off.
 
+The [Android companion app](Android-App) is developed separately; signed APKs are not yet
+published. The Termux instructions above remain the available installation route.
+
 ### Homebrew and Scoop
 
-This repository works as a Homebrew tap (macOS, and Linux on x86_64 or ARM64) and as a Scoop
-bucket (Windows x86_64 and ARM64). Both install the newest release, verified against its
-`SHA256SUMS`:
+Package catalogs live in separate repositories: [Homebrew](https://github.com/outpace-stream/homebrew-outpace)
+(macOS and Linux on x86_64 or ARM64) and [Scoop](https://github.com/outpace-stream/scoop-outpace)
+(Windows x86_64 and ARM64). They install the release selected by the catalog, verified against
+its published `SHA256SUMS`:
 
 ```bash
-brew tap jamezrin/outpace https://github.com/jamezrin/outpace-stream
-brew install jamezrin/outpace/outpace
+brew tap outpace-stream/outpace
+brew install outpace-stream/outpace/outpace
 brew services start outpace      # optional: run in the background (launchd or systemd)
 ```
 
 ```powershell
-scoop bucket add outpace https://github.com/jamezrin/outpace-stream
+scoop bucket add outpace https://github.com/outpace-stream/scoop-outpace
 scoop install outpace/outpace
 ```
 
@@ -102,6 +106,22 @@ scoop install outpace/outpace
   `$(brew --prefix)/var/log/outpace.log`.
 - Upgrade with `brew upgrade outpace` or `scoop update outpace`. The formula and manifest are
   updated shortly after each release, so a brand-new release can take a little while to appear.
+
+If you installed through the previous engine-repository tap or bucket, switch catalogs once:
+
+```bash
+brew tap outpace-stream/outpace
+brew uninstall jamezrin/outpace/outpace
+brew untap jamezrin/outpace
+brew install outpace-stream/outpace/outpace
+# If you used brew services, stop the old service first and start the new one afterward.
+```
+
+```powershell
+scoop bucket rm outpace
+scoop bucket add outpace https://github.com/outpace-stream/scoop-outpace
+scoop update
+```
 
 ### Debian, Ubuntu and Fedora packages
 
@@ -158,18 +178,36 @@ which proves that this repository's release workflow built the archive from the 
 With the [GitHub CLI](https://cli.github.com):
 
 ```bash
-gh attestation verify "$artifact" --repo jamezrin/outpace-stream
+gh attestation verify "$artifact" --repo outpace-stream/outpace-engine
 ```
 
 The `.deb` and `.rpm` packages are attested the same way.
 
+Releases v1.0.0 and v1.0.1 were built before the organization migration. GitHub's repository
+attestation lookup currently returns 404 for these historical bundles after the transfer;
+changing `--repo` to the old URL does not fix the lookup. Fetch the bundle from the original
+owner and verify against the original signed repository identity instead:
+
+```bash
+digest=$(sha256sum "$artifact" | cut -d ' ' -f1)
+gh api "users/jamezrin/attestations/sha256:$digest" \
+  --jq '.attestations[].bundle | tojson' > attestation.jsonl
+gh attestation verify "$artifact" --bundle attestation.jsonl --repo jamezrin/outpace-stream
+```
+
+This verifies the historical signature and artifact digest, using the repository name recorded
+at build time. It does not assert current ownership of that old name. The procedure was
+verified against the v1.0.1 Linux x86_64 archive during migration.
+
 The same works for release images, including the `-minimal` ones, by tag or digest:
 
 ```bash
-gh attestation verify oci://ghcr.io/jamezrin/outpace:<version> --repo jamezrin/outpace-stream
+gh attestation verify oci://ghcr.io/outpace-stream/outpace-engine:<version> --repo outpace-stream/outpace-engine
 ```
 
-`edge` images and v0.9.0 and older releases have no attestations.
+`edge` images and v0.9.0 and older releases have no attestations. Existing images at
+`ghcr.io/jamezrin/outpace` remain available; their provenance refers to the old repository.
+New images use `ghcr.io/outpace-stream/outpace-engine`.
 
 ### ARM, RISC-V and small devices
 
@@ -198,7 +236,7 @@ one (for example some Asahi Linux or Raspberry Pi 5 kernels), please report whet
 
 ## Container image
 
-The image is `ghcr.io/jamezrin/outpace`.
+The image is `ghcr.io/outpace-stream/outpace-engine`.
 
 | Tag | What it is | Architectures |
 | --- | --- | --- |
@@ -223,7 +261,7 @@ docker run -d --name outpace --restart unless-stopped \
   -p 127.0.0.1:1935:1935 \
   -p 8621:8621/tcp \
   -v outpace-data:/var/lib/outpace \
-  ghcr.io/jamezrin/outpace:1.0.1
+  ghcr.io/outpace-stream/outpace-engine:1.0.1
 ```
 
 Publish HTTP and RTMP on `127.0.0.1` unless a firewall or authenticating proxy protects them.
@@ -248,14 +286,14 @@ with no shell, package manager or `curl`. It is about a fifth of the size of the
 ### Docker Compose
 
 The repository's
-[`compose.yml`](https://github.com/jamezrin/outpace-stream/blob/main/compose.yml) and
-[`.env.example`](https://github.com/jamezrin/outpace-stream/blob/main/.env.example) give you a
+[`compose.yml`](https://github.com/outpace-stream/outpace-engine/blob/main/compose.yml) and
+[`.env.example`](https://github.com/outpace-stream/outpace-engine/blob/main/.env.example) give you a
 production layout with a health check, log rotation and safe port bindings:
 
 ```bash
-curl -LO https://raw.githubusercontent.com/jamezrin/outpace-stream/main/compose.yml
-curl -L -o .env https://raw.githubusercontent.com/jamezrin/outpace-stream/main/.env.example
-# edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/jamezrin/outpace:1.0.1
+curl -LO https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/compose.yml
+curl -L -o .env https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/.env.example
+# edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/outpace-stream/outpace-engine:1.0.1
 docker compose up -d --wait
 ```
 
@@ -269,7 +307,7 @@ macOS) and [rustup](https://rustup.rs). The repository pins its Rust version in
 `rust-toolchain.toml`, and rustup installs it automatically.
 
 ```bash
-git clone https://github.com/jamezrin/outpace-stream.git outpace
+git clone https://github.com/outpace-stream/outpace-engine.git outpace
 cd outpace
 git checkout v1.0.1          # or stay on main for the newest features
 cargo build --release --locked -p ace-engine --bin outpace
@@ -324,7 +362,7 @@ If you turn normalisation on:
 - The published image doesn't contain FFmpeg. Build a derived image, for example:
 
 ```dockerfile
-FROM ghcr.io/jamezrin/outpace:1.0.1
+FROM ghcr.io/outpace-stream/outpace-engine:1.0.1
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*

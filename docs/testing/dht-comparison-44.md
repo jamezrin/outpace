@@ -176,7 +176,7 @@ crate relies on.
 
 ## Recommended follow-up
 
-Tracked in [#384](https://github.com/jamezrin/outpace-stream/issues/384).
+Tracked in [#384](https://github.com/outpace-stream/outpace-engine/issues/384).
 
 Change the custom walk's pacing so that `discover_peers_with_options` keeps its
 semantics but gets faster. Two concrete options:
@@ -218,6 +218,6 @@ The custom walk's 24 datagrams show that the conservative footprint is worth kee
   monitor existed yet, so an address added and removed during the run is not ruled
   out. Blocks now refuse admission when the host owns such an address, and any
   change during a block makes it inconclusive
-  ([#391](https://github.com/jamezrin/outpace-stream/issues/391) tracks prevention).
+  ([#391](https://github.com/outpace-stream/outpace-engine/issues/391) tracks prevention).
   None of these changes alters the lookups' network path, so the measured results
   stand.

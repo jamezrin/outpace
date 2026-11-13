@@ -2,7 +2,7 @@ name: outpace
 
 services:
   outpace:
-    image: ${OUTPACE_IMAGE:-ghcr.io/jamezrin/outpace:latest}
+    image: ${OUTPACE_IMAGE:-ghcr.io/outpace-stream/outpace-engine:latest}
     restart: unless-stopped
     environment:
       # Listeners bind inside the container; host exposure is controlled by ports below.

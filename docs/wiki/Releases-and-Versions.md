@@ -10,27 +10,27 @@
   match it.
 
 The latest published release is **v1.0.1**, a patch release on top of 1.0.0. See the
-[GitHub Release](https://github.com/jamezrin/outpace-stream/releases/tag/v1.0.1) for downloads,
-the [1.0.1 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/1.0.1.md)
+[GitHub Release](https://github.com/outpace-stream/outpace-engine/releases/tag/v1.0.1) for downloads,
+the [1.0.1 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.1.md)
 for its fixes, and the
-[1.0.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/1.0.0.md)
+[1.0.0 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.0.md)
 for scope, upgrades and validation limits.
 
 ## Where to find release notes
 
-- **GitHub Releases:** <https://github.com/jamezrin/outpace-stream/releases>. Each release lists
+- **GitHub Releases:** <https://github.com/outpace-stream/outpace-engine/releases>. Each release lists
   its downloads and generated change notes.
 - **Curated notes:** for releases that have them, in
-  [`docs/releases/`](https://github.com/jamezrin/outpace-stream/tree/main/docs/releases)
+  [`docs/releases/`](https://github.com/outpace-stream/outpace-engine/tree/main/docs/releases)
   (including `1.0.0.md` and `1.0.1.md`).
-- **Milestones:** <https://github.com/jamezrin/outpace-stream/milestones> track what each
+- **Milestones:** <https://github.com/outpace-stream/outpace-engine/milestones> track what each
   version covers.
 
 ## Which version am I running?
 
 ```bash
 outpace --version
-docker run --rm ghcr.io/jamezrin/outpace:1.0.1 --version
+docker run --rm ghcr.io/outpace-stream/outpace-engine:1.0.1 --version
 curl "http://127.0.0.1:6878/server/api?method=get_version"   # needs OUTPACE_ACE_COMPAT=1
 ```
 
@@ -41,7 +41,7 @@ curl "http://127.0.0.1:6878/server/api?method=get_version"   # needs OUTPACE_ACE
 preparation this can be the upcoming version before that release is published. To find out exactly which commit an `edge` image contains:
 
 ```bash
-docker image inspect ghcr.io/jamezrin/outpace:edge \
+docker image inspect ghcr.io/outpace-stream/outpace-engine:edge \
   --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
 ```
 
@@ -122,7 +122,7 @@ These changes are included in 1.0.0; they are absent from v0.9.0:
 
 ## v0.9.0 highlights
 
-From the [0.9.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/0.9.0.md):
+From the [0.9.0 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/0.9.0.md):
 
 - better live protocol compatibility, and serving only complete, verified pieces;
 - an optional daemon-wide cap on concurrent sources (`OUTPACE_MAX_SESSIONS`);
@@ -130,7 +130,7 @@ From the [0.9.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs
 
 The 0.9.0 notes describe the evidence available at that release. Since then, the reviewed
 7,500-second matched comparison completed with more than 7,200 sampled active seconds per
-player, and the maintainer recorded [production-replacement acceptance in #210](https://github.com/jamezrin/outpace-stream/issues/210#issuecomment-6827431678).
+player, and the maintainer recorded [production-replacement acceptance in #210](https://github.com/outpace-stream/outpace-engine/issues/210#issuecomment-6827431678).
 That acceptance is not a new passing soak of every later commit. Latency to live against the
 reference remains unmeasured; the historical reconnect stall was closed as inconclusive,
 not as causally fixed. See the 1.0.0 notes for the remaining limits.
@@ -147,16 +147,42 @@ broadcast subset. See the linked release notes for issue references and evidence
 
 ## Updating the Homebrew formula and Scoop manifest
 
-Homebrew and Scoop definitions now target 1.0.1 using its published checksums.
+The [Homebrew tap](https://github.com/outpace-stream/homebrew-outpace) and
+[Scoop bucket](https://github.com/outpace-stream/scoop-outpace) contain the catalogs, pinned to
+published release checksums. `packaging/` stays in the engine repository because it builds
+release packages and provides platform service/install files.
 
-`Formula/outpace.rb` and `bucket/outpace.json` point at a published release,
-because their checksums only exist once it's out. After publishing a release, a maintainer
-refreshes them and opens a PR:
+After publishing a release, clone both catalog repositories next to the engine checkout,
+create a topic branch in each, generate the manifests, and open a PR in each catalog:
 
 ```bash
-gh release download vX.Y.Z --pattern SHA256SUMS --dir /tmp/sums
-python3 tools/release/package_manifests.py vX.Y.Z /tmp/sums/SHA256SUMS
+gh repo clone outpace-stream/homebrew-outpace ../homebrew-outpace
+gh repo clone outpace-stream/scoop-outpace ../scoop-outpace
+git -C ../homebrew-outpace switch -c chore/update-outpace
+git -C ../scoop-outpace switch -c chore/update-outpace
+gh release download vX.Y.Z --repo outpace-stream/outpace-engine --pattern SHA256SUMS --dir /tmp/sums
+python3 tools/release/package_manifests.py vX.Y.Z /tmp/sums/SHA256SUMS \
+  --homebrew-root ../homebrew-outpace --scoop-root ../scoop-outpace
 ```
+
+The generator requires explicit destination directories; it does not create `Formula/` or
+`bucket/` inside the engine. Each catalog runs its own real-platform install checks.
+
+## Organization migration
+
+The engine repository moved from `jamezrin/outpace-stream` to
+`outpace-stream/outpace-engine`. GitHub redirects old repository links and Git remotes;
+update local remotes with `git remote set-url origin git@github.com:outpace-stream/outpace-engine.git`.
+The Android companion app is developed independently in
+[outpace-stream/outpace-android](https://github.com/outpace-stream/outpace-android).
+Its APK releases belong there; engine binaries remain in engine releases.
+
+Container publication now targets `ghcr.io/outpace-stream/outpace-engine`. Existing personal-
+namespace images at `ghcr.io/jamezrin/outpace` remain available for rollback. The initial
+organization image is v1.0.1; older image tags remain in the previous namespace. The binary
+name, configuration, data paths and release archive names have not changed. Before switching
+a deployment, verify the desired tag exists in the new namespace. See
+[Installation](Installation#verify-where-a-release-came-from) for historical attestation identity.
 
 ## Upgrading
 

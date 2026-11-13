@@ -211,9 +211,9 @@ debugging inbound peers.
 
 ## Reporting a bug
 
-Open a [bug report](https://github.com/jamezrin/outpace-stream/issues/new?template=bug_report.yml).
+Open a [bug report](https://github.com/outpace-stream/outpace-engine/issues/new?template=bug_report.yml).
 The form asks for everything below. For slow startup, stutter, CPU or memory problems, use the
-[performance form](https://github.com/jamezrin/outpace-stream/issues/new?template=performance.yml)
+[performance form](https://github.com/outpace-stream/outpace-engine/issues/new?template=performance.yml)
 instead. A report should include:
 
 - `outpace --version`, and whether you use a release, `edge` (with its `sha-` tag) or your own
@@ -255,6 +255,6 @@ lines, IPv6 addresses or base32 magnet links.
 
 ## More questions
 
-Ask in [Discussions](https://github.com/jamezrin/outpace-stream/discussions). See the
+Ask in [Discussions](https://github.com/outpace-stream/outpace-engine/discussions). See the
 [FAQ](FAQ) for common questions: do you need the official engine, Docker, VLC,
 Jellyfin and Dispatcharr, broadcasting, and the differences from the official engine.

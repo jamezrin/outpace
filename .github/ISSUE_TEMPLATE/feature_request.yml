@@ -7,9 +7,9 @@ body:
       value: |
         Thanks for the idea. Describe the problem first: a clear problem often has a better solution than the first one that comes to mind.
 
-        For a rough idea you'd like to discuss first, start a thread in [Ideas](https://github.com/jamezrin/outpace-stream/discussions/categories/ideas) instead.
+        For a rough idea you'd like to discuss first, start a thread in [Ideas](https://github.com/outpace-stream/outpace-engine/discussions/categories/ideas) instead.
 
-        Check the [scope](https://github.com/jamezrin/outpace-stream/blob/main/CONTRIBUTING.md#scope) before you start. Outpace targets public, unencrypted swarms, and requests outside the scope won't be accepted.
+        Check the [scope](https://github.com/outpace-stream/outpace-engine/blob/main/CONTRIBUTING.md#scope) before you start. Outpace targets public, unencrypted swarms, and requests outside the scope won't be accepted.
 
         Don't include content ids, infohashes, stream names or source URLs. Use `0123456789abcdef0123456789abcdef01234567` wherever an id is needed.
 

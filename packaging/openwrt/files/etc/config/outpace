@@ -1,6 +1,6 @@
 # Outpace on OpenWrt. Apply changes with: /etc/init.d/outpace restart
 # Every OUTPACE_* setting is documented at
-# https://github.com/jamezrin/outpace-stream/wiki/Environment-Variables
+# https://github.com/outpace-stream/outpace-engine/wiki/Environment-Variables
 
 config outpace 'main'
 	# Set to 1 to start Outpace at boot (/etc/init.d/outpace enable && start).

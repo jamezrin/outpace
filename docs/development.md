@@ -13,7 +13,7 @@ Contributor notes: the local gate, live-network testing, the Rust API surface an
 - [`superpowers/plans/`](superpowers/plans/) and [`superpowers/specs/`](superpowers/specs/): implementation plans and design specs, kept as historical records.
 - [`wiki/`](wiki/): the user wiki source, published to the GitHub wiki.
 
-GitHub [milestones](https://github.com/jamezrin/outpace-stream/milestones) track release scope; [#212](https://github.com/jamezrin/outpace-stream/issues/212) records the permanent non-goals and compatibility scope.
+GitHub [milestones](https://github.com/outpace-stream/outpace-engine/milestones) track release scope; [#212](https://github.com/outpace-stream/outpace-engine/issues/212) records the permanent non-goals and compatibility scope.
 
 ## Status and the local gate
 
@@ -108,11 +108,12 @@ does not match `v<cargo_version>`, so artifact names and image tags agree with C
 
 Inspect the final workflow status and verify exact assets/checksums, image manifests and version
 output. Packaging success does not prove playback acceptance. After publication, refresh
-Homebrew/Scoop definitions using `tools/release/package_manifests.py` with the actual published
-`SHA256SUMS`; switch the active `.env.example` pin and remove preparation caveats from the
+Homebrew/Scoop definitions in `outpace-stream/homebrew-outpace` and `outpace-stream/scoop-outpace`
+using `tools/release/package_manifests.py` with the actual published `SHA256SUMS` and explicit
+`--homebrew-root` / `--scoop-root` checkout directories (see the wiki release guide); switch the active `.env.example` pin and remove preparation caveats from the
 README/wiki. Keep the previous release available for rollback; never move a published tag.
 
 Pushes to `main` run `.github/workflows/edge.yml`, which publishes
-`ghcr.io/jamezrin/outpace:edge` and `ghcr.io/jamezrin/outpace:sha-<commit>` for
+`ghcr.io/outpace-stream/outpace-engine:edge` and `ghcr.io/outpace-stream/outpace-engine:sha-<commit>` for
 `linux/amd64` only. `edge` moves with `main`. Keep production pinned to a
 release tag.
