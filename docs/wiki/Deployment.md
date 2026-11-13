@@ -123,7 +123,8 @@ startup buffer (up to 128 MiB), seeding store, HLS window and timeshift budget, 
 
 ## systemd
 
-From v1.0.0, the [`.deb` and `.rpm` packages](Installation#debian-ubuntu-and-fedora-packages)
+The [AUR packages](Installation#arch-linux-aur) and, from v1.0.0, the
+[`.deb` and `.rpm` packages](Installation#debian-ubuntu-and-fedora-packages)
 set all of this up: edit `/etc/outpace/outpace.env` and run `systemctl enable --now outpace`. The
 unit they ship is
 [`packaging/linux/outpace.service`](https://github.com/outpace-stream/outpace-engine/blob/main/packaging/linux/outpace.service),

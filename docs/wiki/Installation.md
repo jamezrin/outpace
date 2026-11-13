@@ -127,6 +127,58 @@ scoop bucket add outpace https://github.com/outpace-stream/scoop-outpace
 scoop update
 ```
 
+### Arch Linux (AUR)
+
+Two packages are available in the Arch User Repository:
+
+- [outpace-bin](https://aur.archlinux.org/packages/outpace-bin) installs the official
+  release binary, verified against its published SHA-256 checksum.
+- [outpace-git](https://aur.archlinux.org/packages/outpace-git) builds from Git. Each build
+  selects the highest stable `vX.Y.Z` tag fetched from upstream, excluding prereleases and
+  untagged commits. Its AUR version records the last published package metadata; rebuild
+  it to pick up a newer release tag. It uses the upstream lockfile and the optimised
+  `dist` profile, and runs the offline workspace tests. Arch's Rust package supplies the
+  compiler; when using rustup instead, the repository's pinned toolchain applies.
+
+Choose one; they provide the same `outpace` command and conflict with each other. Both also
+conflict with `acestream-engine`, including packages that provide that name, so pacman
+requires removing the original engine before installing Outpace. Outpace does not declare
+that it provides `acestream-engine`; applications requiring the original package may need
+separate configuration. With an AUR helper already installed:
+
+```bash
+yay -S outpace-bin          # official binary
+# or: yay -S outpace-git    # compile the latest stable Git tag
+```
+
+To install manually, first install Arch's `base-devel` group and `git`, then clone and
+review the recipe before running `makepkg` as a regular user:
+
+```bash
+git clone https://aur.archlinux.org/outpace-bin.git
+cd outpace-bin
+less PKGBUILD
+makepkg -si
+```
+
+Use `outpace-git.git` instead to build from source. Both recipes support x86_64, aarch64,
+ARMv7 hard-float (`armv7h`), ARMv6 hard-float (`armv6h`) and RISC-V 64 (`riscv64`), including
+compatible Arch derivatives. FFmpeg is optional for audio normalisation and media processing.
+
+Both packages install `/usr/bin/outpace`, a systemd unit, a system-user definition and
+`/etc/outpace/outpace.env`. They do not enable or start the service automatically:
+
+```bash
+sudoedit /etc/outpace/outpace.env
+sudo systemctl enable --now outpace
+```
+
+The service runs as `outpace`, with data in `/var/lib/outpace`. HTTP and RTMP bind to
+loopback by default. Pacman preserves edited configuration on upgrade and saves it as
+`outpace.env.pacsave` on removal; the system user and service data remain. Service lifecycle
+handling uses Arch's standard systemd package hooks. See [Deployment](Deployment#systemd)
+for service hardening and configuration.
+
 ### Debian, Ubuntu and Fedora packages
 
 From v1.0.0, each release also has `.deb` and `.rpm` packages for x86_64, ARM64 and
