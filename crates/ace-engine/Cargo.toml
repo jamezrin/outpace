@@ -32,6 +32,9 @@ tower = { version = "0.5", features = ["util"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+form_urlencoded = "1"
+# Native service request/response signatures (fixed protocol compatibility algorithm).
+sha1 = "0.11"
 dirs = "7"
 rand = "0.10"
 rtmp-rs = "0.6"
@@ -62,7 +65,6 @@ tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_support
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-sha1 = "0.11"
 ace-tracker = { path = "../ace-tracker" }
 
 [build-dependencies]

@@ -45,8 +45,9 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 - It does **not** play premium, encrypted or protected content. That is a permanent non-goal.
 - It is **not** a full clone of the closed engine. There are no accounts, subscriptions, web UI,
   EPG or general channel catalogues. The compatibility API is a documented subset.
-- [Stream-name search](Stream-Search) is planned as a separate, default-off services adapter
-  within v1.0.0. It is not available yet.
+- [Stream-name search](Stream-Search) is a separate, default-off external services adapter,
+  newer than v0.9.0. It needs no operator API key and uses external HTTP services; it does
+  not bundle a UI or catalog.
 - It is not a recorder or DVR. The optional [Timeshift](Timeshift) buffer lives in memory and
   disappears on restart.
 
@@ -68,6 +69,7 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 | Open your peer port through a router | [NAT and Port Mapping](NAT-and-Port-Mapping) |
 | Restrict peers to an allowlist | [Private Peer Mode](Private-Peer-Mode) |
 | Run it as a service, in Docker or behind a proxy | [Deployment](Deployment) |
+| Run it on a router, NAS or Raspberry Pi | [Routers and Small Devices](Routers-and-Small-Devices) |
 | Replace an existing AceStream engine | [Migrating from AceStream Engine](Migrating-from-AceStream-Engine) |
 | Keep sources warm and monitor the daemon | [Support Sources and Operations](Support-Sources-and-Operations) |
 | Fix a problem or read the logs | [Troubleshooting](Troubleshooting) |

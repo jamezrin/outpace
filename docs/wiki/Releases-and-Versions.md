@@ -50,6 +50,7 @@ build.
 | --- | --- | --- | --- |
 | `X.Y.Z` (e.g. `0.9.0`) | No | amd64, arm64, arm/v7 | Production. Pin this. |
 | `latest` | With each release | amd64, arm64, arm/v7 | Trying the newest release. |
+| `X.Y.Z-minimal`, `minimal` | Like `X.Y.Z` and `latest` | amd64, arm64, arm/v7 | Smaller `scratch` image (next release on). |
 | `edge` | With every merge to `main` | amd64 | Testing unreleased features. |
 | `sha-<commit>` | No | amd64 | Pinning one specific `main` build. |
 
@@ -73,6 +74,17 @@ These are merged into `main` (and so in `edge`), but aren't in v0.9.0:
   `/support`).
 - A best-effort Android (`aarch64-linux-android`) binary for Termux; see
   [Installation](Installation#android-with-termux-best-effort).
+- An OpenWrt procd service and installer; see [Routers and Small Devices](Routers-and-Small-Devices#openwrt).
+- `.deb` and `.rpm` packages with a systemd unit; see
+  [Installation](Installation#debian-ubuntu-and-fedora-packages).
+- A minimal `scratch` image (`X.Y.Z-minimal`) and the
+  [`outpace healthcheck`](Command-Line#outpace-healthcheck) command.
+- A FreeBSD x86_64 release binary; see
+  [Installation](Installation#freebsd-and-other-bsds).
+- Signed build provenance for release archives and images, checked with
+  `gh attestation verify` (see [Installation](Installation#verify-where-a-release-came-from)).
+- Release binaries for ARMv6 hard-float (`arm-unknown-linux-musleabihf`) and RISC-V 64
+  (`riscv64gc-unknown-linux-musl`); see [Installation](Installation#release-binaries).
 
 **Fixes you'll notice**
 
@@ -97,6 +109,17 @@ From the [0.9.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs
 
 The notes also say plainly that 0.9.0 isn't a production sign-off. Long-running playback
 stability is still being investigated.
+
+## Updating the Homebrew formula and Scoop manifest
+
+`Formula/outpace.rb` and `bucket/outpace.json` always point at the newest published release,
+because their checksums only exist once it's out. After publishing a release, a maintainer
+refreshes them and opens a PR:
+
+```bash
+gh release download vX.Y.Z --pattern SHA256SUMS --dir /tmp/sums
+python3 tools/release/package_manifests.py vX.Y.Z /tmp/sums/SHA256SUMS
+```
 
 ## Upgrading
 

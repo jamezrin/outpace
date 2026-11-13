@@ -1,0 +1,28 @@
+# Outpace on OpenWrt. Apply changes with: /etc/init.d/outpace restart
+# Every OUTPACE_* setting is documented at
+# https://github.com/jamezrin/outpace-stream/wiki/Environment-Variables
+
+config outpace 'main'
+	# Set to 1 to start Outpace at boot (/etc/init.d/outpace enable && start).
+	option enabled '0'
+
+	# HTTP API and RTMP ingest. Loopback by default; use the router's LAN address
+	# (for example 192.168.1.1:6878) to reach it from the LAN. Never expose it on WAN.
+	option bind '127.0.0.1:6878'
+	option rtmp_bind '127.0.0.1:1935'
+
+	# Identity and broadcast keys (small, rarely written; kept across sysupgrade).
+	option data_dir '/etc/outpace'
+
+	# Low-memory defaults for routers with 128-512 MiB of RAM. Raise them on bigger
+	# devices. With USB storage, a disk cache saves RAM:
+	#   option cache_type 'disk'
+	#   option cache_dir '/mnt/usb/outpace-cache'
+	option cache_type 'memory'
+	option seed_store_bytes '33554432'
+	option prebuffer_bytes '16777216'
+	option session_buffer '64'
+	option max_sessions '1'
+
+	# Any other setting, one NAME=value per line:
+	#   list env 'OUTPACE_ENABLE_SEEDING=0'
