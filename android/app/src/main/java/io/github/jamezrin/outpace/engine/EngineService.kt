@@ -99,7 +99,7 @@ class EngineService : Service() {
         val binary = EngineFiles.store(this).binary(version)
         val data = EngineFiles.dataDir(this).apply { mkdirs() }
         val cache = EngineFiles.cacheDir(this).apply { mkdirs() }
-        EngineController.update(EngineState.Starting, emptyList(), version)
+        EngineController.update(EngineState.Starting, emptyList(), version, settings)
         updateNotification()
         val proc = try {
             val command = Launch.command(Build.VERSION.SDK_INT, Launch.elfIs64(binary), binary.path)

@@ -334,7 +334,8 @@ jobs:
 
   best-effort-android-app:
     # The Android app APK. It bundles no engine, so it does not wait for the engine builds.
-    # Signed only when the release keystore secrets exist; otherwise the APK is unsigned.
+    # Android installs only signed APKs, and updates only with the same key, so without the
+    # release keystore secrets the job publishes nothing rather than an uninstallable APK.
     name: Best-effort Android app
     runs-on: ubuntu-24.04
     needs:
@@ -367,20 +368,20 @@ jobs:
           OUTPACE_ANDROID_KEY_PASSWORD: ${{ secrets.OUTPACE_ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          suffix=unsigned
-          if [[ -n "$KEYSTORE_BASE64" ]]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            export OUTPACE_ANDROID_KEYSTORE="$RUNNER_TEMP/release.jks"
-            suffix=signed
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "::warning::OUTPACE_ANDROID_KEYSTORE_BASE64 is not set; skipping the Android app APK."
+            exit 0
           fi
+          trap 'rm -f "$RUNNER_TEMP/release.jks"' EXIT
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          export OUTPACE_ANDROID_KEYSTORE="$RUNNER_TEMP/release.jks"
           ./gradlew --no-daemon testDebugUnitTest assembleRelease -PappVersion="$VERSION"
+          apk=app/build/outputs/apk/release/app-release.apk
+          test -f "$apk"
           mkdir -p ../dist
-          apk="$(ls app/build/outputs/apk/release/*.apk | head -n1)"
           name="outpace-android-${VERSION}.apk"
-          [[ "$suffix" == unsigned ]] && name="outpace-android-${VERSION}-unsigned.apk"
           cp "$apk" "../dist/$name"
           (cd ../dist && sha256sum "$name" > "$name.sha256")
-          rm -f "$RUNNER_TEMP/release.jks"
 
       - name: Upload APK
         uses: actions/upload-artifact@v7
@@ -389,7 +390,7 @@ jobs:
           path: |
             dist/*.apk
             dist/*.apk.sha256
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 1
 
   upload-best-effort-android:

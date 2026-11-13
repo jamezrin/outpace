@@ -142,7 +142,7 @@ class MainActivity : Activity() {
             },
         )
         startStop.isEnabled = s != EngineState.Stopping
-        val settings = prefs.settings
+        val settings = EngineController.effectiveSettings(prefs.settings)
         val host = if (settings.lan) Device.lanAddress() ?: StreamUrls.LOOPBACK else StreamUrls.LOOPBACK
         url.text = getString(R.string.player_url, StreamUrls.base(host, settings.port))
         url.visibility = if (s == EngineState.Running) View.VISIBLE else View.GONE

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import io.github.jamezrin.outpace.core.EngineSettings
 import io.github.jamezrin.outpace.core.LogRing
 import io.github.jamezrin.outpace.core.StreamInfo
 import java.util.concurrent.CopyOnWriteArraySet
@@ -30,6 +31,10 @@ object EngineController {
         private set
 
     @Volatile var runningVersion: String? = null
+        private set
+
+    /** The settings the running engine started with; saved settings apply only after a restart. */
+    @Volatile var runningSettings: EngineSettings? = null
         private set
 
     private val main = Handler(Looper.getMainLooper())
@@ -58,19 +63,37 @@ object EngineController {
         visibleScreens = maxOf(0, visibleScreens - 1)
     }
 
-    internal fun update(state: EngineState? = null, streams: List<StreamInfo>? = null, version: String? = null, clearVersion: Boolean = false) {
+    internal fun update(
+        state: EngineState? = null,
+        streams: List<StreamInfo>? = null,
+        version: String? = null,
+        settings: EngineSettings? = null,
+        clearVersion: Boolean = false,
+    ) {
         if (state != null) this.state = state
         if (streams != null) this.streams = streams
         if (version != null) runningVersion = version
-        if (clearVersion) runningVersion = null
+        if (settings != null) runningSettings = settings
+        if (clearVersion) {
+            runningVersion = null
+            runningSettings = null
+        }
         notifyListeners()
     }
+
+    /** Settings that describe where the engine is reachable now: the running ones, else the saved ones. */
+    fun effectiveSettings(saved: EngineSettings): EngineSettings = runningSettings ?: saved
 
     internal fun notifyListeners() {
         main.post { listeners.forEach { it() } }
     }
 
-    fun start(context: Context) = send(context, EngineService.ACTION_START)
+    fun start(context: Context) {
+        // Mark the start now, so a waiter never mistakes an earlier crash for this attempt's result.
+        val s = state
+        if (s != EngineState.Running && s != EngineState.Starting) update(EngineState.Starting)
+        send(context, EngineService.ACTION_START)
+    }
 
     fun restart(context: Context) = send(context, EngineService.ACTION_RESTART)
 

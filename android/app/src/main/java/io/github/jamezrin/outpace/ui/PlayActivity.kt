@@ -98,7 +98,9 @@ class PlayActivity : Activity() {
         }
     }
 
-    private fun port() = Prefs(this).settings.port
+    private fun settings() = EngineController.effectiveSettings(Prefs(this).settings)
+
+    private fun port() = settings().port
 
     private fun localUrl(hls: Boolean): String {
         val hex = id ?: return ""
@@ -108,7 +110,7 @@ class PlayActivity : Activity() {
     /** For other devices: the LAN address when LAN access is on, else loopback with a hint. */
     private fun shareableUrl(): String {
         val hex = id ?: return ""
-        val settings = Prefs(this).settings
+        val settings = settings()
         val host = if (settings.lan) Device.lanAddress() else null
         if (host == null) toast(getString(R.string.play_lan_hint))
         return StreamUrls.live(host ?: StreamUrls.LOOPBACK, settings.port, hex)
