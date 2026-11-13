@@ -12,7 +12,7 @@
 **Watching**
 
 - [Playing Streams](Playing-Streams)
-- [Stream Search (planned)](Stream-Search)
+- [Stream Search](Stream-Search)
 - [HLS Output](HLS-Output)
 - [Timeshift](Timeshift)
 - [Managed HLS Origins](Managed-HLS-Origins)
@@ -27,6 +27,7 @@
 **Running it**
 
 - [Deployment](Deployment)
+- [Routers and Small Devices](Routers-and-Small-Devices)
 - [Migrating from AceStream Engine](Migrating-from-AceStream-Engine)
 - [Support Sources and Operations](Support-Sources-and-Operations)
 - [Troubleshooting](Troubleshooting)

@@ -11,9 +11,23 @@ prepare = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prepare)
 
 
+# A release asset set: the container's Linux archives plus other platforms' archives.
+TARGETS = {
+    "x86_64-unknown-linux-musl": "tar.gz",
+    "aarch64-unknown-linux-musl": "tar.gz",
+    "armv7-unknown-linux-musleabihf": "tar.gz",
+    "arm-unknown-linux-musleabihf": "tar.gz",
+    "riscv64gc-unknown-linux-musl": "tar.gz",
+    "x86_64-apple-darwin": "tar.gz",
+    "aarch64-apple-darwin": "tar.gz",
+    "x86_64-pc-windows-msvc": "zip",
+    "aarch64-pc-windows-msvc": "zip",
+}
+
+
 class PrepareTests(unittest.TestCase):
     def fixture(self, root, member_type=tarfile.REGTYPE):
-        for target, extension in prepare.TARGETS.items():
+        for target, extension in TARGETS.items():
             archive = root / f"outpace-0.3.0-{target}.{extension}"
             if target in prepare.LINUX:
                 with tarfile.open(archive, "w:gz") as tar:
@@ -48,14 +62,41 @@ class PrepareTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prepare.prepare("v0.3.0", root, root / "context")
 
-    def test_missing_target_rejected(self):
+    def test_missing_container_archive_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            (root / "outpace-0.3.0-aarch64-unknown-linux-musl.tar.gz").unlink()
+            self.checksums(root)
+            with self.assertRaises(ValueError):
+                prepare.prepare("v0.3.0", root, root / "context")
+
+    def test_listed_but_missing_asset_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.fixture(root)
             next(root.glob("*.zip")).unlink()
-            self.checksums(root)
             with self.assertRaises(ValueError):
                 prepare.prepare("v0.3.0", root, root / "context")
+
+    def test_smaller_older_target_set_accepted(self):
+        # Older releases have fewer non-container targets; republishing their image works.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            for archive in root.glob("*.zip"):
+                archive.unlink()
+            (root / "outpace-0.3.0-riscv64gc-unknown-linux-musl.tar.gz").unlink()
+            self.checksums(root)
+            prepare.prepare("v0.3.0", root, root / "context")
+
+    def test_unlisted_extra_asset_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            (root / "outpace-0.3.0-mipsel-unknown-linux-musl.tar.gz").write_bytes(b"late upload")
+            prepare.prepare("v0.3.0", root, root / "context")
+            self.assertFalse((root / "context" / "mipsel").exists())
 
     def test_symlink_binary_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -83,6 +124,21 @@ class PrepareTests(unittest.TestCase):
             self.checksums(root)
             with self.assertRaises(ValueError):
                 prepare.prepare("v0.3.0", root, root / "context")
+
+    def test_package_checksums_are_verified(self):
+        # SHA256SUMS also lists the .deb/.rpm packages; they are downloaded and checked too.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            package = root / "outpace_0.3.0_amd64.deb"
+            package.write_bytes(b"package")
+            digest = hashlib.sha256(b"package").hexdigest()
+            sums = root / "SHA256SUMS"
+            sums.write_text(sums.read_text() + f"{digest}  outpace_0.3.0_amd64.deb\n")
+            prepare.prepare("v0.3.0", root, root / "context")
+            package.write_bytes(b"tampered")
+            with self.assertRaises(ValueError):
+                prepare.prepare("v0.3.0", root, root / "context2")
 
     def test_invalid_tag_rejected(self):
         with self.assertRaises(ValueError):

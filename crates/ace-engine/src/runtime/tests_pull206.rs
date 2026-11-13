@@ -693,6 +693,7 @@ async fn private_runtime_local_vod_alias_delivers_allowed_peer_bytes_over_native
         resolve_content_ids_in_getstream: true,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: Some(broadcasts.clone()),
     };
@@ -819,6 +820,7 @@ async fn private_runtime_local_live_alias_delivers_authenticated_source_and_canc
         resolve_content_ids_in_getstream: true,
         ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
         experimental_ace_compat: false,
+        search: None,
         origin_hls: None,
         broadcasts: Some(broadcasts.clone()),
     };

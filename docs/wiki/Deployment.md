@@ -54,6 +54,18 @@ What the defaults give you:
 After changing `.env`, run `docker compose up -d --wait`. `docker compose restart` doesn't apply
 environment changes.
 
+The shipped health check runs `curl`, which the Debian images include. To use a
+[minimal image](Installation#minimal-image), which has no `curl`, override it in a
+`compose.override.yml`:
+
+```yaml
+services:
+  outpace:
+    image: ghcr.io/jamezrin/outpace:X.Y.Z-minimal
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/outpace", "healthcheck"]
+```
+
 ### Passing other settings
 
 `compose.yml` only forwards a fixed list of variables into the container (listed in
@@ -111,7 +123,13 @@ startup buffer (up to 128 MiB), seeding store, HLS window and timeshift budget, 
 
 ## systemd
 
-Create a user and an environment file:
+From the next release, the [`.deb` and `.rpm` packages](Installation#debian-ubuntu-and-fedora-packages)
+set all of this up: edit `/etc/outpace/outpace.env` and run `systemctl enable --now outpace`. The
+unit they ship is
+[`packaging/linux/outpace.service`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/linux/outpace.service),
+the same as below with the binary at `/usr/bin/outpace`.
+
+To set it up by hand, create a user and an environment file:
 
 ```bash
 sudo useradd --system --home-dir /var/lib/outpace --shell /usr/sbin/nologin outpace
@@ -160,6 +178,33 @@ journalctl -u outpace -f
 
 Logs go to standard error. Each line starts with a UTC time of day (`HH:MM:SS.mmm`), and the
 journal adds the date. Open TCP 8621 in your firewall if you run as a full participant.
+
+## FreeBSD rc.d
+
+From the next release, there is a FreeBSD binary (see
+[Installation](Installation#freebsd-and-other-bsds)). Run it under `daemon(8)`, which
+restarts it if it exits:
+
+```sh
+pw useradd outpace -d /var/db/outpace -s /usr/sbin/nologin
+install -d -o outpace -g outpace -m 0700 /var/db/outpace
+fetch -o /usr/local/etc/rc.d/outpace \
+  https://raw.githubusercontent.com/jamezrin/outpace-stream/main/packaging/freebsd/outpace
+chmod 0755 /usr/local/etc/rc.d/outpace
+sysrc outpace_enable=YES
+service outpace start
+```
+
+Run these as root. The script is
+[`packaging/freebsd/outpace`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/freebsd/outpace).
+`daemon(8)` stays root so it can write `/var/run/outpace.pid` and `/var/log/outpace.log`, and
+runs Outpace itself as `outpace`. To use another account, set `outpace_runas`, not
+`outpace_user`: `rc.subr` would run `daemon(8)` as that user too, and the start would fail.
+
+`daemon -P` stops the supervisor and the daemon together, so `service outpace stop` shuts
+Outpace down gracefully. To change settings, set `outpace_env` with `sysrc`, for example
+`sysrc outpace_env="OUTPACE_BIND=127.0.0.1:6878 OUTPACE_DATA_DIR=/var/db/outpace OUTPACE_CACHE_TYPE=disk"`,
+then restart.
 
 ## Behind a reverse proxy
 
@@ -233,8 +278,9 @@ To compare two engines behind one router, give each its own external peer port a
 ## Linux portability
 
 - Images: `linux/amd64`, `linux/arm64`, `linux/arm/v7` (releases); `edge` is `linux/amd64` only.
-- ARMv7 means hard-float ARMv7 such as Raspberry Pi 2/3. ARMv6 and soft-float aren't supported.
-  Expect fewer simultaneous streams; start with `OUTPACE_CACHE_TYPE=disk`,
+- ARMv7 means hard-float ARMv7 such as Raspberry Pi 2/3. From the next release there are also
+  ARMv6 hard-float and RISC-V 64 binaries (no image). Soft-float ARM isn't supported. On 32-bit
+  ARM expect fewer simultaneous streams; start with `OUTPACE_CACHE_TYPE=disk`,
   `OUTPACE_SEED_STORE_BYTES=67108864` and `OUTPACE_SESSION_BUFFER=64`.
 - On 32-bit systems each in-memory pool is capped at about 512 MiB. Disk caches can be larger.
 - ARM64 kernels with 16 KiB pages haven't been verified on real hardware.

@@ -6,3 +6,14 @@ resolver = "2"
 version = "0.9.0"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/jamezrin/outpace-stream"
+
+# Profile for published release binaries (release.yml). It trades a slower, single-unit
+# link-time-optimised build for a smaller and slightly faster binary, which matters on
+# routers and small boards. `cargo build --release`, the source Dockerfile and the edge
+# image keep the default release profile so their build times do not change.
+# panic stays "unwind": a panicking task must not abort the whole daemon.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
