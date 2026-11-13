@@ -1,0 +1,33 @@
+name: Documentation
+description: Something in the wiki, README or docs is wrong, missing or unclear.
+labels: ["documentation"]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page
+      description: Link to the wiki page or file, with the section if possible.
+      placeholder: https://github.com/jamezrin/outpace-stream/wiki/Configuration#live-recovery-advanced
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong or missing?
+      description: Quote the text if it's wrong, and say what actually happens. Don't include content ids, infohashes or stream names.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix
+      description: Optional wording or structure. Pull requests against `docs/wiki/` are welcome, since the wiki is published from there.
+
+  - type: input
+    id: version
+    attributes:
+      label: Outpace version
+      description: The `outpace --version` you compared the docs against, if the problem is about behaviour.
+      placeholder: outpace 1.0.1

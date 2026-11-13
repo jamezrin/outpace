@@ -1,0 +1,100 @@
+name: Performance problem
+description: Slow startup, stutter or latency, high CPU or memory, low throughput, or a larger binary.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance is treated as seriously as correctness, and a regression is a bug. Numbers make these reports actionable, even rough ones.
+
+        **Never include stream identifiers.** Remove content ids, infohashes, stream names, source URLs, tokens and IP addresses. Where a hex id is needed, write `0123456789abcdef0123456789abcdef01234567`. See [Reporting a bug](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting#reporting-a-bug) for redaction commands.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed content ids, infohashes, stream names, source URLs, tokens and IP addresses from everything in this report.
+          required: true
+        - label: The numbers come from a release build or a published image, not a debug (`cargo run` without `--release`) build.
+          required: true
+
+  - type: dropdown
+    id: metric
+    attributes:
+      label: What is worse than expected?
+      multiple: true
+      options:
+        - Startup time (time to first byte or first frame)
+        - Playback smoothness (stalls, stutter, gaps)
+        - Latency behind live
+        - Throughput or bitrate
+        - CPU use
+        - Memory use
+        - Disk or cache use
+        - Binary or image size
+    validations:
+      required: true
+
+  - type: textarea
+    id: measurement
+    attributes:
+      label: Measurements
+      description: What you measured, how, and the numbers. Before/after versions, or Outpace against another engine on the same machine and network at the same time, is the most useful form.
+      placeholder: |
+        Startup to first frame in mpv, 5 cold starts each, same stream, same machine:
+        - outpace 1.0.0: 22 s median
+        - outpace 1.0.1: 41 s median
+        Measured with: `time mpv --frames=1 ...`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Is this a regression?
+      options:
+        - Yes, an earlier version was better
+        - No, it has always been like this
+        - Don't know
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions compared
+      description: Output of `outpace --version` for each build, with the `edge` `sha-` tag or commit if applicable.
+      placeholder: 1.0.0 (good), 1.0.1 (bad)
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: How you run Outpace, OS and architecture, CPU and RAM, number of concurrent streams and viewers, player, and non-default `OUTPACE_*` settings.
+      placeholder: |
+        Docker Compose on Debian 12, x86_64, 4 cores, 8 GB RAM
+        2 streams, 1 viewer each, VLC 3.0.21
+        OUTPACE_CACHE_TYPE=disk
+    validations:
+      required: true
+
+  - type: textarea
+    id: stream_shape
+    attributes:
+      label: Stream characteristics
+      description: Without identifying the stream. Most values are in `/status`.
+      placeholder: |
+        - Live or VOD: live
+        - Advertised bitrate: ~6 Mbit/s
+        - Typical peer count: 10-20
+        - Reproduces on other streams: yes / only this one / didn't try
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or /status snapshots
+      description: Redacted. For startup, include the `[ace] discovery stage=...` and `[prebuffer]` lines. For memory, RSS over time is more useful than one reading.
+      render: text
