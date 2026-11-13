@@ -15,7 +15,7 @@ See [Releases and Versions](Releases-and-Versions) for which features are in whi
 ## Release binaries
 
 Every release publishes archives named `outpace-<version>-<target>.<ext>` and one `SHA256SUMS`
-file on the [releases page](https://github.com/jamezrin/outpace-stream/releases).
+file on the [releases page](https://github.com/outpace-stream/outpace-engine/releases).
 
 | Platform | Target | Archive |
 | --- | --- | --- |
@@ -39,7 +39,7 @@ the table above:
 version=1.0.1
 target=x86_64-unknown-linux-musl   # e.g. aarch64-apple-darwin on Apple silicon
 artifact="outpace-${version}-${target}.tar.gz"
-base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
+base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
 curl -LO "${base}/${artifact}"
 curl -LO "${base}/SHA256SUMS"
 awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
@@ -67,7 +67,7 @@ In Termux:
 pkg install curl
 version=1.0.1
 artifact="outpace-${version}-aarch64-linux-android.tar.gz"
-base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
+base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
 curl -LO "${base}/${artifact}" && curl -LO "${base}/${artifact}.sha256"
 sha256sum -c "${artifact}.sha256" && tar -xzf "$artifact"
 install -m 0755 "outpace-${version}-aarch64-linux-android/outpace" "$PREFIX/bin/outpace"
@@ -88,13 +88,13 @@ bucket (Windows x86_64 and ARM64). Both install the newest release, verified aga
 `SHA256SUMS`:
 
 ```bash
-brew tap jamezrin/outpace https://github.com/jamezrin/outpace-stream
-brew install jamezrin/outpace/outpace
+brew tap outpace-stream/outpace https://github.com/outpace-stream/outpace-engine
+brew install outpace-stream/outpace/outpace
 brew services start outpace      # optional: run in the background (launchd or systemd)
 ```
 
 ```powershell
-scoop bucket add outpace https://github.com/jamezrin/outpace-stream
+scoop bucket add outpace https://github.com/outpace-stream/outpace-engine
 scoop install outpace/outpace
 ```
 
@@ -158,7 +158,7 @@ which proves that this repository's release workflow built the archive from the 
 With the [GitHub CLI](https://cli.github.com):
 
 ```bash
-gh attestation verify "$artifact" --repo jamezrin/outpace-stream
+gh attestation verify "$artifact" --owner jamezrin --signer-repo jamezrin/outpace-stream
 ```
 
 The `.deb` and `.rpm` packages are attested the same way.
@@ -166,8 +166,13 @@ The `.deb` and `.rpm` packages are attested the same way.
 The same works for release images, including the `-minimal` ones, by tag or digest:
 
 ```bash
-gh attestation verify oci://ghcr.io/jamezrin/outpace:<version> --repo jamezrin/outpace-stream
+gh attestation verify oci://ghcr.io/jamezrin/outpace:<version> \
+  --owner jamezrin --signer-repo jamezrin/outpace-stream
 ```
+
+Releases up to v1.0.1 were built before the repository moved to the `outpace-stream`
+organisation, so their attestations are stored under the original `jamezrin` owner and name
+the old repository as signer. Use the commands above for them.
 
 `edge` images and v0.9.0 and older releases have no attestations.
 
@@ -248,13 +253,13 @@ with no shell, package manager or `curl`. It is about a fifth of the size of the
 ### Docker Compose
 
 The repository's
-[`compose.yml`](https://github.com/jamezrin/outpace-stream/blob/main/compose.yml) and
-[`.env.example`](https://github.com/jamezrin/outpace-stream/blob/main/.env.example) give you a
+[`compose.yml`](https://github.com/outpace-stream/outpace-engine/blob/main/compose.yml) and
+[`.env.example`](https://github.com/outpace-stream/outpace-engine/blob/main/.env.example) give you a
 production layout with a health check, log rotation and safe port bindings:
 
 ```bash
-curl -LO https://raw.githubusercontent.com/jamezrin/outpace-stream/main/compose.yml
-curl -L -o .env https://raw.githubusercontent.com/jamezrin/outpace-stream/main/.env.example
+curl -LO https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/compose.yml
+curl -L -o .env https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/.env.example
 # edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/jamezrin/outpace:1.0.1
 docker compose up -d --wait
 ```
@@ -269,7 +274,7 @@ macOS) and [rustup](https://rustup.rs). The repository pins its Rust version in
 `rust-toolchain.toml`, and rustup installs it automatically.
 
 ```bash
-git clone https://github.com/jamezrin/outpace-stream.git outpace
+git clone https://github.com/outpace-stream/outpace-engine.git outpace
 cd outpace
 git checkout v1.0.1          # or stay on main for the newest features
 cargo build --release --locked -p ace-engine --bin outpace

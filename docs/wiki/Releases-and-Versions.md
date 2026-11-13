@@ -10,20 +10,20 @@
   match it.
 
 The latest published release is **v1.0.1**, a patch release on top of 1.0.0. See the
-[GitHub Release](https://github.com/jamezrin/outpace-stream/releases/tag/v1.0.1) for downloads,
-the [1.0.1 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/1.0.1.md)
+[GitHub Release](https://github.com/outpace-stream/outpace-engine/releases/tag/v1.0.1) for downloads,
+the [1.0.1 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.1.md)
 for its fixes, and the
-[1.0.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/1.0.0.md)
+[1.0.0 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.0.md)
 for scope, upgrades and validation limits.
 
 ## Where to find release notes
 
-- **GitHub Releases:** <https://github.com/jamezrin/outpace-stream/releases>. Each release lists
+- **GitHub Releases:** <https://github.com/outpace-stream/outpace-engine/releases>. Each release lists
   its downloads and generated change notes.
 - **Curated notes:** for releases that have them, in
-  [`docs/releases/`](https://github.com/jamezrin/outpace-stream/tree/main/docs/releases)
+  [`docs/releases/`](https://github.com/outpace-stream/outpace-engine/tree/main/docs/releases)
   (including `1.0.0.md` and `1.0.1.md`).
-- **Milestones:** <https://github.com/jamezrin/outpace-stream/milestones> track what each
+- **Milestones:** <https://github.com/outpace-stream/outpace-engine/milestones> track what each
   version covers.
 
 ## Which version am I running?
@@ -41,7 +41,7 @@ curl "http://127.0.0.1:6878/server/api?method=get_version"   # needs OUTPACE_ACE
 preparation this can be the upcoming version before that release is published. To find out exactly which commit an `edge` image contains:
 
 ```bash
-docker image inspect ghcr.io/jamezrin/outpace:edge \
+docker image inspect ghcr.io/outpace-stream/outpace-engine:edge \
   --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
 ```
 
@@ -49,6 +49,10 @@ Every `edge` build is also tagged `sha-<full commit hash>`. Pin that tag if you 
 build.
 
 ## Image tags
+
+Images moved with the repository. `edge`, `sha-<commit>` and releases after v1.0.1 publish to
+`ghcr.io/outpace-stream/outpace-engine`. Releases up to v1.0.1 were published to
+`ghcr.io/jamezrin/outpace`, which keeps those tags but receives nothing new.
 
 | Tag | Moves? | Architectures | Use for |
 | --- | --- | --- | --- |
@@ -122,7 +126,7 @@ These changes are included in 1.0.0; they are absent from v0.9.0:
 
 ## v0.9.0 highlights
 
-From the [0.9.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/0.9.0.md):
+From the [0.9.0 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/0.9.0.md):
 
 - better live protocol compatibility, and serving only complete, verified pieces;
 - an optional daemon-wide cap on concurrent sources (`OUTPACE_MAX_SESSIONS`);
@@ -130,7 +134,7 @@ From the [0.9.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs
 
 The 0.9.0 notes describe the evidence available at that release. Since then, the reviewed
 7,500-second matched comparison completed with more than 7,200 sampled active seconds per
-player, and the maintainer recorded [production-replacement acceptance in #210](https://github.com/jamezrin/outpace-stream/issues/210#issuecomment-6827431678).
+player, and the maintainer recorded [production-replacement acceptance in #210](https://github.com/outpace-stream/outpace-engine/issues/210#issuecomment-6827431678).
 That acceptance is not a new passing soak of every later commit. Latency to live against the
 reference remains unmeasured; the historical reconnect stall was closed as inconclusive,
 not as causally fixed. See the 1.0.0 notes for the remaining limits.

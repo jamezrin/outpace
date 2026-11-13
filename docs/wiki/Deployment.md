@@ -25,7 +25,7 @@ So:
 ## Docker Compose
 
 The repository ships a production
-[`compose.yml`](https://github.com/jamezrin/outpace-stream/blob/main/compose.yml) with:
+[`compose.yml`](https://github.com/outpace-stream/outpace-engine/blob/main/compose.yml) with:
 
 - a non-root user;
 - a persistent named volume;
@@ -126,7 +126,7 @@ startup buffer (up to 128 MiB), seeding store, HLS window and timeshift budget, 
 From v1.0.0, the [`.deb` and `.rpm` packages](Installation#debian-ubuntu-and-fedora-packages)
 set all of this up: edit `/etc/outpace/outpace.env` and run `systemctl enable --now outpace`. The
 unit they ship is
-[`packaging/linux/outpace.service`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/linux/outpace.service),
+[`packaging/linux/outpace.service`](https://github.com/outpace-stream/outpace-engine/blob/main/packaging/linux/outpace.service),
 the same as below with the binary at `/usr/bin/outpace`.
 
 To set it up by hand, create a user and an environment file:
@@ -228,13 +228,13 @@ From v1.0.0. The repository ships a per-user LaunchAgent. It
 starts Outpace at login and restarts it if it crashes:
 
 ```bash
-git clone https://github.com/jamezrin/outpace-stream.git outpace && cd outpace
+git clone https://github.com/outpace-stream/outpace-engine.git outpace && cd outpace
 packaging/macos/install-launchagent.sh install /usr/local/bin/outpace
 packaging/macos/install-launchagent.sh uninstall     # to remove it
 ```
 
 - The agent is `~/Library/LaunchAgents/outpace.plist`, created from
-  [`packaging/macos/outpace.plist.in`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/macos/outpace.plist.in).
+  [`packaging/macos/outpace.plist.in`](https://github.com/outpace-stream/outpace-engine/blob/main/packaging/macos/outpace.plist.in).
 - To change settings, edit its `EnvironmentVariables`, then run
   `packaging/macos/install-launchagent.sh reload`. Running `install` again, for example after
   updating the binary, keeps your edits and only updates the program path.
@@ -252,14 +252,14 @@ restarts it if it exits:
 pw useradd outpace -d /var/db/outpace -s /usr/sbin/nologin
 install -d -o outpace -g outpace -m 0700 /var/db/outpace
 fetch -o /usr/local/etc/rc.d/outpace \
-  https://raw.githubusercontent.com/jamezrin/outpace-stream/main/packaging/freebsd/outpace
+  https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/packaging/freebsd/outpace
 chmod 0755 /usr/local/etc/rc.d/outpace
 sysrc outpace_enable=YES
 service outpace start
 ```
 
 Run these as root. The script is
-[`packaging/freebsd/outpace`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/freebsd/outpace).
+[`packaging/freebsd/outpace`](https://github.com/outpace-stream/outpace-engine/blob/main/packaging/freebsd/outpace).
 `daemon(8)` stays root so it can write `/var/run/outpace.pid` and `/var/log/outpace.log`, and
 runs Outpace itself as `outpace`. To use another account, set `outpace_runas`, not
 `outpace_user`: `rc.subr` would run `daemon(8)` as that user too, and the start would fail.
@@ -312,9 +312,9 @@ is often simpler than proxy authentication.
 
 There is a tested setup for running the image in an unprivileged Proxmox LXC guest that follows
 `edge` automatically and sits behind Cloudflare WARP. It is in
-[`docs/deployment-lxc-warp.md`](https://github.com/jamezrin/outpace-stream/blob/main/docs/deployment-lxc-warp.md),
+[`docs/deployment-lxc-warp.md`](https://github.com/outpace-stream/outpace-engine/blob/main/docs/deployment-lxc-warp.md),
 with scripts in
-[`tools/deploy/lxc/`](https://github.com/jamezrin/outpace-stream/tree/main/tools/deploy/lxc).
+[`tools/deploy/lxc/`](https://github.com/outpace-stream/outpace-engine/tree/main/tools/deploy/lxc).
 In short:
 
 - The guest needs `nesting=1,keyctl=1` for Docker and the TUN device for WARP. Give it a static

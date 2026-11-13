@@ -39,7 +39,7 @@ viewer), so on a small device cap them and allow one stream at a time:
 ## OpenWrt
 
 The repository's
-[`packaging/openwrt/`](https://github.com/jamezrin/outpace-stream/tree/main/packaging/openwrt)
+[`packaging/openwrt/`](https://github.com/outpace-stream/outpace-engine/tree/main/packaging/openwrt)
 directory has a procd service, a UCI configuration with the small-device settings above, and an
 installer. It is tested under procd on OpenWrt 24.10.
 
@@ -48,9 +48,9 @@ want. The installer and its files come from the repository; the binary comes fro
 
 ```sh
 cd /tmp
-wget -O outpace-src.tar.gz https://github.com/jamezrin/outpace-stream/archive/refs/heads/main.tar.gz
+wget -O outpace-src.tar.gz https://github.com/outpace-stream/outpace-engine/archive/refs/heads/main.tar.gz
 tar -xzf outpace-src.tar.gz
-sh outpace-stream-main/packaging/openwrt/install.sh 1.0.1
+sh outpace-engine-main/packaging/openwrt/install.sh 1.0.1
 ```
 
 The installer:

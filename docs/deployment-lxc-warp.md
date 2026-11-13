@@ -48,7 +48,7 @@ Copy [`compose.yml`](../tools/deploy/lxc/compose.yml) to `/opt/outpace/compose.y
 `/opt/outpace/.env`:
 
 ```dotenv
-OUTPACE_IMAGE=ghcr.io/jamezrin/outpace:edge
+OUTPACE_IMAGE=ghcr.io/outpace-stream/outpace-engine:edge
 ```
 
 Use a pinned release tag instead of `edge` if you do not want to follow `main`. The file uses
@@ -70,7 +70,7 @@ only one side advertises an endpoint nobody can reach.
 
 ## Follow `main` automatically
 
-Every push to `main` publishes `ghcr.io/jamezrin/outpace:edge` (see
+Every push to `main` publishes `ghcr.io/outpace-stream/outpace-engine:edge` (see
 [`edge.yml`](../.github/workflows/edge.yml)). A guest cannot receive a GitHub webhook unless it
 is publicly reachable, and a push webhook fires before the image exists, so the guest polls the
 registry instead. Install the pair from `tools/deploy/lxc/`:

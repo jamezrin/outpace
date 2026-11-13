@@ -153,6 +153,6 @@ for example `/streams/ace/ih:<infohash>`. See [Playing Streams](Playing-Streams#
 
 ## Where do I report a bug?
 
-Open an issue at <https://github.com/jamezrin/outpace-stream/issues>, following
+Open an issue at <https://github.com/outpace-stream/outpace-engine/issues>, following
 [Troubleshooting](Troubleshooting#reporting-a-bug). Please remove content ids and stream names
 first.

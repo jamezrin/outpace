@@ -32,7 +32,7 @@ docker run --rm --name outpace \
 ## Option B: run the binary
 
 Download the archive for your platform from the
-[releases page](https://github.com/jamezrin/outpace-stream/releases), unpack it and run:
+[releases page](https://github.com/outpace-stream/outpace-engine/releases), unpack it and run:
 
 ```bash
 ./outpace serve

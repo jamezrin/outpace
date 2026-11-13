@@ -233,7 +233,7 @@ public-network streams. A live original-engine comparison remains an operator st
 
 ## Bounded release gate (#196)
 
-This optional offline gate supports the [v1.0 checklist (#208)](https://github.com/jamezrin/outpace-stream/issues/208).
+This optional offline gate supports the [v1.0 checklist (#208)](https://github.com/outpace-stream/outpace-engine/issues/208).
 It does not sign off a production replacement or multi-hour reliability; the
 long-soak work is separate (#210). Missing live prerequisites mean the operator
 records **skipped**, never pass; the evaluator itself has no skip outcome.

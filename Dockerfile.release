@@ -27,7 +27,7 @@ RUN mkdir -p /rootfs/etc /rootfs/var/lib/outpace /rootfs/tmp \
 # The static musl binary needs nothing else: TLS roots are compiled in (webpki-root-certs).
 # No shell, no package manager and no curl; use `outpace healthcheck` for health checks.
 FROM scratch AS minimal
-LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace-stream" \
+LABEL org.opencontainers.image.source="https://github.com/outpace-stream/outpace-engine" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 COPY --from=minimal-rootfs /rootfs/ /
 COPY --from=binary /outpace /usr/local/bin/outpace
@@ -44,7 +44,7 @@ ENTRYPOINT ["/usr/local/bin/outpace"]
 CMD ["serve"]
 
 FROM debian:bookworm-slim AS runtime
-LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace-stream" \
+LABEL org.opencontainers.image.source="https://github.com/outpace-stream/outpace-engine" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \

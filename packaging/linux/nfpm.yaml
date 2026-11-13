@@ -14,7 +14,7 @@ description: |
   Plays live and VOD streams over HTTP and HLS, ingests broadcasts over RTMP, and runs as
   a systemd service. The binary is statically linked (musl).
 vendor: Outpace
-homepage: https://github.com/jamezrin/outpace-stream
+homepage: https://github.com/outpace-stream/outpace-engine
 license: AGPL-3.0-or-later
 
 contents:

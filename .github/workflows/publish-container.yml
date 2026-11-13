@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE_NAME: ghcr.io/jamezrin/outpace
+  IMAGE_NAME: ghcr.io/outpace-stream/outpace-engine
 
 jobs:
   prepare:

@@ -336,7 +336,7 @@ operator checks them from the initial namespace before each block:
   but an address added to the egress device between the relay's last change check
   and its send could receive one datagram. Any address change during a block makes
   it inconclusive, so such a delivery is detected, not prevented
-  ([#391](https://github.com/jamezrin/outpace-stream/issues/391)).
+  ([#391](https://github.com/outpace-stream/outpace-engine/issues/391)).
 
 The report omits the target, content id and endpoints. Gateway and VPN exit
 provenance must be checked separately, immediately before and after. Exit 0 means

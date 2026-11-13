@@ -1,7 +1,7 @@
 # Configuration reference
 
 Every setting is an `OUTPACE_*` environment variable read once at daemon startup. The
-[user wiki](https://github.com/jamezrin/outpace-stream/wiki/Configuration) groups the same
+[user wiki](https://github.com/outpace-stream/outpace-engine/wiki/Configuration) groups the same
 settings by task with defaults and examples; this page keeps the detailed contract.
 
 [Outbound-only private peer mode](private-peer-mode.md) restricts peer traffic to

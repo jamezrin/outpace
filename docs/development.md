@@ -13,7 +13,7 @@ Contributor notes: the local gate, live-network testing, the Rust API surface an
 - [`superpowers/plans/`](superpowers/plans/) and [`superpowers/specs/`](superpowers/specs/): implementation plans and design specs, kept as historical records.
 - [`wiki/`](wiki/): the user wiki source, published to the GitHub wiki.
 
-GitHub [milestones](https://github.com/jamezrin/outpace-stream/milestones) track release scope; [#212](https://github.com/jamezrin/outpace-stream/issues/212) records the permanent non-goals and compatibility scope.
+GitHub [milestones](https://github.com/outpace-stream/outpace-engine/milestones) track release scope; [#212](https://github.com/outpace-stream/outpace-engine/issues/212) records the permanent non-goals and compatibility scope.
 
 ## Status and the local gate
 
@@ -113,6 +113,6 @@ Homebrew/Scoop definitions using `tools/release/package_manifests.py` with the a
 README/wiki. Keep the previous release available for rollback; never move a published tag.
 
 Pushes to `main` run `.github/workflows/edge.yml`, which publishes
-`ghcr.io/jamezrin/outpace:edge` and `ghcr.io/jamezrin/outpace:sha-<commit>` for
+`ghcr.io/outpace-stream/outpace-engine:edge` and `ghcr.io/outpace-stream/outpace-engine:sha-<commit>` for
 `linux/amd64` only. `edge` moves with `main`. Keep production pinned to a
 release tag.

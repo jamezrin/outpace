@@ -1,0 +1,72 @@
+name: Copy legacy release image
+
+# One-off migration helper. Releases up to 1.0.1 were published to
+# ghcr.io/jamezrin/outpace before the repository moved to the outpace-stream
+# organisation. This copies one release's standard and minimal indexes, byte for
+# byte, to the organisation image so pinned tags keep working at the new name.
+# Digests are preserved, so the original build attestations still apply; no new
+# provenance is attested, because this job did not build the images.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published release version to copy, for example 1.0.1
+        required: true
+      move_moving_tags:
+        description: Also point latest and minimal at this release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: copy-legacy-image
+  cancel-in-progress: false
+
+env:
+  SOURCE: ghcr.io/jamezrin/outpace
+  TARGET: ghcr.io/outpace-stream/outpace-engine
+
+jobs:
+  copy:
+    name: Copy release image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || { echo "expected X.Y.Z, got '$VERSION'" >&2; exit 1; }
+
+      - name: Install skopeo
+        run: |
+          command -v skopeo || { sudo apt-get update -q && sudo apt-get install -yq skopeo; }
+          skopeo --version
+
+      - name: Copy indexes with their digests
+        env:
+          VERSION: ${{ inputs.version }}
+          MOVE: ${{ inputs.move_moving_tags }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | skopeo login ghcr.io --username "$GH_ACTOR" --password-stdin
+          pairs=("$VERSION:$VERSION" "$VERSION-minimal:$VERSION-minimal")
+          if [[ "$MOVE" == "true" ]]; then
+            pairs+=("$VERSION:latest" "$VERSION-minimal:minimal")
+          fi
+          for pair in "${pairs[@]}"; do
+            from="${pair%%:*}" to="${pair##*:}"
+            skopeo copy --all --preserve-digests --retry-times 3 \
+              "docker://${SOURCE}:${from}" "docker://${TARGET}:${to}"
+            source_digest="$(skopeo inspect --raw "docker://${SOURCE}:${from}" | sha256sum | cut -d' ' -f1)"
+            target_digest="$(skopeo inspect --raw "docker://${TARGET}:${to}" | sha256sum | cut -d' ' -f1)"
+            [[ "$source_digest" == "$target_digest" ]] \
+              || { echo "digest mismatch for ${to}: ${source_digest} != ${target_digest}" >&2; exit 1; }
+            echo "${TARGET}:${to} = sha256:${target_digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+          done

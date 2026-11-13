@@ -253,7 +253,7 @@ flag surface are intentionally deferred until the configuration model is stable 
 making internal scheduler details a permanent public contract.
 
 The detailed environment-variable contract is in [`configuration.md`](configuration.md); the
-[user wiki's configuration page](https://github.com/jamezrin/outpace-stream/wiki/Configuration)
+[user wiki's configuration page](https://github.com/outpace-stream/outpace-engine/wiki/Configuration)
 groups every setting by topic. Most daemon settings are not secret, but
 `OUTPACE_BROADCAST_SOURCES` URLs can carry access tokens and `OUTPACE_SRT_PASSPHRASE_FILE`
 names a key file: protect the env file and avoid dumping the resolved configuration.

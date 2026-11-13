@@ -12,7 +12,7 @@ permissions:
 env:
   BIN_NAME: outpace
   CARGO_TERM_COLOR: always
-  IMAGE_NAME: ghcr.io/jamezrin/outpace
+  IMAGE_NAME: ghcr.io/outpace-stream/outpace-engine
 
 jobs:
   release-metadata:

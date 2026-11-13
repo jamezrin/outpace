@@ -105,7 +105,7 @@ If you used the old variable `OUTPACE_EXPERIMENTAL_ACE_COMPAT`, rename it to
 
 If you use Compose, two ready-made standalone profiles cover the common cases: a leecher gateway
 (HTTP only, no inbound, no seeding) and a signed broadcast origin. They are in
-[`docs/engine-migration.md`](https://github.com/jamezrin/outpace-stream/blob/main/docs/engine-migration.md#two-standalone-compose-profiles).
+[`docs/engine-migration.md`](https://github.com/outpace-stream/outpace-engine/blob/main/docs/engine-migration.md#two-standalone-compose-profiles).
 Use them as separate files, not as overrides of the root `compose.yml`.
 
 ## Related pages

@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "1.0.1"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/jamezrin/outpace-stream"
+repository = "https://github.com/outpace-stream/outpace-engine"
 
 # Profile for published release binaries (release.yml). It trades a slower, single-unit
 # link-time-optimised build for a smaller and slightly faster binary, which matters on

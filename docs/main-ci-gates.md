@@ -73,14 +73,14 @@ settings. Re-read them immediately before creation to detect concurrent changes.
 After independent review, create the ruleset once:
 
 ```sh
-gh api --method POST repos/jamezrin/outpace/rulesets \
+gh api --method POST repos/outpace-stream/outpace-engine/rulesets \
   --input .github/main-ruleset.json
-gh api repos/jamezrin/outpace/rulesets
-gh api repos/jamezrin/outpace/rules/branches/main
+gh api repos/outpace-stream/outpace-engine/rulesets
+gh api repos/outpace-stream/outpace-engine/rules/branches/main
 ```
 
 Save the returned ruleset ID and read its full configuration with
-`gh api repos/jamezrin/outpace/rulesets/RULESET_ID`. Compare the name, target,
+`gh api repos/outpace-stream/outpace-engine/rulesets/RULESET_ID`. Compare the name, target,
 enforcement, bypass actors, conditions, and rules against the payload; the
 effective main rules must contain all four rule types. Avoid creating duplicates
 on retry. Use an independently reviewed PUT to that ID for future updates.

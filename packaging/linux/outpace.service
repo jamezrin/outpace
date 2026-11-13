@@ -2,7 +2,7 @@
 # Enable with: systemctl enable --now outpace
 [Unit]
 Description=Outpace streaming engine
-Documentation=https://github.com/jamezrin/outpace-stream/wiki
+Documentation=https://github.com/outpace-stream/outpace-engine/wiki
 Wants=network-online.target
 After=network-online.target
 

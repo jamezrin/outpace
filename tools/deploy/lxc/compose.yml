@@ -1,12 +1,12 @@
 # Host-networked outpace for an LXC guest. Install as /opt/outpace/compose.yml with an .env
-# containing OUTPACE_IMAGE=ghcr.io/jamezrin/outpace:edge (or a pinned release tag).
+# containing OUTPACE_IMAGE=ghcr.io/outpace-stream/outpace-engine:edge (or a pinned release tag).
 # Host networking means the listeners bind the guest's own addresses, so WARP and the guest
 # firewall apply to the daemon directly. The peer port is published by the router, not Docker.
 name: outpace
 
 services:
   outpace:
-    image: ${OUTPACE_IMAGE:-ghcr.io/jamezrin/outpace:edge}
+    image: ${OUTPACE_IMAGE:-ghcr.io/outpace-stream/outpace-engine:edge}
     network_mode: host
     restart: unless-stopped
     environment:

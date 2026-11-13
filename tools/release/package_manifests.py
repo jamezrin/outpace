@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 import re
 
-REPO = "https://github.com/jamezrin/outpace-stream"
+REPO = "https://github.com/outpace-stream/outpace-engine"
 DESCRIPTION = "Open-source streaming engine for public Acestream content"
 LICENSE = "AGPL-3.0-or-later"
 ROOT = Path(__file__).resolve().parents[2]
