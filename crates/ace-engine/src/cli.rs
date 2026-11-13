@@ -44,6 +44,10 @@ pub enum Command {
     Play(PlayArgs),
     /// Check that a running daemon answers /healthz; exit 0 if healthy, 1 otherwise.
     Healthcheck(HealthcheckArgs),
+    /// Install, remove, or run outpace as a Windows service.
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Service(ServiceCommand),
 }
 
 #[derive(Debug, Args)]
@@ -55,6 +59,19 @@ pub struct HealthcheckArgs {
     /// Seconds to wait for the connection and the response.
     #[arg(long, default_value_t = 3)]
     pub timeout: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Register outpace as an automatic-start service running as the NT SERVICE\outpace
+    /// virtual account, with a private data directory (needs an elevated prompt). It is not
+    /// started.
+    Install,
+    /// Stop the service if it is running, then remove it (needs an elevated prompt).
+    Uninstall,
+    /// Entry point used by the Service Control Manager; not meant to be run by hand.
+    Run,
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +173,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Broadcast(args) => run_broadcast(args).await,
         Command::Play(args) => run_play(args).await,
         Command::Healthcheck(args) => run_healthcheck(args),
+        #[cfg(windows)]
+        Command::Service(command) => tokio::task::block_in_place(|| match command {
+            ServiceCommand::Install => crate::win_service::install(),
+            ServiceCommand::Uninstall => crate::win_service::uninstall(),
+            ServiceCommand::Run => crate::win_service::run(),
+        }),
     }
 }
 

@@ -110,6 +110,18 @@ The command:
 - refuses to run in private peer mode;
 - applies the name's profile from `OUTPACE_BROADCAST_OPTIONS`, if there is one.
 
+## `outpace service` (Windows)
+
+Unreleased: `edge` and builds from `main` only. This command exists only in Windows builds:
+
+| Command | What it does |
+| --- | --- |
+| `outpace service install` | Registers the automatic-start `outpace` service, running as its own `NT SERVICE\outpace` account, and creates its private data directory. It doesn't start the service. Needs an elevated prompt. |
+| `outpace service uninstall` | Stops the service if it's running, then removes it. Needs an elevated prompt. |
+| `outpace service run` | The entry point the Service Control Manager starts. Not for running by hand. |
+
+See [Deployment](Deployment#windows-service) for settings, data and logs.
+
 ## `outpace healthcheck`
 
 Unreleased: `edge` and builds from `main` only. Checks that a running daemon answers `/healthz`,

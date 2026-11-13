@@ -1,0 +1,164 @@
+name: Service managers
+
+# Installs and starts outpace under the Windows Service Control Manager and macOS launchd on
+# real runners, and lints the cfg(windows) code that no other PR check compiles.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/service-managers.yml
+      - crates/ace-engine/**
+      - Cargo.toml
+      - Cargo.lock
+      - packaging/macos/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-service:
+    name: Windows service lifecycle
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+          build-warnings: ""
+
+      - name: Clippy (Windows)
+        run: cargo clippy --locked -p ace-engine --all-targets -- -D warnings
+
+      - name: Unit tests (Windows service)
+        run: cargo test --locked -p ace-engine --lib win_service
+
+      - name: Build release binary
+        run: cargo build --locked --release -p ace-engine --bin outpace
+
+      # Runners are elevated, as `outpace service install` requires.
+      - name: Install, start, probe, stop and uninstall the service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:ProgramFiles 'outpace'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target\release\outpace.exe $dir
+          $exe = Join-Path $dir 'outpace.exe'
+          # Fail closed: a pre-created data dir (inheriting ProgramData's ACL, as any local
+          # user could arrange) must make install fail and leave no service behind.
+          $data = Join-Path $env:ProgramData 'outpace'
+          New-Item -ItemType Directory -Force $data | Out-Null
+          & $exe service install
+          if ($LASTEXITCODE -eq 0) { throw 'install accepted an unsafe pre-existing data dir' }
+          if (Get-Service outpace -ErrorAction SilentlyContinue) { throw 'failed install left a service behind' }
+          Remove-Item -Recurse -Force $data
+          & $exe service install
+          if ($LASTEXITCODE -ne 0) { throw 'install failed' }
+          # Error exits (not only crashes) must trigger the restart actions.
+          $flag = sc.exe qfailureflag outpace | Out-String
+          $flag
+          if ($flag -notmatch 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*TRUE') { throw 'non-crash failure actions are off' }
+          # Service settings live in its Environment registry value.
+          reg add HKLM\SYSTEM\CurrentControlSet\Services\outpace /v Environment /t REG_MULTI_SZ `
+            /d "OUTPACE_BIND=127.0.0.1:16878\0OUTPACE_RTMP_BIND=127.0.0.1:16879\0OUTPACE_ENABLE_INBOUND=0\0OUTPACE_ENABLE_SEEDING=0" /f
+          sc.exe qc outpace
+          sc.exe start outpace
+          $healthy = $false
+          foreach ($i in 1..60) {
+            curl.exe --fail --silent --max-time 2 http://127.0.0.1:16878/healthz 2>$null
+            if ($LASTEXITCODE -eq 0) { $healthy = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          $log = Join-Path $env:ProgramData 'outpace\outpace.log'
+          if (Test-Path $log) { Get-Content $log -Tail 20 }
+          if (-not $healthy) { sc.exe query outpace; throw 'service did not answer /healthz' }
+          sc.exe stop outpace
+          foreach ($i in 1..40) {
+            if ((Get-Service outpace).Status -eq 'Stopped') { break }
+            Start-Sleep -Seconds 1
+          }
+          if ((Get-Service outpace).Status -ne 'Stopped') { throw 'service did not stop' }
+          Get-Content $log -Tail 5
+          if (-not (Select-String -Path $log -Pattern 'stop requested' -Quiet)) { throw 'no graceful stop in log' }
+          # The data dir holds the identity seed and broadcast keys: no inherited or Users access.
+          $acl = Get-Acl (Join-Path $env:ProgramData 'outpace')
+          $acl.Access | Format-Table IdentityReference, FileSystemRights, IsInherited -AutoSize
+          if (-not $acl.AreAccessRulesProtected) { throw 'data dir ACL still inherits' }
+          $users = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+          foreach ($rule in $acl.Access) {
+            $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+            if ($sid -eq $users) { throw 'BUILTIN\Users can access the data dir' }
+          }
+          # With the HTTP port taken, the service must never report Running.
+          $blocker = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 16878)
+          $blocker.Start()
+          sc.exe start outpace | Out-Null
+          foreach ($i in 1..40) {
+            if ((Get-Service outpace).Status -eq 'Running') { throw 'service reported Running without its listener' }
+            Start-Sleep -Milliseconds 250
+          }
+          $blocker.Stop()
+          & $exe service uninstall
+          if ($LASTEXITCODE -ne 0) { throw 'uninstall failed' }
+          if (Get-Service outpace -ErrorAction SilentlyContinue) { throw 'service still registered' }
+
+  macos-launchagent:
+    name: macOS LaunchAgent lifecycle
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+          build-warnings: ""
+
+      - name: Build release binary
+        run: cargo build --locked --release -p ace-engine --bin outpace
+
+      - name: Install, probe and uninstall the LaunchAgent
+        run: |
+          set -eu
+          # A path with a space and an ampersand must be stored literally.
+          dir="$RUNNER_TEMP/A & B"
+          mkdir -p "$dir"
+          cp target/release/outpace "$dir/outpace"
+          plist="$HOME/Library/LaunchAgents/outpace.plist"
+          packaging/macos/install-launchagent.sh install "$dir/outpace"
+          [ "$(plutil -extract ProgramArguments.0 raw "$plist")" = "$dir/outpace" ]
+          # An edited setting survives install (binary update) and reload.
+          plutil -replace EnvironmentVariables.OUTPACE_SMOKE_MARKER -string kept "$plist"
+          packaging/macos/install-launchagent.sh install "$dir/outpace"
+          packaging/macos/install-launchagent.sh reload
+          [ "$(plutil -extract EnvironmentVariables.OUTPACE_SMOKE_MARKER raw "$plist")" = kept ]
+          # Reinstalling must leave exactly the program and `serve`.
+          [ "$(plutil -extract ProgramArguments raw "$plist")" = 2 ]
+          [ "$(plutil -extract ProgramArguments.0 raw "$plist")" = "$dir/outpace" ]
+          [ "$(plutil -extract ProgramArguments.1 raw "$plist")" = serve ]
+          ok=0
+          for i in $(seq 60); do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:6878/healthz; then ok=1; break; fi
+            sleep 1
+          done
+          tail -20 "$HOME/Library/Logs/outpace.log" || true
+          [ "$ok" = 1 ] || { launchctl list | grep outpace || true; exit 1; }
+          packaging/macos/install-launchagent.sh uninstall
+          sleep 2
+          if curl --fail --silent --max-time 2 http://127.0.0.1:6878/healthz; then
+            echo "daemon still running after uninstall" >&2
+            exit 1
+          fi

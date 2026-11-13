@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template for install-launchagent.sh, which sets the program and log paths with plutil. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>outpace</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BINARY@</string>
+		<string>serve</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- HTTP and RTMP stay on loopback; only the peer port faces the network. -->
+		<key>OUTPACE_BIND</key>
+		<string>127.0.0.1:6878</string>
+		<key>OUTPACE_RTMP_BIND</key>
+		<string>127.0.0.1:1935</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restart after a crash or error exit, not after a clean stop. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<!-- launchd sends SIGTERM on unload; give the graceful drain time to finish. -->
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/Library/Logs/outpace.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/outpace.log</string>
+</dict>
+</plist>

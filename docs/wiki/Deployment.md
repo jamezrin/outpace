@@ -179,6 +179,69 @@ journalctl -u outpace -f
 Logs go to standard error. Each line starts with a UTC time of day (`HH:MM:SS.mmm`), and the
 journal adds the date. Open TCP 8621 in your firewall if you run as a full participant.
 
+## Windows service
+
+Unreleased: `edge` and builds from `main` only. On Windows, `outpace.exe` can install itself as
+a service. Run these from an elevated (administrator) prompt:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:ProgramFiles\outpace"
+Copy-Item .\outpace.exe "$env:ProgramFiles\outpace\"
+& "$env:ProgramFiles\outpace\outpace.exe" service install
+sc.exe start outpace
+```
+
+- The service is called `outpace`. It starts automatically at boot, runs as its own
+  unprivileged virtual account `NT SERVICE\outpace`, and Windows restarts it if it crashes.
+- Its data directory holds the node identity and broadcast signing keys, so it must be private.
+  `service install` creates `%ProgramData%\outpace` for SYSTEM, Administrators and the service
+  account only, with nothing inherited. The service refuses to start, and `service install`
+  refuses to finish, if the directory already exists with any other owner or access, or is a
+  link. Remove such a directory and run `service install` again. A custom `OUTPACE_DATA_DIR`
+  that doesn't exist yet is created the same way. If it already exists, it must already be
+  private.
+- Without `OUTPACE_DATA_DIR`, data lives in `%ProgramData%\outpace`. The log is
+  `%ProgramData%\outpace\outpace.log`, because a service has no console.
+- Settings come from the service's `Environment` registry value: one `NAME=value` per entry,
+  separated by `\0`. Restart the service after changing it:
+
+```powershell
+reg add HKLM\SYSTEM\CurrentControlSet\Services\outpace /v Environment /t REG_MULTI_SZ `
+  /d "OUTPACE_BIND=127.0.0.1:6878\0OUTPACE_CACHE_TYPE=disk" /f
+sc.exe stop outpace
+# Wait for the stop (graceful drain) to finish before starting again.
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Service outpace).Status -ne 'Stopped') {
+  if ((Get-Date) -gt $deadline) { throw 'outpace did not stop within 60 seconds' }
+  Start-Sleep -Seconds 1
+}
+sc.exe start outpace
+if ($LASTEXITCODE -ne 0) { throw 'outpace did not start; see %ProgramData%\outpace\outpace.log' }
+```
+
+To remove it, run `outpace.exe service uninstall`, which stops the service first. The data
+directory is kept. Open TCP 8621 in Windows Defender Firewall if you run as a full participant.
+
+## macOS launchd
+
+Unreleased: `edge` and builds from `main` only. The repository ships a per-user LaunchAgent. It
+starts Outpace at login and restarts it if it crashes:
+
+```bash
+git clone https://github.com/jamezrin/outpace-stream.git outpace && cd outpace
+packaging/macos/install-launchagent.sh install /usr/local/bin/outpace
+packaging/macos/install-launchagent.sh uninstall     # to remove it
+```
+
+- The agent is `~/Library/LaunchAgents/outpace.plist`, created from
+  [`packaging/macos/outpace.plist.in`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/macos/outpace.plist.in).
+- To change settings, edit its `EnvironmentVariables`, then run
+  `packaging/macos/install-launchagent.sh reload`. Running `install` again, for example after
+  updating the binary, keeps your edits and only updates the program path.
+- HTTP and RTMP stay on `127.0.0.1`. The log is `~/Library/Logs/outpace.log`, and data stays in
+  `~/Library/Application Support/outpace`.
+- Unloading sends `SIGTERM`, which drains gracefully. Uninstalling keeps the data and the log.
+
 ## FreeBSD rc.d
 
 From the next release, there is a FreeBSD binary (see

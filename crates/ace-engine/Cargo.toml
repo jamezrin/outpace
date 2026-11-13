@@ -46,6 +46,17 @@ flate2 = "1"
 # Origin playlist reload fingerprints (already a dependency of ace-wire).
 sha2 = "0.11"
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_SystemServices",
+] }
+
 # jemalloc is the default global allocator on 64-bit non-MSVC targets (see main.rs). 32-bit targets
 # (e.g. armv7) are excluded: jemalloc's 64-bit `ffs` helper needs a `__ffsdi2` builtin that fails to
 # link against static 32-bit musl. The default `background_threads_runtime_support` feature lets
