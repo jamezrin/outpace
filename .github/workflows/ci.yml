@@ -83,6 +83,17 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # Root bypasses directory permissions and the test skips itself, so prove it ran.
+      - name: Execute-only cache ancestor (non-root)
+        run: |
+          test "$(id -u)" -ne 0
+          out=$(cargo test -p ace-swarm --lib --locked \
+            live_session::warm_peers::tests::cache_persists_through_execute_only_parent \
+            -- --exact --nocapture 2>&1)
+          echo "$out"
+          grep -q 'test result: ok. 1 passed' <<<"$out"
+          ! grep -q 'skipping execute-only' <<<"$out"
+
       # Real UDP cases require the separately owned offline namespace runner.
       - name: DHT comparison contracts
         run: cargo test --manifest-path tools/dhtcompare/Cargo.toml --all-features --locked

@@ -620,7 +620,13 @@ async fn warm_peer_hints_never_grant_descriptor_authority() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
         .with_cache(CacheType::Memory, dir.clone());
-    provider.warm_peers.initialized().await;
+    assert!(
+        provider
+            .warm_peers
+            .wait_loaded(std::time::Duration::from_secs(2))
+            .await,
+        "authority fixture cache load must finish"
+    );
     let hash = hex20(PLACEHOLDER_ID).unwrap();
     assert_eq!(
         provider.warm_peers.candidate_addresses(&hash),
