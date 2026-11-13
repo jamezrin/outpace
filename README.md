@@ -200,10 +200,10 @@ Outpace is a community project, and you're welcome to take part, whether you're 
 reporting a stream that won't play, testing it with your player or app, or digging into the
 protocol. Every kind of contribution counts:
 
-- **Bug reports and feature ideas.** Open an [issue](https://github.com/jamezrin/outpace-stream/issues).
-  Include what you ran, what you expected and what happened.
-- **Questions and discussion.** Ask in an issue for now; GitHub Discussions is planned
-  ([#399](https://github.com/jamezrin/outpace-stream/issues/399)). Disagreement is healthy, so
+- **Bug reports and feature ideas.** Open an [issue](https://github.com/jamezrin/outpace-stream/issues/new/choose)
+  with one of the forms, which ask for what you ran, what you expected and what happened.
+- **Questions and discussion.** Ask in [Discussions](https://github.com/jamezrin/outpace-stream/discussions).
+  Disagreement is healthy, so
   challenge a design or a decision when you think it's wrong, and explain why.
 - **Docs and guides.** The wiki lives in [`docs/wiki/`](docs/wiki). If something confused you,
   improving the page helps the next person.

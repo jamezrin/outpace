@@ -1,0 +1,74 @@
+name: Feature request
+description: Suggest a new capability or a change to existing behaviour.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Describe the problem first: a clear problem often has a better solution than the first one that comes to mind.
+
+        For a rough idea you'd like to discuss first, start a thread in [Ideas](https://github.com/jamezrin/outpace-stream/discussions/categories/ideas) instead.
+
+        Check the [scope](https://github.com/jamezrin/outpace-stream/blob/main/CONTRIBUTING.md#scope) before you start. Outpace targets public, unencrypted swarms, and requests outside the scope won't be accepted.
+
+        Don't include content ids, infohashes, stream names or source URLs. Use `0123456789abcdef0123456789abcdef01234567` wherever an id is needed.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: What you're doing, what gets in the way today, and who else is likely to run into it.
+      placeholder: I run Outpace behind Jellyfin, and every channel change takes 30 s because ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you'd like Outpace to do. Name any setting, route or CLI flag you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: Other approaches you considered, and what you do today instead.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Playback (direct TS, HLS, VOD)
+        - Compat API (AceStream-compatible routes)
+        - Native HTTP API
+        - CLI
+        - Peer discovery, trackers, DHT
+        - Seeding, NAT and port mapping
+        - Broadcasting (RTMP, SRT, pulled sources)
+        - Timeshift
+        - Configuration
+        - Installation, Docker, packaging
+        - Performance or resource use
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: compat
+    attributes:
+      label: Comparison with the official engine
+      description: If the official AceStream engine already does this, describe how it behaves from the outside (requests, responses, player experience). Don't paste or link its code.
+
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you like to work on it?
+      options:
+        - "Yes, I'd like to open a PR"
+        - Maybe, with some guidance
+        - "No"

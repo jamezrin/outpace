@@ -1,0 +1,235 @@
+name: Bug report
+description: Something doesn't work, crashes, stalls or behaves differently from the docs.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. The more of this form you fill in, the faster it can be debugged.
+
+        **Never include stream identifiers.** Outpace is debugged from the *shape* of a stream (live or VOD, bitrate, codecs, peers), not from its identity. Before you paste anything, remove:
+
+        - content ids and infohashes: 40-character hex strings, and the base32 `btih` value in magnet links. Where a hex id is needed, write `0123456789abcdef0123456789abcdef01234567`;
+        - stream and channel names (`metadata.title`, `Icy-Name`) and playlist or channel-list names;
+        - broadcast source URLs, tokens, SRT passphrases, your public IP and peer IP addresses (IPv4 and IPv6);
+        - captures, recordings or screenshots of the media.
+
+        If the specific stream turns out to matter, the maintainer will arrange a private channel. Don't post it here.
+
+        To redact a log and a `/status` snapshot before pasting (see also [Reporting a bug](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting#reporting-a-bug)):
+
+        ```bash
+        sed -E 's/[0-9a-fA-F]{40}/<id>/g; s/([0-9]{1,3}\.){3}[0-9]{1,3}/<ip>/g' outpace.log > outpace-redacted.log
+        curl -s "http://127.0.0.1:6878/streams/ace/${CONTENT_ID:?set a content id}/status" \
+          | jq '.id = "<id>" | .metadata.title = "<title>"'
+        ```
+
+        Check what's left by eye: the commands don't catch names, IPv6 addresses or magnet links.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed content ids, infohashes, stream names, source URLs, tokens and IP addresses from everything in this report.
+          required: true
+        - label: I searched the existing issues and the [Troubleshooting](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting) page.
+          required: true
+        - label: If the problem involves a stream, it is public and unencrypted (premium and encrypted content are out of scope).
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. Include the HTTP status and the player's error message, if any.
+      placeholder: |
+        Opened the HLS playlist in VLC. Expected playback within ~30 s.
+        The playlist returned 503 for two minutes, then VLC gave up with "cannot open MRL".
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands or URLs, with the id replaced by the placeholder.
+      placeholder: |
+        1. outpace serve (settings below)
+        2. vlc "http://127.0.0.1:6878/streams/ace/0123456789abcdef0123456789abcdef01234567.m3u8"
+        3. Wait ~45 s
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproducibility
+    attributes:
+      label: How often does it happen?
+      options:
+        - Every time
+        - Often (more than half of attempts)
+        - Sometimes
+        - Happened once
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Does it happen with other streams?
+      description: Try at least one other stream that you know is live. A dead channel looks exactly like a bug.
+      options:
+        - Yes, with several different streams
+        - Only with one stream so far; other live streams work
+        - Only tried one stream
+        - Not stream-related (startup, config, API, packaging)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: other_engine
+    attributes:
+      label: Does the same stream play in another engine at the same time?
+      description: For example the official AceStream engine, on the same network and at the same moment.
+      options:
+        - Yes, it plays fine elsewhere
+        - No, it fails elsewhere too
+        - Didn't check / can't check
+    validations:
+      required: true
+
+  - type: textarea
+    id: stream_shape
+    attributes:
+      label: Stream characteristics
+      description: |
+        Describe the stream without identifying it. Most values are in the `/status` snapshot. Leave out what you don't know.
+      placeholder: |
+        - Live or VOD: live
+        - Advertised bitrate (metadata.bitrate): ~2.4 Mbit/s
+        - Video / audio codecs, if known (e.g. from ffprobe or the player): H264 / AAC
+        - Typical peer count: 3-6
+        - Source: content id / infohash / magnet / local broadcast / RTMP or SRT ingest / origin HLS
+
+  - type: dropdown
+    id: route
+    attributes:
+      label: How are you playing or using it?
+      multiple: true
+      options:
+        - Native direct TS (/streams/ace/<id> or <id>.ts)
+        - Native HLS (/streams/ace/<id>.m3u8)
+        - VOD (/vod/...)
+        - Compat API (/ace/getstream, /ace/manifest.m3u8)
+        - outpace play (CLI)
+        - Broadcasting (RTMP, SRT or pulled source)
+        - Managed origin HLS (OUTPACE_MANAGED_HLS)
+        - Timeshift
+        - Seeding / inbound peers
+        - Other HTTP API route
+        - Not playback related
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: Player or client
+      description: Name and version, plus any middleware in between.
+      placeholder: VLC 3.0.21 / mpv 0.39 / ffmpeg 7.1 / Jellyfin 10.10 via Dispatcharr / curl
+
+  - type: textarea
+    id: timing
+    attributes:
+      label: Timing
+      description: Cold start (first viewer) or a stream that was already running? How long until it went wrong? Did it ever play?
+      placeholder: Cold start. Discovery took ~20 s, played for ~8 minutes, then stalled with buffer_ms dropping to 0.
+
+  - type: input
+    id: version
+    attributes:
+      label: Outpace version
+      description: Output of `outpace --version`, and the build. For `edge`, add the `sha-` tag; for your own build, add the commit (`git rev-parse --short HEAD`).
+      placeholder: outpace 1.0.1, release binary / edge sha-1a2b3c4 / own build at 1a2b3c4
+    validations:
+      required: true
+
+  - type: input
+    id: last_working
+    attributes:
+      label: Last version that worked
+      description: If this is a regression, the last version or commit where it worked.
+      placeholder: 1.0.0, or "never worked", or "don't know"
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How do you run Outpace?
+      options:
+        - Docker Compose
+        - Docker / Podman (docker run)
+        - Release binary with a service manager (systemd, OpenRC, launchd, rc.d, Windows service)
+        - Release binary run by hand
+        - Package manager (Homebrew, Scoop, distro package)
+        - Router or small device (OpenWrt etc.)
+        - Android
+        - Built from source
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and version, CPU architecture, and for containers the host OS.
+      placeholder: Debian 12, x86_64, Docker 27 / macOS 15, arm64 / OpenWrt 24.10, aarch64
+    validations:
+      required: true
+
+  - type: textarea
+    id: settings
+    attributes:
+      label: Non-default settings
+      description: Every `OUTPACE_*` variable, CLI flag or config key you changed. Remove passphrases, tokens and source URLs. Write "none" if you use the defaults.
+      render: shell
+      placeholder: |
+        OUTPACE_PREBUFFER_MS=5000
+        OUTPACE_HLS_STARTUP_SEGMENTS=2
+        OUTPACE_CACHE_TYPE=disk
+    validations:
+      required: true
+
+  - type: textarea
+    id: network
+    attributes:
+      label: Network
+      description: Anything between Outpace and the internet. VPNs, Cloudflare WARP in particular, often cause discovery and stall problems.
+      placeholder: |
+        - VPN / WARP: off
+        - Inbound TCP 8621 reachable from outside: yes / no / don't know
+        - `[reachability] externally reachable:` log value: no
+        - NAT: home router, UPnP on / CGNAT warning in the log
+        - Container network mode: bridge / host
+
+  - type: textarea
+    id: status
+    attributes:
+      label: /status snapshot
+      description: |
+        `GET /streams/ace/<id>/status` taken while the problem is happening, redacted with the `jq` command above. Two snapshots a few seconds apart are even better, since they show which counters are moving.
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        A redacted excerpt from the start of the request to the failure. Include the `[ace] discovery stage=...` and `[prebuffer] startup buffer released: reason=...` lines for startup problems, and the `[ace]` recovery lines for stalls. Logs: `docker compose logs outpace`, `docker logs outpace` or `journalctl -u outpace`. Long logs can be attached as a redacted file.
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Workarounds you found, related issues, or anything you already ruled out.

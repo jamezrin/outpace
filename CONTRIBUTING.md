@@ -14,14 +14,17 @@ Ace Stream swarms.
 
 **Not in scope**, unless an issue explicitly narrows it:
 - premium or encrypted content;
-- accounts, a web UI, search or EPG;
+- accounts, a web UI, EPG, or catalog and playlist management. Stream search is limited to the
+  optional [service-backed adapter](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search);
 - full parity with the closed engine's API.
 
 Contributions in those areas won't be accepted.
 
 ## Reporting a bug
 
-Open an [issue](https://github.com/jamezrin/outpace-stream/issues) with:
+Open a [bug report](https://github.com/jamezrin/outpace-stream/issues/new?template=bug_report.yml)
+(or the [performance form](https://github.com/jamezrin/outpace-stream/issues/new?template=performance.yml)
+for slow startup, stutter, CPU or memory). The form asks for:
 
 - `outpace --version`, and whether you run a release, the `edge` image (with its `sha-` tag) or
   your own build;
@@ -29,22 +32,36 @@ Open an [issue](https://github.com/jamezrin/outpace-stream/issues) with:
   settings;
 - what you did, what you expected and what happened: the HTTP status, the player's error, and
   the stream's `/status`;
+- the stream's characteristics instead of its identity (live or VOD, bitrate, codecs, peers),
+  and whether other live streams show the same problem;
 - a log excerpt around the problem.
 
 **Never include stream identifiers**, in issues, logs, screenshots or PRs:
 - Replace content ids and infohashes (40-character hex strings) with the placeholder
   `0123456789abcdef0123456789abcdef01234567`.
 - Remove stream and channel names, source URLs and tokens, and IP addresses.
+- If the specific stream matters, the maintainer will arrange a private channel.
 
 The wiki's [bug report checklist](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting#reporting-a-bug)
-includes a one-line command to mask ids in a log.
+includes commands to mask ids in a log and a `/status` snapshot.
 
-For feature ideas, describe the problem you're trying to solve before the solution.
+## Asking a question
+
+Ask questions in [Discussions](https://github.com/jamezrin/outpace-stream/discussions), under
+Q&A, rather than in an issue. Rough ideas that need discussion before they're a concrete
+request can go under Ideas. The same identifier rules apply there.
+
+## Requesting a feature
+
+For feature ideas, use the [feature request](https://github.com/jamezrin/outpace-stream/issues/new?template=feature_request.yml)
+form and describe the problem you're trying to solve before the solution.
 
 ## Security issues
 
-Please don't post exploit details publicly. Open a minimal issue that says you have a security
-report, without details, and the maintainer will arrange a private channel.
+Please don't post exploit details publicly, in issues, discussions or pull requests. Report
+vulnerabilities privately through
+[GitHub private vulnerability reporting](https://github.com/jamezrin/outpace-stream/security/advisories/new).
+See the [security policy](SECURITY.md).
 
 ## Setting up
 
