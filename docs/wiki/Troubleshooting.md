@@ -255,5 +255,6 @@ lines, IPv6 addresses or base32 magnet links.
 
 ## More questions
 
-See the [FAQ](FAQ) for common questions: do you need the official engine, Docker, VLC,
+Ask in [Discussions](https://github.com/jamezrin/outpace-stream/discussions). See the
+[FAQ](FAQ) for common questions: do you need the official engine, Docker, VLC,
 Jellyfin and Dispatcharr, broadcasting, and the differences from the official engine.

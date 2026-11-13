@@ -35,7 +35,7 @@ body:
           required: true
         - label: I searched the existing issues and the [Troubleshooting](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting) page.
           required: true
-        - label: The stream is public and unencrypted (premium and encrypted content are out of scope).
+        - label: If the problem involves a stream, it is public and unencrypted (premium and encrypted content are out of scope).
           required: true
 
   - type: textarea

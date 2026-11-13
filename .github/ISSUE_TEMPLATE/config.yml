@@ -1,5 +1,11 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/jamezrin/outpace-stream/security/advisories/new
+    about: Report vulnerabilities privately here. Don't open a public issue for them.
+  - name: Ask a question
+    url: https://github.com/jamezrin/outpace-stream/discussions/categories/q-a
+    about: How to do something, or whether a setup is supported. Use Discussions, not issues.
   - name: Troubleshooting guide
     url: https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting
     about: Quick checks and fixes for startup, stalls, discovery and inbound peers. Many problems are solved there.

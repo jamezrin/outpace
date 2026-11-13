@@ -14,7 +14,8 @@ Ace Stream swarms.
 
 **Not in scope**, unless an issue explicitly narrows it:
 - premium or encrypted content;
-- accounts, a web UI, search or EPG;
+- accounts, a web UI, EPG, or catalog and playlist management. Stream search is limited to the
+  optional [service-backed adapter](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search);
 - full parity with the closed engine's API.
 
 Contributions in those areas won't be accepted.
@@ -44,14 +45,23 @@ for slow startup, stutter, CPU or memory). The form asks for:
 The wiki's [bug report checklist](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting#reporting-a-bug)
 includes commands to mask ids in a log and a `/status` snapshot.
 
+## Asking a question
+
+Ask questions in [Discussions](https://github.com/jamezrin/outpace-stream/discussions), under
+Q&A, rather than in an issue. Rough ideas that need discussion before they're a concrete
+request can go under Ideas. The same identifier rules apply there.
+
+## Requesting a feature
+
 For feature ideas, use the [feature request](https://github.com/jamezrin/outpace-stream/issues/new?template=feature_request.yml)
 form and describe the problem you're trying to solve before the solution.
 
 ## Security issues
 
-Please don't post exploit details publicly. Open a
-[security report](https://github.com/jamezrin/outpace-stream/issues/new?template=security.yml)
-issue, which only says that you have a report, and the maintainer will arrange a private channel.
+Please don't post exploit details publicly, in issues, discussions or pull requests. Report
+vulnerabilities privately through
+[GitHub private vulnerability reporting](https://github.com/jamezrin/outpace-stream/security/advisories/new).
+See the [security policy](SECURITY.md).
 
 ## Setting up
 
