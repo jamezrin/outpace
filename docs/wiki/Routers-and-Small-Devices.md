@@ -9,6 +9,8 @@ and flash than a server. This page collects what changes on them.
 | --- | --- |
 | OpenWrt router | The [OpenWrt installer](#openwrt) below. It picks the right build. |
 | Raspberry Pi 2/3/4/5, most ARM NAS boxes | `armv7-unknown-linux-musleabihf` (32-bit) or `aarch64-unknown-linux-musl` (64-bit OS) from [Installation](Installation#release-binaries). |
+| Raspberry Pi Zero/1 | `arm-unknown-linux-musleabihf` (ARMv6), from the next release. |
+| RISC-V boards | `riscv64gc-unknown-linux-musl`, from the next release. |
 | x86 mini PC or appliance | `x86_64-unknown-linux-musl`. |
 
 All Linux release binaries are static (musl), so they run on any distribution, including
