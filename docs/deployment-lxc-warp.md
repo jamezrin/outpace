@@ -7,7 +7,7 @@ files referenced here live in [`tools/deploy/lxc/`](../tools/deploy/lxc/).
 
 The one non-obvious part is inbound peers: **with WARP in `Warp` mode, a correctly forwarded
 peer port never completes a handshake** unless the guest is told to let it through. That is an
-environment property, not an outpace bug, so the fix is an optional helper service and not part
+environment property, not an Outpace bug, so the fix is an optional helper service and not part
 of the daemon. See [Inbound peers behind WARP](#inbound-peers-behind-warp).
 
 Nothing here is required for a normal deployment. Skip it if you do not run WARP or a similar
@@ -42,7 +42,7 @@ there too before reusing one.
 Install Docker and the Cloudflare WARP client from their vendors' packages, register the client,
 and leave it connected in `Warp` mode with always-on enabled.
 
-## Run outpace
+## Run Outpace
 
 Copy [`compose.yml`](../tools/deploy/lxc/compose.yml) to `/opt/outpace/compose.yml` and create
 `/opt/outpace/.env`:
@@ -64,7 +64,7 @@ environment entry to `OUTPACE_ACE_COMPAT: "0"` and recreate the service with
 For boolean validation and legacy precedence, see the
 [configuration contract](deployment.md#ace-http-compatibility).
 
-`OUTPACE_PEER_LISTEN`'s port is also the port outpace announces to trackers. The listen port,
+`OUTPACE_PEER_LISTEN`'s port is also the port Outpace announces to trackers. The listen port,
 the announced port, and the router's **external** port must therefore be identical; remapping
 only one side advertises an endpoint nobody can reach.
 
@@ -88,7 +88,7 @@ id changed, then prunes old images. It exits quietly while the tag does not exis
 ## Inbound peers behind WARP
 
 Symptom: the router forward is correct, packets reach the guest (visible with `tcpdump` on the
-bridge), yet the connection never opens from the Internet and outpace logs
+bridge), yet the connection never opens from the Internet and Outpace logs
 `externally reachable: no (0 inbound peer(s)…)` indefinitely. Two separate things cause it:
 
 1. **WARP installs a default-drop nft firewall** (`table inet cloudflare-warp`). Its input
@@ -167,8 +167,8 @@ path. The `[reachability]` log line flips to `yes` after a real peer dials in.
 
 ## Running two engines side by side
 
-When comparing outpace against another engine behind the same router, both want TCP 8621 by
+When comparing Outpace against another engine behind the same router, both want TCP 8621 by
 default and a router can send one external port to only one guest. Give each its own external
-port, with outpace's `OUTPACE_PEER_LISTEN` set to match, and run the helper in each guest with its
+port, with Outpace's `OUTPACE_PEER_LISTEN` set to match, and run the helper in each guest with its
 own `PORT`. That keeps the comparison fair: both engines get a working inbound path rather than
 one winning the default port.
