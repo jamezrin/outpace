@@ -46,12 +46,6 @@ flate2 = "1"
 # Origin playlist reload fingerprints (already a dependency of ace-wire).
 sha2 = "0.11"
 
-# jemalloc is the default global allocator on 64-bit non-MSVC targets (see main.rs). 32-bit targets
-# (e.g. armv7) are excluded: jemalloc's 64-bit `ffs` helper needs a `__ffsdi2` builtin that fails to
-# link against static 32-bit musl. The default `background_threads_runtime_support` feature lets
-# main.rs's exported `malloc_conf` turn the purge thread on where it is supported; do not force the
-# `background_threads` feature, which compiles `background_thread:true` in on every target and makes
-# Apple builds print a startup warning. `tikv-jemalloc-ctl` powers `/debug/memstats`.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 windows-sys = { version = "0.61", features = [
@@ -63,7 +57,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
 ] }
 
-[target.'cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))'.dependencies]
+# jemalloc is the default global allocator on 64-bit non-MSVC targets (see main.rs). 32-bit targets
+# (e.g. armv7) are excluded: jemalloc's 64-bit `ffs` helper needs a `__ffsdi2` builtin that fails to
+# link against static 32-bit musl. The default `background_threads_runtime_support` feature lets
+# main.rs's exported `malloc_conf` turn the purge thread on where it is supported; do not force the
+# `background_threads` feature, which compiles `background_thread:true` in on every target and makes
+# Apple builds print a startup warning. `tikv-jemalloc-ctl` powers `/debug/memstats`. Android keeps
+# Bionic's allocator (Scudo, or jemalloc on older releases), which already returns freed pages, and
+# tikv-jemalloc-sys links libgcc there, which current NDKs no longer ship.
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "android"), target_pointer_width = "64"))'.dependencies]
 tikv-jemallocator = "0.7"
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 

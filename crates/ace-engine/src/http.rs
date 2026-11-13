@@ -242,7 +242,11 @@ impl BroadcastState {
 /// retention (`resident - allocated` grows). Without the feature it only reports
 /// that profiling is off; process RSS is still observable via `/proc`.
 async fn debug_memstats() -> Response {
-    #[cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))]
+    #[cfg(all(
+        not(target_env = "msvc"),
+        not(target_os = "android"),
+        target_pointer_width = "64"
+    ))]
     let body = {
         use tikv_jemalloc_ctl::{epoch, stats};
         // Refresh the cached stats; report the failure rather than silently returning stale values.
@@ -260,7 +264,11 @@ async fn debug_memstats() -> Response {
             "mapped": read(stats::mapped::read()),
         })
     };
-    #[cfg(not(all(not(target_env = "msvc"), target_pointer_width = "64")))]
+    #[cfg(not(all(
+        not(target_env = "msvc"),
+        not(target_os = "android"),
+        target_pointer_width = "64"
+    )))]
     let body = json!({ "allocator": "system" });
     Json(body).into_response()
 }
