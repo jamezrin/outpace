@@ -70,10 +70,22 @@ It must work equally well on a phone and on an Android TV box.
   32-bit one (picked from the engine's ELF class, not the app's bitness). The loader only accepts
   a program argument from Android 10, the same release that introduced the block, so on Android 5
   to 9 the app executes the file directly. The launch command depends only on the device's API
-  level, never on where the engine came from. Verified on an API 35 emulator with targetSdk 36: a
-  direct `exec` fails with `error=13, Permission denied`; through `linker64` the engine starts,
-  `/healthz` answers `ok` within 500 ms, and SIGTERM exits it cleanly (code 0). The API 21 to 28
-  path still needs a check on an old emulator or device. This relies on release binaries being
+  level, never on where the engine came from. Verified with targetSdk 36 and locally built
+  engines on emulators:
+
+  | Image | Direct exec | Through the loader | `/healthz` | `destroy()` |
+  | --- | --- | --- | --- | --- |
+  | API 35, x86_64 (64-bit only) | `error=13, Permission denied` | `linker64` runs the engine | `ok` in 500 ms | exit 0 (SIGTERM) |
+  | API 30, x86 (32-bit) | `error=13, Permission denied` | `linker` runs the engine | `ok` in 500 ms | exit 0 (SIGTERM) |
+  | API 28, x86_64 and x86 | runs (64 and 32-bit) | prints its help text and exits **0** | `ok` in 500 ms | exit 0 (SIGTERM) |
+
+  So the cutoff is exactly API 29, and it must be chosen by API level: on API 28 the loader
+  "succeeds" without running anything, so a failed launch cannot be detected from its exit code.
+  A 64-bit-only device has no `/system/bin/linker`, so the engine choice must follow
+  `SUPPORTED_ABIS` (never offer a 32-bit engine there). API 21 to 27 were not tested; older
+  libcore may implement `destroy()` as SIGKILL, so below API 24 the app sends SIGTERM itself via
+  `android.os.Process.sendSignal` and the child's pid. The thread reading the engine's output gets
+  an `IOException` when the engine exits and must treat that as end of stream. This relies on release binaries being
   dynamically linked PIEs with the bionic interpreter, which they are today (NDK builds); the
   Android CI jobs must keep it that way.
 - **ABIs.** `arm64-v8a` (existing `aarch64-linux-android` release asset) and `armeabi-v7a` (new
@@ -230,10 +242,19 @@ see "Left to the builder".
 
 ### 7. Engine versions
 
-- **Source:** the GitHub releases of `jamezrin/outpace-stream` (a constant in the app), read from
-  `GET https://api.github.com/repos/jamezrin/outpace-stream/releases` (unauthenticated) and
-  `/releases/latest`. Assets are matched by name:
-  `outpace-<version>-<target>.tar.gz` plus `outpace-<version>-<target>.tar.gz.sha256`.
+- **Source:** the GitHub releases of `jamezrin/outpace-stream` (a constant in the app). The
+  unauthenticated GitHub API allows 60 requests an hour per IP address, which users behind VPNs,
+  carrier-grade NAT or shared networks can exhaust (observed during the design check). So:
+  - "Latest" comes from `HEAD https://github.com/jamezrin/outpace-stream/releases/latest`, which
+    redirects to `/releases/tag/v<version>` and is not API rate-limited.
+  - Downloads use the predictable URLs
+    `https://github.com/jamezrin/outpace-stream/releases/download/v<version>/outpace-<version>-<target>.tar.gz`
+    and the same plus `.sha256`. Whether a release has an asset for the device is checked by
+    fetching that small `.sha256` file.
+  - Only the full list for the versions screen uses
+    `GET https://api.github.com/repos/jamezrin/outpace-stream/releases`, cached for 24 hours. If
+    the API refuses (rate limit or network), the screen still shows the latest release and the
+    installed ones, with a short note that the full list is temporarily unavailable.
 - **Versions screen:** lists releases newest first. Each row shows the version, its date, and a
   badge: *running*, *installed*, *latest*, or *not available for this device* (no asset for the
   device's target, for example releases before v1.0.0, or 32-bit before the armv7 build ships).
