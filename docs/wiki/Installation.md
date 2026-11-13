@@ -140,8 +140,11 @@ Two packages are available in the Arch User Repository:
   `dist` profile, and runs the offline workspace tests. Arch's Rust package supplies the
   compiler; when using rustup instead, the repository's pinned toolchain applies.
 
-Choose one; they provide the same `outpace` command and conflict with each other. With
-an AUR helper already installed:
+Choose one; they provide the same `outpace` command and conflict with each other. Both also
+conflict with `acestream-engine`, including packages that provide that name, so pacman
+requires removing the original engine before installing Outpace. Outpace does not declare
+that it provides `acestream-engine`; applications requiring the original package may need
+separate configuration. With an AUR helper already installed:
 
 ```bash
 yay -S outpace-bin          # official binary
