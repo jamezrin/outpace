@@ -8,7 +8,7 @@ Contributor notes: the local gate, live-network testing, the Rust API surface an
 - [`protocol/wire-protocol.md`](protocol/wire-protocol.md): consolidated peer-wire protocol notes.
 - [`protocol/transport-file.md`](protocol/transport-file.md): transport container and infohash math.
 - [`protocol/notes/`](protocol/notes/): chronological reverse-engineering and live validation notes.
-- [`testing/interop-swarm.md`](testing/interop-swarm.md): the `swarmtest` engine/outpace interop harness. It runs on demand and locally only, and needs Docker plus the proprietary engine, so it isn't part of CI.
+- [`testing/interop-swarm.md`](testing/interop-swarm.md): the `swarmtest` engine/Outpace interop harness. It runs on demand and locally only, and needs Docker plus the proprietary engine, so it isn't part of CI.
 - [`testing/fuzzing.md`](testing/fuzzing.md): parser fuzz targets. Committed seeds replay in `cargo test`; mutation campaigns run locally with `cargo-fuzz`.
 - [`superpowers/plans/`](superpowers/plans/) and [`superpowers/specs/`](superpowers/specs/): implementation plans and design specs, kept as historical records.
 - [`wiki/`](wiki/): the user wiki source, published to the GitHub wiki.
@@ -66,7 +66,7 @@ docker compose -f re/sandbox/docker-compose.yml up -d acestream
 ```
 
 It exposes the engine HTTP API on `127.0.0.1:6878` and is intended for controlled
-capture/interop work, not for runtime use by outpace.
+capture/interop work, not for runtime use by Outpace.
 
 ## Cutting a release
 

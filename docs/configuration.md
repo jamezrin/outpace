@@ -21,7 +21,7 @@ Other environment variables parsed by the daemon include:
 
 - `OUTPACE_BEP9_CONTENT_ID_FALLBACK` - raw transport-hash BEP-9 fallback for content-id
   resolution after catalog failure, default off. Set to `1` on the receiving daemon or
-  standalone `play` process for outpace broadcast Ace links from another daemon. Applies to
+  standalone `play` process for Outpace broadcast Ace links from another daemon. Applies to
   live and VOD; peer results do not populate the catalog-provenance infohash index.
 - `OUTPACE_BIND` - HTTP bind address, default `127.0.0.1:6878`.
 - `OUTPACE_RTMP_BIND` - RTMP ingest bind address, default `127.0.0.1:1935`.
@@ -53,7 +53,7 @@ Other environment variables parsed by the daemon include:
   file (written automatically on first successful disk-cache start). A symlink is not accepted
   as a sentinel. An unmarked non-empty path is refused rather than deleted.
 - `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.
-  When unset, outpace derives the depth from the startup target and advertised bitrate, falling
+  When unset, Outpace derives the depth from the startup target and advertised bitrate, falling
   back to `32` pieces when the bitrate is unavailable.
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
@@ -66,7 +66,7 @@ Other environment variables parsed by the daemon include:
   budget. Queue metadata and the rest of the daemon add memory overhead beyond this payload cap.
 - `OUTPACE_PREBUFFER_TIMEOUT_MS` - deadline after the first media byte for reaching the
   target duration, default `15000`. It is absolute: a source gap or clock reset discards the
-  queued media but does not restart the deadline. On expiry, outpace degrades gracefully by
+  queued media but does not restart the deadline. On expiry, Outpace degrades gracefully by
   releasing the available queue; it does not turn a short advertised live window into a playback
   failure.
 - `OUTPACE_REQUEST_TIMEOUT_MS` - per-piece request timeout before re-requesting or skipping an
@@ -169,9 +169,9 @@ Other environment variables parsed by the daemon include:
   When set (non-empty after trimming) it fully replaces the built-in public default
   (`udp://t1.torrentstream.org:2710/announce`); unset leaves that default in place. Entries with
   no `scheme://` prefix (or longer than 256 bytes) are dropped with a warning, and the list is
-  clamped to 64 entries. Note outpace only **self-announces** to lowercase `udp://` trackers;
+  clamped to 64 entries. Note Outpace only **self-announces** to lowercase `udp://` trackers;
   entries with any other scheme are kept in the minted descriptor for other clients but warned
-  about, since outpace itself never announces there. Use this to point a broadcast at a
+  about, since Outpace itself never announces there. Use this to point a broadcast at a
   private/local tracker (announcing to a private-address tracker also requires the non-global
   tracker allowance, tracked separately).
 - `OUTPACE_TRACKER_ALLOW_NON_GLOBAL` - set to `1` to allow announcing to trackers that resolve
@@ -210,7 +210,7 @@ all existing contents may be deleted.
 
 Disk mode never silently converts `OUTPACE_SEED_STORE_BYTES` into an equal per-stream RAM
 allocation. An invalid/unwritable cache root fails daemon startup. If a new per-stream directory
-cannot be created later (for example after a permission change), outpace logs an escalating
+cannot be created later (for example after a permission change), Outpace logs an escalating
 `disk store creation failure #N` error and keeps playback running with **zero piece retention** for
 that stream: no memory cache fallback is allocated, and reciprocal/inbound seeding has no retained
 pieces to serve. This favors the operator's RAM bound over transient seeding capacity.

@@ -1,6 +1,6 @@
 # Native CLI and HTTP API
 
-The native CLI and HTTP routes are outpace's supported integration surface. They are suitable for
+The native CLI and HTTP routes are Outpace's supported integration surface. They are suitable for
 players such as VLC, media servers such as Jellyfin, and playlist/proxy tools such as dispatcharr.
 Playback requests start and share sessions, while status routes observe sessions already active.
 
@@ -25,7 +25,7 @@ CLI inputs retain their existing meanings.
 
 | Command | Behavior |
 | --- | --- |
-| `outpace serve` | Runs the native HTTP API, RTMP ingest, and enabled peer services. With no command, outpace defaults to `serve`. |
+| `outpace serve` | Runs the native HTTP API, RTMP ingest, and enabled peer services. With no command, Outpace defaults to `serve`. |
 | `outpace play <input>` | Writes live MPEG-TS bytes to stdout. Diagnostics go to stderr, so redirection and piping are safe. Accepts `acestream://`, `acestream:?`, `magnet:`, and HTTP(S) transport-file inputs; infohash and magnet inputs fail closed (no verified descriptor in a one-shot process). |
 | `outpace play --vod <input>` | Downloads a single-file VOD, verifies every piece, and writes the file to stdout. |
 | `outpace broadcast <name>` | Creates or resumes a broadcast, prints HTTP/RTMP ingest and playback metadata to stderr, and runs the server. |
@@ -382,14 +382,14 @@ decoder or player lead measurement: a client can drain the server queue faster t
 or maintain its own independent buffer. Metadata always has the stable `title`, `bitrate`, and
 `categories` fields;
 descriptors without metadata return `null`, `null`, and `[]` respectively.
-The descriptor title is authoritative for both `metadata.title` and `Icy-Name`; outpace does not
+The descriptor title is authoritative for both `metadata.title` and `Icy-Name`; Outpace does not
 invent a title.
 Live HLS media playlists are unchanged because they have no portable stream-title field.
 
 ## Origin HLS
 
 Some descriptors carry no swarm: they name an HTTP(S) HLS manifest. These are not
-peer-to-peer sources, so outpace never opens a session for them.
+peer-to-peer sources, so Outpace never opens a session for them.
 
 **Default: direct handoff.** Live playback routes (`/streams/…`, `/ace/getstream`,
 `/ace/manifest.m3u8`, and a compat JSON lease's `playback_url`) answer `302` with the
@@ -475,7 +475,7 @@ its own broadcast content ids using its trusted local broadcast registry.
 
 Set `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` on the receiving daemon or standalone `play`
 process to enable BEP-9 fallback after catalog failure. This supports the raw wrapped
-transport-file hash convention used by outpace broadcasts. The peer result must satisfy
+transport-file hash convention used by Outpace broadcasts. The peer result must satisfy
 `SHA1(raw wrapped transport bytes) == requested identifier`; this is not an established
 public catalog content-id derivation. Peer results stay outside the catalog-provenance
 infohash index and do not authorize later bare-infohash playback.
