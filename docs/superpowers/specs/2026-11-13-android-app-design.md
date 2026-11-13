@@ -24,14 +24,19 @@ It must work equally well on a phone and on an Android TV box.
    box, or a recent-streams list, and hand the stream to an external player.
 5. Expose a small set of engine settings through a UI, mapped to existing `OUTPACE_*`
    environment variables.
-6. One APK for phones and Android TV, covering 64-bit and 32-bit ARM devices.
+6. Let the user pick which engine release to run, downloaded from GitHub releases, and always
+   see which version is running and which is the latest.
+7. One APK for phones and Android TV, covering 64-bit and 32-bit ARM devices.
 
 ## Non-goals
 
 - No built-in player, ever. Playback is always delegated to another app.
 - No stream search or channel lists.
 - No broadcasting UI (RTMP, SRT, `outpace broadcast`).
-- No in-app updater in v1. Updates are by installing a newer APK.
+- No self-update of the app itself in v1 (a newer APK is installed by hand). Engine versions are
+  managed in-app, see feature 7.
+- No automatic engine upgrades: the app tells the user a newer release exists; the user decides.
+- No engine bundled in the APK.
 - No root features.
 - No Play Store listing in v1 (sideloaded from GitHub releases). Do not design anything that
   rules a store listing out later, but do not do the store-specific work now.
@@ -54,19 +59,33 @@ It must work equally well on a phone and on an Android TV box.
 
 ## Constraints
 
-- **Engine as a child process, not a library.** The APK bundles the unmodified `outpace` release
-  binary per ABI and runs `outpace serve` with `ProcessBuilder` from a foreground service. No JNI,
-  no Rust changes. A crash in the engine kills only the engine process; the app reports it.
-- **Where the binary lives.** On Android 10+, app-writable directories are not executable. The
-  binary is packaged as a native library (for example `jniLibs/<abi>/liboutpace.so`) with
-  `android:extractNativeLibs="true"` (or `useLegacyPackaging` in Gradle), and executed from
-  `applicationInfo.nativeLibraryDir`. This is the standard approach and works from Android 5.
-- **ABIs.** `arm64-v8a` (existing `aarch64-linux-android` build) and `armeabi-v7a` (new
-  `armv7-linux-androideabi` build). Many TV devices run a 32-bit userland on 64-bit chips, so
-  32-bit is required, not optional. `x86_64` is optional, only if it is cheap to add for the
-  emulator. The 32-bit engine build must be added to CI; the engine already keeps the system
-  allocator on Android and on 32-bit targets, so no allocator work is expected, but this is
-  unverified until CI builds and smoke-tests it.
+- **Engine as a child process, not a library.** The app downloads the unmodified `outpace`
+  release binary for the device from GitHub releases and runs `outpace serve` with
+  `ProcessBuilder` from a foreground service. No JNI, no Rust changes, no engine in the APK. A
+  crash in the engine kills only the engine process; the app reports it.
+- **Where the binary lives and how it runs (decided, verified).** Downloaded engines live in
+  `filesDir/engines/<version>/outpace`. Since Android 10, apps targeting API 29+ cannot `exec()`
+  files in their own storage. The app therefore runs the engine through the system loader:
+  `/system/bin/linker64 <path> serve` for a 64-bit engine, `/system/bin/linker <path> serve` for a
+  32-bit one (picked from the engine's ELF class, not the app's bitness). The loader only accepts
+  a program argument from Android 10, the same release that introduced the block, so on Android 5
+  to 9 the app executes the file directly. The launch command depends only on the device's API
+  level, never on where the engine came from. Verified on an API 35 emulator with targetSdk 36: a
+  direct `exec` fails with `error=13, Permission denied`; through `linker64` the engine starts,
+  `/healthz` answers `ok` within 500 ms, and SIGTERM exits it cleanly (code 0). The API 21 to 28
+  path still needs a check on an old emulator or device. This relies on release binaries being
+  dynamically linked PIEs with the bionic interpreter, which they are today (NDK builds); the
+  Android CI jobs must keep it that way.
+- **ABIs.** `arm64-v8a` (existing `aarch64-linux-android` release asset) and `armeabi-v7a` (new
+  `armv7-linux-androideabi` asset). Many TV devices run a 32-bit userland on 64-bit chips, so
+  32-bit is required, not optional. The app maps `Build.SUPPORTED_ABIS[0]` to a release target:
+  `arm64-v8a` to `aarch64-linux-android`, `armeabi-v7a` to `armv7-linux-androideabi`, `x86_64` to
+  `x86_64-linux-android`. `x86_64` releases are optional (emulator use); the mapping exists so a
+  release that adds them just works. The 32-bit engine build must be added to CI; the engine
+  already keeps the system allocator on Android and on 32-bit targets, so no allocator work is
+  expected, but this is unverified until CI builds and smoke-tests it.
+- **Play Store.** Downloading executable code is against Play policy, so a store build would need
+  a different engine source. Out of scope for v1 (sideload only); nothing here prevents adding one.
 - **Minimum Android version.** Match the engine: API 21 (Android 5). Target the current SDK
   required for sideloaded installs to not warn.
 - **Stopping.** The engine handles SIGTERM with a graceful shutdown. The app sends SIGTERM, waits
@@ -91,8 +110,7 @@ It must work equally well on a phone and on an Android TV box.
   Nothing polls while the engine is stopped. The engine's stderr goes into a bounded in-memory
   ring buffer (a few hundred lines); the app never parses it.
 - **Kotlin**, minimal dependencies (AndroidX core, the leanback launcher bits for TV). No
-  cross-platform UI frameworks. The APK size is dominated by the engine binaries; keep the
-  app part small.
+  cross-platform UI frameworks. With no engine bundled, the APK should stay well under 5 MB.
 - **Location in the repo:** an `android/` directory with its own Gradle build. The Rust workspace
   is unaffected.
 - Repository rules apply as usual: wiki updated in the same PR as user-visible changes, branch
@@ -107,6 +125,9 @@ These were agreed with the maintainer:
 - Share/hand-off of a content id to an external player (VLC and others).
 - Phones and Android TV are equally important.
 - Phone auto-stop on idle, start-on-boot for TV, both as defaults the user can change.
+- Download-only engine: no engine in the APK; the user picks a release; one launch mechanism
+  (per Android version), chosen over a bundled engine or a bundled-plus-download hybrid to keep
+  one way of running and debugging the engine.
 
 ## Features
 
@@ -207,7 +228,36 @@ see "Left to the builder".
   prominently on TV and on phones only when start-on-boot is enabled.
 - `BOOT_COMPLETED` receiver starts the service when start-on-boot is on.
 
-### 7. Phone and TV presentation
+### 7. Engine versions
+
+- **Source:** the GitHub releases of `jamezrin/outpace-stream` (a constant in the app), read from
+  `GET https://api.github.com/repos/jamezrin/outpace-stream/releases` (unauthenticated) and
+  `/releases/latest`. Assets are matched by name:
+  `outpace-<version>-<target>.tar.gz` plus `outpace-<version>-<target>.tar.gz.sha256`.
+- **Versions screen:** lists releases newest first. Each row shows the version, its date, and a
+  badge: *running*, *installed*, *latest*, or *not available for this device* (no asset for the
+  device's target, for example releases before v1.0.0, or 32-bit before the armv7 build ships).
+  Drafts are never shown; pre-releases are hidden unless a "show pre-releases" toggle is on.
+- **Install:** download the archive and its `.sha256` over HTTPS into the cache dir, verify the
+  SHA-256, extract only the `outpace` entry from the tar.gz into
+  `filesDir/engines/<version>/outpace`, then mark it installed. A failed or cancelled download
+  leaves nothing behind. Download progress is shown; the download runs only while the user waits
+  on that screen (no background download service in v1).
+- **Activate:** choosing an installed version makes it the active engine; if the engine is
+  running, the app restarts it on the new version.
+- **Storage bound:** at most 3 installed versions; installing a fourth asks which to remove.
+  The active version cannot be removed while it runs.
+- **First run:** with no engine installed, the main screen's start control becomes "Download
+  engine", preselecting the latest release that has an asset for the device.
+- **Running vs latest:** the main screen shows "Engine vX.Y.Z" and, when a newer release with an
+  asset for this device exists, "vA.B.C available" linking to the versions screen. The latest
+  release is fetched when the main screen opens, at most once every 24 hours, plus on a manual
+  refresh. Network failures are shown quietly and never block starting an installed engine.
+- **Integrity scope:** the `.sha256` comes from the same release, so it detects corruption and
+  truncation; transport security comes from HTTPS to GitHub. Signature verification is out of
+  scope for v1.
+
+### 8. Phone and TV presentation
 
 - One APK. TV: `LEANBACK_LAUNCHER` intent filter, a launcher banner, `touchscreen` declared not
   required. Phone: normal launcher icon.
@@ -217,10 +267,13 @@ see "Left to the builder".
 ## Build, CI and release
 
 - CI gains an `armv7-linux-androideabi` engine build next to the existing best-effort
-  `aarch64-linux-android` one, with the same QEMU smoke test.
-- A workflow builds the APK from those two binaries and attaches it to the GitHub release as a
-  best-effort asset, the same way the Termux archive is handled today (uploaded after the main
-  release, its own `.sha256`).
+  `aarch64-linux-android` one, with the same QEMU smoke test, and the release workflow uploads it
+  the same way (its own archive and `.sha256`). These archives are what the app downloads, so
+  their names and layout (`outpace-<version>-<target>/outpace` inside the tar.gz) are now an
+  interface the app depends on.
+- A workflow builds and unit-tests the APK on PRs touching `android/`, and attaches the APK to
+  the GitHub release as a best-effort asset with its own `.sha256`. The APK contains no engine,
+  so it does not depend on the engine build jobs.
 - Release signing: a dedicated release keystore stored as a CI secret. Creating the key and
   adding the secrets is a maintainer task; until then CI builds an unsigned or debug-signed APK
   for testing only.
@@ -228,8 +281,9 @@ see "Left to the builder".
 
 ## Documentation
 
-- New wiki page `Android-App.md` (install, first start, playing a link, settings, battery
-  advice, TV notes), linked from `_Sidebar.md` and `Home.md`.
+- New wiki page `Android-App.md` (install, first start and engine download, choosing engine
+  versions, playing a link, settings, battery advice, TV notes), linked from `_Sidebar.md` and
+  `Home.md`.
 - `Installation.md`: add the APK as the recommended Android route; keep Termux as the
   alternative.
 - `Releases-and-Versions.md`: list the APK asset and its best-effort status.
@@ -237,7 +291,9 @@ see "Left to the builder".
 ## Testing
 
 - Unit tests for the pure parts: content-id extraction from shared text and links (only the
-  synthetic placeholder id in tests), URL building, settings-to-environment mapping.
+  synthetic placeholder id in tests), URL building, settings-to-environment mapping, release-list
+  parsing and asset matching, version comparison, SHA-256 file parsing, tar.gz extraction, and
+  launch-command selection per API level and ELF class.
 - Instrumented or manual test checklist: start/stop, crash detection (kill the process), link
   tap with the engine stopped, share-sheet hand-off to VLC, TV D-pad navigation, boot start, idle
   auto-stop. Live playback checks use a current content id resolved at runtime, never recorded.
@@ -256,5 +312,5 @@ see "Left to the builder".
   signal exists (or a small engine issue can add one), fall back to `/vod/ace/cid:<id>`, and make
   idle auto-stop aware of VOD hand-offs, since VOD sessions are not listed in `/streams`. If not,
   ship live-only in v1 and say so in the wiki.
-- Whether to add `x86_64` for emulator use.
+- Whether to add `x86_64` engine release assets for emulator use.
 - How the APK workflow is split from or folded into `release.yml`.
