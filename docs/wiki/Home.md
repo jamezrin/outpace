@@ -58,6 +58,7 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 | Get quick answers | [FAQ](FAQ) |
 | Play a stream in five minutes | [Getting Started](Getting-Started) |
 | Pick a binary, container or source build | [Installation](Installation) |
+| Run it on an Android phone or TV | [Android App](Android-App) |
 | Look up a setting | [Configuration](Configuration) (by topic) · [Environment Variables](Environment-Variables) (A–Z) |
 | Use `outpace play`, `broadcast` or other commands | [Command Line](Command-Line) |
 | Point a player or app at Outpace | [Playing Streams](Playing-Streams) |

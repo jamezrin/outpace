@@ -51,10 +51,18 @@ awk -v a="$artifact" '$2 == a { print }' SHA256SUMS | grep -q . \
 
 On Windows, unzip the archive and run `outpace.exe serve` from a terminal. To run it in the background, see [Deployment](Deployment#windows-service).
 
+### Android app
+
+The [Android App](Android-App) is the easiest way to run outpace on a phone or an Android TV box:
+install the APK, and it downloads, runs and updates the engine for you, then hands streams to
+your video player. It first ships with the next release after v1.0.0.
+
 ### Android with Termux (best-effort)
 
 From v1.0.0, there is a best-effort `aarch64-linux-android` build for 64-bit ARM
-phones and Android TV boxes, to run under [Termux](https://termux.dev).
+phones and Android TV boxes, to run under [Termux](https://termux.dev). From the release that
+ships the Android app, there is also an `armv7-linux-androideabi` build for 32-bit ARM devices,
+packaged the same way.
 
 - **Best-effort** means it is uploaded after the rest of the release. If its build fails, that
   release has no Android archive.

@@ -1,11 +1,13 @@
 name: Android best-effort
 
-# aarch64-linux-android (Termux on phones and Android TV boxes) is a best-effort target:
-# checked here, and uploaded by release.yml only after the release and image are published.
+# The Android engine builds (aarch64 and armv7, used by Termux and by the Android app) are
+# best-effort targets: checked here, and uploaded by release.yml only after the release and
+# image are published. The Android app itself is built and unit-tested by the `app` job.
 on:
   pull_request:
     paths:
       - .github/workflows/android.yml
+      - android/**
       - crates/**
       - Cargo.toml
       - Cargo.lock
@@ -18,13 +20,19 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: aarch64-linux-android
 
 jobs:
   android:
-    name: Build and smoke aarch64-linux-android
+    name: Build and smoke ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # armeabi-v7a matters: many Android TV devices run a 32-bit userland on 64-bit chips.
+        target: [aarch64-linux-android, armv7-linux-androideabi]
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -55,3 +63,26 @@ jobs:
           export SMOKE_RUNNER="${!runner_var:-}"
           echo "runner: ${SMOKE_RUNNER:-native}"
           sh tools/ci/smoke_daemon.sh "target/$TARGET/release/outpace"
+
+  app:
+    name: Build and test the Android app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # The app bundles no engine, so it does not depend on the engine jobs above.
+      - name: Unit tests, lint and release build
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleRelease

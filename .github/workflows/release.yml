@@ -268,10 +268,12 @@ jobs:
       tag: ${{ github.ref_name }}
 
   best-effort-android:
-    # aarch64-linux-android for Termux. Runs only after the release and its container image
-    # exist, so a failure can never block either. Builds with a read-only token; the separate
-    # upload job below is the only one that can write to the release.
-    name: Best-effort aarch64-linux-android
+    # Android engines for Termux and the Android app, which downloads these archives by name
+    # (outpace-<version>-<target>.tar.gz plus .sha256), so their names and layout are an
+    # interface. Runs only after the release and its container image exist, so a failure can
+    # never block either. Builds with a read-only token; the separate upload job below is the
+    # only one that can write to the release.
+    name: Best-effort ${{ matrix.target }}
     runs-on: ubuntu-24.04
     needs:
       - release-metadata
@@ -280,8 +282,12 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux-android, armv7-linux-androideabi]
     env:
-      TARGET: aarch64-linux-android
+      TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -319,31 +325,102 @@ jobs:
       - name: Upload packaged binary
         uses: actions/upload-artifact@v7
         with:
-          name: best-effort-android
+          name: best-effort-android-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
           if-no-files-found: error
           retention-days: 1
 
+  best-effort-android-app:
+    # The Android app APK. It bundles no engine, so it does not wait for the engine builds.
+    # Signed only when the release keystore secrets exist; otherwise the APK is unsigned.
+    name: Best-effort Android app
+    runs-on: ubuntu-24.04
+    needs:
+      - release-metadata
+      - publish-container
+    continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Build and package
+        shell: bash
+        working-directory: android
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          KEYSTORE_BASE64: ${{ secrets.OUTPACE_ANDROID_KEYSTORE_BASE64 }}
+          OUTPACE_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.OUTPACE_ANDROID_KEYSTORE_PASSWORD }}
+          OUTPACE_ANDROID_KEY_ALIAS: ${{ secrets.OUTPACE_ANDROID_KEY_ALIAS }}
+          OUTPACE_ANDROID_KEY_PASSWORD: ${{ secrets.OUTPACE_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          suffix=unsigned
+          if [[ -n "$KEYSTORE_BASE64" ]]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            export OUTPACE_ANDROID_KEYSTORE="$RUNNER_TEMP/release.jks"
+            suffix=signed
+          fi
+          ./gradlew --no-daemon testDebugUnitTest assembleRelease -PappVersion="$VERSION"
+          mkdir -p ../dist
+          apk="$(ls app/build/outputs/apk/release/*.apk | head -n1)"
+          name="outpace-android-${VERSION}.apk"
+          [[ "$suffix" == unsigned ]] && name="outpace-android-${VERSION}-unsigned.apk"
+          cp "$apk" "../dist/$name"
+          (cd ../dist && sha256sum "$name" > "$name.sha256")
+          rm -f "$RUNNER_TEMP/release.jks"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: best-effort-android-app
+          path: |
+            dist/*.apk
+            dist/*.apk.sha256
+          if-no-files-found: error
+          retention-days: 1
+
   upload-best-effort-android:
     # Write-scoped, but runs no build steps or toolchain actions: it only attaches the
-    # archive built above.
-    name: Upload best-effort aarch64-linux-android
+    # archives built above. Each artifact is optional, since every build is best-effort.
+    name: Upload best-effort Android assets
     runs-on: ubuntu-24.04
-    needs: best-effort-android
+    needs:
+      - best-effort-android
+      - best-effort-android-app
+    if: ${{ !cancelled() }}
     continue-on-error: true
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Download packaged binary
+      - name: Download packaged binaries
         uses: actions/download-artifact@v8
         with:
-          name: best-effort-android
+          pattern: best-effort-android*
+          merge-multiple: true
           path: dist
 
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+        run: |
+          shopt -s nullglob
+          files=(dist/*)
+          if (( ${#files[@]} == 0 )); then
+            echo "::warning::No best-effort Android assets were built."
+            exit 0
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY"

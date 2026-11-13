@@ -56,6 +56,16 @@ build.
 | `edge` | With every merge to `main` | amd64 | Testing unreleased features. |
 | `sha-<commit>` | No | amd64 | Pinning one specific `main` build. |
 
+## Unreleased
+
+On `main`, not yet in a release:
+
+- The [Android App](Android-App) for phones and Android TV, published as a best-effort
+  `outpace-android-<version>.apk` with its own `.sha256`. It downloads engine releases itself.
+- A best-effort `armv7-linux-androideabi` engine archive for 32-bit Android devices, next to the
+  `aarch64-linux-android` one. The app downloads these archives by name, so their names and
+  layout (`outpace-<version>-<target>/outpace` inside the `.tar.gz`) stay stable.
+
 ## v1.0.0 highlights
 
 These changes are included in 1.0.0; they are absent from v0.9.0:

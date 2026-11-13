@@ -5,6 +5,7 @@
 - [FAQ](FAQ)
 - [Getting Started](Getting-Started)
 - [Installation](Installation)
+- [Android App](Android-App)
 - [Configuration](Configuration)
 - [Environment Variables](Environment-Variables)
 - [Command Line](Command-Line)
