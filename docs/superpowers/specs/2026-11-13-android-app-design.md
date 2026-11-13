@@ -242,17 +242,17 @@ see "Left to the builder".
 
 ### 7. Engine versions
 
-- **Source:** the GitHub releases of `jamezrin/outpace-stream` (a constant in the app). The
+- **Source:** the GitHub releases of `outpace-stream/outpace-engine` (a constant in the app). The
   unauthenticated GitHub API allows 60 requests an hour per IP address, which users behind VPNs,
   carrier-grade NAT or shared networks can exhaust (observed during the design check). So:
-  - "Latest" comes from `HEAD https://github.com/jamezrin/outpace-stream/releases/latest`, which
+  - "Latest" comes from `HEAD https://github.com/outpace-stream/outpace-engine/releases/latest`, which
     redirects to `/releases/tag/v<version>` and is not API rate-limited.
   - Downloads use the predictable URLs
-    `https://github.com/jamezrin/outpace-stream/releases/download/v<version>/outpace-<version>-<target>.tar.gz`
+    `https://github.com/outpace-stream/outpace-engine/releases/download/v<version>/outpace-<version>-<target>.tar.gz`
     and the same plus `.sha256`. Whether a release has an asset for the device is checked by
     fetching that small `.sha256` file.
   - Only the full list for the versions screen uses
-    `GET https://api.github.com/repos/jamezrin/outpace-stream/releases`, cached for 24 hours. If
+    `GET https://api.github.com/repos/outpace-stream/outpace-engine/releases`, cached for 24 hours. If
     the API refuses (rate limit or network), the screen still shows the latest release and the
     installed ones, with a short note that the full list is temporarily unavailable.
 - **Versions screen:** lists releases newest first. Each row shows the version, its date, and a

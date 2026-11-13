@@ -13,7 +13,7 @@ data class Release(
 )
 
 object Releases {
-    const val REPO = "jamezrin/outpace-stream"
+    const val REPO = "outpace-stream/outpace-engine"
     const val LIST_URL = "https://api.github.com/repos/$REPO/releases?per_page=30"
     const val LATEST_URL = "https://github.com/$REPO/releases/latest"
 

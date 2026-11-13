@@ -64,7 +64,7 @@ class ReleasesTest {
     }
 
     @Test fun downloadUrlUsesTag() = assertEquals(
-        "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-aarch64-linux-android.tar.gz",
+        "https://github.com/outpace-stream/outpace-engine/releases/download/v1.0.0/outpace-1.0.0-aarch64-linux-android.tar.gz",
         Releases.downloadUrl("1.0.0", Releases.archiveName("1.0.0", "aarch64-linux-android")),
     )
 

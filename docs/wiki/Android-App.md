@@ -11,7 +11,7 @@ Kodi. It has no player of its own.
 ## Install
 
 1. Download `outpace-android-<version>.apk` from the
-   [releases page](https://github.com/jamezrin/outpace-stream/releases) and check it against its
+   [releases page](https://github.com/outpace-stream/outpace-engine/releases) and check it against its
    `.sha256` file.
 2. Open it on the device and allow installing from that source when Android asks. On Android TV,
    copy it over with a USB drive or a file-transfer app, or install it from a computer with
