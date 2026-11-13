@@ -1,23 +1,29 @@
 # Migrating an engine installation to Outpace
 
-This is an operator migration guide for the v1.0 milestone, not a production-readiness
-signoff. v0.9 is published; #195 and #246 hardening remains unfinished. Verify the exact
-binary/image you select: current source documentation can describe changes newer than a
-published image. No runtime or official-engine interoperability qualification is implied.
+This operator guide targets the documented 1.0.0 subset. The release is being prepared;
+v0.9.0 remains the latest published release until publication. See the
+[release notes](releases/1.0.0.md) for supported behavior and validation limits.
+[#195](https://github.com/jamezrin/outpace-stream/issues/195) records the sustained comparison,
+and [#210](https://github.com/jamezrin/outpace-stream/issues/210#issuecomment-6827431678)
+records maintainer production-replacement acceptance. The historical reconnect stall
+[#246](https://github.com/jamezrin/outpace-stream/issues/246#issuecomment-6827432729) was closed
+as inconclusive, not as causally fixed. Reference-relative latency to live remains unmeasured.
+Verify the exact binary/image and your own clients before cutover; these decisions do not
+qualify every later build or deployment.
 
 Outpace runs independently of the closed engine. Use the native CLI and
 [native API](native-api.md) first; the [Ace HTTP subset](protocol/compat-matrix.md) is an
 optional adapter, not complete engine parity. Public, unencrypted content is the scope.
 Premium/encrypted content, account/subscription import, player/web UI, and a closed-engine
 runtime remain permanent non-goals (#212). Service-backed name search is a separate,
-default-off adapter in builds newer than v0.9.0. It uses native HTTP services without an
+default-off adapter in builds from v1.0.0. It uses native HTTP services without an
 operator API key; see
 [search configuration and client limits](wiki/Stream-Search.md). HTTP compatibility alone
 does not enable it. Existing infohash playback selectors provide the result-to-playback path;
 older reverse-content-ID clients still need an integration change. Search is not a migration
 prerequisite, and [#406](https://github.com/jamezrin/outpace-stream/issues/406) retains the
 remaining client/access qualification requirements.
-Protected-descriptor refusal is still tracked in [#279](https://github.com/jamezrin/outpace-stream/issues/279);
+Protected-descriptor refusal was delivered for [#279](https://github.com/jamezrin/outpace-stream/issues/279) in [#314](https://github.com/jamezrin/outpace-stream/pull/314);
 do not treat a reported zero encryption flag as independent proof that content is public.
 
 ## Inventory and configuration mapping

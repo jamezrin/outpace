@@ -122,9 +122,9 @@ Things to know:
 
 ## SRT ingest
 
-> **Unreleased, and only in special builds.** SRT is newer than v0.9.0, and it isn't in any
-> release binary or published image. Build from `main` on native Linux with `--features srt`
-> and libsrt 1.5.7 or newer; see [Installation](Installation#building-with-srt-ingest).
+> **From v1.0.0, only in special builds.** SRT isn't in any
+> release binary or published image. Build from `main` until `v1.0.0` is tagged, then from that tag,
+> on native Linux with `--features srt` and libsrt 1.5.7 or newer; see [Installation](Installation#building-with-srt-ingest).
 
 SRT gives you an **encrypted** input over UDP, useful for publishing from a remote encoder.
 
@@ -166,7 +166,11 @@ Security notes:
 ## Broadcast profiles
 
 `OUTPACE_BROADCAST_OPTIONS` sets per-name descriptor metadata. It applies to every producer type
-and to the `broadcast` command:
+and to the `broadcast` command. Supported fields are listed below. Metatracker/startup-node
+settings and tags/logo/description (#269) are explicitly deferred for 1.0.0 pending complete
+wire and runtime evidence; arbitrary metadata is not accepted. See
+[Releases and Versions](Releases-and-Versions#deferred-scope).
+
 
 ```bash
 export OUTPACE_BROADCAST_OPTIONS='{"my-channel":{"title":"My Channel","bitrate_bytes_per_sec":500000,"piece_length":131072,"quality":"HD","categories":["other"]}}'

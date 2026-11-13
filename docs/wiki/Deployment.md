@@ -1,5 +1,8 @@
 # Deployment
 
+> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
+> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
+
 This page covers running Outpace permanently: with Docker Compose, as a systemd service, behind
 a reverse proxy and in an LXC guest. It also covers upgrades, rollback and shutdown.
 
@@ -36,7 +39,7 @@ The repository ships a production
 
 ```bash
 cp .env.example .env
-# set OUTPACE_IMAGE=ghcr.io/jamezrin/outpace:0.9.0 (pin a release)
+# set OUTPACE_IMAGE=ghcr.io/jamezrin/outpace:1.0.0 (pin a release)
 docker compose config        # check the result
 docker compose up -d --wait
 curl --fail http://127.0.0.1:6878/healthz
@@ -123,7 +126,7 @@ startup buffer (up to 128 MiB), seeding store, HLS window and timeshift budget, 
 
 ## systemd
 
-From the next release, the [`.deb` and `.rpm` packages](Installation#debian-ubuntu-and-fedora-packages)
+From v1.0.0, the [`.deb` and `.rpm` packages](Installation#debian-ubuntu-and-fedora-packages)
 set all of this up: edit `/etc/outpace/outpace.env` and run `systemctl enable --now outpace`. The
 unit they ship is
 [`packaging/linux/outpace.service`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/linux/outpace.service),
@@ -181,7 +184,7 @@ journal adds the date. Open TCP 8621 in your firewall if you run as a full parti
 
 ## Windows service
 
-Unreleased: `edge` and builds from `main` only. On Windows, `outpace.exe` can install itself as
+From v1.0.0. On Windows, `outpace.exe` can install itself as
 a service. Run these from an elevated (administrator) prompt:
 
 ```powershell
@@ -224,7 +227,7 @@ directory is kept. Open TCP 8621 in Windows Defender Firewall if you run as a fu
 
 ## macOS launchd
 
-Unreleased: `edge` and builds from `main` only. The repository ships a per-user LaunchAgent. It
+From v1.0.0. The repository ships a per-user LaunchAgent. It
 starts Outpace at login and restarts it if it crashes:
 
 ```bash
@@ -244,7 +247,7 @@ packaging/macos/install-launchagent.sh uninstall     # to remove it
 
 ## FreeBSD rc.d
 
-From the next release, there is a FreeBSD binary (see
+From v1.0.0, there is a FreeBSD binary (see
 [Installation](Installation#freebsd-and-other-bsds)). Run it under `daemon(8)`, which
 restarts it if it exits:
 
@@ -341,7 +344,7 @@ To compare two engines behind one router, give each its own external peer port a
 ## Linux portability
 
 - Images: `linux/amd64`, `linux/arm64`, `linux/arm/v7` (releases); `edge` is `linux/amd64` only.
-- ARMv7 means hard-float ARMv7 such as Raspberry Pi 2/3. From the next release there are also
+- ARMv7 means hard-float ARMv7 such as Raspberry Pi 2/3. From v1.0.0 there are also
   ARMv6 hard-float and RISC-V 64 binaries (no image). Soft-float ARM isn't supported. On 32-bit
   ARM expect fewer simultaneous streams; start with `OUTPACE_CACHE_TYPE=disk`,
   `OUTPACE_SEED_STORE_BYTES=67108864` and `OUTPACE_SESSION_BUFFER=64`.
@@ -382,7 +385,7 @@ On `SIGTERM` (`docker stop`, `systemctl stop`) outpace:
 3. drains HTTP connections;
 4. exits.
 
-> **Unreleased fix:** ending open viewer responses first is in `edge` and `main`. On v0.9.0, a
+> **From v1.0.0:** shutdown ends open viewer responses first. On v0.9.0, a
 > connected viewer keeps the process alive until it disconnects, or until the stop timeout
 > kills it (30 seconds in the provided Compose file).
 
@@ -394,7 +397,7 @@ exits.
 
 A stream with no viewers, HLS requests or leases is torn down after a 30-second grace period.
 
-> **Unreleased fix:** in `edge` and `main`, one stream whose cleanup hangs no longer stops later
+> **From v1.0.0:** one stream whose cleanup hangs no longer stops later
 > idle streams from being cleaned up. The log shows `[manager] idle cleanup still pending` when
 > this happens.
 

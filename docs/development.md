@@ -25,8 +25,8 @@ The live byte path is built and proven against real public swarms:
 - the daemon can discover peers, connect, download live media, and serve it over
   the native API;
 - reciprocal upload, inbound seeding plumbing, signed broadcast origination,
-  HTTP raw ingest, managed HTTP(S) MPEG-TS sources, RTMP ingest, content-id metadata serving, and the three-command
-  CLI are implemented;
+  HTTP raw ingest, managed HTTP(S) MPEG-TS sources, RTMP ingest, optional SRT, content-id
+  metadata serving, and the CLI are implemented;
 - live-network tests remain ignored by default because they need the public swarm
   and a suitable network.
 
@@ -57,8 +57,8 @@ ignored live-network tests never run in CI.
 - A known-good live content id for smoke tests is `cid1` in the gitignored
   `acestream-ids.txt` registry (see AGENTS.md); resolve it to the current
   infohash when needed because live infohashes rotate.
-- `status=prebuf, peers=0` forever usually means a dead live channel. The old promo
-  transport id `685e...6067` is dead and should not be used as proof.
+- `status=prebuf, peers=0` alone does not establish a dead source. Check current source
+  availability, discovery progress, routing and buffering before attributing a failure.
 - The official closed engine sandbox, when present, is started with:
 
 ```bash
@@ -74,34 +74,43 @@ The release version is the Cargo package version: the workspace crates inherit a
 single `version` from `[workspace.package]` in the root `Cargo.toml`, and that is
 the version `outpace --version` reports. The git tag is only a validated trigger.
 
-First bump the shared version and commit the change, including the updated lockfile.
-Merge that release-preparation commit into `main` before creating the matching tag
-with a leading `v`:
+Prepare a topic-branch PR from current `main`: bump the shared version and matching workspace
+lockfile entries, add `docs/releases/<version>.md`, and update affected wiki pages/examples.
+The release workflow includes that file as the curated release body alongside generated notes.
+Run the local gate, wiki link checker and identifier hygiene, then review candidate CI and any
+required acceptance evidence before merging. The [1.0.0 preparation checklist](superpowers/plans/2026-11-13-release-1.0.0-398.md#tomorrows-cut-checklist-maintainer-action)
+records publication and post-publication steps for that release.
+
+After the preparation PR is merged and publication is authorized, tag the exact reviewed commit
+with an annotated tag (the following is an example for the planned 1.0.0 cut):
 
 ```bash
-# On a release-preparation branch, edit [workspace.package] in Cargo.toml,
-# e.g. to 0.10.0, then refresh Cargo.lock and commit both files:
-cargo check --workspace
-git add Cargo.toml Cargo.lock
-git commit -m "chore: prepare release 0.10.0"
-# After the release-preparation PR is merged:
 git switch main
 git pull --ff-only origin main
-git tag v0.10.0
-git push origin v0.10.0
+# Verify HEAD is the accepted candidate and CI is green before tagging.
+git tag -a v1.0.0 -m "Outpace 1.0.0"
+git push origin v1.0.0
 ```
 
-Pushing the tag runs `.github/workflows/release.yml`. It reads the version from
-`cargo metadata` and fails the release before building anything if the tag does
-not match `v<cargo_version>`, so artifact names and Docker tags always agree with
-the Cargo version. The workflow:
+Pushing the tag runs `.github/workflows/release.yml`. Its metadata job rejects a tag that
+does not match `v<cargo_version>`, so artifact names and image tags agree with Cargo. It:
 
-- builds Linux binaries for amd64, arm64, and ARMv7, plus macOS and Windows binaries for amd64
-  and arm64;
-- uploads `tar.gz` archives for Unix targets and `zip` archives for Windows;
-- generates one `SHA256SUMS` file for all archives;
-- creates a GitHub Release with generated release notes;
-- publishes `ghcr.io/jamezrin/outpace:<version>` and `ghcr.io/jamezrin/outpace:latest`.
+- builds ten required archives using the `dist` profile: Linux musl x86_64, ARM64, ARMv7,
+  ARMv6 hard-float and RISC-V 64; FreeBSD x86_64; macOS Intel/Apple silicon; Windows x86_64/ARM64;
+- packages Unix `.tar.gz` and Windows `.zip` archives, plus six `.deb`/`.rpm` packages for
+  Linux x86_64, ARM64 and ARMv7;
+- creates `SHA256SUMS` for those required archives/packages and attests their build provenance;
+- creates the GitHub Release with curated and generated notes;
+- publishes standard and minimal images for linux/amd64, linux/arm64 and linux/arm/v7,
+  with versioned and moving `latest`/`minimal` tags and provenance;
+- attempts Android ARM64 afterward as best-effort, with a separate `.sha256` file. Its failure
+  does not block the standard release.
+
+Inspect the final workflow status and verify exact assets/checksums, image manifests and version
+output. Packaging success does not prove playback acceptance. After publication, refresh
+Homebrew/Scoop definitions using `tools/release/package_manifests.py` with the actual published
+`SHA256SUMS`; switch the active `.env.example` pin and remove preparation caveats from the
+README/wiki. Keep the previous release available for rollback; never move a published tag.
 
 Pushes to `main` run `.github/workflows/edge.yml`, which publishes
 `ghcr.io/jamezrin/outpace:edge` and `ghcr.io/jamezrin/outpace:sha-<commit>` for

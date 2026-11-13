@@ -319,7 +319,7 @@ does not change them. They are not an independent media-capability probe.
 
 | Feature | Status | Rationale / limit |
 | --- | --- | --- |
-| Service-backed stream-name search | Separate opt-in adapter; newer than v0.9.0 | `GET /search` requires `OUTPACE_COMPAT_ACESTREAM_SERVICES=1`. The native HTTP backend needs no operator API key; legacy HTTP compatibility alone does not enable it. See [the search contract, limits and current-client boundary](../wiki/Stream-Search.md). |
+| Service-backed stream-name search | Separate opt-in adapter; from v1.0.0 | `GET /search` requires `OUTPACE_COMPAT_ACESTREAM_SERVICES=1`. The native HTTP backend needs no operator API key; legacy HTTP compatibility alone does not enable it. See [the search contract, limits and current-client boundary](../wiki/Stream-Search.md). |
 | Legacy VOD playback/HLS | Deferred; not supported | Native `/vod` is a separate surface, not this legacy contract. |
 | Seek/file selection | Deferred; not supported | No legacy seeking or file-selection contract is implemented. |
 | Reverse content-id lookup | Deferred; not supported | `get_content_id` only echoes a supplied content id. Search selections use explicit infohash playback selectors and existing descriptor verification; no reverse mapping is fabricated. Older clients requiring it need an integration change. |
@@ -337,22 +337,21 @@ legacy geometry; they add no compatibility endpoint or automatic media/bitrate d
 API bitrate metadata remains bits/second. See [deployment configuration](../deployment.md#broadcast-profile-configuration)
 for container forwarding, one-full-piece budgets and immutable restart behavior.
 
-This supported slice does not by itself close #51. Its remaining issue accounting belongs
-to the parent issue/PR workflow; no follow-up below is implemented or implied here:
+The following distinguishes the implemented profile subset from other delivered capabilities
+and explicitly deferred protocol work. A tracker override alone does not establish privacy.
 
-| Area | Disposition / evidence still required |
+| Area | Current scope / evidence still required |
 | --- | --- |
-| Metatracker and startup-node fields (#51) | Deferred pending actual wire evidence and a scoped contract. |
-| Tags, logo and description (#51) | Deferred pending wire evidence; no arbitrary metadata bag or invented fields. |
-| Private peer/advertisement policy | Separate security/discovery scope; a tracker override does not establish privacy. |
-| HLS as an origination transport/support capability | Separate transport/support scope; existing playback HLS is unchanged. |
-| Autonomous support-node lifecycle and deployment | Separate topology/lifecycle/deployment scope; no autonomous node management here. |
-| SRT (#7) | Existing follow-up; no new source protocol in profiles. |
-| Live interoperability/deployment (#205) | Existing follow-up; offline tests do not establish deployed playback or interoperability. |
+| Metatracker and startup-node fields (#269) | Explicitly deferred for 1.0.0; partial static evidence does not establish producer-to-consumer or endpoint/advertisement semantics. |
+| Tags, logo and description (#269) | Explicitly deferred for 1.0.0 pending wire/runtime evidence; no arbitrary metadata bag. |
+| Private peer/advertisement policy (#271) | Implemented as separate outbound-only private mode; see [private peer policy](../private-peer-mode.md). It is not enabled by a tracker override. |
+| HLS transport origination/support parity (#272) | Explicitly deferred for 1.0.0. Native TS-to-HLS packaging and managed upstream relay do not establish original-engine HLS transport parity. |
+| Autonomous support-source lifecycle (#270) | Implemented for the documented MPEG-TS source subset; see [support operation](../support-operation.md). This does not implement HLS transport support parity. |
+| SRT (#7) | Implemented as optional native-Linux ingest with the `srt` feature and encryption-enabled libsrt; absent from standard release binaries/images. See [SRT ingest](../srt-ingest.md). |
+| Live interoperability/deployment (#205) | Recorded evidence is scoped to its tested topology and build; offline profile tests alone do not establish deployed playback or full interoperability. |
 
-Root must record/link the scoped follow-ups before claiming broader #51 closure. No public
-network probe, original-engine comparison, deployment or release evidence is claimed by this
-profile implementation.
+See the [1.0.0 notes](../releases/1.0.0.md#deferred-scope) for the maintainer's release-scope
+decision and [validation limits](../releases/1.0.0.md#validation-and-limits).
 
 ## Evidence boundary
 
@@ -368,7 +367,7 @@ Static client sources and offline fixtures do not establish deployed routing, st
 time, source availability, decoding continuity, playback smoothness or full official
 error parity.
 
-## Descriptor protection (#279, implementation under review)
+## Descriptor protection (#279, delivered in #314)
 
 Recognized wrapped descriptors use root `premium`; single-file raw/disk metainfo uses
 `info/premium`. Missing/integer zero is public, integer one is protected, and other
@@ -377,8 +376,9 @@ Playback refusal text is `encrypted content is not supported`; malformed protect
 uses `invalid content protection metadata`. Catalog protection/format errors are terminal,
 including when raw-hash fallback is enabled. Inspection does not grant authorization.
 
-The current patch gates Ace provider live discovery and VOD store creation, manager cached
+The implementation gates Ace provider live discovery and VOD store creation, manager cached
 session admission, and compatibility catalog/URL preparation before lease minting.
-Uninspected playback retains existing policy and legacy zero flags. Complete route-level
-acceptance (especially VOD compatibility selection and explicit discovery counters)
-is still pending; this table is not a claim that #279 is ready to close.
+Uninspected playback retains existing policy and legacy zero flags. Synthetic regression
+coverage and acceptance were delivered in [#314](https://github.com/jamezrin/outpace-stream/pull/314).
+That acceptance establishes the documented refusal policy; it does not implement protected
+playback or turn an uninspected zero flag into proof that content is public.

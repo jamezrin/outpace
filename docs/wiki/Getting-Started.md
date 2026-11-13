@@ -1,5 +1,8 @@
 # Getting Started
 
+> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
+> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
+
 This page gets you from nothing to a playing stream as quickly as possible. For other platforms
 and options, see [Installation](Installation).
 
@@ -20,7 +23,7 @@ docker run --rm --name outpace \
   -p 127.0.0.1:6878:6878 \
   -p 8621:8621/tcp \
   -v outpace-data:/var/lib/outpace \
-  ghcr.io/jamezrin/outpace:0.9.0
+  ghcr.io/jamezrin/outpace:1.0.0
 ```
 
 - `127.0.0.1:6878` publishes the HTTP API **only on this machine**. The API has no
@@ -120,7 +123,7 @@ started above first (`docker stop outpace`, or Ctrl+C), because it holds port 68
 ```bash
 docker run -d --rm --name outpace -e OUTPACE_ACE_COMPAT=1 \
   -p 127.0.0.1:6878:6878 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0
+  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0
 # for the binary instead: OUTPACE_ACE_COMPAT=1 ./outpace serve  (and open VLC in another terminal)
 vlc "http://127.0.0.1:6878/ace/getstream?id=0123456789abcdef0123456789abcdef01234567"
 ```

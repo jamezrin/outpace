@@ -46,7 +46,7 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 - It is **not** a full clone of the closed engine. There are no accounts, subscriptions, web UI,
   EPG or general channel catalogues. The compatibility API is a documented subset.
 - [Stream-name search](Stream-Search) is a separate, default-off external services adapter,
-  newer than v0.9.0. It needs no operator API key and uses external HTTP services; it does
+  available from v1.0.0. It needs no operator API key and uses external HTTP services; it does
   not bundle a UI or catalog.
 - It is not a recorder or DVR. The optional [Timeshift](Timeshift) buffer lives in memory and
   disappears on restart.
@@ -75,12 +75,13 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 | Fix a problem or read the logs | [Troubleshooting](Troubleshooting) |
 | Check what version has which feature | [Releases and Versions](Releases-and-Versions) |
 
-## Released and unreleased features
+## Release availability
 
-The latest tagged release is **v0.9.0**. Several features described in this wiki were merged
-after it and are only available in the `edge` container image and in builds from `main`. Pages
-mark them with an **Unreleased** note, and the [Configuration](Configuration) reference has an
-availability column. See [Releases and Versions](Releases-and-Versions) for the full list.
+**v1.0.0 is being prepared.** Until its release workflow completes, **v0.9.0** remains the
+latest published release. Features marked **From v1.0.0** are already in `main` and `edge`;
+release binaries and multi-architecture images become available when 1.0.0 is published.
+The [Configuration](Configuration) reference records feature version floors.
+See [Releases and Versions](Releases-and-Versions) for the release contents and remaining limits.
 
 ## Placeholder ids
 
