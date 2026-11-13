@@ -169,6 +169,11 @@ pub(crate) fn spawn(
             .await
             .unwrap_or(Err(HlsFailure::Pump));
         if let Err(reason) = result {
+            crate::alog!(
+                "[audio] live normalization failed: reason={} generation={}",
+                reason.code(),
+                worker.recovery.generation.0
+            );
             worker
                 .media
                 .fail_generation(worker.recovery.generation, reason);
