@@ -9,22 +9,22 @@ class Outpace < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-aarch64-apple-darwin.tar.gz"
-      sha256 "03a84e0c280b0565f8599b6f7e86368e147629c2b307901450e2bd085ec3c120"
+      url "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.1/outpace-1.0.1-aarch64-apple-darwin.tar.gz"
+      sha256 "e7563f6a0231efcc467400d1ba7a6c4107e47612b4272a8fada01652e32ce3cb"
     end
     on_intel do
-      url "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-x86_64-apple-darwin.tar.gz"
-      sha256 "b2fac9594126372da7225b75df8601231674033e11681cf9e7be3d97d5bbfea2"
+      url "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.1/outpace-1.0.1-x86_64-apple-darwin.tar.gz"
+      sha256 "080f37c0c4cf0fd73e0eff46718b2fb3b164ddf80585043d8478f997d3e46964"
     end
   end
   on_linux do
     on_arm do
-      url "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "6bad82b0838bf0d395cffcec393627de1cfabdb818c96d97d93fb019b1f3e8df"
+      url "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.1/outpace-1.0.1-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "e909e59df99d93b09e9ae90c915f4b9ab7d4143dd3bb0aac40e8ad9e15e10284"
     end
     on_intel do
-      url "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "3efb76a73cbf528641d25662f0071e71ab530ffc138263236deeeaa07650b7a4"
+      url "https://github.com/jamezrin/outpace-stream/releases/download/v1.0.1/outpace-1.0.1-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "e75ae33061213f5782787dbcb5883ddeb97f9c7b35b5054341a6b9cd5f6f8a2a"
     end
   end
 

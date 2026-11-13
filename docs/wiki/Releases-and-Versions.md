@@ -9,8 +9,10 @@
 - The version a binary reports is the version in the source it was built from. The tag must
   match it.
 
-The latest published release is **v1.0.0**. See the
-[GitHub Release](https://github.com/jamezrin/outpace-stream/releases/tag/v1.0.0) for downloads and
+The latest published release is **v1.0.1**, a patch release on top of 1.0.0. See the
+[GitHub Release](https://github.com/jamezrin/outpace-stream/releases/tag/v1.0.1) for downloads,
+the [1.0.1 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/1.0.1.md)
+for its fixes, and the
 [1.0.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/1.0.0.md)
 for scope, upgrades and validation limits.
 
@@ -20,7 +22,7 @@ for scope, upgrades and validation limits.
   its downloads and generated change notes.
 - **Curated notes:** for releases that have them, in
   [`docs/releases/`](https://github.com/jamezrin/outpace-stream/tree/main/docs/releases)
-  (including `1.0.0.md`).
+  (including `1.0.0.md` and `1.0.1.md`).
 - **Milestones:** <https://github.com/jamezrin/outpace-stream/milestones> track what each
   version covers.
 
@@ -28,7 +30,7 @@ for scope, upgrades and validation limits.
 
 ```bash
 outpace --version
-docker run --rm ghcr.io/jamezrin/outpace:1.0.0 --version
+docker run --rm ghcr.io/jamezrin/outpace:1.0.1 --version
 curl "http://127.0.0.1:6878/server/api?method=get_version"   # needs OUTPACE_ACE_COMPAT=1
 ```
 
@@ -55,6 +57,17 @@ build.
 | `X.Y.Z-minimal`, `minimal` | Like `X.Y.Z` and `latest` | amd64, arm64, arm/v7 | Smaller `scratch` image (from v1.0.0). |
 | `edge` | With every merge to `main` | amd64 | Testing unreleased features. |
 | `sha-<commit>` | No | amd64 | Pinning one specific `main` build. |
+
+## v1.0.1 fixes
+
+A patch release with no new features or default changes. It fixes live audio normalization:
+
+- Normalization no longer ends live streams when a generation starts mid-GOP on a high-bitrate
+  source, when a source chunk is larger than 1 MiB, or when the upstream reconnects every few
+  seconds (#447). Failures and recoveries are logged under `[audio]`.
+- AC3 signalled as ATSC stream type `0x81`, which FFmpeg writes by default, is now converted
+  instead of refused with `422` (#448). With normalization off, HLS now drops `0x81`/`0x87`
+  tracks when the stream has AAC, as it already did for DVB-signalled AC3.
 
 ## v1.0.0 highlights
 
@@ -134,7 +147,7 @@ broadcast subset. See the linked release notes for issue references and evidence
 
 ## Updating the Homebrew formula and Scoop manifest
 
-Homebrew and Scoop definitions now target 1.0.0 using its published checksums.
+Homebrew and Scoop definitions now target 1.0.1 using its published checksums.
 
 `Formula/outpace.rb` and `bucket/outpace.json` point at a published release,
 because their checksums only exist once it's out. After publishing a release, a maintainer
