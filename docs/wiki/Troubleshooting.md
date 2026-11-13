@@ -41,6 +41,13 @@ With Compose, remember that most settings must go in `compose.override.yml`. If 
 
 ## Slow startup
 
+Outpace keeps recent productive peer hints in its data directory to help later starts.
+On Linux and Android, this works through execute-only parent directories, including
+Android app storage and Termux. The cache directory must still belong to the daemon
+user, must not be group- or world-writable, and must have no symlinks in its path.
+If the log says `warm peer cache I/O failed`, check those permissions and that no
+other daemon is using the same directory. Streaming continues without durable hints.
+
 A cold start has three stages:
 
 1. **Resolving** the content id through the catalog.
