@@ -85,9 +85,6 @@ Download the archive for your platform from the
 [latest release](https://github.com/jamezrin/outpace-stream/releases/latest). For example, on
 Linux x86_64:
 
-The examples target the upcoming 1.0.0 release. Until it is published, use 0.9.0 for
-release downloads and images, or `main`/`edge` for the new features.
-
 ```bash
 curl -LO https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
 tar -xzf outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz

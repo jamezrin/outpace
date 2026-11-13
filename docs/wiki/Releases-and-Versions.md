@@ -9,10 +9,9 @@
 - The version a binary reports is the version in the source it was built from. The tag must
   match it.
 
-**v1.0.0 is being prepared for publication.** Until its release workflow completes,
-**v0.9.0** remains the latest published release. Examples in this wiki target 1.0.0 once
-published; use 0.9.0 for existing downloads or `main`/`edge` for the new functionality.
-See the [1.0.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/1.0.0.md)
+The latest published release is **v1.0.0**. See the
+[GitHub Release](https://github.com/jamezrin/outpace-stream/releases/tag/v1.0.0) for downloads and
+[1.0.0 notes](https://github.com/jamezrin/outpace-stream/blob/main/docs/releases/1.0.0.md)
 for scope, upgrades and validation limits.
 
 ## Where to find release notes
@@ -21,7 +20,7 @@ for scope, upgrades and validation limits.
   its downloads and generated change notes.
 - **Curated notes:** for releases that have them, in
   [`docs/releases/`](https://github.com/jamezrin/outpace-stream/tree/main/docs/releases)
-  (including the upcoming `1.0.0.md`).
+  (including `1.0.0.md`).
 - **Milestones:** <https://github.com/jamezrin/outpace-stream/milestones> track what each
   version covers.
 
@@ -59,7 +58,7 @@ build.
 
 ## v1.0.0 highlights
 
-These changes are merged into `main` and planned for 1.0.0; they are absent from v0.9.0:
+These changes are included in 1.0.0; they are absent from v0.9.0:
 
 **New features**
 
@@ -135,8 +134,7 @@ broadcast subset. See the linked release notes for issue references and evidence
 
 ## Updating the Homebrew formula and Scoop manifest
 
-Homebrew and Scoop definitions are already available for 0.9.0; the 1.0.0 refresh happens
-after publication.
+Homebrew and Scoop definitions now target 1.0.0 using its published checksums.
 
 `Formula/outpace.rb` and `bucket/outpace.json` point at a published release,
 because their checksums only exist once it's out. After publishing a release, a maintainer

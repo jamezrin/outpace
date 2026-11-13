@@ -1,8 +1,5 @@
 # FAQ
 
-> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
-> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
-
 Answers to the questions people ask most about Outpace. Each answer links to the page with the
 details.
 

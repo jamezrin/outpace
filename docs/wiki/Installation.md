@@ -5,14 +5,12 @@ can build yourself. All three run the same program: `outpace serve` starts the d
 
 ## Choose a version
 
-- **Releases** (`vX.Y.Z` tags) are the stable choice. **v1.0.0 is being prepared**;
-  v0.9.0 remains the latest published release until its successor is published.
+- **Releases** (`vX.Y.Z` tags) are the stable choice. The latest is **v1.0.0**.
 - **`edge`** follows `main` and includes features newer than the latest release. It is
   `linux/amd64` only and changes with every merge. Don't use it where you need predictable
   upgrades.
 
 See [Releases and Versions](Releases-and-Versions) for which features are in which build.
-The examples below target 1.0.0 once published; use 0.9.0 for existing downloads until then.
 
 ## Release binaries
 
@@ -67,7 +65,7 @@ In Termux:
 
 ```bash
 pkg install curl
-version=1.0.0   # once published
+version=1.0.0
 artifact="outpace-${version}-aarch64-linux-android.tar.gz"
 base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
 curl -LO "${base}/${artifact}" && curl -LO "${base}/${artifact}.sha256"
@@ -306,7 +304,7 @@ headers:
 cargo build --release --locked -p ace-engine --bin outpace --features srt
 ```
 
-SRT is available from v1.0.0; build from that tag once published, or from `main`.
+SRT is available from v1.0.0; build from that tag, or from `main` for development.
 
 ## FFmpeg
 

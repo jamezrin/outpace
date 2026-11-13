@@ -1,8 +1,5 @@
 # Deployment
 
-> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
-> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
-
 This page covers running Outpace permanently: with Docker Compose, as a systemd service, behind
 a reverse proxy and in an LXC guest. It also covers upgrades, rollback and shutdown.
 

@@ -1,8 +1,5 @@
 # NAT and Port Mapping
 
-> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
-> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
-
 Most home and office connections sit behind a router doing NAT. Without help, peers on the
 internet can't open connections to you. Playback still works, because Outpace connects out to
 peers, but you won't receive inbound peers, and your [broadcasts](Broadcasting) and seeding are
