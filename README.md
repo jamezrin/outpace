@@ -33,7 +33,9 @@ The project lives in the [Outpace organization](https://github.com/outpace-strea
 [engine](https://github.com/outpace-stream/outpace-engine),
 [Android companion app](https://github.com/outpace-stream/outpace-android),
 [Homebrew tap](https://github.com/outpace-stream/homebrew-outpace), and
-[Scoop bucket](https://github.com/outpace-stream/scoop-outpace).
+[Scoop bucket](https://github.com/outpace-stream/scoop-outpace). Arch users can install
+[outpace-bin](https://aur.archlinux.org/packages/outpace-bin) or build the newest stable Git
+tag with [outpace-git](https://aur.archlinux.org/packages/outpace-git) from the AUR.
 
 ## What is Outpace?
 
