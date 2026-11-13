@@ -13,5 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Scan tracked files for real AceStream identifiers
-        run: python3 tools/hygiene/check_identifiers.py
+        with:
+          persist-credentials: false
+      - uses: outpace-stream/actions/identifier-hygiene@v1

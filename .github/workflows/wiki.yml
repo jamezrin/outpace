@@ -28,8 +28,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Scan tracked files for real AceStream identifiers
-        run: python3 tools/hygiene/check_identifiers.py
+      - uses: outpace-stream/actions/identifier-hygiene@v1
       - name: Check links between wiki pages
         run: python3 tools/wiki/check_links.py docs/wiki
 

@@ -2,5 +2,47 @@
 # AceStream identifier hygiene gate. Blocks staged real content ids / infohashes
 # and any attempt to commit the private acestream-ids.txt registry.
 # Activate once per clone:  git config core.hooksPath .githooks
+# Scan every tracked file instead of the index:  .githooks/pre-commit --all
+#
+# The checker is shared through outpace-stream/actions. This hook runs the
+# version CI pins in .github/workflows/hygiene.yml: it downloads that version
+# once, caches it under the git directory and refreshes it daily. It is
+# fail-closed: with no cached copy and no network, the commit is blocked.
+# OUTPACE_HYGIENE_SCRIPT=/path/to/check_identifiers.py uses a local copy instead.
+set -u
 root=$(git rev-parse --show-toplevel) || exit 1
-exec python3 "$root/tools/hygiene/check_identifiers.py" --staged
+mode=--staged
+[ "${1:-}" = "--all" ] && mode=
+
+script=${OUTPACE_HYGIENE_SCRIPT:-}
+if [ -z "$script" ]; then
+	ref=$(sed -n 's#.*uses:[[:space:]]*outpace-stream/actions/identifier-hygiene@\([A-Za-z0-9._-]*\).*#\1#p' \
+		"$root/.github/workflows/hygiene.yml" | head -n 1)
+	if [ -z "$ref" ]; then
+		echo "pre-commit: no outpace-stream/actions/identifier-hygiene pin in .github/workflows/hygiene.yml; commit blocked" >&2
+		exit 1
+	fi
+	cache="$(git rev-parse --path-format=absolute --git-common-dir)/outpace-hygiene/$ref" || exit 1
+	script="$cache/check_identifiers.py"
+	if [ ! -s "$script" ] || [ -n "$(find "$script" -mmin +1440 2>/dev/null)" ]; then
+		# Resolve a tag to its commit first: raw.githubusercontent.com serves a
+		# moved tag stale for a few minutes, but a commit path never changes.
+		rev=$(git ls-remote https://github.com/outpace-stream/actions "refs/tags/$ref" "refs/tags/$ref^{}" 2>/dev/null |
+			sort -k2 | tail -n 1 | cut -f1)
+		url="https://raw.githubusercontent.com/outpace-stream/actions/${rev:-$ref}/identifier-hygiene/check_identifiers.py"
+		tmp="$script.tmp.$$"
+		if mkdir -p "$cache" && curl -fsSL --connect-timeout 5 --max-time 20 -o "$tmp" "$url" && [ -s "$tmp" ]; then
+			mv -f "$tmp" "$script"
+		else
+			rm -f "$tmp"
+			if [ -s "$script" ]; then
+				echo "pre-commit: could not refresh the identifier hygiene checker, using the cached copy" >&2
+			else
+				echo "pre-commit: could not download the identifier hygiene checker ($url); commit blocked." >&2
+				echo "pre-commit: retry with network access, or set OUTPACE_HYGIENE_SCRIPT to a local copy." >&2
+				exit 1
+			fi
+		fi
+	fi
+fi
+exec python3 "$script" $mode

@@ -1,4 +1,4 @@
-# Allowlist for tools/hygiene/check_identifiers.py
+# Allowlist for the shared outpace-stream/actions identifier-hygiene check
 #
 # Legitimate non-placeholder 40-hex values that may appear in tracked files.
 # These are NOT real AceStream identifiers — they are synthetic-fixture digests,

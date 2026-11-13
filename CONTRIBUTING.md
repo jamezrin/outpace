@@ -100,7 +100,7 @@ CI runs these on every PR, along with a few extra jobs. The checks required to m
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-python3 tools/hygiene/check_identifiers.py
+.githooks/pre-commit --all
 ```
 
 If you changed `docs/wiki/`, also run `python3 tools/wiki/check_links.py docs/wiki`. A local
@@ -162,9 +162,15 @@ Real content ids, infohashes and stream names must never appear in tracked files
 messages, issues or PRs. Where a 40-hex value is syntactically required, use an obviously
 synthetic placeholder such as `0123456789abcdef0123456789abcdef01234567`.
 
-`tools/hygiene/check_identifiers.py` enforces this in CI and in the pre-commit hook. If you have
+The shared [`outpace-stream/actions/identifier-hygiene`](https://github.com/outpace-stream/actions)
+check enforces this in CI and in the pre-commit hook. If you have
 a genuine non-identifier hash, such as a test-fixture digest, add it to
 `tools/hygiene/allowed-identifiers.txt` with a comment explaining it.
+
+The pre-commit hook downloads the checker version that `.github/workflows/hygiene.yml` pins,
+caches it under `.git/outpace-hygiene/` and refreshes it daily. With no cached copy and no network
+it blocks the commit, as the checker always fails closed. To work fully offline, point
+`OUTPACE_HYGIENE_SCRIPT` at a local copy of `check_identifiers.py`.
 
 ## Documentation
 
