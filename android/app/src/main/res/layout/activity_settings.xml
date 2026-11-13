@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent" android:fitsSystemWindows="true">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:padding="24dp">
+        <Switch android:id="@+id/lan" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="48dp" android:text="@string/settings_lan" />
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="@string/settings_lan_warning" />
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:layout_marginTop="12dp">
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_gravity="center_vertical" android:labelFor="@id/port" android:text="@string/settings_port" />
+            <EditText android:id="@+id/port" android:layout_width="120dp" android:layout_height="wrap_content"
+                android:layout_marginStart="12dp" android:inputType="number" android:maxLength="5"
+                android:importantForAutofill="no" />
+        </LinearLayout>
+        <Switch android:id="@+id/seeding" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="48dp" android:text="@string/settings_seeding" />
+        <Switch android:id="@+id/inbound" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="48dp" android:text="@string/settings_inbound" />
+        <Switch android:id="@+id/port_mapping" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="48dp" android:text="@string/settings_port_mapping" />
+        <Switch android:id="@+id/ace_compat" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="48dp" android:text="@string/settings_ace_compat" />
+        <Switch android:id="@+id/boot" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="48dp" android:layout_marginTop="12dp" android:text="@string/settings_boot" />
+        <Switch android:id="@+id/idle" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="48dp" android:text="@string/settings_idle" />
+        <Button android:id="@+id/battery" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="12dp" android:text="@string/settings_battery" />
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="@string/settings_battery_summary" />
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="16dp" android:text="@string/settings_restart_needed" />
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+            <Button android:id="@+id/save" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="@string/settings_save" />
+            <Button android:id="@+id/restart" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="@string/action_restart" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:fitsSystemWindows="true">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:padding="24dp">
+
+        <TextView android:id="@+id/state" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:textAppearance="@android:style/TextAppearance.DeviceDefault.Large" />
+        <TextView android:id="@+id/version" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="4dp" />
+        <Button android:id="@+id/update" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" />
+        <Button android:id="@+id/start_stop" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="12dp" />
+        <TextView android:id="@+id/url" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="4dp" android:textIsSelectable="false" />
+
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="20dp" android:orientation="horizontal">
+            <EditText android:id="@+id/id_input" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:hint="@string/play_hint" android:imeOptions="actionGo"
+                android:inputType="textUri|textNoSuggestions" android:importantForAutofill="no" />
+            <Button android:id="@+id/play" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/action_play" />
+        </LinearLayout>
+
+        <TextView style="@style/Section" android:id="@+id/recent_title" android:text="@string/recent_title" />
+        <LinearLayout android:id="@+id/recent" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" />
+        <Button android:id="@+id/clear_recent" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="@string/action_clear_recent" />
+
+        <TextView style="@style/Section" android:text="@string/streams_title" />
+        <LinearLayout android:id="@+id/streams" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="24dp" android:orientation="horizontal">
+            <Button android:id="@+id/versions" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="@string/action_versions" />
+            <Button android:id="@+id/settings" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="@string/action_settings" />
+            <Button android:id="@+id/logs" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="@string/action_logs" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

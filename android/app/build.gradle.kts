@@ -38,12 +38,22 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Emulator testing only: force the engine targets, e.g. -PengineTargets=aarch64-linux-android.
+            val targets = (findProperty("engineTargets") as String?).orEmpty()
+            buildConfigField("String", "ENGINE_TARGETS_OVERRIDE", "\"$targets\"")
+        }
         release {
+            buildConfigField("String", "ENGINE_TARGETS_OVERRIDE", "\"\"")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             signingConfigs.findByName("release")?.let { signingConfig = it }
         }
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     compileOptions {

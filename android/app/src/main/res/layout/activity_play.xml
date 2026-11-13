@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:orientation="vertical" android:padding="24dp">
+    <TextView android:id="@+id/status" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:textAppearance="@android:style/TextAppearance.DeviceDefault.Medium" />
+    <ProgressBar android:id="@+id/progress" style="@android:style/Widget.DeviceDefault.ProgressBar.Horizontal"
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:indeterminate="true"
+        android:layout_marginTop="12dp" />
+    <TextView android:id="@+id/url" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="8dp" android:textIsSelectable="true" />
+    <LinearLayout android:id="@+id/actions" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:layout_marginTop="12dp" android:visibility="gone">
+        <Button android:id="@+id/open" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="@string/play_open_player" />
+        <Button android:id="@+id/open_hls" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="@string/play_open_hls" />
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+            <Button android:id="@+id/copy" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="@string/play_copy" />
+            <Button android:id="@+id/share" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="@string/play_share" />
+        </LinearLayout>
+    </LinearLayout>
+</LinearLayout>

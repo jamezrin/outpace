@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">outpace</string>
+    <string name="channel_engine">Engine</string>
+
+    <string name="state_stopped">Engine stopped</string>
+    <string name="state_starting">Engine starting</string>
+    <string name="state_running">Engine running</string>
+    <string name="state_stopping">Engine stopping</string>
+    <string name="state_crashed">Engine stopped with an error: %1$s</string>
+    <plurals name="notification_running">
+        <item quantity="one">Running %1$s, %2$d stream</item>
+        <item quantity="other">Running %1$s, %2$d streams</item>
+    </plurals>
+
+    <string name="action_start">Start engine</string>
+    <string name="action_stop">Stop engine</string>
+    <string name="action_restart">Restart engine</string>
+    <string name="action_download_engine">Download engine</string>
+    <string name="action_versions">Engine versions</string>
+    <string name="action_settings">Settings</string>
+    <string name="action_logs">Logs</string>
+    <string name="action_play">Play</string>
+    <string name="action_clear_recent">Clear recent</string>
+
+    <string name="engine_version">Engine v%1$s</string>
+    <string name="engine_none">No engine installed</string>
+    <string name="engine_update_available">v%1$s available</string>
+    <string name="player_url">Players use %1$s</string>
+    <string name="no_engine_installed">No engine installed. Download one from Engine versions.</string>
+    <string name="engine_failed_to_start">Could not start the engine: %1$s</string>
+    <string name="engine_no_answer">The engine did not answer within %1$d seconds.</string>
+    <string name="engine_exited">The engine exited (code %1$d).</string>
+
+    <string name="play_hint">Content id or acestream:// link</string>
+    <string name="recent_title">Recent</string>
+    <string name="streams_title">Active streams</string>
+    <string name="streams_none">No active streams</string>
+    <plurals name="stream_row">
+        <item quantity="one">%1$s, %2$d client</item>
+        <item quantity="other">%1$s, %2$d clients</item>
+    </plurals>
+    <string name="untitled">Untitled stream</string>
+
+    <string name="play_title">Play stream</string>
+    <string name="play_preparing">Starting the engine</string>
+    <string name="play_ready">Ready. Pick a player.</string>
+    <string name="play_open_player">Open in player</string>
+    <string name="play_open_hls">Open as HLS</string>
+    <string name="play_copy">Copy URL</string>
+    <string name="play_share">Share URL</string>
+    <string name="play_choose">Play with</string>
+    <string name="play_no_player">No app on this device can play the stream. Copy the URL instead.</string>
+    <string name="play_copied">URL copied</string>
+    <string name="play_infohash">That is an infohash. Only content ids and acestream:// links are supported.</string>
+    <string name="play_no_id">No content id found.</string>
+    <string name="play_engine_failed">The engine is not running: %1$s</string>
+    <string name="play_lan_hint">Other devices need LAN access turned on in Settings.</string>
+
+    <string name="versions_title">Engine versions</string>
+    <string name="versions_running">Running: %1$s</string>
+    <string name="versions_latest">Latest: %1$s</string>
+    <string name="versions_unknown">unknown</string>
+    <string name="versions_none_running">none</string>
+    <string name="versions_refresh">Refresh</string>
+    <string name="versions_show_pre">Show pre-releases</string>
+    <string name="versions_partial">Full list unavailable (%1$s). Showing the latest and installed versions.</string>
+    <string name="versions_error">Could not reach GitHub: %1$s</string>
+    <string name="badge_running">running</string>
+    <string name="badge_active">selected</string>
+    <string name="badge_installed">installed</string>
+    <string name="badge_latest">latest</string>
+    <string name="badge_prerelease">pre-release</string>
+    <string name="badge_unavailable">not available for this device</string>
+    <string name="version_install">Download and use</string>
+    <string name="version_use">Use this version</string>
+    <string name="version_remove">Remove</string>
+    <string name="version_downloading">Downloading v%1$s: %2$s</string>
+    <string name="version_installed">v%1$s installed</string>
+    <string name="version_failed">Install failed: %1$s</string>
+    <string name="version_full">Up to %1$d versions can be installed. Remove one first.</string>
+    <string name="version_remove_running">Stop the engine before removing the version it runs.</string>
+    <string name="cancel">Cancel</string>
+
+    <string name="settings_title">Settings</string>
+    <string name="settings_lan">Allow LAN access</string>
+    <string name="settings_lan_warning">Anyone on your network can use the engine. Turn this on only on a trusted network.</string>
+    <string name="settings_port">HTTP port</string>
+    <string name="settings_port_invalid">Use a port between 1024 and 65535.</string>
+    <string name="settings_seeding">Seeding (upload to peers)</string>
+    <string name="settings_inbound">Accept inbound peers</string>
+    <string name="settings_port_mapping">Router port mapping (UPnP / NAT-PMP)</string>
+    <string name="settings_ace_compat">AceStream-compatible API</string>
+    <string name="settings_boot">Start on boot</string>
+    <string name="settings_idle">Stop after 10 minutes with no streams</string>
+    <string name="settings_battery">Battery optimisation</string>
+    <string name="settings_battery_summary">Allow the engine to keep running in the background.</string>
+    <string name="settings_restart_needed">Changes apply the next time the engine starts.</string>
+    <string name="settings_save">Save</string>
+
+    <string name="logs_title">Logs</string>
+    <string name="logs_copy">Copy</string>
+    <string name="logs_share">Share</string>
+    <string name="logs_empty">No engine output yet.</string>
+</resources>

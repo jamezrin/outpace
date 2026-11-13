@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent" android:fitsSystemWindows="true">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:padding="24dp">
+        <TextView android:id="@+id/running" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:textAppearance="@android:style/TextAppearance.DeviceDefault.Medium" />
+        <TextView android:id="@+id/latest" android:layout_width="match_parent" android:layout_height="wrap_content" />
+        <TextView android:id="@+id/note" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="8dp" android:visibility="gone" />
+        <LinearLayout android:id="@+id/download" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" android:layout_marginTop="8dp" android:visibility="gone">
+            <TextView android:id="@+id/download_text" android:layout_width="match_parent" android:layout_height="wrap_content" />
+            <ProgressBar android:id="@+id/download_progress" style="@android:style/Widget.DeviceDefault.ProgressBar.Horizontal"
+                android:layout_width="match_parent" android:layout_height="wrap_content" android:max="1000" />
+            <Button android:id="@+id/download_cancel" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/cancel" />
+        </LinearLayout>
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:layout_marginTop="8dp">
+            <Button android:id="@+id/refresh" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/versions_refresh" />
+            <CheckBox android:id="@+id/show_pre" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/versions_show_pre" />
+        </LinearLayout>
+        <LinearLayout android:id="@+id/list" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" android:layout_marginTop="8dp" />
+    </LinearLayout>
+</ScrollView>

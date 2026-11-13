@@ -68,6 +68,16 @@ class ReleasesTest {
         Releases.downloadUrl("1.0.0", Releases.archiveName("1.0.0", "aarch64-linux-android")),
     )
 
+    @Test fun dropsTranslatedAbis() = assertEquals(
+        listOf("x86_64-linux-android", "i686-linux-android"),
+        Abi.targetsFor(listOf("x86_64", "arm64-v8a", "x86", "armeabi-v7a")),
+    )
+
+    @Test fun keepsArm32OnArm64() = assertEquals(
+        listOf("aarch64-linux-android", "armv7-linux-androideabi"),
+        Abi.targetsFor(listOf("arm64-v8a", "armeabi-v7a", "armeabi")),
+    )
+
     @Test fun abiMapping() =
-        assertEquals(listOf("i686-linux-android", "armv7-linux-androideabi"), Abi.targetsFor(listOf("x86", "armeabi-v7a", "armeabi")))
+        assertEquals(listOf("armv7-linux-androideabi"), Abi.targetsFor(listOf("armeabi-v7a", "armeabi", "mips")))
 }
