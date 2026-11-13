@@ -187,7 +187,10 @@ pub struct SyntheticTools {
 
 #[derive(Clone, Copy, Debug)]
 pub enum AudioCase {
+    /// AC3 signalled DVB-style: stream type 0x06 plus an AC-3 descriptor (`system_b`).
     Ac3,
+    /// AC3 from FFmpeg's default MPEG-TS mux: ATSC stream type 0x81, no AC-3 descriptor.
+    Ac3DefaultMux,
     MpegLayer2,
     MpegLayer3,
     AacAndAc3,
@@ -294,7 +297,7 @@ pub fn generate_case(tools: &SyntheticTools, case: AudioCase) -> Result<Syntheti
         "0",
     ]);
     match case {
-        AudioCase::Ac3 => {
+        AudioCase::Ac3 | AudioCase::Ac3DefaultMux => {
             command.args(["-map", "1:a:0", "-c:a", "ac3", "-b:a", "192k"]);
         }
         AudioCase::MpegLayer2 => {
@@ -311,7 +314,9 @@ pub fn generate_case(tools: &SyntheticTools, case: AudioCase) -> Result<Syntheti
         }
         AudioCase::VideoOnly => {}
     }
-    command.args(["-mpegts_flags", "+system_b"]);
+    if !matches!(case, AudioCase::Ac3DefaultMux) {
+        command.args(["-mpegts_flags", "+system_b"]);
+    }
     let status = command
         .arg("-t")
         .arg(duration)
