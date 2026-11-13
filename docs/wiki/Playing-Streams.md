@@ -129,8 +129,13 @@ mpv "http://127.0.0.1:6878/vod/ace/cid:0123456789abcdef0123456789abcdef01234567"
 outpace play --vod acestream://0123456789abcdef0123456789abcdef01234567 > movie.mp4
 ```
 
-Multi-file VOD isn't supported and fails with a clear error. VOD isn't available through the
-compatibility API.
+Multi-file VOD isn't supported and fails with a clear error; selected-file support (#79) is
+explicitly deferred for 1.0.0. VOD isn't available through the compatibility API.
+
+VOD HLS segments use byte-based cuts and approximate durations. They are not keyframe-aligned,
+and PCR-based media-time seeking (#128) remains conditional on a demonstrated player failure.
+Byte-range seeking in the direct `/vod` file response is a separate supported feature; it does
+not establish precise HLS seeking. See [Releases and Versions](Releases-and-Versions#deferred-scope).
 
 ## Command-line playback
 

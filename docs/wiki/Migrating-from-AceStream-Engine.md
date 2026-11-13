@@ -4,7 +4,9 @@ Outpace can replace the AceStream engine for most setups that play public, unenc
 media servers, IPTV playlists, proxies such as acexy, and apps that use `/ace/getstream`. It is
 not a full clone, so check the differences below before you switch.
 
-Outpace hasn't reached 1.0. Test it with your own clients before retiring the old engine.
+1.0.0 is being prepared; see [Releases and Versions](Releases-and-Versions) for publication
+status and the recorded maintainer acceptance. Test the exact build with your own clients
+before retiring the old engine; acceptance does not qualify every deployment.
 
 ## What carries over
 
@@ -30,7 +32,9 @@ handshake and work with compat off.
   is available from v1.0.0 and needs no operator API key. It uses external HTTP services.
   HTTP compatibility alone does not enable it. Older clients that need
   reverse content-ID lookup still require an integration change; use explicit infohash selectors.
-- **No legacy seek or file selection**, and no VOD through the compat API. Native `/vod` exists.
+- **No legacy seek or file selection**, and no VOD through the compat API. Native `/vod` supports
+  single-file content with byte ranges. Multi-file selection and PCR/keyframe-based VOD HLS
+  seeking are outside the 1.0.0 subset; see [Playing Streams](Playing-Streams#live-and-vod).
 - **No port 62062** and no UDP 8621 listener.
 - **No access-token authentication** on the compat API. Protect it with your network.
 - **Different timings.** Startup buffering, error codes and discovery differ. Outpace waits for a

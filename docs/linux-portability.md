@@ -1,7 +1,9 @@
 # Linux portability
 
 Outpace release containers support `linux/amd64`, `linux/arm64`, and `linux/arm/v7`. Release
-archives use the matching Rust targets, including `armv7-unknown-linux-musleabihf` for ARMv7.
+archives include those targets plus ARMv6 hard-float (`arm-unknown-linux-musleabihf`) and
+RISC-V 64 (`riscv64gc-unknown-linux-musl`) from 1.0.0; neither has a container image. See
+[Installation](wiki/Installation.md#release-binaries) for publication status and the full matrix.
 
 ## ARMv7 scope and constraints
 
@@ -25,7 +27,7 @@ For constrained devices, start with the disk cache and a conservative session bu
 
 ```sh
 docker run --rm \
-  -p 6878:6878 \
+  -p 127.0.0.1:6878:6878 \
   -p 8621:8621/tcp \
   -e OUTPACE_CACHE_TYPE=disk \
   -e OUTPACE_SEED_STORE_BYTES=67108864 \
@@ -57,8 +59,8 @@ Run both parts of this procedure on an aarch64 host whose kernel was built for 1
 the pinned Rust toolchain and provide native `musl-gcc`, `file`, and `readelf` tools before
 starting.
 
-First verify the exact release commit and build the same aarch64 musl target used by the release
-workflow:
+First verify the exact release commit and build the same aarch64 musl target and `dist` profile
+used by the release workflow:
 
 ```sh
 test "$(uname -m)" = aarch64
@@ -72,10 +74,10 @@ test -z "$(git status --porcelain)"
 rustup target add aarch64-unknown-linux-musl
 CC_aarch64_unknown_linux_musl=musl-gcc \
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-  cargo build --locked --release -p ace-engine --bin outpace \
+  cargo build --locked --profile dist -p ace-engine --bin outpace \
   --target aarch64-unknown-linux-musl
 
-MUSL_BINARY=target/aarch64-unknown-linux-musl/release/outpace
+MUSL_BINARY=target/aarch64-unknown-linux-musl/dist/outpace
 file "$MUSL_BINARY"
 readelf -hW "$MUSL_BINARY"
 readelf -lW "$MUSL_BINARY"
@@ -98,8 +100,10 @@ trap - EXIT
 cat /tmp/outpace-16k-musl.log
 ```
 
-Then build and run the glibc-based release container shape from that same clean commit. Run it by
-the immutable local image ID, not the temporary tag:
+Then build and run the source Dockerfile from that same clean commit. This exercises the source
+container build, not the published image: release images use the archive binary through
+`Dockerfile.release`. Also run the published image by its immutable digest before recording
+release-image hardware qualification. Run this local source image by its immutable image ID:
 
 ```sh
 docker build --pull --platform linux/arm64 --tag "outpace:16k-${COMMIT}" .

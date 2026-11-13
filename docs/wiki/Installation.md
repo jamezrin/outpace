@@ -175,8 +175,8 @@ gh attestation verify oci://ghcr.io/jamezrin/outpace:<version> --repo jamezrin/o
 
 ### ARM, RISC-V and small devices
 
-ARMv7 builds cover hard-float ARMv7 Linux (Raspberry Pi 2/3, older NAS boxes). From the next
-release, ARMv6 builds cover hard-float ARMv6 (Raspberry Pi Zero and 1, older ARM routers and NAS
+ARMv7 builds cover hard-float ARMv7 Linux (Raspberry Pi 2/3, older NAS boxes). From v1.0.0,
+ARMv6 builds cover hard-float ARMv6 (Raspberry Pi Zero and 1, older ARM routers and NAS
 boxes), and RISC-V 64 builds cover 64-bit RISC-V boards. Soft-float ARM is not supported. The
 container image doesn't cover ARMv6 or RISC-V 64 yet: use the binaries. Expect lower throughput
 and fewer simultaneous streams on 32-bit ARM than on 64-bit hardware. On 32-bit targets each in-memory pool, such as the piece cache or the timeshift

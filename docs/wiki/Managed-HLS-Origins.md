@@ -7,6 +7,11 @@ Some AceStream descriptors don't point at a peer-to-peer swarm. Instead they nam
 HTTP(S) HLS stream (an "origin"). Outpace recognises these and never tries to open a swarm for
 them. What it does next depends on `OUTPACE_MANAGED_HLS`.
 
+This is HTTP playback handoff or relay, not original-engine HLS transport origination or
+peer-to-peer HLS support-node parity. That protocol scope (#272) is explicitly deferred for
+1.0.0. Native MPEG-TS-to-HLS packaging is also a separate supported feature; see
+[Releases and Versions](Releases-and-Versions#deferred-scope).
+
 ## Default: direct handoff
 
 With `OUTPACE_MANAGED_HLS` unset or `0`, every playback route answers **`302`** with the
