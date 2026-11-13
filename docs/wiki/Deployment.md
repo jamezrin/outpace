@@ -123,7 +123,13 @@ startup buffer (up to 128 MiB), seeding store, HLS window and timeshift budget, 
 
 ## systemd
 
-Create a user and an environment file:
+From the next release, the [`.deb` and `.rpm` packages](Installation#debian-ubuntu-and-fedora-packages)
+set all of this up: edit `/etc/outpace/outpace.env` and run `systemctl enable --now outpace`. The
+unit they ship is
+[`packaging/linux/outpace.service`](https://github.com/jamezrin/outpace-stream/blob/main/packaging/linux/outpace.service),
+the same as below with the binary at `/usr/bin/outpace`.
+
+To set it up by hand, create a user and an environment file:
 
 ```bash
 sudo useradd --system --home-dir /var/lib/outpace --shell /usr/sbin/nologin outpace

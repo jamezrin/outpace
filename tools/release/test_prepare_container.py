@@ -125,6 +125,21 @@ class PrepareTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prepare.prepare("v0.3.0", root, root / "context")
 
+    def test_package_checksums_are_verified(self):
+        # SHA256SUMS also lists the .deb/.rpm packages; they are downloaded and checked too.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            package = root / "outpace_0.3.0_amd64.deb"
+            package.write_bytes(b"package")
+            digest = hashlib.sha256(b"package").hexdigest()
+            sums = root / "SHA256SUMS"
+            sums.write_text(sums.read_text() + f"{digest}  outpace_0.3.0_amd64.deb\n")
+            prepare.prepare("v0.3.0", root, root / "context")
+            package.write_bytes(b"tampered")
+            with self.assertRaises(ValueError):
+                prepare.prepare("v0.3.0", root, root / "context2")
+
     def test_invalid_tag_rejected(self):
         with self.assertRaises(ValueError):
             prepare.prepare("v0.3.0;echo unsafe", Path("unused"), Path("unused"))
