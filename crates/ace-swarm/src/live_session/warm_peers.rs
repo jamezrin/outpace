@@ -621,31 +621,49 @@ mod secure {
     }
     impl Directory {
         pub(super) fn open(path: &Path) -> io::Result<Self> {
+            // Ancestors need search permission only (notably Android's /data).
+            // The final directory stays readable for sync_all after atomic replacement.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            const TRAVERSE: i32 = libc::O_PATH | libc::O_DIRECTORY;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            const TRAVERSE: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
+            let mut components = path
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(name) => Some(name),
+                    _ => None,
+                })
+                .peekable();
             let mut dir = openat(
                 libc::AT_FDCWD,
                 Path::new("/").as_os_str(),
-                libc::O_RDONLY | libc::O_DIRECTORY,
+                if components.peek().is_some() {
+                    TRAVERSE
+                } else {
+                    libc::O_RDONLY | libc::O_DIRECTORY
+                },
                 0,
             )?;
-            for component in path.components() {
-                if let Component::Normal(name) = component {
-                    dir = match openat(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-                    {
-                        Ok(next) => next,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            let name_c = CString::new(name.as_bytes()).map_err(|_| {
-                                io::Error::new(io::ErrorKind::InvalidInput, "NUL path")
-                            })?;
-                            if unsafe { libc::mkdirat(dir.as_raw_fd(), name_c.as_ptr(), 0o700) } < 0
-                                && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-                            {
-                                return Err(io::Error::last_os_error());
-                            }
-                            openat(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+            while let Some(name) = components.next() {
+                let flags = if components.peek().is_some() {
+                    TRAVERSE
+                } else {
+                    libc::O_RDONLY | libc::O_DIRECTORY
+                };
+                dir = match openat(dir.as_raw_fd(), name, flags, 0) {
+                    Ok(next) => next,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        let name_c = CString::new(name.as_bytes())
+                            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL path"))?;
+                        if unsafe { libc::mkdirat(dir.as_raw_fd(), name_c.as_ptr(), 0o700) } < 0
+                            && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+                        {
+                            return Err(io::Error::last_os_error());
                         }
-                        Err(error) => return Err(error),
-                    };
-                }
+                        openat(dir.as_raw_fd(), name, flags, 0)?
+                    }
+                    Err(error) => return Err(error),
+                };
             }
             let metadata = dir.metadata()?;
             if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
@@ -986,6 +1004,38 @@ mod tests {
             "header/version is required"
         );
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn cache_persists_through_execute_only_parent() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping execute-only parent test: root bypasses directory permissions");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("search-only");
+        let existing = parent.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let result = (|| -> io::Result<()> {
+            assert_eq!(
+                std::fs::read_dir(&parent).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+                "fixture must deny directory reads"
+            );
+            // Also exercise mkdirat through a search-only ancestor.
+            for path in [existing.clone(), existing.join("new").join("cache")] {
+                let directory = secure::Directory::open(&path)?;
+                directory.write(&valid())?;
+                assert_eq!(directory.read()?, valid());
+                drop(directory);
+                let reopened = secure::Directory::open(&path)?;
+                assert_eq!(reopened.read()?, valid());
+            }
+            Ok(())
+        })();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
     #[test]
     fn cache_inode_and_directory_rejections_are_nonblocking() {
         let root = temp();
@@ -1023,6 +1073,7 @@ mod tests {
         let alias = root.with_extension("alias");
         symlink(&root, &alias).unwrap();
         assert!(secure::Directory::open(&alias).is_err());
+        assert!(secure::Directory::open(&alias.join("child")).is_err());
         std::fs::remove_file(alias).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(secure::Directory::open(&root).is_err());
