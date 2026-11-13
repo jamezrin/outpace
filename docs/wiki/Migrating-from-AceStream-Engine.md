@@ -27,7 +27,7 @@ handshake and work with compat off.
 - **No premium or encrypted content**, accounts, subscriptions, web UI, remote control,
   channel lists or EPG. These are permanent non-goals.
 - **Search needs a separate opt-in.** [Service-backed stream-name search](Stream-Search)
-  is newer than v0.9.0 and needs no operator API key. It uses external HTTP services.
+  is available from v1.0.0 and needs no operator API key. It uses external HTTP services.
   HTTP compatibility alone does not enable it. Older clients that need
   reverse content-ID lookup still require an integration change; use explicit infohash selectors.
 - **No legacy seek or file selection**, and no VOD through the compat API. Native `/vod` exists.

@@ -1,5 +1,8 @@
 # FAQ
 
+> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
+> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
+
 Answers to the questions people ask most about Outpace. Each answer links to the page with the
 details.
 
@@ -19,7 +22,7 @@ engine HTTP routes that existing apps call, through an opt-in compatibility mode
 
 It isn't a full clone. It doesn't play premium or encrypted content, and it has no accounts, web
 UI or EPG. [Optional stream-name search](Stream-Search) requires a separate services opt-in
-in builds newer than v0.9.0. It needs no operator API key. See
+in builds available from v1.0.0. It needs no operator API key. See
 [what's different](Migrating-from-AceStream-Engine#whats-different).
 
 Outpace isn't affiliated with or endorsed by Ace Stream. It uses Ace Stream names only to
@@ -52,7 +55,7 @@ See [Getting Started](Getting-Started) and [Command Line](Command-Line#outpace-p
 
 ```bash
 docker run -d --name outpace -p 127.0.0.1:6878:6878 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0
+  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0
 ```
 
 The image is multi-arch (amd64, arm64, arm/v7). For a production setup with Docker Compose, a
@@ -143,7 +146,7 @@ RTMP (1935) private. No UDP port needs forwarding. See
 
 ## Can I rewind live TV?
 
-For a few minutes, with [Timeshift](Timeshift) (newer than v0.9.0). It's an in-memory buffer,
+For a few minutes, with [Timeshift](Timeshift) (available from v1.0.0). It's an in-memory buffer,
 not a recorder, and it doesn't do EPG catch-up.
 
 ## Why did my old playlist of bare infohashes stop working?

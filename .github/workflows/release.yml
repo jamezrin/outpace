@@ -247,6 +247,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
+          body_path: docs/releases/${{ needs.release-metadata.outputs.version }}.md
           generate_release_notes: true
           files: |
             dist/outpace-*

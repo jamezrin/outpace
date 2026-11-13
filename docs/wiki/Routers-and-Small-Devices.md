@@ -1,5 +1,8 @@
 # Routers and Small Devices
 
+> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
+> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
+
 Outpace runs on routers, NAS boxes and single-board computers, but they have far less RAM
 and flash than a server. This page collects what changes on them.
 
@@ -9,8 +12,8 @@ and flash than a server. This page collects what changes on them.
 | --- | --- |
 | OpenWrt router | The [OpenWrt installer](#openwrt) below. It picks the right build. |
 | Raspberry Pi 2/3/4/5, most ARM NAS boxes | `armv7-unknown-linux-musleabihf` (32-bit) or `aarch64-unknown-linux-musl` (64-bit OS) from [Installation](Installation#release-binaries). |
-| Raspberry Pi Zero/1 | `arm-unknown-linux-musleabihf` (ARMv6), from the next release. |
-| RISC-V boards | `riscv64gc-unknown-linux-musl`, from the next release. |
+| Raspberry Pi Zero/1 | `arm-unknown-linux-musleabihf` (ARMv6), from v1.0.0. |
+| RISC-V boards | `riscv64gc-unknown-linux-musl`, from v1.0.0. |
 | x86 mini PC or appliance | `x86_64-unknown-linux-musl`. |
 
 All Linux release binaries are static (musl), so they run on any distribution, including
@@ -50,7 +53,7 @@ want. The installer and its files come from the repository; the binary comes fro
 cd /tmp
 wget -O outpace-src.tar.gz https://github.com/jamezrin/outpace-stream/archive/refs/heads/main.tar.gz
 tar -xzf outpace-src.tar.gz
-sh outpace-stream-main/packaging/openwrt/install.sh 0.9.0
+sh outpace-stream-main/packaging/openwrt/install.sh 1.0.0
 ```
 
 The installer:
@@ -74,7 +77,7 @@ Running the installer again upgrades the binary and keeps your configuration.
 | `riscv64_*` | `riscv64gc-unknown-linux-musl` |
 
 Only releases that ship an architecture's build can be installed on it. ARMv6 and RISC-V 64
-builds are newer than v0.9.0, so on those routers install a later release.
+builds are available from v1.0.0, so on those routers install 1.0.0 or later once published.
 
 MIPS routers (for example MT7621 or ath79 boards) are not supported. Most have too little
 flash and RAM for Outpace, and Rust supports MIPS only as a tier 3 target.
@@ -100,7 +103,7 @@ logread -e outpace
 
 ## pfSense and OPNsense
 
-These run FreeBSD. From the next release, the FreeBSD x86_64 binary covers them. Treat a
+These run FreeBSD. From v1.0.0, the FreeBSD x86_64 binary covers them. Treat a
 firewall carefully: keep the API on `127.0.0.1` and open only the peer port.
 
 ## Related pages

@@ -71,7 +71,7 @@ What it isn't:
 - It doesn't play premium or encrypted content.
 - It has no accounts, EPG or web UI.
 - Stream-name search is a separate, default-off external services adapter. No
-  operator API key is needed. It is newer than v0.9.0; see
+  operator API key is needed. It is available from v1.0.0; see
   [search setup and limits](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search).
 - The compatible API is a subset, not full parity with the official engine.
 
@@ -85,10 +85,13 @@ Download the archive for your platform from the
 [latest release](https://github.com/jamezrin/outpace-stream/releases/latest). For example, on
 Linux x86_64:
 
+The examples target the upcoming 1.0.0 release. Until it is published, use 0.9.0 for
+release downloads and images, or `main`/`edge` for the new features.
+
 ```bash
-curl -LO https://github.com/jamezrin/outpace-stream/releases/download/v0.9.0/outpace-0.9.0-x86_64-unknown-linux-musl.tar.gz
-tar -xzf outpace-0.9.0-x86_64-unknown-linux-musl.tar.gz
-sudo install -m 0755 outpace-0.9.0-x86_64-unknown-linux-musl/outpace /usr/local/bin/outpace
+curl -LO https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
+sudo install -m 0755 outpace-1.0.0-x86_64-unknown-linux-musl/outpace /usr/local/bin/outpace
 ```
 
 On Windows, unzip the archive and use `outpace.exe`. The
@@ -125,7 +128,7 @@ A cold start takes 20–60 seconds while Outpace finds peers and buffers.
 
 ```bash
 docker run -d --name outpace -p 127.0.0.1:6878:6878 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0
+  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0
 ```
 
 For a production setup, use the repository's [`compose.yml`](compose.yml) and
@@ -153,7 +156,7 @@ The HTTP API has no authentication, so keep it on `127.0.0.1` or behind a proxy.
 | VOD | Single-file VOD with per-piece verification and byte-range seeking. |
 | Peer participation | Uploads and accepts inbound peers by default, like the official engine. Download-only mode is one setting away. |
 | Broadcasting | Publish your own signed swarm from HTTP, RTMP or an HTTP pull source, or from encrypted SRT in builds that include it. |
-| Timeshift and HLS origins | Per-viewer rewind of live HLS, and a guarded relay for descriptors that point at HLS servers. Newer than v0.9.0 ([details](https://github.com/jamezrin/outpace-stream/wiki/Releases-and-Versions#not-yet-released)). |
+| Timeshift and HLS origins | Per-viewer rewind of live HLS, and a guarded relay for descriptors that point at HLS servers. Available from v1.0.0 ([details](https://github.com/jamezrin/outpace-stream/wiki/Releases-and-Versions#v100-highlights)). |
 
 ## Documentation
 

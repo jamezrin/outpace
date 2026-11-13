@@ -122,8 +122,8 @@ Things to know:
 
 ## SRT ingest
 
-> **Unreleased, and only in special builds.** SRT is newer than v0.9.0, and it isn't in any
-> release binary or published image. Build from `main` on native Linux with `--features srt`
+> **From v1.0.0, only in special builds.** SRT isn't in any
+> release binary or published image. Build from the `v1.0.0` tag on native Linux with `--features srt`
 > and libsrt 1.5.7 or newer; see [Installation](Installation#building-with-srt-ingest).
 
 SRT gives you an **encrypted** input over UDP, useful for publishing from a remote encoder.

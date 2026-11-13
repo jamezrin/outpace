@@ -319,7 +319,7 @@ does not change them. They are not an independent media-capability probe.
 
 | Feature | Status | Rationale / limit |
 | --- | --- | --- |
-| Service-backed stream-name search | Separate opt-in adapter; newer than v0.9.0 | `GET /search` requires `OUTPACE_COMPAT_ACESTREAM_SERVICES=1`. The native HTTP backend needs no operator API key; legacy HTTP compatibility alone does not enable it. See [the search contract, limits and current-client boundary](../wiki/Stream-Search.md). |
+| Service-backed stream-name search | Separate opt-in adapter; from v1.0.0 | `GET /search` requires `OUTPACE_COMPAT_ACESTREAM_SERVICES=1`. The native HTTP backend needs no operator API key; legacy HTTP compatibility alone does not enable it. See [the search contract, limits and current-client boundary](../wiki/Stream-Search.md). |
 | Legacy VOD playback/HLS | Deferred; not supported | Native `/vod` is a separate surface, not this legacy contract. |
 | Seek/file selection | Deferred; not supported | No legacy seeking or file-selection contract is implemented. |
 | Reverse content-id lookup | Deferred; not supported | `get_content_id` only echoes a supplied content id. Search selections use explicit infohash playback selectors and existing descriptor verification; no reverse mapping is fabricated. Older clients requiring it need an integration change. |

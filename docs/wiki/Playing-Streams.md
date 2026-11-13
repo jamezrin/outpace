@@ -227,7 +227,7 @@ original engine's sense, and no VOD. Outpace adds its own [timeshift](Timeshift)
 instead.
 
 [Stream-name search](Stream-Search) is a separate, default-off AceStream services adapter in
-builds newer than v0.9.0. Enabling `OUTPACE_ACE_COMPAT` alone does not add search, and
+builds available from v1.0.0. Enabling `OUTPACE_ACE_COMPAT` alone does not add search, and
 `get_content_id` still does not convert an infohash to a content ID. Select results using
 explicit `/streams/ace/ih:<infohash>` or compatibility `infohash=` playback selectors.
 

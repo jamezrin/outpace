@@ -5,12 +5,14 @@ can build yourself. All three run the same program: `outpace serve` starts the d
 
 ## Choose a version
 
-- **Releases** (`vX.Y.Z` tags) are the stable choice. The latest is **v0.9.0**.
+- **Releases** (`vX.Y.Z` tags) are the stable choice. **v1.0.0 is being prepared**;
+  v0.9.0 remains the latest published release until its successor is published.
 - **`edge`** follows `main` and includes features newer than the latest release. It is
   `linux/amd64` only and changes with every merge. Don't use it where you need predictable
   upgrades.
 
 See [Releases and Versions](Releases-and-Versions) for which features are in which build.
+The examples below target 1.0.0 once published; use 0.9.0 for existing downloads until then.
 
 ## Release binaries
 
@@ -22,9 +24,9 @@ file on the [releases page](https://github.com/jamezrin/outpace-stream/releases)
 | Linux x86_64 | `x86_64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARM64 (aarch64) | `aarch64-unknown-linux-musl` | `.tar.gz` |
 | Linux ARMv7 hard-float (Raspberry Pi 2/3 class) | `armv7-unknown-linux-musleabihf` | `.tar.gz` |
-| Linux ARMv6 hard-float (Raspberry Pi Zero/1 class), from the next release | `arm-unknown-linux-musleabihf` | `.tar.gz` |
-| Linux RISC-V 64, from the next release | `riscv64gc-unknown-linux-musl` | `.tar.gz` |
-| FreeBSD 14 and 15 x86_64, from the next release | `x86_64-unknown-freebsd` | `.tar.gz` |
+| Linux ARMv6 hard-float (Raspberry Pi Zero/1 class), from v1.0.0 | `arm-unknown-linux-musleabihf` | `.tar.gz` |
+| Linux RISC-V 64, from v1.0.0 | `riscv64gc-unknown-linux-musl` | `.tar.gz` |
+| FreeBSD 14 and 15 x86_64, from v1.0.0 | `x86_64-unknown-freebsd` | `.tar.gz` |
 | macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
@@ -36,7 +38,7 @@ Download, verify and install on Linux or macOS. Set `target` to the row for your
 the table above:
 
 ```bash
-version=0.9.0
+version=1.0.0
 target=x86_64-unknown-linux-musl   # e.g. aarch64-apple-darwin on Apple silicon
 artifact="outpace-${version}-${target}.tar.gz"
 base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
@@ -53,7 +55,7 @@ On Windows, unzip the archive and run `outpace.exe serve` from a terminal. To ru
 
 ### Android with Termux (best-effort)
 
-From the next release, there is a best-effort `aarch64-linux-android` build for 64-bit ARM
+From v1.0.0, there is a best-effort `aarch64-linux-android` build for 64-bit ARM
 phones and Android TV boxes, to run under [Termux](https://termux.dev).
 
 - **Best-effort** means it is uploaded after the rest of the release. If its build fails, that
@@ -65,7 +67,7 @@ In Termux:
 
 ```bash
 pkg install curl
-version=X.Y.Z   # a release newer than v0.9.0
+version=1.0.0   # once published
 artifact="outpace-${version}-aarch64-linux-android.tar.gz"
 base="https://github.com/jamezrin/outpace-stream/releases/download/v${version}"
 curl -LO "${base}/${artifact}" && curl -LO "${base}/${artifact}.sha256"
@@ -105,7 +107,7 @@ scoop install outpace/outpace
 
 ### Debian, Ubuntu and Fedora packages
 
-From the next release, each release also has `.deb` and `.rpm` packages for x86_64, ARM64 and
+From v1.0.0, each release also has `.deb` and `.rpm` packages for x86_64, ARM64 and
 ARMv7. They contain the same static binary, plus a systemd unit and a configuration file, and
 they are listed in `SHA256SUMS`.
 
@@ -138,7 +140,7 @@ The service runs with the hardening described in [Deployment](Deployment#systemd
 
 ### FreeBSD and other BSDs
 
-From the next release there is a FreeBSD x86_64 binary. It uses the same archive layout, so
+From v1.0.0 there is a FreeBSD x86_64 binary. It uses the same archive layout, so
 the commands above work with `target=x86_64-unknown-freebsd` and `version` set to a release
 that includes it (v0.9.0 does not). Use `sha256 -c` or
 `shasum -a 256 --check` to verify. The binary is built against FreeBSD 14 and is tested on 14
@@ -152,7 +154,7 @@ There are no NetBSD or OpenBSD builds. On those systems,
 ### Verify where a release came from
 
 `SHA256SUMS` proves an archive wasn't corrupted, but it comes from the same release page as the
-archive. Releases newer than v0.9.0 also carry signed
+archive. Releases from v1.0.0 onward also carry signed
 [build provenance](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations),
 which proves that this repository's release workflow built the archive from the tagged commit.
 With the [GitHub CLI](https://cli.github.com):
@@ -202,9 +204,9 @@ The image is `ghcr.io/jamezrin/outpace`.
 
 | Tag | What it is | Architectures |
 | --- | --- | --- |
-| `0.9.0` (any `X.Y.Z`) | A release. Pin this in production. | `linux/amd64`, `linux/arm64`, `linux/arm/v7` |
+| `1.0.0` (any `X.Y.Z`) | A release. Pin this in production. | `linux/amd64`, `linux/arm64`, `linux/arm/v7` |
 | `latest` | The most recent release. | same as releases |
-| `X.Y.Z-minimal`, `minimal` | The same release in a minimal `scratch` image, from the next release. | `linux/amd64`, `linux/arm64`, `linux/arm/v7` |
+| `X.Y.Z-minimal`, `minimal` | The same release in a minimal `scratch` image, from v1.0.0. | `linux/amd64`, `linux/arm64`, `linux/arm/v7` |
 | `edge` | The current `main` branch. | `linux/amd64` only |
 | `sha-<commit>` | One specific `main` commit. | `linux/amd64` only |
 
@@ -223,7 +225,7 @@ docker run -d --name outpace --restart unless-stopped \
   -p 127.0.0.1:1935:1935 \
   -p 8621:8621/tcp \
   -v outpace-data:/var/lib/outpace \
-  ghcr.io/jamezrin/outpace:0.9.0
+  ghcr.io/jamezrin/outpace:1.0.0
 ```
 
 Publish HTTP and RTMP on `127.0.0.1` unless a firewall or authenticating proxy protects them.
@@ -234,7 +236,7 @@ The image doesn't include FFmpeg; see [FFmpeg](#ffmpeg) below.
 
 ### Minimal image
 
-From the next release, every release image also comes as `X.Y.Z-minimal` (and `minimal` for the
+From v1.0.0, every release image also comes as `X.Y.Z-minimal` (and `minimal` for the
 newest). It is built `FROM scratch`: the same static binary, its licence, and a data directory,
 with no shell, package manager or `curl`. It is about a fifth of the size of the Debian image.
 
@@ -255,7 +257,7 @@ production layout with a health check, log rotation and safe port bindings:
 ```bash
 curl -LO https://raw.githubusercontent.com/jamezrin/outpace-stream/main/compose.yml
 curl -L -o .env https://raw.githubusercontent.com/jamezrin/outpace-stream/main/.env.example
-# edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/jamezrin/outpace:0.9.0
+# edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/jamezrin/outpace:1.0.0
 docker compose up -d --wait
 ```
 
@@ -271,7 +273,7 @@ macOS) and [rustup](https://rustup.rs). The repository pins its Rust version in
 ```bash
 git clone https://github.com/jamezrin/outpace-stream.git outpace
 cd outpace
-git checkout v0.9.0          # or stay on main for the newest features
+git checkout v1.0.0          # or stay on main for the newest features
 cargo build --release --locked -p ace-engine --bin outpace
 ./target/release/outpace --version
 ```
@@ -280,7 +282,7 @@ The binary is `target/release/outpace`.
 
 Release binaries use a slower, smaller `dist` profile (link-time optimisation, one codegen unit,
 symbols stripped). It roughly halves the binary, which helps on routers and boards with little
-flash. To build the same way, from source newer than v0.9.0:
+flash. To build the same way from v1.0.0 source or later:
 
 ```bash
 cargo build --profile dist --locked -p ace-engine --bin outpace
@@ -304,13 +306,13 @@ headers:
 cargo build --release --locked -p ace-engine --bin outpace --features srt
 ```
 
-SRT is newer than v0.9.0, so build from `main`.
+SRT is available from v1.0.0; build from that tag once published, or from `main`.
 
 ## FFmpeg
 
 Outpace doesn't need FFmpeg to play, package HLS or broadcast. It only runs FFmpeg when you turn
 on audio normalisation with `OUTPACE_HLS_AUDIO_NORMALIZE` (all versions) or
-`OUTPACE_LIVE_AUDIO_NORMALIZE` (unreleased: `edge` and builds from `main` only); see
+`OUTPACE_LIVE_AUDIO_NORMALIZE` (from v1.0.0); see
 [HLS Output](HLS-Output#audio-normalisation). With both off, it never looks for FFmpeg.
 
 If you turn normalisation on:
@@ -324,7 +326,7 @@ If you turn normalisation on:
 - The published image doesn't contain FFmpeg. Build a derived image, for example:
 
 ```dockerfile
-FROM ghcr.io/jamezrin/outpace:0.9.0
+FROM ghcr.io/jamezrin/outpace:1.0.0
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*

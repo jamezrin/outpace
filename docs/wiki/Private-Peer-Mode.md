@@ -1,7 +1,7 @@
 # Private Peer Mode
 
-> **Unreleased:** private peer mode and private descriptors are in the `edge` image and builds
-> from `main`. v0.9.0 doesn't have them. See [Releases and Versions](Releases-and-Versions).
+> **From v1.0.0:** Private peer mode and local descriptors. See [Releases and Versions](Releases-and-Versions)
+> for publication status.
 
 Private peer mode restricts Outpace to an exact list of peers that you choose. It is for setups
 such as a home gateway that should only pull from your own origin node, or a lab swarm.

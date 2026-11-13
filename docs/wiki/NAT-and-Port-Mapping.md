@@ -1,5 +1,8 @@
 # NAT and Port Mapping
 
+> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
+> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
+
 Most home and office connections sit behind a router doing NAT. Without help, peers on the
 internet can't open connections to you. Playback still works, because Outpace connects out to
 peers, but you won't receive inbound peers, and your [broadcasts](Broadcasting) and seeding are
@@ -30,7 +33,7 @@ outpace serve
 
 # docker run: set the listener and publish the same port
 docker run -d --name outpace -e OUTPACE_PEER_LISTEN=0.0.0.0:8622 -p 8622:8622/tcp \
-  -p 127.0.0.1:6878:6878 -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0
+  -p 127.0.0.1:6878:6878 -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0
 ```
 
 Then forward external TCP 8622 to port 8622 on the host. The provided `compose.yml` fixes both

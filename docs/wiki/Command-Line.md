@@ -1,5 +1,8 @@
 # Command Line
 
+> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
+> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
+
 Outpace is one executable with three commands. Daemon behaviour is configured with `OUTPACE_*`
 environment variables, not flags; see [Configuration](Configuration) and the
 [A–Z list](Environment-Variables).
@@ -70,7 +73,7 @@ Rules for these inputs:
 - The `acestream://` link of a broadcast made by **another** Outpace daemon needs
   `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1`.
 
-> **Unreleased:** the `edge` image and builds from `main` reject duplicate query keys
+> **From v1.0.0:** `play` rejects duplicate query keys
 > and the file-selection options `_idx` and `stream_id`. v0.9.0 does not enforce
 > these rejection rules.
 
@@ -112,7 +115,7 @@ The command:
 
 ## `outpace service` (Windows)
 
-Unreleased: `edge` and builds from `main` only. This command exists only in Windows builds:
+From v1.0.0. This command exists only in Windows builds:
 
 | Command | What it does |
 | --- | --- |
@@ -124,7 +127,7 @@ See [Deployment](Deployment#windows-service) for settings, data and logs.
 
 ## `outpace healthcheck`
 
-Unreleased: `edge` and builds from `main` only. Checks that a running daemon answers `/healthz`,
+From v1.0.0. Checks that a running daemon answers `/healthz`,
 then exits `0` if it does and `1` if it doesn't. Use it for container and service health checks
 on systems without `curl`, such as the minimal image.
 
@@ -143,7 +146,7 @@ It reads no other settings and doesn't start anything.
 ## `--version` and `--help`
 
 ```bash
-outpace --version      # e.g. "outpace 0.9.0"
+outpace --version      # e.g. "outpace 1.0.0"
 outpace --help
 outpace play --help
 ```
@@ -157,11 +160,11 @@ The image's entry point is `outpace` and its default command is `serve`, so argu
 the image name:
 
 ```bash
-docker run --rm ghcr.io/jamezrin/outpace:0.9.0 --version
-docker run --rm -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0 \
+docker run --rm ghcr.io/jamezrin/outpace:1.0.0 --version
+docker run --rm -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0 \
   play acestream://0123456789abcdef0123456789abcdef01234567 > live.ts
 docker run -d -p 127.0.0.1:6878:6878 -p 127.0.0.1:1935:1935 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:0.9.0 broadcast my-channel
+  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0 broadcast my-channel
 ```
 
 ## Related pages

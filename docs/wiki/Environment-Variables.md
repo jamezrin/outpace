@@ -6,13 +6,14 @@ change it. See [Command Line](Command-Line) for commands and flags.
 
 Restart the daemon after any change. Booleans accept exactly `1`, `true`, `0` or `false`.
 Variables marked "exact `1`" turn on only for the string `1`. **Avail.** says where a variable
-is available: **all** means v0.9.0 and later; **edge** means only the `edge` image and builds
-from `main`; **srt build** means binaries built with the `srt` feature.
+is available: **all** means v0.9.0 and later; **1.0.0** means v1.0.0 and later (also
+in `edge` and builds from `main`); **srt build** requires the optional `srt` feature.
+See [Releases and Versions](Releases-and-Versions) for publication status.
 
 | Variable | Default | Avail. | Purpose |
 | --- | --- | --- | --- |
 | [`OUTPACE_ACE_COMPAT`](Configuration#acestream-compatibility-api) | `false` | all | Turn on the AceStream-compatible `/ace/*` and `/server/api` routes. |
-| [`OUTPACE_COMPAT_ACESTREAM_SERVICES`](Configuration#acestream-search-services) | `false` | edge | Separate opt-in for external stream-name search. |
+| [`OUTPACE_COMPAT_ACESTREAM_SERVICES`](Configuration#acestream-search-services) | `false` | 1.0.0 | Separate opt-in for external stream-name search. |
 | [`OUTPACE_ACE_PEERS`](Configuration#discovery-trackers-and-resolution) | unset | all | Extra bootstrap peers, as `IPv4:port` separated by commas. |
 | [`OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE`](Configuration#broadcasting-and-ingest) | off | all | Exact `1`: allow private and loopback broadcast pull sources. |
 | [`OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT`](Configuration#discovery-trackers-and-resolution) | off | all | Exact `1`: allow transport-file URLs on private hosts. |
@@ -28,17 +29,17 @@ from `main`; **srt build** means binaries built with the `srt` feature.
 | [`OUTPACE_ENABLE_SEEDING`](Configuration#seeding-and-inbound-peers) | `true` | all | Upload to the peers you download from. |
 | [`OUTPACE_EXPERIMENTAL_ACE_COMPAT`](Configuration#acestream-compatibility-api) | unset | all | Deprecated name for `OUTPACE_ACE_COMPAT`. |
 | [`OUTPACE_FFMPEG_PATH`](Configuration#audio-normalisation) | `ffmpeg` | all | FFmpeg executable, used only for audio normalisation. |
-| [`OUTPACE_HISTORY_BYTES`](Configuration#timeshift) | 128 MiB | edge | Timeshift memory per source. |
-| [`OUTPACE_HISTORY_SECONDS`](Configuration#timeshift) | `0` (off) | edge | How far back viewers can rewind, up to 3600 seconds. |
-| [`OUTPACE_HISTORY_TOTAL_BYTES`](Configuration#timeshift) | 256 MiB | edge | Timeshift memory shared by all sources. |
+| [`OUTPACE_HISTORY_BYTES`](Configuration#timeshift) | 128 MiB | 1.0.0 | Timeshift memory per source. |
+| [`OUTPACE_HISTORY_SECONDS`](Configuration#timeshift) | `0` (off) | 1.0.0 | How far back viewers can rewind, up to 3600 seconds. |
+| [`OUTPACE_HISTORY_TOTAL_BYTES`](Configuration#timeshift) | 256 MiB | 1.0.0 | Timeshift memory shared by all sources. |
 | [`OUTPACE_HLS_AUDIO_NORMALIZE`](Configuration#audio-normalisation) | `false` | all | Convert AC3 and MPEG audio to AAC for live HLS. |
 | [`OUTPACE_HLS_SEGMENT_DURATION_MS`](Configuration#hls) | `5000` | all | Target HLS segment length. |
 | [`OUTPACE_HLS_SEGMENT_PACKETS`](Configuration#hls) | `65536` | all | Size ceiling per segment, in 188-byte packets. |
 | [`OUTPACE_HLS_STARTUP_SEGMENTS`](Configuration#hls) | `6` | all | Segments ready before the first playlist is returned. |
 | [`OUTPACE_HLS_STARTUP_TIMEOUT_MS`](Configuration#hls) | `45000` | all | HLS startup wait before answering `503`. |
 | [`OUTPACE_HLS_WINDOW_SEGMENTS`](Configuration#hls) | `8` | all | Segments kept in the live playlist. |
-| [`OUTPACE_LIVE_AUDIO_NORMALIZE`](Configuration#audio-normalisation) | `false` | edge | Convert audio once per source, for TS and HLS. |
-| [`OUTPACE_MANAGED_HLS`](Configuration#managed-hls-origins) | `false` | edge | Relay HLS-origin descriptors locally instead of redirecting players. |
+| [`OUTPACE_LIVE_AUDIO_NORMALIZE`](Configuration#audio-normalisation) | `false` | 1.0.0 | Convert audio once per source, for TS and HLS. |
+| [`OUTPACE_MANAGED_HLS`](Configuration#managed-hls-origins) | `false` | 1.0.0 | Relay HLS-origin descriptors locally instead of redirecting players. |
 | [`OUTPACE_MAX_ACTIVE_UPSTREAMS`](Configuration#live-recovery-advanced) | `4` | all | Peers one stream downloads from at once. |
 | [`OUTPACE_MAX_INBOUND`](Configuration#seeding-and-inbound-peers) | `64` | all | Total inbound peer connections. |
 | [`OUTPACE_MAX_INBOUND_PER_STREAM`](Configuration#seeding-and-inbound-peers) | `16` | all | Inbound connections per stream. `0` means no per-stream cap. |
@@ -47,7 +48,7 @@ from `main`; **srt build** means binaries built with the `srt` feature.
 | [`OUTPACE_MAX_REASM_PIECES_AHEAD`](Configuration#live-recovery-advanced) | `512` | all | Pieces accepted ahead of the playback cursor. |
 | [`OUTPACE_MAX_SESSIONS`](Configuration#limits-and-admission) | `0` (unlimited) | all | Cap on concurrent sources. |
 | [`OUTPACE_MAX_UNCHOKED`](Configuration#seeding-and-inbound-peers) | `8` | all | Stable desired unchoke count per stream, plus one rotating optimistic peer. `0` still selects one optimistic peer; this is not an instantaneous wire-visible cap. |
-| [`OUTPACE_METRICS`](Configuration#diagnostics) | `false` | all | Serve Prometheus metrics at `GET /metrics`. |
+| [`OUTPACE_METRICS`](Configuration#diagnostics) | `false` | 1.0.0 | Serve Prometheus metrics at `GET /metrics`. |
 | [`OUTPACE_PEER_LISTEN`](Configuration#network-and-listeners) | `0.0.0.0:8621` | all | TCP peer listener. Its port is also the announced port. |
 | [`OUTPACE_PORT_MAP_BACKEND`](Configuration#nat-and-port-mapping) | `auto` | all | `auto`, `upnp`, `natpmp` or `none`. |
 | [`OUTPACE_PORT_MAP_EXTERNAL_PORT`](Configuration#nat-and-port-mapping) | the peer port | all | External port to request from the router. |
@@ -55,8 +56,8 @@ from `main`; **srt build** means binaries built with the `srt` feature.
 | [`OUTPACE_PREBUFFER_MS`](Configuration#playback-and-startup-buffering) | `30000` | all | Media to collect before playback starts. `0` disables it. |
 | [`OUTPACE_PREBUFFER_TIMEOUT_MS`](Configuration#playback-and-startup-buffering) | `15000` | all | Longest startup wait after the first media byte. |
 | [`OUTPACE_PREFETCH_PIECES`](Configuration#playback-and-startup-buffering) | automatic | all | Pieces behind the live edge to start at. |
-| [`OUTPACE_PRIVATE_DESCRIPTORS`](Configuration#private-peers-and-descriptors) | unset | edge | Local descriptor files, as an alias-to-path JSON object. |
-| [`OUTPACE_PRIVATE_PEERS`](Configuration#private-peers-and-descriptors) | unset | edge | Allowlist that switches on private peer mode. |
+| [`OUTPACE_PRIVATE_DESCRIPTORS`](Configuration#private-peers-and-descriptors) | unset | 1.0.0 | Local descriptor files, as an alias-to-path JSON object. |
+| [`OUTPACE_PRIVATE_PEERS`](Configuration#private-peers-and-descriptors) | unset | 1.0.0 | Allowlist that switches on private peer mode. |
 | [`OUTPACE_REQUEST_CHECK_INTERVAL_MS`](Configuration#live-recovery-advanced) | `1000` | all | How often outstanding piece requests are checked. |
 | [`OUTPACE_REQUEST_TIMEOUT_MS`](Configuration#live-recovery-advanced) | `1500` | all | Wait for a piece before asking another peer. |
 | [`OUTPACE_RTMP_BIND`](Configuration#network-and-listeners) | `127.0.0.1:1935` | all | RTMP ingest address. The container sets `0.0.0.0:1935`. |
@@ -70,7 +71,7 @@ from `main`; **srt build** means binaries built with the `srt` feature.
 | [`OUTPACE_SRT_MAX_CONNECTIONS`](Configuration#broadcasting-and-ingest) | `4` | srt build | Simultaneous SRT connections, 1–16. |
 | [`OUTPACE_SRT_PASSPHRASE_FILE`](Configuration#broadcasting-and-ingest) | unset | srt build | SRT passphrase file. Required with `OUTPACE_SRT_BIND`. |
 | [`OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`](Configuration#live-recovery-advanced) | `12000` | all | Rebuild the peer pool after this long without progress. |
-| [`OUTPACE_SUPPORT_SOURCES`](Configuration#support-sources) | unset (off) | edge | Streams kept running and seeding with no viewer (JSON). |
+| [`OUTPACE_SUPPORT_SOURCES`](Configuration#support-sources) | unset (off) | 1.0.0 | Streams kept running and seeding with no viewer (JSON). |
 | [`OUTPACE_TRACKER_ALLOW_NON_GLOBAL`](Configuration#discovery-trackers-and-resolution) | off | all | Exact `1`: allow announcing to trackers on private addresses. |
 | [`OUTPACE_TRACKERS`](Configuration#broadcasting-and-ingest) | built-in public tracker | all | Trackers written into new broadcasts. |
 
