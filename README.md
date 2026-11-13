@@ -86,9 +86,9 @@ Download the archive for your platform from the
 Linux x86_64:
 
 ```bash
-curl -LO https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
-tar -xzf outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
-sudo install -m 0755 outpace-1.0.0-x86_64-unknown-linux-musl/outpace /usr/local/bin/outpace
+curl -LO https://github.com/jamezrin/outpace-stream/releases/download/v1.0.1/outpace-1.0.1-x86_64-unknown-linux-musl.tar.gz
+tar -xzf outpace-1.0.1-x86_64-unknown-linux-musl.tar.gz
+sudo install -m 0755 outpace-1.0.1-x86_64-unknown-linux-musl/outpace /usr/local/bin/outpace
 ```
 
 On Windows, unzip the archive and use `outpace.exe`. The
@@ -125,7 +125,7 @@ A cold start takes 20–60 seconds while Outpace finds peers and buffers.
 
 ```bash
 docker run -d --name outpace -p 127.0.0.1:6878:6878 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0
+  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.1
 ```
 
 For a production setup, use the repository's [`compose.yml`](compose.yml) and
