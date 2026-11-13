@@ -92,9 +92,9 @@ Download the archive for your platform from the
 Linux x86_64:
 
 ```bash
-curl -LO https://github.com/outpace-stream/outpace-engine/releases/download/v1.0.0/outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
-tar -xzf outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
-sudo install -m 0755 outpace-1.0.0-x86_64-unknown-linux-musl/outpace /usr/local/bin/outpace
+curl -LO https://github.com/outpace-stream/outpace-engine/releases/download/v1.0.1/outpace-1.0.1-x86_64-unknown-linux-musl.tar.gz
+tar -xzf outpace-1.0.1-x86_64-unknown-linux-musl.tar.gz
+sudo install -m 0755 outpace-1.0.1-x86_64-unknown-linux-musl/outpace /usr/local/bin/outpace
 ```
 
 On Windows, unzip the archive and use `outpace.exe`. The

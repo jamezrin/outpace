@@ -5,7 +5,7 @@ can build yourself. All three run the same program: `outpace serve` starts the d
 
 ## Choose a version
 
-- **Releases** (`vX.Y.Z` tags) are the stable choice. The latest is **v1.0.0**.
+- **Releases** (`vX.Y.Z` tags) are the stable choice. The latest is **v1.0.1**.
 - **`edge`** follows `main` and includes features newer than the latest release. It is
   `linux/amd64` only and changes with every merge. Don't use it where you need predictable
   upgrades.
@@ -36,7 +36,7 @@ Download, verify and install on Linux or macOS. Set `target` to the row for your
 the table above:
 
 ```bash
-version=1.0.0
+version=1.0.1
 target=x86_64-unknown-linux-musl   # e.g. aarch64-apple-darwin on Apple silicon
 artifact="outpace-${version}-${target}.tar.gz"
 base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
@@ -65,7 +65,7 @@ In Termux:
 
 ```bash
 pkg install curl
-version=1.0.0
+version=1.0.1
 artifact="outpace-${version}-aarch64-linux-android.tar.gz"
 base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
 curl -LO "${base}/${artifact}" && curl -LO "${base}/${artifact}.sha256"
@@ -309,7 +309,7 @@ macOS) and [rustup](https://rustup.rs). The repository pins its Rust version in
 ```bash
 git clone https://github.com/outpace-stream/outpace-engine.git outpace
 cd outpace
-git checkout v1.0.0          # or stay on main for the newest features
+git checkout v1.0.1          # or stay on main for the newest features
 cargo build --release --locked -p ace-engine --bin outpace
 ./target/release/outpace --version
 ```

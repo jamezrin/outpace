@@ -143,7 +143,7 @@ It reads no other settings and doesn't start anything.
 ## `--version` and `--help`
 
 ```bash
-outpace --version      # e.g. "outpace 1.0.0"
+outpace --version      # e.g. "outpace 1.0.1"
 outpace --help
 outpace play --help
 ```
