@@ -94,8 +94,6 @@ These changes are merged into `main` and planned for 1.0.0; they are absent from
   `OUTPACE_COMPAT_ACESTREAM_SERVICES` setting; client integration limits still apply.
 - Opt-in [Prometheus metrics](Support-Sources-and-Operations#prometheus-metrics),
   enabled with `OUTPACE_METRICS=1`.
-- Homebrew and Scoop installers; their manifests are refreshed after publication using
-  the new release's checksums.
 
 **Fixes you'll notice**
 
@@ -137,7 +135,10 @@ broadcast subset. See the linked release notes for issue references and evidence
 
 ## Updating the Homebrew formula and Scoop manifest
 
-`Formula/outpace.rb` and `bucket/outpace.json` always point at the newest published release,
+Homebrew and Scoop definitions are already available for 0.9.0; the 1.0.0 refresh happens
+after publication.
+
+`Formula/outpace.rb` and `bucket/outpace.json` point at a published release,
 because their checksums only exist once it's out. After publishing a release, a maintainer
 refreshes them and opens a PR:
 
