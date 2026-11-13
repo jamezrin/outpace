@@ -58,6 +58,15 @@ build.
 | `edge` | With every merge to `main` | amd64 | Testing unreleased features. |
 | `sha-<commit>` | No | amd64 | Pinning one specific `main` build. |
 
+## Unreleased
+
+On `main`, not yet in a release:
+
+- A best-effort `armv7-linux-androideabi` engine archive for 32-bit Android devices, next to the
+  `aarch64-linux-android` one; see [Installation](Installation#android-with-termux-best-effort).
+  The [Android companion app](Android-App) downloads these archives by name, so their names and
+  layout (`outpace-<version>-<target>/outpace` inside the `.tar.gz`) stay stable.
+
 ## v1.0.1 fixes
 
 A patch release with no new features or default changes. It fixes live audio normalization:

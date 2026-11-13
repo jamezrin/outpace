@@ -1,7 +1,8 @@
 name: Android best-effort
 
-# aarch64-linux-android (Termux on phones and Android TV boxes) is a best-effort target:
-# checked here, and uploaded by release.yml only after the release and image are published.
+# The Android engine builds (aarch64 and armv7, used by Termux and by the Android app in
+# outpace-stream/outpace-android) are best-effort targets: checked here, and uploaded by
+# release.yml only after the release and image are published.
 on:
   pull_request:
     paths:
@@ -18,13 +19,19 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: aarch64-linux-android
 
 jobs:
   android:
-    name: Build and smoke aarch64-linux-android
+    name: Build and smoke ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # armeabi-v7a matters: many Android TV devices run a 32-bit userland on 64-bit chips.
+        target: [aarch64-linux-android, armv7-linux-androideabi]
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7

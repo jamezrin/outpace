@@ -54,23 +54,27 @@ On Windows, unzip the archive and run `outpace.exe serve` from a terminal. To ru
 ### Android with Termux (best-effort)
 
 From v1.0.0, there is a best-effort `aarch64-linux-android` build for 64-bit ARM
-phones and Android TV boxes, to run under [Termux](https://termux.dev).
+phones and Android TV boxes, to run under [Termux](https://termux.dev). From the release after
+v1.0.1, there is also an `armv7-linux-androideabi` build for 32-bit ARM devices, packaged the
+same way. Many Android TV boxes run 32-bit Android on a 64-bit chip; they need the 32-bit build.
 
-- **Best-effort** means it is uploaded after the rest of the release. If its build fails, that
-  release has no Android archive.
-- It isn't covered by `SHA256SUMS`. It has its own `<archive>.sha256` file.
-- It runs on Android 5 and newer, without root.
+- **Best-effort** means it is uploaded after the rest of the release. If a build fails, that
+  release has no archive for that target.
+- These archives aren't covered by `SHA256SUMS`. Each has its own `<archive>.sha256` file.
+- These builds run on Android 5 and newer, without root.
 
-In Termux:
+In Termux, `dpkg --print-architecture` prints `aarch64` for the 64-bit build or `arm` for the
+32-bit one. For `arm`, set `target=armv7-linux-androideabi` and use a release that has it:
 
 ```bash
 pkg install curl
 version=1.0.1
-artifact="outpace-${version}-aarch64-linux-android.tar.gz"
+target=aarch64-linux-android
+artifact="outpace-${version}-${target}.tar.gz"
 base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
 curl -LO "${base}/${artifact}" && curl -LO "${base}/${artifact}.sha256"
 sha256sum -c "${artifact}.sha256" && tar -xzf "$artifact"
-install -m 0755 "outpace-${version}-aarch64-linux-android/outpace" "$PREFIX/bin/outpace"
+install -m 0755 "outpace-${version}-${target}/outpace" "$PREFIX/bin/outpace"
 termux-wake-lock    # keep Android from suspending it in the background
 outpace serve
 ```
