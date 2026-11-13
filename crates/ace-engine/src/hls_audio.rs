@@ -203,6 +203,14 @@ pub struct ClassifiedOpening {
     pub packet: [u8; 188],
 }
 
+/// Pre-opening payload is discarded as it is scanned, so this bounds evidence, not
+/// memory. Opening needs fresh PAT/PMT and then the next video access point, which
+/// can be a whole GOP away: a 2 s GOP at 8 Mbit/s is about 2 MB, so the 1 MiB input
+/// budget is far too small here. 16 MiB covers multi-second GOPs at high bitrates
+/// while still failing fast on a source that never opens; the startup deadline
+/// bounds the wait in time.
+pub(crate) const CLASSIFY_SCAN_BYTES: usize = 16 * 1024 * 1024;
+
 /// Pre-opening payload can never be replayed. Count it toward the scan ceiling,
 /// discard it immediately, and retain only the strict selector's two fresh tables.
 /// This avoids allocating a history whose sole eventual operation would be drop.
@@ -233,7 +241,7 @@ impl Classifier {
 
     pub fn observe(&mut self, packet: [u8; 188]) -> Result<Option<ClassifiedOpening>, HlsFailure> {
         self.scanned += 188;
-        if self.scanned > process::INPUT_BYTES {
+        if self.scanned > CLASSIFY_SCAN_BYTES {
             return Err(HlsFailure::InputOverflow);
         }
         if !validate_packet(&packet)? {
@@ -310,10 +318,18 @@ pub enum RecoveryReason {
     Transport,
 }
 
+/// A generation that has served this long before its recovery was playing, not
+/// churning: upstream reconnects on a flaky source end such generations every
+/// 15-30 s. Its recovery does not count toward the three-per-minute limit, which
+/// still stops generations that fail again soon after opening.
+const STABLE_GENERATION: Duration = Duration::from_secs(10);
+
 pub struct RecoveryWindow {
     invalidations: VecDeque<Instant>,
     generation: GenerationId,
     paired_marker: bool,
+    opened_at: Option<Instant>,
+    last_counted: bool,
 }
 impl Default for RecoveryWindow {
     fn default() -> Self {
@@ -321,6 +337,8 @@ impl Default for RecoveryWindow {
             invalidations: VecDeque::new(),
             generation: GenerationId(1),
             paired_marker: false,
+            opened_at: None,
+            last_counted: false,
         }
     }
 }
@@ -343,16 +361,32 @@ impl RecoveryWindow {
         {
             self.invalidations.pop_front();
         }
-        if self.invalidations.len() == 3 {
-            return Err(HlsFailure::RecoveryLimit);
+        let stable = self
+            .opened_at
+            .take()
+            .is_some_and(|opened| now.duration_since(opened) >= STABLE_GENERATION);
+        if !stable {
+            if self.invalidations.len() == 3 {
+                return Err(HlsFailure::RecoveryLimit);
+            }
+            self.invalidations.push_back(now);
         }
-        self.invalidations.push_back(now);
+        self.last_counted = !stable;
         self.generation.0 += 1;
         self.paired_marker = reason == RecoveryReason::Source;
         Ok(self.generation)
     }
-    pub fn opening(&mut self) {
+    pub fn opening(&mut self, now: Instant) {
         self.paired_marker = false;
+        self.opened_at = Some(now);
+    }
+    /// Whether the latest admitted recovery counted toward the limit.
+    pub fn last_counted(&self) -> bool {
+        self.last_counted
+    }
+    /// Recoveries currently counted inside the rolling window.
+    pub fn counted(&self) -> usize {
+        self.invalidations.len()
     }
     pub fn marker_is_paired(&self) -> bool {
         self.paired_marker
@@ -385,7 +419,14 @@ pub(crate) fn spawn_worker(
                     budget: InputBudget::new(),
                 };
                 match worker.run(cancel).await {
-                    Err(reason) => media.fail_generation(worker.recovery.generation, reason),
+                    Err(reason) => {
+                        crate::alog!(
+                            "[audio] hls normalization failed: reason={} generation={}",
+                            reason.code(),
+                            worker.recovery.generation.0
+                        );
+                        media.fail_generation(worker.recovery.generation, reason)
+                    }
                     Ok(WorkerEnd::Eof) => media.finish(),
                     Ok(WorkerEnd::Cancelled) => media.stop(),
                 }
@@ -407,9 +448,31 @@ enum PacketReader {
         stats: Arc<std::sync::Mutex<crate::provider::SourceStats>>,
     },
 }
+/// Views up to this size are detached into the input budget, so a small view never
+/// pins a large owner. Larger views are consumed in place: they already cost at
+/// least their own length, and their size is the source's piece length, which can
+/// exceed the whole budget. Half the budget leaves room for replay and stdin queue.
+const DETACH_MAX_BYTES: usize = process::INPUT_BYTES / 2;
+
+enum SourceChunk {
+    Detached(BudgetedInput),
+    InPlace(bytes::Bytes),
+}
+impl SourceChunk {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Detached(chunk) => chunk.as_slice(),
+            Self::InPlace(chunk) => chunk,
+        }
+    }
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
 struct PacketSource {
     rx: PacketReader,
-    chunk: Option<BudgetedInput>,
+    chunk: Option<SourceChunk>,
     offset: usize,
     partial: [u8; 188],
     staged: usize,
@@ -494,13 +557,17 @@ impl PacketSource {
                         StreamEvent::Data(chunk) | StreamEvent::NormalizedData { bytes: chunk, .. },
                     ) => {
                         // Bytes may be a tiny view of an arbitrarily large owner.
-                        // Reserve and detach synchronously, then drop that owner
-                        // before returning a packet or reaching any await.
-                        let detached = budget.try_copy(&chunk);
-                        drop(chunk);
-                        self.chunk = match detached {
-                            Ok(chunk) => Some(chunk),
-                            Err(reason) => return SourceItem::Failed(reason),
+                        // Reserve and detach small views synchronously, then drop
+                        // that owner before returning a packet or reaching any await.
+                        self.chunk = if chunk.len() > DETACH_MAX_BYTES {
+                            Some(SourceChunk::InPlace(chunk))
+                        } else {
+                            let detached = budget.try_copy(&chunk);
+                            drop(chunk);
+                            match detached {
+                                Ok(chunk) => Some(SourceChunk::Detached(chunk)),
+                                Err(reason) => return SourceItem::Failed(reason),
+                            }
                         };
                         self.offset = 0;
                         #[cfg(test)]
@@ -624,6 +691,13 @@ impl<M: WorkerTarget> EnabledWorker<M> {
         if generation == old {
             return Ok(());
         }
+        crate::alog!(
+            "[audio] recovery: reason={:?} generation={} counted={} window={}/3",
+            reason,
+            generation.0,
+            self.recovery.last_counted(),
+            self.recovery.counted()
+        );
         // A recovery while still starting preserves that original absolute clock.
         if self.media.status() == HlsStatus::Ready {
             self.deadline = Instant::now() + Duration::from_millis(self.config.startup_timeout_ms);
@@ -672,7 +746,7 @@ impl<M: WorkerTarget> EnabledWorker<M> {
                     }
                 }
             };
-            self.recovery.opening();
+            self.recovery.opening(Instant::now());
             let transform = opening
                 .layout
                 .audio
@@ -1023,83 +1097,21 @@ mod task4_tests {
         .unwrap_or(false)
     }
 
-    #[tokio::test]
-    async fn hls_audio_packet_source_budget_oversized_logical_chunk_fails_before_retention_escape()
-    {
+    /// A source chunk too large to detach is consumed in place: the transform
+    /// starts, the budget never exceeds its bound, and the owner is released once
+    /// the worker stops holding it.
+    async fn large_chunk_is_consumed_in_place(logical_bytes: usize) {
         let _serial = process::test_support::process_test_lock().await;
         let (tx, rx) = broadcast::channel(1);
-        let mut eviction_observer = tx.subscribe();
         let (mut worker, _session, counters, probe) = worker_for_receiver(rx);
         let budget = worker.budget.clone();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let task = tokio::spawn(async move { worker.run(cancel_rx).await });
 
-        const LOGICAL_BYTES: usize = 9 * 1024 * 1024;
-        let mut large = valid_mpeg_audio_source(LOGICAL_BYTES);
-        assert!(large.len() > 8 * 1024 * 1024);
-        assert_eq!(large.len() % 188, 0);
-        let allocation_bytes = large.capacity();
-        let drops = Arc::new(AtomicUsize::new(0));
-        tx.send(StreamEvent::Data(Bytes::from_owner(TrackedBacking {
-            bytes: std::mem::take(&mut large),
-            drops: drops.clone(),
-        })))
-        .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(4), task)
-            .await
-            .expect("oversized source input terminates worker")
-            .expect("worker task joins");
-        let eviction_packet = fixtures::pcr_packet(256, 216_000);
-        for _ in 0..4 {
-            let _ = tx.send(StreamEvent::Data(Bytes::copy_from_slice(&eviction_packet)));
-        }
-        assert!(matches!(
-            eviction_observer.try_recv(),
-            Err(broadcast::error::TryRecvError::Lagged(n)) if n > 0
-        ));
-        drop(eviction_observer);
-        drop(tx);
-
-        let retained_tail = probe.retained_bytes.load(Ordering::Relaxed);
-        let charged = budget.charged();
-        let owner_drops_before_cancel = drops.load(Ordering::SeqCst);
-        let child_starts = counters.snapshot().children_started;
-        println!(
-            "oversized source rejected: logical={} backing_capacity={} charged={} retained_tail={} owner_drops={} child_starts={}",
-            LOGICAL_BYTES,
-            allocation_bytes,
-            charged,
-            retained_tail,
-            owner_drops_before_cancel,
-            child_starts
-        );
-
-        assert_eq!(result, Err(HlsFailure::InputOverflow));
-        assert_eq!(
-            child_starts, 0,
-            "reject oversized input before child admission"
-        );
-        assert_eq!(owner_drops_before_cancel, 1);
-        assert_eq!(charged, 0);
-        assert_eq!(retained_tail, 0);
-        let cleanup = counters.snapshot();
-        assert_eq!(cleanup.children_started, cleanup.children_reaped);
-        assert_eq!(cleanup.active_tasks, 0);
-    }
-
-    #[tokio::test]
-    async fn hls_audio_packet_source_budget_full_chunk_rejects_without_waiting_for_replay_permit() {
-        let _serial = process::test_support::process_test_lock().await;
-        let (tx, rx) = broadcast::channel(1);
-        let (mut worker, _session, counters, _probe) = worker_for_receiver(rx);
-        let budget = worker.budget.clone();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let task = tokio::spawn(async move { worker.run(cancel_rx).await });
-
-        const LOGICAL_BYTES: usize = process::INPUT_BYTES / 188 * 188;
-        let source = valid_mpeg_audio_source(LOGICAL_BYTES);
-        assert_eq!(source.len(), LOGICAL_BYTES);
-        let allocation_bytes = source.capacity();
+        let source = valid_mpeg_audio_source(logical_bytes);
+        assert!(source.len() > DETACH_MAX_BYTES);
+        assert_eq!(source.len() % 188, 0);
+        let logical_len = source.len();
         let drops = Arc::new(AtomicUsize::new(0));
         tx.send(StreamEvent::Data(Bytes::from_owner(TrackedBacking {
             bytes: source,
@@ -1107,25 +1119,51 @@ mod task4_tests {
         })))
         .unwrap();
 
+        let blocked = wait_for_blocked_transform(&task, &counters, &probe).await;
+        let charged = budget.charged();
+        let retained_tail = probe.retained_bytes.load(Ordering::Relaxed);
+        println!(
+            "large chunk consumed in place: logical={logical_len} charged={charged} retained_tail={retained_tail} blocked={blocked}"
+        );
+        assert!(
+            blocked,
+            "the transform starts on a chunk larger than the detach bound"
+        );
+        assert!(charged <= process::INPUT_BYTES);
+        assert!(
+            retained_tail > 0,
+            "the unconsumed tail is still held in place"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "owner held while in use");
+
+        cancel_tx.send_replace(true);
         let result = tokio::time::timeout(Duration::from_secs(4), task)
             .await
-            .expect("full-budget source must not wait on permits it already owns")
+            .expect("worker cancellation completes child cleanup")
             .expect("worker task joins");
-        let cleanup = counters.snapshot();
-        println!(
-            "full-budget source rejected promptly: logical={} backing_capacity={} owner_drops={} child_starts={} charged_after_join={}",
-            LOGICAL_BYTES,
-            allocation_bytes,
+        drop(tx);
+        assert_eq!(result, Ok(WorkerEnd::Cancelled));
+        assert_eq!(
             drops.load(Ordering::SeqCst),
-            cleanup.children_started,
-            budget.charged()
+            1,
+            "owner released with the worker"
         );
-        assert_eq!(result, Err(HlsFailure::InputOverflow));
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert_eq!(cleanup.children_started, 0);
-        assert_eq!(cleanup.children_reaped, 0);
+        let cleanup = counters.snapshot();
+        assert_eq!(cleanup.children_started, 1);
+        assert_eq!(cleanup.children_reaped, 1);
         assert_eq!(cleanup.active_tasks, 0);
-        assert_eq!(budget.charged(), 0);
+    }
+
+    #[tokio::test]
+    async fn hls_audio_packet_source_budget_chunk_above_budget_is_consumed_in_place() {
+        large_chunk_is_consumed_in_place(9 * 1024 * 1024).await;
+    }
+
+    #[tokio::test]
+    async fn hls_audio_packet_source_budget_chunk_near_budget_leaves_room_for_replay() {
+        // One packet below the budget: detaching it would leave no permits for the
+        // replay, so it is consumed in place as well.
+        large_chunk_is_consumed_in_place(process::INPUT_BYTES / 188 * 188).await;
     }
 
     #[tokio::test]
@@ -1161,10 +1199,10 @@ mod task4_tests {
         .expect("initial MPEG-audio opening either starts transform or fails closed");
 
         const BACKING_BYTES: usize = 16 * 1024 * 1024;
-        const LOGICAL_BYTES: usize = 512 * 1024;
-        let logical = valid_mpeg_audio_source(LOGICAL_BYTES);
+        // The largest view that is still detached: it must release its owner.
+        let logical = valid_mpeg_audio_source(DETACH_MAX_BYTES - 187);
         let logical_len = logical.len();
-        assert!(logical_len <= LOGICAL_BYTES + 187 && logical_len > 400 * 1024);
+        assert!(logical_len <= DETACH_MAX_BYTES && logical_len > 400 * 1024);
         let mut backing = vec![0; BACKING_BYTES];
         backing[..logical_len].copy_from_slice(&logical);
         let allocation_bytes = backing.capacity();
@@ -1245,6 +1283,139 @@ mod task4_tests {
         assert_eq!(opening.layout.program_id, 9);
         assert_eq!(opening.layout.video_pid, 256);
         assert_eq!(opening.layout.audio.unwrap().pid, 257);
+    }
+
+    #[tokio::test]
+    async fn hls_audio_packet_source_consumes_a_chunk_larger_than_the_input_budget() {
+        // Source chunks are whole pieces; piece length is a per-stream property and
+        // can exceed the 1 MiB budget (a live source delivered 1,048,664 bytes).
+        const PACKETS: usize = 2 * process::INPUT_BYTES / 188;
+        let mut chunk = Vec::with_capacity(PACKETS * 188);
+        for i in 0..PACKETS {
+            let mut packet = [0u8; 188];
+            packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10]);
+            packet[4..12].copy_from_slice(&(i as u64).to_be_bytes());
+            chunk.extend_from_slice(&packet);
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Bytes::from_owner(TrackedBacking {
+            bytes: chunk,
+            drops: drops.clone(),
+        });
+        let mut source = PacketSource::from_reader(PacketReader::Direct {
+            source: Some(Box::new(OneChunkSource(Some(owner)))),
+            stats: Arc::new(std::sync::Mutex::new(SourceStats::default())),
+        });
+        let budget = InputBudget::new();
+        for i in 0..PACKETS {
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "owner held before packet {i}"
+            );
+            match source.next(&budget).await {
+                SourceItem::Packet(packet) => {
+                    assert_eq!(packet[4..12], (i as u64).to_be_bytes(), "packet {i}");
+                }
+                SourceItem::Failed(reason) => panic!("packet {i}: failed with {reason:?}"),
+                _ => panic!("packet {i}: unexpected item"),
+            }
+            assert_eq!(budget.charged(), 0, "an in-place chunk is not copied");
+        }
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "owner released once consumed"
+        );
+    }
+
+    /// Bounded synthetic benchmark: packets per second out of `PacketSource` for
+    /// typical small chunks and for piece-sized chunks. Run in release:
+    /// `cargo test --release -p ace-engine --lib packet_source_measurement -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn packet_source_measurement() {
+        struct Chunks(Vec<Bytes>);
+        #[async_trait::async_trait]
+        impl TsSource for Chunks {
+            async fn next(&mut self) -> Option<Bytes> {
+                self.0.pop()
+            }
+            fn stats(&self) -> SourceStats {
+                SourceStats::default()
+            }
+        }
+        const TOTAL: usize = 512 * 1024 * 1024;
+        for chunk_bytes in [32 * 1024 / 188 * 188, 768 * 1024 / 188 * 188] {
+            let mut packet = [0u8; 188];
+            packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10]);
+            let chunk = Bytes::from(packet.repeat(chunk_bytes / 188));
+            let chunks = vec![chunk; TOTAL / chunk_bytes];
+            let packets = chunks.len() * chunk_bytes / 188;
+            let mut source = PacketSource::from_reader(PacketReader::Direct {
+                source: Some(Box::new(Chunks(chunks))),
+                stats: Arc::new(std::sync::Mutex::new(SourceStats::default())),
+            });
+            let budget = InputBudget::new();
+            let started = std::time::Instant::now();
+            let mut seen = 0usize;
+            loop {
+                match source.next(&budget).await {
+                    SourceItem::Packet(p) => seen += std::hint::black_box(p)[0] as usize / 0x47,
+                    SourceItem::Closed => break,
+                    _ => panic!("unexpected item"),
+                }
+            }
+            let elapsed = started.elapsed();
+            assert_eq!(seen, packets);
+            println!(
+                "packet_source chunk={chunk_bytes} packets={packets} elapsed_ms={} mpkt_per_s={:.1} mib_per_s={:.0}",
+                elapsed.as_millis(),
+                packets as f64 / elapsed.as_secs_f64() / 1e6,
+                (packets * 188) as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hls_audio_packet_source_detaches_a_view_at_the_detach_bound() {
+        let chunk = Bytes::from(vec![0x47; DETACH_MAX_BYTES / 188 * 188]);
+        let mut source = PacketSource::from_reader(PacketReader::Direct {
+            source: Some(Box::new(OneChunkSource(Some(chunk.clone())))),
+            stats: Arc::new(std::sync::Mutex::new(SourceStats::default())),
+        });
+        let budget = InputBudget::new();
+        assert!(matches!(source.next(&budget).await, SourceItem::Packet(_)));
+        assert_eq!(
+            budget.charged(),
+            chunk.len(),
+            "views up to the bound are copied"
+        );
+    }
+
+    #[test]
+    fn hls_audio_classification_waits_through_a_long_gop_for_the_next_access_point() {
+        // A 2 s GOP at about 7 Mbit/s puts keyframes 1.6-1.8 MB apart. A generation
+        // that starts just after one must scan past more than 1 MiB of inter frames.
+        let source = fixtures::transport_prefix();
+        let pat: [u8; 188] = source[..188].try_into().unwrap();
+        let pmt: [u8; 188] = source[188..376].try_into().unwrap();
+        let access: [u8; 188] = source[376..564].try_into().unwrap();
+        let mut classifier = Classifier::new();
+        assert!(classifier.observe(pat).unwrap().is_none());
+        assert!(classifier.observe(pmt).unwrap().is_none());
+        const GOP_BYTES: usize = 2 * 1024 * 1024;
+        let mut inter = [0x55; 188];
+        inter[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10]); // PID 256, payload only
+        for i in 0..GOP_BYTES / 188 {
+            inter[3] = 0x10 | (i as u8 & 0x0f);
+            assert!(classifier.observe(inter).unwrap().is_none());
+        }
+        let opening = classifier
+            .observe(access)
+            .expect("a long GOP is not an overflow")
+            .expect("the next access point opens the generation");
+        assert_eq!(opening.tables, vec![pat, pmt]);
     }
 
     #[test]
@@ -1459,6 +1630,33 @@ mod task4_tests {
     }
 
     #[test]
+    fn hls_audio_recovery_of_a_stable_generation_does_not_count_toward_the_limit() {
+        // Upstream reconnects every 15 s each end a generation that was serving.
+        // That is a flaky source, not churn, and must not end playback.
+        let start = tokio::time::Instant::now();
+        let mut recovery = RecoveryWindow::new();
+        recovery.opening(start);
+        for i in 1..=4u64 {
+            let now = start + Duration::from_secs(15 * i);
+            assert!(
+                recovery.invalidate(now, RecoveryReason::Source).is_ok(),
+                "recovery {i} after a stable generation"
+            );
+            recovery.opening(now + Duration::from_millis(500));
+        }
+        // Generations that fail again right after opening still exhaust the window.
+        let later = start + Duration::from_secs(70);
+        for _ in 0..3 {
+            assert!(recovery.invalidate(later, RecoveryReason::Layout).is_ok());
+            recovery.opening(later);
+        }
+        assert_eq!(
+            recovery.invalidate(later, RecoveryReason::Layout),
+            Err(crate::hls::HlsFailure::RecoveryLimit)
+        );
+    }
+
+    #[test]
     fn hls_audio_recovery_window_allows_three_then_fails_fourth() {
         let now = tokio::time::Instant::now();
         let mut recovery = RecoveryWindow::new();
@@ -1492,8 +1690,8 @@ mod task4_tests {
         let mut payload = [0xff; 188];
         payload[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10]);
         // A sync-looking non-PSI packet is scanned and discarded. The next whole
-        // packet would cross the 1 MiB cap, so no later opening can be accepted.
-        for _ in 0..(process::INPUT_BYTES / 188) {
+        // packet would cross the scan cap, so no later opening can be accepted.
+        for _ in 0..(CLASSIFY_SCAN_BYTES / 188) {
             assert!(classifier.observe(payload).unwrap().is_none());
         }
         assert!(matches!(
@@ -1513,7 +1711,7 @@ mod task4_tests {
             GenerationId(2),
             "the paired transport marker must not create another generation"
         );
-        recovery.opening();
+        recovery.opening(tokio::time::Instant::now());
         assert!(!recovery.marker_is_paired());
         assert_eq!(
             recovery.invalidate(now, RecoveryReason::Transport).unwrap(),

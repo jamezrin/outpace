@@ -141,6 +141,12 @@ with it off.
 | `502` | The conversion failed. |
 | Body ends with an error | A failure after playback started (direct TS). |
 
+Short source interruptions (upstream reconnects, lag, layout or transport changes) do not end
+playback: the conversion restarts at the next keyframe and the player sees one discontinuity.
+A restart counts toward a limit unless the output before it had been playing for at least
+10 seconds. A fourth counted restart within 60 seconds stops the session with `recovery_limit`.
+The daemon log records each restart and failure under `[audio]`.
+
 A conversion failure is final for that session. HLS keeps answering `503` and nothing retries
 on its own. Stop the stream (`DELETE /streams/ace/<id>`) or let it go idle, and the next request
 starts fresh. The stream's `/status` shows the state under `normalization`, for example

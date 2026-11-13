@@ -45,10 +45,18 @@ session are required. Authorization and expiry still take precedence.
 
 Shared TS startup and recovery use `OUTPACE_HLS_STARTUP_TIMEOUT_MS` (default
 45,000 ms). A recovery during startup keeps the original deadline; a ready source
-gets a new recovery deadline. Three invalidations per minute are allowed. Old
+gets a new recovery deadline. Three invalidations per minute are allowed; a
+recovery that ends a generation which served for at least 10 s does not count,
+so a flaky upstream that reconnects every 15-30 s keeps playing. Each new
+generation scans at most 16 MiB for fresh tables and the next video access point
+(a whole GOP can pass first); scanned bytes are discarded, not retained. Old
 queued output is fenced before replacement. Input/replay/writer storage shares
-one 1 MiB budget; output has four slots with chunks below 32 KiB, plus fixed
-stdout/framing and existing provider, fanout and client buffers. Full output
+one 1 MiB budget. Source views up to 512 KiB are copied into it so they never pin
+a larger owner; larger views (whole pieces, which can exceed the budget) are read
+in place, so the worker can hold one source chunk outside the budget. Output has
+four slots with chunks below 32 KiB, plus fixed stdout/framing and existing
+provider, fanout and client buffers. Failures and recoveries are logged under
+`[audio]` with their reason code. Full output
 backpressures the worker; cancellation still collects owned work. Native status
 counters describe the upstream source, not transformed byte counts.
 
