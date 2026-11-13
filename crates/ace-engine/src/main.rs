@@ -6,16 +6,26 @@
 // that is really allocator retention. jemalloc with a background purge thread and short decay hands
 // freed pages back, so idle RSS falls after teardown. 32-bit targets (e.g. armv7) keep the system
 // allocator: jemalloc's 64-bit `ffs` helper pulls in a `__ffsdi2` builtin that fails to link
-// against static 32-bit musl. Windows/MSVC also keeps the system allocator. `/debug/memstats` reads
-// jemalloc's live-heap vs resident counters on the jemalloc path.
-#[cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))]
+// against static 32-bit musl. Windows/MSVC also keeps the system allocator, and so does Android:
+// Bionic's allocator already returns freed pages, and tikv-jemalloc-sys links libgcc, which
+// current NDKs no longer ship. `/debug/memstats` reads jemalloc's live-heap vs resident counters
+// on the jemalloc path.
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_os = "android"),
+    target_pointer_width = "64"
+))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // Purge dirty pages ~1s after they go idle and return muzzy pages immediately. On Linux a
 // background thread does it even while the process is otherwise idle, which is what makes RSS drop
 // back toward the live set after a stream tears down.
-#[cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))]
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_os = "android"),
+    target_pointer_width = "64"
+))]
 mod allocator_config {
     // jemalloc excludes Mach-O from its background-thread implementation, so asking for one on
     // Apple only prints `option background_thread currently supports pthread only` at startup.

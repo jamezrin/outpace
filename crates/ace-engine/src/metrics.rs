@@ -122,7 +122,11 @@ async fn metrics(State(state): State<MetricsState>) -> Response {
     ([(header::CONTENT_TYPE, CONTENT_TYPE)], render(&snapshot)).into_response()
 }
 
-#[cfg(all(not(target_env = "msvc"), target_pointer_width = "64"))]
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_os = "android"),
+    target_pointer_width = "64"
+))]
 fn allocator_stats() -> Vec<(&'static str, u64)> {
     use tikv_jemalloc_ctl::{epoch, stats};
     if epoch::advance().is_err() {
@@ -141,7 +145,11 @@ fn allocator_stats() -> Vec<(&'static str, u64)> {
     .collect()
 }
 
-#[cfg(not(all(not(target_env = "msvc"), target_pointer_width = "64")))]
+#[cfg(not(all(
+    not(target_env = "msvc"),
+    not(target_os = "android"),
+    target_pointer_width = "64"
+)))]
 fn allocator_stats() -> Vec<(&'static str, u64)> {
     Vec::new()
 }
