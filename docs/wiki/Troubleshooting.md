@@ -211,7 +211,10 @@ debugging inbound peers.
 
 ## Reporting a bug
 
-Open an issue at <https://github.com/jamezrin/outpace-stream/issues> with:
+Open a [bug report](https://github.com/jamezrin/outpace-stream/issues/new?template=bug_report.yml).
+The form asks for everything below. For slow startup, stutter, CPU or memory problems, use the
+[performance form](https://github.com/jamezrin/outpace-stream/issues/new?template=performance.yml)
+instead. A report should include:
 
 - `outpace --version`, and whether you use a release, `edge` (with its `sha-` tag) or your own
   build;
@@ -219,24 +222,36 @@ Open an issue at <https://github.com/jamezrin/outpace-stream/issues> with:
 - the non-default `OUTPACE_*` settings you use;
 - what you did, what you expected and what happened: the HTTP status, the player's error, and
   a `/status` snapshot;
-- whether the same stream plays in another engine at the same time, if you can check;
+- whether it happens with other live streams, and whether the same stream plays in another
+  engine at the same time, if you can check;
+- the stream's characteristics instead of its identity: live or VOD, bitrate, codecs if known,
+  and the peer count;
 - a log excerpt around the problem.
 
 **Don't include stream identifiers.** Before you paste anything:
 
 - Replace content ids and infohashes (40-character hex strings) with a placeholder such as
   `0123456789abcdef0123456789abcdef01234567`. They appear in URLs, `/streams` output, `/status`
-  and some `[ace]` log lines.
+  and some `[ace]` log lines. Magnet links carry the infohash too, sometimes as a 32-character
+  base32 value.
 - Remove stream and channel names (the `title` and `Icy-Name` values).
 - Remove broadcast source URLs and any tokens, SRT passphrases, your public IP and peer IP
-  addresses.
+  addresses (IPv4 and IPv6).
 - Don't attach captures or recordings of the media.
 
-For example, to mask hex ids in a log before sharing it:
+If the specific stream turns out to matter, the maintainer will arrange a private channel. Don't
+post it in the issue.
+
+To mask hex ids and IPv4 addresses in a log, and the id and title in a `/status` snapshot:
 
 ```bash
-sed -E 's/[0-9a-fA-F]{40}/<id>/g' outpace.log > outpace-redacted.log
+sed -E 's/[0-9a-fA-F]{40}/<id>/g; s/([0-9]{1,3}\.){3}[0-9]{1,3}/<ip>/g' outpace.log > outpace-redacted.log
+curl -s "http://127.0.0.1:6878/streams/ace/${CONTENT_ID:?set a content id}/status" \
+  | jq '.id = "<id>" | .metadata.title = "<title>"'
 ```
+
+Check the result by eye before you paste it: these commands don't catch stream names in log
+lines, IPv6 addresses or base32 magnet links.
 
 ## More questions
 

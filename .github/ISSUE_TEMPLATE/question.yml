@@ -1,0 +1,24 @@
+name: Question
+description: Ask how to do something, or whether a setup is supported.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The [wiki](https://github.com/jamezrin/outpace-stream/wiki), and its [FAQ](https://github.com/jamezrin/outpace-stream/wiki/FAQ) in particular, answer many questions. If something is broken, use the bug report form instead.
+
+        Don't include content ids, infohashes, stream names, source URLs, tokens or IP addresses. Use `0123456789abcdef0123456789abcdef01234567` wherever an id is needed.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What you want to do, what you've tried, and what you're unsure about.
+    validations:
+      required: true
+
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup
+      description: Optional. Outpace version, how you run it (Docker, binary, router), and the player or app you use with it.
