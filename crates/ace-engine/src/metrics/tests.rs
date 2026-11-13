@@ -257,3 +257,48 @@ async fn extension_methods_collapse_into_one_series() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn collection_is_rejected_without_a_free_scrape_permit() {
+    let scrapes = Semaphore::new(SCRAPE_CONCURRENCY);
+    let _held = scrapes
+        .acquire_many(SCRAPE_CONCURRENCY as u32)
+        .await
+        .unwrap();
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let result = bounded_collect(&scrapes, SNAPSHOT_DEADLINE, async {
+        ran.store(true, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
+    assert!(result.is_none(), "a saturated scrape must be refused");
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "a refused scrape must not walk sessions"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_collection_times_out_and_releases_its_permit() {
+    let scrapes = Semaphore::new(SCRAPE_CONCURRENCY);
+    let result = bounded_collect(&scrapes, SNAPSHOT_DEADLINE, std::future::pending::<()>()).await;
+    assert!(result.is_none(), "a stalled snapshot must hit the deadline");
+    assert_eq!(scrapes.available_permits(), SCRAPE_CONCURRENCY);
+    assert_eq!(
+        bounded_collect(&scrapes, SNAPSHOT_DEADLINE, async { 7 }).await,
+        Some(7)
+    );
+}
+
+#[tokio::test]
+async fn unavailable_scrape_is_a_bodyless_503_with_retry_after() {
+    let response = scrape_unavailable();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers().get(header::RETRY_AFTER).unwrap(),
+        RETRY_AFTER_SECS
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty(), "no partial exposition on refusal");
+}
