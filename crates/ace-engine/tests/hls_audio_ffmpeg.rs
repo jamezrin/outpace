@@ -351,6 +351,36 @@ fn pat_identity(data: &[u8]) -> (u16, u16) {
     )
 }
 
+/// Elementary stream types declared by the first PMT, in PMT order.
+fn pmt_stream_types(data: &[u8]) -> Vec<u8> {
+    let section_of = |pid: u16| {
+        let packet = data
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .find(|p| p[0] == 0x47 && p[1] & 0x40 != 0 && ace_media::mpegts::ts_pid(&p[..]) == pid)
+            .expect("PSI packet");
+        let payload = if packet[3] & 0x20 != 0 {
+            5 + usize::from(packet[4])
+        } else {
+            4
+        };
+        let start = payload + 1 + usize::from(packet[payload]);
+        let len = (usize::from(packet[start + 1] & 0x0f) << 8) | usize::from(packet[start + 2]);
+        packet[start..start + 3 + len].to_vec()
+    };
+    let pat = section_of(0);
+    let pmt = section_of(u16::from_be_bytes([pat[10] & 0x1f, pat[11]]));
+    let end = pmt.len() - 4;
+    let mut pos = 12 + ((usize::from(pmt[10] & 0x0f) << 8) | usize::from(pmt[11]));
+    let mut types = Vec::new();
+    while pos + 5 <= end {
+        types.push(pmt[pos]);
+        pos += 5 + ((usize::from(pmt[pos + 3] & 0x0f) << 8) | usize::from(pmt[pos + 4]));
+    }
+    types
+}
+
 fn sdt_service_count(packet: &[u8]) -> usize {
     assert_eq!(ace_media::mpegts::ts_pid(packet), 17);
     let payload = if packet[3] & 0x20 != 0 {
@@ -803,11 +833,22 @@ async fn generated_ac3_and_mpeg_audio_are_normalized_with_copy_video_and_correct
     let mut acceptance_failures = Vec::new();
     for (name, codec) in [
         ("ac3", AudioCase::Ac3),
+        ("ac3-default-mux", AudioCase::Ac3DefaultMux),
         ("mp2", AudioCase::MpegLayer2),
         ("mp3", AudioCase::MpegLayer3),
     ] {
         let case = support::generate_case(&tools, codec)
             .unwrap_or_else(|e| panic!("generate {name} case: {e}"));
+        let audio_type = match codec {
+            AudioCase::Ac3DefaultMux => 0x81,
+            AudioCase::Ac3 => 0x06,
+            _ => 0x03,
+        };
+        assert_eq!(
+            pmt_stream_types(&case.transport),
+            [0x02, audio_type],
+            "{name}: source PMT signals the intended stream types"
+        );
         // Exercise the exact production command with the complete ten-second input and capture
         // stdout through EOF. The manager/HTTP checks below intentionally measure retained output.
         let complete = run_production_transform(&tools, &case.transport).await;
@@ -1487,7 +1528,11 @@ async fn shared_live_ts_normalizes_ac3_and_mp2_for_two_viewers_and_native_hls() 
             }
         }
     }
-    for codec in [AudioCase::Ac3, AudioCase::MpegLayer2] {
+    for codec in [
+        AudioCase::Ac3,
+        AudioCase::Ac3DefaultMux,
+        AudioCase::MpegLayer2,
+    ] {
         let mut case = support::generate_case(&tools, codec).expect("generate source");
         // Exercise a nondefault transport identity; elementary payload stays identical.
         for packet in case.transport.as_chunks_mut::<188>().0 {

@@ -90,6 +90,16 @@ fn descriptors(mut bytes: &[u8]) -> Option<DescriptorCodecs> {
     })
 }
 
+/// ATSC A/53 stream types that name their codec directly. FFmpeg's default
+/// MPEG-TS mux writes AC3 as 0x81 (the DVB 0x06 route needs `system_b`).
+fn atsc_audio(ty: u8) -> Option<AudioCodec> {
+    match ty {
+        0x81 => Some(AudioCodec::Ac3),
+        0x87 => Some(AudioCodec::Eac3),
+        _ => None,
+    }
+}
+
 fn audio_codec(ty: u8, desc: &[u8]) -> Option<DescriptorCodecs> {
     let mut private = descriptors(desc)?;
     private.first = match ty {
@@ -97,7 +107,14 @@ fn audio_codec(ty: u8, desc: &[u8]) -> Option<DescriptorCodecs> {
         0x11 => Some(AudioCodec::LatmAac),
         0x03 | 0x04 => Some(AudioCodec::MpegAudio),
         0x06 => private.first,
-        _ => None,
+        _ => match atsc_audio(ty) {
+            Some(codec) => {
+                // A codec descriptor contradicting the stream type makes the entry ambiguous.
+                private.conflicting |= private.first.is_some_and(|signal| signal != codec);
+                Some(codec)
+            }
+            None => None,
+        },
     };
     Some(private)
 }
@@ -447,7 +464,7 @@ impl LiveAudioSelection {
                 if video.replace((es_pid, ty)).is_some() {
                     return Unsupported;
                 }
-            } else if !matches!(ty, 0x03 | 0x04 | 0x06 | 0x0f | 0x11
+            } else if !matches!(ty, 0x03 | 0x04 | 0x06 | 0x0f | 0x11 | 0x81 | 0x87
                 | 0x05 | 0x0a..=0x0e | 0x15..=0x19)
             {
                 // Only known audio or data (private sections, DSM-CC, auxiliary,
@@ -697,6 +714,9 @@ mod tests {
             (6, &[5, 4, b'D', b'T', b'S', b'1'], false),
             (6, &[5, 4, b'N', b'O', b'N', b'E'], true),
             (0x11, &[], false),
+            (0x81, &[], false),
+            (0x81, &[0x0a, 4, b'e', b'n', b'g', 0], false),
+            (0x87, &[], false),
         ];
         for (ty, desc, retained) in cases {
             let mut st = LiveAudioSelection::default();
@@ -1119,6 +1139,130 @@ mod tests {
                 codec: AudioCodec::Ac3,
             })
         );
+    }
+
+    #[test]
+    fn atsc_ac3_stream_type_is_selected_without_descriptors() {
+        // FFmpeg's default MPEG-TS mux and ATSC A/53 signal AC3 as 0x81, often with
+        // only an ISO 639 language descriptor and no AC-3 descriptor or registration.
+        let language = [0x0a, 4, b'e', b'n', b'g', 0];
+        let ac3 = [0x6a, 1, 0];
+        let ac3_registration = [0x05, 4, b'A', b'C', b'-', b'3'];
+        let cases: &[AudioSelectionCase<'_>] = &[
+            (&[(0x1b, 257, &[]), (0x81, 258, &[])], 258, AudioCodec::Ac3),
+            (
+                &[(0x1b, 257, &[]), (0x81, 258, &language)],
+                258,
+                AudioCodec::Ac3,
+            ),
+            (&[(0x1b, 257, &[]), (0x81, 258, &ac3)], 258, AudioCodec::Ac3),
+            (
+                &[(0x1b, 257, &[]), (0x81, 258, &ac3_registration)],
+                258,
+                AudioCodec::Ac3,
+            ),
+            // AAC is still preferred over ATSC AC3.
+            (
+                &[(0x1b, 257, &[]), (0x81, 258, &[]), (15, 259, &[])],
+                259,
+                AudioCodec::AdtsAac,
+            ),
+            // ATSC E-AC3 is recognized and skipped in favour of convertible audio.
+            (
+                &[(0x1b, 257, &[]), (0x87, 259, &[]), (0x81, 258, &[])],
+                258,
+                AudioCodec::Ac3,
+            ),
+        ];
+        for (entries, selected_pid, codec) in cases {
+            let LayoutDecision::Supported(layout) = normalization_policy_layout(entries) else {
+                panic!("expected supported layout for {entries:?}");
+            };
+            assert_eq!(
+                layout.audio,
+                Some(SelectedAudio {
+                    pid: *selected_pid,
+                    codec: *codec
+                }),
+                "{entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn atsc_ac3_vector_with_language_descriptor_only_is_supported() {
+        // Synthetic PAT+PMT shaped like FFmpeg's default mux: PMT 4096, PCR/video 256 (H.264),
+        // AC3 on 257 as stream type 0x81 with only an ISO 639 descriptor.
+        let vector = include_bytes!("../../../tests/vectors/media/pmt-ac3-atsc.ts");
+        let mut st = LiveAudioSelection::default();
+        for packet in vector.as_chunks::<N>().0 {
+            st.observe(*packet);
+        }
+        let LayoutDecision::Supported(layout) = st.layout() else {
+            panic!("ATSC AC3 vector should be supported, got {:?}", st.layout());
+        };
+        assert_eq!(
+            (
+                layout.pmt_pid,
+                layout.pcr_pid,
+                layout.video_pid,
+                layout.video_type
+            ),
+            (4096, 256, 256, 0x1b)
+        );
+        assert_eq!(
+            layout.audio,
+            Some(SelectedAudio {
+                pid: 257,
+                codec: AudioCodec::Ac3
+            })
+        );
+    }
+
+    #[test]
+    fn atsc_audio_stream_types_reject_contradicting_descriptors_and_lone_eac3() {
+        let ac3 = [0x6a, 1, 0];
+        let eac3 = [0x7a, 1, 0];
+        let dts = [0x7b, 5, 0, 0, 0, 0, 0];
+        let eac3_registration = [0x05, 4, b'E', b'A', b'C', b'3'];
+        let cases: &[RejectionCase<'_>] = &[
+            (
+                "AC3 type, E-AC3 descriptor",
+                &[(0x1b, 257, &[]), (0x81, 258, &eac3)],
+            ),
+            (
+                "AC3 type, DTS descriptor",
+                &[(0x1b, 257, &[]), (0x81, 258, &dts)],
+            ),
+            (
+                "AC3 type, E-AC3 registration",
+                &[(0x1b, 257, &[]), (0x81, 258, &eac3_registration)],
+            ),
+            (
+                "AC3 type, E-AC3 descriptor, beside AAC",
+                &[(0x1b, 257, &[]), (15, 259, &[]), (0x81, 258, &eac3)],
+            ),
+            (
+                "E-AC3 type, AC3 descriptor",
+                &[(0x1b, 257, &[]), (0x87, 258, &ac3)],
+            ),
+            ("E-AC3 only", &[(0x1b, 257, &[]), (0x87, 258, &[])]),
+        ];
+        for (label, entries) in cases {
+            assert_eq!(
+                normalization_policy_layout(entries),
+                LayoutDecision::Unsupported,
+                "{label}"
+            );
+        }
+        // An E-AC3 descriptor agreeing with the E-AC3 stream type is not a conflict:
+        // AAC beside it is still selected.
+        let LayoutDecision::Supported(layout) =
+            normalization_policy_layout(&[(0x1b, 257, &[]), (0x87, 258, &eac3), (15, 259, &[])])
+        else {
+            panic!("agreeing E-AC3 signal beside AAC should be supported");
+        };
+        assert_eq!(layout.audio.map(|a| a.pid), Some(259));
     }
 
     #[test]

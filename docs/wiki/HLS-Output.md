@@ -110,6 +110,9 @@ With both on, only the shared conversion runs. VOD is never converted, whichever
 ### What conversion does
 
 - Selected AC3, MP2 or MP3 audio becomes **AAC-LC stereo, 48 kHz, 128 kbit/s**.
+- AC3 is recognised both as DVB signals it (stream type `0x06` with an AC-3 descriptor or
+  `AC-3` registration) and as ATSC stream type `0x81`, which FFmpeg's MPEG-TS muxer writes by
+  default.
 - Video is copied, never re-encoded.
 - AAC audio passes through without conversion, and video-only streams start no converter.
 - Everyone watching a source gets the same converted audio. There is no per-viewer track or
@@ -127,9 +130,10 @@ With both on, only the shared conversion runs. VOD is never converted, whichever
   - valid PCR timing;
   - simple (single-packet) PAT/PMT tables.
 
-Audio-only streams, multiple programs or video streams, fragmented tables, MPEG Layer I, LATM,
-E-AC3 and DTS are rejected. Turning normalisation on can therefore refuse streams that play fine
-with it off.
+Audio-only streams, multiple programs or video streams, fragmented tables, MPEG Layer I and
+audio tracks whose codec signals contradict each other are rejected. LATM, E-AC3 (DVB or ATSC
+`0x87`) and DTS tracks are skipped when the stream also has an AAC, AC3 or MPEG audio track, and
+rejected when it doesn't. Turning normalisation on can therefore refuse streams that play fine with it off.
 
 ### Errors with normalisation on
 
