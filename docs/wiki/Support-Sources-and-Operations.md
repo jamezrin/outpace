@@ -93,6 +93,11 @@ Set `OUTPACE_METRICS=1` to serve `GET /metrics` in the Prometheus text format on
 bind. It is off by default. The endpoint has no authentication, so keep `OUTPACE_BIND` on a
 trusted network or put it behind your reverse proxy.
 
+At most two scrapes collect metrics at the same time, and each has two seconds to finish. A scrape
+over either limit gets `503 Service Unavailable` with `Retry-After: 1` and an empty body, which
+Prometheus records as a failed scrape (`up` is `0`) rather than partial values. A normal
+`scrape_interval` from one or two Prometheus servers never hits these limits.
+
 ```yaml
 scrape_configs:
   - job_name: outpace

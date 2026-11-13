@@ -8,18 +8,27 @@
 use crate::manager::StreamManager;
 use crate::provider::SourceStats;
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::{header, Method};
+use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 /// Prometheus text format content type (exposition format 0.0.4).
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Scrapes that may collect a snapshot at once. Further scrapes are refused, never queued,
+/// so a misbehaving scraper cannot stack up session walks on the engine it observes.
+const SCRAPE_CONCURRENCY: usize = 2;
+/// Upper bound on collecting one snapshot. Prometheus records a refusal as a failed scrape.
+const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
+const RETRY_AFTER_SECS: &str = "1";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct RequestTotals {
@@ -73,6 +82,7 @@ struct MetricsState {
     networks: Arc<[String]>,
     http: Arc<HttpMetrics>,
     started: Instant,
+    scrapes: Arc<Semaphore>,
 }
 
 /// Add `GET /metrics` and per-route request accounting to a fully assembled router.
@@ -82,6 +92,7 @@ pub fn instrument(app: Router, manager: Arc<StreamManager>, networks: &[String])
         networks: networks.into(),
         http: Arc::default(),
         started: Instant::now(),
+        scrapes: Arc::new(Semaphore::new(SCRAPE_CONCURRENCY)),
     };
     app.route("/metrics", get(metrics).with_state(state.clone()))
         .route_layer(axum::middleware::from_fn_with_state(state, track))
@@ -109,17 +120,43 @@ async fn track(State(state): State<MetricsState>, request: Request, next: Next) 
     response
 }
 
+/// Run `collect` only with a free scrape permit and within `deadline`. `None` means the scrape
+/// was refused or timed out; dropping `collect` cancels it, which is safe for read-only stats.
+async fn bounded_collect<T>(
+    scrapes: &Semaphore,
+    deadline: Duration,
+    collect: impl Future<Output = T>,
+) -> Option<T> {
+    let _permit = scrapes.try_acquire().ok()?;
+    tokio::time::timeout(deadline, collect).await.ok()
+}
+
+fn scrape_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, RETRY_AFTER_SECS)],
+    )
+        .into_response()
+}
+
 async fn metrics(State(state): State<MetricsState>) -> Response {
-    let snapshot = Snapshot {
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_seconds: state.started.elapsed().as_secs_f64(),
-        memory: allocator_stats(),
-        networks: state.networks.to_vec(),
-        sessions: state.manager.session_stats().await,
-        admission: state.manager.admission_status(),
-        http: state.http.snapshot(),
+    let collect = async {
+        Snapshot {
+            version: env!("CARGO_PKG_VERSION"),
+            uptime_seconds: state.started.elapsed().as_secs_f64(),
+            memory: allocator_stats(),
+            networks: state.networks.to_vec(),
+            sessions: state.manager.session_stats().await,
+            admission: state.manager.admission_status(),
+            http: state.http.snapshot(),
+        }
     };
-    ([(header::CONTENT_TYPE, CONTENT_TYPE)], render(&snapshot)).into_response()
+    match bounded_collect(&state.scrapes, SNAPSHOT_DEADLINE, collect).await {
+        Some(snapshot) => {
+            ([(header::CONTENT_TYPE, CONTENT_TYPE)], render(&snapshot)).into_response()
+        }
+        None => scrape_unavailable(),
+    }
 }
 
 #[cfg(all(
