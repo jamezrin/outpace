@@ -1,8 +1,5 @@
 # Command Line
 
-> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
-> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
-
 Outpace is one executable with three commands. Daemon behaviour is configured with `OUTPACE_*`
 environment variables, not flags; see [Configuration](Configuration) and the
 [A–Z list](Environment-Variables).

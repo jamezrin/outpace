@@ -1,8 +1,5 @@
 # Getting Started
 
-> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
-> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
-
 This page gets you from nothing to a playing stream as quickly as possible. For other platforms
 and options, see [Installation](Installation).
 

@@ -1,7 +1,6 @@
 # Migrating an engine installation to Outpace
 
-This operator guide targets the documented 1.0.0 subset. The release is being prepared;
-v0.9.0 remains the latest published release until publication. See the
+This operator guide targets the documented 1.0.0 subset. Version 1.0.0 is published; see the
 [release notes](releases/1.0.0.md) for supported behavior and validation limits.
 [#195](https://github.com/jamezrin/outpace-stream/issues/195) records the sustained comparison,
 and [#210](https://github.com/jamezrin/outpace-stream/issues/210#issuecomment-6827431678)

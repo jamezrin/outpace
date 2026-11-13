@@ -4,8 +4,8 @@ Outpace can replace the AceStream engine for most setups that play public, unenc
 media servers, IPTV playlists, proxies such as acexy, and apps that use `/ace/getstream`. It is
 not a full clone, so check the differences below before you switch.
 
-1.0.0 is being prepared; see [Releases and Versions](Releases-and-Versions) for publication
-status and the recorded maintainer acceptance. Test the exact build with your own clients
+1.0.0 is published; see [Releases and Versions](Releases-and-Versions) for release contents
+and the recorded maintainer acceptance. Test the exact build with your own clients
 before retiring the old engine; acceptance does not qualify every deployment.
 
 ## What carries over

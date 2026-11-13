@@ -1,8 +1,5 @@
 # Routers and Small Devices
 
-> **Release preparation:** examples targeting 1.0.0 require its publication first. Until
-> then, substitute 0.9.0 for release downloads/images; new features require `main`/`edge`.
-
 Outpace runs on routers, NAS boxes and single-board computers, but they have far less RAM
 and flash than a server. This page collects what changes on them.
 
@@ -77,7 +74,7 @@ Running the installer again upgrades the binary and keeps your configuration.
 | `riscv64_*` | `riscv64gc-unknown-linux-musl` |
 
 Only releases that ship an architecture's build can be installed on it. ARMv6 and RISC-V 64
-builds are available from v1.0.0, so on those routers install 1.0.0 or later once published.
+builds are available from v1.0.0, so on those routers install 1.0.0 or later.
 
 MIPS routers (for example MT7621 or ath79 boards) are not supported. Most have too little
 flash and RAM for Outpace, and Rust supports MIPS only as a tier 3 target.
