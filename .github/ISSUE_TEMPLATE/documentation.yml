@@ -7,7 +7,7 @@ body:
     attributes:
       label: Page
       description: Link to the wiki page or file, with the section if possible.
-      placeholder: https://github.com/jamezrin/outpace-stream/wiki/Configuration#live-recovery-advanced
+      placeholder: https://github.com/outpace-stream/outpace-engine/wiki/Configuration#live-recovery-advanced
     validations:
       required: true
 

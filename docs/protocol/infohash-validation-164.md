@@ -4,7 +4,7 @@ This audit follows PR #179's safety scope: a bare infohash can open only from a
 catalog-provenanced descriptor remembered in the same process, or a descriptor
 minted by that daemon's own broadcast. Geometry and source key come from that
 descriptor. Cold infohash network lookup remains tracked in
-[#176](https://github.com/jamezrin/outpace-stream/issues/176).
+[#176](https://github.com/outpace-stream/outpace-engine/issues/176).
 
 ## Original acceptance and deviations
 
@@ -32,8 +32,8 @@ then checks that the daemon's minted trackers win over the conflicting index.
 The transport-URL resolver returns directly without indexing its caller-supplied
 descriptor. These restrictions preserve descriptor provenance; they do not
 authenticate catalog responses. Catalog authentication and BEP-9 binding remain
-[#178](https://github.com/jamezrin/outpace-stream/issues/178) and
-[#177](https://github.com/jamezrin/outpace-stream/issues/177), respectively.
+[#178](https://github.com/outpace-stream/outpace-engine/issues/178) and
+[#177](https://github.com/outpace-stream/outpace-engine/issues/177), respectively.
 
 The original runtime geometry-mismatch detection proposal was deferred in
 PR #179 when the guessed-geometry path was removed. This audit adds no guessed
@@ -125,7 +125,7 @@ Measured candidate media duplication, sync losses, malformed/transport-error
 packets and PCR jumps were zero. SDT PID 17 still had 79 continuity errors and
 240 exact repeated PSI packets (80 each PAT/PMT/SDT), so the literal requirement
 for zero continuity errors across all PIDs remains covered by
-[#172](https://github.com/jamezrin/outpace-stream/issues/172). The media-integrity result
+[#172](https://github.com/outpace-stream/outpace-engine/issues/172). The media-integrity result
 does not claim that every transport counter is zero.
 
 Both staged transitions returned DELETE 204 and reached stable status 404,

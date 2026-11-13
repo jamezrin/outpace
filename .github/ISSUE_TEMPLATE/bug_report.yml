@@ -16,7 +16,7 @@ body:
 
         If the specific stream turns out to matter, the maintainer will arrange a private channel. Don't post it here.
 
-        To redact a log and a `/status` snapshot before pasting (see also [Reporting a bug](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting#reporting-a-bug)):
+        To redact a log and a `/status` snapshot before pasting (see also [Reporting a bug](https://github.com/outpace-stream/outpace-engine/wiki/Troubleshooting#reporting-a-bug)):
 
         ```bash
         sed -E 's/[0-9a-fA-F]{40}/<id>/g; s/([0-9]{1,3}\.){3}[0-9]{1,3}/<ip>/g' outpace.log > outpace-redacted.log
@@ -33,7 +33,7 @@ body:
       options:
         - label: I removed content ids, infohashes, stream names, source URLs, tokens and IP addresses from everything in this report.
           required: true
-        - label: I searched the existing issues and the [Troubleshooting](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting) page.
+        - label: I searched the existing issues and the [Troubleshooting](https://github.com/outpace-stream/outpace-engine/wiki/Troubleshooting) page.
           required: true
         - label: If the problem involves a stream, it is public and unencrypted (premium and encrypted content are out of scope).
           required: true

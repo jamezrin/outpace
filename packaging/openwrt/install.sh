@@ -8,7 +8,7 @@
 # Re-running upgrades the binary and keeps /etc/config/outpace and /etc/outpace.
 set -eu
 
-repo=https://github.com/jamezrin/outpace-stream
+repo=https://github.com/outpace-stream/outpace-engine
 here=$(cd "$(dirname "$0")" && pwd)
 version=""
 binary=""

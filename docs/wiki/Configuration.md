@@ -255,7 +255,7 @@ The repository's `compose.yml` also reads these. They configure Compose, not the
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OUTPACE_IMAGE` | `ghcr.io/jamezrin/outpace:latest` | Image to run. Pin a release tag. |
+| `OUTPACE_IMAGE` | `ghcr.io/outpace-stream/outpace-engine:latest` | Image to run. Pin a release tag. |
 | `OUTPACE_HTTP_HOST` | `127.0.0.1` | Host address the HTTP port is published on. |
 | `OUTPACE_HTTP_PORT` | `6878` | Host port for HTTP. |
 | `OUTPACE_RTMP_HOST` | `127.0.0.1` | Host address the RTMP port is published on. |

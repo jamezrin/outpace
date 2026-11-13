@@ -157,11 +157,11 @@ The image's entry point is `outpace` and its default command is `serve`, so argu
 the image name:
 
 ```bash
-docker run --rm ghcr.io/jamezrin/outpace:1.0.0 --version
-docker run --rm -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0 \
+docker run --rm ghcr.io/outpace-stream/outpace-engine:1.0.1 --version
+docker run --rm -v outpace-data:/var/lib/outpace ghcr.io/outpace-stream/outpace-engine:1.0.1 \
   play acestream://0123456789abcdef0123456789abcdef01234567 > live.ts
 docker run -d -p 127.0.0.1:6878:6878 -p 127.0.0.1:1935:1935 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0 broadcast my-channel
+  -v outpace-data:/var/lib/outpace ghcr.io/outpace-stream/outpace-engine:1.0.1 broadcast my-channel
 ```
 
 ## Related pages

@@ -1,59 +1,21 @@
-name: Package manifests
+name: Package manifest generator
 
-# Installs the release the Homebrew formula and Scoop manifest point at, on real macOS and
-# Windows runners, using this repository as the tap and the bucket.
 on:
   pull_request:
     paths:
       - .github/workflows/package-manifests.yml
-      - Formula/**
-      - bucket/**
-      - tools/release/package_manifests.py
+      - tools/release/**
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  homebrew:
-    name: Homebrew install (macOS)
-    runs-on: macos-15
-    timeout-minutes: 20
-    env:
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-      HOMEBREW_NO_INSTALL_FROM_API: "1"
+  generator:
+    name: Release tooling tests
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-
-      - name: Tap this checkout, install, test and audit
-        run: |
-          set -eu
-          brew tap local/outpace "$GITHUB_WORKSPACE"
-          brew install local/outpace/outpace
-          outpace --version
-          brew test local/outpace/outpace
-          brew audit --strict --formula local/outpace/outpace
-
-  scoop:
-    name: Scoop install (Windows)
-    runs-on: windows-2025
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Install Scoop and the manifest
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Invoke-RestMethod -Uri https://get.scoop.sh -OutFile install-scoop.ps1
-          .\install-scoop.ps1 -RunAsAdmin
-          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
-          scoop install .\bucket\outpace.json
-          outpace --version
-          if ($LASTEXITCODE -ne 0) { throw 'outpace did not run' }
+      - run: python3 -m unittest discover -s tools/release -p 'test_*.py'

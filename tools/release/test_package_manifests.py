@@ -1,6 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -26,9 +28,9 @@ class ManifestTests(unittest.TestCase):
             root = Path(tmp)
             text = sums_for("1.2.3")
             sums = manifests.parse_sums(text)
-            manifests.render("v1.2.3", text, root)
-            formula = (root / "Formula" / "outpace.rb").read_text()
-            scoop = json.loads((root / "bucket" / "outpace.json").read_text())
+            manifests.render("v1.2.3", text, root / "homebrew", root / "scoop")
+            formula = (root / "homebrew" / "Formula" / "outpace.rb").read_text()
+            scoop = json.loads((root / "scoop" / "bucket" / "outpace.json").read_text())
         # Homebrew scans the version from the URL; an explicit `version` fails `brew audit`.
         self.assertNotIn('version "', formula)
         for target in manifests.BREW.values():
@@ -45,33 +47,48 @@ class ManifestTests(unittest.TestCase):
     def test_missing_platform_rejected(self):
         text = "\n".join(l for l in sums_for("1.2.3").splitlines() if "aarch64-apple-darwin" not in l)
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
-            manifests.render("v1.2.3", text, Path(tmp))
+            manifests.render("v1.2.3", text, Path(tmp) / "homebrew", Path(tmp) / "scoop")
 
     def test_invalid_tag_rejected(self):
         with self.assertRaises(ValueError):
             manifests.parse_tag("v1.2.3-rc1")
 
-    def test_committed_manifests_are_generated_output(self):
-        # Formula/ and bucket/ must be exactly what the generator writes for their version.
-        root = manifests.ROOT
-        scoop = json.loads((root / "bucket" / "outpace.json").read_text())
-        version = scoop["version"]
-        sums = {}
-        for arch, entry in scoop["architecture"].items():
-            sums[f"outpace-{version}-{manifests.SCOOP[arch]}.zip"] = entry["hash"]
-        formula = (root / "Formula" / "outpace.rb").read_text()
-        for key, target in manifests.BREW.items():
-            name = f"outpace-{version}-{target}.tar.gz"
-            block = formula.split(name, 1)[1]
-            sums[name] = block.split('sha256 "', 1)[1].split('"', 1)[0]
-        text = "".join(f"{digest}  {name}\n" for name, digest in sums.items())
+    def test_missing_scoop_checksum_leaves_both_repositories_untouched(self):
+        text = "\n".join(l for l in sums_for("1.2.3").splitlines() if "windows" not in l)
         with tempfile.TemporaryDirectory() as tmp:
-            manifests.render(f"v{version}", text, Path(tmp))
-            self.assertEqual((Path(tmp) / "Formula" / "outpace.rb").read_text(), formula)
-            self.assertEqual(
-                (Path(tmp) / "bucket" / "outpace.json").read_text(),
-                (root / "bucket" / "outpace.json").read_text(),
-            )
+            root = Path(tmp)
+            with self.assertRaises(ValueError):
+                manifests.render("v1.2.3", text, root / "homebrew", root / "scoop")
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_cli_writes_only_to_explicit_catalog_repositories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sums = root / "SHA256SUMS"
+            sums.write_text(sums_for("1.2.3"))
+            script = Path(manifests.__file__).resolve()
+            result = subprocess.run([
+                sys.executable, str(script), "v1.2.3", str(sums),
+                "--homebrew-root", str(root / "homebrew"),
+                "--scoop-root", str(root / "scoop"),
+            ], cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            formula = (root / "homebrew" / "Formula" / "outpace.rb").read_text()
+            scoop = json.loads((root / "scoop" / "bucket" / "outpace.json").read_text())
+            expected = "https://github.com/outpace-stream/outpace-engine"
+            self.assertIn(expected + "/releases/download/v1.2.3/", formula)
+            self.assertEqual(scoop["homepage"], expected)
+            self.assertEqual(scoop["checkver"]["github"], expected)
+            self.assertFalse((root / "Formula").exists())
+            self.assertFalse((root / "bucket").exists())
+
+    def test_cli_requires_explicit_catalog_repositories(self):
+        result = subprocess.run([
+            sys.executable, str(Path(manifests.__file__).resolve()), "v1.2.3", "SHA256SUMS",
+        ], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--homebrew-root", result.stderr)
+        self.assertIn("--scoop-root", result.stderr)
 
 
 if __name__ == "__main__":

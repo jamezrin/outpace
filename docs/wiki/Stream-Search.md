@@ -1,7 +1,7 @@
 # Stream Search
 
 Optional service-backed stream-name search is available in builds containing
-[#408](https://github.com/jamezrin/outpace-stream/pull/408), available from v1.0.0. It is disabled
+[#408](https://github.com/outpace-stream/outpace-engine/pull/408), available from v1.0.0. It is disabled
 by default and independent of the legacy HTTP compatibility API. Outpace remains headless:
 client apps supply the UI. General catalog management, EPG, playlist management and a
 production crawler are outside this adapter's scope.
@@ -94,7 +94,7 @@ form), or `/ace/getstream?infohash=<infohash>` with `OUTPACE_ACE_COMPAT=1`. Exis
 resolution and descriptor/media verification still apply. Do not pass the infohash as a bare
 content ID or invent a content ID by hashing metadata.
 
-The original request in [#253](https://github.com/jamezrin/outpace-stream/issues/253#issuecomment-6334792867)
+The original request in [#253](https://github.com/outpace-stream/outpace-engine/issues/253#issuecomment-6334792867)
 was for an older scraper workflow that called `/search`, then
 `/server/api?method=get_content_id&infohash=...`. Reverse lookup remains unsupported. Those
 clients need an explicit integration change to use infohash playback selectors.
@@ -102,7 +102,7 @@ clients need an explicit integration change to use infohash playback selectors.
 The current [acestream-scraper](https://github.com/visesa84/acestream-scraper) client uses
 explicit `ih:` selectors and searches the external service directly. Its search bypasses
 Outpace; using this adapter requires a client endpoint/parser integration change.
-[#406](https://github.com/jamezrin/outpace-stream/issues/406) tracks remaining client
+[#406](https://github.com/outpace-stream/outpace-engine/issues/406) tracks remaining client
 integration qualification. Local adapter tests do not establish a working deployed scraper
 installation.
 

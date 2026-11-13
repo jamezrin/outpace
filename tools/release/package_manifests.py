@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """Render the Homebrew formula and Scoop manifest for a published release.
 
-This repository doubles as a Homebrew tap (Formula/outpace.rb) and a Scoop bucket
-(bucket/outpace.json). After a release is published, refresh both from its SHA256SUMS:
+The catalogs live in outpace-stream/homebrew-outpace and outpace-stream/scoop-outpace.
+After a release is published, clone both repositories and refresh their manifests:
 
-    gh release download vX.Y.Z --pattern SHA256SUMS --dir /tmp/sums
-    python3 tools/release/package_manifests.py vX.Y.Z /tmp/sums/SHA256SUMS
+    gh release download vX.Y.Z --repo outpace-stream/outpace-engine --pattern SHA256SUMS --dir /tmp/sums
+    python3 tools/release/package_manifests.py vX.Y.Z /tmp/sums/SHA256SUMS \
+        --homebrew-root ../homebrew-outpace --scoop-root ../scoop-outpace
 
-and open a PR with the result. The manifests always point at the newest published release,
-never at an unreleased version, because the checksums only exist after the release.
+Open a PR in each catalog repository. Checksums always come from a published release.
 """
 import argparse
 import json
 from pathlib import Path
 import re
 
-REPO = "https://github.com/jamezrin/outpace-stream"
+REPO = "https://github.com/outpace-stream/outpace-engine"
 DESCRIPTION = "Open-source streaming engine for public Acestream content"
 LICENSE = "AGPL-3.0-or-later"
-ROOT = Path(__file__).resolve().parents[2]
 
 # Homebrew (macOS and Linux) and Scoop (Windows) platforms -> release targets.
 BREW = {
@@ -139,18 +138,23 @@ def scoop(version: str, sums: dict) -> str:
     return json.dumps(manifest, indent=4) + "\n"
 
 
-def render(tag: str, sums_text: str, root: Path = ROOT) -> None:
+def render(tag: str, sums_text: str, homebrew_root: Path, scoop_root: Path) -> None:
     version = parse_tag(tag)
     sums = parse_sums(sums_text)
-    (root / "Formula").mkdir(exist_ok=True)
-    (root / "bucket").mkdir(exist_ok=True)
-    (root / "Formula" / "outpace.rb").write_text(formula(version, sums))
-    (root / "bucket" / "outpace.json").write_text(scoop(version, sums))
+    # Validate both catalogs before writing either, so missing assets leave no partial update.
+    brew_text = formula(version, sums)
+    scoop_text = scoop(version, sums)
+    (homebrew_root / "Formula").mkdir(parents=True, exist_ok=True)
+    (scoop_root / "bucket").mkdir(parents=True, exist_ok=True)
+    (homebrew_root / "Formula" / "outpace.rb").write_text(brew_text)
+    (scoop_root / "bucket" / "outpace.json").write_text(scoop_text)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("tag")
     parser.add_argument("sha256sums", type=Path)
+    parser.add_argument("--homebrew-root", type=Path, required=True)
+    parser.add_argument("--scoop-root", type=Path, required=True)
     args = parser.parse_args()
-    render(args.tag, args.sha256sums.read_text())
+    render(args.tag, args.sha256sums.read_text(), args.homebrew_root, args.scoop_root)

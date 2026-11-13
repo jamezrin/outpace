@@ -379,6 +379,6 @@ including when raw-hash fallback is enabled. Inspection does not grant authoriza
 The implementation gates Ace provider live discovery and VOD store creation, manager cached
 session admission, and compatibility catalog/URL preparation before lease minting.
 Uninspected playback retains existing policy and legacy zero flags. Synthetic regression
-coverage and acceptance were delivered in [#314](https://github.com/jamezrin/outpace-stream/pull/314).
+coverage and acceptance were delivered in [#314](https://github.com/outpace-stream/outpace-engine/pull/314).
 That acceptance establishes the documented refusal policy; it does not implement protected
 playback or turn an uninspected zero flag into proof that content is public.

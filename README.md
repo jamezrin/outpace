@@ -9,8 +9,8 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/jamezrin/outpace-stream?sort=semver"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamezrin/outpace-stream/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/outpace-stream/outpace-engine?sort=semver"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/outpace-stream/outpace-engine/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://www.rust-lang.org"><img alt="Written in Rust" src="https://img.shields.io/badge/written%20in-Rust-orange?logo=rust"></a>
 </p>
 
@@ -21,13 +21,19 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/jamezrin/outpace-stream/wiki"><b>Documentation</b></a> ·
+  <a href="https://github.com/outpace-stream/outpace-engine/wiki"><b>Documentation</b></a> ·
   <a href="#quick-start">Quick start</a> ·
-  <a href="https://github.com/jamezrin/outpace-stream/wiki/Installation">Installation</a> ·
-  <a href="https://github.com/jamezrin/outpace-stream/wiki/FAQ">FAQ</a> ·
+  <a href="https://github.com/outpace-stream/outpace-engine/wiki/Installation">Installation</a> ·
+  <a href="https://github.com/outpace-stream/outpace-engine/wiki/FAQ">FAQ</a> ·
   <a href="docs/native-api.md">HTTP API</a> ·
-  <a href="https://github.com/jamezrin/outpace-stream/releases">Releases</a>
+  <a href="https://github.com/outpace-stream/outpace-engine/releases">Releases</a>
 </p>
+
+The project lives in the [Outpace organization](https://github.com/outpace-stream):
+[engine](https://github.com/outpace-stream/outpace-engine),
+[Android companion app](https://github.com/outpace-stream/outpace-android),
+[Homebrew tap](https://github.com/outpace-stream/homebrew-outpace), and
+[Scoop bucket](https://github.com/outpace-stream/scoop-outpace).
 
 ## What is Outpace?
 
@@ -72,27 +78,27 @@ What it isn't:
 - It has no accounts, EPG or web UI.
 - Stream-name search is a separate, default-off external services adapter. No
   operator API key is needed. It is available from v1.0.0; see
-  [search setup and limits](https://github.com/jamezrin/outpace-stream/wiki/Stream-Search).
+  [search setup and limits](https://github.com/outpace-stream/outpace-engine/wiki/Stream-Search).
 - The compatible API is a subset, not full parity with the official engine.
 
-See [differences from the official engine](https://github.com/jamezrin/outpace-stream/wiki/Migrating-from-AceStream-Engine#whats-different).
+See [differences from the official engine](https://github.com/outpace-stream/outpace-engine/wiki/Migrating-from-AceStream-Engine#whats-different).
 
 ## Quick start
 
 ### 1. Install
 
 Download the archive for your platform from the
-[latest release](https://github.com/jamezrin/outpace-stream/releases/latest). For example, on
+[latest release](https://github.com/outpace-stream/outpace-engine/releases/latest). For example, on
 Linux x86_64:
 
 ```bash
-curl -LO https://github.com/jamezrin/outpace-stream/releases/download/v1.0.0/outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/outpace-stream/outpace-engine/releases/download/v1.0.0/outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
 tar -xzf outpace-1.0.0-x86_64-unknown-linux-musl.tar.gz
 sudo install -m 0755 outpace-1.0.0-x86_64-unknown-linux-musl/outpace /usr/local/bin/outpace
 ```
 
 On Windows, unzip the archive and use `outpace.exe`. The
-[installation guide](https://github.com/jamezrin/outpace-stream/wiki/Installation) covers
+[installation guide](https://github.com/outpace-stream/outpace-engine/wiki/Installation) covers
 checksum verification, every platform and building from source.
 
 ### 2. Start the engine
@@ -125,11 +131,11 @@ A cold start takes 20–60 seconds while Outpace finds peers and buffers.
 
 ```bash
 docker run -d --name outpace -p 127.0.0.1:6878:6878 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/jamezrin/outpace:1.0.0
+  -v outpace-data:/var/lib/outpace ghcr.io/outpace-stream/outpace-engine:1.0.1
 ```
 
 For a production setup, use the repository's [`compose.yml`](compose.yml) and
-[`.env.example`](.env.example); see [Deployment](https://github.com/jamezrin/outpace-stream/wiki/Deployment).
+[`.env.example`](.env.example); see [Deployment](https://github.com/outpace-stream/outpace-engine/wiki/Deployment).
 
 ### Connect your apps
 
@@ -140,8 +146,8 @@ For a production setup, use the repository's [`compose.yml`](compose.yml) and
 
 The HTTP API has no authentication, so keep it on `127.0.0.1` or behind a proxy. Only TCP 8621
 (the peer port) is meant to be public. See
-[Playing streams](https://github.com/jamezrin/outpace-stream/wiki/Playing-Streams) and
-[NAT and port mapping](https://github.com/jamezrin/outpace-stream/wiki/NAT-and-Port-Mapping).
+[Playing streams](https://github.com/outpace-stream/outpace-engine/wiki/Playing-Streams) and
+[NAT and port mapping](https://github.com/outpace-stream/outpace-engine/wiki/NAT-and-Port-Mapping).
 
 ## Features
 
@@ -153,23 +159,23 @@ The HTTP API has no authentication, so keep it on `127.0.0.1` or behind a proxy.
 | VOD | Single-file VOD with per-piece verification and byte-range seeking. |
 | Peer participation | Uploads and accepts inbound peers by default, like the official engine. Download-only mode is one setting away. |
 | Broadcasting | Publish your own signed swarm from HTTP, RTMP or an HTTP pull source, or from encrypted SRT in builds that include it. |
-| Timeshift and HLS origins | Per-viewer rewind of live HLS, and a guarded relay for descriptors that point at HLS servers. Available from v1.0.0 ([details](https://github.com/jamezrin/outpace-stream/wiki/Releases-and-Versions#v100-highlights)). |
+| Timeshift and HLS origins | Per-viewer rewind of live HLS, and a guarded relay for descriptors that point at HLS servers. Available from v1.0.0 ([details](https://github.com/outpace-stream/outpace-engine/wiki/Releases-and-Versions#v100-highlights)). |
 
 ## Documentation
 
 | You want to... | Read |
 | --- | --- |
-| Get answers to common questions | [FAQ](https://github.com/jamezrin/outpace-stream/wiki/FAQ) |
-| Play a stream in five minutes | [Getting started](https://github.com/jamezrin/outpace-stream/wiki/Getting-Started) |
-| Install on Linux, macOS, Windows or Docker | [Installation](https://github.com/jamezrin/outpace-stream/wiki/Installation) |
-| Run it with Compose, systemd or behind a proxy | [Deployment](https://github.com/jamezrin/outpace-stream/wiki/Deployment) |
-| Point VLC, mpv, Jellyfin, Dispatcharr or an Ace Stream app at it | [Playing streams](https://github.com/jamezrin/outpace-stream/wiki/Playing-Streams) |
-| Look up a setting or command | [Configuration](https://github.com/jamezrin/outpace-stream/wiki/Configuration) · [Environment variables](https://github.com/jamezrin/outpace-stream/wiki/Environment-Variables) · [Command line](https://github.com/jamezrin/outpace-stream/wiki/Command-Line) |
-| Replace an existing AceStream engine | [Migrating](https://github.com/jamezrin/outpace-stream/wiki/Migrating-from-AceStream-Engine) |
-| Publish your own stream | [Broadcasting](https://github.com/jamezrin/outpace-stream/wiki/Broadcasting) |
-| Fix a problem | [Troubleshooting](https://github.com/jamezrin/outpace-stream/wiki/Troubleshooting) |
+| Get answers to common questions | [FAQ](https://github.com/outpace-stream/outpace-engine/wiki/FAQ) |
+| Play a stream in five minutes | [Getting started](https://github.com/outpace-stream/outpace-engine/wiki/Getting-Started) |
+| Install on Linux, macOS, Windows or Docker | [Installation](https://github.com/outpace-stream/outpace-engine/wiki/Installation) |
+| Run it with Compose, systemd or behind a proxy | [Deployment](https://github.com/outpace-stream/outpace-engine/wiki/Deployment) |
+| Point VLC, mpv, Jellyfin, Dispatcharr or an Ace Stream app at it | [Playing streams](https://github.com/outpace-stream/outpace-engine/wiki/Playing-Streams) |
+| Look up a setting or command | [Configuration](https://github.com/outpace-stream/outpace-engine/wiki/Configuration) · [Environment variables](https://github.com/outpace-stream/outpace-engine/wiki/Environment-Variables) · [Command line](https://github.com/outpace-stream/outpace-engine/wiki/Command-Line) |
+| Replace an existing AceStream engine | [Migrating](https://github.com/outpace-stream/outpace-engine/wiki/Migrating-from-AceStream-Engine) |
+| Publish your own stream | [Broadcasting](https://github.com/outpace-stream/outpace-engine/wiki/Broadcasting) |
+| Fix a problem | [Troubleshooting](https://github.com/outpace-stream/outpace-engine/wiki/Troubleshooting) |
 
-The [user wiki](https://github.com/jamezrin/outpace-stream/wiki) is generated from
+The [user wiki](https://github.com/outpace-stream/outpace-engine/wiki) is generated from
 [`docs/wiki/`](docs/wiki); edit it there.
 
 Technical reference:
@@ -191,8 +197,8 @@ Technical reference:
 - **Protocol:** [wire protocol](docs/protocol/wire-protocol.md),
   [transport file](docs/protocol/transport-file.md) and the
   [reverse-engineering notes](docs/protocol/notes/).
-- **Releases:** [GitHub Releases](https://github.com/jamezrin/outpace-stream/releases),
-  [release notes](docs/releases/) and [milestones](https://github.com/jamezrin/outpace-stream/milestones).
+- **Releases:** [GitHub Releases](https://github.com/outpace-stream/outpace-engine/releases),
+  [release notes](docs/releases/) and [milestones](https://github.com/outpace-stream/outpace-engine/milestones).
 
 ## Contributing
 
@@ -200,14 +206,14 @@ Outpace is a community project, and you're welcome to take part, whether you're 
 reporting a stream that won't play, testing it with your player or app, or digging into the
 protocol. Every kind of contribution counts:
 
-- **Bug reports and feature ideas.** Open an [issue](https://github.com/jamezrin/outpace-stream/issues/new/choose)
+- **Bug reports and feature ideas.** Open an [issue](https://github.com/outpace-stream/outpace-engine/issues/new/choose)
   with one of the forms, which ask for what you ran, what you expected and what happened.
-- **Questions and discussion.** Ask in [Discussions](https://github.com/jamezrin/outpace-stream/discussions).
+- **Questions and discussion.** Ask in [Discussions](https://github.com/outpace-stream/outpace-engine/discussions).
   Disagreement is healthy, so
   challenge a design or a decision when you think it's wrong, and explain why.
 - **Docs and guides.** The wiki lives in [`docs/wiki/`](docs/wiki). If something confused you,
   improving the page helps the next person.
-- **Code.** Look for [good first issues](https://github.com/jamezrin/outpace-stream/labels/good%20first%20issue),
+- **Code.** Look for [good first issues](https://github.com/outpace-stream/outpace-engine/labels/good%20first%20issue),
   or open an issue first for larger changes, so we can agree on the approach before you invest
   the time.
 
@@ -262,21 +268,21 @@ Unreviewed, fully automated submissions will be closed.
 ## Project activity
 
 <p>
-  <a href="https://github.com/jamezrin/outpace-stream/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/jamezrin/outpace-stream?style=flat"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/forks"><img alt="Forks" src="https://img.shields.io/github/forks/jamezrin/outpace-stream?style=flat"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/watchers"><img alt="Watchers" src="https://img.shields.io/github/watchers/jamezrin/outpace-stream?style=flat"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/jamezrin/outpace-stream"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/issues"><img alt="Open issues" src="https://img.shields.io/github/issues/jamezrin/outpace-stream"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/pulls"><img alt="Open pull requests" src="https://img.shields.io/github/issues-pr/jamezrin/outpace-stream"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/jamezrin/outpace-stream/main"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/pulse"><img alt="Commit activity" src="https://img.shields.io/github/commit-activity/m/jamezrin/outpace-stream"></a>
-  <a href="https://github.com/jamezrin/outpace-stream/releases"><img alt="Release downloads" src="https://img.shields.io/github/downloads/jamezrin/outpace-stream/total"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/outpace-stream/outpace-engine?style=flat"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/forks"><img alt="Forks" src="https://img.shields.io/github/forks/outpace-stream/outpace-engine?style=flat"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/watchers"><img alt="Watchers" src="https://img.shields.io/github/watchers/outpace-stream/outpace-engine?style=flat"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/outpace-stream/outpace-engine"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/issues"><img alt="Open issues" src="https://img.shields.io/github/issues/outpace-stream/outpace-engine"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/pulls"><img alt="Open pull requests" src="https://img.shields.io/github/issues-pr/outpace-stream/outpace-engine"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/outpace-stream/outpace-engine/main"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/pulse"><img alt="Commit activity" src="https://img.shields.io/github/commit-activity/m/outpace-stream/outpace-engine"></a>
+  <a href="https://github.com/outpace-stream/outpace-engine/releases"><img alt="Release downloads" src="https://img.shields.io/github/downloads/outpace-stream/outpace-engine/total"></a>
 </p>
 
-<a href="https://star-history.com/#jamezrin/outpace-stream&Date">
+<a href="https://star-history.com/#outpace-stream/outpace-engine&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jamezrin/outpace-stream&type=Date&theme=dark">
-    <img alt="Star history" src="https://api.star-history.com/svg?repos=jamezrin/outpace-stream&type=Date" width="600">
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=outpace-stream/outpace-engine&type=Date&theme=dark">
+    <img alt="Star history" src="https://api.star-history.com/svg?repos=outpace-stream/outpace-engine&type=Date" width="600">
   </picture>
 </a>
 
