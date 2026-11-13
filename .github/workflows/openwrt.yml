@@ -1,0 +1,51 @@
+name: OpenWrt
+
+# Lints the OpenWrt service files and runs them under procd in an official OpenWrt rootfs
+# container: install, enable through UCI, start, /healthz, service user, stop.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/openwrt.yml
+      - packaging/openwrt/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  openwrt:
+    name: OpenWrt service lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Shellcheck
+        run: |
+          shellcheck -s sh packaging/openwrt/install.sh packaging/openwrt/files/etc/init.d/outpace
+          shellcheck packaging/openwrt/test-openwrt.sh
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ env.TARGET }}
+          cache: false
+          build-warnings: ""
+
+      - name: Install musl cross toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ env.TARGET }}
+
+      - name: Build static binary
+        run: cargo build --locked --release -p ace-engine --bin outpace --target "$TARGET"
+
+      - name: Run the service under procd
+        run: packaging/openwrt/test-openwrt.sh "target/$TARGET/release/outpace"

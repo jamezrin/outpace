@@ -135,6 +135,9 @@ OUTPACE_SESSION_BUFFER=64 \
 outpace serve
 ```
 
+[Routers and Small Devices](Routers-and-Small-Devices) covers memory sizing, OpenWrt and
+NAS boxes in more detail.
+
 ### ARM64 with 16 KiB memory pages
 
 Outpace doesn't bundle the precompiled Android libraries that break some other engines on
