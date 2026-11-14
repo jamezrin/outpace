@@ -62,7 +62,6 @@ pub(super) async fn activate_upstream_peer_with_policy(
     } = inputs;
     let activation::Prepared { upstream, permit } = activation::prepare_with_policy(
         activation::Start {
-            peer_id,
             cursor: start,
             head: continuity.head,
         },

@@ -1872,11 +1872,14 @@ fn build_descriptor(
     );
     d.insert(b"allow_public_trackers".to_vec(), Bencode::Int(1));
     // `name` above is actually reused for outpace's internal identifier too; keep the
-    // ingest path segment discoverable via a dedicated key for operator tooling.
-    d.insert(
-        b"outpace_name".to_vec(),
-        Bencode::Bytes(name.as_bytes().to_vec()),
-    );
+    // ingest path segment discoverable via a dedicated key for operator tooling. The
+    // official engine never writes this key, so the AceStream identity leaves it out.
+    if ace_swarm::engine_profile::identity().is_none() {
+        d.insert(
+            b"outpace_name".to_vec(),
+            Bencode::Bytes(name.as_bytes().to_vec()),
+        );
+    }
     Bencode::Dict(d)
 }
 

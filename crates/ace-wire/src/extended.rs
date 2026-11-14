@@ -31,6 +31,20 @@ pub struct NodeFields {
     pub p: i64,
     pub nt: i64,
     pub platform: i64,
+    /// The `asn` / `asn_country` / `geoip_country` keys.
+    pub geo: GeoFields,
+}
+
+/// How the network-location keys of a signed handshake are filled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeoFields {
+    /// `asn=0` and empty countries (outpace's long-standing default).
+    #[default]
+    Unknown,
+    /// Keys omitted while our own location is still being looked up.
+    Pending,
+    /// The engine's own autonomous system number and ISO 3166 alpha-2 country.
+    Known { asn: i64, country: [u8; 2] },
 }
 
 impl Default for NodeFields {
@@ -43,6 +57,7 @@ impl Default for NodeFields {
             p: 8621,
             nt: 1,
             platform: 2,
+            geo: GeoFields::Unknown,
         }
     }
 }
@@ -138,10 +153,24 @@ impl OutgoingExtendedHandshake {
                 mi.insert(k.as_bytes().to_vec(), bi(v));
             }
             f.insert(b"mi".to_vec(), Bencode::Dict(mi));
+        } else {
+            // The engine always sends the full `mi` dict, with placeholders before it
+            // holds any live position.
+            f.insert(b"mi".to_vec(), placeholder_mi());
         }
-        f.insert(b"asn".to_vec(), bi(0));
-        f.insert(b"asn_country".to_vec(), bb(b""));
-        f.insert(b"geoip_country".to_vec(), bb(b""));
+        match self.node.geo {
+            GeoFields::Unknown => {
+                f.insert(b"asn".to_vec(), bi(0));
+                f.insert(b"asn_country".to_vec(), bb(b""));
+                f.insert(b"geoip_country".to_vec(), bb(b""));
+            }
+            GeoFields::Pending => {}
+            GeoFields::Known { asn, country } => {
+                f.insert(b"asn".to_vec(), bi(asn));
+                f.insert(b"asn_country".to_vec(), bb(&country));
+                f.insert(b"geoip_country".to_vec(), bb(&country));
+            }
+        }
         let root_lsp = self
             .mi
             .filter(|p| p.position >= 0 && p.max_piece >= p.min_piece && p.max_piece >= 0)
@@ -171,6 +200,38 @@ impl OutgoingExtendedHandshake {
         Bencode::Dict(f).encode()
     }
 }
+
+/// The `mi` dict a real engine sends before it holds a live position: every position
+/// field `-1`, rates `0`, and a typical live window width.
+fn placeholder_mi() -> Bencode {
+    let mut mi: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
+    for (k, v) in [
+        ("distance_from_source", -1),
+        ("down_rate", 0),
+        ("download_window_end", -1),
+        ("is_accessible", 0),
+        ("live_window_size", PLACEHOLDER_LIVE_WINDOW_SIZE),
+        ("lsp", -1),
+        ("mam", -1),
+        ("max_piece", -1),
+        ("min_piece", -1),
+        ("peer_type", 0),
+        ("ping_from_source", -1),
+        ("position", -1),
+        ("time_from_source", -1),
+        ("top_session_up_rate", 0),
+        ("top_up_rate", 0),
+        ("up_rate", 0),
+        ("upload_rating", 0),
+    ] {
+        mi.insert(k.as_bytes().to_vec(), Bencode::Int(v));
+    }
+    Bencode::Dict(mi)
+}
+
+/// Window width used before we know the stream's own: the most common value peers
+/// advertise (note 11).
+const PLACEHOLDER_LIVE_WINDOW_SIZE: i64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtendedHandshake {

@@ -66,6 +66,7 @@ On `main`, not yet in a release:
   `aarch64-linux-android` one; see [Installation](Installation#android-with-termux-best-effort).
   The [Android companion app](Android-App) downloads these archives by name, so their names and
   layout (`outpace-<version>-<target>/outpace` inside the `.tar.gz`) stay stable.
+- Opt-in [engine camouflage](Engine-Camouflage) (`OUTPACE_ACESTREAM_IDENTITY`). Default off.
 
 ## v1.0.2 fixes
 

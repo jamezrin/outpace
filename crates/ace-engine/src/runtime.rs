@@ -327,6 +327,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config
         .acestream_services
         .validate(config.peer_policy.is_private())?;
+    config.acestream_identity = crate::engine_identity::settings_from_env()?;
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
@@ -734,6 +735,7 @@ pub async fn build_runtime(
     config
         .acestream_services
         .validate(config.peer_policy.is_private())?;
+    crate::engine_identity::validate(&config.acestream_identity)?;
     let srt_config = config.srt.prepare(cfg!(feature = "srt"))?;
     config.support_sources.validate(&config)?;
     crate::private_network::validate_private_config(&config, &bootstrap_peers)?;
@@ -763,6 +765,9 @@ pub async fn build_runtime(
     // library/test callers, and it runs before any destructive operation.
     prepare_disk_cache_paths(&mut config)?;
     let identity = Arc::new(load_or_create_identity(&config.data_dir)?);
+    // Signed handshakes advertise the port we actually listen on (`p`), not a constant.
+    ace_swarm::engine_profile::set_listen_port(config.peer_listen.port());
+    crate::engine_identity::apply(&config)?;
 
     // Fail fast on a misconfigured disk cache, and start from a clean slate: wipe the cache root
     // so per-infohash dirs orphaned by a hard crash (no `Drop` ran) don't survive a restart. The
@@ -1121,6 +1126,7 @@ async fn serve_http_inner(
     if config.enable_inbound {
         let peer_listener = tokio::net::TcpListener::bind(config.peer_listen).await?;
         let bound_peer_port = peer_listener.local_addr()?.port();
+        ace_swarm::engine_profile::set_listen_port(bound_peer_port);
         eprintln!(
             "outpace: inbound seeding ENABLED on {} (max {} peers)",
             config.peer_listen, config.max_inbound_peers
@@ -1804,6 +1810,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn acestream_identity_defaults_off_and_rejects_bad_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let names = [
+            ace_swarm::engine_profile::ENV_IDENTITY,
+            ace_swarm::engine_profile::ENV_VERSION,
+            ace_swarm::engine_profile::ENV_PLATFORM,
+            ace_swarm::engine_profile::ENV_DEVICE_ID,
+            ace_swarm::engine_profile::ENV_HARDWARE_KEY,
+            ace_swarm::engine_profile::ENV_ASN,
+            ace_swarm::engine_profile::ENV_COUNTRY,
+            ace_swarm::engine_profile::ENV_USER_AGENT,
+        ];
+        let _restore = EnvRestore::clear(&names);
+        assert!(!config_from_env().unwrap().acestream_identity.enabled);
+        std::env::set_var(ace_swarm::engine_profile::ENV_IDENTITY, "0");
+        std::env::set_var(ace_swarm::engine_profile::ENV_VERSION, "nope");
+        assert!(!config_from_env().unwrap().acestream_identity.enabled);
+        let placeholder = "0123456789abcdef0123456789abcdef01234567";
+        std::env::set_var(ace_swarm::engine_profile::ENV_IDENTITY, "1");
+        std::env::set_var(ace_swarm::engine_profile::ENV_VERSION, "3.1.32");
+        std::env::set_var(ace_swarm::engine_profile::ENV_PLATFORM, "linux");
+        std::env::set_var(ace_swarm::engine_profile::ENV_DEVICE_ID, placeholder);
+        std::env::set_var(ace_swarm::engine_profile::ENV_HARDWARE_KEY, placeholder);
+        std::env::set_var(ace_swarm::engine_profile::ENV_ASN, "13335");
+        std::env::set_var(ace_swarm::engine_profile::ENV_COUNTRY, "us");
+        let settings = config_from_env().unwrap().acestream_identity;
+        assert!(settings.enabled);
+        assert_eq!(settings.version.as_deref(), Some("3.1.32"));
+        assert_eq!(settings.country.as_deref(), Some("us"));
+        assert_eq!(settings.device_id.as_deref(), Some(placeholder));
+        std::env::set_var(ace_swarm::engine_profile::ENV_VERSION, "3.2");
+        let error = config_from_env().unwrap_err().to_string();
+        assert!(
+            error.contains(ace_swarm::engine_profile::ENV_VERSION),
+            "{error}"
+        );
+        std::env::set_var(ace_swarm::engine_profile::ENV_VERSION, "3.2.11");
+        std::env::remove_var(ace_swarm::engine_profile::ENV_COUNTRY);
+        let error = config_from_env().unwrap_err().to_string();
+        assert!(
+            error.contains(ace_swarm::engine_profile::ENV_ASN),
+            "{error}"
+        );
+        std::env::set_var(ace_swarm::engine_profile::ENV_IDENTITY, "yes");
+        let error = config_from_env().unwrap_err().to_string();
+        assert!(
+            error.contains(ace_swarm::engine_profile::ENV_IDENTITY),
+            "{error}"
+        );
     }
 
     #[test]

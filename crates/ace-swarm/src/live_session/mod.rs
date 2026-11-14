@@ -33,8 +33,10 @@ use crate::types::StreamInfo;
 #[cfg(test)]
 use crate::types::StreamMetadata;
 use ace_peer::session::{connect, PeerSession};
+#[cfg(test)]
+use ace_wire::extended::NodeFields;
 use ace_wire::extended::{
-    ExtendedHandshake, LivePosition as WireLivePosition, NodeFields, OutgoingExtendedHandshake,
+    ExtendedHandshake, LivePosition as WireLivePosition, OutgoingExtendedHandshake,
 };
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;

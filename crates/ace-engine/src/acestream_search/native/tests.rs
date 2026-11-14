@@ -163,3 +163,88 @@ fn native_disabled_flag_accepts_binary_numbers_and_rejects_other_values() {
         }
     }
 }
+
+fn synthetic_identity() -> ace_swarm::engine_profile::EngineIdentity {
+    ace_swarm::engine_profile::EngineIdentity::new(
+        ("3.2.11".into(), 3_021_100),
+        ace_swarm::engine_profile::Platform::Linux,
+        [0x11; 20],
+        [0x22; 20],
+        String::new(),
+    )
+}
+
+fn query_of(pairs: &[(&str, &str)]) -> SearchQuery {
+    SearchQuery::parse(
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    )
+    .unwrap()
+}
+
+// Signatures generated independently with Python hashlib over the engine's canonical
+// form; the same scheme reproduces a captured official 3.2.11 request.
+#[test]
+fn engine_shaped_request_matches_independent_vector_and_order() {
+    let identity = synthetic_identity();
+    let query = query_of(&[("query", "news"), ("page_size", "5")]);
+    let request = NativeRequest::for_client(&query, 1_700_000_000, NONCE.into(), Some(&identity));
+    let path = request.path_and_query();
+    let keys: Vec<String> = form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes())
+        .map(|(k, _)| k.into_owned())
+        .collect();
+    assert_eq!(
+        keys,
+        ["_a", "_b", "_n", "_p", "_r", "_t", "_v", "a", "i", "m", "_s"]
+    );
+    let params: std::collections::BTreeMap<_, _> =
+        form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes())
+            .into_owned()
+            .collect();
+    assert_eq!(params["_a"], hex::encode([0x11; 20]));
+    assert_eq!(params["_b"], hex::encode([0x22; 20]));
+    assert_eq!(params["_p"], "linux");
+    assert_eq!(
+        params["_s"],
+        hex::encode([
+            101, 213, 67, 190, 44, 176, 229, 156, 210, 7, 253, 70, 113, 14, 176, 172, 32, 244, 54,
+            15
+        ])
+    );
+
+    let query = query_of(&[
+        ("query", "news"),
+        ("page_size", "5"),
+        ("page", "1"),
+        ("category", "sport"),
+    ]);
+    let request = NativeRequest::for_client(&query, 1_700_000_000, NONCE.into(), Some(&identity));
+    let params: std::collections::BTreeMap<_, _> = form_urlencoded::parse(
+        request
+            .path_and_query()
+            .split_once('?')
+            .unwrap()
+            .1
+            .as_bytes(),
+    )
+    .into_owned()
+    .collect();
+    assert_eq!((params["h"].as_str(), params["c"].as_str()), ("1", "sport"));
+    assert!(!params.contains_key("s") && !params.contains_key("t"));
+    assert_eq!(
+        params["_s"],
+        hex::encode([
+            179, 212, 182, 8, 129, 49, 91, 253, 173, 30, 163, 47, 124, 154, 216, 9, 46, 24, 179,
+            175
+        ])
+    );
+}
+
+#[test]
+fn outpace_request_is_unchanged_without_identity() {
+    let query = query_of(&[("query", "news")]);
+    let request = NativeRequest::for_client(&query, 1, NONCE.into(), None);
+    assert!(request.path_and_query().contains("_p=outpace"));
+}

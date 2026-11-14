@@ -29,6 +29,17 @@ const DHT_PEER_TARGET: usize = 8;
 /// be matched by an unrelated packet arriving much later in the walk.
 const INFLIGHT_TTL: Duration = Duration::from_secs(3);
 
+/// The client version tag the official engine's DHT (pymdht `NEXTSHARE_VERSION`) puts in
+/// every KRPC message's `v` key.
+pub const CLIENT_VERSION: &[u8] = b"NS\x01\x18";
+
+/// Our DHT node id: one random id for the whole process, like the engine's, so the
+/// tokens a `get_peers` walk collects are valid for the announces that follow it.
+pub fn session_node_id() -> [u8; 20] {
+    static ID: std::sync::OnceLock<[u8; 20]> = std::sync::OnceLock::new();
+    *ID.get_or_init(rand::random)
+}
+
 /// Build a `get_peers` KRPC query for `infohash` from our `node_id`.
 pub fn build_get_peers(node_id: &[u8; 20], infohash: &[u8; 20], txid: &[u8]) -> Vec<u8> {
     let mut a: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
@@ -38,6 +49,7 @@ pub fn build_get_peers(node_id: &[u8; 20], infohash: &[u8; 20], txid: &[u8]) -> 
     d.insert(b"a".to_vec(), Bencode::Dict(a));
     d.insert(b"q".to_vec(), Bencode::Bytes(b"get_peers".to_vec()));
     d.insert(b"t".to_vec(), Bencode::Bytes(txid.to_vec()));
+    d.insert(b"v".to_vec(), Bencode::Bytes(CLIENT_VERSION.to_vec()));
     d.insert(b"y".to_vec(), Bencode::Bytes(b"q".to_vec()));
     Bencode::Dict(d).encode()
 }
@@ -45,8 +57,8 @@ pub fn build_get_peers(node_id: &[u8; 20], infohash: &[u8; 20], txid: &[u8]) -> 
 /// Build an `announce_peer` KRPC query (BEP-5) — the DHT half of "make ourselves
 /// discoverable as a peer for `infohash`". Must carry the opaque `token` a node handed us in
 /// its own `get_peers` response (anti-spoofing: a node only accepts an announce echoing a
-/// token it issued). `implied_port=0` and an explicit `port` — we advertise our real
-/// listening port rather than relying on the sender's UDP source port.
+/// token it issued). An explicit `port` advertises our real listening port; like the engine
+/// we send no `implied_port`, which BEP-5 treats as 0.
 pub fn build_announce_peer(
     node_id: &[u8; 20],
     infohash: &[u8; 20],
@@ -59,11 +71,11 @@ pub fn build_announce_peer(
     a.insert(b"info_hash".to_vec(), Bencode::Bytes(infohash.to_vec()));
     a.insert(b"port".to_vec(), Bencode::Int(port as i64));
     a.insert(b"token".to_vec(), Bencode::Bytes(token.to_vec()));
-    a.insert(b"implied_port".to_vec(), Bencode::Int(0));
     let mut d: BTreeMap<Vec<u8>, Bencode> = BTreeMap::new();
     d.insert(b"a".to_vec(), Bencode::Dict(a));
     d.insert(b"q".to_vec(), Bencode::Bytes(b"announce_peer".to_vec()));
     d.insert(b"t".to_vec(), Bencode::Bytes(txid.to_vec()));
+    d.insert(b"v".to_vec(), Bencode::Bytes(CLIENT_VERSION.to_vec()));
     d.insert(b"y".to_vec(), Bencode::Bytes(b"q".to_vec()));
     Bencode::Dict(d).encode()
 }
@@ -318,7 +330,7 @@ async fn dht_walk_owned(
     mut lookups: tokio::task::JoinSet<(usize, Option<SocketAddrV4>)>,
     mut on_response: impl FnMut(SocketAddrV4, &GetPeersResponse) -> bool,
 ) -> DhtWalkMetrics {
-    let node_id: [u8; 20] = rand::random();
+    let node_id = session_node_id();
     let mut metrics = DhtWalkMetrics {
         bootstrap_seeded: frontier.len(),
         ..Default::default()
@@ -602,7 +614,7 @@ pub async fn dht_announce_peer(infohash: &[u8; 20], peer_port: u16, budget: Dura
     })
     .await;
 
-    let node_id: [u8; 20] = rand::random();
+    let node_id = session_node_id();
     let mut announced = 0usize;
     for (i, (addr, token)) in tokens.iter().enumerate() {
         let txid = (i as u16).to_be_bytes();
@@ -815,7 +827,36 @@ mod tests {
             a.get(b"token").unwrap().as_bytes(),
             Some(b"tok123".as_slice())
         );
-        assert_eq!(a.get(b"implied_port").unwrap().as_int(), Some(0));
+        assert!(
+            a.get(b"implied_port").is_none(),
+            "the engine sends no implied_port"
+        );
+    }
+
+    /// Byte-exact engine shapes: keys `a q t v y`, the pymdht `v` tag, 2-byte txids.
+    #[test]
+    fn queries_match_engine_wire_shape() {
+        let id = [1u8; 20];
+        let ih = [2u8; 20];
+        let mut expected = b"d1:ad2:id20:".to_vec();
+        expected.extend_from_slice(&id);
+        expected.extend_from_slice(b"9:info_hash20:");
+        expected.extend_from_slice(&ih);
+        expected.extend_from_slice(b"e1:q9:get_peers1:t2:aa1:v4:NS\x01\x181:y1:qe");
+        assert_eq!(build_get_peers(&id, &ih, b"aa"), expected);
+
+        let mut expected = b"d1:ad2:id20:".to_vec();
+        expected.extend_from_slice(&id);
+        expected.extend_from_slice(b"9:info_hash20:");
+        expected.extend_from_slice(&ih);
+        expected.extend_from_slice(b"4:porti8621e5:token2:tke1:q13:announce_peer1:t2:aa");
+        expected.extend_from_slice(b"1:v4:NS\x01\x181:y1:qe");
+        assert_eq!(build_announce_peer(&id, &ih, 8621, b"tk", b"aa"), expected);
+    }
+
+    #[test]
+    fn node_id_is_stable_for_the_process() {
+        assert_eq!(session_node_id(), session_node_id());
     }
 
     #[test]

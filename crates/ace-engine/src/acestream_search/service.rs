@@ -27,6 +27,9 @@ struct HttpTransport;
 impl Transport for HttpTransport {
     fn fetch<'a>(&'a self, raw_url: &'a str, budget: &'a mut usize) -> FetchFuture<'a> {
         Box::pin(async move {
+            if let Some(identity) = ace_swarm::engine_profile::identity() {
+                return fetch_as_engine(raw_url, budget, &identity.user_agent).await;
+            }
             let policy = FetchPolicy::default();
             let url = FetchUrl::parse_source(raw_url, policy)
                 .map_err(|_| SearchError::InvalidSettings)?;
@@ -57,6 +60,36 @@ impl Transport for HttpTransport {
         })
     }
 }
+/// Under the AceStream identity, send the request with the engine's exact head instead of
+/// the HTTP client's defaults. Search hosts are plain HTTP on port 80.
+async fn fetch_as_engine(
+    raw_url: &str,
+    budget: &mut usize,
+    user_agent: &str,
+) -> Result<Vec<u8>, SearchError> {
+    let rest = raw_url
+        .strip_prefix("http://")
+        .ok_or(SearchError::InvalidSettings)?;
+    let (host, path) = rest
+        .find('/')
+        .map(|i| rest.split_at(i))
+        .ok_or(SearchError::InvalidSettings)?;
+    // Room for response headers on top of the body budget.
+    let limit = budget.saturating_add(16 * 1024);
+    let body = ace_swarm::engine_http::get(host, 80, path, user_agent, limit, HOST_DEADLINE)
+        .await
+        .map_err(|e| match e {
+            ace_swarm::engine_http::EngineHttpError::TooLarge => SearchError::TooLarge,
+            ace_swarm::engine_http::EngineHttpError::Timeout => SearchError::Timeout,
+            _ => SearchError::Upstream,
+        })?;
+    if body.len() > *budget {
+        return Err(SearchError::TooLarge);
+    }
+    *budget -= body.len();
+    Ok(body)
+}
+
 const HOSTS: [&str; 3] = [
     "s5.torrentstream.net",
     "s5.torrentstream.org",
@@ -152,7 +185,12 @@ impl SearchService {
             // The service expects a numeric nonce. Hexadecimal random tokens are
             // not interchangeable: server nonce coercion breaks response binding.
             let nonce = rand::random_range(1..=i64::MAX).to_string();
-            let request = super::native::NativeRequest::new(&query, timestamp, nonce);
+            let request = super::native::NativeRequest::for_client(
+                &query,
+                timestamp,
+                nonce,
+                ace_swarm::engine_profile::identity(),
+            );
             let mut hosts = HOSTS;
             hosts.shuffle(&mut rand::rng());
             let mut budget = MAX_RESPONSE_BYTES;

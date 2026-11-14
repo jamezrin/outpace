@@ -40,8 +40,8 @@ Playback works in every mode.
 ## The peer port
 
 - `OUTPACE_PEER_LISTEN` (default `0.0.0.0:8621`) is a **TCP** listener on all interfaces.
-- Outpace announces this same port to trackers and the DHT, so whatever forwards traffic to it
-  must use the same external port.
+- Outpace announces this same port to trackers and the DHT, and peer handshakes advertise it
+  as well, so whatever forwards traffic to it must use the same external port.
 - There is **no UDP listener**. DHT and tracker traffic use outbound UDP from random ports, so
   allow outbound UDP and its replies, but don't forward UDP 8621.
 - Outpace doesn't implement the legacy port 62062 protocol.

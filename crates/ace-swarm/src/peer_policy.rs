@@ -82,7 +82,7 @@ impl fmt::Debug for PayloadLabel<'_> {
 impl PeerPolicy {
     /// Private nodes never accept inbound peers; advertise no listening port.
     pub(crate) fn node_fields(&self) -> ace_wire::extended::NodeFields {
-        let mut fields = ace_wire::extended::NodeFields::default();
+        let mut fields = crate::engine_profile::node_fields();
         if self.is_private() {
             fields.p = 0;
         }

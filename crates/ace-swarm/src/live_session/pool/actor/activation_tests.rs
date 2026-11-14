@@ -177,7 +177,6 @@ async fn activation_obsolete_completion_preserves_current_peers_and_counters() {
             replacement: target,
             write: activation::prepare_with_policy(
                 activation::Start {
-                    peer_id: 3,
                     cursor: 0,
                     head: 10,
                 },
@@ -500,11 +499,7 @@ async fn full_worker_budget_keeps_healthy_control_and_cancellation_responsive() 
     let socket = TcpStream::connect(addr).await.unwrap();
     let (mut remote, _) = listener.accept().await.unwrap();
     let write = activation::prepare_with_policy(
-        activation::Start {
-            peer_id: 2,
-            cursor: 7,
-            head: 8,
-        },
+        activation::Start { cursor: 7, head: 8 },
         ConnectedUpstream {
             session: PeerSession::new(socket),
             addr,
