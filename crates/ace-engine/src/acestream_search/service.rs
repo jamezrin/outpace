@@ -74,20 +74,23 @@ async fn fetch_as_engine(
         .find('/')
         .map(|i| rest.split_at(i))
         .ok_or(SearchError::InvalidSettings)?;
-    // Room for response headers on top of the body budget.
-    let limit = budget.saturating_add(16 * 1024);
-    let body = ace_swarm::engine_http::get(host, 80, path, user_agent, limit, HOST_DEADLINE)
-        .await
-        .map_err(|e| match e {
-            ace_swarm::engine_http::EngineHttpError::TooLarge => SearchError::TooLarge,
-            ace_swarm::engine_http::EngineHttpError::Timeout => SearchError::Timeout,
-            _ => SearchError::Upstream,
-        })?;
-    if body.len() > *budget {
-        return Err(SearchError::TooLarge);
-    }
-    *budget -= body.len();
-    Ok(body)
+    // Received bytes are debited from the shared budget as they arrive, even when the
+    // exchange later fails, so retries across hosts cannot exceed it.
+    ace_swarm::engine_http::get(
+        host,
+        80,
+        path,
+        user_agent,
+        budget,
+        MAX_RESPONSE_BYTES,
+        HOST_DEADLINE,
+    )
+    .await
+    .map_err(|e| match e {
+        ace_swarm::engine_http::EngineHttpError::TooLarge => SearchError::TooLarge,
+        ace_swarm::engine_http::EngineHttpError::Timeout => SearchError::Timeout,
+        _ => SearchError::Upstream,
+    })
 }
 
 const HOSTS: [&str; 3] = [

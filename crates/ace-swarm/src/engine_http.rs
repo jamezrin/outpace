@@ -19,14 +19,16 @@ pub enum EngineHttpError {
 }
 
 /// `GET path_and_query` from `host:port` with the engine's request head and `user_agent`.
-/// Only globally routable addresses are dialed. The whole exchange is bounded by `timeout`
-/// and the raw response by `limit` bytes.
+/// Only globally routable addresses are dialed. The whole exchange is bounded by `timeout`.
+/// Raw response bytes are debited from the caller's shared `budget` as they arrive, so
+/// bytes read before a failure stay spent; the decoded body is bounded by `body_limit`.
 pub async fn get(
     host: &str,
     port: u16,
     path_and_query: &str,
     user_agent: &str,
-    limit: usize,
+    budget: &mut usize,
+    body_limit: usize,
     timeout: Duration,
 ) -> Result<Vec<u8>, EngineHttpError> {
     tokio::time::timeout(timeout, async {
@@ -58,17 +60,22 @@ pub async fn get(
             if n == 0 {
                 break;
             }
-            if response.len() + n > limit {
+            if n > *budget {
                 return Err(EngineHttpError::TooLarge);
             }
+            *budget -= n;
             response.extend_from_slice(&buf[..n]);
         }
-        crate::resolve::http_response_body(&response).map_err(|e| match e {
+        let body = crate::resolve::http_response_body(&response).map_err(|e| match e {
             crate::resolve::ResolveError::Catalog("catalog response too large") => {
                 EngineHttpError::TooLarge
             }
             _ => EngineHttpError::Response,
-        })
+        })?;
+        if body.len() > body_limit {
+            return Err(EngineHttpError::TooLarge);
+        }
+        Ok(body)
     })
     .await
     .unwrap_or(Err(EngineHttpError::Timeout))
@@ -80,9 +87,17 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_non_global_destinations() {
-        let err = get("127.0.0.1", 80, "/", "ua", 1024, Duration::from_secs(2))
-            .await
-            .unwrap_err();
+        let err = get(
+            "127.0.0.1",
+            80,
+            "/",
+            "ua",
+            &mut 1024,
+            1024,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, EngineHttpError::Resolve);
     }
 }

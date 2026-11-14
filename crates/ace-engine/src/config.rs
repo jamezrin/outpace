@@ -635,9 +635,23 @@ pub(crate) fn read_acestream_device_id(data_dir: &Path) -> std::io::Result<Optio
     }
 }
 
+/// Write the id to a private temporary file and publish it only once complete, so a
+/// failed first-use write never leaves a partial id that later reads reject.
 pub(crate) fn write_acestream_device_id(data_dir: &Path, id: &[u8; 20]) -> std::io::Result<()> {
     std::fs::create_dir_all(data_dir)?;
-    write_private(&data_dir.join(ACESTREAM_DEVICE_ID_FILE), id)
+    let tmp = data_dir.join(format!(
+        ".{ACESTREAM_DEVICE_ID_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    let result = (|| {
+        write_private(&tmp, id)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, data_dir.join(ACESTREAM_DEVICE_ID_FILE))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -985,6 +999,17 @@ mod tests {
         let id = [0x11; 20];
         write_acestream_device_id(&dir, &id).unwrap();
         assert_eq!(read_acestream_device_id(&dir).unwrap(), Some(id));
+        // Only the published id remains; the temporary file was renamed into place.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("acestream-device-id"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::write(dir.join("acestream-device-id"), [0u8; 4]).unwrap();
         assert_eq!(
             read_acestream_device_id(&dir).unwrap_err().kind(),

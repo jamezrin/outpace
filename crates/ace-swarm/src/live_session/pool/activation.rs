@@ -56,7 +56,7 @@ pub(super) fn prepare_with_policy(
             monitor.observe_yourip(ip);
         }
         // Identity mode learns our public address from the same echo. No identity, no work.
-        crate::engine_location::note_public_address(ip);
+        crate::engine_location::note_public_address(ip, (*upstream.addr.ip()).into());
     }
     let hs = OutgoingExtendedHandshake {
         ace_metadata_version: 1,

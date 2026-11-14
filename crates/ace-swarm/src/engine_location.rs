@@ -1,6 +1,6 @@
 //! Public-address tally and one RIPEstat lookup for the optional AceStream identity.
 //!
-//! Peers echo our address in `yourip`. After two of them agree on a globally routable
+//! Peers echo our address in `yourip`. After two distinct peers agree on a globally routable
 //! address, one task asks RIPEstat for the ASN and country and records them on the
 //! installed identity. Redirects are not followed. The lookup host is fixed, and DNS
 //! is pinned to an address that passes the same global-address check as other clients.
@@ -19,9 +19,10 @@ const LOOKUP_USER_AGENT: &str = "Python-urllib/3.10";
 const BODY_LIMIT: usize = 256 * 1024;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Remember a public address a peer echoed. Two agreeing global addresses schedule
-/// the single lookup, and only when an identity is installed without a location yet.
-pub fn note_public_address(ip: IpAddr) {
+/// Remember a public address `peer` echoed. Two distinct peers agreeing on a global
+/// address schedule the single lookup, and only when an identity is installed without a
+/// location yet. Repeated echoes from one peer (reconnects, reactivations) count once.
+pub fn note_public_address(ip: IpAddr, peer: IpAddr) {
     let Some(identity) = engine_profile::identity() else {
         return;
     };
@@ -30,10 +31,14 @@ pub fn note_public_address(ip: IpAddr) {
     }
     let ready = {
         let mut watch = watch().lock().unwrap();
+        // Once the lookup fired, later echoes have nothing left to corroborate.
+        if watch.fired {
+            return;
+        }
         watch
             .counts
-            .observe(ip)
-            .filter(|_| !watch.fired && watch.listener.is_some())
+            .observe(ip, peer)
+            .filter(|_| watch.listener.is_some())
     };
     if let Some(ip) = ready {
         dispatch(ip);
@@ -62,6 +67,8 @@ fn dispatch(ip: IpAddr) {
             return;
         }
         watch.fired = true;
+        // The tally is complete; keep only the chosen address.
+        watch.counts.peers = HashMap::new();
         watch.listener.clone()
     };
     if let Some(listener) = listener {
@@ -176,16 +183,19 @@ fn country_from_geoloc(body: &str) -> Option<[u8; 2]> {
 
 #[derive(Default)]
 struct AddressCounts {
-    counts: HashMap<IpAddr, u32>,
+    /// The first peer that echoed each address; a second, different peer corroborates it.
+    peers: HashMap<IpAddr, IpAddr>,
     chosen: Option<IpAddr>,
 }
 
 impl AddressCounts {
-    /// The address that just reached two agreeing observations, once.
-    fn observe(&mut self, ip: IpAddr) -> Option<IpAddr> {
-        let count = self.counts.entry(ip).or_insert(0);
-        *count = count.saturating_add(1);
-        if self.chosen.is_none() && *count >= 2 {
+    /// The address that was just echoed by a second distinct peer, once.
+    fn observe(&mut self, ip: IpAddr, peer: IpAddr) -> Option<IpAddr> {
+        if self.chosen.is_some() {
+            return None;
+        }
+        let first = *self.peers.entry(ip).or_insert(peer);
+        if first != peer {
             self.chosen = Some(ip);
             return Some(ip);
         }
@@ -224,11 +234,28 @@ mod tests {
         let mut counts = AddressCounts::default();
         let first = ip([203, 0, 113, 7]);
         let other = ip([203, 0, 113, 8]);
-        assert_eq!(counts.observe(first), None);
-        assert_eq!(counts.observe(other), None);
-        assert_eq!(counts.observe(first), Some(first));
-        assert_eq!(counts.observe(first), None);
-        assert_eq!(counts.observe(other), None);
+        let (peer_a, peer_b, peer_c) = (
+            ip([198, 51, 100, 1]),
+            ip([198, 51, 100, 2]),
+            ip([198, 51, 100, 3]),
+        );
+        assert_eq!(counts.observe(first, peer_a), None);
+        assert_eq!(counts.observe(other, peer_b), None);
+        assert_eq!(counts.observe(first, peer_b), Some(first));
+        assert_eq!(counts.observe(first, peer_c), None);
+        assert_eq!(counts.observe(other, peer_c), None);
+    }
+
+    #[test]
+    fn repeated_echoes_from_one_peer_count_once() {
+        let mut counts = AddressCounts::default();
+        let addr = ip([203, 0, 113, 7]);
+        let peer = ip([198, 51, 100, 1]);
+        for _ in 0..5 {
+            assert_eq!(counts.observe(addr, peer), None);
+        }
+        assert!(counts.chosen.is_none());
+        assert_eq!(counts.observe(addr, ip([198, 51, 100, 2])), Some(addr));
     }
 
     #[test]
@@ -248,8 +275,8 @@ mod tests {
 
     #[test]
     fn note_without_an_identity_does_not_choose() {
-        note_public_address(ip([203, 0, 113, 7]));
-        note_public_address(ip([203, 0, 113, 7]));
+        note_public_address(ip([203, 0, 113, 7]), ip([198, 51, 100, 1]));
+        note_public_address(ip([203, 0, 113, 7]), ip([198, 51, 100, 2]));
         let watch = watch().lock().unwrap();
         assert!(watch.counts.chosen.is_none());
     }
