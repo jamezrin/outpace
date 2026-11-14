@@ -77,13 +77,6 @@ for players that handle `.m3u8` better than MPEG-TS. **Recently played** on Home
 way to start the same stream again from the remote. The rest of the screens are in the
 [app user guide](https://github.com/outpace-stream/outpace-android/blob/main/docs/Android-App.md).
 
-A pre-release debug build used a different package name and can sit next to v0.1.0 as a second
-Outpace icon. Remove it once the release is installed:
-
-```bash
-adb uninstall io.github.jamezrin.outpace
-```
-
 ## When you are finished installing
 
 USB debugging leaves port 5555 open on the LAN. Anyone on that network who can reach the
