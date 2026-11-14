@@ -57,23 +57,27 @@ The TCL 55T69C does not list **Wireless debugging**. On that set, USB debugging 
 television accepts `adb connect` on port **5555**. Skip the pairing steps and continue at
 [Allow this computer](#allow-this-computer).
 
-A set that does list **Wireless debugging** does not use port 5555 until it is paired. Open that
-screen and note the pairing address, the pairing port, and the pairing code. The ports below are
-examples; use the ones on the screen. The pairing port and the connection port are different.
+A set that does list **Wireless debugging** does not use port 5555 until it is paired. Turn
+**Wireless debugging** on, then open **Pair device with pairing code**. That is what shows the
+pairing address, the pairing port, and the pairing code. The ports below are examples; use the
+ones on the screen. The pairing port and the connection port are different.
 
 ```bash
 adb pair 192.0.2.10:37123
 ```
 
-Enter the code when `adb` asks. Then connect to the address and port shown for the connection:
+Enter the code when `adb` asks. Then connect to the address and port shown for the connection,
+not the pairing port:
 
 ```bash
 adb connect 192.0.2.10:39555
 adb devices
 ```
 
-Turn **Wireless debugging** off when you finish installing. The allow dialog in the next section
-still applies.
+A paired connection is ready when that line says `device`. It does not show **Allow USB
+debugging?** Do not follow the revoke steps below for this path: revoking authorizations drops
+the pairing, and you pair again from **Pair device with pairing code**. Turn **Wireless
+debugging** off when you finish installing.
 
 Find the television's address under **Settings → Network & Internet**, or in the router's client
 list. The examples use `192.0.2.10`. Use the address of your set.
@@ -97,7 +101,9 @@ this computer** if you will install again from the same machine.
 
 If Back never reveals a dialog, open **Developer options → Revoke USB debugging authorizations**,
 return to **Home**, and run `adb connect` once. Connecting again and again stacks another prompt
-each time; dismiss the stack with Back before the next attempt.
+each time; dismiss the stack with Back before the next attempt. These steps are for the port
+5555 path. On a set you paired with **Wireless debugging**, revoking authorizations removes the
+pairing; open **Pair device with pairing code** and pair again instead of waiting for this dialog.
 
 ## Install and open
 
