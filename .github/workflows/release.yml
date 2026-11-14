@@ -274,7 +274,7 @@ jobs:
     # image exist, so a failure can never block either. Builds with a read-only token; the
     # separate upload job below is the only one that can write to the release.
     name: Best-effort ${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs:
       - release-metadata
       - publish-container
@@ -336,7 +336,7 @@ jobs:
     # Write-scoped, but runs no build steps or toolchain actions: it only attaches the
     # archives built above. Each target is best-effort, so it uploads whichever were built.
     name: Upload best-effort Android archives
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: best-effort-android
     if: ${{ !cancelled() }}
     continue-on-error: true

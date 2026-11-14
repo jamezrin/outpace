@@ -20,7 +20,7 @@ env:
 jobs:
   packages:
     name: Build and install-test deb and rpm
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - name: Checkout
