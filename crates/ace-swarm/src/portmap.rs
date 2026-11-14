@@ -531,7 +531,7 @@ impl MapAttempt for UpnpMapper {
 
         // The local address the gateway should forward to. We bind the peer listener on all
         // interfaces, so tell the gateway to route to our LAN IP on that port.
-        let local_ip = local_ip_toward_gateway(gateway.addr.ip())
+        let local_ip = local_ip_toward(gateway.addr.ip())
             .ok_or_else(|| PortMapError::NoGateway("could not resolve local LAN IP".to_string()))?;
         let local_addr = SocketAddr::new(local_ip, cfg.internal_port);
 
@@ -611,15 +611,16 @@ impl MapAttempt for NatPmpMapper {
 // Local/gateway address discovery (heuristic, best-effort)
 // ---------------------------------------------------------------------------------------------
 
-/// Resolve the local LAN IP used to reach `gateway`. Uses the "connect a UDP socket and read
-/// its local address" trick — no packets are sent; the OS just resolves the outbound route.
-fn local_ip_toward_gateway(gateway: IpAddr) -> Option<IpAddr> {
-    let bind = match gateway {
+/// Resolve the local IP the OS would use to reach `peer` (a gateway, or a LAN renderer when
+/// casting). Uses the "connect a UDP socket and read its local address" trick — no packets are
+/// sent; the OS just resolves the outbound route.
+pub fn local_ip_toward(peer: IpAddr) -> Option<IpAddr> {
+    let bind = match peer {
         IpAddr::V4(_) => "0.0.0.0:0",
         IpAddr::V6(_) => "[::]:0",
     };
     let socket = std::net::UdpSocket::bind(bind).ok()?;
-    socket.connect(SocketAddr::new(gateway, 65535)).ok()?;
+    socket.connect(SocketAddr::new(peer, 65535)).ok()?;
     socket.local_addr().ok().map(|a| a.ip())
 }
 

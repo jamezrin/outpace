@@ -31,6 +31,8 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 - **Plays public AceStream content.** Give it a content id, a transport-file URL, an infohash or
   a magnet link and it streams the result to VLC, mpv, ffmpeg, Jellyfin, Dispatcharr and similar
   tools.
+- **Casts to TVs.** It can find DLNA/UPnP renderers on your network and tell one to play a
+  live stream, with no app on the TV.
 - **Serves HLS.** It packages live streams into HLS itself, with optional audio normalisation
   for players that only handle AAC.
 - **Takes part in the swarm.** By default it uploads to other peers and accepts inbound peer
@@ -61,6 +63,7 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 | Look up a setting | [Configuration](Configuration) (by topic) · [Environment Variables](Environment-Variables) (A–Z) |
 | Use `outpace play`, `broadcast` or other commands | [Command Line](Command-Line) |
 | Point a player or app at Outpace | [Playing Streams](Playing-Streams) |
+| Send a live stream to a smart TV or other DLNA renderer | [Casting](Casting) |
 | Tune HLS or fix audio for a player | [HLS Output](HLS-Output) |
 | Rewind a live stream | [Timeshift](Timeshift) |
 | Play descriptors that point at an HLS origin | [Managed HLS Origins](Managed-HLS-Origins) |

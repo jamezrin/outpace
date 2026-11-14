@@ -25,7 +25,10 @@ pub(super) async fn list_streams(State(s): State<AppState>) -> Json<serde_json::
 
 /// Normalize native Ace selectors once, before any session lookup. Provider-facing bare
 /// hashes remain infohash keys so compat and CLI semantics do not change.
-fn native_stream_id<'a>(network: &str, id: &'a str) -> Result<Cow<'a, str>, &'static str> {
+pub(super) fn native_stream_id<'a>(
+    network: &str,
+    id: &'a str,
+) -> Result<Cow<'a, str>, &'static str> {
     if network != "ace" {
         return Ok(Cow::Borrowed(id));
     }
@@ -47,7 +50,7 @@ fn native_stream_id<'a>(network: &str, id: &'a str) -> Result<Cow<'a, str>, &'st
 
 /// Public native identifiers must round-trip through the native selector, including ids
 /// originating in compat sessions whose internal infohash key has no prefix.
-fn native_public_stream_id<'a>(network: &str, id: &'a str) -> Cow<'a, str> {
+pub(super) fn native_public_stream_id<'a>(network: &str, id: &'a str) -> Cow<'a, str> {
     if network == "ace" {
         if let Some(hex) = ace_normalized_hex_id(id) {
             return Cow::Owned(format!("ih:{hex}"));
@@ -333,7 +336,7 @@ fn normalization_body_error(reason: crate::audio_normalize::Failure) -> std::io:
     std::io::Error::other(format!("audio normalization failed: {}", reason.code()))
 }
 
-async fn stream_session_response(
+pub(super) async fn stream_session_response(
     (session, sub): (Arc<StreamSession>, crate::session::Subscription),
     startup_timeout: std::time::Duration,
 ) -> Response {

@@ -30,6 +30,7 @@ pub mod broadcast_pull;
 #[cfg(test)]
 #[path = "broadcast_pull/tests.rs"]
 mod broadcast_pull_tests;
+pub mod cast;
 pub mod cli;
 pub mod config;
 mod engine_identity;

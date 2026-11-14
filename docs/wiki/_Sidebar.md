@@ -12,6 +12,7 @@
 **Watching**
 
 - [Playing Streams](Playing-Streams)
+- [Casting](Casting)
 - [Stream Search](Stream-Search)
 - [HLS Output](HLS-Output)
 - [Timeshift](Timeshift)

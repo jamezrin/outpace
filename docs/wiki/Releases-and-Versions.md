@@ -60,7 +60,8 @@ build.
 
 ## Unreleased
 
-Nothing on `main` is waiting for a release yet.
+- [Casting](Casting): with `OUTPACE_ENABLE_CAST=1`, the engine finds DLNA/UPnP renderers on
+  the LAN and tells one to play a live stream (`/cast/*` routes). Off by default.
 
 ## v1.1.0 changes
 

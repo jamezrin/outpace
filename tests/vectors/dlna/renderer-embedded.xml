@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion><major>1</major><minor>1</minor></specVersion>
+  <URLBase>http://192.168.1.40:49152/dev/</URLBase>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:Basic:1</deviceType>
+    <friendlyName>Software Renderer</friendlyName>
+    <manufacturer>Example Project</manufacturer>
+    <modelName>Example Renderer</modelName>
+    <UDN>uuid:00000000-0000-0000-0000-000000000003</UDN>
+    <deviceList>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaRenderer:2</deviceType>
+        <UDN>uuid:00000000-0000-0000-0000-000000000004</UDN>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:2</serviceType>
+            <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>
+            <controlURL>AVTransport/control</controlURL>
+            <eventSubURL>AVTransport/event</eventSubURL>
+            <SCPDURL>AVTransport/scpd.xml</SCPDURL>
+          </service>
+        </serviceList>
+      </device>
+    </deviceList>
+  </device>
+</root>

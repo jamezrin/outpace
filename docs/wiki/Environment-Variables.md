@@ -28,12 +28,13 @@ See [Releases and Versions](Releases-and-Versions) for publication status.
 | [`OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE`](Configuration#broadcasting-and-ingest) | off | all | Exact `1`: allow private and loopback broadcast pull sources. |
 | [`OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT`](Configuration#discovery-trackers-and-resolution) | off | all | Exact `1`: allow transport-file URLs on private hosts. |
 | [`OUTPACE_BEP9_CONTENT_ID_FALLBACK`](Configuration#discovery-trackers-and-resolution) | `false` | all | Resolve content ids from peer metadata when the catalog fails. |
-| [`OUTPACE_BIND`](Configuration#network-and-listeners) | `127.0.0.1:6878` | all | HTTP API address. The container sets `0.0.0.0:6878`. |
+| [`OUTPACE_BIND`](Configuration#network-and-listeners) | `127.0.0.1:6878` | all | HTTP API address. The container sets `0.0.0.0:6878`. [Casting](Casting) needs a LAN address. |
 | [`OUTPACE_BROADCAST_OPTIONS`](Configuration#broadcasting-and-ingest) | `{}` | all | Per-broadcast metadata profiles (JSON). |
 | [`OUTPACE_BROADCAST_SOURCES`](Configuration#broadcasting-and-ingest) | `{}` | all | HTTP(S) MPEG-TS pull sources started at boot (JSON). Treat as a secret. |
 | [`OUTPACE_CACHE_DIR`](Configuration#storage-and-cache) | `<data dir>/cache` | all | Disk-cache root. Wiped at startup. |
 | [`OUTPACE_CACHE_TYPE`](Configuration#storage-and-cache) | `memory` | all | Where seeding pieces are kept: `memory` or `disk`. |
 | [`OUTPACE_DATA_DIR`](Configuration#storage-and-cache) | platform data dir + `outpace` | all | Identity and broadcast state. The container uses `/var/lib/outpace`. |
+| [`OUTPACE_ENABLE_CAST`](Configuration#casting) | `false` | edge | Add the `/cast/*` routes for DLNA/UPnP renderers. Needs a LAN `OUTPACE_BIND`. |
 | [`OUTPACE_ENABLE_INBOUND`](Configuration#seeding-and-inbound-peers) | `true` | all | Accept inbound peers and announce to trackers and the DHT. |
 | [`OUTPACE_ENABLE_PORT_MAPPING`](Configuration#nat-and-port-mapping) | `false` | all | Ask the router to open the peer port with UPnP or NAT-PMP. |
 | [`OUTPACE_ENABLE_SEEDING`](Configuration#seeding-and-inbound-peers) | `true` | all | Upload to the peers you download from. |

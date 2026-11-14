@@ -45,6 +45,8 @@ libc = "0.2"
 flate2 = "1"
 # Origin playlist reload fingerprints (already a dependency of ace-wire).
 sha2 = "0.11"
+# Bounded DLNA device-description and SOAP parsing (already linked through ace-swarm).
+roxmltree = "0.21"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
