@@ -645,13 +645,44 @@ pub(crate) fn write_acestream_device_id(data_dir: &Path, id: &[u8; 20]) -> std::
     ));
     let result = (|| {
         write_private(&tmp, id)?;
-        std::fs::File::open(&tmp)?.sync_all()?;
+        // Write access: Windows `FlushFileBuffers` refuses a read-only handle.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)?
+            .sync_all()?;
         std::fs::rename(&tmp, data_dir.join(ACESTREAM_DEVICE_ID_FILE))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result
+    result?;
+    // Rename is atomic, not durable: flush the directory entry so a crash cannot
+    // lose the published id and mint a different one on the next start.
+    sync_directory(data_dir)
+}
+
+/// Same platform boundary as `broadcast_persist`: fsync on Unix (plain `fsync` on macOS,
+/// where `sync_all` requests `F_FULLFSYNC`), and no directory flush on other targets.
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(path)?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        dir.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
