@@ -154,7 +154,7 @@ curl "http://127.0.0.1:6878/streams/ace/${CONTENT_ID:?set a content id}/status"
 | `network` | The catalog couldn't be reached. Check VPNs, WARP and firewalls. |
 | `unresolvable` | The id has no verified descriptor; `message` says what to try (often the `cid:` content id). |
 | `protected` | Encrypted content. Outpace doesn't play it. |
-| `capacity` | The session cap is reached. See [Too many streams](#too-many-streams). |
+| `capacity` | The session cap, the catalog resolver or audio conversion is at capacity. Retry shortly; see [Too many streams](#too-many-streams). |
 | `internal` | Something else failed. Check the log. |
 
 ## No peers, or discovery fails

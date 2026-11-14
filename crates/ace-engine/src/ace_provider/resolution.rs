@@ -94,7 +94,7 @@ impl AceProvider {
                 Err(CatalogLookupError::Capacity) => {
                     return Err(ProviderStartFailure::new(
                         StartFailureKind::Capacity,
-                        ProviderError::Backend(
+                        ProviderError::ResolverBusy(
                             "content-id catalog resolution capacity exceeded".into(),
                         ),
                     ));
@@ -390,12 +390,21 @@ impl AceProvider {
             }
             Err(error) => {
                 self.remember_infohash_failure(requested);
+                let kind = error.failure_kind();
+                let reason = format!(
+                    "{} Catalog lookup failed: {error:?}",
+                    unresolved_infohash_message(id)
+                );
+                // An unreachable catalog keeps the `Unresolvable` statuses and message, but
+                // native clients see `network` rather than a refusal of the id.
+                let error = if kind == ace_swarm::resolve::ResolveFailureKind::Network {
+                    ProviderError::UnresolvableNetwork(reason)
+                } else {
+                    ProviderError::Unresolvable(reason)
+                };
                 return Err(ProviderStartFailure::new(
-                    StartFailureKind::Resolution(error.failure_kind()),
-                    ProviderError::Unresolvable(format!(
-                        "{} Catalog lookup failed: {error:?}",
-                        unresolved_infohash_message(id)
-                    )),
+                    StartFailureKind::Resolution(kind),
+                    error,
                 ));
             }
         };
@@ -728,6 +737,40 @@ mod classified_tests {
     }
 
     #[tokio::test]
+    async fn bare_infohash_catalog_outage_is_typed_network_but_keeps_unresolvable_text() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+        let network = provider
+            .resolve_infohash_with_catalog_classified(id, async {
+                Err(ResolveError::CatalogNetwork("diagnostic"))
+            })
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            network.error,
+            ProviderError::UnresolvableNetwork(_)
+        ));
+        assert_eq!(
+            network.kind,
+            StartFailureKind::Resolution(ResolveFailureKind::Network)
+        );
+        assert!(network
+            .error
+            .to_string()
+            .starts_with(&unresolved_infohash_message(id)));
+        let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+        let refused = provider
+            .resolve_infohash_with_catalog_classified(id, async {
+                Err(ResolveError::Catalog("diagnostic"))
+            })
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(refused.error, ProviderError::Unresolvable(_)));
+    }
+
+    #[tokio::test]
     async fn classified_content_id_catalog_capacity_is_retryable_without_fetch() {
         let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
         let ids: Vec<_> = (0..32).map(|index| infohash_hex(&[index; 20])).collect();
@@ -753,6 +796,8 @@ mod classified_tests {
             .unwrap();
         drop(pending);
         assert_eq!(error.kind, StartFailureKind::Capacity);
+        // Typed for the native `capacity` code; HTTP statuses stay those of `Backend`.
+        assert!(matches!(error.error, ProviderError::ResolverBusy(_)));
         assert!(error.kind.retryable());
         assert_eq!(
             error.error.to_string(),

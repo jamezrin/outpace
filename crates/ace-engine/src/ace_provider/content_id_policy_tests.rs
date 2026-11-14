@@ -370,7 +370,7 @@ async fn catalog_resolution_capacity_never_enables_peer_fallback() {
 
     assert!(matches!(
         outcome,
-        Err(ProviderError::Backend(message))
+        Err(ProviderError::ResolverBusy(message))
             if message == "content-id catalog resolution capacity exceeded"
     ));
     assert_eq!(polls.load(Ordering::SeqCst), 32);

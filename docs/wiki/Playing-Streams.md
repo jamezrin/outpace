@@ -98,7 +98,7 @@ A status response looks like this:
 | `connecting` | Descriptor known; looking for and connecting to peers. |
 | `buffering` | Connected to peers; waiting for the first media. |
 | `playing` | Media is flowing out of the stream. |
-| `failed` | The start failed; `error` says why. |
+| `failed` | The start failed; `error` says why. A running stream also reports `failed` when [audio normalisation](HLS-Output#audio-normalisation) failed before any media went out. |
 
 The status route answers from the moment a playback URL is opened, before the stream exists.
 While it is still `resolving` or `connecting`, and for about 60 seconds after a start
@@ -153,17 +153,19 @@ stable error code:
 { "error": { "code": "unresolvable", "message": "..." } }
 ```
 
-The same `error` object appears on the status route while `phase` is `failed`. Key off `code`;
-`message` is human-readable text and can change.
+The same `error` object appears on the status route while `phase` is `failed`, but only for
+live starts on a known network. A VOD failure or an unknown network leaves no start record, so
+the status route answers `404`: read the `error` from the start response itself. Key off
+`code`; `message` is human-readable text and can change.
 
 | `code` | Status | Meaning |
 | --- | --- | --- |
 | `not_found` | `404` | Unknown network, or the start was refused. |
 | `no_peers` | `404` (`502` for VOD) | Nobody is sharing the stream right now: no metadata peer answered, or initial discovery found no peer. |
-| `network` | `404` (`502` for VOD) | The catalog couldn't be reached. Check the network, VPN and firewall. |
+| `network` | `404` (`502` for VOD); `422` for an `ih:` infohash | The catalog couldn't be reached. Check the network, VPN and firewall. |
 | `unresolvable` | `422` (`502` for public VOD) | The id has no verified descriptor. `message` explains why and what to try instead. |
 | `protected` | `422` | Encrypted or invalid-protection content, which Outpace doesn't play. |
-| `capacity` | `503` + `Retry-After: 1` | The [session cap](Configuration#limits-and-admission) is reached. Retry later. |
+| `capacity` | `503` + `Retry-After: 1` (`404` when the catalog resolver is saturated) | The [session cap](Configuration#limits-and-admission), the catalog resolver or audio conversion is at capacity. Retry later. |
 | `no_space` | | Reserved for a VOD free-space check. Not produced yet. |
 | `internal` | `404` (`502` for VOD) | Any other failure. The daemon log shows how far the start got. |
 

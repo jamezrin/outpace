@@ -23,6 +23,10 @@ impl StreamProvider for FailingProvider {
             "invalid-protection" => ProviderError::InvalidProtection,
             "unresolvable" => ProviderError::Unresolvable("synthetic user-facing reason".into()),
             "not-found" => ProviderError::NotFound,
+            "resolver-busy" => ProviderError::ResolverBusy("synthetic resolver diagnostic".into()),
+            "catalog-unreachable" => {
+                ProviderError::UnresolvableNetwork("synthetic catalog diagnostic".into())
+            }
             _ => ProviderError::Backend("synthetic backend diagnostic".into()),
         })
     }
@@ -73,6 +77,13 @@ async fn native_start_failures_return_typed_json_and_status_retains_them() {
         ("network", StatusCode::NOT_FOUND, "network"),
         ("backend", StatusCode::NOT_FOUND, "internal"),
         ("not-found", StatusCode::NOT_FOUND, "not_found"),
+        // Typed codes with the statuses of `Backend` and `Unresolvable` respectively.
+        ("resolver-busy", StatusCode::NOT_FOUND, "capacity"),
+        (
+            "catalog-unreachable",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "network",
+        ),
         ("capacity", StatusCode::SERVICE_UNAVAILABLE, "capacity"),
         ("protected", StatusCode::UNPROCESSABLE_ENTITY, "protected"),
         (
@@ -144,6 +155,66 @@ async fn an_offline_refusal_before_open_is_retained_on_status() {
         assert_eq!(body["phase"], "failed", "{suffix}: {body}");
         assert_eq!(body["error"]["code"], "unresolvable", "{suffix}: {body}");
         assert_eq!(body["error"]["message"], "synthetic refusal", "{suffix}");
+    }
+}
+
+/// Opens sources whose audio normalization has already failed, before any output.
+struct NormalizationFailedProvider;
+
+struct NormalizationFailedSource(crate::audio_normalize::PlaybackStateHandle);
+
+#[async_trait]
+impl TsSource for NormalizationFailedSource {
+    async fn next(&mut self) -> Option<Bytes> {
+        std::future::pending().await
+    }
+    fn stats(&self) -> SourceStats {
+        SourceStats::default()
+    }
+    fn playback_state(&self) -> Option<crate::audio_normalize::PlaybackStateHandle> {
+        Some(self.0.clone())
+    }
+}
+
+#[async_trait]
+impl StreamProvider for NormalizationFailedProvider {
+    fn network(&self) -> &'static str {
+        "norm"
+    }
+    async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        use crate::audio_normalize::{Failure, PlaybackPublisher};
+        let (publisher, handle) = PlaybackPublisher::new();
+        assert!(publisher.begin_generation(1));
+        let reason = if id == "admission" {
+            Failure::Admission
+        } else {
+            Failure::ChildExit
+        };
+        assert!(publisher.fail(1, reason));
+        Ok(Box::new(NormalizationFailedSource(handle)))
+    }
+}
+
+#[tokio::test]
+async fn a_session_whose_normalization_failed_before_output_reports_failed() {
+    let state = app_state(Arc::new(NormalizationFailedProvider));
+    let app = router(state.clone());
+    for (id, code, message) in [
+        (
+            "child",
+            "internal",
+            "audio normalization failed: child_exit",
+        ),
+        ("admission", "capacity", "audio conversion capacity reached"),
+    ] {
+        state.manager.get_or_start("norm", id).await.unwrap();
+        let response = get(&app, &format!("/streams/norm/{id}/status")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["phase"], "failed", "{id}: {body}");
+        assert_eq!(body["error"]["code"], code, "{id}: {body}");
+        assert_eq!(body["error"]["message"], message, "{id}: {body}");
+        assert_eq!(body["normalization"]["state"], "failed", "{id}: {body}");
     }
 }
 

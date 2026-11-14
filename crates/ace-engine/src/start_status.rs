@@ -127,7 +127,9 @@ impl StartError {
         match error {
             ProviderError::NotFound => Self::new(StartErrorCode::NotFound),
             ProviderError::NoPeers(_) => Self::new(StartErrorCode::NoPeers),
-            ProviderError::Network(_) => Self::new(StartErrorCode::Network),
+            ProviderError::Network(_) | ProviderError::UnresolvableNetwork(_) => {
+                Self::new(StartErrorCode::Network)
+            }
             ProviderError::Unresolvable(reason) => Self {
                 code: StartErrorCode::Unresolvable,
                 message: reason.clone(),
@@ -136,10 +138,27 @@ impl StartError {
                 code: StartErrorCode::Protected,
                 message: error.to_string(),
             },
-            ProviderError::CapacityExhausted => Self::new(StartErrorCode::Capacity),
+            ProviderError::CapacityExhausted | ProviderError::ResolverBusy(_) => {
+                Self::new(StartErrorCode::Capacity)
+            }
             ProviderError::Backend(_) | ProviderError::DirectHls(_) => {
                 Self::new(StartErrorCode::Internal)
             }
+        }
+    }
+
+    /// Classify an audio normalization failure that ended a session before any output:
+    /// conversion admission is `capacity`, anything else `internal` with its fixed reason code.
+    pub fn from_normalization(failure: crate::audio_normalize::Failure) -> Self {
+        match failure {
+            crate::audio_normalize::Failure::Admission => Self {
+                code: StartErrorCode::Capacity,
+                message: "audio conversion capacity reached".to_owned(),
+            },
+            other => Self {
+                code: StartErrorCode::Internal,
+                message: format!("audio normalization failed: {}", other.code()),
+            },
         }
     }
 
@@ -263,6 +282,10 @@ impl StartAttempts {
         let mut log = self.log.lock().unwrap();
         if let Some(index) = log.position(key, seq) {
             let attempt = &mut log.entries[index];
+            // Failure is terminal: a late progress report must not revive it or its expiry.
+            if attempt.failed_at.is_some() {
+                return;
+            }
             attempt.failed_at = matches!(status, AttemptStatus::Failed(_)).then_some(now);
             attempt.status = status;
         }
@@ -406,6 +429,14 @@ mod tests {
                 ProviderError::Backend("detail http://host".into()),
                 StartErrorCode::Internal,
             ),
+            (
+                ProviderError::ResolverBusy("detail resolver".into()),
+                StartErrorCode::Capacity,
+            ),
+            (
+                ProviderError::UnresolvableNetwork("detail http://host".into()),
+                StartErrorCode::Network,
+            ),
         ];
         for (error, code) in cases {
             let mapped = StartError::from_provider(&error);
@@ -459,6 +490,23 @@ mod tests {
         assert_eq!(attempts.status(&key("a")), Some(AttemptStatus::Resolving));
         second.fail(&ProviderError::NotFound);
         assert_eq!(attempts.len(), 1);
+    }
+
+    #[test]
+    fn late_progress_never_overwrites_a_failure() {
+        let attempts = Arc::new(StartAttempts::default());
+        let attempt = attempts.begin(key("a"));
+        let progress = attempt.progress();
+        attempt.fail(&ProviderError::NoPeers("x".into()));
+        progress.resolved();
+        let status = attempts.status(&key("a")).unwrap();
+        assert_eq!(status.phase(), StartPhase::Failed);
+        assert_eq!(status.error().unwrap().code, StartErrorCode::NoPeers);
+        // Still expires: the failure time survived the late report.
+        assert_eq!(
+            attempts.status_at(&key("a"), Instant::now() + START_ATTEMPT_TTL),
+            None
+        );
     }
 
     #[test]

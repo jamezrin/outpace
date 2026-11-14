@@ -218,11 +218,19 @@ pub enum ProviderError {
     /// A network step (catalog hosts) was unreachable, as distinct from [`Self::NoPeers`]. The
     /// message is a diagnostic for the log; HTTP clients get the stable `network` code.
     Network(String),
+    /// A shared resolver (the catalog-resolution cache) was at capacity. HTTP statuses are those
+    /// of [`Self::Backend`]; native clients get the stable `capacity` code. The message is a
+    /// diagnostic for the log.
+    ResolverBusy(String),
     /// The id is well-formed, but the provider holds no verified metadata to open it with and
     /// will not guess (#164: a bare infohash without a verified transport descriptor). The
     /// message is user-facing: it explains the refusal and how to open the stream instead, and
     /// is safe to return to HTTP clients and to print in the CLI.
     Unresolvable(String),
+    /// [`Self::Unresolvable`] because the catalog lookup that would have verified the id could
+    /// not reach the catalog. HTTP statuses and the user-facing message are those of
+    /// `Unresolvable`; native clients get the stable `network` code.
+    UnresolvableNetwork(String),
     /// The id resolved to an origin HLS source, which cannot be opened as raw TS. HTTP callers
     /// hand this URL to the player (or the opt-in managed relay); no local session or piece
     /// geometry is created. `Debug` and `Display` never include the (possibly signed) URL.
@@ -239,7 +247,9 @@ impl std::fmt::Display for ProviderError {
             ProviderError::Backend(msg)
             | ProviderError::NoPeers(msg)
             | ProviderError::Network(msg)
-            | ProviderError::Unresolvable(msg) => f.write_str(msg),
+            | ProviderError::ResolverBusy(msg)
+            | ProviderError::Unresolvable(msg)
+            | ProviderError::UnresolvableNetwork(msg) => f.write_str(msg),
             ProviderError::DirectHls(_) => {
                 f.write_str("source is origin HLS; open it through an HTTP playback route")
             }

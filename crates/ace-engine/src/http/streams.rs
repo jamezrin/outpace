@@ -95,11 +95,12 @@ pub(super) async fn stream_status(
     match s.manager.get(&network, &id).await {
         Some(session) => {
             let stats = session.stats().await;
+            let (phase, error) = session_phase(&session, &stats);
             Json(json!({
                 "network": network,
                 "id": native_public_stream_id(&network, &id),
-                "phase": session_phase(&session, &stats).as_str(),
-                "error": null,
+                "phase": phase.as_str(),
+                "error": error.as_ref().map(StartError::to_json),
                 "clients": session.subscriber_count(),
                 "occupied_sessions": s.manager.admission_status().0,
                 "max_sessions": s.manager.admission_status().1,
@@ -130,16 +131,30 @@ pub(super) async fn stream_status(
     }
 }
 
-/// Start phase of a running session: `playing` once media has left the session, `buffering`
-/// while connected peers have not produced output yet, `connecting` before any peer connects.
-fn session_phase(session: &StreamSession, stats: &crate::provider::SourceStats) -> StartPhase {
+/// Start phase of a running session: `playing` once media has left the session, `failed` when
+/// audio normalization failed before any output, `buffering` while connected peers have not
+/// produced output yet, `connecting` before any peer connects.
+fn session_phase(
+    session: &StreamSession,
+    stats: &crate::provider::SourceStats,
+) -> (StartPhase, Option<StartError>) {
     if session.output_started() {
-        StartPhase::Playing
-    } else if stats.peers > 0 {
+        return (StartPhase::Playing, None);
+    }
+    if let Some(state) = session.playback_state() {
+        if let crate::audio_normalize::PlaybackPhase::Failed(reason) = state.snapshot().phase {
+            return (
+                StartPhase::Failed,
+                Some(StartError::from_normalization(reason)),
+            );
+        }
+    }
+    let phase = if stats.peers > 0 {
         StartPhase::Buffering
     } else {
         StartPhase::Connecting
-    }
+    };
+    (phase, None)
 }
 
 /// `GET /streams/{network}/{id}/seg/{n}.ts` — a retained HLS segment.
@@ -179,7 +194,8 @@ async fn stream_start_error(s: &AppState, e: ProviderError) -> Response {
         ProviderError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
         ProviderError::ProtectedContent
         | ProviderError::InvalidProtection
-        | ProviderError::Unresolvable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        | ProviderError::Unresolvable(_)
+        | ProviderError::UnresolvableNetwork(_) => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::NOT_FOUND,
     };
     let error = StartError::from_provider(&e);

@@ -168,7 +168,9 @@ pub(super) async fn resolve_vod(
         ProviderError::ProtectedContent | ProviderError::InvalidProtection => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        ProviderError::Unresolvable(_) if s.peer_policy.is_private() => {
+        ProviderError::Unresolvable(_) | ProviderError::UnresolvableNetwork(_)
+            if s.peer_policy.is_private() =>
+        {
             StatusCode::UNPROCESSABLE_ENTITY
         }
         ProviderError::NotFound => StatusCode::NOT_FOUND,
