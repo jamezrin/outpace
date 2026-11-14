@@ -25,7 +25,7 @@ const BOOTSTRAP: &[&str] = &[
 const DHT_PEER_TARGET: usize = 8;
 
 /// How long an inflight `(source, txid)` query stays eligible to be answered. Long enough to
-/// admit a genuine reply that lands a round or two late, short enough that a stale entry can't
+/// admit a genuine reply that lands after its slot was handed to another query, short enough that a stale entry can't
 /// be matched by an unrelated packet arriving much later in the walk.
 const INFLIGHT_TTL: Duration = Duration::from_secs(3);
 
@@ -216,7 +216,7 @@ fn distance(id: &[u8; 20], target: &[u8; 20]) -> [u8; 20] {
 
 /// Iterative `get_peers` walk toward `infohash`, shared by `dht_get_peers` (harvest peers)
 /// and `dht_announce_peer` (harvest tokens to announce back with). Seeds the frontier from
-/// bootstrap routers, sends batched queries to the closest not-yet-queried nodes, and calls
+/// bootstrap routers, keeps queries outstanding to the closest not-yet-queried nodes, and calls
 /// `on_response` for each reply — which returns `true` to stop the walk early (e.g. "enough
 /// peers" or "enough tokens"). Bounded by `budget` regardless.
 async fn dht_walk(
@@ -470,8 +470,10 @@ async fn dht_walk_owned(
         // Removing the entry also means a duplicate/replayed packet for the same query is not
         // processed twice. Unmatched packets never free a slot, so spoofed traffic can't
         // speed the walk up or cut it short.
+        // The expiry is re-checked here because `retain` only runs when the loop wakes, and a
+        // packet can land after `expires` but before the next wake.
         match inflight.get_mut(&src) {
-            Some(query) if resp.txid == query.txid => {
+            Some(query) if resp.txid == query.txid && query.expires > Instant::now() => {
                 inflight.remove(&src);
             }
             Some(query) => {
@@ -1497,7 +1499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn walk_metrics_count_a_silent_round_as_a_timeout() {
+    async fn walk_metrics_count_a_silent_query_as_a_timeout() {
         // A seed that receives the query but never answers: the response window elapses in
         // total silence, which is a timeout, and the walk then exhausts its frontier.
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1593,6 +1595,49 @@ mod tests {
             out.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         }
         out
+    }
+
+    #[tokio::test]
+    async fn reply_after_inflight_ttl_is_rejected_without_an_intervening_wake() {
+        // The only query's slot releases at SLOT_TIMEOUT; a still-pending bootstrap lookup then
+        // keeps the walk parked with no other wake before the reply lands past INFLIGHT_TTL.
+        // That late packet must not be correlated against the expired entry.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = v4_addr(&server);
+        let peer: SocketAddrV4 = "10.0.0.4:4444".parse().unwrap();
+        let replier = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, caller) = server.recv_from(&mut buf).await.unwrap();
+            tokio::time::sleep(INFLIGHT_TTL + Duration::from_millis(200)).await;
+            let resp = response_with(&buf_txid(&buf[..n]), &[peer], &[]);
+            server.send_to(&resp, caller).await.unwrap();
+            std::future::pending::<()>().await
+        });
+        let mut lookups = tokio::task::JoinSet::new();
+        lookups.spawn(async {
+            std::future::pending::<()>().await;
+            (0, None)
+        });
+        let mut frontier = BTreeMap::new();
+        frontier.insert([0xff; 20], seed);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut accepted = false;
+        let metrics = dht_walk_owned(
+            &[0u8; 20],
+            Instant::now() + INFLIGHT_TTL + Duration::from_millis(600),
+            &client,
+            frontier,
+            lookups,
+            |_src, resp| {
+                accepted |= resp.peers.contains(&peer);
+                false
+            },
+        )
+        .await;
+        replier.abort();
+        assert!(!accepted, "reply past INFLIGHT_TTL was correlated");
+        assert_eq!(metrics.valid_responses, 0);
+        assert_eq!(metrics.uncorrelated_responses, 1);
     }
 
     #[tokio::test]
