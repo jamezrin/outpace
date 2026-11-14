@@ -2,7 +2,7 @@
 //!
 //! The XML is untrusted: it is size-capped before parsing, parsed without DTDs under a node
 //! limit, walked only to a fixed device-nesting depth, and its control URL must stay on the
-//! host that served the description.
+//! host and port that served the description.
 
 use super::url::LanUrl;
 use super::CastError;
@@ -60,8 +60,10 @@ pub fn parse(xml: &[u8], location: &LanUrl) -> Result<Renderer, CastError> {
     let Some((device, (service_type, control))) = device else {
         return Err(CastError::Malformed("no AVTransport service"));
     };
+    // `URLBase` and the control URL may be absolute (or `//host`), so check the result: the
+    // control endpoint must be the very host and port that served this description.
     let control = base.join(control)?;
-    if control.ip() != location.ip() {
+    if control.addr != location.addr {
         return Err(CastError::Forbidden("control url is on another host"));
     }
     let field = |name| {
@@ -160,7 +162,34 @@ mod tests {
         );
         assert_eq!(
             renderer.control,
-            LanUrl::parse("http://192.168.1.40:8200/dev/AVTransport/control").unwrap()
+            LanUrl::parse("http://192.168.1.40:49152/dev/AVTransport/control").unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_a_control_url_on_another_port_or_via_url_base() {
+        let device = |url_base: &str, control: &str| {
+            format!(
+                "<root>{url_base}<device><serviceList><service>\
+                 <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>\
+                 <controlURL>{control}</controlURL></service></serviceList></device></root>"
+            )
+        };
+        let forbidden = Err(CastError::Forbidden("control url is on another host"));
+        for (url_base, control) in [
+            ("", "http://192.168.1.40:8080/ctl"),
+            ("", "//192.168.1.40:22/ctl"),
+            ("", "//192.168.1.1/ctl"),
+            ("<URLBase>http://192.168.1.40:1900/</URLBase>", "ctl"),
+            ("<URLBase>http://192.168.1.1:49152/</URLBase>", "/ctl"),
+        ] {
+            let xml = device(url_base, control);
+            assert_eq!(parse(xml.as_bytes(), &location()), forbidden, "{xml}");
+        }
+        let ok = device("<URLBase>http://192.168.1.40:49152/a/</URLBase>", "ctl");
+        assert_eq!(
+            parse(ok.as_bytes(), &location()).unwrap().control.path,
+            "/a/ctl"
         );
     }
 

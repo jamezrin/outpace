@@ -104,7 +104,8 @@ async fn cast_stream_serves_the_shared_session_and_counts_the_fetch() {
         send(&app, "GET", "/cast/s/0000.ts", "").await.0,
         StatusCode::NOT_FOUND
     );
-    let token = cast.insert_cast_for_test("t1", "test", "abc");
+    let renderer = crate::cast::test_support::target("t1", "127.0.0.1:9".parse().unwrap());
+    let token = cast.insert_cast_for_test(renderer, "test", "abc");
     let response = app
         .clone()
         .oneshot(
@@ -160,4 +161,38 @@ async fn play_starts_the_stream_then_drives_the_renderer() {
     assert_eq!(actions.len(), 2);
     assert!(actions[0].ends_with("#SetAVTransportURI\""));
     assert!(actions[1].ends_with("#Play\""));
+}
+
+#[tokio::test]
+async fn cast_stream_answers_head_and_routes_check_the_method() {
+    let (app, cast) = cast_app("192.168.1.2:6878");
+    let renderer = crate::cast::test_support::target("t1", "127.0.0.1:9".parse().unwrap());
+    let token = cast.insert_cast_for_test(renderer, "test", "abc");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(format!("/cast/s/{token}.ts"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "video/mp2t");
+    drop(response);
+    for (method, uri) in [
+        ("GET", "/cast/targets/t1/play".to_string()),
+        ("POST", "/cast/targets".to_string()),
+        ("DELETE", "/cast/targets/t1/stop".to_string()),
+        ("GET", format!("/cast/s/{token}")),
+        ("GET", "/cast/targets/t1/play/extra".to_string()),
+    ] {
+        assert_eq!(
+            send(&app, method, &uri, "").await.0,
+            StatusCode::NOT_FOUND,
+            "{method} {uri}"
+        );
+    }
 }

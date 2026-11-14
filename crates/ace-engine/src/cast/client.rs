@@ -99,10 +99,21 @@ fn build_request(request: &Request<'_>) -> Result<Vec<u8>, CastError> {
 /// Parse a buffered response. `Ok(None)` means more bytes are needed; `eof` says the peer
 /// closed, which completes a body without framing.
 pub fn parse_response(
-    buf: &[u8],
+    mut buf: &[u8],
     max_body: usize,
     eof: bool,
 ) -> Result<Option<HttpResponse>, CastError> {
+    // Skip interim `1xx` heads (`100 Continue`, `103 Early Hints`) before the final response.
+    // The caller's byte cap bounds how many there can be.
+    while buf.len() > 12 && buf.starts_with(b"HTTP/1.") && buf[8] == b' ' && buf[9] == b'1' {
+        match find(buf, b"\r\n\r\n") {
+            Some(head_end) if head_end <= MAX_HEAD => buf = &buf[head_end + 4..],
+            Some(_) => return Err(CastError::TooLarge),
+            None if buf.len() > MAX_HEAD => return Err(CastError::TooLarge),
+            None if eof => return Err(CastError::Malformed("truncated http response")),
+            None => return Ok(None),
+        }
+    }
     let Some(head_end) = find(buf, b"\r\n\r\n") else {
         if buf.len() > MAX_HEAD {
             return Err(CastError::TooLarge);
@@ -211,7 +222,9 @@ fn decode_chunked(mut data: &[u8], max_body: usize) -> Result<Option<Vec<u8>>, C
             // but a peer that closes right after `0\r\n` is accepted at EOF by the caller.
             return Ok(find(data, b"\r\n").map(|_| out));
         }
-        if out.len() + size > max_body {
+        // `out.len() <= max_body` holds here, so this cannot overflow even where `usize` is
+        // 32 bits and a chunk size of `ffffffff` would wrap `out.len() + size`.
+        if size > max_body - out.len() {
             return Err(CastError::TooLarge);
         }
         if data.len() < size + 2 {
@@ -264,6 +277,22 @@ mod tests {
     }
 
     #[test]
+    fn skips_informational_responses() {
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        assert_eq!(complete(raw).body, b"ok");
+        assert_eq!(complete(raw).status, 200);
+        assert_eq!(
+            parse_response(b"HTTP/1.1 100 Continue\r\n\r\n", 1024, false).unwrap(),
+            None
+        );
+        // At EOF with no final response, `send` reports a truncated response.
+        assert!(!matches!(
+            parse_response(b"HTTP/1.1 100 Continue\r\n\r\n", 1024, true),
+            Ok(Some(_))
+        ));
+    }
+
+    #[test]
     fn decodes_chunked_bodies() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\n\r\n";
         assert_eq!(complete(raw).body, b"abcde");
@@ -295,6 +324,13 @@ mod tests {
         let big_chunk = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n";
         assert_eq!(
             parse_response(big_chunk, 1024, false),
+            Err(CastError::TooLarge)
+        );
+        // A maximal chunk size after a first chunk must not wrap the length check.
+        let wrapping =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffff\r\nb\r\n";
+        assert_eq!(
+            parse_response(wrapping, 1024, false),
             Err(CastError::TooLarge)
         );
         let huge_head = vec![b'a'; MAX_HEAD + 1];

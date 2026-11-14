@@ -83,7 +83,7 @@ impl LanUrl {
         }
         Ok(Self {
             addr,
-            path: path.to_string(),
+            path: remove_dot_segments(path),
         })
     }
 
@@ -108,6 +108,9 @@ impl LanUrl {
             return Self::with_path(self.addr, reference);
         }
         let base = self.path.split('?').next().unwrap_or("/");
+        if reference.starts_with('?') {
+            return Self::with_path(self.addr, &format!("{base}{reference}"));
+        }
         let dir = &base[..base.rfind('/').map_or(0, |at| at + 1)];
         let dir = if dir.is_empty() { "/" } else { dir };
         Self::with_path(self.addr, &format!("{dir}{reference}"))
@@ -116,6 +119,39 @@ impl LanUrl {
     pub fn ip(&self) -> Ipv4Addr {
         *self.addr.ip()
     }
+}
+
+/// RFC 3986 section 5.2.4 on the path part of an origin-form target (the query is kept).
+fn remove_dot_segments(target: &str) -> String {
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    let mut trailing_slash = false;
+    for segment in path.split('/').skip(1) {
+        trailing_slash = matches!(segment, "." | "..");
+        match segment {
+            "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    let mut out = String::with_capacity(target.len());
+    for segment in &segments {
+        out.push('/');
+        out.push_str(segment);
+    }
+    if trailing_slash || out.is_empty() {
+        out.push('/');
+    }
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
 }
 
 fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -173,6 +209,11 @@ mod tests {
         let network_path = base.join("//192.168.1.9:81/y").unwrap();
         assert_eq!(network_path.addr, "192.168.1.9:81".parse().unwrap());
         assert!(base.join("gopher://192.168.1.4/").is_err());
+        assert_eq!(base.join("?svc=avt").unwrap().path, "/dev/desc.xml?svc=avt");
+        assert_eq!(base.join("../ctl").unwrap().path, "/ctl");
+        assert_eq!(base.join("../../a/./b/..").unwrap().path, "/a/");
+        assert_eq!(base.join("./x?a=../b").unwrap().path, "/dev/x?a=../b");
+        assert_eq!(base.join("/").unwrap().path, "/");
     }
 
     #[test]

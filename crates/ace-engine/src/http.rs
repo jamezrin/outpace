@@ -359,7 +359,7 @@ pub fn router_with_services(
         router = router.route("/search", get(search::search));
     }
     if let Some(cast) = cast {
-        router = router.merge(cast::routes(cast));
+        router = router.route("/cast/{*path}", cast::route(cast));
     }
     router
         .with_state(state)

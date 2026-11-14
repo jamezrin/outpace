@@ -336,7 +336,7 @@ fn normalization_body_error(reason: crate::audio_normalize::Failure) -> std::io:
     std::io::Error::other(format!("audio normalization failed: {}", reason.code()))
 }
 
-async fn stream_session_response(
+pub(super) async fn stream_session_response(
     (session, sub): (Arc<StreamSession>, crate::session::Subscription),
     startup_timeout: std::time::Duration,
 ) -> Response {

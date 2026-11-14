@@ -170,6 +170,66 @@ async fn unknown_targets_are_rejected() {
     assert!(cast.open_stream("nope").is_none());
 }
 
+#[tokio::test]
+async fn an_active_cast_stays_controllable_after_discovery_drops_its_renderer() {
+    let (addr, renderer) = fake_renderer(vec![(200, INFO), (200, OK)]).await;
+    let cast = service("192.168.1.2:6878");
+    // Cast to a renderer that the current discovery result does not list.
+    let token = cast.insert_cast_for_test(test_support::target("gone", addr), "ace", "x");
+    assert!(cast.status("gone").await.unwrap().cast.is_some());
+    cast.stop("gone").await.unwrap();
+    assert!(cast.open_stream(&token).is_none());
+    assert_eq!(
+        cast.stop("gone").await.unwrap_err(),
+        CastError::UnknownTarget
+    );
+    assert_eq!(renderer.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn operations_on_one_target_are_serialized() {
+    // The renderer answers the first SOAP call only after a delay; a stop sent meanwhile
+    // must wait for the play sequence to finish instead of interleaving with it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let server = tokio::spawn(async move {
+        let mut actions = Vec::new();
+        for delay in [300u64, 0, 0] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut request = Vec::new();
+            while !String::from_utf8_lossy(&request).contains("</s:Envelope>") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            let text = String::from_utf8_lossy(&request).to_string();
+            let action = text.split('#').nth(1).unwrap().split('"').next().unwrap();
+            actions.push(action.to_string());
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{OK}",
+                OK.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+        actions
+    });
+    let cast = Arc::new(service("192.168.1.2:6878"));
+    cast.insert_target_for_test(test_support::target("t1", addr));
+    let playing = tokio::spawn({
+        let cast = cast.clone();
+        async move { cast.play("t1", "ace", "x", "t").await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cast.stop("t1").await.unwrap();
+    let started = playing.await.unwrap().unwrap();
+    assert!(cast.open_stream(&started.token).is_none());
+    assert_eq!(server.await.unwrap(), ["SetAVTransportURI", "Play", "Stop"]);
+}
+
 #[test]
 fn stream_address_follows_the_bind() {
     let renderer = Ipv4Addr::new(192, 168, 1, 40);

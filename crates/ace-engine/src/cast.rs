@@ -150,6 +150,9 @@ pub struct Cast {
     /// The MPEG-TS MIME type the renderer accepted; the stream route serves this type.
     pub mime: &'static str,
     connections: Arc<AtomicUsize>,
+    /// The renderer's control endpoint, kept so `stop` and `status` still reach it after a
+    /// later discovery misses its SSDP reply.
+    renderer: Target,
 }
 
 impl Cast {
@@ -193,6 +196,9 @@ pub struct CastService {
     state: Mutex<State>,
     /// Single-flights discovery so concurrent `/cast/targets` calls share one search.
     discovery: tokio::sync::Mutex<()>,
+    /// Per-target operation locks, so one renderer's `play` and `stop` SOAP sequences never
+    /// interleave. An entry lives only while an operation holds or awaits it.
+    operations: Mutex<Vec<(String, Arc<tokio::sync::Mutex<()>>)>>,
 }
 
 impl CastService {
@@ -265,15 +271,39 @@ impl CastService {
         self.target(id).is_ok()
     }
 
+    /// The renderer `id` from the last discovery, or from its active cast.
     fn target(&self, id: &str) -> Result<Target, CastError> {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        state
             .targets
             .iter()
             .find(|target| target.id == id)
+            .or_else(|| {
+                state
+                    .casts
+                    .iter()
+                    .find(|cast| cast.target == id)
+                    .map(|cast| &cast.renderer)
+            })
             .cloned()
             .ok_or(CastError::UnknownTarget)
+    }
+
+    /// Wait for exclusive control of renderer `id`.
+    async fn operation(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut operations = self.operations.lock().unwrap();
+            operations.retain(|(_, lock)| Arc::strong_count(lock) > 1);
+            match operations.iter().find(|(known, _)| known == id) {
+                Some((_, lock)) => lock.clone(),
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    operations.push((id.to_string(), lock.clone()));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
     }
 
     /// The URL a renderer at `renderer` can fetch `/cast/s/<token>.ts` from.
@@ -301,6 +331,7 @@ impl CastService {
         title: &str,
     ) -> Result<Cast, CastError> {
         self.check_bind()?;
+        let _operation = self.operation(target_id).await;
         let target = self.target(target_id)?;
         let token = hex::encode(rand::random::<[u8; 16]>());
         let url = self.stream_url(target.address, &token)?;
@@ -312,6 +343,7 @@ impl CastService {
             url: url.clone(),
             mime: soap::TS_MIME_TYPES[0],
             connections: Arc::new(AtomicUsize::new(0)),
+            renderer: target.clone(),
         };
         let previous = self.replace_cast(cast.clone());
         if previous.is_some() {
@@ -370,6 +402,7 @@ impl CastService {
 
     /// Stop playback on `target_id` and forget its cast.
     pub async fn stop(&self, target_id: &str) -> Result<(), CastError> {
+        let _operation = self.operation(target_id).await;
         let target = self.target(target_id)?;
         let removed = self.remove_cast(&target.id, None);
         let result = soap_call(
@@ -442,16 +475,17 @@ impl CastService {
     }
 
     #[cfg(test)]
-    pub(crate) fn insert_cast_for_test(&self, target: &str, network: &str, id: &str) -> String {
+    pub(crate) fn insert_cast_for_test(&self, renderer: Target, network: &str, id: &str) -> String {
         let token = hex::encode(rand::random::<[u8; 16]>());
         self.replace_cast(Cast {
-            target: target.to_string(),
+            target: renderer.id.clone(),
             token: token.clone(),
             network: network.to_string(),
             id: id.to_string(),
             url: String::new(),
             mime: soap::TS_MIME_TYPES[0],
             connections: Arc::new(AtomicUsize::new(0)),
+            renderer,
         });
         token
     }

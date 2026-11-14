@@ -3,17 +3,36 @@
 
 use super::*;
 use crate::cast::{CastError, CastService, Target};
-use axum::extract::Extension;
-use axum::routing::post;
+use axum::extract::{Extension, RawQuery};
+use axum::http::Method;
+use axum::routing::{any, MethodRouter};
 
-pub(super) fn routes(cast: Arc<CastService>) -> Router<AppState> {
-    Router::new()
-        .route("/cast/targets", get(list_targets))
-        .route("/cast/targets/{target}/play", post(play))
-        .route("/cast/targets/{target}/stop", post(stop))
-        .route("/cast/targets/{target}/status", get(status))
-        .route("/cast/s/{file}", get(cast_stream))
-        .layer(Extension(cast))
+/// One route, `/cast/{*path}`, dispatched here. A single handler keeps the binary small: each
+/// axum handler is its own monomorphized service, and casting is an opt-in feature.
+pub(super) fn route(cast: Arc<CastService>) -> MethodRouter<AppState> {
+    any(dispatch).layer(Extension(cast))
+}
+
+async fn dispatch(
+    State(s): State<AppState>,
+    Extension(cast): Extension<Arc<CastService>>,
+    method: Method,
+    Path(path): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response {
+    let segments: Vec<&str> = path.split('/').collect();
+    let get = method == Method::GET;
+    let post = method == Method::POST;
+    match segments.as_slice() {
+        ["targets"] if get => list_targets(&cast, query.as_deref()).await,
+        ["targets", target, "play"] if post => play(&s, &cast, target, &body).await,
+        ["targets", target, "stop"] if post => stop(&cast, target).await,
+        ["targets", target, "status"] if get => status(&cast, target).await,
+        // Renderers often probe the stream with HEAD; hyper sends no body for it.
+        ["s", file] if get || method == Method::HEAD => cast_stream(&s, &cast, file).await,
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 fn error_response(error: &CastError) -> Response {
@@ -70,17 +89,13 @@ fn target_json(target: &Target) -> serde_json::Value {
     })
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct TargetsQuery {
-    refresh: Option<String>,
-}
-
 /// `GET /cast/targets[?refresh=1]` — renderers with AVTransport, cached for 60 s.
-async fn list_targets(
-    Extension(cast): Extension<Arc<CastService>>,
-    Query(query): Query<TargetsQuery>,
-) -> Response {
-    let refresh = matches!(query.refresh.as_deref(), Some("1" | "true"));
+async fn list_targets(cast: &CastService, query: Option<&str>) -> Response {
+    let refresh = query.is_some_and(|query| {
+        query
+            .split('&')
+            .any(|pair| matches!(pair, "refresh=1" | "refresh=true"))
+    });
     match cast.targets(refresh).await {
         Ok(found) => Json(json!({
             "targets": found.targets.iter().map(target_json).collect::<Vec<_>>(),
@@ -91,55 +106,42 @@ async fn list_targets(
     }
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct PlayRequest {
-    network: String,
-    id: String,
-}
-
 /// `POST /cast/targets/{target}/play` with `{"network":"ace","id":"..."}`.
-async fn play(
-    State(s): State<AppState>,
-    Extension(cast): Extension<Arc<CastService>>,
-    Path(target): Path<String>,
-    body: Bytes,
-) -> Response {
+async fn play(s: &AppState, cast: &CastService, target: &str, body: &[u8]) -> Response {
     // Fail on a loopback bind before anything else, so the error is the actionable one.
     if let Err(error) = cast.check_bind() {
         return error_response(&error);
     }
-    let Ok(request) = serde_json::from_slice::<PlayRequest>(&body) else {
+    // Read through `Value` rather than a derived struct: no extra deserializer to compile.
+    let request: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let (Some(network), Some(raw_id)) = (request["network"].as_str(), request["id"].as_str())
+    else {
         return bad_request(
             "invalid_request",
             "expected a JSON body {\"network\":...,\"id\":...}",
         );
     };
-    if !s.networks.contains(&request.network) {
+    if !s.networks.iter().any(|known| known == network) {
         return bad_request("unknown_network", "unknown network");
     }
-    let raw_id = request
-        .id
-        .strip_suffix(".ts")
-        .unwrap_or(request.id.as_str());
+    let raw_id = raw_id.strip_suffix(".ts").unwrap_or(raw_id);
     if raw_id.is_empty() || raw_id.contains(['/', '.', '?', '#']) || raw_id.len() > 512 {
         return bad_request("invalid_id", "invalid stream id");
     }
-    let id = match native_stream_id(&request.network, raw_id) {
+    let id = match native_stream_id(network, raw_id) {
         Ok(id) => id.into_owned(),
         Err(reason) => return bad_request("invalid_id", reason),
     };
-    if !cast.knows_target(&target) {
+    if !cast.knows_target(target) {
         return error_response(&CastError::UnknownTarget);
     }
     // Start the shared session and hold a viewer on it while the renderer is told about it:
     // many renderers open the URL inside `SetAVTransportURI`, and should find it running.
-    let warm = match s.manager.get_or_subscribe(&request.network, &id).await {
+    let warm = match s.manager.get_or_subscribe(network, &id).await {
         Ok(warm) => warm,
         Err(error) => return stream_error(error),
     };
-    let result = cast
-        .play(&target, &request.network, &id, "Outpace live stream")
-        .await;
+    let result = cast.play(target, network, &id, "Outpace live stream").await;
     drop(warm);
     match result {
         Ok(started) => Json(json!({
@@ -154,11 +156,8 @@ async fn play(
 }
 
 /// `POST /cast/targets/{target}/stop`.
-async fn stop(
-    Extension(cast): Extension<Arc<CastService>>,
-    Path(target): Path<String>,
-) -> Response {
-    match cast.stop(&target).await {
+async fn stop(cast: &CastService, target: &str) -> Response {
+    match cast.stop(target).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(&error),
     }
@@ -166,23 +165,19 @@ async fn stop(
 
 /// `GET /cast/targets/{target}/status` — transport state plus whether the renderer is still
 /// fetching the stream.
-async fn status(
-    Extension(cast): Extension<Arc<CastService>>,
-    Path(target): Path<String>,
-) -> Response {
-    match cast.status(&target).await {
+async fn status(cast: &CastService, target: &str) -> Response {
+    match cast.status(target).await {
         Ok(status) => {
+            let connections = status.cast.as_ref().map_or(0, |cast| cast.connections());
             let casting = status.cast.map(|cast| {
                 json!({
                     "network": cast.network,
                     "id": native_public_stream_id(&cast.network, &cast.id),
                     "url": cast.url,
-                    "stream_connections": cast.connections(),
+                    "stream_connections": connections,
                 })
             });
-            let fetching = casting
-                .as_ref()
-                .is_some_and(|c| c["stream_connections"].as_u64().unwrap_or(0) > 0);
+            let fetching = connections > 0;
             Json(json!({
                 "target": target,
                 "transport_state": status.transport.state,
@@ -199,16 +194,25 @@ async fn status(
 
 /// `GET /cast/s/{token}.ts` — the stream a renderer was told to play. Serves the ordinary
 /// shared live session and counts the open response for `status`.
-async fn cast_stream(
-    State(s): State<AppState>,
-    Extension(cast): Extension<Arc<CastService>>,
-    Path(file): Path<String>,
-) -> Response {
-    let token = file.strip_suffix(".ts").unwrap_or(&file);
-    let Some((active, guard)) = cast.open_stream(token) else {
+async fn cast_stream(s: &AppState, cast: &CastService, file: &str) -> Response {
+    let Some((active, guard)) = file
+        .strip_suffix(".ts")
+        .and_then(|token| cast.open_stream(token))
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let response = stream_file(State(s), Path((active.network.clone(), active.id.clone()))).await;
+    // `active.id` is the normalized session key `play` started, so subscribe to it directly
+    // rather than re-parsing it as a `/streams` selector (a bare infohash key would be read
+    // back as a content id there).
+    let session = match s
+        .manager
+        .get_or_subscribe(&active.network, &active.id)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return stream_error(error),
+    };
+    let response = stream_session_response(session, s.manager.hls_startup_timeout()).await;
     if !response.status().is_success() {
         return response;
     }

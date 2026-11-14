@@ -59,7 +59,8 @@ Outpace offers the stream as `video/mp2t`. If the renderer refuses that type (UP
 serves the stream with whichever type the renderer accepted.
 
 `play` starts the stream before it contacts the TV, so it answers once the stream is running
-and the TV has accepted it. Many TVs open the stream before they answer, which is why `play`
+and the TV has accepted it. Outpace sends one renderer one request at a time: a `stop` sent
+while a `play` is still talking to the same TV waits for it to finish, then stops it. Many TVs open the stream before they answer, which is why `play`
 can take several seconds. The TV fetches the stream like any other player: it shares the
 running session with your other viewers and counts as one of the stream's clients.
 
@@ -159,9 +160,9 @@ untrusted:
 - It only reads a reply from a private (RFC 1918) or link-local IPv4 address, and only
   fetches a description from the address that sent the reply. Host names aren't accepted, so
   DNS can't redirect it.
-- The renderer's control URL must be on the same host as its description. A description that
-  points somewhere else is skipped, so a device can't make Outpace send requests to your router
-  or another machine.
+- The renderer's control URL must be on the same host and port as its description. A
+  description that points somewhere else is skipped, so a device can't make Outpace send
+  requests to your router, another machine or another service.
 - One search reads at most 64 replies and 16 devices. A description may be at most 64 KiB
   and a control response at most 16 KiB. XML document type declarations are refused.
 - Fetching a description times out after 2 seconds. A control request times out after
@@ -170,7 +171,8 @@ untrusted:
 - Redirects are never followed.
 
 There is no background discovery. The engine searches only when `GET /cast/targets` asks it
-to, and remembers at most 16 renderers.
+to, and remembers at most 16 renderers. A renderer you're casting to stays controllable with
+`stop` and `status` even if a later search misses it.
 
 The `/cast/*` routes follow the same exposure rule as the other control routes: they are
 reachable wherever `OUTPACE_BIND` is. Anyone who can reach the API can list your renderers and
