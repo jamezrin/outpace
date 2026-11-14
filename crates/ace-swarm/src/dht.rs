@@ -25,9 +25,18 @@ const BOOTSTRAP: &[&str] = &[
 const DHT_PEER_TARGET: usize = 8;
 
 /// How long an inflight `(source, txid)` query stays eligible to be answered. Long enough to
-/// admit a genuine reply that lands a round or two late, short enough that a stale entry can't
+/// admit a genuine reply that lands after its slot was handed to another query, short enough that a stale entry can't
 /// be matched by an unrelated packet arriving much later in the walk.
 const INFLIGHT_TTL: Duration = Duration::from_secs(3);
+
+/// How many `get_peers` queries the walk keeps outstanding at once.
+const MAX_ACTIVE: usize = 8;
+
+/// How long an unanswered query holds one of the [`MAX_ACTIVE`] slots before the walk sends
+/// a replacement. Shorter than [`INFLIGHT_TTL`]: public DHT nodes are often silent, so a slot
+/// waiting out the full TTL would halve the query rate on a sparse frontier. The query stays
+/// correlatable until the TTL, so a late reply is still accepted.
+const SLOT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The client version tag the official engine's DHT (pymdht `NEXTSHARE_VERSION`) puts in
 /// every KRPC message's `v` key.
@@ -175,7 +184,7 @@ struct DhtWalkMetrics {
     /// Datagrams that parsed as a response but matched no inflight `(source, txid)` query —
     /// late, replayed, or spoofed traffic rejected by correlation (#40).
     uncorrelated_responses: usize,
-    /// Query rounds whose response window elapsed without receiving any datagram at all.
+    /// Queries whose slot timeout elapsed without any datagram at all from that node.
     timeouts: usize,
     /// The walk ran out of new frontier nodes before exhausting its time budget.
     frontier_exhausted: bool,
@@ -207,7 +216,7 @@ fn distance(id: &[u8; 20], target: &[u8; 20]) -> [u8; 20] {
 
 /// Iterative `get_peers` walk toward `infohash`, shared by `dht_get_peers` (harvest peers)
 /// and `dht_announce_peer` (harvest tokens to announce back with). Seeds the frontier from
-/// bootstrap routers, sends batched queries to the closest not-yet-queried nodes, and calls
+/// bootstrap routers, keeps queries outstanding to the closest not-yet-queried nodes, and calls
 /// `on_response` for each reply — which returns `true` to stop the walk early (e.g. "enough
 /// peers" or "enough tokens"). Bounded by `budget` regardless.
 async fn dht_walk(
@@ -322,6 +331,21 @@ fn add_bootstrap(
         }
     }
 }
+/// One outstanding `get_peers` query. A node is queried at most once per walk, so the
+/// destination alone identifies it; the transaction id is checked on every reply.
+struct Inflight {
+    txid: [u8; 2],
+    /// When the query stops holding one of the [`MAX_ACTIVE`] slots. A reply after this is
+    /// still accepted until `expires`; it just no longer blocks a replacement query.
+    release: Instant,
+    /// When the query is abandoned and its `(source, txid)` can no longer be matched.
+    expires: Instant,
+    /// Whether the query still holds a slot (no correlated reply, `release` not reached).
+    active: bool,
+    /// Whether any datagram at all arrived from this node.
+    heard: bool,
+}
+
 async fn dht_walk_owned(
     infohash: &[u8; 20],
     deadline: Instant,
@@ -337,143 +361,144 @@ async fn dht_walk_owned(
     };
 
     let mut queried: HashSet<SocketAddrV4> = HashSet::new();
-    // Inflight queries keyed by (destination, transaction id) → expiry deadline. Public DHT
-    // UDP is untrusted, so a reply is only trusted if it arrives from the exact node we asked
-    // and echoes the exact transaction id we generated for that query.
-    let mut inflight: HashMap<(SocketAddrV4, Vec<u8>), Instant> = HashMap::new();
+    // Public DHT UDP is untrusted, so a reply is only trusted if it arrives from the exact node
+    // we asked and echoes the exact transaction id we generated for that query.
+    let mut inflight: HashMap<SocketAddrV4, Inflight> = HashMap::new();
     // Monotonic per-walk counter → a distinct 2-byte transaction id for every outbound query.
     let mut next_txid: u16 = 0;
     let mut buf = [0u8; 2048];
-    // A bootstrap completion may interrupt a response round to send useful new queries.
-    // Retain that round when no new batch exists, rather than losing its pending replies.
-    let mut interrupted_window: Option<(Instant, bool, bool)> = None;
+    let tokio_deadline = tokio::time::Instant::from_std(deadline);
     crate::alog!("[dht] seeded {} bootstrap node(s)", frontier.len());
 
-    'outer: while Instant::now() < deadline {
+    // Paced by responses (#384): keep up to MAX_ACTIVE queries outstanding, sending the next
+    // closest node as soon as a correlated reply or a slot timeout frees a slot, instead of
+    // waiting out a fixed window per batch.
+    'walk: while Instant::now() < deadline {
         while let Some(result) = lookups.try_join_next() {
             add_bootstrap(result, &mut frontier, &mut metrics);
         }
-        // Drop expired inflight entries so a stale (source, txid) can't be matched by a much
-        // later packet — an unanswered query is abandoned, not left open for the whole walk.
         let now = Instant::now();
-        inflight.retain(|_, exp| *exp > now);
-
-        // Send to up to 8 closest not-yet-queried nodes.
-        let batch: Vec<SocketAddrV4> = frontier
-            .values()
-            .filter(|a| !queried.contains(a))
-            .take(8)
-            .copied()
-            .collect();
-        if batch.is_empty()
-            && !lookups.is_empty()
-            && inflight.is_empty()
-            && interrupted_window.is_none()
-        {
-            // Empty frontier is not exhaustion while a later bootstrap can still resolve.
-            tokio::select! {
-                result = lookups.join_next() => {
-                    if let Some(result) = result { add_bootstrap(result, &mut frontier, &mut metrics); }
+        for query in inflight.values_mut() {
+            if query.active && query.release <= now {
+                query.active = false;
+                if !query.heard {
+                    metrics.timeouts += 1;
                 }
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break,
             }
-            continue;
         }
-        if batch.is_empty() && lookups.is_empty() && interrupted_window.is_none() {
+        // Drop expired entries so a stale (source, txid) can't be matched by a much later
+        // packet: an unanswered query is abandoned, not left open for the whole walk.
+        inflight.retain(|_, query| query.expires > now);
+
+        let mut active = inflight.values().filter(|query| query.active).count();
+        while active < MAX_ACTIVE {
+            let Some(addr) = frontier
+                .values()
+                .find(|addr| !queried.contains(*addr))
+                .copied()
+            else {
+                break;
+            };
+            queried.insert(addr);
+            let txid = next_txid.to_be_bytes();
+            next_txid = next_txid.wrapping_add(1);
+            let query = build_get_peers(&node_id, infohash, &txid);
+            let sent =
+                tokio::time::timeout_at(tokio_deadline, sock.send_to(&query, SocketAddr::V4(addr)))
+                    .await
+                    .is_ok_and(|sent| sent.is_ok());
+            if sent {
+                metrics.nodes_queried += 1;
+                let sent_at = Instant::now();
+                inflight.insert(
+                    addr,
+                    Inflight {
+                        txid,
+                        release: sent_at + SLOT_TIMEOUT,
+                        expires: sent_at + INFLIGHT_TTL,
+                        active: true,
+                        heard: false,
+                    },
+                );
+                active += 1;
+            }
+        }
+
+        if active == 0 && lookups.is_empty() {
+            // Nothing left to ask and nothing outstanding that could add to the frontier.
             metrics.frontier_exhausted = true;
             crate::alog!("[dht] frontier exhausted: queried={}", queried.len());
             break;
         }
-        for addr in &batch {
-            queried.insert(*addr);
-            let txid = next_txid.to_be_bytes().to_vec();
-            next_txid = next_txid.wrapping_add(1);
-            let q = build_get_peers(&node_id, infohash, &txid);
-            if tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                sock.send_to(&q, SocketAddr::V4(*addr)),
-            )
-            .await
-            .is_ok_and(|sent| sent.is_ok())
-            {
-                metrics.nodes_queried += 1;
-                inflight.insert((*addr, txid), Instant::now() + INFLIGHT_TTL);
-            }
-        }
+        // Wake for the next slot release so a silent node can't hold its slot past it.
+        let wake = inflight
+            .values()
+            .filter(|query| query.active)
+            .map(|query| query.release)
+            .min()
+            .map_or(deadline, |release| release.min(deadline));
 
-        // Collect responses for a short window. A round in which no datagram arrives at all is
-        // a timeout; datagrams that arrive but are rejected are counted by their failure mode.
-        let (window, mut received_any, count_round) = if batch.is_empty() {
-            interrupted_window.take().unwrap_or((
-                (Instant::now() + Duration::from_millis(1500)).min(deadline),
-                false,
-                false,
-            ))
-        } else {
-            interrupted_window.take();
-            (
-                (Instant::now() + Duration::from_millis(1500)).min(deadline),
-                false,
-                true,
-            )
+        let received = tokio::select! {
+            result = lookups.join_next(), if !lookups.is_empty() => {
+                if let Some(result) = result {
+                    add_bootstrap(result, &mut frontier, &mut metrics);
+                }
+                continue;
+            }
+            received = sock.recv_from(&mut buf) => received,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => continue,
         };
-        while Instant::now() < window {
-            let received = tokio::select! {
-                result = lookups.join_next(), if !lookups.is_empty() => {
-                    if let Some(result) = result { add_bootstrap(result, &mut frontier, &mut metrics); }
-                    interrupted_window = Some((window, received_any, count_round));
-                    // Query the newly useful frontier immediately, keeping existing inflight
-                    // correlation and the original absolute deadline in this same walk.
-                    continue 'outer;
-                }
-                received = sock.recv_from(&mut buf) => received,
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(window)) => break,
-            };
-            match received {
-                Ok((n, src)) => {
-                    received_any = true;
-                    // Bootstrap/frontier addresses are always v4 (see below), so a real reply
-                    // is always from a v4 peer; skip (not break — keep collecting within the
-                    // window) on the theoretical v6 case rather than treating it as a timeout.
-                    let SocketAddr::V4(src) = src else { continue };
-                    let Some(resp) = parse_response(&buf[..n]) else {
-                        // Rejected before correlation: either a node's KRPC error or genuinely
-                        // malformed/hostile traffic. Bucket the two apart for diagnostics.
-                        if is_krpc_error(&buf[..n]) {
-                            metrics.krpc_errors += 1;
-                        } else {
-                            metrics.malformed_responses += 1;
-                        }
-                        continue;
-                    };
-                    // Correlate: only accept a reply whose (source, txid) matches an inflight
-                    // query. Removing the entry also means a duplicate/replayed packet for the
-                    // same query is not processed twice. Unmatched packets are dropped, not
-                    // treated as end-of-window, so a spoofed packet can't cut the walk short.
-                    if inflight.remove(&(src, resp.txid.clone())).is_none() {
-                        metrics.uncorrelated_responses += 1;
-                        continue;
-                    }
-                    metrics.valid_responses += 1;
-                    metrics.peers_discovered += resp.peers.len();
-                    metrics.nodes_discovered += resp.nodes.len();
-                    for (id, addr) in &resp.nodes {
-                        frontier.entry(distance(id, infohash)).or_insert(*addr);
-                    }
-                    // Cap frontier growth: keep the 64 closest.
-                    while frontier.len() > 64 {
-                        let last = *frontier.keys().next_back().unwrap();
-                        frontier.remove(&last);
-                    }
-                    if on_response(src, &resp) {
-                        break 'outer;
-                    }
-                }
-                _ => break,
+        // A receive error (e.g. an ICMP reset some platforms surface on unconnected UDP)
+        // consumes one event and the walk carries on.
+        let Ok((n, SocketAddr::V4(src))) = received else {
+            continue;
+        };
+        let Some(resp) = parse_response(&buf[..n]) else {
+            // Rejected before correlation: either a node's KRPC error or genuinely
+            // malformed/hostile traffic. Bucket the two apart for diagnostics.
+            if let Some(query) = inflight.get_mut(&src) {
+                query.heard = true;
+            }
+            if is_krpc_error(&buf[..n]) {
+                metrics.krpc_errors += 1;
+            } else {
+                metrics.malformed_responses += 1;
+            }
+            continue;
+        };
+        // Correlate: only accept a reply whose (source, txid) matches an outstanding query.
+        // Removing the entry also means a duplicate/replayed packet for the same query is not
+        // processed twice. Unmatched packets never free a slot, so spoofed traffic can't
+        // speed the walk up or cut it short.
+        // The expiry is re-checked here because `retain` only runs when the loop wakes, and a
+        // packet can land after `expires` but before the next wake.
+        match inflight.get_mut(&src) {
+            Some(query) if resp.txid == query.txid && query.expires > Instant::now() => {
+                inflight.remove(&src);
+            }
+            Some(query) => {
+                query.heard = true;
+                metrics.uncorrelated_responses += 1;
+                continue;
+            }
+            None => {
+                metrics.uncorrelated_responses += 1;
+                continue;
             }
         }
-        if count_round && !received_any {
-            metrics.timeouts += 1;
+        metrics.valid_responses += 1;
+        metrics.peers_discovered += resp.peers.len();
+        metrics.nodes_discovered += resp.nodes.len();
+        for (id, addr) in &resp.nodes {
+            frontier.entry(distance(id, infohash)).or_insert(*addr);
+        }
+        // Cap frontier growth: keep the 64 closest.
+        while frontier.len() > 64 {
+            let last = *frontier.keys().next_back().unwrap();
+            frontier.remove(&last);
+        }
+        if on_response(src, &resp) {
+            break 'walk;
         }
     }
 
@@ -1474,7 +1499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn walk_metrics_count_a_silent_round_as_a_timeout() {
+    async fn walk_metrics_count_a_silent_query_as_a_timeout() {
         // A seed that receives the query but never answers: the response window elapses in
         // total silence, which is a timeout, and the walk then exhausts its frontier.
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1495,6 +1520,215 @@ mod tests {
         assert_eq!(metrics.timeouts, 1);
         assert!(metrics.frontier_exhausted);
         drop(server);
+    }
+
+    // --- Response pacing (#384) ---
+
+    /// Answer one `get_peers` query on `server` with `reply(txid)`, recording when it arrived.
+    fn answer_once(
+        server: UdpSocket,
+        reply: impl FnOnce(&[u8]) -> Vec<u8> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, caller) = server.recv_from(&mut buf).await.unwrap();
+            let resp = reply(&buf_txid(&buf[..n]));
+            server.send_to(&resp, caller).await.unwrap();
+            // Keep the port bound until the walk is done with it.
+            std::future::pending::<()>().await
+        })
+    }
+
+    #[tokio::test]
+    async fn multi_hop_walk_advances_as_replies_arrive() {
+        // Four hops, each answering promptly with one node closer to the target and the last
+        // handing over a peer. The first peer must arrive at network speed, not after one
+        // fixed response window per hop.
+        let target = [0u8; 20];
+        let hops: Vec<UdpSocket> = bind_loopback(4).await;
+        let addrs: Vec<SocketAddrV4> = hops.iter().map(v4_addr).collect();
+        let peer: SocketAddrV4 = "10.0.0.1:1111".parse().unwrap();
+        let mut servers = Vec::new();
+        for (i, hop) in hops.into_iter().enumerate() {
+            let next = addrs.get(i + 1).copied();
+            servers.push(answer_once(hop, move |txid| match next {
+                Some(next) => {
+                    let mut id = [0u8; 20];
+                    id[0] = 0x80 >> i;
+                    response_with(txid, &[], &[(id, next)])
+                }
+                None => response_with(txid, &[peer], &[]),
+            }));
+        }
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let start = Instant::now();
+        let mut first_peer = None;
+        let metrics = dht_walk_from_seeds(
+            &target,
+            Duration::from_secs(10),
+            &client,
+            vec![addrs[0]],
+            |_src, resp| {
+                if resp.peers.contains(&peer) {
+                    first_peer = Some(start.elapsed());
+                }
+                first_peer.is_some()
+            },
+        )
+        .await;
+        for server in servers {
+            server.abort();
+        }
+        let first_peer = first_peer.expect("chain end never reached");
+        eprintln!("multi-hop first peer after {first_peer:?}");
+        assert_eq!(metrics.nodes_queried, 4);
+        assert_eq!(metrics.valid_responses, 4);
+        assert!(
+            first_peer < Duration::from_millis(300),
+            "4-hop walk took {first_peer:?}; it is waiting out fixed rounds"
+        );
+    }
+
+    async fn bind_loopback(n: usize) -> Vec<UdpSocket> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn reply_after_inflight_ttl_is_rejected_without_an_intervening_wake() {
+        // The only query's slot releases at SLOT_TIMEOUT; a still-pending bootstrap lookup then
+        // keeps the walk parked with no other wake before the reply lands past INFLIGHT_TTL.
+        // That late packet must not be correlated against the expired entry.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seed = v4_addr(&server);
+        let peer: SocketAddrV4 = "10.0.0.4:4444".parse().unwrap();
+        let replier = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, caller) = server.recv_from(&mut buf).await.unwrap();
+            tokio::time::sleep(INFLIGHT_TTL + Duration::from_millis(200)).await;
+            let resp = response_with(&buf_txid(&buf[..n]), &[peer], &[]);
+            server.send_to(&resp, caller).await.unwrap();
+            std::future::pending::<()>().await
+        });
+        let mut lookups = tokio::task::JoinSet::new();
+        lookups.spawn(async {
+            std::future::pending::<()>().await;
+            (0, None)
+        });
+        let mut frontier = BTreeMap::new();
+        frontier.insert([0xff; 20], seed);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut accepted = false;
+        let metrics = dht_walk_owned(
+            &[0u8; 20],
+            Instant::now() + INFLIGHT_TTL + Duration::from_millis(600),
+            &client,
+            frontier,
+            lookups,
+            |_src, resp| {
+                accepted |= resp.peers.contains(&peer);
+                false
+            },
+        )
+        .await;
+        replier.abort();
+        assert!(!accepted, "reply past INFLIGHT_TTL was correlated");
+        assert_eq!(metrics.valid_responses, 0);
+        assert_eq!(metrics.uncorrelated_responses, 1);
+    }
+
+    #[tokio::test]
+    async fn correlated_reply_frees_a_query_slot_immediately() {
+        // Nine seeds in frontier order: the first answers at once (with nothing useful), the
+        // next seven stay silent, and the ninth is only reachable once a slot frees. The
+        // answer must free that slot right away rather than at the end of a round.
+        let sockets = bind_loopback(9).await;
+        let seeds: Vec<SocketAddrV4> = sockets.iter().map(v4_addr).collect();
+        let mut sockets = sockets.into_iter();
+        let fast = answer_once(sockets.next().unwrap(), |txid| {
+            response_with(txid, &[], &[])
+        });
+        let silent: Vec<UdpSocket> = sockets.by_ref().take(7).collect();
+        let peer: SocketAddrV4 = "10.0.0.2:2222".parse().unwrap();
+        let ninth = answer_once(sockets.next().unwrap(), move |txid| {
+            response_with(txid, &[peer], &[])
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let start = Instant::now();
+        let mut found = None;
+        dht_walk_from_seeds(
+            &[0u8; 20],
+            Duration::from_secs(5),
+            &client,
+            seeds,
+            |_src, resp| {
+                if resp.peers.contains(&peer) {
+                    found = Some(start.elapsed());
+                }
+                found.is_some()
+            },
+        )
+        .await;
+        fast.abort();
+        ninth.abort();
+        drop(silent);
+        let found = found.expect("ninth seed never queried");
+        assert!(
+            found < Duration::from_millis(300),
+            "freed slot was not refilled until {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_queries_release_their_slots_after_the_soft_timeout() {
+        // Eight silent seeds fill every slot. The ninth must not be queried before the soft
+        // slot timeout, and must not wait for the longer correlation TTL either.
+        let sockets = bind_loopback(9).await;
+        let seeds: Vec<SocketAddrV4> = sockets.iter().map(v4_addr).collect();
+        let mut sockets = sockets.into_iter();
+        let silent: Vec<UdpSocket> = sockets.by_ref().take(8).collect();
+        let peer: SocketAddrV4 = "10.0.0.3:3333".parse().unwrap();
+        let ninth = answer_once(sockets.next().unwrap(), move |txid| {
+            response_with(txid, &[peer], &[])
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let start = Instant::now();
+        let metrics = dht_walk_from_seeds(
+            &[0u8; 20],
+            Duration::from_secs(5),
+            &client,
+            seeds,
+            |_src, resp| resp.peers.contains(&peer),
+        )
+        .await;
+        let mut buf = [0u8; 2048];
+        for socket in &silent {
+            assert!(
+                socket.try_recv_from(&mut buf).is_ok(),
+                "silent seed unqueried"
+            );
+            assert!(
+                socket.try_recv_from(&mut buf).is_err(),
+                "silent seed queried twice"
+            );
+        }
+        // The walk stops on the ninth seed's reply, so its length is when that seed was asked.
+        let elapsed = start.elapsed();
+        ninth.abort();
+        assert_eq!(metrics.nodes_queried, 9);
+        assert_eq!(metrics.valid_responses, 1);
+        assert_eq!(metrics.timeouts, 8);
+        assert!(
+            elapsed >= SLOT_TIMEOUT - Duration::from_millis(100),
+            "ninth seed queried before any slot released ({elapsed:?})"
+        );
+        assert!(
+            elapsed < SLOT_TIMEOUT + Duration::from_millis(700),
+            "slots were held for {elapsed:?}"
+        );
     }
 
     #[tokio::test]

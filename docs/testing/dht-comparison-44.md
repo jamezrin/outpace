@@ -11,6 +11,12 @@ per-round wait, which can be fixed in place.
 This document covers the method, the one matched live block, the integration costs,
 and the limits of what was measured.
 
+> **Follow-up:** [#384](https://github.com/outpace-stream/outpace-engine/issues/384)
+> replaced the fixed rounds described below. The walk now keeps up to 8 queries
+> outstanding and sends the next one as soon as a correlated reply arrives or a silent
+> query's 1.5-second slot timeout passes. The measurements in this document describe
+> the walk before that change.
+
 ## Candidates
 
 | Candidate | Version | How it runs a lookup |
