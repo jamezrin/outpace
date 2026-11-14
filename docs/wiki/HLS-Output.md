@@ -60,7 +60,8 @@ Constraints the daemon checks at startup:
 The [startup prebuffer](Configuration#playback-and-startup-buffering) applies to the shared
 live source, so HLS goes through it as well. When the prebuffer releases, its queued media
 arrives in one burst, and several segments complete almost at once. With the defaults, an HLS
-start is roughly discovery time plus up to 15 seconds of prebuffering. Setting
+start is roughly discovery time plus up to 15 seconds of prebuffering, or less when the peers
+hold a shorter backlog than the target. Setting
 `OUTPACE_PREBUFFER_MS=0` removes the prebuffer stage, and the startup segment count alone then
 decides how long HLS waits.
 

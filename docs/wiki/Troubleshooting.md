@@ -53,7 +53,8 @@ A cold start has three stages:
 1. **Resolving** the content id through the catalog.
 2. **Discovering** peers through trackers and the DHT, then connecting.
 3. **Prebuffering**: collecting media before the first byte goes out, up to 30 seconds of media
-   or 15 seconds after the first byte, whichever comes first. HLS also waits for six segments.
+   or 15 seconds after the first byte, whichever comes first. If the peers hold less history
+   than that, playback starts as soon as all of it has arrived. HLS also waits for six segments.
 
 20–60 seconds in total is normal with the defaults. To start faster, at the cost of more
 stutter on weak swarms:
@@ -82,6 +83,7 @@ The `reason` on the `[prebuffer]` line tells you why playback started:
 | --- | --- |
 | `TargetDuration` | The full target was reached. |
 | `Deadline` | The 15-second limit expired; playback started with what was there. |
+| `BacklogExhausted` | Every piece the peers hold up to the live edge has arrived, so playback started with that shorter backlog instead of waiting for the target. |
 | `ByteLimit` | The 128 MiB cap was hit. |
 | `EndOfStream` | The source ended during startup. |
 | `Disabled` | Prebuffering is off. |
