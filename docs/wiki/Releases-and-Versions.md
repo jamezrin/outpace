@@ -9,10 +9,10 @@
 - The version a binary reports is the version in the source it was built from. The tag must
   match it.
 
-The latest published release is **v1.0.3**, a patch release on top of 1.0.2. See the
-[GitHub Release](https://github.com/outpace-stream/outpace-engine/releases/tag/v1.0.3) for downloads,
-the [1.0.3 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.3.md)
-for its fixes, and the
+The latest published release is **v1.1.0**, a minor release on top of 1.0.3. See the
+[GitHub Release](https://github.com/outpace-stream/outpace-engine/releases/tag/v1.1.0) for downloads,
+the [1.1.0 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.1.0.md)
+for its changes, and the
 [1.0.0 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.0.md)
 for scope, upgrades and validation limits.
 
@@ -22,7 +22,7 @@ for scope, upgrades and validation limits.
   its downloads and generated change notes.
 - **Curated notes:** for releases that have them, in
   [`docs/releases/`](https://github.com/outpace-stream/outpace-engine/tree/main/docs/releases)
-  (including `1.0.0.md`, `1.0.1.md`, `1.0.2.md` and `1.0.3.md`).
+  (including `1.0.0.md`, `1.0.1.md`, `1.0.2.md`, `1.0.3.md` and `1.1.0.md`).
 - **Milestones:** <https://github.com/outpace-stream/outpace-engine/milestones> track what each
   version covers.
 
@@ -30,7 +30,7 @@ for scope, upgrades and validation limits.
 
 ```bash
 outpace --version
-docker run --rm ghcr.io/outpace-stream/outpace-engine:1.0.3 --version
+docker run --rm ghcr.io/outpace-stream/outpace-engine:1.1.0 --version
 curl "http://127.0.0.1:6878/server/api?method=get_version"   # needs OUTPACE_ACE_COMPAT=1
 ```
 
@@ -60,13 +60,17 @@ build.
 
 ## Unreleased
 
-On `main`, not yet in a release:
+Nothing on `main` is waiting for a release yet.
 
-- A best-effort `armv7-linux-androideabi` engine archive for 32-bit Android devices, next to the
-  `aarch64-linux-android` one; see [Installation](Installation#android-with-termux-best-effort).
-  The [Android companion app](Android-App) downloads these archives by name, so their names and
-  layout (`outpace-<version>-<target>/outpace` inside the `.tar.gz`) stay stable.
-- Opt-in [engine camouflage](Engine-Camouflage) (`OUTPACE_ACESTREAM_IDENTITY`). Default off.
+## v1.1.0 changes
+
+A minor release with one opt-in feature and no default changes:
+
+- Opt-in [engine camouflage](Engine-Camouflage) (`OUTPACE_ACESTREAM_IDENTITY`, default off)
+  presents one official Linux engine profile to peers, search, the catalog, UPnP and broadcast
+  descriptors (#476).
+- With it off, DHT messages carry the engine's version tag, use one node id per process and send
+  no `implied_port`; handshakes advertise the real listen port and host uptime.
 
 ## v1.0.3 fixes
 

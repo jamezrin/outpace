@@ -79,7 +79,7 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 
 ## Release availability
 
-The latest tagged release is **v1.0.3**. Features marked **From v1.0.0** are available in
+The latest tagged release is **v1.1.0**. Features marked **From v1.0.0** are available in
 release binaries and multi-architecture images; optional SRT still requires a feature build.
 The [Configuration](Configuration) reference records feature version floors.
 See [Releases and Versions](Releases-and-Versions) for the release contents and remaining limits.

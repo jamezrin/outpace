@@ -52,8 +52,10 @@ The **Avail.** column shows where each setting is available:
 - **all**: v0.9.0 and later.
 - **1.0.0**: v1.0.0 and later, also in `edge` and builds from `main`. A v0.9.0
   binary ignores these variables. See [Releases and Versions](Releases-and-Versions) for publication status.
+- **1.1.0**: v1.1.0 and later, also in `edge` and builds from `main`. Earlier releases ignore
+  these variables.
 - **srt build**: v1.0.0 and later, only in binaries built with the `srt` feature.
-- **edge**: current `main` and the `edge` image. Not in v1.0.2.
+- **edge**: current `main` and the `edge` image. Not in v1.1.0.
 
 ## Network and listeners
 
@@ -249,14 +251,14 @@ Overrides are ignored while the switch is off.
 
 | Setting | Default | Accepted values | Avail. | Notes |
 | --- | --- | --- | --- | --- |
-| `OUTPACE_ACESTREAM_IDENTITY` | `false` | boolean | edge | `1` or `true` installs the profile for the process. |
-| `OUTPACE_ACESTREAM_IDENTITY_VERSION` | `3.2.11` | `X.Y.Z` | edge | Search, catalog, handshake and the User-Agent use this version. The numeric code is `X*1000000 + Y*10000 + Z*100`. |
-| `OUTPACE_ACESTREAM_IDENTITY_PLATFORM` | `linux` | `linux` | edge | Any other value is rejected. |
-| `OUTPACE_ACESTREAM_IDENTITY_DEVICE_ID` | random, persisted | 40 hex digits | edge | Stable id for search and the UPnP label. Stored in the data directory when unset. |
-| `OUTPACE_ACESTREAM_IDENTITY_HARDWARE_KEY` | derived from this host | 40 hex digits | edge | Linux default comes from the machine's memory size. Hosts without `/proc/meminfo` must set it. |
-| `OUTPACE_ACESTREAM_IDENTITY_ASN` | looked up | integer, optional `AS` prefix | edge | Set both this and the country to skip the lookup. Setting only one is an error. |
-| `OUTPACE_ACESTREAM_IDENTITY_COUNTRY` | looked up | two letters | edge | ISO 3166 alpha-2. Paired with the ASN. |
-| `OUTPACE_ACESTREAM_IDENTITY_USER_AGENT` | engine UA for the version | printable ASCII, at most 256 characters | edge | Sent to search and AceStream web hosts. Catalog requests keep a per-request Chrome User-Agent. |
+| `OUTPACE_ACESTREAM_IDENTITY` | `false` | boolean | 1.1.0 | `1` or `true` installs the profile for the process. |
+| `OUTPACE_ACESTREAM_IDENTITY_VERSION` | `3.2.11` | `X.Y.Z` | 1.1.0 | Search, catalog, handshake and the User-Agent use this version. The numeric code is `X*1000000 + Y*10000 + Z*100`. |
+| `OUTPACE_ACESTREAM_IDENTITY_PLATFORM` | `linux` | `linux` | 1.1.0 | Any other value is rejected. |
+| `OUTPACE_ACESTREAM_IDENTITY_DEVICE_ID` | random, persisted | 40 hex digits | 1.1.0 | Stable id for search and the UPnP label. Stored in the data directory when unset. |
+| `OUTPACE_ACESTREAM_IDENTITY_HARDWARE_KEY` | derived from this host | 40 hex digits | 1.1.0 | Linux default comes from the machine's memory size. Hosts without `/proc/meminfo` must set it. |
+| `OUTPACE_ACESTREAM_IDENTITY_ASN` | looked up | integer, optional `AS` prefix | 1.1.0 | Set both this and the country to skip the lookup. Setting only one is an error. |
+| `OUTPACE_ACESTREAM_IDENTITY_COUNTRY` | looked up | two letters | 1.1.0 | ISO 3166 alpha-2. Paired with the ASN. |
+| `OUTPACE_ACESTREAM_IDENTITY_USER_AGENT` | engine UA for the version | printable ASCII, at most 256 characters | 1.1.0 | Sent to search and AceStream web hosts. Catalog requests keep a per-request Chrome User-Agent. |
 
 ## Diagnostics
 
