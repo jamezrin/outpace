@@ -5,7 +5,7 @@ can build yourself. All three run the same program: `outpace serve` starts the d
 
 ## Choose a version
 
-- **Releases** (`vX.Y.Z` tags) are the stable choice. The latest is **v1.0.2**.
+- **Releases** (`vX.Y.Z` tags) are the stable choice. The latest is **v1.0.3**.
 - **`edge`** follows `main` and includes features newer than the latest release. It is
   `linux/amd64` only and changes with every merge. Don't use it where you need predictable
   upgrades.
@@ -36,7 +36,7 @@ Download, verify and install on Linux or macOS. Set `target` to the row for your
 the table above:
 
 ```bash
-version=1.0.2
+version=1.0.3
 target=x86_64-unknown-linux-musl   # e.g. aarch64-apple-darwin on Apple silicon
 artifact="outpace-${version}-${target}.tar.gz"
 base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
@@ -68,7 +68,7 @@ In Termux, `dpkg --print-architecture` prints `aarch64` for the 64-bit build or 
 
 ```bash
 pkg install curl
-version=1.0.2
+version=1.0.3
 target=aarch64-linux-android
 artifact="outpace-${version}-${target}.tar.gz"
 base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
@@ -320,7 +320,7 @@ docker run -d --name outpace --restart unless-stopped \
   -p 127.0.0.1:1935:1935 \
   -p 8621:8621/tcp \
   -v outpace-data:/var/lib/outpace \
-  ghcr.io/outpace-stream/outpace-engine:1.0.2
+  ghcr.io/outpace-stream/outpace-engine:1.0.3
 ```
 
 Publish HTTP and RTMP on `127.0.0.1` unless a firewall or authenticating proxy protects them.
@@ -352,7 +352,7 @@ production layout with a health check, log rotation and safe port bindings:
 ```bash
 curl -LO https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/compose.yml
 curl -L -o .env https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/.env.example
-# edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/outpace-stream/outpace-engine:1.0.2
+# edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/outpace-stream/outpace-engine:1.0.3
 docker compose up -d --wait
 ```
 
@@ -368,7 +368,7 @@ macOS) and [rustup](https://rustup.rs). The repository pins its Rust version in
 ```bash
 git clone https://github.com/outpace-stream/outpace-engine.git outpace
 cd outpace
-git checkout v1.0.2          # or stay on main for the newest features
+git checkout v1.0.3          # or stay on main for the newest features
 cargo build --release --locked -p ace-engine --bin outpace
 ./target/release/outpace --version
 ```
@@ -421,7 +421,7 @@ If you turn normalisation on:
 - The published image doesn't contain FFmpeg. Build a derived image, for example:
 
 ```dockerfile
-FROM ghcr.io/outpace-stream/outpace-engine:1.0.2
+FROM ghcr.io/outpace-stream/outpace-engine:1.0.3
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*

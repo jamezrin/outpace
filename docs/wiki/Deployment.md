@@ -36,7 +36,7 @@ The repository ships a production
 
 ```bash
 cp .env.example .env
-# set OUTPACE_IMAGE=ghcr.io/outpace-stream/outpace-engine:1.0.2 (pin a release)
+# set OUTPACE_IMAGE=ghcr.io/outpace-stream/outpace-engine:1.0.3 (pin a release)
 docker compose config        # check the result
 docker compose up -d --wait
 curl --fail http://127.0.0.1:6878/healthz
