@@ -326,6 +326,8 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let local_descriptors = config.private_descriptors.load()?;
 
     let identity = std::sync::Arc::new(crate::config::load_or_create_identity(&config.data_dir)?);
+    ace_swarm::engine_profile::set_listen_port(config.peer_listen.port());
+    crate::engine_identity::apply(&config)?;
     let provider = play_provider_from_config(
         identity,
         &config,

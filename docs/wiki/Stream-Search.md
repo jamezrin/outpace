@@ -22,7 +22,9 @@ Search uses the fixed AceStream hosts `s5.torrentstream.net`, `s5.torrentstream.
 `s5.torrentstream.info` over **plain HTTP**. Queries and the server's IP reach the external
 service and are visible to network observers. Requests use public-address validation and
 DNS pinning; redirects and environment proxies are disabled. Outpace identifies itself as
-Outpace and sends no device or account identity. There is no automatic fallback to the
+Outpace and sends no device or account identity. With
+[engine camouflage](Engine-Camouflage) on, search uses the official engine's parameter set
+and User-Agent instead. There is no automatic fallback to the
 public API or a user-supplied endpoint.
 
 Responses must pass the native protocol's signature and request-nonce checks. These shared

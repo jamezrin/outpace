@@ -24,6 +24,52 @@ pub(super) struct NativeRequest {
     pub nonce: String,
 }
 impl NativeRequest {
+    /// A request labelled as outpace, or, under the AceStream identity, shaped exactly as
+    /// the official engine sends it.
+    pub fn for_client(
+        query: &SearchQuery,
+        timestamp: u64,
+        nonce: String,
+        identity: Option<&ace_swarm::engine_profile::EngineIdentity>,
+    ) -> Self {
+        match identity {
+            Some(identity) => Self::as_engine(query, timestamp, nonce, identity),
+            None => Self::new(query, timestamp, nonce),
+        }
+    }
+
+    /// The engine's parameter set: `_a _b _n _p _r _t _v a [c] [h] i m`. It omits `h` for
+    /// the first page and never sends `s` or `t`.
+    fn as_engine(
+        query: &SearchQuery,
+        timestamp: u64,
+        nonce: String,
+        identity: &ace_swarm::engine_profile::EngineIdentity,
+    ) -> Self {
+        let mut params: BTreeMap<String, String> = [
+            ("_a", hex::encode(identity.device_id)),
+            ("_b", hex::encode(identity.hardware_key)),
+            ("_n", identity.version_name.clone()),
+            ("_p", identity.platform.name().to_owned()),
+            ("_r", nonce.clone()),
+            ("_t", timestamp.to_string()),
+            ("_v", identity.version_code.to_string()),
+            ("a", query.query.clone()),
+            ("i", query.page_size.to_string()),
+            ("m", "4".into()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        if query.page > 0 {
+            params.insert("h".into(), query.page.to_string());
+        }
+        if let Some(category) = &query.category {
+            params.insert("c".into(), category.clone());
+        }
+        Self::signed(params, nonce)
+    }
+
     pub fn new(query: &SearchQuery, timestamp: u64, nonce: String) -> Self {
         let major: u64 = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap();
         let minor: u64 = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap();
@@ -50,6 +96,10 @@ impl NativeRequest {
         if let Some(category) = &query.category {
             params.insert("c".into(), category.clone());
         }
+        Self::signed(params, nonce)
+    }
+
+    fn signed(mut params: BTreeMap<String, String>, nonce: String) -> Self {
         let canonical = params
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -62,9 +112,15 @@ impl NativeRequest {
         Self { params, nonce }
     }
     pub fn url(&self, host: &str) -> String {
+        format!("http://{host}{}", self.path_and_query())
+    }
+
+    /// `/a?<params>` with `_s` last, as the engine orders it.
+    pub fn path_and_query(&self) -> String {
         let mut form = form_urlencoded::Serializer::new(String::new());
-        form.extend_pairs(&self.params);
-        format!("http://{host}/a?{}", form.finish())
+        form.extend_pairs(self.params.iter().filter(|(k, _)| k.as_str() != "_s"));
+        form.extend_pairs(self.params.get_key_value("_s"));
+        format!("/a?{}", form.finish())
     }
 }
 

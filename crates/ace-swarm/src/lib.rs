@@ -25,6 +25,9 @@ pub use ace_log::alog;
 
 pub mod dht;
 pub mod discover;
+pub mod engine_http;
+pub mod engine_location;
+pub mod engine_profile;
 pub mod http_fetch;
 pub mod listen;
 pub mod live_session;

@@ -25,10 +25,14 @@ webpki-root-certs = "1"
 hyper = { version = "1", default-features = false }
 httpdate = "1"
 hex = "0.4"
+# Catalog responses may be gzip-encoded once we advertise it like the engine (already linked by ace-engine).
+flate2 = "1"
 roxmltree = "0.21"
 igd-next = { version = "0.18", features = ["aio_tokio"] }
 crab_nat = "0.8"
 serde = { version = "1", features = ["derive"] }
+# One RIPEstat JSON read for the optional AceStream identity's network location.
+serde_json = "1"
 async-trait = "0.1"
 
 [target.'cfg(unix)'.dependencies]

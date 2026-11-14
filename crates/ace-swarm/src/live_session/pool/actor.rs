@@ -548,7 +548,6 @@ impl PoolActor<'_> {
             replacement,
             write: activation::prepare_with_policy(
                 activation::Start {
-                    peer_id,
                     cursor: self.continuity.reasm.next_needed(),
                     head: self.continuity.head,
                 },
