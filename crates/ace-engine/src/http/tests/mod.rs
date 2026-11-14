@@ -14,6 +14,7 @@ use tower::ServiceExt;
 
 mod broadcast;
 mod broadcast_source;
+mod cast;
 mod compat;
 mod compat_catalog;
 mod compat_hls;

@@ -25,6 +25,7 @@ dependencies = [
  "hex",
  "libc",
  "rand",
+ "roxmltree",
  "rtmp-rs",
  "serde",
  "serde_json",

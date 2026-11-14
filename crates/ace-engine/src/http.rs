@@ -43,6 +43,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 mod broadcast;
 mod broadcast_source;
+mod cast;
 mod compat;
 mod origin_history;
 mod origin_hls;
@@ -285,6 +286,16 @@ pub fn router_with_support(
     state: AppState,
     support_service: Option<Arc<crate::support::SupportService>>,
 ) -> Router {
+    router_with_services(state, support_service, None)
+}
+
+/// The full router. `cast` adds the `/cast/*` routes (`OUTPACE_ENABLE_CAST`); without it
+/// they answer `404` like any unknown path.
+pub fn router_with_services(
+    state: AppState,
+    support_service: Option<Arc<crate::support::SupportService>>,
+    cast: Option<Arc<crate::cast::CastService>>,
+) -> Router {
     let compat = state.experimental_ace_compat;
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -346,6 +357,9 @@ pub fn router_with_support(
     }
     if state.search.is_some() && !state.peer_policy.is_private() {
         router = router.route("/search", get(search::search));
+    }
+    if let Some(cast) = cast {
+        router = router.merge(cast::routes(cast));
     }
     router
         .with_state(state)

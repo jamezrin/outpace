@@ -1,0 +1,8 @@
+HTTP/1.1 200 OK
+CACHE-CONTROL: max-age=1800
+EXT:
+LOCATION: http://192.168.1.40:49152/description.xml
+SERVER: Linux/5.4 UPnP/1.0 ExampleTV/1.0
+ST: urn:schemas-upnp-org:device:MediaRenderer:1
+USN: uuid:00000000-0000-0000-0000-000000000001::urn:schemas-upnp-org:device:MediaRenderer:1
+

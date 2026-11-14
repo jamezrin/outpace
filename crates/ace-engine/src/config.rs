@@ -506,6 +506,9 @@ config_with_root_redaction! {
     /// Serve Prometheus text metrics at `GET /metrics` on the HTTP bind. Off by default.
     /// `OUTPACE_METRICS`.
     pub metrics: bool,
+    /// Serve the `/cast/*` DLNA/UPnP renderer routes on the HTTP bind. Off by default.
+    /// Discovery runs only on request; playing needs a LAN-reachable `bind`. `OUTPACE_ENABLE_CAST`.
+    pub enable_cast: bool,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
     pub bep9_content_id_fallback: bool,
     /// Immutable per-name origination profiles, applied only at identity admission.
@@ -571,6 +574,7 @@ impl Default for Config {
             experimental_ace_compat: false,
             acestream_services: Default::default(),
             managed_hls: false,
+            enable_cast: false,
             metrics: false,
             bep9_content_id_fallback: false,
             broadcast_options: BTreeMap::new(),
@@ -924,6 +928,7 @@ mod tests {
         );
         assert!(!c.managed_hls, "managed origin HLS must remain opt-in");
         assert!(!c.metrics, "the metrics endpoint must remain opt-in");
+        assert!(!c.enable_cast, "casting must remain opt-in");
         assert!(
             !c.enable_port_mapping,
             "port mapping must default OFF so merging has zero effect on default operation"

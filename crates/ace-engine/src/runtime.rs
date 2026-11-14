@@ -301,6 +301,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_METRICS")? {
         config.metrics = v;
     }
+    if let Some(v) = bool_from_env("OUTPACE_ENABLE_CAST")? {
+        config.enable_cast = v;
+    }
     // Preserve presence: explicit public-network settings conflict, implicit defaults normalize.
     let private_peers = optional_private_env("OUTPACE_PRIVATE_PEERS")?;
     let private_descriptors = optional_private_env("OUTPACE_PRIVATE_DESCRIPTORS")?;
@@ -1200,6 +1203,11 @@ async fn serve_http_inner(
     // Bind HTTP before starting broadcast-owned network work. RTMP keeps its existing
     // dependency listener/bind behavior; its owned handle is stopped on every exit path.
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let cast = config.enable_cast.then(|| {
+        let cast = Arc::new(crate::cast::CastService::new());
+        cast.set_http_bind(listener.local_addr().unwrap_or(config.bind));
+        cast
+    });
     *srt_owner = if srt_config.is_some() {
         crate::srt::SrtService::start(srt_config, broadcasts.clone()).await?
     } else {
@@ -1244,6 +1252,12 @@ async fn serve_http_inner(
     if config.metrics {
         eprintln!("  metrics: http://{}/metrics", config.bind);
     }
+    if cast.is_some() {
+        eprintln!("  cast:    http://{}/cast/targets", config.bind);
+        if config.bind.ip().is_loopback() {
+            eprintln!("outpace: casting is enabled but OUTPACE_BIND is loopback; renderers cannot fetch streams until it is a LAN address");
+        }
+    }
     let cancel_rtmp = rtmp.cancel.clone();
     let cancel_background = background.cancel.clone();
     let mut background_cancelled = background.cancel.subscribe();
@@ -1283,7 +1297,7 @@ async fn serve_http_inner(
         let draining_support = support.clone();
         let manager = state.manager.clone();
         let networks = state.networks.clone();
-        let mut app = crate::http::router_with_support(state, support);
+        let mut app = crate::http::router_with_services(state, support, cast);
         if config.metrics {
             app = crate::metrics::instrument(app, manager, &networks);
         }
@@ -1891,6 +1905,22 @@ mod tests {
             assert_eq!(config_from_env().unwrap().managed_hls, expected);
         }
         for invalid in ["", "yes", "ture", " 1"] {
+            std::env::set_var(name, invalid);
+            assert!(config_from_env().unwrap_err().to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn enable_cast_env_defaults_off_and_parses_strictly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_ENABLE_CAST";
+        let _restore = EnvRestore::clear(&[name]);
+        assert!(!config_from_env().unwrap().enable_cast);
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(name, value);
+            assert_eq!(config_from_env().unwrap().enable_cast, expected);
+        }
+        for invalid in ["", "yes", " 1"] {
             std::env::set_var(name, invalid);
             assert!(config_from_env().unwrap_err().to_string().contains(name));
         }
