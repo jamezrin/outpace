@@ -38,6 +38,7 @@ These settings decide what the daemon exposes to the network. Change them delibe
 | `OUTPACE_ENABLE_INBOUND` | `true` | Accept inbound peers and announce yourself to trackers and the DHT. |
 | `OUTPACE_ENABLE_SEEDING` | `true` | Upload to peers you connect to. |
 | `OUTPACE_ENABLE_PORT_MAPPING` | `false` | Ask your router (UPnP/NAT-PMP) to open the peer port. |
+| `OUTPACE_ENABLE_CAST` | `false` | Add `/cast/*` routes on `OUTPACE_BIND` that discover LAN renderers on request and start or stop playback on them. |
 | `OUTPACE_DATA_DIR` | platform data dir + `outpace` | Node identity and broadcast signing keys. |
 | `OUTPACE_CACHE_DIR` | `<data dir>/cache` | Disk cache. **Wiped at startup** when disk caching is on. |
 
@@ -61,7 +62,7 @@ The **Avail.** column shows where each setting is available:
 
 | Setting | Default | Accepted values | Avail. | Notes |
 | --- | --- | --- | --- | --- |
-| `OUTPACE_BIND` | `127.0.0.1:6878` | socket address | all | HTTP API, playback, HLS and ingest. Set `0.0.0.0:6878` to reach it from other machines, and protect it with a firewall or proxy first. |
+| `OUTPACE_BIND` | `127.0.0.1:6878` | socket address | all | HTTP API, playback, HLS and ingest. Set `0.0.0.0:6878` to reach it from other machines, and protect it with a firewall or proxy first. [Casting](Casting) needs a LAN-reachable address here: on loopback, `play` fails with `409 loopback_bind`. |
 | `OUTPACE_RTMP_BIND` | `127.0.0.1:1935` | socket address | all | RTMP ingest for [broadcasting](Broadcasting). Use port `0` for a random local port if you never use RTMP. |
 | `OUTPACE_PEER_LISTEN` | `0.0.0.0:8621` | socket address | all | TCP peer listener. Its port is also the port Outpace announces, so the router's external port must match. See [NAT and Port Mapping](NAT-and-Port-Mapping). |
 
@@ -133,6 +134,12 @@ Off by default. See [Timeshift](Timeshift).
 | Setting | Default | Accepted values | Avail. | Notes |
 | --- | --- | --- | --- | --- |
 | `OUTPACE_MANAGED_HLS` | `false` | boolean | 1.0.0 | Serve descriptors that point at an HTTP(S) HLS origin through a local relay instead of redirecting the player to the origin. The daemon then fetches public origin URLs itself. See [Managed HLS Origins](Managed-HLS-Origins). |
+
+## Casting
+
+| Setting | Default | Accepted values | Avail. | Notes |
+| --- | --- | --- | --- | --- |
+| `OUTPACE_ENABLE_CAST` | `false` | boolean | edge | `1` or `true` adds the `/cast/*` routes for DLNA/UPnP media renderers. Discovery runs only when `GET /cast/targets` is called, and its result is cached for 60 seconds. `OUTPACE_BIND` must be reachable from the renderer. See [Casting](Casting). |
 
 ## Broadcasting and ingest
 

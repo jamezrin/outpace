@@ -204,6 +204,7 @@ of Outpace logged it:
 | `[dht]` | DHT peer search results. |
 | `[reachability]` | Whether inbound peers can reach you, every two minutes. |
 | `[portmap]` | UPnP/NAT-PMP mapping, renewal and removal. |
+| `[dlna]` | [Casting](Casting): discovery results, skipped devices, play and stop on a renderer. |
 | `[seed]`, `[seed-listener]` | Inbound seeding: accepted connections, cleanup of idle seeding data. |
 | `[seed-session]` | Per-message seeding detail. Only shown with `OUTPACE_SEED_DEBUG` set. |
 | `[cache]` | Disk cache errors. |
