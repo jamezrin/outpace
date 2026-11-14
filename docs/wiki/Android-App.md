@@ -4,8 +4,11 @@ The companion app for phones and Android TV is developed in
 [outpace-stream/outpace-android](https://github.com/outpace-stream/outpace-android).
 It downloads the engine version you choose and opens streams in an external player.
 
-**Status:** under development. Signed APK releases and device validation are still pending.
-Use [Termux](Installation#android-with-termux-best-effort) for the currently documented Android installation.
+**Status:** early release. Signed APKs start at v0.1.0 on the
+[releases page](https://github.com/outpace-stream/outpace-android/releases).
+Sideload one onto a television with [Android TV](Android-TV).
+[Termux](Installation#android-with-termux-best-effort) remains the way to run the engine
+binary yourself.
 
 - [App user guide](https://github.com/outpace-stream/outpace-android/blob/main/docs/Android-App.md)
 - [Implementation issue](https://github.com/outpace-stream/outpace-android/issues/1)

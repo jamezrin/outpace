@@ -85,8 +85,9 @@ outpace serve
 - Android may still stop background apps. Disable battery optimisation for Termux if streams
   stop when the screen is off.
 
-The [Android companion app](Android-App) is developed separately; signed APKs are not yet
-published. The Termux instructions above remain the available installation route.
+The [Android companion app](Android-App) is developed separately. Signed APKs start at v0.1.0
+in that repository. [Android TV](Android-TV) is the sideload path for a television. The Termux
+instructions above remain the way to run the engine binary yourself.
 
 ### Homebrew and Scoop
 

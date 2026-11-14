@@ -74,6 +74,7 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 | Keep sources warm and monitor the daemon | [Support Sources and Operations](Support-Sources-and-Operations) |
 | Fix a problem or read the logs | [Troubleshooting](Troubleshooting) |
 | Check what version has which feature | [Releases and Versions](Releases-and-Versions) |
+| Run the Android app on a television | [Android TV](Android-TV) |
 
 ## Release availability
 
