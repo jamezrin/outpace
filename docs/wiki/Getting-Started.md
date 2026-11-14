@@ -133,6 +133,9 @@ See [Playing Streams](Playing-Streams#acestream-compatible-api).
   peer traffic. Try another stream and turn off VPNs.
 - HLS returns `503`: the stream didn't produce enough segments within the startup timeout.
 - `422` with a reason: the id couldn't be resolved to a stream Outpace can play.
+- The stream's `status` shows a `phase` (`resolving`, `connecting`, `buffering`, `playing`) and,
+  after a failed start, an `error.code` such as `no_peers`. See
+  [Playing Streams](Playing-Streams#start-phase).
 
 [Troubleshooting](Troubleshooting) covers these and more.
 

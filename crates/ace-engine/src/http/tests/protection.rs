@@ -78,7 +78,11 @@ async fn native_protection_refusals_preserve_policy_text_before_source_work() {
                 status,
                 String::from_utf8(body.to_vec()).unwrap(),
             ));
-            expected.push((path, StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
+            expected.push((
+                path,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({"error": {"code": "protected", "message": error.to_string()}}).to_string(),
+            ));
         }
     }
     assert_eq!(opens.load(Ordering::SeqCst), 0);

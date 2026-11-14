@@ -152,7 +152,7 @@ impl VodContent for AceVodContent {
                 peers.len()
             );
             if peers.is_empty() {
-                return Err(ProviderError::Backend("no VOD peers discovered".into()));
+                return Err(ProviderError::NoPeers("no VOD peers discovered".into()));
             }
             let info = self.info.clone();
             let store = self.store.0.clone();

@@ -61,6 +61,8 @@ A status response looks like this:
 {
   "network": "ace",
   "id": "cid:0123456789abcdef0123456789abcdef01234567",
+  "phase": "playing",
+  "error": null,
   "clients": 1,
   "peers": 4,
   "bitrate": 2450000,
@@ -75,6 +77,8 @@ A status response looks like this:
 
 | Field | Meaning |
 | --- | --- |
+| `phase` | Where the start is: `resolving`, `connecting`, `buffering`, `playing` or `failed`. See below. |
+| `error` | `{"code": ..., "message": ...}` when `phase` is `failed`, otherwise `null`. |
 | `clients` | Direct MPEG-TS viewers. HLS viewers don't add to it. |
 | `peers` | Connected upstream peers. |
 | `bitrate` | Measured incoming media rate in bits per second, over about five seconds. |
@@ -84,9 +88,40 @@ A status response looks like this:
 | `metadata` | Title, advertised bitrate (bits/s) and categories from the descriptor, or `null`, `null` and `[]`. |
 | `normalization` | Audio-conversion state when [live audio normalisation](HLS-Output#audio-normalisation) is on, otherwise `null`. |
 
-The status route never starts a stream; it returns `404` when the stream isn't running. Use it
-(and `/streams`) for monitoring. **Don't poll a playback URL as a health check**, because that
-starts or keeps alive a real stream.
+#### Start phase
+
+`phase` tells a player or app why a stream hasn't started yet:
+
+| `phase` | Meaning |
+| --- | --- |
+| `resolving` | Resolving the id to its descriptor. |
+| `connecting` | Descriptor known; looking for and connecting to peers. |
+| `buffering` | Connected to peers; waiting for the first media. |
+| `playing` | Media is flowing out of the stream. |
+| `failed` | The start failed; `error` says why. A running stream also reports `failed` when [audio normalisation](HLS-Output#audio-normalisation) failed before any media went out. |
+
+The status route answers from the moment a playback URL is opened, before the stream exists.
+While it is still `resolving` or `connecting`, and for about 60 seconds after a start
+`failed`, the response carries only `network`, `id`, `phase`, `error`, `clients` (`0`) and
+`peers` (`0`):
+
+```json
+{
+  "network": "ace",
+  "id": "cid:0123456789abcdef0123456789abcdef01234567",
+  "phase": "failed",
+  "error": { "code": "no_peers", "message": "no peer is sharing this stream" },
+  "clients": 0,
+  "peers": 0
+}
+```
+
+Outpace remembers at most 64 such start attempts. A new start of the same stream replaces the
+old record. A stopped or cancelled start leaves none.
+
+The status route never starts a stream. It returns `404` when the stream isn't running and
+has no recent start attempt. Use it (and `/streams`) for monitoring. **Don't poll a playback
+URL as a health check**, because that starts or keeps alive a real stream.
 
 ### Stopping a stream
 
@@ -106,9 +141,35 @@ This returns `204`, or `404` if the stream wasn't running.
 | Status | Meaning |
 | --- | --- |
 | `400` | A malformed `cid:` or `ih:` selector. |
-| `404` | Unknown network or invalid id. For a segment: not produced yet, or already outside the window. |
-| `422` | The input couldn't be turned into a playable descriptor, for example an infohash with no verified descriptor. The body gives the reason. |
+| `404` | Unknown network, invalid id, or a start that failed (see the `code`). For a segment: not produced yet, or already outside the window. |
+| `422` | The input couldn't be turned into a playable descriptor, for example an infohash with no verified descriptor, or protected content. |
 | `503` + `Retry-After: 1` | HLS not ready within the startup timeout, the [session cap](Configuration#limits-and-admission) reached, or audio conversion temporarily unavailable. |
+
+When a stream can't be **started**, the playback routes (`/streams/<network>/<id>`, `.ts`,
+`.m3u8`) and the VOD routes (`/vod/...`) answer with `Content-Type: application/json` and a
+stable error code:
+
+```json
+{ "error": { "code": "unresolvable", "message": "..." } }
+```
+
+The same `error` object appears on the status route while `phase` is `failed`, but only for
+live starts on a known network. A VOD failure or an unknown network leaves no start record, so
+the status route answers `404`: read the `error` from the start response itself. Key off
+`code`; `message` is human-readable text and can change.
+
+| `code` | Status | Meaning |
+| --- | --- | --- |
+| `not_found` | `404` | Unknown network, or the start was refused. |
+| `no_peers` | `404` (`502` for VOD) | Nobody is sharing the stream right now: no metadata peer answered, or initial discovery found no peer. |
+| `network` | `404` (`502` for VOD); `422` for an `ih:` infohash | The catalog couldn't be reached. Check the network, VPN and firewall. |
+| `unresolvable` | `422` (`502` for public VOD) | The id has no verified descriptor. `message` explains why and what to try instead. |
+| `protected` | `422` | Encrypted or invalid-protection content, which Outpace doesn't play. |
+| `capacity` | `503` + `Retry-After: 1` (`404` when the catalog resolver is saturated) | The [session cap](Configuration#limits-and-admission), the catalog resolver or audio conversion is at capacity. Retry later. |
+| `no_space` | | Reserved for a VOD free-space check. Not produced yet. |
+| `internal` | `404` (`502` for VOD) | Any other failure. The daemon log shows how far the start got. |
+
+The [compatibility API](#acestream-compatible-api) keeps its own error format.
 
 ## Live and VOD
 

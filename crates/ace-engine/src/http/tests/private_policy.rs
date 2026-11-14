@@ -95,7 +95,11 @@ async fn private_catalog_refusals_remain_explicit_on_native_routes() {
             StatusCode::UNPROCESSABLE_ENTITY,
             "private refusal lost on native route"
         );
-        assert_eq!(raw.as_ref(), b"catalog_disabled_in_private_mode");
+        let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            body,
+            json!({"error": {"code": "unresolvable", "message": "catalog_disabled_in_private_mode"}})
+        );
     }
 }
 
@@ -135,14 +139,15 @@ async fn private_vod_alias_refuses_live_hls_and_compat_playback_with_422() {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "compat={compat}, hls={hls}"
             );
-            assert_eq!(
-                raw.as_ref(),
-                if compat {
-                    b"stream metadata unavailable".as_slice()
-                } else {
-                    b"local_descriptor_is_not_live".as_slice()
-                }
-            );
+            if compat {
+                assert_eq!(raw.as_ref(), b"stream metadata unavailable");
+            } else {
+                let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(
+                    body,
+                    json!({"error": {"code": "unresolvable", "message": "local_descriptor_is_not_live"}})
+                );
+            }
         }
     }
 }

@@ -78,7 +78,9 @@ pub(super) async fn delete_stream(
     }
 }
 
-/// `GET /streams/{network}/{id}/status` — stats for a running session (404 if not active).
+/// `GET /streams/{network}/{id}/status` — start `phase` and stats for a running session, or
+/// the recorded start attempt (`resolving`/`connecting`, or `failed` with a typed `error`) when
+/// no session answers yet or any more. 404 when neither exists.
 pub(super) async fn stream_status(
     State(s): State<AppState>,
     Path((network, id)): Path<(String, String)>,
@@ -87,12 +89,18 @@ pub(super) async fn stream_status(
         Ok(id) => id,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
+    // Read the attempt record before the session map: a successful start inserts its session
+    // before it removes its record, so this order never misses both mid-handoff.
+    let attempt = s.manager.start_status(&network, &id);
     match s.manager.get(&network, &id).await {
         Some(session) => {
             let stats = session.stats().await;
+            let (phase, error) = session_phase(&session, &stats);
             Json(json!({
                 "network": network,
                 "id": native_public_stream_id(&network, &id),
+                "phase": phase.as_str(),
+                "error": error.as_ref().map(StartError::to_json),
                 "clients": session.subscriber_count(),
                 "occupied_sessions": s.manager.admission_status().0,
                 "max_sessions": s.manager.admission_status().1,
@@ -108,8 +116,45 @@ pub(super) async fn stream_status(
             }))
             .into_response()
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => match attempt {
+            Some(attempt) => Json(json!({
+                "network": network,
+                "id": native_public_stream_id(&network, &id),
+                "phase": attempt.phase().as_str(),
+                "error": attempt.error().map(StartError::to_json),
+                "clients": 0,
+                "peers": 0,
+            }))
+            .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
     }
+}
+
+/// Start phase of a running session: `playing` once media has left the session, `failed` when
+/// audio normalization failed before any output, `buffering` while connected peers have not
+/// produced output yet, `connecting` before any peer connects.
+fn session_phase(
+    session: &StreamSession,
+    stats: &crate::provider::SourceStats,
+) -> (StartPhase, Option<StartError>) {
+    if session.output_started() {
+        return (StartPhase::Playing, None);
+    }
+    if let Some(state) = session.playback_state() {
+        if let crate::audio_normalize::PlaybackPhase::Failed(reason) = state.snapshot().phase {
+            return (
+                StartPhase::Failed,
+                Some(StartError::from_normalization(reason)),
+            );
+        }
+    }
+    let phase = if stats.peers > 0 {
+        StartPhase::Buffering
+    } else {
+        StartPhase::Connecting
+    };
+    (phase, None)
 }
 
 /// `GET /streams/{network}/{id}/seg/{n}.ts` — a retained HLS segment.
@@ -135,24 +180,41 @@ pub(super) async fn stream_segment(
     }
 }
 
-/// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
-/// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
-/// that text. Protection policy failures also return 422 with their stable message.
-/// Capacity returns 503 with Retry-After; an origin HLS source is a `302` handoff (to the origin,
-/// or to a managed relay lease) without a swarm session; other failures retain bodiless 404.
+/// Response for a failed stream start on the native routes: a JSON
+/// `{"error": {"code", "message"}}` body with a stable code (see [`StartError`]). Status codes
+/// are unchanged: `Unresolvable` (a bare infohash without a verified descriptor, #164) and
+/// protection policy failures are `422`; capacity is `503` with Retry-After; an origin HLS
+/// source is a `302` handoff (to the origin, or to a managed relay lease) without a swarm
+/// session; other failures are `404`.
 async fn stream_start_error(s: &AppState, e: ProviderError) -> Response {
-    match e {
-        ProviderError::CapacityExhausted => capacity_error(),
+    let status = match &e {
         ProviderError::DirectHls(origin) => {
-            super::compat::resolved_origin_redirect(s, &origin.manifest_url).await
+            return super::compat::resolved_origin_redirect(s, &origin.manifest_url).await
         }
-        e @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
-        }
-        ProviderError::Unresolvable(reason) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response()
-        }
-        _ => StatusCode::NOT_FOUND.into_response(),
+        ProviderError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        ProviderError::ProtectedContent
+        | ProviderError::InvalidProtection
+        | ProviderError::Unresolvable(_)
+        | ProviderError::UnresolvableNetwork(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::NOT_FOUND,
+    };
+    let error = StartError::from_provider(&e);
+    // Provider diagnostics may embed identifiers or URLs: log only the typed code.
+    crate::alog!(
+        "[streams] start failed: code={} status={}",
+        error.code.as_str(),
+        status.as_u16()
+    );
+    start_error_response(status, &error)
+}
+
+/// A typed start failure as `application/json`; `503` responses also carry Retry-After.
+pub(super) fn start_error_response(status: StatusCode, error: &StartError) -> Response {
+    let body = Json(json!({ "error": error.to_json() }));
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        (status, [(header::RETRY_AFTER, "1")], body).into_response()
+    } else {
+        (status, body).into_response()
     }
 }
 

@@ -537,6 +537,22 @@ pub(super) async fn ace_playback(
                 ProviderError::Backend(_) => {
                     (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
                 }
+                ProviderError::NoPeers(_) => {
+                    (StatusCode::BAD_GATEWAY, "NoPeers", "stream start failed")
+                }
+                ProviderError::Network(_) => {
+                    (StatusCode::BAD_GATEWAY, "Network", "stream start failed")
+                }
+                ProviderError::ResolverBusy(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    "ResolverBusy",
+                    "stream start failed",
+                ),
+                ProviderError::UnresolvableNetwork(_) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "UnresolvableNetwork",
+                    "stream metadata unavailable",
+                ),
                 ProviderError::Unresolvable(_) => (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "Unresolvable",
@@ -1039,7 +1055,8 @@ pub(super) async fn resolve_ace_selection(
         if let Err(
             e @ (ProviderError::ProtectedContent
             | ProviderError::InvalidProtection
-            | ProviderError::Unresolvable(_)),
+            | ProviderError::Unresolvable(_)
+            | ProviderError::UnresolvableNetwork(_)),
         ) = s.manager.check_openable(network, &selection.session_key)
         {
             return Err(e.to_string());

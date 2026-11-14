@@ -23,6 +23,7 @@ mod origin_hls;
 mod protection;
 mod search;
 mod server_api;
+mod start_status;
 mod support;
 mod timeshift;
 mod vod;

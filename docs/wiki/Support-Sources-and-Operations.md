@@ -76,7 +76,7 @@ None of these start a stream. Use them for monitoring, never a playback URL.
 | `GET /healthz` | `ok` while the HTTP server runs. Liveness only: it doesn't prove peers or media. | all |
 | `GET /networks` | Provider networks, normally `{"networks":["ace"]}`. | all |
 | `GET /streams` | Active streams with their viewer count and metadata. | all |
-| `GET /streams/ace/<id>/status` | One stream: peers, bitrate, server buffer, upload, recovery counters, session occupancy. `404` when not running. | all |
+| `GET /streams/ace/<id>/status` | One stream: start `phase` and `error`, peers, bitrate, server buffer, upload, recovery counters, session occupancy. While starting, or shortly after a failed start, only `phase`, `error`, `clients` and `peers`. `404` when neither running nor recently started. | all |
 | `GET /origin-hls/status` | Managed-relay state: `{"enabled":...,"active_sessions":...}`. | 1.0.0 |
 | `GET /support` | Support-source states. | 1.0.0 |
 | `GET /network-policy` | Public or private peer mode and allowlist size. | 1.0.0 |

@@ -21,11 +21,11 @@ pub(super) async fn vod_stream(
         // Whole file (no usable Range): 200 with Accept-Ranges so players know they *can* seek.
         RangeOutcome::Full => match vod.open_range(0, total - 1).await {
             Ok(source) => vod_response_from_source(source),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+            Err(e) => vod_range_error(e),
         },
         RangeOutcome::Satisfiable(start, end) => match vod.open_range(start, end).await {
             Ok(source) => vod_partial_response(source, start, end, total),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+            Err(e) => vod_range_error(e),
         },
         // A well-formed range that can't be met: 416 with the resource's true length.
         RangeOutcome::Unsatisfiable => axum::http::Response::builder()
@@ -159,22 +159,36 @@ pub(super) async fn resolve_vod(
     network: &str,
     id: &str,
 ) -> Result<Arc<dyn VodContent>, Box<Response>> {
-    match s.manager.resolve_vod(network, id).await {
-        Ok(v) => Ok(v),
-        Err(ProviderError::CapacityExhausted) => Err(Box::new(super::streams::capacity_error())),
-        Err(e @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection)) => Err(
-            Box::new((StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()),
-        ),
-        Err(ProviderError::Unresolvable(reason)) if s.peer_policy.is_private() => Err(Box::new(
-            (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response(),
-        )),
-        Err(ProviderError::NotFound) => Err(Box::new(
-            (StatusCode::NOT_FOUND, "unknown network").into_response(),
-        )),
-        Err(e) => Err(Box::new(
-            (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
-        )),
-    }
+    let error = match s.manager.resolve_vod(network, id).await {
+        Ok(v) => return Ok(v),
+        Err(error) => error,
+    };
+    let status = match &error {
+        ProviderError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        ProviderError::ProtectedContent | ProviderError::InvalidProtection => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        ProviderError::Unresolvable(_) | ProviderError::UnresolvableNetwork(_)
+            if s.peer_policy.is_private() =>
+        {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        ProviderError::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let error = StartError::from_provider(&error);
+    // Provider diagnostics may embed identifiers or URLs: log only the typed code.
+    crate::alog!("[vod] resolution failed: code={}", error.code.as_str());
+    Err(Box::new(super::streams::start_error_response(
+        status, &error,
+    )))
+}
+
+/// A failed VOD range open: `502` with the typed JSON error body.
+fn vod_range_error(error: ProviderError) -> Response {
+    let error = StartError::from_provider(&error);
+    crate::alog!("[vod] range open failed: code={}", error.code.as_str());
+    super::streams::start_error_response(StatusCode::BAD_GATEWAY, &error)
 }
 
 /// `GET /vod/{network}/{id}/manifest.m3u8` — a static VOD HLS media playlist for the resolved
@@ -217,7 +231,7 @@ pub(super) async fn vod_hls_segment(
     };
     match vod.open_range(start, end).await {
         Ok(source) => vod_hls_segment_response(source),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+        Err(e) => vod_range_error(e),
     }
 }
 

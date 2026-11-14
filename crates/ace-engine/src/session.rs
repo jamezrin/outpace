@@ -4,7 +4,7 @@
 use crate::provider::{SourceStats, StatsHandle, TsSource};
 use ace_swarm::types::StreamMetadata;
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, Mutex};
 
@@ -24,6 +24,8 @@ pub struct StreamSession {
     tx: broadcast::WeakSender<StreamEvent>,
     subscribers: Arc<AtomicU64>,
     support_pins: AtomicU64,
+    /// Set once by the pump when the first media chunk leaves the session.
+    output_started: Arc<AtomicBool>,
     stats: Arc<Mutex<SourceStats>>,
     live_stats: Option<StatsHandle>,
     metadata: StreamMetadata,
@@ -108,10 +110,14 @@ impl StreamSession {
         let weak_tx = tx.downgrade();
         let pump_tx = tx;
         let pump_stats = stats.clone();
+        let output_started = Arc::new(AtomicBool::new(false));
+        let pump_output_started = output_started.clone();
         let failed_sources = cleanup.failed_sources();
         let mut control = cleanup.spawn(move |mut cancel| async move {
             use futures::FutureExt;
             let pull_result = std::panic::AssertUnwindSafe(async {
+                // Local copy: one shared store per session, not per chunk.
+                let mut started = false;
                 loop {
                     let chunk = tokio::select! {
                         biased;
@@ -141,6 +147,10 @@ impl StreamSession {
                         None => StreamEvent::Data(chunk),
                     };
                     let _ = pump_tx.send(event);
+                    if !started {
+                        started = true;
+                        pump_output_started.store(true, Ordering::Release);
+                    }
                 }
             })
             .catch_unwind()
@@ -164,6 +174,7 @@ impl StreamSession {
             tx: weak_tx,
             subscribers: Arc::new(AtomicU64::new(0)),
             support_pins: AtomicU64::new(0),
+            output_started,
             stats,
             live_stats,
             metadata,
@@ -217,6 +228,11 @@ impl StreamSession {
     /// Retained even after the media pump and source cleanup finish.
     pub fn playback_state(&self) -> Option<crate::audio_normalize::PlaybackStateHandle> {
         self.playback_state.clone()
+    }
+
+    /// True once the session has published its first media chunk.
+    pub fn output_started(&self) -> bool {
+        self.output_started.load(Ordering::Acquire)
     }
 
     pub fn subscriber_count(&self) -> u64 {

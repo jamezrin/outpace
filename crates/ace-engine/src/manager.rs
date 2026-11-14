@@ -376,6 +376,8 @@ pub struct StreamManager {
     cleanup: CleanupTracker,
     reaper: StdMutex<Option<WorkerControl>>,
     shutting_down: std::sync::atomic::AtomicBool,
+    /// Bounded record of in-progress and recently failed live starts for the status route.
+    start_attempts: Arc<crate::start_status::StartAttempts>,
 }
 
 impl StreamManager {
@@ -570,6 +572,7 @@ impl StreamManager {
             cleanup: CleanupTracker::default(),
             reaper: StdMutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            start_attempts: Arc::default(),
         })
     }
 
@@ -627,6 +630,20 @@ impl StreamManager {
             .get(network)
             .ok_or(ProviderError::NotFound)?
             .check_openable(id)
+    }
+
+    /// [`check_openable`](Self::check_openable) for a live start: a provider's refusal (not an
+    /// unknown network) is recorded as a failed attempt, so the status route reports it too.
+    fn check_live_start(&self, network: &str, id: &str) -> Result<(), ProviderError> {
+        let result = self.check_openable(network, id);
+        if let Err(error) = &result {
+            if !matches!(error, ProviderError::NotFound) {
+                self.start_attempts
+                    .begin((network.to_string(), id.to_string()))
+                    .fail(error);
+            }
+        }
+        result
     }
 
     /// Prepare through the registered provider without opening a source or changing its key.
@@ -858,7 +875,7 @@ impl StreamManager {
         id: &str,
     ) -> Result<crate::session::SupportPin, ProviderError> {
         let id = &*self.canonical_id(network, id);
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let manager = self.clone();
         let network = network.to_owned();
         let id = id.to_owned();
@@ -951,7 +968,7 @@ impl StreamManager {
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
         let id = &*self.canonical_id(network, id);
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -985,7 +1002,7 @@ impl StreamManager {
         id: &str,
     ) -> Result<(Arc<StreamSession>, crate::session::Subscription), ProviderError> {
         let id = &*self.canonical_id(network, id);
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let manager = self.clone();
         let network = network.to_owned();
         let id = id.to_owned();
@@ -1017,7 +1034,7 @@ impl StreamManager {
         F: FnOnce(Arc<StreamSession>) -> T + Send,
         T: Send,
     {
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let key = (network.to_string(), id.to_string());
         if support
             .as_ref()
@@ -1120,9 +1137,24 @@ impl StreamManager {
         let provider = self.registry.get(network).ok_or_else(|| {
             ProviderStartFailure::new(StartFailureKind::Cancelled, ProviderError::NotFound)
         })?;
-        let reservation = self.admission.reserve()?;
+        // Dropped without `fail` (success or cancellation), the attempt record is removed.
+        let attempt = self.start_attempts.begin(key.clone());
+        let reservation = match self.admission.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                attempt.fail(&error);
+                return Err(error.into());
+            }
+        };
+        let inner = match provider.open_with_progress(id, attempt.progress()).await {
+            Ok(inner) => inner,
+            Err(failure) => {
+                settle_failed_open(attempt, &failure);
+                return Err(failure);
+            }
+        };
         let source: Box<dyn TsSource> = Box::new(crate::admission::Source {
-            inner: provider.open_classified(id).await?,
+            inner,
             _reservation: reservation,
         });
         let _finalizing = self.hls_finalization.lock().await;
@@ -1151,6 +1183,18 @@ impl StreamManager {
         let session = StreamSession::start_with_cleanup(source, self.buffer, &self.cleanup);
         let mut map = self.sessions.lock().await;
         Ok(acquire(map.entry(key).or_insert(session).clone()))
+    }
+
+    /// The recorded live start attempt for `(network, id)` when no session answers for it:
+    /// in progress (`resolving`/`connecting`) or failed within the retention window.
+    pub fn start_status(
+        &self,
+        network: &str,
+        id: &str,
+    ) -> Option<crate::start_status::AttemptStatus> {
+        let id = self.canonical_id(network, id);
+        self.start_attempts
+            .status(&(network.to_string(), id.into_owned()))
     }
 
     /// Peek at an already-running session without starting one.
@@ -1193,7 +1237,7 @@ impl StreamManager {
         id: &str,
         native: bool,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let manager = self.clone();
         let network = network.to_owned();
         let id = id.to_owned();
@@ -1216,7 +1260,7 @@ impl StreamManager {
         mut cancel: watch::Receiver<bool>,
         mut transition: HlsTransition,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let key = (network.to_string(), id.to_string());
         if transition.is_cancelled()
             || *cancel.borrow()
@@ -1244,11 +1288,28 @@ impl StreamManager {
         }
 
         let existing_session = self.sessions.lock().await.get(&key).cloned();
+        // Dropped without `fail` (success or cancellation), the attempt record is removed.
+        let mut _attempt = None;
         let mut source: Option<Box<dyn TsSource>> = if existing_session.is_none() {
             let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-            let reservation = self.admission.reserve()?;
+            let attempt = self.start_attempts.begin(key.clone());
+            let reservation = match self.admission.reserve() {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    attempt.fail(&error);
+                    return Err(error);
+                }
+            };
+            let inner = match provider.open_with_progress(id, attempt.progress()).await {
+                Ok(inner) => inner,
+                Err(failure) => {
+                    settle_failed_open(attempt, &failure);
+                    return Err(failure.into());
+                }
+            };
+            _attempt = Some(attempt);
             Some(Box::new(crate::admission::Source {
-                inner: provider.open(id).await?,
+                inner,
                 _reservation: reservation,
             }))
         } else {
@@ -1615,6 +1676,19 @@ impl StreamManager {
         success &= self.cleanup.drain().await;
         self.stopping.lock().unwrap().clear();
         success
+    }
+}
+
+/// Record a provider open failure on the status route. A cancelled open, and an origin HLS
+/// handoff (a redirect, not a failure), leave no record.
+fn settle_failed_open(attempt: crate::start_status::StartAttempt, failure: &ProviderStartFailure) {
+    let not_a_failure = matches!(
+        failure.kind,
+        StartFailureKind::Cancelled
+            | StartFailureKind::Resolution(ace_swarm::resolve::ResolveFailureKind::Cancelled)
+    ) || matches!(failure.error, ProviderError::DirectHls(_));
+    if !not_a_failure {
+        attempt.fail(&failure.error);
     }
 }
 
