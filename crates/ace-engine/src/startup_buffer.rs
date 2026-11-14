@@ -4,6 +4,7 @@ use ace_media::mpegts::{ts_timing, ClockObservation, SelectedPcrClock, TsTiming,
 use ace_swarm::types::StreamMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,8 +15,30 @@ enum ReleaseReason {
     TargetDuration,
     ByteLimit,
     Deadline,
+    /// The live source has reassembled every piece up to its known head, so waiting longer
+    /// only accumulates media at real-time speed, or not at all when the head is stalled.
+    BacklogExhausted,
     EndOfStream,
     Disabled,
+}
+
+/// How often a collecting reservoir rereads live position stats between chunks, to catch a
+/// position update published after the last backlog chunk was delivered.
+const BACKLOG_RECHECK: Duration = Duration::from_millis(250);
+
+/// Upper bound on chunks taken without waiting when the backlog is exhausted. The live
+/// position runs ahead of delivery, so reassembled media can still sit in the source
+/// channel, whose capacity this matches.
+const READY_DRAIN_LIMIT: usize = 256;
+
+/// Whether a live source reports that only its head piece, at most, is still outstanding.
+/// Sources without live position stats never report an exhausted backlog.
+fn live_backlog_exhausted(stats: &SourceStats) -> bool {
+    stats
+        .livepos
+        .as_ref()
+        .and_then(|position| Some(position.pos? >= position.last?))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +243,13 @@ impl StartupReservoir {
         }
     }
 
+    /// Release reason for an exhausted live backlog, once media is queued. An empty
+    /// reservoir has nothing to start playback with, so it keeps collecting.
+    fn backlog_exhausted(&self) -> Option<ReleaseReason> {
+        (self.phase == Phase::Collecting && self.queued_bytes > 0)
+            .then_some(ReleaseReason::BacklogExhausted)
+    }
+
     fn deadline(&self) -> Option<Instant> {
         (self.phase == Phase::Collecting)
             .then(|| {
@@ -320,7 +350,10 @@ impl StartupBufferedSource {
     }
 
     fn publish_stats(&self) {
-        let cached = self.inner.stats();
+        self.publish_cached_stats(self.inner.stats());
+    }
+
+    fn publish_cached_stats(&self, cached: SourceStats) {
         let reservoir_ms = (self.reservoir.phase != Phase::Released)
             .then(|| self.reservoir.duration().as_millis().min(u64::MAX as u128) as u64);
         *self.stats.observed.lock().unwrap() = StartupObservation {
@@ -329,15 +362,64 @@ impl StartupBufferedSource {
         };
     }
 
+    /// Queue one source read. Returns whether the reservoir is still collecting.
+    fn accept(&mut self, next: Option<Bytes>) -> bool {
+        match next {
+            Some(chunk) => {
+                if self.inner.take_discontinuity() {
+                    self.reservoir.discontinuity();
+                    self.pending_discontinuity = true;
+                }
+                self.reservoir.push(chunk).is_none()
+            }
+            None => {
+                self.reservoir.release(ReleaseReason::EndOfStream);
+                false
+            }
+        }
+    }
+
+    /// Release on an exhausted live backlog. Live position is published before its media
+    /// is delivered, so first take the media that is already readable: it may still reach
+    /// the target, and the release log should count it. Returns the stats it read.
+    fn release_exhausted_backlog(&mut self) -> SourceStats {
+        let stats = self.inner.stats();
+        if !live_backlog_exhausted(&stats) {
+            return stats;
+        }
+        for _ in 0..READY_DRAIN_LIMIT {
+            // A read that is not ready is dropped; production sources read from a
+            // channel, which is cancel-safe.
+            let Some(next) = self.inner.next().now_or_never() else {
+                break;
+            };
+            if !self.accept(next) {
+                return self.inner.stats();
+            }
+        }
+        if let Some(reason) = self.reservoir.backlog_exhausted() {
+            self.reservoir.release(reason);
+        }
+        self.inner.stats()
+    }
+
     async fn collect_next(&mut self) {
         let next = if let Some(deadline) = self.reservoir.deadline() {
             // Once the deadline has expired, drain the retained media before consuming
-            // another ready chunk, which may belong to a new source epoch.
+            // another ready chunk, which may belong to a new source epoch. The recheck
+            // cancels a pending read; production sources read from a channel, which is
+            // cancel-safe, as the deadline arm already requires.
+            let recheck = Instant::now() + BACKLOG_RECHECK;
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(deadline) => {
                     self.reservoir.release(ReleaseReason::Deadline);
                     self.publish_stats();
+                    return;
+                }
+                _ = tokio::time::sleep_until(recheck), if recheck < deadline => {
+                    let stats = self.release_exhausted_backlog();
+                    self.publish_cached_stats(stats);
                     return;
                 }
                 chunk = self.inner.next() => chunk,
@@ -347,17 +429,12 @@ impl StartupBufferedSource {
         };
 
         let empty = next.as_ref().is_some_and(Bytes::is_empty);
-        match next {
-            Some(chunk) => {
-                if self.inner.take_discontinuity() {
-                    self.reservoir.discontinuity();
-                    self.pending_discontinuity = true;
-                }
-                self.reservoir.push(chunk);
-            }
-            None => self.reservoir.release(ReleaseReason::EndOfStream),
+        if self.accept(next) {
+            let stats = self.release_exhausted_backlog();
+            self.publish_cached_stats(stats);
+        } else {
+            self.publish_stats();
         }
-        self.publish_stats();
         if empty {
             // A source can return ready empty chunks without ever yielding to cancellation
             // or the deadline. Its gap and stats are recorded; now cooperate.
@@ -1008,6 +1085,140 @@ mod tests {
         assert!(source.take_discontinuity());
         assert!(!source.take_discontinuity());
         assert!(source.next().await.is_none());
+    }
+
+    fn live_position(pos: u64, last: u64) -> Arc<std::sync::Mutex<SourceStats>> {
+        Arc::new(std::sync::Mutex::new(SourceStats {
+            livepos: Some(crate::provider::LivePositionStats {
+                pos: Some(pos),
+                last: Some(last),
+                ..Default::default()
+            }),
+            ..SourceStats::default()
+        }))
+    }
+
+    /// Two media packets one second apart, then a source that never yields again.
+    fn short_live_backlog(stats: &Arc<std::sync::Mutex<SourceStats>>) -> Box<dyn TsSource> {
+        let mut inner = FixtureSource::new(vec![
+            (packet(PID, Some(0), false, b'a'), false),
+            (packet(PID, Some(90_000), false, b'b'), false),
+        ]);
+        inner.live_stats = Some(stats.clone());
+        inner.delay_after = Some(2);
+        Box::new(inner)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_live_backlog_releases_without_waiting_for_target_or_deadline() {
+        let stats = live_position(10, 10);
+        let mut buffered = StartupBufferedSource::new(
+            short_live_backlog(&stats),
+            config(30_000, 1 << 20, 15_000),
+            None,
+        );
+        let started = Instant::now();
+        assert_eq!(buffered.next().await.unwrap()[20], b'a');
+        assert_eq!(buffered.next().await.unwrap()[20], b'b');
+        assert!(Instant::now() - started < Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_media_behind_an_exhausted_position_still_reaches_the_target() {
+        let stats = live_position(10, 10);
+        let mut inner = FixtureSource::new(vec![
+            (packet(PID, Some(0), false, b'a'), false),
+            (packet(PID, Some(90_000), false, b'b'), false),
+            (packet(PID, Some(2 * 90_000), false, b'c'), false),
+        ]);
+        inner.live_stats = Some(stats.clone());
+        inner.delay_after = Some(3);
+        let mut buffered =
+            StartupBufferedSource::new(Box::new(inner), config(2_000, 1 << 20, 15_000), None);
+        assert_eq!(buffered.next().await.unwrap()[20], b'a');
+        // Released with all three packets queued: two remain, two thirds of the 2 s
+        // release duration. Releasing before the ready reads would leave nothing queued.
+        assert_eq!(buffered.stats().buffer_ms, 1_333);
+        assert_eq!(buffered.next().await.unwrap()[20], b'b');
+        assert_eq!(buffered.next().await.unwrap()[20], b'c');
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outstanding_live_backlog_keeps_the_deadline() {
+        let stats = live_position(5, 10);
+        let mut buffered = StartupBufferedSource::new(
+            short_live_backlog(&stats),
+            config(30_000, 1 << 20, 15_000),
+            None,
+        );
+        let started = Instant::now();
+        assert_eq!(buffered.next().await.unwrap()[20], b'a');
+        assert_eq!(Instant::now() - started, Duration::from_secs(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backlog_exhaustion_published_after_the_last_chunk_releases_on_recheck() {
+        let stats = live_position(5, 10);
+        let mut buffered = StartupBufferedSource::new(
+            short_live_backlog(&stats),
+            config(30_000, 1 << 20, 15_000),
+            None,
+        );
+        let started = Instant::now();
+        let next = buffered.next();
+        tokio::pin!(next);
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        stats.lock().unwrap().livepos.as_mut().unwrap().pos = Some(11);
+        assert_eq!(next.await.unwrap()[20], b'a');
+        let waited = Instant::now() - started;
+        assert!(
+            waited <= Duration::from_secs(2) + BACKLOG_RECHECK,
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sources_without_live_position_keep_the_deadline() {
+        let mut inner = FixtureSource::new(vec![(packet(PID, Some(0), false, b'a'), false)]);
+        inner.delay_after = Some(1);
+        let mut buffered =
+            StartupBufferedSource::new(Box::new(inner), config(30_000, 1 << 20, 15_000), None);
+        let started = Instant::now();
+        assert_eq!(buffered.next().await.unwrap()[20], b'a');
+        assert_eq!(Instant::now() - started, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn exhausted_backlog_never_releases_an_empty_reservoir() {
+        let mut reservoir = StartupReservoir::new(config(30_000, 4096, 15_000), None);
+        assert!(reservoir.backlog_exhausted().is_none());
+        assert!(reservoir.push(Bytes::new()).is_none());
+        assert!(reservoir.backlog_exhausted().is_none());
+        assert!(reservoir.push(packet(PID, Some(0), false, b'a')).is_none());
+        assert_eq!(
+            reservoir.backlog_exhausted(),
+            Some(ReleaseReason::BacklogExhausted)
+        );
+    }
+
+    #[test]
+    fn caught_up_requires_only_the_head_piece_outstanding() {
+        let at = |pos, last| SourceStats {
+            livepos: Some(crate::provider::LivePositionStats {
+                pos,
+                last,
+                ..Default::default()
+            }),
+            ..SourceStats::default()
+        };
+        assert!(!live_backlog_exhausted(&SourceStats::default()));
+        assert!(!live_backlog_exhausted(&at(Some(9), Some(10))));
+        assert!(live_backlog_exhausted(&at(Some(10), Some(10))));
+        assert!(live_backlog_exhausted(&at(Some(11), Some(10))));
+        assert!(!live_backlog_exhausted(&at(None, Some(10))));
+        assert!(!live_backlog_exhausted(&at(Some(10), None)));
     }
 
     #[tokio::test]

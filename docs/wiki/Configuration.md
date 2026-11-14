@@ -72,7 +72,7 @@ peers stall. The defaults favour smooth playback over a fast start.
 
 | Setting | Default | Accepted values | Avail. | Notes |
 | --- | --- | --- | --- | --- |
-| `OUTPACE_PREBUFFER_MS` | `30000` | ms, `0` disables | all | Target amount of media to queue on the server before a live stream is released to viewers (direct TS and HLS alike). Measured on the media clock when possible, otherwise from the advertised bitrate. Lower it (for example `5000`) for faster starts; `0` sends media immediately. |
+| `OUTPACE_PREBUFFER_MS` | `30000` | ms, `0` disables | all | Target amount of media to queue on the server before a live stream is released to viewers (direct TS and HLS alike). Measured on the media clock when possible, otherwise from the advertised bitrate. Lower it (for example `5000`) for faster starts; `0` sends media immediately. When the peers hold less live history than the target, playback starts as soon as everything up to the live edge has arrived, with that shorter lead. |
 | `OUTPACE_PREBUFFER_BYTES` | `134217728` (128 MiB) | bytes, at least `188` | all | Hard cap on the startup queue. Reaching it releases playback early. |
 | `OUTPACE_PREBUFFER_TIMEOUT_MS` | `15000` | ms, at least `1` when prebuffering is on | all | Longest wait, counted from the **first media byte**, before releasing whatever is queued. A short live window degrades to a shorter buffer, not a failure. Since v1.0.0 it is absolute: source gaps no longer restart it. |
 | `OUTPACE_PREFETCH_PIECES` | unset (automatic) | pieces | all | How far behind the live edge to start. When unset it is derived from the prebuffer target and the advertised bitrate, or 32 pieces if the bitrate is unknown. Leave unset unless you are debugging. |
