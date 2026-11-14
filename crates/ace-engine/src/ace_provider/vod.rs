@@ -82,6 +82,9 @@ pub(super) struct AceVodContent {
     /// Serializes cache inspection plus download streams so overlapping requests never fetch
     /// and write the same piece concurrently.
     pub(super) range_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set when a disk cache write failed because the disk is full. The running range stops,
+    /// and every later range open fails with `no_space` until the handle is dropped.
+    pub(super) no_space: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AceVodContent {
@@ -129,6 +132,9 @@ impl VodContent for AceVodContent {
                 "vod range [{start}, {end}] out of bounds for {total}-byte content"
             )));
         }
+        if self.no_space.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(no_space_mid_download());
+        }
         let piece_length = self.info.piece_length;
         let range_guard = self.range_lock.clone().lock_owned().await;
         // The contiguous pieces covering [start, end]. `download_vod_pieces` verifies each whole
@@ -163,6 +169,7 @@ impl VodContent for AceVodContent {
             // `drx`), `download_vod_pieces` sees `ConsumerGone` on its next send and stops.
             let (dtx, mut drx) = mpsc::channel::<Bytes>(64);
             let peer_policy = self.peer_policy.clone();
+            let no_space = self.no_space.clone();
             let downloader = tokio::spawn(async move {
                 if let Err(e) = ace_swarm::vod::download_vod_pieces_with_peer_policy(
                     info,
@@ -192,8 +199,9 @@ impl VodContent for AceVodContent {
                     };
                     // The downloader emits only whole pieces after SHA-1 verification. Populate
                     // the shared store only here, never from partial/unverified peer blocks.
+                    let mut disk_full = false;
                     for (chunk, data) in piece.chunks(chunk_length as usize).enumerate() {
-                        PieceStore::shared_put_chunk_with_header(
+                        let put = PieceStore::shared_try_put_chunk_with_header(
                             &store,
                             idx,
                             chunk as u16,
@@ -201,6 +209,17 @@ impl VodContent for AceVodContent {
                             data,
                         )
                         .await;
+                        if put.is_err_and(crate::disk_space::is_no_space) {
+                            disk_full = true;
+                            break;
+                        }
+                    }
+                    if disk_full {
+                        // End the download instead of streaming on with a cache that can't
+                        // keep pieces; later opens report `no_space` (#485).
+                        no_space.store(true, std::sync::atomic::Ordering::Release);
+                        crate::alog!("[vod] download stopped at piece {idx}: code=no_space");
+                        break;
                     }
                     idx += 1;
                     if tx.send(piece).await.is_err() {
@@ -228,6 +247,11 @@ impl VodContent for AceVodContent {
             emit_len,
         }))
     }
+}
+
+/// The `no_space` failure for a VOD whose disk cache filled while it downloaded.
+pub(super) fn no_space_mid_download() -> ProviderError {
+    ProviderError::NoSpace("not enough free disk space: the disk filled during the download".into())
 }
 
 /// Streams verified whole-piece bytes trimmed to a byte range: it drops `skip` leading bytes (the

@@ -561,3 +561,34 @@ async fn url_cache_metadata_does_not_authenticate_bare_hash_with_fallback() {
         .is_err());
     assert!(p.infohash_index.get(&info.infohash).is_none());
 }
+
+#[tokio::test]
+async fn disk_vod_start_is_refused_with_no_space_when_the_reserve_cannot_fit() {
+    for (cache_type, refused) in [(CacheType::Disk, true), (CacheType::Memory, false)] {
+        let bytes = test_support::protection_vod_bytes(0, true);
+        let cache = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/no-space-485-{}-{refused}",
+            std::process::id()
+        ));
+        let mut p = provider().with_bep9_content_id_fallback(true);
+        p.cache_type = cache_type;
+        p.cache_dir = cache.clone();
+        // No filesystem has u64::MAX bytes free; a memory store never asks.
+        p.vod_disk_reserve = u64::MAX;
+        let result = p
+            .resolve_vod_inner_with_catalog(&format!("cid:{CID}"), ready(Ok(bytes)))
+            .await;
+        if refused {
+            let error = result.err().expect("disk start refused");
+            assert!(matches!(error, ProviderError::NoSpace(_)), "{error}");
+            let start = crate::start_status::StartError::from_provider(&error);
+            assert_eq!(start.code.as_str(), "no_space");
+            assert!(start.message.contains("required"), "{}", start.message);
+            assert!(start.message.contains("available"), "{}", start.message);
+        } else {
+            assert_eq!(result.unwrap().content_length(), 1);
+        }
+        drop(p);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+}

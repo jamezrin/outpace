@@ -186,6 +186,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         // now that `OUTPACE_DATA_DIR` may have selected a different root.
         config.cache_dir = config.data_dir.join("cache");
     }
+    if let Ok(v) = std::env::var("OUTPACE_VOD_DISK_RESERVE_BYTES") {
+        config.vod_disk_reserve_bytes = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_PREFETCH_PIECES") {
         config.prefetch_pieces = Some(v.parse()?);
     }
@@ -815,7 +818,8 @@ pub async fn build_runtime(
             .with_seed_registry(seed_registry.clone())
             .with_seed_store_bytes(config.seed_store_bytes)
             .with_seed_store_retention(std::time::Duration::from_secs(config.seed_retention_secs))
-            .with_cache(config.cache_type, config.cache_dir.clone());
+            .with_cache(config.cache_type, config.cache_dir.clone())
+            .with_vod_disk_reserve(config.vod_disk_reserve_bytes);
         let provider = ace_provider_from_config(provider, &config)
             .with_seeding_enabled(config.enable_seeding)
             .with_inbound_announce_port_receiver(announce_port_rx.clone())

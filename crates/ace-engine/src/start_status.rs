@@ -141,6 +141,10 @@ impl StartError {
             ProviderError::CapacityExhausted | ProviderError::ResolverBusy(_) => {
                 Self::new(StartErrorCode::Capacity)
             }
+            ProviderError::NoSpace(message) => Self {
+                code: StartErrorCode::NoSpace,
+                message: message.clone(),
+            },
             ProviderError::Backend(_) | ProviderError::DirectHls(_) => {
                 Self::new(StartErrorCode::Internal)
             }
@@ -450,6 +454,14 @@ mod tests {
         assert_eq!(
             StartError::from_provider(&ProviderError::ProtectedContent).message,
             "encrypted content is not supported"
+        );
+        let no_space = StartError::from_provider(&ProviderError::NoSpace(
+            "not enough free disk space: 356 MiB required, 300 MiB available".into(),
+        ));
+        assert_eq!(no_space.code, StartErrorCode::NoSpace);
+        assert_eq!(
+            no_space.message,
+            "not enough free disk space: 356 MiB required, 300 MiB available"
         );
     }
 

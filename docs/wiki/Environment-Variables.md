@@ -84,6 +84,7 @@ See [Releases and Versions](Releases-and-Versions) for publication status.
 | [`OUTPACE_SUPPORT_SOURCES`](Configuration#support-sources) | unset (off) | 1.0.0 | Streams kept running and seeding with no viewer (JSON). |
 | [`OUTPACE_TRACKER_ALLOW_NON_GLOBAL`](Configuration#discovery-trackers-and-resolution) | off | all | Exact `1`: allow announcing to trackers on private addresses. |
 | [`OUTPACE_TRACKERS`](Configuration#broadcasting-and-ingest) | built-in public tracker | all | Trackers written into new broadcasts. |
+| [`OUTPACE_VOD_DISK_RESERVE_BYTES`](Configuration#vod-free-space-check) | 256 MiB | edge | Free space a disk-cached VOD download must leave. |
 
 Variables named `OUTPACE_TEST_*`, `OUTPACE_DHT_COMPARE_*` or `OUTPACE_RUN_*` belong to the test
 suite. The repository's Compose file also reads `OUTPACE_IMAGE`, `OUTPACE_HTTP_HOST`,

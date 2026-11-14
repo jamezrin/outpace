@@ -755,6 +755,28 @@ impl StreamManager {
         Ok(vod)
     }
 
+    /// Drop the cached VOD handle for `(network, id)` if it is still `vod`. Reads already in
+    /// flight keep their own reference; the provider content (and its piece store lease) is
+    /// released when they end, and the next request resolves the VOD again. A handle that a
+    /// concurrent request already replaced is left alone.
+    pub async fn forget_vod(&self, network: &str, id: &str, vod: &Arc<dyn VodContent>) {
+        let id = &*self.canonical_id(network, id);
+        let key = (network.to_string(), id.to_string());
+        let removed = {
+            let mut cache = self.vod_cache.lock().await;
+            if cache
+                .get(&key)
+                .is_some_and(|(cached, _)| Arc::ptr_eq(cached, vod))
+            {
+                cache.remove(&key)
+            } else {
+                None
+            }
+        };
+        // Content destruction may release the final provider reservation; never under the lock.
+        drop(removed);
+    }
+
     /// A live (non-expired) cached VOD for `key`, refreshing its access time. Sweeps entries idle
     /// longer than `grace` on the way, so the cache is bounded to VODs read within the last `grace`.
     async fn cached_vod(&self, key: &(String, String)) -> Option<Arc<dyn VodContent>> {
@@ -2961,6 +2983,19 @@ mod tests {
             m.resolve_vod("nope", "x").await,
             Err(ProviderError::NotFound)
         ));
+
+        // `forget_vod` drops only the handle it was given: a stale caller can't evict the
+        // replacement a concurrent request already resolved.
+        m.forget_vod("cvod", "x", &a).await;
+        let fresh = m.resolve_vod("cvod", "x").await.unwrap();
+        assert_eq!(resolves.load(Ordering::SeqCst), 3);
+        m.forget_vod("cvod", "x", &a).await;
+        let again = m.resolve_vod("cvod", "x").await.unwrap();
+        assert!(
+            Arc::ptr_eq(&fresh, &again),
+            "stale forget kept the new handle"
+        );
+        assert_eq!(resolves.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

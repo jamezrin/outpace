@@ -440,6 +440,10 @@ config_with_root_redaction! {
     /// Root directory for disk-mode piece files (one subdirectory per infohash). Only used when
     /// `cache_type` is `Disk`. Defaults to `<data_dir>/cache`.
     pub cache_dir: PathBuf,
+    /// Free space a VOD download leaves on the `cache_dir` filesystem in disk mode: a start is
+    /// refused with `no_space` unless the bytes it still needs plus the larger of this and 5% of
+    /// them are free. `OUTPACE_VOD_DISK_RESERVE_BYTES`.
+    pub vod_disk_reserve_bytes: u64,
     /// Pieces behind the live edge to start at, giving an immediate playback cushion.
     pub prefetch_pieces: Option<u64>,
     /// Depth of the per-session fan-out broadcast channel (messages buffered per client).
@@ -551,6 +555,7 @@ impl Default for Config {
             seed_retention_secs: 45,
             cache_type: CacheType::Memory,
             cache_dir,
+            vod_disk_reserve_bytes: crate::disk_space::DEFAULT_VOD_DISK_RESERVE_BYTES,
             prefetch_pieces: None,
             session_buffer: 256,
             live_recovery: LiveRecoveryConfig::default(),
@@ -941,6 +946,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.cache_type, CacheType::Memory);
         assert_eq!(c.cache_dir, c.data_dir.join("cache"));
+        assert_eq!(c.vod_disk_reserve_bytes, 256 * 1024 * 1024);
     }
 
     #[test]

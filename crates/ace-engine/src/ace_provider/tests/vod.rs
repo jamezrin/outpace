@@ -197,6 +197,7 @@ async fn open_range_downloads_each_covering_piece_at_most_once() {
         store,
         peers: Arc::new(tokio::sync::Mutex::new(None)),
         range_lock: Arc::new(tokio::sync::Mutex::new(())),
+        no_space: Default::default(),
     };
 
     let first = read_all(vod.open_range(0, 3).await.unwrap()).await;
@@ -233,6 +234,7 @@ async fn open_range_reuses_cached_pieces_larger_than_one_request() {
         store,
         peers: Arc::new(tokio::sync::Mutex::new(None)),
         range_lock: Arc::new(tokio::sync::Mutex::new(())),
+        no_space: Default::default(),
     };
 
     // Two reads inside piece 0, the second one in its second chunk.
@@ -284,6 +286,7 @@ async fn open_range_spanning_a_new_piece_downloads_only_the_missing_suffix() {
         store,
         peers: Arc::new(tokio::sync::Mutex::new(None)),
         range_lock: Arc::new(tokio::sync::Mutex::new(())),
+        no_space: Default::default(),
     };
 
     let _ = read_all(vod.open_range(0, 15).await.unwrap()).await; // piece 0
@@ -308,6 +311,7 @@ async fn downloaded_vod_piece_is_served_to_an_inbound_bittorrent_peer() {
         store,
         peers: Arc::new(tokio::sync::Mutex::new(None)),
         range_lock: Arc::new(tokio::sync::Mutex::new(())),
+        no_space: Default::default(),
     };
     assert_eq!(
         read_all(vod.open_range(0, 15).await.unwrap()).await,
@@ -373,6 +377,7 @@ async fn cancelled_range_finishes_background_transaction_before_overlap_download
         store,
         peers: Arc::new(tokio::sync::Mutex::new(None)),
         range_lock: range_lock.clone(),
+        no_space: Default::default(),
     };
 
     let cancelled = vod.open_range(0, 15).await.unwrap();
@@ -550,6 +555,7 @@ async fn cancelling_multi_peer_range_is_followed_by_correct_overlapping_range() 
         store,
         peers: Arc::new(tokio::sync::Mutex::new(None)),
         range_lock: range_lock.clone(),
+        no_space: Default::default(),
     });
 
     let cancelled = vod.open_range(0, 31).await.unwrap();
@@ -633,6 +639,7 @@ async fn out_of_order_and_corrupt_upstream_never_reseed_unverified_bytes() {
         store,
         peers: Arc::new(tokio::sync::Mutex::new(None)),
         range_lock: Arc::new(tokio::sync::Mutex::new(())),
+        no_space: Default::default(),
     };
 
     let source = vod.open_range(0, 31).await.unwrap();
@@ -755,4 +762,57 @@ async fn out_of_order_and_corrupt_upstream_never_reseed_unverified_bytes() {
     for seeder in seeders {
         seeder.stop().await;
     }
+}
+
+/// A disk cache write that fails with ENOSPC ends the running range and makes every later open
+/// report `no_space` (#485). `/dev/full` stands in for a full disk: writes to it fail with ENOSPC.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn full_disk_mid_download_ends_the_range_with_no_space() {
+    if !std::path::Path::new("/dev/full").exists() {
+        eprintln!("skipping: /dev/full is unavailable");
+        return;
+    }
+    let (content, info) = make_vod_content(16, 16, 32);
+    let served = Arc::new(AtomicU64::new(0));
+    let addr = spawn_counting_vod_seeder(content.clone(), info.clone(), served.clone()).await;
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../target/vod-enospc-485-{}",
+        std::process::id()
+    ));
+    let registry = SeedRegistry::new();
+    let store = registry.lease_store(info.infohash, || {
+        PieceStore::new_disk(16, 16, 128, dir.clone()).expect("disk store")
+    });
+    std::os::unix::fs::symlink("/dev/full", dir.join("0.piece")).unwrap();
+    let vod = AceVodContent {
+        peer_policy: Default::default(),
+        info,
+        bootstrap_peers: vec![addr],
+        announce_peer_port: tokio::sync::watch::channel(None).1,
+        store,
+        peers: Arc::new(tokio::sync::Mutex::new(None)),
+        range_lock: Arc::new(tokio::sync::Mutex::new(())),
+        no_space: Default::default(),
+    };
+
+    let partial = read_all(vod.open_range(0, 31).await.unwrap()).await;
+    assert!(partial.len() < 32, "the range ends early on a full disk");
+    // The supervisor sets the flag before releasing the range lock; wait for it.
+    drop(vod.range_lock.lock().await);
+    let error = vod
+        .open_range(0, 31)
+        .await
+        .err()
+        .expect("later opens refuse");
+    assert!(matches!(error, ProviderError::NoSpace(_)), "{error}");
+    assert_eq!(
+        crate::start_status::StartError::from_provider(&error)
+            .code
+            .as_str(),
+        "no_space"
+    );
+    drop(vod);
+    drop(registry);
+    let _ = std::fs::remove_dir_all(&dir);
 }

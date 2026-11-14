@@ -32,6 +32,7 @@ pub mod broadcast_pull;
 mod broadcast_pull_tests;
 pub mod cli;
 pub mod config;
+pub mod disk_space;
 mod engine_identity;
 pub mod healthcheck;
 pub mod history;

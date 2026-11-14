@@ -171,6 +171,7 @@ See [Seeding and Peers](Seeding-and-Peers).
 | `OUTPACE_CACHE_DIR` | `<data dir>/cache` | directory | all | Disk cache root, used only with `disk`. Wiped at startup. It may be inside the data directory, but it must not be the data directory or contain it. |
 | `OUTPACE_SEED_STORE_BYTES` | `134217728` (128 MiB) | bytes | all | Ceiling on retained pieces **per stream** (not a total). In memory mode it is capped per platform (about 512 MiB on 32-bit, 8 GiB on 64-bit). It must hold at least one full piece of every broadcast you run. |
 | `OUTPACE_SEED_RETENTION_SECS` | `45` | seconds, `0` = byte cap only | all | For live streams, keep only about this many seconds of recent pieces, so memory follows the bitrate instead of filling the byte cap. VOD always uses the byte cap. |
+| `OUTPACE_VOD_DISK_RESERVE_BYTES` | `268435456` (256 MiB) | bytes, `0` = 5% margin only | edge | Free space a VOD download must leave on the cache filesystem with `disk`. See [VOD free-space check](#vod-free-space-check). |
 
 ### How the disk cache wipe works
 
@@ -179,6 +180,21 @@ deleting the wrong directory, Outpace only wipes a cache directory that is empty
 regular file named `.outpace-cache`. It writes that file itself the first time it uses an empty
 directory. If you point `OUTPACE_CACHE_DIR` at a non-empty directory without that file, startup
 fails instead of deleting anything.
+
+### VOD free-space check
+
+With `OUTPACE_CACHE_TYPE=disk`, a VOD start first checks the free space on the filesystem that
+holds `OUTPACE_CACHE_DIR`. The download needs the file's size from its descriptor, capped at
+`OUTPACE_SEED_STORE_BYTES` (the store never keeps more than that), minus whatever the cache
+already holds for the same file. It must fit with a margin to spare: the larger of
+`OUTPACE_VOD_DISK_RESERVE_BYTES` and 5% of the bytes needed. Otherwise the start is refused with
+`507` and the `no_space` code ([error codes](Playing-Streams#native-error-responses)).
+
+The check is one filesystem query per VOD start. It uses `statvfs` on Linux, Android, macOS
+and the BSDs, and `GetDiskFreeSpaceExW` on Windows. Where free space can't be read, the start
+is allowed. The memory cache and live streams skip it. If the disk fills during a download
+anyway, the download stops and the next request for that VOD gets `no_space`; the request
+after that runs the check again.
 
 If a stream's cache directory can't be created later (for example after a permission change),
 playback continues but that stream keeps no pieces for seeding. The log shows

@@ -235,6 +235,10 @@ pub enum ProviderError {
     /// hand this URL to the player (or the opt-in managed relay); no local session or piece
     /// geometry is created. `Debug` and `Display` never include the (possibly signed) URL.
     DirectHls(Box<ace_swarm::resolve::HlsOrigin>),
+    /// A VOD download does not fit on the disk cache, or the disk filled while it ran. The
+    /// message is user-facing (required and available sizes only) and safe to return to HTTP
+    /// clients; native clients get the stable `no_space` code.
+    NoSpace(String),
 }
 
 impl std::fmt::Display for ProviderError {
@@ -249,7 +253,8 @@ impl std::fmt::Display for ProviderError {
             | ProviderError::Network(msg)
             | ProviderError::ResolverBusy(msg)
             | ProviderError::Unresolvable(msg)
-            | ProviderError::UnresolvableNetwork(msg) => f.write_str(msg),
+            | ProviderError::UnresolvableNetwork(msg)
+            | ProviderError::NoSpace(msg) => f.write_str(msg),
             ProviderError::DirectHls(_) => {
                 f.write_str("source is origin HLS; open it through an HTTP playback route")
             }

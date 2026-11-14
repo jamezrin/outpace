@@ -326,3 +326,109 @@ async fn vod_hls_segment_past_the_end_404s() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// A VOD provider that refuses resolution with `no_space`, or (when `full_on_open`) resolves
+/// and then reports `no_space` from every range open, as after a disk filled mid-download.
+struct NoSpaceProvider {
+    full_on_open: bool,
+    resolutions: Arc<std::sync::atomic::AtomicUsize>,
+}
+struct NoSpaceVod;
+#[async_trait]
+impl VodContent for NoSpaceVod {
+    fn content_length(&self) -> u64 {
+        20
+    }
+    async fn open_range(&self, _: u64, _: u64) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        Err(ProviderError::NoSpace(
+            "not enough free disk space: the disk filled during the download".into(),
+        ))
+    }
+}
+#[async_trait]
+impl StreamProvider for NoSpaceProvider {
+    fn network(&self) -> &'static str {
+        "nospace"
+    }
+    async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        Err(ProviderError::NotFound)
+    }
+    async fn resolve_vod(&self, _id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+        self.resolutions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.full_on_open {
+            Ok(Box::new(NoSpaceVod))
+        } else {
+            Err(ProviderError::NoSpace(
+                "not enough free disk space: 356 MiB required, 300 MiB available".into(),
+            ))
+        }
+    }
+}
+
+fn nospace_router(full_on_open: bool) -> (Router, Arc<std::sync::atomic::AtomicUsize>) {
+    let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut r = ProviderRegistry::new();
+    r.register(Arc::new(NoSpaceProvider {
+        full_on_open,
+        resolutions: resolutions.clone(),
+    }));
+    let router = router(AppState {
+        peer_policy: Default::default(),
+        manager: StreamManager::new(r),
+        networks: vec!["nospace".into()],
+        resolve_content_ids_in_getstream: false,
+        ace_sessions: Arc::new(AceSessionStore::default()),
+        experimental_ace_compat: false,
+        search: None,
+        origin_hls: None,
+        broadcasts: None,
+    });
+    (router, resolutions)
+}
+
+async fn json_error(router: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = router
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn vod_start_without_disk_space_is_507_no_space_with_sizes() {
+    let (router, _) = nospace_router(false);
+    for uri in [
+        "/vod/nospace/x",
+        "/vod/nospace/x/manifest.m3u8",
+        "/vod/nospace/x/seg/0.ts",
+    ] {
+        let (status, body) = json_error(&router, uri).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{uri}");
+        assert_eq!(body["error"]["code"], "no_space", "{uri}");
+        assert_eq!(
+            body["error"]["message"],
+            "not enough free disk space: 356 MiB required, 300 MiB available"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vod_disk_full_mid_download_is_507_and_drops_the_cached_handle() {
+    let (router, resolutions) = nospace_router(true);
+    for expected_resolutions in [1, 2] {
+        let (status, body) = json_error(&router, "/vod/nospace/x").await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(body["error"]["code"], "no_space");
+        // The failed handle is not reused: the next request resolves (and re-checks) again.
+        assert_eq!(
+            resolutions.load(std::sync::atomic::Ordering::SeqCst),
+            expected_resolutions
+        );
+    }
+}
