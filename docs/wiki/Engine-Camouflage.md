@@ -4,7 +4,7 @@ Outpace normally labels itself as Outpace. Peers, trackers, the search service a
 can see that. Engine camouflage is an opt-in profile in which those public values match one
 official Linux AceStream engine instead.
 
-It is off by default, and it is on current `main` and the `edge` image, not in v1.0.2.
+It is off by default and available from v1.1.0, as well as on current `main` and the `edge` image.
 Restart the daemon after changing it. The local API, metrics, logs and the `outpace:` startup
 lines stay Outpace's. One extra line confirms the profile:
 
