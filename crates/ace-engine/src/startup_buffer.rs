@@ -4,6 +4,7 @@ use ace_media::mpegts::{ts_timing, ClockObservation, SelectedPcrClock, TsTiming,
 use ace_swarm::types::StreamMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,6 +25,11 @@ enum ReleaseReason {
 /// How often a collecting reservoir rereads live position stats between chunks, to catch a
 /// position update published after the last backlog chunk was delivered.
 const BACKLOG_RECHECK: Duration = Duration::from_millis(250);
+
+/// Upper bound on chunks taken without waiting when the backlog is exhausted. The live
+/// position runs ahead of delivery, so reassembled media can still sit in the source
+/// channel, whose capacity this matches.
+const READY_DRAIN_LIMIT: usize = 256;
 
 /// Whether a live source reports that only its head piece, at most, is still outstanding.
 /// Sources without live position stats never report an exhausted backlog.
@@ -356,15 +362,45 @@ impl StartupBufferedSource {
         };
     }
 
-    /// Release on an exhausted live backlog. Returns the stats it read, for publication.
-    fn release_exhausted_backlog(&mut self) -> SourceStats {
-        let stats = self.inner.stats();
-        if live_backlog_exhausted(&stats) {
-            if let Some(reason) = self.reservoir.backlog_exhausted() {
-                self.reservoir.release(reason);
+    /// Queue one source read. Returns whether the reservoir is still collecting.
+    fn accept(&mut self, next: Option<Bytes>) -> bool {
+        match next {
+            Some(chunk) => {
+                if self.inner.take_discontinuity() {
+                    self.reservoir.discontinuity();
+                    self.pending_discontinuity = true;
+                }
+                self.reservoir.push(chunk).is_none()
+            }
+            None => {
+                self.reservoir.release(ReleaseReason::EndOfStream);
+                false
             }
         }
-        stats
+    }
+
+    /// Release on an exhausted live backlog. Live position is published before its media
+    /// is delivered, so first take the media that is already readable: it may still reach
+    /// the target, and the release log should count it. Returns the stats it read.
+    fn release_exhausted_backlog(&mut self) -> SourceStats {
+        let stats = self.inner.stats();
+        if !live_backlog_exhausted(&stats) {
+            return stats;
+        }
+        for _ in 0..READY_DRAIN_LIMIT {
+            // A read that is not ready is dropped; production sources read from a
+            // channel, which is cancel-safe.
+            let Some(next) = self.inner.next().now_or_never() else {
+                break;
+            };
+            if !self.accept(next) {
+                return self.inner.stats();
+            }
+        }
+        if let Some(reason) = self.reservoir.backlog_exhausted() {
+            self.reservoir.release(reason);
+        }
+        self.inner.stats()
     }
 
     async fn collect_next(&mut self) {
@@ -393,23 +429,11 @@ impl StartupBufferedSource {
         };
 
         let empty = next.as_ref().is_some_and(Bytes::is_empty);
-        match next {
-            Some(chunk) => {
-                if self.inner.take_discontinuity() {
-                    self.reservoir.discontinuity();
-                    self.pending_discontinuity = true;
-                }
-                if self.reservoir.push(chunk).is_none() {
-                    let stats = self.release_exhausted_backlog();
-                    self.publish_cached_stats(stats);
-                } else {
-                    self.publish_stats();
-                }
-            }
-            None => {
-                self.reservoir.release(ReleaseReason::EndOfStream);
-                self.publish_stats();
-            }
+        if self.accept(next) {
+            let stats = self.release_exhausted_backlog();
+            self.publish_cached_stats(stats);
+        } else {
+            self.publish_stats();
         }
         if empty {
             // A source can return ready empty chunks without ever yielding to cancellation
@@ -1097,6 +1121,26 @@ mod tests {
         assert_eq!(buffered.next().await.unwrap()[20], b'a');
         assert_eq!(buffered.next().await.unwrap()[20], b'b');
         assert!(Instant::now() - started < Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_media_behind_an_exhausted_position_still_reaches_the_target() {
+        let stats = live_position(10, 10);
+        let mut inner = FixtureSource::new(vec![
+            (packet(PID, Some(0), false, b'a'), false),
+            (packet(PID, Some(90_000), false, b'b'), false),
+            (packet(PID, Some(2 * 90_000), false, b'c'), false),
+        ]);
+        inner.live_stats = Some(stats.clone());
+        inner.delay_after = Some(3);
+        let mut buffered =
+            StartupBufferedSource::new(Box::new(inner), config(2_000, 1 << 20, 15_000), None);
+        assert_eq!(buffered.next().await.unwrap()[20], b'a');
+        // Released with all three packets queued: two remain, two thirds of the 2 s
+        // release duration. Releasing before the ready reads would leave nothing queued.
+        assert_eq!(buffered.stats().buffer_ms, 1_333);
+        assert_eq!(buffered.next().await.unwrap()[20], b'b');
+        assert_eq!(buffered.next().await.unwrap()[20], b'c');
     }
 
     #[tokio::test(start_paused = true)]
