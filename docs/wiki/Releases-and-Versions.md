@@ -9,9 +9,9 @@
 - The version a binary reports is the version in the source it was built from. The tag must
   match it.
 
-The latest published release is **v1.0.1**, a patch release on top of 1.0.0. See the
-[GitHub Release](https://github.com/outpace-stream/outpace-engine/releases/tag/v1.0.1) for downloads,
-the [1.0.1 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.1.md)
+The latest published release is **v1.0.2**, a patch release on top of 1.0.1. See the
+[GitHub Release](https://github.com/outpace-stream/outpace-engine/releases/tag/v1.0.2) for downloads,
+the [1.0.2 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.2.md)
 for its fixes, and the
 [1.0.0 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.0.md)
 for scope, upgrades and validation limits.
@@ -22,7 +22,7 @@ for scope, upgrades and validation limits.
   its downloads and generated change notes.
 - **Curated notes:** for releases that have them, in
   [`docs/releases/`](https://github.com/outpace-stream/outpace-engine/tree/main/docs/releases)
-  (including `1.0.0.md` and `1.0.1.md`).
+  (including `1.0.0.md`, `1.0.1.md` and `1.0.2.md`).
 - **Milestones:** <https://github.com/outpace-stream/outpace-engine/milestones> track what each
   version covers.
 
@@ -30,7 +30,7 @@ for scope, upgrades and validation limits.
 
 ```bash
 outpace --version
-docker run --rm ghcr.io/outpace-stream/outpace-engine:1.0.1 --version
+docker run --rm ghcr.io/outpace-stream/outpace-engine:1.0.2 --version
 curl "http://127.0.0.1:6878/server/api?method=get_version"   # needs OUTPACE_ACE_COMPAT=1
 ```
 
@@ -66,6 +66,19 @@ On `main`, not yet in a release:
   `aarch64-linux-android` one; see [Installation](Installation#android-with-termux-best-effort).
   The [Android companion app](Android-App) downloads these archives by name, so their names and
   layout (`outpace-<version>-<target>/outpace` inside the `.tar.gz`) stay stable.
+
+## v1.0.2 fixes
+
+A patch release with no new features or default changes, and the first one built and published
+from the organization:
+
+- The warm peer cache now opens when the data directory sits under an execute-only parent, as on
+  Android and Termux. Before, every start there was cold (#456).
+- With `OUTPACE_METRICS=1`, at most two `/metrics` scrapes collect at once, each within two
+  seconds. A scrape over either limit gets `503` with `Retry-After: 1` (#466).
+- A best-effort `armv7-linux-androideabi` archive is published for 32-bit Android (#459).
+- Archives, packages and images are attested by `outpace-stream/outpace-engine` and verify with
+  `--repo outpace-stream/outpace-engine`.
 
 ## v1.0.1 fixes
 
@@ -188,7 +201,8 @@ Its APK releases belong there; engine binaries remain in engine releases.
 
 Container publication now targets `ghcr.io/outpace-stream/outpace-engine`. Existing personal-
 namespace images at `ghcr.io/jamezrin/outpace` remain available for rollback. The initial
-organization image is v1.0.1; older image tags remain in the previous namespace. The binary
+organization image is v1.0.1, and v1.0.2 is the first release published only there; older image
+tags remain in the previous namespace. The binary
 name, configuration, data paths and release archive names have not changed. Before switching
 a deployment, verify the desired tag exists in the new namespace. See
 [Installation](Installation#verify-where-a-release-came-from) for historical attestation identity.

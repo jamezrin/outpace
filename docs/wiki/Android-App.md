@@ -12,5 +12,5 @@ Use [Termux](Installation#android-with-termux-best-effort) for the currently doc
 - [App releases](https://github.com/outpace-stream/outpace-android/releases)
 
 APK releases belong to the Android repository. Engine archives, including the Android targets
-(`aarch64-linux-android`, and `armv7-linux-androideabi` from the release after v1.0.1), remain
+(`aarch64-linux-android`, and `armv7-linux-androideabi` from v1.0.2), remain
 in [engine releases](https://github.com/outpace-stream/outpace-engine/releases).

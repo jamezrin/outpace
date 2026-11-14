@@ -5,7 +5,7 @@ can build yourself. All three run the same program: `outpace serve` starts the d
 
 ## Choose a version
 
-- **Releases** (`vX.Y.Z` tags) are the stable choice. The latest is **v1.0.1**.
+- **Releases** (`vX.Y.Z` tags) are the stable choice. The latest is **v1.0.2**.
 - **`edge`** follows `main` and includes features newer than the latest release. It is
   `linux/amd64` only and changes with every merge. Don't use it where you need predictable
   upgrades.
@@ -36,7 +36,7 @@ Download, verify and install on Linux or macOS. Set `target` to the row for your
 the table above:
 
 ```bash
-version=1.0.1
+version=1.0.2
 target=x86_64-unknown-linux-musl   # e.g. aarch64-apple-darwin on Apple silicon
 artifact="outpace-${version}-${target}.tar.gz"
 base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
@@ -54,8 +54,8 @@ On Windows, unzip the archive and run `outpace.exe serve` from a terminal. To ru
 ### Android with Termux (best-effort)
 
 From v1.0.0, there is a best-effort `aarch64-linux-android` build for 64-bit ARM
-phones and Android TV boxes, to run under [Termux](https://termux.dev). From the release after
-v1.0.1, there is also an `armv7-linux-androideabi` build for 32-bit ARM devices, packaged the
+phones and Android TV boxes, to run under [Termux](https://termux.dev). From v1.0.2, there is
+also an `armv7-linux-androideabi` build for 32-bit ARM devices, packaged the
 same way. Many Android TV boxes run 32-bit Android on a 64-bit chip; they need the 32-bit build.
 
 - **Best-effort** means it is uploaded after the rest of the release. If a build fails, that
@@ -68,7 +68,7 @@ In Termux, `dpkg --print-architecture` prints `aarch64` for the 64-bit build or 
 
 ```bash
 pkg install curl
-version=1.0.1
+version=1.0.2
 target=aarch64-linux-android
 artifact="outpace-${version}-${target}.tar.gz"
 base="https://github.com/outpace-stream/outpace-engine/releases/download/v${version}"
@@ -237,7 +237,9 @@ With the [GitHub CLI](https://cli.github.com):
 gh attestation verify "$artifact" --repo outpace-stream/outpace-engine
 ```
 
-The `.deb` and `.rpm` packages are attested the same way.
+The `.deb` and `.rpm` packages are attested the same way. This works directly from v1.0.2, the
+first release built in the organization. The best-effort Android archives have no attestation;
+check them against their `.sha256` file.
 
 Releases v1.0.0 and v1.0.1 were built before the organization migration. GitHub's repository
 attestation lookup currently returns 404 for these historical bundles after the transfer;
@@ -317,7 +319,7 @@ docker run -d --name outpace --restart unless-stopped \
   -p 127.0.0.1:1935:1935 \
   -p 8621:8621/tcp \
   -v outpace-data:/var/lib/outpace \
-  ghcr.io/outpace-stream/outpace-engine:1.0.1
+  ghcr.io/outpace-stream/outpace-engine:1.0.2
 ```
 
 Publish HTTP and RTMP on `127.0.0.1` unless a firewall or authenticating proxy protects them.
@@ -349,7 +351,7 @@ production layout with a health check, log rotation and safe port bindings:
 ```bash
 curl -LO https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/compose.yml
 curl -L -o .env https://raw.githubusercontent.com/outpace-stream/outpace-engine/main/.env.example
-# edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/outpace-stream/outpace-engine:1.0.1
+# edit OUTPACE_IMAGE in .env to the release you want, e.g. ghcr.io/outpace-stream/outpace-engine:1.0.2
 docker compose up -d --wait
 ```
 
@@ -365,7 +367,7 @@ macOS) and [rustup](https://rustup.rs). The repository pins its Rust version in
 ```bash
 git clone https://github.com/outpace-stream/outpace-engine.git outpace
 cd outpace
-git checkout v1.0.1          # or stay on main for the newest features
+git checkout v1.0.2          # or stay on main for the newest features
 cargo build --release --locked -p ace-engine --bin outpace
 ./target/release/outpace --version
 ```
@@ -418,7 +420,7 @@ If you turn normalisation on:
 - The published image doesn't contain FFmpeg. Build a derived image, for example:
 
 ```dockerfile
-FROM ghcr.io/outpace-stream/outpace-engine:1.0.1
+FROM ghcr.io/outpace-stream/outpace-engine:1.0.2
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
