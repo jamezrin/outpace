@@ -52,6 +52,11 @@ Other environment variables parsed by the daemon include:
   this directory only when it is empty or already contains a regular `.outpace-cache` sentinel
   file (written automatically on first successful disk-cache start). A symlink is not accepted
   as a sentinel. An unmarked non-empty path is refused rather than deleted.
+- `OUTPACE_VOD_DISK_RESERVE_BYTES` - free space (bytes) a disk-mode VOD start must leave on the
+  `OUTPACE_CACHE_DIR` filesystem, default `268435456` (256 MiB). The start needs
+  `min(file size, OUTPACE_SEED_STORE_BYTES)` minus bytes already cached, plus the larger of this
+  reserve and 5% of that; otherwise it fails with `507` `no_space`. One free-space query per
+  VOD start; an unknown free space allows the start. Memory mode skips the check.
 - `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.
   When unset, Outpace derives the depth from the startup target and advertised bitrate, falling
   back to `32` pieces when the bitrate is unavailable.

@@ -21,11 +21,11 @@ pub(super) async fn vod_stream(
         // Whole file (no usable Range): 200 with Accept-Ranges so players know they *can* seek.
         RangeOutcome::Full => match vod.open_range(0, total - 1).await {
             Ok(source) => vod_response_from_source(source),
-            Err(e) => vod_range_error(e),
+            Err(e) => vod_range_error(&s, &network, &id, e).await,
         },
         RangeOutcome::Satisfiable(start, end) => match vod.open_range(start, end).await {
             Ok(source) => vod_partial_response(source, start, end, total),
-            Err(e) => vod_range_error(e),
+            Err(e) => vod_range_error(&s, &network, &id, e).await,
         },
         // A well-formed range that can't be met: 416 with the resource's true length.
         RangeOutcome::Unsatisfiable => axum::http::Response::builder()
@@ -153,7 +153,8 @@ fn vod_partial_response(
 
 /// Resolve `id` on `network` to a single-file VOD via the manager's shared cache, or the HTTP
 /// error response to return: `404` for an unknown network, `422` for protection
-/// policy refusal, `502` for other resolution failures.
+/// policy refusal, `507` when the download would not fit in the disk cache, `502` for other
+/// resolution failures.
 pub(super) async fn resolve_vod(
     s: &AppState,
     network: &str,
@@ -174,6 +175,7 @@ pub(super) async fn resolve_vod(
             StatusCode::UNPROCESSABLE_ENTITY
         }
         ProviderError::NotFound => StatusCode::NOT_FOUND,
+        ProviderError::NoSpace(_) => StatusCode::INSUFFICIENT_STORAGE,
         _ => StatusCode::BAD_GATEWAY,
     };
     let error = StartError::from_provider(&error);
@@ -184,11 +186,20 @@ pub(super) async fn resolve_vod(
     )))
 }
 
-/// A failed VOD range open: `502` with the typed JSON error body.
-fn vod_range_error(error: ProviderError) -> Response {
+/// A failed VOD range open: the typed JSON error body, `507` for `no_space` (the disk filled
+/// during an earlier download) and `502` otherwise. A `no_space` handle is dropped from the
+/// manager's cache, so it releases its pieces once in-flight reads end and the next request
+/// resolves again, re-running the free-space check.
+async fn vod_range_error(s: &AppState, network: &str, id: &str, error: ProviderError) -> Response {
+    let status = if matches!(error, ProviderError::NoSpace(_)) {
+        s.manager.forget_vod(network, id).await;
+        StatusCode::INSUFFICIENT_STORAGE
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
     let error = StartError::from_provider(&error);
     crate::alog!("[vod] range open failed: code={}", error.code.as_str());
-    super::streams::start_error_response(StatusCode::BAD_GATEWAY, &error)
+    super::streams::start_error_response(status, &error)
 }
 
 /// `GET /vod/{network}/{id}/manifest.m3u8` — a static VOD HLS media playlist for the resolved
@@ -231,7 +242,7 @@ pub(super) async fn vod_hls_segment(
     };
     match vod.open_range(start, end).await {
         Ok(source) => vod_hls_segment_response(source),
-        Err(e) => vod_range_error(e),
+        Err(e) => vod_range_error(&s, &network, &id, e).await,
     }
 }
 

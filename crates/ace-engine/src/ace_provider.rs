@@ -283,6 +283,8 @@ pub struct AceProvider {
     enable_seeding: bool,
     cache_type: CacheType,
     cache_dir: PathBuf,
+    /// Free space a disk-mode VOD start keeps on the cache filesystem (see [`crate::disk_space`]).
+    vod_disk_reserve: u64,
     warm_peers: WarmPeerCache,
     /// Records the public IP peers echo back in `yourip` on our outbound handshakes (issue #22).
     /// `None` unless inbound serving is enabled — with inbound off we can't be dialed anyway, so
@@ -318,6 +320,7 @@ impl AceProvider {
             live_recovery: LiveRecoveryConfig::default(),
             enable_seeding: true,
             cache_type: CacheType::Memory,
+            vod_disk_reserve: crate::disk_space::DEFAULT_VOD_DISK_RESERVE_BYTES,
             cache_dir: PathBuf::new(),
             warm_peers: WarmPeerCache::memory(),
             reachability: None,
@@ -453,6 +456,14 @@ impl AceProvider {
     /// infohash, same as [`with_seed_store_bytes`](Self::with_seed_store_bytes).
     pub fn with_seed_store_retention(mut self, window: Duration) -> Self {
         self.seed_store_retention = (!window.is_zero()).then_some(window);
+        self
+    }
+
+    /// Free space a disk-mode VOD start leaves on the cache filesystem, on top of the bytes it
+    /// still needs (the margin is the larger of this and 5% of them). Defaults to
+    /// [`DEFAULT_VOD_DISK_RESERVE_BYTES`](crate::disk_space::DEFAULT_VOD_DISK_RESERVE_BYTES).
+    pub fn with_vod_disk_reserve(mut self, bytes: u64) -> Self {
+        self.vod_disk_reserve = bytes;
         self
     }
 

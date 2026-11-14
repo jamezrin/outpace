@@ -537,6 +537,10 @@ pub(super) async fn ace_playback(
                 ProviderError::Backend(_) => {
                     (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
                 }
+                // VOD-only today; the compatibility API serves no VOD.
+                ProviderError::NoSpace(_) => {
+                    (StatusCode::BAD_GATEWAY, "NoSpace", "stream start failed")
+                }
                 ProviderError::NoPeers(_) => {
                     (StatusCode::BAD_GATEWAY, "NoPeers", "stream start failed")
                 }

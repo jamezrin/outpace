@@ -755,6 +755,17 @@ impl StreamManager {
         Ok(vod)
     }
 
+    /// Drop the cached VOD handle for `(network, id)`, if any. Reads already in flight keep
+    /// their own reference; the provider content (and its piece store lease) is released when
+    /// they end, and the next request resolves the VOD again.
+    pub async fn forget_vod(&self, network: &str, id: &str) {
+        let id = &*self.canonical_id(network, id);
+        let key = (network.to_string(), id.to_string());
+        let removed = self.vod_cache.lock().await.remove(&key);
+        // Content destruction may release the final provider reservation; never under the lock.
+        drop(removed);
+    }
+
     /// A live (non-expired) cached VOD for `key`, refreshing its access time. Sweeps entries idle
     /// longer than `grace` on the way, so the cache is bounded to VODs read within the last `grace`.
     async fn cached_vod(&self, key: &(String, String)) -> Option<Arc<dyn VodContent>> {

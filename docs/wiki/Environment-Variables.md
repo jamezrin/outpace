@@ -76,6 +76,7 @@ See [Releases and Versions](Releases-and-Versions) for publication status.
 | [`OUTPACE_SEED_STORE_BYTES`](Configuration#storage-and-cache) | 128 MiB | all | Ceiling on retained pieces per stream. |
 | [`OUTPACE_SEED_TTL_SECS`](Configuration#seeding-and-inbound-peers) | `300` | all | Safety net that frees seeding data nothing owns. |
 | [`OUTPACE_SESSION_BUFFER`](Configuration#playback-and-startup-buffering) | `256` | all | Per-viewer fan-out queue depth. |
+| [`OUTPACE_VOD_DISK_RESERVE_BYTES`](Configuration#vod-free-space-check) | 256 MiB | edge | Free space a disk-cached VOD download must leave. |
 | [`OUTPACE_SRT_BIND`](Configuration#broadcasting-and-ingest) | unset (off) | srt build | SRT ingest address (UDP). |
 | [`OUTPACE_SRT_LATENCY_MS`](Configuration#broadcasting-and-ingest) | `120` | srt build | SRT receiver latency, 20–2000 ms. |
 | [`OUTPACE_SRT_MAX_CONNECTIONS`](Configuration#broadcasting-and-ingest) | `4` | srt build | Simultaneous SRT connections, 1–16. |

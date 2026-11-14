@@ -144,6 +144,7 @@ This returns `204`, or `404` if the stream wasn't running.
 | `404` | Unknown network, invalid id, or a start that failed (see the `code`). For a segment: not produced yet, or already outside the window. |
 | `422` | The input couldn't be turned into a playable descriptor, for example an infohash with no verified descriptor, or protected content. |
 | `503` + `Retry-After: 1` | HLS not ready within the startup timeout, the [session cap](Configuration#limits-and-admission) reached, or audio conversion temporarily unavailable. |
+| `507` | A VOD that doesn't fit on the cache disk (code `no_space`). |
 
 When a stream can't be **started**, the playback routes (`/streams/<network>/<id>`, `.ts`,
 `.m3u8`) and the VOD routes (`/vod/...`) answer with `Content-Type: application/json` and a
@@ -166,7 +167,7 @@ the status route answers `404`: read the `error` from the start response itself.
 | `unresolvable` | `422` (`502` for public VOD) | The id has no verified descriptor. `message` explains why and what to try instead. |
 | `protected` | `422` | Encrypted or invalid-protection content, which Outpace doesn't play. |
 | `capacity` | `503` + `Retry-After: 1` (`404` when the catalog resolver is saturated) | The [session cap](Configuration#limits-and-admission), the catalog resolver or audio conversion is at capacity. Retry later. |
-| `no_space` | | Reserved for a VOD free-space check. Not produced yet. |
+| `no_space` | `507` | VOD only, with the disk cache: the file doesn't fit in the free space on the cache disk, or the disk filled during the download. `message` gives the required and available sizes. See [VOD free-space check](Configuration#vod-free-space-check). |
 | `internal` | `404` (`502` for VOD) | Any other failure. The daemon log shows how far the start got. |
 
 The [compatibility API](#acestream-compatible-api) keeps its own error format.
@@ -189,6 +190,18 @@ every piece before sending it:
 mpv "http://127.0.0.1:6878/vod/ace/cid:0123456789abcdef0123456789abcdef01234567"
 outpace play --vod acestream://0123456789abcdef0123456789abcdef01234567 > movie.mp4
 ```
+
+With `OUTPACE_CACHE_TYPE=disk`, a VOD start checks the free space on the cache disk first and
+answers `507` with the `no_space` code if the file won't fit (see
+[VOD free-space check](Configuration#vod-free-space-check)):
+
+```json
+{ "error": { "code": "no_space", "message": "not enough free disk space: 356 MiB required, 300 MiB available" } }
+```
+
+If the disk fills during a download anyway, the response ends early and the next request for
+that VOD gets the same `507` `no_space` error. The memory cache writes nothing to disk and skips
+the check.
 
 Multi-file VOD isn't supported and fails with a clear error; selected-file support (#79) is
 explicitly deferred for 1.0.0. VOD isn't available through the compatibility API.

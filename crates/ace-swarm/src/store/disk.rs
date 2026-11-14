@@ -67,7 +67,7 @@ enum Command {
         header: [u8; 8],
         data: Vec<u8>,
         max_bytes: u64,
-        reply: tokio::sync::oneshot::Sender<()>,
+        reply: tokio::sync::oneshot::Sender<Result<(), std::io::ErrorKind>>,
     },
     Get {
         piece: u64,
@@ -351,7 +351,7 @@ impl DiskHandle {
         header: [u8; 8],
         data: Vec<u8>,
         max_bytes: u64,
-    ) {
+    ) -> Result<(), std::io::ErrorKind> {
         let (reply, done) = tokio::sync::oneshot::channel();
         if self
             .tx
@@ -365,8 +365,10 @@ impl DiskHandle {
             })
             .is_ok()
         {
-            let _ = done.await;
+            // A store that shut down mid-write has nothing left to report.
+            return done.await.unwrap_or(Ok(()));
         }
+        Ok(())
     }
     pub(super) async fn reciprocal_get(
         &self,
@@ -474,8 +476,10 @@ impl Actor {
                     max_bytes,
                     reply,
                 } => {
-                    let _ = self.put(piece, chunk, header, &data, max_bytes);
-                    let _ = reply.send(());
+                    let result = self
+                        .try_put(piece, chunk, header, &data, max_bytes)
+                        .map(|_| ());
+                    let _ = reply.send(result);
                 }
                 Command::Get {
                     piece,
@@ -565,13 +569,27 @@ impl Actor {
     }
 
     fn put(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8], max: u64) -> Stored {
+        self.try_put(piece, chunk, header, data, max)
+            .unwrap_or_default()
+    }
+
+    /// [`put`](Self::put) that also reports a failed write's error kind (logged either way), so
+    /// a caller can tell a full disk apart from a stored chunk.
+    fn try_put(
+        &mut self,
+        piece: u64,
+        chunk: u16,
+        header: [u8; 8],
+        data: &[u8],
+        max: u64,
+    ) -> Result<Stored, std::io::ErrorKind> {
         let offset = chunk as u64 * self.chunk_length;
         if let Err(e) = self
             .file(piece, true)
             .and_then(|f| write_all_at(f, data, offset))
         {
             crate::alog!("[cache] disk write failed for piece {piece} chunk {chunk}: {e}");
-            return Stored::default();
+            return Err(e.kind());
         }
         let (stored, evicted) = {
             let mut state = self.state.lock().unwrap();
@@ -607,7 +625,7 @@ impl Actor {
         for piece in evicted {
             self.remove(piece);
         }
-        stored
+        Ok(stored)
     }
 
     fn put_complete(

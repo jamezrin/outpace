@@ -526,22 +526,35 @@ impl PieceStore {
         header: [u8; 8],
         data: &[u8],
     ) {
+        let _ = Self::shared_try_put_chunk_with_header(store, piece, chunk, header, data).await;
+    }
+
+    /// [`shared_put_chunk_with_header`](Self::shared_put_chunk_with_header) that reports a failed
+    /// disk write's error kind (for example [`std::io::ErrorKind::StorageFull`]). The chunk is
+    /// dropped either way; the memory backend and skipped chunks always report `Ok`.
+    pub async fn shared_try_put_chunk_with_header(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+        header: [u8; 8],
+        data: &[u8],
+    ) -> Result<(), std::io::ErrorKind> {
         let (handle, max_bytes) = {
             let mut guard = store.lock().await;
             if guard.max_bytes == 0 || (chunk as u64) >= guard.piece_length / guard.chunk_length {
-                return;
+                return Ok(());
             }
             match &guard.backend {
                 Backend::Memory(_) => {
                     guard.put_chunk_with_header(piece, chunk, header, data);
-                    return;
+                    return Ok(());
                 }
                 Backend::Disk(disk) => (disk.handle(), guard.max_bytes),
             }
         };
         handle
             .put(piece, chunk, header, data.to_vec(), max_bytes)
-            .await;
+            .await
     }
 
     /// # Panics
@@ -600,6 +613,24 @@ impl PieceStore {
             max_bytes,
             BackendKind::Disk { dir },
         )
+    }
+
+    /// True when piece data lives on disk (the `Disk` backend), so new pieces consume disk space.
+    pub fn is_disk_backed(&self) -> bool {
+        matches!(self.backend, Backend::Disk(_))
+    }
+
+    /// Byte budget this store never grows past.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// Bytes of piece data currently retained (read from the disk index on the disk backend).
+    pub fn retained_bytes(&self) -> u64 {
+        match &self.backend {
+            Backend::Disk(disk) => disk.retained_bytes(),
+            Backend::Memory(_) => self.cur_bytes,
+        }
     }
 
     /// Chunks per piece (`piece_length / chunk_length`).
@@ -1170,6 +1201,34 @@ mod tests {
     }
 
     // ---- Disk backend ----
+
+    #[tokio::test]
+    async fn shared_try_put_reports_disk_write_failures_and_accessors_track_bytes() {
+        let memory = Arc::new(Mutex::new(PieceStore::new(8, 4, 64)));
+        assert!(!memory.lock().await.is_disk_backed());
+        assert_eq!(
+            PieceStore::shared_try_put_chunk_with_header(&memory, 1, 0, [0; 8], b"abcd").await,
+            Ok(())
+        );
+        assert_eq!(memory.lock().await.retained_bytes(), 4);
+        assert_eq!(memory.lock().await.max_bytes(), 64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ih");
+        let disk = Arc::new(Mutex::new(
+            PieceStore::new_disk(8, 4, 64, root.clone()).unwrap(),
+        ));
+        assert!(disk.lock().await.is_disk_backed());
+        PieceStore::shared_put_chunk_with_header(&disk, 1, 0, [0; 8], b"abcd").await;
+        assert_eq!(disk.lock().await.retained_bytes(), 4);
+        // A directory squatting on piece 2's file makes its write fail; the kind is reported
+        // and the chunk is not counted.
+        std::fs::create_dir(root.join("2.piece")).unwrap();
+        let failed =
+            PieceStore::shared_try_put_chunk_with_header(&disk, 2, 0, [0; 8], b"efgh").await;
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(disk.lock().await.retained_bytes(), 4);
+    }
 
     #[test]
     fn disk_backend_round_trips_and_evicts() {

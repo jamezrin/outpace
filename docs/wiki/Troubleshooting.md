@@ -155,6 +155,7 @@ curl "http://127.0.0.1:6878/streams/ace/${CONTENT_ID:?set a content id}/status"
 | `unresolvable` | The id has no verified descriptor; `message` says what to try (often the `cid:` content id). |
 | `protected` | Encrypted content. Outpace doesn't play it. |
 | `capacity` | The session cap, the catalog resolver or audio conversion is at capacity. Retry shortly; see [Too many streams](#too-many-streams). |
+| `no_space` | VOD only, with the disk cache: the file won't fit on the cache disk (`507`), and `message` gives both sizes. Free space on the disk holding `OUTPACE_CACHE_DIR`, move it to a bigger disk, lower `OUTPACE_SEED_STORE_BYTES` or `OUTPACE_VOD_DISK_RESERVE_BYTES`, or use the memory cache. See [VOD free-space check](Configuration#vod-free-space-check). |
 | `internal` | Something else failed. Check the log. |
 
 ## No peers, or discovery fails
@@ -230,6 +231,7 @@ of Outpace logged it:
 | `[seed]`, `[seed-listener]` | Inbound seeding: accepted connections, cleanup of idle seeding data. |
 | `[seed-session]` | Per-message seeding detail. Only shown with `OUTPACE_SEED_DEBUG` set. |
 | `[cache]` | Disk cache errors. |
+| `[vod]` | VOD failures by code, for example `start refused: code=no_space required=<bytes> available=<bytes>` or `download stopped at piece <n>: code=no_space`. |
 | `[broadcast]` | Broadcasts: reloads, tracker warnings, cleanup. |
 | `[rtmp]`, `[srt]` | Ingest listeners. |
 | `[support]` | Support sources. |

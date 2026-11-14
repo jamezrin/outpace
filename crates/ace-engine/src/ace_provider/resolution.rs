@@ -475,6 +475,8 @@ impl AceProvider {
                 &infohash,
             )
         });
+        self.check_vod_disk_space(&store.0, info.total_length)
+            .await?;
         Ok(Box::new(AceVodContent {
             peer_policy: self.peer_policy.clone(),
             info,
@@ -483,7 +485,42 @@ impl AceProvider {
             store,
             peers: Arc::new(tokio::sync::Mutex::new(None)),
             range_lock: Arc::new(tokio::sync::Mutex::new(())),
+            no_space: Default::default(),
         }))
+    }
+
+    /// Refuse a VOD whose pieces would not fit in the disk cache (#485). Runs once per
+    /// resolution: one free-space query, never on the piece path. Memory-backed stores write
+    /// nothing to disk and skip it; bytes the store already holds for this content need no new
+    /// space. Dropping the caller's lease on refusal releases a store created for this start.
+    async fn check_vod_disk_space(
+        &self,
+        store: &Arc<tokio::sync::Mutex<PieceStore>>,
+        total: u64,
+    ) -> Result<(), ProviderError> {
+        let (budget, held) = {
+            let guard = store.lock().await;
+            if !guard.is_disk_backed() {
+                return Ok(());
+            }
+            (guard.max_bytes(), guard.retained_bytes())
+        };
+        let dir = self.cache_dir.clone();
+        let available =
+            tokio::task::spawn_blocking(move || crate::disk_space::available_bytes(&dir))
+                .await
+                .ok()
+                .flatten();
+        crate::disk_space::check_fit(total, budget, held, available, self.vod_disk_reserve).map_err(
+            |no_space| {
+                crate::alog!(
+                    "[vod] start refused: code=no_space required={} available={}",
+                    no_space.required,
+                    no_space.available
+                );
+                ProviderError::NoSpace(no_space.message())
+            },
+        )
     }
 
     /// Fetch the VOD transport descriptor for `id` and decode it into a [`VodInfo`]. Accepts a
