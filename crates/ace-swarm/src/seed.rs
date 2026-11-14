@@ -6,7 +6,7 @@ use crate::store::PieceStore;
 use ace_peer::session::PeerSession;
 use ace_peer::Result;
 use ace_wire::bencode::Bencode;
-use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
+use ace_wire::extended::{ExtendedHandshake, LivePosition, OutgoingExtendedHandshake};
 use ace_wire::identity::Identity;
 use ace_wire::live_codec::{live_bitfield, live_have};
 use ace_wire::message::PeerMessage;
@@ -80,7 +80,7 @@ impl SeederSession {
                 position: max as i64,
                 distance_from_source: -1,
             }),
-            node: NodeFields::default(),
+            node: crate::engine_profile::node_fields(),
             peer_ip: Some(peer_ip),
             metadata_size: metadata.as_ref().map(|m| m.len() as i64),
         };

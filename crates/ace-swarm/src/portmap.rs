@@ -475,6 +475,15 @@ type TokioGateway = igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>;
 
 const MAPPING_DESCRIPTION: &str = "outpace peer";
 
+/// The UPnP mapping label: the engine's `AS <device id prefix>` under the AceStream
+/// identity, else outpace's own.
+fn mapping_description() -> std::borrow::Cow<'static, str> {
+    match crate::engine_profile::identity() {
+        Some(identity) => identity.port_mapping_description().into(),
+        None => MAPPING_DESCRIPTION.into(),
+    }
+}
+
 struct UpnpMapper;
 
 /// A live UPnP mapping: keeps the discovered gateway for renew/remove without re-searching.
@@ -495,7 +504,7 @@ impl UpnpActive {
                 self.external_port,
                 self.local_addr,
                 cfg.lease_seconds,
-                MAPPING_DESCRIPTION,
+                &mapping_description(),
             )
             .await
             .map_err(|e| PortMapError::Upnp(e.to_string()))
@@ -533,7 +542,7 @@ impl MapAttempt for UpnpMapper {
                 external_port,
                 local_addr,
                 cfg.lease_seconds,
-                MAPPING_DESCRIPTION,
+                &mapping_description(),
             )
             .await
             .map_err(|e| PortMapError::Upnp(e.to_string()))?;

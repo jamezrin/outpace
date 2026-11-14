@@ -80,6 +80,7 @@ dependencies = [
  "bytes",
  "cbc",
  "crab_nat",
+ "flate2",
  "hex",
  "httpdate",
  "hyper",

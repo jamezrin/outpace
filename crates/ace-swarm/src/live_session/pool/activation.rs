@@ -5,7 +5,6 @@ pub(in crate::live_session) struct Prepared {
     pub permit: WorkerPermit,
 }
 pub(super) struct Start {
-    pub peer_id: u64,
     pub cursor: u64,
     pub head: u64,
 }
@@ -19,7 +18,7 @@ pub(super) struct Activation {
 }
 #[cfg(test)]
 pub(super) fn prepare(
-    peer_id: u64,
+    _peer_id: u64,
     upstream: ConnectedUpstream,
     start: u64,
     head: u64,
@@ -28,7 +27,6 @@ pub(super) fn prepare(
 ) -> WriteJob {
     prepare_with_policy(
         Start {
-            peer_id,
             cursor: start,
             head,
         },
@@ -48,14 +46,17 @@ pub(super) fn prepare_with_policy(
     admission: WorkerAdmission,
 ) -> WriteJob {
     let Start {
-        peer_id,
         cursor: start,
         head,
     } = start;
     // Observe the already-received echo exactly once, before any write can fail
     // or be cancelled. The returned future owns no observer/identity borrow.
-    if let (Some(monitor), Some(ip)) = (reachability, upstream.yourip) {
-        monitor.observe_yourip(ip);
+    if let Some(ip) = upstream.yourip {
+        if let Some(monitor) = reachability {
+            monitor.observe_yourip(ip);
+        }
+        // Identity mode learns our public address from the same echo. No identity, no work.
+        crate::engine_location::note_public_address(ip, (*upstream.addr.ip()).into());
     }
     let hs = OutgoingExtendedHandshake {
         ace_metadata_version: 1,
@@ -66,10 +67,7 @@ pub(super) fn prepare_with_policy(
             position: -1,
             distance_from_source: 1,
         }),
-        node: NodeFields {
-            ts: 5000 + peer_id as i64,
-            ..policy.node_fields()
-        },
+        node: policy.node_fields(),
         peer_ip: Some(upstream.addr.ip().octets()),
         metadata_size: None,
     };
@@ -216,11 +214,7 @@ async fn private_activation_and_gossip_wire_do_not_advertise_inbound_port() {
                     payload
                 } else {
                     let job = prepare_with_policy(
-                        Start {
-                            peer_id: 1,
-                            cursor: 1,
-                            head: 2,
-                        },
+                        Start { cursor: 1, head: 2 },
                         upstream,
                         &identity,
                         None,

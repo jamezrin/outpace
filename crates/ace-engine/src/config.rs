@@ -374,6 +374,37 @@ macro_rules! config_with_root_redaction {
     };
 }
 
+/// Opt-in AceStream engine identity (`OUTPACE_ACESTREAM_IDENTITY`).
+///
+/// Device and hardware ids are operator secrets for the life of the install. Debug
+/// redacts them, and the field is skipped by serde so a serialized config cannot carry them.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct AcestreamIdentitySettings {
+    pub enabled: bool,
+    pub version: Option<String>,
+    pub platform: Option<String>,
+    pub device_id: Option<String>,
+    pub hardware_key: Option<String>,
+    pub asn: Option<String>,
+    pub country: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+impl std::fmt::Debug for AcestreamIdentitySettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcestreamIdentitySettings")
+            .field("enabled", &self.enabled)
+            .field("version", &self.version)
+            .field("platform", &self.platform)
+            .field("device_id_set", &self.device_id.is_some())
+            .field("hardware_key_set", &self.hardware_key.is_some())
+            .field("asn", &self.asn)
+            .field("country", &self.country)
+            .field("user_agent_set", &self.user_agent.is_some())
+            .finish()
+    }
+}
+
 config_with_root_redaction! {
     /// Operator-only exact peer endpoint policy. Public by default.
     #[serde(rename = "private_peers")]
@@ -485,6 +516,9 @@ config_with_root_redaction! {
     pub broadcast_sources: BTreeMap<String, BroadcastSourceConfig>,
     /// Independent operator-only SSRF opt-in, enabled by exact env string `1`.
     pub allow_non_global_broadcast_source: bool,
+    /// Opt-in AceStream engine identity. Off by default, so Outpace keeps its own labels.
+    #[serde(skip)]
+    pub acestream_identity: AcestreamIdentitySettings,
 }
 
 impl Config {
@@ -542,6 +576,7 @@ impl Default for Config {
             broadcast_options: BTreeMap::new(),
             broadcast_sources: BTreeMap::new(),
             allow_non_global_broadcast_source: false,
+            acestream_identity: AcestreamIdentitySettings::default(),
         }
     }
 }
@@ -578,6 +613,76 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
+}
+
+const ACESTREAM_DEVICE_ID_FILE: &str = "acestream-device-id";
+
+/// The persisted AceStream device id, if this data directory has one.
+/// A file of the wrong length is an error so a damaged id is not replaced silently.
+pub(crate) fn read_acestream_device_id(data_dir: &Path) -> std::io::Result<Option<[u8; 20]>> {
+    match std::fs::read(data_dir.join(ACESTREAM_DEVICE_ID_FILE)) {
+        Ok(bytes) if bytes.len() == 20 => {
+            let mut id = [0u8; 20];
+            id.copy_from_slice(&bytes);
+            Ok(Some(id))
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid acestream device id in OUTPACE_DATA_DIR",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Write the id to a private temporary file and publish it only once complete, so a
+/// failed first-use write never leaves a partial id that later reads reject.
+pub(crate) fn write_acestream_device_id(data_dir: &Path, id: &[u8; 20]) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let tmp = data_dir.join(format!(
+        ".{ACESTREAM_DEVICE_ID_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    let result = (|| {
+        write_private(&tmp, id)?;
+        // Write access: Windows `FlushFileBuffers` refuses a read-only handle.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)?
+            .sync_all()?;
+        std::fs::rename(&tmp, data_dir.join(ACESTREAM_DEVICE_ID_FILE))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    // Rename is atomic, not durable: flush the directory entry so a crash cannot
+    // lose the published id and mint a different one on the next start.
+    sync_directory(data_dir)
+}
+
+/// Same platform boundary as `broadcast_persist`: fsync on Unix (plain `fsync` on macOS,
+/// where `sync_all` requests `F_FULLFSYNC`), and no directory flush on other targets.
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(path)?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        dir.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -890,6 +995,58 @@ mod tests {
     #[test]
     fn default_seed_ttl_is_300s() {
         assert_eq!(Config::default().seed_ttl_secs, 300);
+    }
+
+    #[test]
+    fn acestream_identity_debug_and_serde_omit_device_secrets() {
+        let placeholder = "0123456789abcdef0123456789abcdef01234567";
+        let settings = AcestreamIdentitySettings {
+            enabled: true,
+            device_id: Some(placeholder.into()),
+            hardware_key: Some(placeholder.into()),
+            ..AcestreamIdentitySettings::default()
+        };
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains(placeholder));
+        assert!(debug.contains("device_id_set: true"));
+        assert!(debug.contains("hardware_key_set: true"));
+        let config = Config {
+            acestream_identity: settings,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains(placeholder));
+        assert!(!json.contains("acestream_identity"));
+        let parsed: Config = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.acestream_identity.enabled);
+    }
+
+    #[test]
+    fn acestream_device_id_is_stable_and_rejects_a_short_file() {
+        let dir = std::env::temp_dir().join(format!("outpace-device-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_acestream_device_id(&dir).unwrap(), None);
+        let id = [0x11; 20];
+        write_acestream_device_id(&dir, &id).unwrap();
+        assert_eq!(read_acestream_device_id(&dir).unwrap(), Some(id));
+        // Only the published id remains; the temporary file was renamed into place.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("acestream-device-id"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::write(dir.join("acestream-device-id"), [0u8; 4]).unwrap();
+        assert_eq!(
+            read_acestream_device_id(&dir).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

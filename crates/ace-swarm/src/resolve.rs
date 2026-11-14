@@ -14,7 +14,7 @@ use crate::http_fetch::{self, FetchError, FetchLimits, FetchPolicy, FetchUrl, Gu
 use crate::http_fetch::{is_private_or_loopback, is_safe_ip};
 use crate::types::{StreamInfo, StreamMetadata, VodInfo};
 use ace_peer::session::PeerSession;
-use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
+use ace_wire::extended::{ExtendedHandshake, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
 use ace_wire::infohash::{infohash_of_decoded_transport, transport_file_hash};
@@ -497,10 +497,7 @@ pub async fn transport_bytes_via_peer_with_policy<S: AsyncRead + AsyncWrite + Un
         ace_metadata_version: 1,
         ut_metadata_id: OUR_UT_METADATA_ID,
         mi: None,
-        node: NodeFields {
-            ts: 5000,
-            ..policy.node_fields()
-        },
+        node: policy.node_fields(),
         peer_ip: None,
         metadata_size: None,
     };
@@ -585,22 +582,41 @@ async fn fetch_catalog_transport_query(
         let mut rng = rand::rng();
         rng.random_range(1..=i64::MAX as u64)
     };
-    let signature = catalog_query_signature(parameter, value, request_random);
+    let (version_name, version_code) = crate::engine_profile::version();
+    let platform = crate::engine_profile::platform_name();
+    let signature = catalog_query_signature(
+        CatalogClient {
+            version_name,
+            version_code,
+            platform,
+        },
+        parameter,
+        value,
+        request_random,
+    );
     // Sign raw values, then form-encode them. In particular a Base64 '+' must not
     // become a space when the server decodes the query.
     let mut url = reqwest::Url::parse("http://catalog.example.invalid/gettorrent")
         .expect("constant catalog URL");
     url.query_pairs_mut()
-        .append_pair("_n", "3.2.11")
-        .append_pair("_p", "linux")
+        .append_pair("_n", version_name)
+        .append_pair("_p", platform)
         .append_pair("_r", &request_random.to_string())
-        .append_pair("_v", "3021100")
+        .append_pair("_v", &version_code.to_string())
         .append_pair(parameter, value)
         .append_pair("_s", &signature);
     let path = format!("{}?{}", url.path(), url.query().expect("catalog query"));
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: outpace/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-    );
+    let request = match crate::engine_profile::identity() {
+        // The engine sends catalog servers a randomized Chrome User-Agent per request.
+        Some(identity) => crate::engine_profile::engine_request_head(
+            &path,
+            &format!("{host}:{port}"),
+            &identity.random_catalog_user_agent(),
+        ),
+        None => format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: outpace/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        ),
+    };
 
     let mut stream = TcpStream::connect((host, port))
         .await
@@ -638,14 +654,41 @@ fn catalog_infohash_info(bytes: &[u8], requested: [u8; 20]) -> Result<StreamInfo
     Ok(info)
 }
 
-#[cfg(test)]
-fn catalog_signature(content_id: &str, request_random: u64) -> String {
-    catalog_query_signature("pid", content_id, request_random)
+/// The client version and platform a catalog request claims and signs.
+#[derive(Clone, Copy)]
+struct CatalogClient<'a> {
+    version_name: &'a str,
+    version_code: i64,
+    platform: &'a str,
 }
 
-fn catalog_query_signature(parameter: &str, value: &str, request_random: u64) -> String {
+#[cfg(test)]
+const DEFAULT_CATALOG_CLIENT: CatalogClient<'static> = CatalogClient {
+    version_name: "3.2.11",
+    version_code: 3021100,
+    platform: "linux",
+};
+
+#[cfg(test)]
+fn catalog_signature(content_id: &str, request_random: u64) -> String {
+    catalog_query_signature(DEFAULT_CATALOG_CLIENT, "pid", content_id, request_random)
+}
+
+fn catalog_query_signature(
+    client: CatalogClient<'_>,
+    parameter: &str,
+    value: &str,
+    request_random: u64,
+) -> String {
     let mut hasher = Sha1::new();
-    let signed = format!("_n=3.2.11#_p=linux#_r={request_random}#_v=3021100#{parameter}={value}");
+    let CatalogClient {
+        version_name,
+        version_code,
+        platform,
+    } = client;
+    let signed = format!(
+        "_n={version_name}#_p={platform}#_r={request_random}#_v={version_code}#{parameter}={value}"
+    );
     hasher.update(signed.as_bytes());
     hasher.update(CATALOG_SIGNING_SECRET);
     hex::encode(hasher.finalize())
@@ -727,7 +770,7 @@ fn catalog_response_transport(body: &[u8], request_random: u64) -> Result<Vec<u8
     Ok(transport)
 }
 
-fn http_response_body(response: &[u8]) -> Result<Vec<u8>, ResolveError> {
+pub(crate) fn http_response_body(response: &[u8]) -> Result<Vec<u8>, ResolveError> {
     let header_end = response
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -741,16 +784,38 @@ fn http_response_body(response: &[u8]) -> Result<Vec<u8>, ResolveError> {
     if !status.starts_with("HTTP/") || !status.contains(" 200 ") {
         return Err(ResolveError::Catalog("catalog http status"));
     }
-    let chunked = lines.any(|line| {
+    let (mut chunked, mut gzip) = (false, false);
+    for line in lines {
         let lower = line.to_ascii_lowercase();
-        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
-    });
-    let body = &response[header_end + 4..];
-    if chunked {
-        decode_chunked_body(body)
-    } else {
-        Ok(body.to_vec())
+        chunked |= lower.starts_with("transfer-encoding:") && lower.contains("chunked");
+        gzip |= lower.starts_with("content-encoding:") && lower.contains("gzip");
     }
+    let body = &response[header_end + 4..];
+    let body = if chunked {
+        decode_chunked_body(body)?
+    } else {
+        body.to_vec()
+    };
+    if gzip {
+        gunzip_bounded(&body)
+    } else {
+        Ok(body)
+    }
+}
+
+/// Inflate a gzip body (sent when we advertise `Accept-Encoding: gzip` like the engine),
+/// refusing anything that expands past the catalog response limit.
+fn gunzip_bounded(body: &[u8]) -> Result<Vec<u8>, ResolveError> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(body)
+        .take(CATALOG_RESPONSE_LIMIT as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|_| ResolveError::Catalog("bad catalog gzip body"))?;
+    if out.len() > CATALOG_RESPONSE_LIMIT {
+        return Err(ResolveError::Catalog("catalog response too large"));
+    }
+    Ok(out)
 }
 
 fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, ResolveError> {
@@ -2048,6 +2113,23 @@ mod tests {
                 assert_eq!(result.unwrap(), b"abc");
             }
         }
+    }
+
+    #[test]
+    fn http_response_body_inflates_gzip_and_bounds_it() {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(b"<xml/>").unwrap();
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
+        response.extend_from_slice(&gz.finish().unwrap());
+        assert_eq!(http_response_body(&response).unwrap(), b"<xml/>");
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(&vec![0u8; CATALOG_RESPONSE_LIMIT + 1])
+            .unwrap();
+        let mut response = b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n\r\n".to_vec();
+        response.extend_from_slice(&gz.finish().unwrap());
+        assert!(http_response_body(&response).is_err());
     }
 
     #[test]

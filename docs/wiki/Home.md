@@ -66,6 +66,7 @@ New here? Start with the [FAQ](FAQ) or [Getting Started](Getting-Started).
 | Play descriptors that point at an HLS origin | [Managed HLS Origins](Managed-HLS-Origins) |
 | Publish your own stream | [Broadcasting](Broadcasting) |
 | Understand upload and inbound peers | [Seeding and Peers](Seeding-and-Peers) |
+| Present the official engine's identity on the network | [Engine Camouflage](Engine-Camouflage) |
 | Open your peer port through a router | [NAT and Port Mapping](NAT-and-Port-Mapping) |
 | Restrict peers to an allowlist | [Private Peer Mode](Private-Peer-Mode) |
 | Run it as a service, in Docker or behind a proxy | [Deployment](Deployment) |

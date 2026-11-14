@@ -54,6 +54,9 @@ in `compose.override.yml`; see [Deployment](Deployment#passing-other-settings).
 - It only acts when inbound serving is on.
 - `auto` tries UPnP-IGD first, then NAT-PMP.
 - Mappings are leased and renewed, and removed when Outpace stops.
+- The router's mapping description is `outpace peer`. With
+  [engine camouflage](Engine-Camouflage) on, it is `AS` plus the first four hex digits of the
+  device id.
 - A failure is logged and Outpace carries on without a mapping.
 
 **Use it only when Outpace owns the machine's LAN address**: a binary running directly on the

@@ -7,7 +7,8 @@ change it. See [Command Line](Command-Line) for commands and flags.
 Restart the daemon after any change. Booleans accept exactly `1`, `true`, `0` or `false`.
 Variables marked "exact `1`" turn on only for the string `1`. **Avail.** says where a variable
 is available: **all** means v0.9.0 and later; **1.0.0** means v1.0.0 and later (also
-in `edge` and builds from `main`); **srt build** requires the optional `srt` feature.
+in `edge` and builds from `main`); **edge** means current `main` and the `edge` image, not
+yet in a numbered release; **srt build** requires the optional `srt` feature.
 See [Releases and Versions](Releases-and-Versions) for publication status.
 
 | Variable | Default | Avail. | Purpose |
@@ -15,6 +16,14 @@ See [Releases and Versions](Releases-and-Versions) for publication status.
 | [`OUTPACE_ACE_COMPAT`](Configuration#acestream-compatibility-api) | `false` | all | Turn on the AceStream-compatible `/ace/*` and `/server/api` routes. |
 | [`OUTPACE_COMPAT_ACESTREAM_SERVICES`](Configuration#acestream-search-services) | `false` | 1.0.0 | Separate opt-in for external stream-name search. |
 | [`OUTPACE_ACE_PEERS`](Configuration#discovery-trackers-and-resolution) | unset | all | Extra bootstrap peers, as `IPv4:port` separated by commas. |
+| [`OUTPACE_ACESTREAM_IDENTITY`](Configuration#acestream-identity) | `false` | edge | Present the official engine's identity on the public network. |
+| [`OUTPACE_ACESTREAM_IDENTITY_ASN`](Configuration#acestream-identity) | looked up | edge | Autonomous system number. Set together with the country. |
+| [`OUTPACE_ACESTREAM_IDENTITY_COUNTRY`](Configuration#acestream-identity) | looked up | edge | ISO country code. Set together with the ASN. |
+| [`OUTPACE_ACESTREAM_IDENTITY_DEVICE_ID`](Configuration#acestream-identity) | random, saved | edge | 40-hex device id. Saved under the data directory when unset. |
+| [`OUTPACE_ACESTREAM_IDENTITY_HARDWARE_KEY`](Configuration#acestream-identity) | from this host | edge | 40-hex hardware key. Required where memory size can't be read. |
+| [`OUTPACE_ACESTREAM_IDENTITY_PLATFORM`](Configuration#acestream-identity) | `linux` | edge | Claimed platform. Only `linux` is accepted. |
+| [`OUTPACE_ACESTREAM_IDENTITY_USER_AGENT`](Configuration#acestream-identity) | engine UA | edge | User-Agent for search and AceStream web hosts. |
+| [`OUTPACE_ACESTREAM_IDENTITY_VERSION`](Configuration#acestream-identity) | `3.2.11` | edge | Claimed engine version, `X.Y.Z`. |
 | [`OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE`](Configuration#broadcasting-and-ingest) | off | all | Exact `1`: allow private and loopback broadcast pull sources. |
 | [`OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT`](Configuration#discovery-trackers-and-resolution) | off | all | Exact `1`: allow transport-file URLs on private hosts. |
 | [`OUTPACE_BEP9_CONTENT_ID_FALLBACK`](Configuration#discovery-trackers-and-resolution) | `false` | all | Resolve content ids from peer metadata when the catalog fails. |

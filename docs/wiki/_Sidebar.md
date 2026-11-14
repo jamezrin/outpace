@@ -21,6 +21,7 @@
 
 - [Broadcasting](Broadcasting)
 - [Seeding and Peers](Seeding-and-Peers)
+- [Engine Camouflage](Engine-Camouflage)
 - [NAT and Port Mapping](NAT-and-Port-Mapping)
 - [Private Peer Mode](Private-Peer-Mode)
 
