@@ -15,7 +15,7 @@ workers = ["candidates", "dep:libc", "dep:serde_json"]
 
 [dependencies]
 mainline = { version = "=8.0.1", optional = true }
-n0-mainline = { version = "=0.7.1", optional = true }
+n0-mainline = { version = "=0.7.2", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "time", "net"], optional = true }
 futures-lite = { version = "2", optional = true }
 
