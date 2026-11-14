@@ -2,8 +2,9 @@
 
 The [companion app](Android-App) runs on Android TV and Google TV. It is not on the Play Store,
 so you install the signed APK from a computer on the same network. The steps below are the ones
-that worked on a TCL 55T69C (Google TV, Android 12). Other sets use the same path when they
-expose network `adb`; the menu names differ.
+that worked on a TCL 55T69C (Google TV, Android 12). That set has no **Wireless debugging** row,
+so the computer connects with `adb` on port 5555. A set that does list Wireless debugging is
+paired first; that path is under [Turn on USB debugging](#turn-on-usb-debugging).
 
 This installs the app, which then downloads an engine build for the television. It is not the
 [Termux](Installation#android-with-termux-best-effort) install.
@@ -18,10 +19,27 @@ You need:
 
 From the [Android app releases](https://github.com/outpace-stream/outpace-android/releases),
 download `outpace-android-<version>.apk` and the matching `.sha256` file. Check the file before
-installing it:
+installing it.
+
+Linux:
 
 ```bash
 sha256sum -c outpace-android-0.1.0.apk.sha256
+```
+
+macOS does not ship `sha256sum`. `shasum` reads the same file:
+
+```bash
+shasum -a 256 -c outpace-android-0.1.0.apk.sha256
+```
+
+Windows PowerShell prints `True` when the hash matches. `Get-FileHash` uses uppercase; the
+comparison is case-insensitive:
+
+```powershell
+$hash = (Get-FileHash .\outpace-android-0.1.0.apk -Algorithm SHA256).Hash
+$expected = (Get-Content .\outpace-android-0.1.0.apk.sha256 -Raw).Split()[0]
+$hash -eq $expected
 ```
 
 App releases start at v0.1.0. That package name is `io.github.outpacestream.android`.
@@ -35,14 +53,34 @@ On the television:
 3. Go back to **System → Developer options**.
 4. Turn on **USB debugging**.
 
-Some sets also list **Wireless debugging**, with a pairing code and a port. Use that screen when
-it is there. The TCL 55T69C does not have it. On that set, USB debugging is enough: the television
-accepts a normal `adb connect` on port **5555**.
+The TCL 55T69C does not list **Wireless debugging**. On that set, USB debugging is enough: the
+television accepts `adb connect` on port **5555**. Skip the pairing steps and continue at
+[Allow this computer](#allow-this-computer).
+
+A set that does list **Wireless debugging** does not use port 5555 until it is paired. Open that
+screen and note the pairing address, the pairing port, and the pairing code. The ports below are
+examples; use the ones on the screen. The pairing port and the connection port are different.
+
+```bash
+adb pair 192.0.2.10:37123
+```
+
+Enter the code when `adb` asks. Then connect to the address and port shown for the connection:
+
+```bash
+adb connect 192.0.2.10:39555
+adb devices
+```
+
+Turn **Wireless debugging** off when you finish installing. The allow dialog in the next section
+still applies.
 
 Find the television's address under **Settings → Network & Internet**, or in the router's client
 list. The examples use `192.0.2.10`. Use the address of your set.
 
 ## Allow this computer
+
+On a set that uses port 5555, including the TCL 55T69C:
 
 ```bash
 adb connect 192.0.2.10:5555
@@ -81,4 +119,5 @@ way to start the same stream again from the remote. The rest of the screens are 
 
 USB debugging leaves port 5555 open on the LAN. Anyone on that network who can reach the
 television can try to connect. Turn **USB debugging** off in Developer options when you no
-longer need to install from the computer. Playback does not need it.
+longer need to install from the computer, and turn **Wireless debugging** off too if you used it.
+Playback does not need either one.
