@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 
 // Independently generated with Python hashlib and the recovered protocol constants.
-// The request vector includes the advertised Outpace 1.0.3 version and numeric code.
+// The request vector includes the advertised Outpace 1.1.0 version and numeric code.
 // Changing canonicalization, encoding, nonce binding, keys or compact aliases breaks these.
 const NONCE: &str = "123456789";
 const DATA: &str = "eyJ0b3RhbCI6MSwidGltZSI6MC4wMSwicmVzdWx0cyI6W3sibmFtZSI6IlN5bnRoZXRpYyBHcm91cCIsIml0ZW1zIjpbeyJuIjoiU3ludGhldGljIEl0ZW0iLCJpIjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImIiOjEwMDAsImMiOlsidHYiXSwiYSI6MC41LCJhdSI6MCwicyI6MiwiZCI6ZmFsc2UsIl9kYXRhIjoiZGlzY2FyZCIsInUiOiJodHRwOi8vZXhhbXBsZS5pbnZhbGlkLyIsImNvbnRlbnRfaWQiOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3In1dfV19";
@@ -32,7 +32,8 @@ fn native_request_matches_independent_vector_before_form_encoding() {
     assert_eq!(
         params["_s"],
         hex::encode([
-            129, 41, 20, 167, 164, 142, 107, 191, 146, 29, 208, 5, 116, 247, 7, 195, 98, 13, 6, 251
+            70, 69, 164, 60, 29, 112, 39, 225, 203, 188, 137, 237, 162, 41, 207, 127, 207, 85, 50,
+            46
         ])
     );
     assert_eq!(params["a"], "a&key=+é");

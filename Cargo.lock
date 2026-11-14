@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ace-engine"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "ace-log",
  "ace-media",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "ace-fuzz"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "ace-media",
  "ace-wire",
@@ -49,15 +49,15 @@ dependencies = [
 
 [[package]]
 name = "ace-log"
-version = "1.0.3"
+version = "1.1.0"
 
 [[package]]
 name = "ace-media"
-version = "1.0.3"
+version = "1.1.0"
 
 [[package]]
 name = "ace-peer"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "ace-wire",
  "bytes",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "ace-swarm"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "ace-log",
  "ace-media",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "ace-tracker"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "hex",
  "rand",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "ace-wire"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "aes",
  "cbc",
@@ -1979,7 +1979,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swarmtest"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "ace-tracker",
  "ace-wire",
