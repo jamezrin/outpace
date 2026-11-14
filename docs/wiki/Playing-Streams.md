@@ -165,7 +165,7 @@ The same `error` object appears on the status route while `phase` is `failed`. K
 | `protected` | `422` | Encrypted or invalid-protection content, which Outpace doesn't play. |
 | `capacity` | `503` + `Retry-After: 1` | The [session cap](Configuration#limits-and-admission) is reached. Retry later. |
 | `no_space` | | Reserved for a VOD free-space check. Not produced yet. |
-| `internal` | `404` (`502` for VOD) | Any other failure. The daemon log has the details. |
+| `internal` | `404` (`502` for VOD) | Any other failure. The daemon log shows how far the start got. |
 
 The [compatibility API](#acestream-compatible-api) keeps its own error format.
 

@@ -89,6 +89,9 @@ pub(super) async fn stream_status(
         Ok(id) => id,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
+    // Read the attempt record before the session map: a successful start inserts its session
+    // before it removes its record, so this order never misses both mid-handoff.
+    let attempt = s.manager.start_status(&network, &id);
     match s.manager.get(&network, &id).await {
         Some(session) => {
             let stats = session.stats().await;
@@ -112,7 +115,7 @@ pub(super) async fn stream_status(
             }))
             .into_response()
         }
-        None => match s.manager.start_status(&network, &id) {
+        None => match attempt {
             Some(attempt) => Json(json!({
                 "network": network,
                 "id": native_public_stream_id(&network, &id),
@@ -179,7 +182,14 @@ async fn stream_start_error(s: &AppState, e: ProviderError) -> Response {
         | ProviderError::Unresolvable(_) => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::NOT_FOUND,
     };
-    start_error_response(status, &StartError::from_provider(&e))
+    let error = StartError::from_provider(&e);
+    // Provider diagnostics may embed identifiers or URLs: log only the typed code.
+    crate::alog!(
+        "[streams] start failed: code={} status={}",
+        error.code.as_str(),
+        status.as_u16()
+    );
+    start_error_response(status, &error)
 }
 
 /// A typed start failure as `application/json`; `503` responses also carry Retry-After.

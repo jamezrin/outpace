@@ -632,6 +632,20 @@ impl StreamManager {
             .check_openable(id)
     }
 
+    /// [`check_openable`](Self::check_openable) for a live start: a provider's refusal (not an
+    /// unknown network) is recorded as a failed attempt, so the status route reports it too.
+    fn check_live_start(&self, network: &str, id: &str) -> Result<(), ProviderError> {
+        let result = self.check_openable(network, id);
+        if let Err(error) = &result {
+            if !matches!(error, ProviderError::NotFound) {
+                self.start_attempts
+                    .begin((network.to_string(), id.to_string()))
+                    .fail(error);
+            }
+        }
+        result
+    }
+
     /// Prepare through the registered provider without opening a source or changing its key.
     pub(crate) async fn prepare_live_content_id(
         &self,
@@ -861,7 +875,7 @@ impl StreamManager {
         id: &str,
     ) -> Result<crate::session::SupportPin, ProviderError> {
         let id = &*self.canonical_id(network, id);
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let manager = self.clone();
         let network = network.to_owned();
         let id = id.to_owned();
@@ -954,7 +968,7 @@ impl StreamManager {
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
         let id = &*self.canonical_id(network, id);
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -988,7 +1002,7 @@ impl StreamManager {
         id: &str,
     ) -> Result<(Arc<StreamSession>, crate::session::Subscription), ProviderError> {
         let id = &*self.canonical_id(network, id);
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let manager = self.clone();
         let network = network.to_owned();
         let id = id.to_owned();
@@ -1020,7 +1034,7 @@ impl StreamManager {
         F: FnOnce(Arc<StreamSession>) -> T + Send,
         T: Send,
     {
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let key = (network.to_string(), id.to_string());
         if support
             .as_ref()
@@ -1223,7 +1237,7 @@ impl StreamManager {
         id: &str,
         native: bool,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let manager = self.clone();
         let network = network.to_owned();
         let id = id.to_owned();
@@ -1246,7 +1260,7 @@ impl StreamManager {
         mut cancel: watch::Receiver<bool>,
         mut transition: HlsTransition,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
-        self.check_openable(network, id)?;
+        self.check_live_start(network, id)?;
         let key = (network.to_string(), id.to_string());
         if transition.is_cancelled()
             || *cancel.borrow()

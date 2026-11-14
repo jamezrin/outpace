@@ -26,6 +26,13 @@ impl StreamProvider for FailingProvider {
             _ => ProviderError::Backend("synthetic backend diagnostic".into()),
         })
     }
+    // Offline refusal before any open, as a bare infohash without a descriptor gets (#164).
+    fn check_openable(&self, id: &str) -> Result<(), ProviderError> {
+        match id {
+            "refused" => Err(ProviderError::Unresolvable("synthetic refusal".into())),
+            _ => Ok(()),
+        }
+    }
 }
 
 fn app_state(provider: Arc<dyn StreamProvider>) -> AppState {
@@ -114,6 +121,30 @@ async fn native_start_failures_return_typed_json_and_status_retains_them() {
         json_body(response).await["error"]["message"],
         "synthetic user-facing reason"
     );
+}
+
+#[tokio::test]
+async fn an_offline_refusal_before_open_is_retained_on_status() {
+    for suffix in [".ts", ".m3u8", ""] {
+        let app = router(app_state(Arc::new(FailingProvider)));
+        let response = get(&app, &format!("/streams/fail/refused{suffix}")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{suffix}"
+        );
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "unresolvable",
+            "{suffix}"
+        );
+        let response = get(&app, "/streams/fail/refused/status").await;
+        assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+        let body = json_body(response).await;
+        assert_eq!(body["phase"], "failed", "{suffix}: {body}");
+        assert_eq!(body["error"]["code"], "unresolvable", "{suffix}: {body}");
+        assert_eq!(body["error"]["message"], "synthetic refusal", "{suffix}");
+    }
 }
 
 #[tokio::test]
