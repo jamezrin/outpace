@@ -85,10 +85,10 @@ async fn private_opted_in_raw_metadata_fallback_never_polls_catalog() {
     let (live, vod) = observation.expect("bounded raw metadata controls");
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     assert!(
-        matches!(live, Err(ProviderError::Backend(ref reason)) if reason == "content-id resolution: no metadata peer responded")
+        matches!(live, Err(ProviderError::NoPeers(ref reason)) if reason == "content-id resolution: no metadata peer responded")
     );
     assert!(
-        matches!(vod, Err(ProviderError::Backend(ref reason)) if reason == "vod content-id resolution: no metadata peer responded")
+        matches!(vod, Err(ProviderError::NoPeers(ref reason)) if reason == "vod content-id resolution: no metadata peer responded")
     );
 }
 

@@ -206,7 +206,7 @@ impl AceProvider {
         }
         Err(ProviderStartFailure::new(
             StartFailureKind::Discovery,
-            ProviderError::Backend("content-id resolution: no metadata peer responded".into()),
+            ProviderError::NoPeers("content-id resolution: no metadata peer responded".into()),
         ))
     }
 
@@ -604,16 +604,22 @@ impl AceProvider {
                 }
             }
         }
-        Err(ProviderError::Backend(
+        Err(ProviderError::NoPeers(
             "vod content-id resolution: no metadata peer responded".into(),
         ))
     }
 }
 
 fn disabled_content_id_fallback(catalog_error: &ResolveError) -> ProviderError {
-    ProviderError::Backend(format!(
+    let message = format!(
         "content-id catalog resolution failed: {catalog_error:?}; raw-hash BEP-9 fallback is disabled (OUTPACE_BEP9_CONTENT_ID_FALLBACK=1 to opt in)"
-    ))
+    );
+    // Catalog hosts unreachable is a network condition, not a refusal of this id.
+    if catalog_error.failure_kind() == ace_swarm::resolve::ResolveFailureKind::Network {
+        ProviderError::Network(message)
+    } else {
+        ProviderError::Backend(message)
+    }
 }
 
 /// Whether `id` is a bare 40-hex string: a swarm infohash, or a content id missing its `cid:`
@@ -659,6 +665,9 @@ mod classified_tests {
             .err()
             .unwrap();
         assert_eq!(network.error.to_string(), response.error.to_string());
+        // Same diagnostic, distinct typed variants for the native `network`/`internal` codes.
+        assert!(matches!(network.error, ProviderError::Network(_)));
+        assert!(matches!(response.error, ProviderError::Backend(_)));
         assert_eq!(
             network.kind,
             StartFailureKind::Resolution(ResolveFailureKind::Network)

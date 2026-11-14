@@ -55,6 +55,7 @@ pub mod session;
 mod source_options;
 pub mod srt;
 pub mod start_failure;
+pub mod start_status;
 pub mod startup_buffer;
 pub mod support;
 pub mod support_config;

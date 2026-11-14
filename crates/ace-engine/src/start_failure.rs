@@ -49,6 +49,8 @@ impl From<ProviderError> for ProviderStartFailure {
                 StartFailureKind::Resolution(ResolveFailureKind::InvalidProtection)
             }
             ProviderError::CapacityExhausted => StartFailureKind::Capacity,
+            ProviderError::NoPeers(_) => StartFailureKind::Discovery,
+            ProviderError::Network(_) => StartFailureKind::Resolution(ResolveFailureKind::Network),
             _ => StartFailureKind::Unclassified,
         };
         Self::new(kind, error)

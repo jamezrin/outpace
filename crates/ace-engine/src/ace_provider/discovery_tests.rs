@@ -3851,3 +3851,19 @@ async fn initial_discovery_timeout_joins_worker_before_returning_error() {
         "discovery timeout released the source-opening owner before worker destruction"
     );
 }
+
+#[tokio::test]
+async fn empty_initial_discovery_fails_with_the_typed_no_peers_error() {
+    let discovery: PeerDiscovery = Arc::new(|_, _| Box::pin(async {}));
+    let provider = AceProvider::new(Arc::new(Identity::generate()), 0);
+    let opened = tokio::time::timeout(
+        Duration::from_secs(15),
+        provider.open_resolved("synthetic", info(), discovery),
+    )
+    .await
+    .expect("empty discovery is bounded by the initial budget");
+    assert!(
+        matches!(opened, Err(ProviderError::NoPeers(_))),
+        "empty discovery must map to no_peers"
+    );
+}

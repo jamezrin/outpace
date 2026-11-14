@@ -537,6 +537,12 @@ pub(super) async fn ace_playback(
                 ProviderError::Backend(_) => {
                     (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
                 }
+                ProviderError::NoPeers(_) => {
+                    (StatusCode::BAD_GATEWAY, "NoPeers", "stream start failed")
+                }
+                ProviderError::Network(_) => {
+                    (StatusCode::BAD_GATEWAY, "Network", "stream start failed")
+                }
                 ProviderError::Unresolvable(_) => (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "Unresolvable",

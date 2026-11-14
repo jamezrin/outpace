@@ -656,6 +656,15 @@ impl StreamProvider for AceProvider {
     }
 
     async fn open_classified(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderStartFailure> {
+        self.open_with_progress(id, crate::start_status::StartProgress::none())
+            .await
+    }
+
+    async fn open_with_progress(
+        &self,
+        id: &str,
+        progress: crate::start_status::StartProgress,
+    ) -> Result<Box<dyn TsSource>, ProviderStartFailure> {
         // One resolver for every live entry point. A bare infohash without a verified
         // descriptor fails closed here, before any discovery (#164).
         let opening = Instant::now();
@@ -666,6 +675,7 @@ impl StreamProvider for AceProvider {
             "[ace] discovery stage=resolved resolve_ms={}",
             opening.elapsed().as_millis()
         );
+        progress.resolved();
 
         let trackers = info.trackers.clone();
         let infohash = info.infohash;

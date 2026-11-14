@@ -135,16 +135,39 @@ What helps:
 Also check the player: a client that reads slower than real time eventually falls behind the
 server's window and gets a discontinuity.
 
+## Why a stream won't start
+
+The [status route](Playing-Streams#start-phase) shows a `phase` while a stream starts and,
+when the start fails, an `error.code`. Native playback and VOD routes return the same JSON
+`error` in their response body:
+
+```bash
+curl "http://127.0.0.1:6878/streams/ace/${CONTENT_ID:?set a content id}/status"
+```
+
+| What you see | What it means |
+| --- | --- |
+| `phase` stays `resolving` | The descriptor lookup is slow. Check outbound network access to the catalog. |
+| `phase` stays `connecting` | No peer connected yet. See [No peers, or discovery fails](#no-peers-or-discovery-fails). |
+| `phase` stays `buffering` | Peers are connected but media isn't arriving. See [Slow startup](#slow-startup). |
+| `no_peers` | Nobody is sharing the stream right now. Try a stream you know is live. |
+| `network` | The catalog couldn't be reached. Check VPNs, WARP and firewalls. |
+| `unresolvable` | The id has no verified descriptor; `message` says what to try (often the `cid:` content id). |
+| `protected` | Encrypted content. Outpace doesn't play it. |
+| `capacity` | The session cap is reached. See [Too many streams](#too-many-streams). |
+| `internal` | Something else failed. Check the log. |
+
 ## No peers, or discovery fails
 
-`status` shows `peers: 0` for a long time, or the request fails:
+`status` shows `peers: 0` for a long time, `phase` stays `connecting`, or the start fails
+with `no_peers`:
 
 - **Is the stream alive?** Try another one. Dead channels never find peers.
 - **Outbound UDP** must work for the DHT and trackers (replies to outbound UDP must come back).
   Some firewalls and VPNs block this.
 - **Outbound TCP** to arbitrary ports must work to reach peers.
-- `422` with a reason: the id couldn't be resolved. For `ih:` infohashes, Outpace needs a
-  verified descriptor; try the content id instead.
+- `422` with code `unresolvable`: the id couldn't be resolved. For `ih:` infohashes, Outpace
+  needs a verified descriptor; try the content id instead.
 - Compat `502 stream start failed`: resolution or discovery failed. Compat `422 stream
   metadata unavailable`: no descriptor was found for an infohash or magnet. Neither proves the
   content is gone for good.

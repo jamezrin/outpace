@@ -910,14 +910,13 @@ async fn native_routes_refuse_an_explicit_infohash_without_a_descriptor() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
         let content_type = resp.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert_eq!(content_type, "application/json", "{path}");
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(body["error"]["code"], "unresolvable", "{path}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
         assert!(
-            content_type.starts_with("text/plain"),
-            "{path}: {content_type}"
-        );
-        let body = body_text(resp).await;
-        assert!(
-            body.contains(&format!("cid:{UNRESOLVED_IH}")),
-            "{path}: {body}"
+            message.contains(&format!("cid:{UNRESOLVED_IH}")),
+            "{path}: {message}"
         );
     }
 }

@@ -148,6 +148,18 @@ pub trait StreamProvider: Send + Sync {
             .map_err(crate::start_failure::ProviderStartFailure::from)
     }
 
+    /// [`open_classified`](Self::open_classified) that also reports start progress (the
+    /// descriptor is resolved) for the native status route. Providers without intermediate
+    /// progress keep the default.
+    async fn open_with_progress(
+        &self,
+        id: &str,
+        progress: crate::start_status::StartProgress,
+    ) -> Result<Box<dyn TsSource>, crate::start_failure::ProviderStartFailure> {
+        let _ = progress;
+        self.open_classified(id).await
+    }
+
     /// Prepare a live content id using the same policy and cache as [`open`](Self::open).
     /// Only `Catalog` grants catalog provenance. A supported provider's error is terminal
     /// for this selection; `Unsupported` alone permits the caller's legacy preflight.
@@ -199,6 +211,13 @@ pub enum ProviderError {
     CapacityExhausted,
     NotFound,
     Backend(String),
+    /// No peer could be found or reached for the stream: no metadata peer answered content-id
+    /// resolution, or initial swarm discovery found nobody. The message is a diagnostic for the
+    /// log; HTTP clients get the stable `no_peers` code instead.
+    NoPeers(String),
+    /// A network step (catalog hosts) was unreachable, as distinct from [`Self::NoPeers`]. The
+    /// message is a diagnostic for the log; HTTP clients get the stable `network` code.
+    Network(String),
     /// The id is well-formed, but the provider holds no verified metadata to open it with and
     /// will not guess (#164: a bare infohash without a verified transport descriptor). The
     /// message is user-facing: it explains the refusal and how to open the stream instead, and
@@ -217,7 +236,10 @@ impl std::fmt::Display for ProviderError {
             ProviderError::InvalidProtection => f.write_str("invalid content protection metadata"),
             ProviderError::CapacityExhausted => f.write_str("session capacity reached"),
             ProviderError::NotFound => f.write_str("not found"),
-            ProviderError::Backend(msg) | ProviderError::Unresolvable(msg) => f.write_str(msg),
+            ProviderError::Backend(msg)
+            | ProviderError::NoPeers(msg)
+            | ProviderError::Network(msg)
+            | ProviderError::Unresolvable(msg) => f.write_str(msg),
             ProviderError::DirectHls(_) => {
                 f.write_str("source is origin HLS; open it through an HTTP playback route")
             }
@@ -255,6 +277,9 @@ impl From<ace_swarm::resolve::ResolveError> for ProviderError {
             ace_swarm::resolve::ResolveError::InvalidProtection => Self::InvalidProtection,
             ace_swarm::resolve::ResolveError::HlsOrigin(origin) => Self::DirectHls(origin),
             ace_swarm::resolve::ResolveError::Hls(reason) => Self::Unresolvable(reason.into()),
+            other if other.failure_kind() == ace_swarm::resolve::ResolveFailureKind::Network => {
+                Self::Network(format!("descriptor resolution: {other:?}"))
+            }
             other => Self::Backend(format!("descriptor resolution: {other:?}")),
         }
     }

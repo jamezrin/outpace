@@ -78,7 +78,9 @@ pub(super) async fn delete_stream(
     }
 }
 
-/// `GET /streams/{network}/{id}/status` — stats for a running session (404 if not active).
+/// `GET /streams/{network}/{id}/status` — start `phase` and stats for a running session, or
+/// the recorded start attempt (`resolving`/`connecting`, or `failed` with a typed `error`) when
+/// no session answers yet or any more. 404 when neither exists.
 pub(super) async fn stream_status(
     State(s): State<AppState>,
     Path((network, id)): Path<(String, String)>,
@@ -93,6 +95,8 @@ pub(super) async fn stream_status(
             Json(json!({
                 "network": network,
                 "id": native_public_stream_id(&network, &id),
+                "phase": session_phase(&session, &stats).as_str(),
+                "error": null,
                 "clients": session.subscriber_count(),
                 "occupied_sessions": s.manager.admission_status().0,
                 "max_sessions": s.manager.admission_status().1,
@@ -108,7 +112,30 @@ pub(super) async fn stream_status(
             }))
             .into_response()
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => match s.manager.start_status(&network, &id) {
+            Some(attempt) => Json(json!({
+                "network": network,
+                "id": native_public_stream_id(&network, &id),
+                "phase": attempt.phase().as_str(),
+                "error": attempt.error().map(StartError::to_json),
+                "clients": 0,
+                "peers": 0,
+            }))
+            .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
+    }
+}
+
+/// Start phase of a running session: `playing` once media has left the session, `buffering`
+/// while connected peers have not produced output yet, `connecting` before any peer connects.
+fn session_phase(session: &StreamSession, stats: &crate::provider::SourceStats) -> StartPhase {
+    if session.output_started() {
+        StartPhase::Playing
+    } else if stats.peers > 0 {
+        StartPhase::Buffering
+    } else {
+        StartPhase::Connecting
     }
 }
 
@@ -135,24 +162,33 @@ pub(super) async fn stream_segment(
     }
 }
 
-/// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
-/// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
-/// that text. Protection policy failures also return 422 with their stable message.
-/// Capacity returns 503 with Retry-After; an origin HLS source is a `302` handoff (to the origin,
-/// or to a managed relay lease) without a swarm session; other failures retain bodiless 404.
+/// Response for a failed stream start on the native routes: a JSON
+/// `{"error": {"code", "message"}}` body with a stable code (see [`StartError`]). Status codes
+/// are unchanged: `Unresolvable` (a bare infohash without a verified descriptor, #164) and
+/// protection policy failures are `422`; capacity is `503` with Retry-After; an origin HLS
+/// source is a `302` handoff (to the origin, or to a managed relay lease) without a swarm
+/// session; other failures are `404`.
 async fn stream_start_error(s: &AppState, e: ProviderError) -> Response {
-    match e {
-        ProviderError::CapacityExhausted => capacity_error(),
+    let status = match &e {
         ProviderError::DirectHls(origin) => {
-            super::compat::resolved_origin_redirect(s, &origin.manifest_url).await
+            return super::compat::resolved_origin_redirect(s, &origin.manifest_url).await
         }
-        e @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
-        }
-        ProviderError::Unresolvable(reason) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response()
-        }
-        _ => StatusCode::NOT_FOUND.into_response(),
+        ProviderError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        ProviderError::ProtectedContent
+        | ProviderError::InvalidProtection
+        | ProviderError::Unresolvable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::NOT_FOUND,
+    };
+    start_error_response(status, &StartError::from_provider(&e))
+}
+
+/// A typed start failure as `application/json`; `503` responses also carry Retry-After.
+pub(super) fn start_error_response(status: StatusCode, error: &StartError) -> Response {
+    let body = Json(json!({ "error": error.to_json() }));
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        (status, [(header::RETRY_AFTER, "1")], body).into_response()
+    } else {
+        (status, body).into_response()
     }
 }
 
