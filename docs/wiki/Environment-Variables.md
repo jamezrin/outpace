@@ -76,7 +76,6 @@ See [Releases and Versions](Releases-and-Versions) for publication status.
 | [`OUTPACE_SEED_STORE_BYTES`](Configuration#storage-and-cache) | 128 MiB | all | Ceiling on retained pieces per stream. |
 | [`OUTPACE_SEED_TTL_SECS`](Configuration#seeding-and-inbound-peers) | `300` | all | Safety net that frees seeding data nothing owns. |
 | [`OUTPACE_SESSION_BUFFER`](Configuration#playback-and-startup-buffering) | `256` | all | Per-viewer fan-out queue depth. |
-| [`OUTPACE_VOD_DISK_RESERVE_BYTES`](Configuration#vod-free-space-check) | 256 MiB | edge | Free space a disk-cached VOD download must leave. |
 | [`OUTPACE_SRT_BIND`](Configuration#broadcasting-and-ingest) | unset (off) | srt build | SRT ingest address (UDP). |
 | [`OUTPACE_SRT_LATENCY_MS`](Configuration#broadcasting-and-ingest) | `120` | srt build | SRT receiver latency, 20–2000 ms. |
 | [`OUTPACE_SRT_MAX_CONNECTIONS`](Configuration#broadcasting-and-ingest) | `4` | srt build | Simultaneous SRT connections, 1–16. |
@@ -85,6 +84,7 @@ See [Releases and Versions](Releases-and-Versions) for publication status.
 | [`OUTPACE_SUPPORT_SOURCES`](Configuration#support-sources) | unset (off) | 1.0.0 | Streams kept running and seeding with no viewer (JSON). |
 | [`OUTPACE_TRACKER_ALLOW_NON_GLOBAL`](Configuration#discovery-trackers-and-resolution) | off | all | Exact `1`: allow announcing to trackers on private addresses. |
 | [`OUTPACE_TRACKERS`](Configuration#broadcasting-and-ingest) | built-in public tracker | all | Trackers written into new broadcasts. |
+| [`OUTPACE_VOD_DISK_RESERVE_BYTES`](Configuration#vod-free-space-check) | 256 MiB | edge | Free space a disk-cached VOD download must leave. |
 
 Variables named `OUTPACE_TEST_*`, `OUTPACE_DHT_COMPARE_*` or `OUTPACE_RUN_*` belong to the test
 suite. The repository's Compose file also reads `OUTPACE_IMAGE`, `OUTPACE_HTTP_HOST`,

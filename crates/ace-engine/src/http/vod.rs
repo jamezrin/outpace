@@ -21,11 +21,11 @@ pub(super) async fn vod_stream(
         // Whole file (no usable Range): 200 with Accept-Ranges so players know they *can* seek.
         RangeOutcome::Full => match vod.open_range(0, total - 1).await {
             Ok(source) => vod_response_from_source(source),
-            Err(e) => vod_range_error(&s, &network, &id, e).await,
+            Err(e) => vod_range_error(&s, &network, &id, &vod, e).await,
         },
         RangeOutcome::Satisfiable(start, end) => match vod.open_range(start, end).await {
             Ok(source) => vod_partial_response(source, start, end, total),
-            Err(e) => vod_range_error(&s, &network, &id, e).await,
+            Err(e) => vod_range_error(&s, &network, &id, &vod, e).await,
         },
         // A well-formed range that can't be met: 416 with the resource's true length.
         RangeOutcome::Unsatisfiable => axum::http::Response::builder()
@@ -190,9 +190,15 @@ pub(super) async fn resolve_vod(
 /// during an earlier download) and `502` otherwise. A `no_space` handle is dropped from the
 /// manager's cache, so it releases its pieces once in-flight reads end and the next request
 /// resolves again, re-running the free-space check.
-async fn vod_range_error(s: &AppState, network: &str, id: &str, error: ProviderError) -> Response {
+async fn vod_range_error(
+    s: &AppState,
+    network: &str,
+    id: &str,
+    vod: &Arc<dyn VodContent>,
+    error: ProviderError,
+) -> Response {
     let status = if matches!(error, ProviderError::NoSpace(_)) {
-        s.manager.forget_vod(network, id).await;
+        s.manager.forget_vod(network, id, vod).await;
         StatusCode::INSUFFICIENT_STORAGE
     } else {
         StatusCode::BAD_GATEWAY
@@ -242,7 +248,7 @@ pub(super) async fn vod_hls_segment(
     };
     match vod.open_range(start, end).await {
         Ok(source) => vod_hls_segment_response(source),
-        Err(e) => vod_range_error(&s, &network, &id, e).await,
+        Err(e) => vod_range_error(&s, &network, &id, &vod, e).await,
     }
 }
 

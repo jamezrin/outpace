@@ -81,7 +81,17 @@ pub fn is_no_space(kind: std::io::ErrorKind) -> bool {
 /// resolved through its nearest existing ancestor (the cache directory may not exist yet).
 /// `None` when the platform has no supported query or the query fails.
 pub fn available_bytes(path: &Path) -> Option<u64> {
-    let existing = path.ancestors().find(|p| p.exists())?;
+    // A relative path's last ancestor is "", which names the current directory.
+    let existing = path
+        .ancestors()
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                p
+            }
+        })
+        .find(|p| p.exists())?;
     query_available(existing)
 }
 
@@ -244,5 +254,7 @@ mod tests {
     fn queries_a_real_filesystem_through_a_missing_child() {
         let missing = std::env::temp_dir().join("outpace-disk-space-missing/child");
         assert!(available_bytes(&missing).is_some());
+        // A relative path with no existing component falls back to the current directory.
+        assert!(available_bytes(Path::new("outpace-disk-space-missing/child")).is_some());
     }
 }
