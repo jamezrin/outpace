@@ -233,19 +233,31 @@ impl WarmPeerCache {
             }
         }
     }
+    /// Best-effort startup wait: returns once the initial disk load finishes or after 100 ms,
+    /// whichever comes first. It does not mean the load completed; see [`Self::wait_loaded`].
     pub async fn initialized(&self) {
-        let _ = tokio::time::timeout(Duration::from_millis(100), async {
+        self.wait_loaded(Duration::from_millis(100)).await;
+    }
+    /// Whether the initial disk load has finished, or this cache uses the in-memory fallback.
+    /// Completion only: a failed or corrupt load also counts, and hints may still be empty.
+    pub fn is_initialized(&self) -> bool {
+        self.0.shared.state.lock().unwrap().loaded
+    }
+    /// Wait up to `deadline` for [`Self::is_initialized`]. Returns whether loading finished.
+    pub async fn wait_loaded(&self, deadline: Duration) -> bool {
+        tokio::time::timeout(deadline, async {
             loop {
                 let notified = self.0.shared.changed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.0.shared.state.lock().unwrap().loaded {
-                    break;
+                if self.is_initialized() {
+                    return;
                 }
                 notified.await;
             }
         })
-        .await;
+        .await
+        .is_ok()
     }
     pub fn candidate_addresses(&self, hash: &[u8; 20]) -> Vec<SocketAddrV4> {
         self.hints(hash).into_iter().map(|(addr, _)| addr).collect()
@@ -785,6 +797,16 @@ mod secure {
     }
 }
 
+/// Fixtures that assert on persisted contents need the load to have actually finished, not the
+/// best-effort 100 ms of [`WarmPeerCache::initialized`].
+#[cfg(test)]
+pub(super) async fn fixture_loaded(cache: &WarmPeerCache) {
+    assert!(
+        cache.wait_loaded(Duration::from_secs(2)).await,
+        "cache fixture initial load must finish"
+    );
+}
+
 #[cfg(test)]
 pub(super) async fn retired_terminal(path: &Path) -> bool {
     let identity = normalize(path).unwrap();
@@ -847,7 +869,7 @@ mod tests {
         let _guard = test_guard().await;
         let path = temp();
         let (cache, events) = observed_cache(&path);
-        cache.initialized().await;
+        fixture_loaded(&cache).await;
         let idle = writer_observation(&events).await;
         cache.record_productive([0; 20], peer(34561), CandidateKind::Source);
         assert!(
@@ -886,7 +908,7 @@ mod tests {
         std::fs::create_dir_all(path.join(FILE)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (cache, events) = observed_cache(&path);
-        cache.initialized().await;
+        fixture_loaded(&cache).await;
         let _ = writer_observation(&events).await;
         cache.record_productive([0; 20], peer(34563), CandidateKind::Source);
         loop {
@@ -1118,14 +1140,14 @@ mod tests {
         assert!(Arc::ptr_eq(&cache.0, &clone.0));
         // New progress can arrive before the old file finishes loading.
         clone.record_productive([0; 20], peer(23457), CandidateKind::Source);
-        cache.initialized().await;
+        fixture_loaded(&cache).await;
         assert_eq!(cache.hints(&[0; 20]).len(), 2);
         assert!(cache.flush().await);
         drop(clone);
         drop(cache);
         assert!(retired_terminal(&root).await);
         let fresh = WarmPeerCache::new(&root, true);
-        fresh.initialized().await;
+        fixture_loaded(&fresh).await;
         assert_eq!(fresh.hints(&[0; 20]).len(), 2);
         assert!(fresh
             .hints(&[0; 20])
@@ -1135,10 +1157,20 @@ mod tests {
         assert!(retired_terminal(&root).await);
         std::fs::remove_dir_all(root).unwrap();
     }
+    /// Releases paused synthetic workers on drop, including during a test panic.
+    struct ReleasePausedWorkers(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleasePausedWorkers {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.0 .1.notify_all();
+        }
+    }
     #[tokio::test]
     async fn paused_io_keeps_load_and_drop_bounded_and_retired_workers_owned() {
         let _guard = test_guard().await;
         let pause = Arc::new((Mutex::new(false), Condvar::new()));
+        // An early assertion failure must still release the paused synthetic workers.
+        let release = ReleasePausedWorkers(pause.clone());
         let mut owners = Vec::new();
         let mut roots = Vec::new();
         for _ in 0..MAX_IDENTITIES {
@@ -1167,9 +1199,47 @@ mod tests {
             MAX_IDENTITIES,
             "retired handles stay bounded and observable"
         );
-        *pause.0.lock().unwrap() = true;
-        pause.1.notify_all();
+        drop(release);
         for root in roots {
+            assert!(retired_terminal(&root).await);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn load_acknowledgement_waits_for_completion_not_success() {
+        let _guard = test_guard().await;
+        let memory = WarmPeerCache::memory();
+        assert!(
+            memory.is_initialized(),
+            "memory fallback needs no disk load"
+        );
+        assert!(memory.wait_loaded(Duration::ZERO).await);
+
+        let pause = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release = ReleasePausedWorkers(pause.clone());
+        let stalled_root = temp();
+        let stalled = WarmPeerCache::new_inner(&stalled_root, true, Some(pause.clone()));
+        assert!(
+            !stalled.is_initialized(),
+            "paused load must not be acknowledged"
+        );
+        assert!(
+            !stalled.wait_loaded(Duration::from_millis(50)).await,
+            "a bounded wait must report that loading has not finished"
+        );
+
+        // A corrupt file still completes loading; acknowledgement is not success.
+        let corrupt_root = temp();
+        let directory = secure::Directory::open(&corrupt_root).unwrap();
+        directory.write(b"invalid cache payload").unwrap();
+        drop(directory);
+        let corrupt = WarmPeerCache::new(&corrupt_root, true);
+        fixture_loaded(&corrupt).await;
+        assert!(corrupt.candidate_addresses(&[0; 20]).is_empty());
+
+        drop((stalled, corrupt));
+        drop(_release);
+        for root in [stalled_root, corrupt_root] {
             assert!(retired_terminal(&root).await);
             std::fs::remove_dir_all(root).unwrap();
         }
