@@ -78,7 +78,8 @@ from the organization:
   seconds. A scrape over either limit gets `503` with `Retry-After: 1` (#466).
 - A best-effort `armv7-linux-androideabi` archive is published for 32-bit Android (#459).
 - Archives, packages and images are attested by `outpace-stream/outpace-engine` and verify with
-  `--repo outpace-stream/outpace-engine`.
+  `--repo outpace-stream/outpace-engine`. The best-effort Android archives are not attested; check
+  them against their `.sha256` file.
 
 ## v1.0.1 fixes
 
