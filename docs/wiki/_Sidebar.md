@@ -33,4 +33,9 @@
 - [Troubleshooting](Troubleshooting)
 - [Releases and Versions](Releases-and-Versions)
 
+**Use cases**
+
+- [Use cases](Use-Cases)
+- [Android TV](Android-TV)
+
 - [Android companion app](Android-App)
