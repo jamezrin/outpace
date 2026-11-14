@@ -52,7 +52,7 @@ See [Getting Started](Getting-Started) and [Command Line](Command-Line#outpace-p
 
 ```bash
 docker run -d --name outpace -p 127.0.0.1:6878:6878 -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace ghcr.io/outpace-stream/outpace-engine:1.0.2
+  -v outpace-data:/var/lib/outpace ghcr.io/outpace-stream/outpace-engine:1.0.3
 ```
 
 The image is multi-arch (amd64, arm64, arm/v7). For a production setup with Docker Compose, a

@@ -50,7 +50,7 @@ want. The installer and its files come from the repository; the binary comes fro
 cd /tmp
 wget -O outpace-src.tar.gz https://github.com/outpace-stream/outpace-engine/archive/refs/heads/main.tar.gz
 tar -xzf outpace-src.tar.gz
-sh outpace-engine-main/packaging/openwrt/install.sh 1.0.2
+sh outpace-engine-main/packaging/openwrt/install.sh 1.0.3
 ```
 
 The installer:

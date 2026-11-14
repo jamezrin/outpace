@@ -9,9 +9,9 @@
 - The version a binary reports is the version in the source it was built from. The tag must
   match it.
 
-The latest published release is **v1.0.2**, a patch release on top of 1.0.1. See the
-[GitHub Release](https://github.com/outpace-stream/outpace-engine/releases/tag/v1.0.2) for downloads,
-the [1.0.2 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.2.md)
+The latest published release is **v1.0.3**, a patch release on top of 1.0.2. See the
+[GitHub Release](https://github.com/outpace-stream/outpace-engine/releases/tag/v1.0.3) for downloads,
+the [1.0.3 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.3.md)
 for its fixes, and the
 [1.0.0 notes](https://github.com/outpace-stream/outpace-engine/blob/main/docs/releases/1.0.0.md)
 for scope, upgrades and validation limits.
@@ -22,7 +22,7 @@ for scope, upgrades and validation limits.
   its downloads and generated change notes.
 - **Curated notes:** for releases that have them, in
   [`docs/releases/`](https://github.com/outpace-stream/outpace-engine/tree/main/docs/releases)
-  (including `1.0.0.md`, `1.0.1.md` and `1.0.2.md`).
+  (including `1.0.0.md`, `1.0.1.md`, `1.0.2.md` and `1.0.3.md`).
 - **Milestones:** <https://github.com/outpace-stream/outpace-engine/milestones> track what each
   version covers.
 
@@ -30,7 +30,7 @@ for scope, upgrades and validation limits.
 
 ```bash
 outpace --version
-docker run --rm ghcr.io/outpace-stream/outpace-engine:1.0.2 --version
+docker run --rm ghcr.io/outpace-stream/outpace-engine:1.0.3 --version
 curl "http://127.0.0.1:6878/server/api?method=get_version"   # needs OUTPACE_ACE_COMPAT=1
 ```
 
@@ -67,6 +67,14 @@ On `main`, not yet in a release:
   The [Android companion app](Android-App) downloads these archives by name, so their names and
   layout (`outpace-<version>-<target>/outpace` inside the `.tar.gz`) stay stable.
 - Opt-in [engine camouflage](Engine-Camouflage) (`OUTPACE_ACESTREAM_IDENTITY`). Default off.
+
+## v1.0.3 fixes
+
+A patch release with no new features or default changes:
+
+- Live streams whose peers hold less history than `OUTPACE_PREBUFFER_MS` now start as soon as
+  everything up to the live edge has arrived, instead of waiting for the 15-second startup
+  deadline. The `[prebuffer]` log line reports `reason=BacklogExhausted` (#474).
 
 ## v1.0.2 fixes
 
